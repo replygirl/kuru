@@ -7,5 +7,5 @@
 
 ## 2. Delivery
 
-- [x] 2.1 @integration (agent) Run the complete gate -> mise run check exited 0 on 2026-09-09: 205 Rust tests passed, including actual fixture tools, with 97.55% line coverage (8435/8647). Formatting, Clippy, metadata, shell/actions, docs and cospec gates passed. No application exclusions or threshold changes were introduced.
+- [x] 2.1 @integration (agent) Run the complete gate -> mise run check exited 0 on 2026-09-09: 209 Rust tests passed, including actual fixture tools and the discovered memory-contention regressions, with 97.51% line coverage (8554/8772). Formatting, Clippy, metadata, shell/actions, docs and cospec gates passed. No application exclusions or threshold changes were introduced.
 - [ ] 2.2 @runtime (agent) Run GitHub CI on macOS and Ubuntu -> required checks exercise the native package tasks on actual hosted runners.

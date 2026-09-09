@@ -4,7 +4,7 @@ use std::{
     io::ErrorKind,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -15,6 +15,7 @@ use crate::Message;
 
 const APPLICATION_ID: i64 = 0x4b55_5255;
 const SCHEMA_VERSION: i64 = 1;
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cloneable process-local handle backed by SQLite's transactional storage.
 ///
@@ -71,11 +72,12 @@ impl MemoryStore {
     }
 
     fn initialize(mut connection: Connection) -> Result<Self> {
-        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
         // Identify and migrate before changing journal policy on an existing file.
         {
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .context("cannot begin memory schema initialization")?;
             let version: i64 =
                 transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
             let identity: i64 =
@@ -115,19 +117,16 @@ impl MemoryStore {
                     "unsupported memory schema version {version}; this build supports {SCHEMA_VERSION}"
                 );
             }
-            transaction.commit()?;
+            transaction
+                .commit()
+                .context("cannot commit memory schema initialization")?;
         }
         let health: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
         ensure!(health == "ok", "memory database integrity check failed");
         // Fail at open, rather than during a user turn, if a table was damaged or altered.
         connection.prepare("SELECT sequence, namespace, role, content FROM messages LIMIT 0")?;
         connection.prepare("SELECT key, value FROM state LIMIT 0")?;
-        let journal: String =
-            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        ensure!(
-            matches!(journal.as_str(), "wal" | "memory"),
-            "SQLite could not enable durable journaling"
-        );
+        enable_wal(&connection, BUSY_TIMEOUT)?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -239,6 +238,43 @@ impl MemoryStore {
     }
 }
 
+fn enable_wal(connection: &Connection, timeout: Duration) -> Result<()> {
+    // SQLite can skip its busy handler during journal-mode lock promotion to
+    // avoid deadlock. Retry this single autocommit statement after it has been
+    // finalized, so another initializer can finish its schema transaction.
+    // Own the wait budget here rather than nesting a busy timeout per attempt.
+    // https://www.sqlite.org/c3ref/busy_handler.html
+    connection.busy_timeout(Duration::ZERO)?;
+    let deadline = Instant::now() + timeout;
+    let result = loop {
+        match connection
+            .query_row::<String, _, _>("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        {
+            Ok(journal) => {
+                break if matches!(journal.as_str(), "wal" | "memory") {
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "SQLite could not enable durable journaling: journal mode is {journal}"
+                    ))
+                };
+            }
+            Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break Err(error).context("timed out enabling SQLite WAL journaling");
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            Err(error) => break Err(error).context("cannot enable SQLite WAL journaling"),
+        }
+    };
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .context("cannot restore SQLite busy timeout after WAL initialization")?;
+    result
+}
+
 fn identifier(label: &str, value: &str, max_bytes: usize) -> Result<()> {
     ensure!(
         !value.trim().is_empty() && value.len() <= max_bytes && !value.contains('\0'),
@@ -250,6 +286,128 @@ fn identifier(label: &str, value: &str, max_bytes: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_transition_waits_for_reserved_lock_and_preserves_data() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("contended.sqlite3");
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES ('keep'); BEGIN IMMEDIATE;")
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.busy_timeout(BUSY_TIMEOUT).unwrap();
+        let busy = connection
+            .query_row::<String, _, _>("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .unwrap_err();
+        assert_eq!(
+            busy.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = enable_wal(&connection, Duration::from_secs(2));
+            finished_tx.send(result).unwrap();
+            connection
+        });
+        started_rx.recv().unwrap();
+        let early = finished_rx.recv_timeout(Duration::from_millis(50));
+        holder.execute_batch("COMMIT").unwrap();
+        let returned_early = early.is_ok();
+        let result = match early {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => finished_rx.recv().unwrap(),
+            Err(error) => panic!("transition worker disconnected: {error}"),
+        };
+        let connection = worker.join().unwrap();
+        assert!(
+            !returned_early,
+            "WAL transition returned while a real competing write lock was held: {result:?}"
+        );
+        result.unwrap();
+        assert_eq!(
+            connection
+                .query_row::<String, _, _>("SELECT value FROM retained", [], |row| row.get(0))
+                .unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value::<String, _>(None, "journal_mode", |row| row.get(0))
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value::<i64, _>(None, "busy_timeout", |row| row.get(0))
+                .unwrap(),
+            5000
+        );
+    }
+
+    #[test]
+    fn wal_contention_expires_and_restores_normal_busy_handling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("locked.sqlite3");
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("CREATE TABLE retained(value TEXT); BEGIN IMMEDIATE;")
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let timeout = Duration::from_millis(20);
+        let start = Instant::now();
+        let error = enable_wal(&connection, timeout).unwrap_err();
+        assert!(start.elapsed() >= timeout);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out enabling SQLite WAL"));
+        assert_eq!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .unwrap()
+                .sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value::<i64, _>(None, "busy_timeout", |row| row.get(0))
+                .unwrap(),
+            5000
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
+        enable_wal(&connection, timeout).unwrap();
+    }
+
+    #[test]
+    fn wal_nonbusy_errors_are_reported_without_waiting_or_mutating_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("corrupt.sqlite3");
+        let bytes = b"not a sqlite database";
+        fs::write(&path, bytes).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let start = Instant::now();
+        let error = enable_wal(&connection, Duration::from_secs(5)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("cannot enable SQLite WAL"));
+        assert_eq!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .unwrap()
+                .sqlite_error_code(),
+            Some(rusqlite::ErrorCode::NotADatabase)
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            connection
+                .pragma_query_value::<i64, _>(None, "busy_timeout", |row| row.get(0))
+                .unwrap(),
+            5000
+        );
+    }
 
     #[test]
     fn poisoned_connection_fails_without_exposing_contents() {

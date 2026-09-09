@@ -335,6 +335,76 @@ fn concurrent_first_opens_initialize_one_shared_schema() {
 }
 
 #[test]
+fn independent_processes_initialize_and_write_one_durable_database() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
+
+    const CHILD_ID: &str = "KURU_MEMORY_PROCESS_TEST_ID";
+    if let Some(id) = std::env::var_os(CHILD_ID) {
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+        let mut start = [0];
+        std::io::stdin().read_exact(&mut start).unwrap();
+        let store = MemoryStore::open(std::path::Path::new("shared.sqlite3")).unwrap();
+        store
+            .append("processes", "writer", id.to_str().unwrap())
+            .unwrap();
+        return;
+    }
+    let directory = TempDir::new().unwrap();
+    let mut children = Vec::new();
+    for id in 0..4 {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "independent_processes_initialize_and_write_one_durable_database",
+                "--nocapture",
+            ])
+            .env(CHILD_ID, id.to_string())
+            .current_dir(directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert!(
+                output.read_line(&mut line).unwrap() > 0,
+                "initializer exited before the start barrier"
+            );
+            if line.trim() == "ready" {
+                break;
+            }
+        }
+        // Keep the pipe open until completion so the child test runner can
+        // finish writing its result without receiving a broken pipe.
+        children.push((child, output));
+    }
+    for (child, _) in &mut children {
+        child.stdin.take().unwrap().write_all(&[1]).unwrap();
+    }
+    for (child, _output) in children {
+        let result = child.wait_with_output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let store = MemoryStore::open(&directory.path().join("shared.sqlite3")).unwrap();
+    let rows = store.history("processes", 10).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.into_iter()
+            .map(|row| row.content)
+            .collect::<HashSet<_>>(),
+        (0..4).map(|id| id.to_string()).collect()
+    );
+}
+
+#[test]
 fn invalid_identifiers_and_unrepresentable_limits_are_rejected() {
     let store = MemoryStore::in_memory().unwrap();
     for invalid in [
@@ -379,6 +449,12 @@ fn corrupt_files_unidentified_schemas_and_future_versions_fail_without_reinitial
             .query_row::<String, _, _>("SELECT value FROM important", [], |row| row.get(0))
             .unwrap(),
         "keep"
+    );
+    assert_eq!(
+        connection
+            .pragma_query_value::<String, _>(None, "journal_mode", |row| row.get(0))
+            .unwrap(),
+        "delete"
     );
     let future = dir.path().join("future.sqlite3");
     let store = MemoryStore::open(&future).unwrap();

@@ -2,8 +2,8 @@
 
 ## Native delivery and public documentation (2026-09-09)
 
-The complete package-owned mise gate passes **205 Rust tests** and **97.55%
-line coverage** (8435/8647), including the CLI and native delivery tooling.
+The complete package-owned mise gate passes **209 Rust tests** and **97.51%
+line coverage** (8554/8772), including the CLI and native delivery tooling.
 The 90% threshold remains unchanged. Rust replaces every Python installer,
 validator and PTY/protocol fixture; Node/npm stays local to the VitePress app.
 The source installer built and executed kuru 0.1.0 from an isolated destination,
@@ -18,6 +18,12 @@ Updater fixtures now prepare independent executables in a dedicated Rust child
 and wait for its exit before launch; no retry or timing delay masks the failure.
 The preserved-version assertion follows the crate version so release verification
 continues to work after a version bump.
+
+The pre-push gate also exposed concurrent SQLite initialization contention.
+A controlled WAL-transition regression failed immediately against the original
+implementation and passes with a five-second retry limited to SQLITE_BUSY at
+that transition. Deadline and non-busy errors, four independent initializing
+processes, the existing eight-thread startup and corruption checks all pass.
 
 The release suite uses actual Cocogitto and Communiqué binaries with disposable
 Git histories and local HTTP fixtures. It verifies scoped version stamping,
