@@ -24,6 +24,8 @@ A controlled WAL-transition regression failed immediately against the original
 implementation and passes with a five-second retry limited to SQLITE_BUSY at
 that transition. Deadline and non-busy errors, four independent initializing
 processes, the existing eight-thread startup and corruption checks all pass.
+The process fixture also exercises libtest's single-thread output format and
+bounds startup readiness with captured diagnostics and child cleanup.
 
 The release suite uses actual Cocogitto and Communiqué binaries with disposable
 Git histories and local HTTP fixtures. It verifies scoped version stamping,

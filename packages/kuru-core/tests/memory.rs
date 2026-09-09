@@ -337,11 +337,14 @@ fn concurrent_first_opens_initialize_one_shared_schema() {
 #[test]
 fn independent_processes_initialize_and_write_one_durable_database() {
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     const CHILD_ID: &str = "KURU_MEMORY_PROCESS_TEST_ID";
+    const READY: &str = "KURU_MEMORY_PROCESS_READY";
     if let Some(id) = std::env::var_os(CHILD_ID) {
-        println!("ready");
+        println!("{READY}");
         std::io::stdout().flush().unwrap();
         let mut start = [0];
         std::io::stdin().read_exact(&mut start).unwrap();
@@ -352,13 +355,14 @@ fn independent_processes_initialize_and_write_one_durable_database() {
         return;
     }
     let directory = TempDir::new().unwrap();
-    let mut children = Vec::new();
+    let mut children: Vec<(Child, thread::JoinHandle<String>)> = Vec::new();
     for id in 0..4 {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "independent_processes_initialize_and_write_one_durable_database",
                 "--nocapture",
+                "--test-threads=1",
             ])
             .env(CHILD_ID, id.to_string())
             .current_dir(directory.path())
@@ -367,29 +371,54 @@ fn independent_processes_initialize_and_write_one_durable_database() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap());
-        loop {
-            let mut line = String::new();
-            assert!(
-                output.read_line(&mut line).unwrap() > 0,
-                "initializer exited before the start barrier"
-            );
-            if line.trim() == "ready" {
-                break;
+        let output = child.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut captured = String::new();
+            for line in BufReader::new(output).lines() {
+                match line {
+                    Ok(line) => {
+                        captured.push_str(&line);
+                        captured.push('\n');
+                        // With one test thread, libtest prefixes this line
+                        // with "test NAME ... ". Match the distinct token.
+                        if line.split_whitespace().last() == Some(READY) {
+                            let _ = ready_tx.send(());
+                        }
+                    }
+                    Err(error) => {
+                        captured.push_str(&format!("stdout read failed: {error}"));
+                        break;
+                    }
+                }
             }
+            captured
+        });
+        if let Err(error) = ready_rx.recv_timeout(Duration::from_secs(5)) {
+            let _ = child.kill();
+            let result = child.wait_with_output().unwrap();
+            let captured = reader.join().unwrap();
+            for (mut pending, reader) in children.drain(..) {
+                let _ = pending.kill();
+                let _ = pending.wait();
+                let _ = reader.join();
+            }
+            panic!(
+                "initializer {id} did not reach its start barrier: {error}\nstdout:\n{captured}\nstderr:\n{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
         }
-        // Keep the pipe open until completion so the child test runner can
-        // finish writing its result without receiving a broken pipe.
-        children.push((child, output));
+        children.push((child, reader));
     }
     for (child, _) in &mut children {
         child.stdin.take().unwrap().write_all(&[1]).unwrap();
     }
-    for (child, _output) in children {
+    for (child, reader) in children {
         let result = child.wait_with_output().unwrap();
+        let captured = reader.join().unwrap();
         assert!(
             result.status.success(),
-            "{}",
+            "stdout:\n{captured}\nstderr:\n{}",
             String::from_utf8_lossy(&result.stderr)
         );
     }

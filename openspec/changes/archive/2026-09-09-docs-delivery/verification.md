@@ -7,7 +7,7 @@
 
 ## 2. Hosted follow-through
 
-- [ ] 2.1 @runtime (agent) Run the docs build in GitHub Actions on Ubuntu -> the actual hosted runner builds and validates the artifact under the pinned toolchain.
+- [x] 2.1 @runtime (agent) Run the docs build in GitHub Actions on Ubuntu -> run 34391814388 completed docs:check at 2026-09-09 19:01:24 UTC on Ubuntu 24.04, including the production build and native public-content/link checks under the pinned toolchain. The overall run was subsequently canceled for a separately reproduced single-thread fixture correction; this records the completed docs task, not an overall CI pass.
 
 After merge, deploy the requested site through GitHub Pages and report its live
 URL and the hosted workflow result. No release tag is authorized by this change.

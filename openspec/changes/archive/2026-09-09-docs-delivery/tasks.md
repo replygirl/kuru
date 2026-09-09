@@ -7,7 +7,7 @@
 ## 2. Acceptance ledger
 
 - [x] 2.1 Run the full repository gate including docs and release regressions and record observed results.
-- [ ] 2.2 Inspect built links/base paths and public content boundaries, and verify the hosted docs build before the final branch commit.
+- [x] 2.2 Inspect built links/base paths and public content boundaries, and verify the hosted docs build before the final branch commit.
 
 Deployment follows merging the reviewed changes; hosted evidence is reported
 from the actual Pages deployment after publication.
