@@ -46,7 +46,9 @@ and mobile navigation. Seven screenshots were inspected; no overflow, clipping,
 page errors or missing resources remained. [Hosted CI run 34393197392](https://github.com/replygirl/kuru/actions/runs/34393197392)
 passed on macOS 14 and Ubuntu 24.04, including the full gate, source installation,
 coverage/docs artifacts and ci-gate. Detailed evidence remains in the archived
-change ledgers; Pages deployment follows the reviewed merge.
+change ledgers. Pages publication belongs to the final jobs of an authorized
+Release run. The mistaken standalone dispatch (34397071952) was canceled with
+zero deployments; it is not evidence of a live site.
 
 ## Hosted CI repair and portable repository layout
 

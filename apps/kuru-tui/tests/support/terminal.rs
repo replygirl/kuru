@@ -140,6 +140,38 @@ impl Terminal {
         self.wait_text(&["enter send"], &[])
     }
 
+    pub fn wait_composer_frame(&mut self, present: &[&str], timeout: Duration) -> Result<()> {
+        self.wait(
+            &format!("completed composer frame contains {present:?}"),
+            timeout,
+            |terminal| {
+                let screen = terminal.screen();
+                // Ratatui's Crossterm backend flushes the cell diff and Show
+                // before separately flushing MoveTo. Visible draft text (or
+                // even the resulting cursor position) can therefore precede
+                // the final bytes. Observe the complete wire trailer instead.
+                let (row, col) = terminal.parser.screen().cursor_position();
+                let trailer = format!(
+                    "\x1b[?25h\x1b[{};{}H",
+                    u32::from(row) + 1,
+                    u32::from(col) + 1
+                );
+                Ok(present.iter().all(|value| screen.contains(value))
+                    && terminal.output.ends_with(trailer.as_bytes()))
+            },
+        )
+    }
+
+    pub fn assert_no_output_since(&self, settled: usize, description: &str) -> Result<()> {
+        ensure!(
+            self.output.len() == settled,
+            "{description}: {} new bytes after completed frame\n{}",
+            self.output.len() - settled,
+            self.screen()
+        );
+        Ok(())
+    }
+
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
         self.master.write_all(bytes)?;
         Ok(())

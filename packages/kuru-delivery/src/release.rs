@@ -59,11 +59,17 @@ pub fn checked_sha(value: &str) -> Result<&str> {
     Ok(value)
 }
 pub async fn run(root: &Path, program: &str, args: &[&str]) -> Result<String> {
+    command_output(Command::new(program).args(args).current_dir(root)).await
+}
+async fn command_output(command: &mut Command) -> Result<String> {
+    let program = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
     let output = tokio::time::timeout(
         Duration::from_secs(180),
-        Command::new(program)
-            .args(args)
-            .current_dir(root)
+        command
             .env("GIT_TERMINAL_PROMPT", "0")
             .kill_on_drop(true)
             .output(),
@@ -112,7 +118,7 @@ pub async fn compute_version(root: &Path, bump: &str) -> Result<Version> {
         {
             ensure!(
                 tag.parse::<Version>().is_err(),
-                "no commits since existing release tag; use explicit resume inputs"
+                "no commits since existing release tag"
             );
         }
     }
@@ -134,37 +140,39 @@ pub struct Plan {
     pub version: String,
     pub tag: String,
     pub base_sha: String,
-    pub resume: bool,
 }
-pub async fn plan(root: &Path, bump: &str, resume_version: &str, resume_sha: &str) -> Result<Plan> {
+pub async fn plan(root: &Path, bump: &str) -> Result<Plan> {
     ensure!(
-        resume_version.is_empty() == resume_sha.is_empty(),
-        "resume_version and resume_sha must be supplied together"
+        ["auto", "major", "minor", "patch"].contains(&bump),
+        "unsupported version bump"
+    );
+    ensure!(
+        git(root, &["status", "--porcelain"]).await?.is_empty(),
+        "release planning requires a clean checkout"
     );
     let head = git(root, &["rev-parse", "HEAD"]).await?;
     checked_sha(&head)?;
-    let (selected, candidate) = if resume_version.is_empty() {
-        let selected = compute_version(root, bump).await?;
-        ensure!(
-            selected >= workspace_version(root, None).await?,
-            "calculated version would downgrade workspace; choose auto or minor"
-        );
-        (selected, head)
+    let current = workspace_version(root, None).await?;
+    let tags = git(root, &["tag", "--points-at", "HEAD", "--list", "v*"]).await?;
+    let tagged = tags.lines().any(|tag| {
+        tag.parse::<Version>()
+            .is_ok_and(|version| version == current)
+    });
+    let prepared =
+        git(root, &["log", "-1", "--format=%s"]).await? == format!("chore(release): v{current}");
+    let selected = if tagged || prepared {
+        current
     } else {
-        let selected = resume_version.parse()?;
-        checked_sha(resume_sha)?;
-        git(root, &["merge-base", "--is-ancestor", resume_sha, &head]).await?;
-        ensure!(
-            workspace_version(root, Some(resume_sha)).await? == selected,
-            "resume SHA does not contain requested workspace version"
-        );
-        (selected, resume_sha.to_owned())
+        compute_version(root, bump).await?
     };
+    ensure!(
+        selected >= current,
+        "calculated version would downgrade workspace; choose auto or minor"
+    );
     Ok(Plan {
         version: selected.to_string(),
         tag: format!("v{selected}"),
-        base_sha: candidate,
-        resume: !resume_version.is_empty(),
+        base_sha: head,
     })
 }
 fn rewrite_version(text: &str, section: Option<&str>, selected: Version) -> Result<String> {
@@ -428,6 +436,44 @@ impl GitHub {
         Self::decode(response, false).await?;
         Ok(())
     }
+    async fn checksum_manifest(&self, id: u64) -> Result<Vec<u8>> {
+        let mut response = self
+            .client
+            .get(
+                self.api_base
+                    .join(&self.path(&format!("releases/assets/{id}")))?,
+            )
+            .bearer_auth(&self.token)
+            .header("User-Agent", "kuru-release")
+            .header("Accept", "application/octet-stream")
+            .send()
+            .await?;
+        // GitHub may redirect asset downloads to a signed storage URL. Never
+        // forward the API token, and never follow a downgrade to plain HTTP.
+        if response.status() == StatusCode::FOUND {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .context("missing asset redirect")?
+                .to_str()?;
+            let url = Url::parse(location)?;
+            ensure!(
+                url.scheme() == "https" && url.username().is_empty() && url.password().is_none(),
+                "invalid asset redirect"
+            );
+            response = self.client.get(url).send().await?;
+        }
+        ensure!(response.status().is_success(), "checksum download failed");
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                bytes.len() + chunk.len() <= 4096,
+                "checksum manifest exceeds limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
 }
 pub async fn commit_version(
     root: &Path,
@@ -444,7 +490,7 @@ pub async fn commit_version(
         workspace_version(root, None).await? == selected,
         "workspace not stamped to selected version"
     );
-    let diff = git(root, &["diff", "--name-only"]).await?;
+    let diff = git(root, &["diff", "HEAD", "--name-only"]).await?;
     let paths: Vec<_> = diff.lines().collect();
     ensure!(
         paths
@@ -452,14 +498,45 @@ pub async fn commit_version(
             .all(|p| ["Cargo.toml", "Cargo.lock"].contains(p)),
         "release stamp changed unrelated files"
     );
-    if paths.is_empty() {
-        let current = api
-            .required(Method::GET, &api.path("commits/main"), None)
+    let current = api
+        .required(Method::GET, &api.path("commits/main"), None)
+        .await?;
+    let head = checked_sha(current["sha"].as_str().context("missing main SHA")?)?;
+    if head != expected {
+        // Compare immutable SHAs, not a moving branch. The first descendant must
+        // be precisely our stamp, even if other commits have since reached main.
+        let comparison = api
+            .required(
+                Method::GET,
+                &api.path(&format!("compare/{expected}...{head}?per_page=1")),
+                None,
+            )
             .await?;
         ensure!(
-            current["sha"].as_str() == Some(expected),
-            "main moved after validation"
+            comparison["status"] == "ahead" && comparison["merge_base_commit"]["sha"] == expected,
+            "main diverged from expected release base"
         );
+        if paths.is_empty() {
+            return Ok(expected.to_owned());
+        }
+        let first = &comparison["commits"][0];
+        let tree = stamped_tree(root).await?;
+        ensure!(
+            first["parents"]
+                .as_array()
+                .is_some_and(|p| p.len() == 1 && p[0]["sha"] == expected)
+                && first["commit"]["message"] == format!("chore(release): v{selected}")
+                && first["commit"]["tree"]["sha"] == tree,
+            "main moved without the expected release commit; expected main head no longer matches"
+        );
+        return Ok(checked_sha(
+            first["sha"]
+                .as_str()
+                .context("missing existing version commit SHA")?,
+        )?
+        .to_owned());
+    }
+    if paths.is_empty() {
         return Ok(expected.to_owned());
     }
     let additions = paths
@@ -473,6 +550,25 @@ pub async fn commit_version(
             .context("missing signed commit SHA")?,
     )?
     .to_owned())
+}
+async fn stamped_tree(root: &Path) -> Result<String> {
+    let temp = tempfile::tempdir()?;
+    let index = temp.path().join("index");
+    let mut result = String::new();
+    for args in [
+        &["read-tree", "HEAD"][..],
+        &["add", "--", "Cargo.toml", "Cargo.lock"],
+        &["write-tree"],
+    ] {
+        result = command_output(
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_INDEX_FILE", &index),
+        )
+        .await?;
+    }
+    Ok(checked_sha(&result)?.to_owned())
 }
 pub async fn tag_commit(api: &GitHub, selected: Version) -> Result<Option<String>> {
     let Some(reference) = api
@@ -600,14 +696,49 @@ fn remote_assets(
         let name = item["name"].as_str().context("missing asset name")?;
         let digest = checksums
             .get(name)
-            .context("unexpected existing draft asset")?;
+            .context("unexpected existing release asset")?;
         ensure!(
             seen.insert(name.to_owned())
                 && item["digest"].as_str() == Some(&format!("sha256:{digest}")),
-            "existing draft asset differs from verified local artifacts"
+            "existing release asset differs from verified checksums"
         );
     }
     Ok(seen)
+}
+async fn published_url(api: &GitHub, release: &Value, selected: Version) -> Result<String> {
+    let listed = release["assets"]
+        .as_array()
+        .context("missing release assets")?;
+    let manifest_asset = listed
+        .iter()
+        .find(|item| item["name"] == "SHA256SUMS")
+        .context("published release is incomplete")?;
+    let id = manifest_asset["id"]
+        .as_u64()
+        .context("missing checksum asset ID")?;
+    let bytes = api.checksum_manifest(id).await?;
+    let text = std::str::from_utf8(&bytes)?;
+    ensure!(
+        text.lines().count() == TARGETS.len(),
+        "published checksum manifest is incomplete"
+    );
+    let mut checksums = BTreeMap::new();
+    for target in TARGETS {
+        let name = format!("kuru-{selected}-{target}.tar.gz");
+        checksums.insert(
+            name.clone(),
+            crate::archive::expected_digest(&bytes, &name)?,
+        );
+    }
+    checksums.insert("SHA256SUMS".into(), digest(&bytes));
+    ensure!(
+        remote_assets(release, &checksums)? == checksums.keys().cloned().collect(),
+        "published release is incomplete"
+    );
+    Ok(release["html_url"]
+        .as_str()
+        .context("missing release URL")?
+        .to_owned())
 }
 pub async fn publish(
     api: &GitHub,
@@ -617,13 +748,8 @@ pub async fn publish(
     notes: &Path,
 ) -> Result<String> {
     checked_sha(candidate)?;
-    let checksums = assets(directory, selected)?;
-    let body = fs::read_to_string(notes)?;
-    ensure!(
-        !body.trim().is_empty() && body.len() <= 100_000,
-        "release notes must be bounded and nonempty"
-    );
-    if let Some(existing) = tag_commit(api, selected).await? {
+    let tag = tag_commit(api, selected).await?;
+    if let Some(existing) = &tag {
         ensure!(
             existing == candidate,
             "existing release tag points to a different commit"
@@ -631,17 +757,32 @@ pub async fn publish(
     }
     let existing = find_release(api, selected).await?;
     let marker = format!("<!-- kuru-release-sha: {candidate} -->");
-    let present = if let Some(release) = &existing {
-        ensure!(
-            release["draft"].as_bool() == Some(true),
-            "release already published; use Pages workflow to redeploy docs"
-        );
+    if let Some(release) = &existing {
         ensure!(
             release["body"]
                 .as_str()
                 .is_some_and(|body| body.contains(&marker)),
-            "existing draft does not belong to this release commit"
+            "existing release does not belong to this release commit"
         );
+        if release["draft"].as_bool() == Some(false) {
+            ensure!(
+                tag.as_deref() == Some(candidate),
+                "published release tag is missing"
+            );
+            return published_url(api, release, selected).await;
+        }
+        ensure!(
+            release["draft"].as_bool() == Some(true),
+            "missing release draft state"
+        );
+    }
+    let checksums = assets(directory, selected)?;
+    let body = fs::read_to_string(notes)?;
+    ensure!(
+        !body.trim().is_empty() && body.len() <= 100_000,
+        "release notes must be bounded and nonempty"
+    );
+    let present = if let Some(release) = &existing {
         remote_assets(release, &checksums)?
     } else {
         BTreeSet::new()
@@ -677,7 +818,9 @@ pub async fn publish(
         .required(
             Method::PATCH,
             &api.path(&format!("releases/{id}")),
-            Some(json!({"draft":false,"make_latest":"true"})),
+            // Let GitHub select latest by version/date; recovering an older
+            // draft must not unconditionally promote it above newer releases.
+            Some(json!({"draft":false,"make_latest":"legacy"})),
         )
         .await?;
     Ok(published["html_url"]

@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::PathBuf,
     process::Command,
     sync::{
@@ -83,10 +83,10 @@ impl Sandbox {
     }
 }
 
-// Re-executed by the backpressure test, with an explicit mode. Keeping this
+// Re-executed by the terminal driver tests, with an explicit mode. Keeping this
 // subprocess entry in the test binary avoids shipping a fixture executable.
 #[test]
-#[ignore = "subprocess entry exercised by terminal_driver_drains_backpressure_and_bounds_stalled_processes"]
+#[ignore = "subprocess entry exercised by terminal driver regressions"]
 fn terminal_fixture_process() -> Result<()> {
     match std::env::var("KURU_TERMINAL_FIXTURE")?.as_str() {
         "pressure" => {
@@ -101,6 +101,28 @@ fn terminal_fixture_process() -> Result<()> {
             println!("STALLED");
             std::io::stdout().flush()?;
             std::thread::sleep(Duration::from_secs(30));
+        }
+        "fragmented-frame" => {
+            crossterm::terminal::enable_raw_mode()?;
+            let mut input = std::io::stdin().lock();
+            let mut output = std::io::stdout().lock();
+            // Each fragment waits for the parent's explicit acknowledgment.
+            // Text and cursor visibility arrive before the final cursor move,
+            // just as the real backend's separate flushes permit.
+            output.write_all(b"\x1b[2J\x1b[Hfocus draft\x1b[?25h")?;
+            output.flush()?;
+            let mut acknowledgment = [0];
+            input.read_exact(&mut acknowledgment)?;
+            output.write_all(b"\x1b[3;")?;
+            output.flush()?;
+            input.read_exact(&mut acknowledgment)?;
+            output.write_all(b"14H")?;
+            output.flush()?;
+            input.read_exact(&mut acknowledgment)?;
+            output.write_all(b"\x1b[1;1Hanimated draft\x1b[?25h\x1b[3;14H")?;
+            output.flush()?;
+            input.read_exact(&mut acknowledgment)?;
+            crossterm::terminal::disable_raw_mode()?;
         }
         other => anyhow::bail!("unknown fixture mode {other}"),
     }
@@ -151,6 +173,51 @@ fn terminal_driver_drains_backpressure_and_bounds_stalled_processes() -> Result<
     Ok(())
 }
 
+#[test]
+fn terminal_driver_waits_for_complete_frames_before_checking_quiescence() -> Result<()> {
+    let mut terminal = fixture("fragmented-frame")?;
+    terminal.wait_text(&["focus draft"], &[])?;
+    let text_only_baseline = terminal.output.len();
+    // The child cannot send the cursor trailer until the parent permits it.
+    // A text-only wait incorrectly succeeds here, before the frame is complete.
+    let error = terminal
+        .wait_composer_frame(&["focus draft"], Duration::from_millis(100))
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"), "{error}");
+
+    terminal.send(b"n")?;
+    terminal.wait("partial cursor trailer", READY_TIMEOUT, |terminal| {
+        Ok(terminal.output.ends_with(b"\x1b[3;"))
+    })?;
+    let error = terminal
+        .wait_composer_frame(&["focus draft"], Duration::from_millis(100))
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"), "{error}");
+
+    terminal.send(b"n")?;
+    terminal.wait_composer_frame(&["focus draft"], READY_TIMEOUT)?;
+    assert!(terminal.output.len() > text_only_baseline);
+    let settled = terminal.output.len();
+    terminal.read_for(Duration::from_millis(100))?;
+    terminal.assert_no_output_since(settled, "unfocused terminal is animating")?;
+
+    // A subsequent visual update must still fail the same strict assertion
+    // used by the application test; completing a frame grants no tolerance.
+    terminal.send(b"n")?;
+    terminal.wait_text(&["animated draft"], &[])?;
+    let error = terminal
+        .assert_no_output_since(settled, "unfocused terminal is animating")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unfocused terminal is animating"),
+        "{error}"
+    );
+    terminal.send(b"q")?;
+    terminal.wait_exit(EXIT_TIMEOUT)
+}
+
 fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {
     let mut command = sandbox.command("demo");
     command.args(["--mode", "freudian"]);
@@ -170,17 +237,13 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {
     terminal.read_for(Duration::from_millis(700))?;
     assert_eq!(terminal.output.len() == settled, reduced);
 
-    // Observe an editable draft after focus loss before checking animation.
-    // This acknowledges event processing without a scheduling assumption.
+    // Observe the complete draft frame after focus loss, including its cursor
+    // trailer, before checking animation. Text can precede the final flush.
     terminal.send(b"\x1b[Ofocus draft")?;
-    terminal.wait_text(&["focus draft", "enter send"], &[])?;
+    terminal.wait_composer_frame(&["focus draft", "enter send"], READY_TIMEOUT)?;
     let settled = terminal.output.len();
     terminal.read_for(Duration::from_millis(400))?;
-    assert_eq!(
-        terminal.output.len(),
-        settled,
-        "unfocused terminal is animating"
-    );
+    terminal.assert_no_output_since(settled, "unfocused terminal is animating")?;
     terminal.send(b"\x1b[I")?;
     terminal.send(&[127; 11])?;
     terminal.wait_text(&["What shall we explore or build?", "enter send"], &[])?;

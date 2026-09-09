@@ -168,33 +168,54 @@ async fn stamps_only_workspace_versions_and_rejects_inconsistent_locks() {
     );
 }
 #[tokio::test]
-async fn plans_initial_release_and_explicit_resume_without_moving_refs() {
+async fn plans_initial_release_and_reuses_prepared_or_tagged_heads_without_inputs() {
     let repo = Repo::new().await;
     let head = repo.head().await;
-    let initial = release::plan(repo.root(), "auto", "", "").await.unwrap();
+    let initial = release::plan(repo.root(), "auto").await.unwrap();
     assert_eq!(initial.base_sha, head);
-    assert!(!initial.resume);
+    assert_eq!(initial.version, "0.1.0");
+    assert!(release::plan(repo.root(), "patch").await.is_err());
+    repo.tag("v0.1.0").await;
+    for strategy in ["auto", "major", "minor", "patch"] {
+        let retry = release::plan(repo.root(), strategy).await.unwrap();
+        assert_eq!(retry.base_sha, head);
+        assert_eq!(retry.version, "0.1.0");
+    }
+    repo.commit("feat: add relationships").await;
+    let base = repo.head().await;
+    let mut plans = Vec::new();
+    for strategy in ["auto", "major", "minor", "patch"] {
+        plans.push((
+            strategy,
+            release::plan(repo.root(), strategy).await.unwrap(),
+        ));
+    }
+    release::stamp(repo.root(), v("0.2.0")).unwrap();
+    let prepared = repo.commit("chore(release): v0.2.0").await;
+    for strategy in ["auto", "major", "minor", "patch"] {
+        let retry = release::plan(repo.root(), strategy).await.unwrap();
+        assert_eq!(retry.base_sha, prepared);
+        assert_eq!(retry.version, "0.2.0");
+    }
+    repo.tag("v0.2.0").await;
+    repo.commit("feat!: later work").await;
+    repo.tag("v1.0.0").await;
+    release::git(repo.root(), &["checkout", "--detach", &base])
+        .await
+        .unwrap();
+    for (strategy, original) in plans {
+        let retry = release::plan(repo.root(), strategy).await.unwrap();
+        assert_eq!(retry.base_sha, original.base_sha);
+        assert_eq!(retry.version, original.version);
+    }
+    assert!(release::plan(repo.root(), "invalid").await.is_err());
+    fs::write(repo.root().join("untracked"), "dirty").unwrap();
     assert!(
-        release::plan(repo.root(), "auto", "0.1.0", &head)
+        release::plan(repo.root(), "auto")
             .await
-            .unwrap()
-            .resume
-    );
-    assert!(
-        release::plan(repo.root(), "auto", "0.1.0", "")
-            .await
-            .is_err()
-    );
-    assert!(
-        release::plan(repo.root(), "auto", "0.2.0", &head)
-            .await
-            .is_err()
-    );
-    assert!(release::plan(repo.root(), "patch", "", "").await.is_err());
-    assert!(
-        release::plan(repo.root(), "auto", "0.1.0", A)
-            .await
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("clean checkout")
     );
     for invalid in ["1.2", "01.2.3", "1.0.0\nx=y", "1.0.0;id", "1.0.0-rc.1", ""] {
         assert!(invalid.parse::<Version>().is_err());
@@ -289,6 +310,12 @@ struct Remote {
     fail_upload: Option<usize>,
     corrupt_upload: bool,
     malformed: bool,
+    prepared_commit: Option<Value>,
+    comparison: Option<Value>,
+    lose_commit_response: bool,
+    manifest: Vec<u8>,
+    manifest_redirect: Option<String>,
+    lose_publish_response: bool,
 }
 struct Server {
     api: GitHub,
@@ -351,9 +378,29 @@ async fn handler(State(shared): State<Arc<Mutex<Remote>>>, request: Request) -> 
                     json!({"errors":[{"message":"expected head changed; private context"}]}),
                 );
             }
-            json!({"data":{"createCommitOnBranch":{"commit":{"oid":B}}}})
+            let sha = state
+                .prepared_commit
+                .as_ref()
+                .map(|commit| commit["sha"].as_str().unwrap())
+                .unwrap_or(B)
+                .to_owned();
+            state.head = sha.clone();
+            if state.lose_commit_response {
+                return response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"message":"response lost after commit"}),
+                );
+            }
+            json!({"data":{"createCommitOnBranch":{"commit":{"oid":sha}}}})
         }
         (Method::GET, "commits/main") => json!({"sha":state.head}),
+        (Method::GET, value) if value.starts_with("compare/") => {
+            assert_eq!(query, "per_page=1");
+            state
+                .comparison
+                .clone()
+                .unwrap_or(json!({"status":"diverged"}))
+        }
         (Method::GET, value) if value.starts_with("git/ref/tags/") => {
             if let Some(tag) = &state.tag {
                 json!({"object":tag})
@@ -404,17 +451,38 @@ async fn handler(State(shared): State<Arc<Mutex<Remote>>>, request: Request) -> 
             } else {
                 digest(&bytes)
             };
-            let asset = json!({"name":name,"digest":format!("sha256:{digest}")});
+            let id = state.uploads.len() as u64;
+            if name == "SHA256SUMS" {
+                state.manifest = bytes.to_vec();
+            }
+            let asset = json!({"id":id,"name":name,"digest":format!("sha256:{digest}")});
             state.release.as_mut().unwrap()["assets"]
                 .as_array_mut()
                 .unwrap()
                 .push(asset.clone());
             asset
         }
+        (Method::GET, value) if value.starts_with("releases/assets/") => {
+            if let Some(location) = &state.manifest_redirect {
+                return (StatusCode::FOUND, [("location", location.clone())]).into_response();
+            }
+            return (StatusCode::OK, state.manifest.clone()).into_response();
+        }
         (Method::PATCH, "releases/17") => {
+            assert_eq!(
+                payload["make_latest"], "legacy",
+                "recovery must not force an older draft to become latest"
+            );
             let release = state.release.as_mut().unwrap();
             release["draft"] = payload["draft"].clone();
-            release.clone()
+            let result = release.clone();
+            if state.lose_publish_response {
+                return response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"message":"response lost after publication"}),
+                );
+            }
+            result
         }
         _ => {
             return response(
@@ -487,7 +555,7 @@ async fn signed_api_commit_uses_expected_head_and_only_scoped_payloads() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("expected main head"));
+    assert!(error.contains("diverged"));
     assert!(!error.contains("private context"));
     fs::write(repo.root().join("cog.toml"), "# unrelated change\n").unwrap();
     assert!(
@@ -496,6 +564,158 @@ async fn signed_api_commit_uses_expected_head_and_only_scoped_payloads() {
             .unwrap_err()
             .to_string()
             .contains("unrelated")
+    );
+}
+async fn comparison(repo: &Repo, base: &str, head: &str) -> Value {
+    let commits = release::git(
+        repo.root(),
+        &["rev-list", "--reverse", &format!("{base}..{head}")],
+    )
+    .await
+    .unwrap();
+    let first = commits.lines().next().unwrap();
+    let parents = release::git(repo.root(), &["show", "-s", "--format=%P", first])
+        .await
+        .unwrap();
+    let tree = release::git(repo.root(), &["rev-parse", &format!("{first}^{{tree}}")])
+        .await
+        .unwrap();
+    let message = release::git(repo.root(), &["show", "-s", "--format=%B", first])
+        .await
+        .unwrap();
+    json!({"status":"ahead", "merge_base_commit":{"sha":base}, "commits":[{
+        "sha":first, "parents":parents.split_whitespace().map(|sha| json!({"sha":sha})).collect::<Vec<_>>(),
+        "commit":{"message":message, "tree":{"sha":tree}}
+    }]})
+}
+#[tokio::test]
+async fn lost_bump_response_reuses_exact_tree_and_parent_even_after_main_advances() {
+    let repo = Repo::new().await;
+    let base = repo.head().await;
+    release::stamp(repo.root(), v("0.2.0")).unwrap();
+    let prepared = repo.commit("chore(release): v0.2.0").await;
+    let expected = comparison(&repo, &base, &prepared).await;
+    fs::write(repo.root().join("later.txt"), "not part of this release").unwrap();
+    let later = repo.commit("feat: later independent work").await;
+    let later_comparison = comparison(&repo, &base, &later).await;
+    release::git(repo.root(), &["checkout", "--detach", &base])
+        .await
+        .unwrap();
+    release::stamp(repo.root(), v("0.2.0")).unwrap();
+    let original_index = fs::read(repo.root().join(".git/index")).unwrap();
+    let server = Server::new(&base).await;
+    {
+        let mut remote = server.state.lock().unwrap();
+        remote.prepared_commit = Some(expected["commits"][0].clone());
+        remote.comparison = Some(expected.clone());
+        remote.lose_commit_response = true;
+    }
+    assert!(
+        release::commit_version(repo.root(), &server.api, &base, v("0.2.0"))
+            .await
+            .is_err()
+    );
+    assert_eq!(server.state.lock().unwrap().head, prepared);
+    assert_eq!(
+        release::commit_version(repo.root(), &server.api, &base, v("0.2.0"))
+            .await
+            .unwrap(),
+        prepared
+    );
+    {
+        let mut remote = server.state.lock().unwrap();
+        remote.head = later;
+        remote.comparison = Some(later_comparison);
+    }
+    assert_eq!(
+        release::commit_version(repo.root(), &server.api, &base, v("0.2.0"))
+            .await
+            .unwrap(),
+        prepared
+    );
+    assert_eq!(
+        fs::read(repo.root().join(".git/index")).unwrap(),
+        original_index
+    );
+    assert_eq!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(method, _, _)| method == Method::POST)
+            .count(),
+        1
+    );
+
+    // A title alone, or even identical contents with the wrong parent, is not
+    // evidence that an intervening commit is the prepared release.
+    for field in ["tree", "parent", "message", "merge", "diverged"] {
+        let mut bad = expected.clone();
+        match field {
+            "tree" => bad["commits"][0]["commit"]["tree"]["sha"] = json!(C),
+            "parent" => bad["commits"][0]["parents"][0]["sha"] = json!(C),
+            "message" => bad["commits"][0]["commit"]["message"] = json!("feat: unrelated work"),
+            "merge" => bad["commits"][0]["parents"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"sha":C})),
+            _ => bad["status"] = json!("diverged"),
+        }
+        server.state.lock().unwrap().comparison = Some(bad);
+        assert!(
+            release::commit_version(repo.root(), &server.api, &base, v("0.2.0"))
+                .await
+                .is_err(),
+            "accepted {field}"
+        );
+    }
+    assert_eq!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(method, _, _)| method == Method::POST)
+            .count(),
+        1
+    );
+}
+#[tokio::test]
+async fn unchanged_stamp_keeps_original_ancestor_without_including_new_main_work() {
+    let repo = Repo::new().await;
+    let base = repo.head().await;
+    fs::write(repo.root().join("later.txt"), "later").unwrap();
+    let later = repo.commit("fix: later work").await;
+    let ahead = comparison(&repo, &base, &later).await;
+    release::git(repo.root(), &["checkout", "--detach", &base])
+        .await
+        .unwrap();
+    let server = Server::new(&later).await;
+    server.state.lock().unwrap().comparison = Some(ahead);
+    assert_eq!(
+        release::commit_version(repo.root(), &server.api, &base, v("0.1.0"))
+            .await
+            .unwrap(),
+        base
+    );
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .all(|(method, _, _)| method == Method::GET)
+    );
+    server.state.lock().unwrap().comparison.as_mut().unwrap()["merge_base_commit"]["sha"] =
+        json!(C);
+    assert!(
+        release::commit_version(repo.root(), &server.api, &base, v("0.1.0"))
+            .await
+            .is_err()
     );
 }
 struct Archives {
@@ -572,15 +792,21 @@ async fn interrupted_draft_resumes_missing_assets_then_publishes_exact_commit() 
         );
     }
     let snapshot = server.state.lock().unwrap().release.clone();
-    assert!(
-        archives
-            .publish(&server.api)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("already published")
+    server.state.lock().unwrap().calls.clear();
+    assert_eq!(
+        archives.publish(&server.api).await.unwrap(),
+        "https://example.invalid/release"
     );
     assert_eq!(server.state.lock().unwrap().release, snapshot);
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .all(|(method, _, _)| method == Method::GET)
+    );
     assert_eq!(
         fs::read_to_string(archives.directory.join("SHA256SUMS"))
             .unwrap()
@@ -588,6 +814,90 @@ async fn interrupted_draft_resumes_missing_assets_then_publishes_exact_commit() 
             .count(),
         4
     );
+}
+#[tokio::test]
+async fn lost_publication_response_recovers_from_remote_checksums_without_rebuilding() {
+    let archives = Archives::new();
+    let server = Server::new(A).await;
+    server.state.lock().unwrap().lose_publish_response = true;
+    assert!(archives.publish(&server.api).await.is_err());
+    assert_eq!(
+        server.state.lock().unwrap().release.as_ref().unwrap()["draft"],
+        false
+    );
+    fs::remove_dir_all(&archives.directory).unwrap();
+    fs::remove_file(&archives.notes).unwrap();
+    server.state.lock().unwrap().calls.clear();
+    assert_eq!(
+        archives.publish(&server.api).await.unwrap(),
+        "https://example.invalid/release"
+    );
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .all(|(method, _, _)| method == Method::GET)
+    );
+}
+#[tokio::test]
+async fn published_recovery_rejects_incomplete_or_mismatched_remote_content() {
+    let archives = Archives::new();
+    let server = Server::new(A).await;
+    archives.publish(&server.api).await.unwrap();
+    let original = server.state.lock().unwrap().release.clone().unwrap();
+    let original_manifest = server.state.lock().unwrap().manifest.clone();
+    for invalid in [
+        "asset",
+        "digest",
+        "marker",
+        "manifest",
+        "oversize",
+        "redirect",
+        "missing-tag",
+    ] {
+        {
+            let mut remote = server.state.lock().unwrap();
+            remote.release = Some(original.clone());
+            remote.manifest = original_manifest.clone();
+            remote.calls.clear();
+            remote.manifest_redirect = None;
+            match invalid {
+                "asset" => {
+                    remote.release.as_mut().unwrap()["assets"]
+                        .as_array_mut()
+                        .unwrap()
+                        .pop();
+                }
+                "digest" => {
+                    remote.release.as_mut().unwrap()["assets"][1]["digest"] =
+                        json!(format!("sha256:{}", "0".repeat(64)))
+                }
+                "marker" => remote.release.as_mut().unwrap()["body"] = json!("unrelated release"),
+                "manifest" => remote.manifest = b"inconsistent checksum data".to_vec(),
+                "oversize" => remote.manifest = vec![b'x'; 4097],
+                "redirect" => {
+                    remote.manifest_redirect = Some("http://example.invalid/unsafe".into())
+                }
+                _ => remote.tag = None,
+            }
+        }
+        assert!(
+            archives.publish(&server.api).await.is_err(),
+            "accepted {invalid}"
+        );
+        assert!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .all(|(method, _, _)| method == Method::GET)
+        );
+    }
 }
 #[tokio::test]
 async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
@@ -624,7 +934,15 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
             .to_string()
             .contains("nonempty")
     );
-    assert!(server.state.lock().unwrap().calls.is_empty());
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .all(|(method, _, _)| method == Method::GET)
+    );
 }
 #[tokio::test]
 async fn immutable_tag_conflicts_and_unowned_or_corrupt_drafts_are_rejected() {
