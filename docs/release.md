@@ -4,7 +4,7 @@ Kuru releases use one manually dispatched workflow. Maintainers select a version
 bump; the workflow validates the source, creates a signed version commit when
 necessary, builds all four native archives, generates Communiqué notes, publishes
 a complete draft release, and deploys documentation from that exact commit.
-Pushes and tags do not start release publication.
+Pushes and tags do not start release publication or deploy documentation.
 
 ## One-time setup
 
@@ -30,8 +30,10 @@ without an app exception. GitHub's `createCommitOnBranch` API signs the commit;
 `expectedHeadOid` rejects a race if main moved after the checked revision.
 The app token also allows normal push CI to run for the version commit.
 
-Configure Pages to use GitHub Actions. Documentation deployment uses the reusable
-Pages workflow with `contents: read`, `pages: write` and `id-token: write`.
+Configure Pages to use GitHub Actions. Documentation builds and publishes in the
+final `build-docs` and `deploy-docs` jobs of `.github/workflows/release.yml`.
+The build job has `contents: read` and `pages: read`; only the deploy job receives
+`pages: write` and `id-token: write`. There is no standalone Pages workflow.
 Deployment of public documentation does not change repository visibility.
 
 Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
@@ -89,7 +91,10 @@ runtime is involved.
 5. Verify that all four expected archives exist and match their checksums.
    Create or reuse the immutable annotated tag, stage the notes and all assets
    in a draft, and verify uploaded asset digests before publishing by release ID.
-6. Invoke the Pages workflow with the exact released commit SHA.
+6. Run `build-docs` after `bump` and `publish` succeed, checking out the exact
+   released commit SHA. Build and validate the site, then publish its artifact
+   through `deploy-docs`, the final release stage. These jobs are skipped if
+   release publication fails.
 
 The archives retain the `kuru-VERSION-TARGET.tar.gz` naming convention and include
 `SHA256SUMS`. [Authenticated installation](install.md#release-archives) continues
@@ -135,7 +140,10 @@ mismatched digest stops the run. Matching existing assets are retained, missing
 assets are uploaded, and publication occurs only after the draft is complete.
 A corrupted draft needs maintainer inspection; the workflow will not delete it.
 
-If publication succeeded and only Pages failed, rerun the Pages workflow with
-the released commit SHA. Do not cut another release to redeploy documentation.
+If publication succeeded and only documentation failed, rerun `build-docs` and
+`deploy-docs` on that existing Release run in the Actions UI. They reuse the
+released commit SHA. Do not dispatch a separate docs workflow or cut another
+release just to redeploy documentation. The initial site also waits for the first
+authorized release.
 The workflows themselves are implemented and tested without dispatching a live
 release during development.
