@@ -91,8 +91,10 @@ fn success(output: Output) -> String {
 fn terminal_selections_survive_restarts_picker_changes_and_failed_database_writes() {
     let sandbox = Sandbox::new();
     let output = Command::new("python3")
-        .arg("-c")
-        .arg(include_str!("fixtures/preferences_smoke.py"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/preferences_smoke.py"
+        ))
         .arg(env!("CARGO_BIN_EXE_kuru"))
         .arg(&sandbox.project)
         .arg(&sandbox.data)

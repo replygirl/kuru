@@ -51,7 +51,7 @@ pauses decoration in background panes. `KURU_REDUCED_MOTION=1` provides a static
 startup accessibility override; useful work status and elapsed seconds still
 update. Animation never changes the draft or caret.
 
-`apps/tui/src/ui.rs` maps events and input to view state and a supplied animation
+`apps/kuru-tui/src/ui.rs` maps events and input to view state and a supplied animation
 clock. `ui/render.rs` draws layout, text and controls. `ui/scene.rs` draws the four
 portraits from that state. Rendering never accesses providers or private memory.
 Transcript layout is cached until text or width changes. No dependencies were

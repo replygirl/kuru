@@ -69,11 +69,11 @@ run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
 run = [
   "cargo fmt --all -- --check",
   "taplo format --check",
-  "ruff format --check scripts apps/tui/tests/fixtures",
+  "ruff format --check scripts apps/kuru-tui/tests/fixtures",
 ]
 
 [tasks."format:fix"]
-run = ["cargo fmt --all", "taplo format", "ruff format scripts apps/tui/tests/fixtures"]
+run = ["cargo fmt --all", "taplo format", "ruff format scripts apps/kuru-tui/tests/fixtures"]
 
 [tasks.coverage]
 description = "Require at least 90% workspace line coverage, including CLI code"
@@ -83,7 +83,7 @@ run = "cargo llvm-cov --workspace --all-targets --locked --fail-under-lines 90 -
 run = [
   "shellcheck scripts/*.sh",
   "actionlint",
-  "ruff check scripts apps/tui/tests/fixtures",
+  "ruff check scripts apps/kuru-tui/tests/fixtures",
   "python3 scripts/check_repo.py",
 ]
 

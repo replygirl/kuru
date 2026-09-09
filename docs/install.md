@@ -1,6 +1,6 @@
 # Installation and updates
 
-The executable is `kuru`; the Cargo package lives at `apps/tui`. Linux and macOS
+The executable is `kuru`; the Cargo package lives at `apps/kuru-tui`. Linux and macOS
 are the initial release targets. Building from source requires Rust 1.98.1 and a
 C compiler for SQLite. Python 3.10 or newer is required for binary release
 installation and updates; running chat does not invoke Python.
@@ -17,7 +17,7 @@ cd kuru
 From the checkout:
 
 ```sh
-cargo install --path apps/tui --locked
+cargo install --path apps/kuru-tui --locked
 ```
 
 Cargo installs under `$CARGO_HOME/bin`, normally `~/.cargo/bin`. For an arbitrary

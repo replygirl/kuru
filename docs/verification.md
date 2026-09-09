@@ -1,5 +1,25 @@
 # Verification record
 
+## Hosted CI repair and portable repository layout
+
+The first hosted main run failed in the Linux terminal fixture at shutdown.
+A controlled one-second scheduling pause plus terminal resize reproduced the
+same timeout locally. Fixtures now observe the current rendered draft and idle
+state between commands and continuously drain terminal output through exit.
+A separate real-child regression checks delayed output larger than the PTY
+buffer (1 MiB) and bounded diagnostics for a stalled process.
+
+The integrated repair passes `mise run check`: **148 Rust tests**, **11 installer
+tests**, two Python PTY-driver regressions and **97.64% coverage** (6731/6894),
+with all formatting, lint, strict-spec and managed-drift checks. The three PTY
+flows retain chat, selectors, cancellation, persistence and terminal restoration.
+
+The app now lives at `apps/kuru-tui`; all runtime source is unchanged. A direct
+Cargo install from that path succeeded and the installed executable reports
+`kuru 0.1.0`. `AGENTS.md` is canonical; `CLAUDE.md` imports it. Cospec generates
+Claude Code, Codex and OpenCode integrations, with repeatable generation and no
+drift. Hosted results remain tracked by the PR and main runs in GitHub Actions.
+
 ## Private GitHub repository preparation
 
 The initial hosting preparation for [replygirl/kuru](https://github.com/replygirl/kuru)

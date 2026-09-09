@@ -55,6 +55,32 @@ hk validates format/tooling/specs before commits, the full gate before pushes,
 and conventional commit titles. Hooks are installed by mise's postinstall and
 `mise run setup`. Fix failed checks instead of bypassing hooks.
 
+## Coding assistants
+
+[AGENTS.md](../AGENTS.md) is the canonical repository instruction source.
+`CLAUDE.md` imports it using `@AGENTS.md`, so instructions are maintained once.
+Cospec generates the same change workflow for the supported assistants:
+
+| Assistant | Generated workflows |
+| --- | --- |
+| Claude Code | `.claude/commands/cospec/` and `.claude/skills/cospec-*/SKILL.md` |
+| Codex | `.agents/skills/cospec-*/SKILL.md` and `.codex/rules/cospec.rules` |
+| OpenCode | `.opencode/commands/cospec-*.md` and `.opencode/skills/cospec-*/SKILL.md` |
+
+To regenerate these integrations while preserving Kuru's existing mise/hk gate:
+
+```sh
+mise run cospec -- init --harness claude,codex,opencode --no-gate --yes
+mise run cospec:managed:check
+```
+
+Here `--no-gate` skips gate scaffolding; the existing hooks and checks remain
+configured. Later `mise run cospec -- update` detects the generated harnesses
+and refreshes their files from cospec's managed sources. Do not hand-edit them.
+Restart Claude Code, start a new Codex session, or reload the OpenCode project
+after adding workflows. Codex uses `$cospec-<skill>`; Claude Code uses
+`/cospec:<command>` and OpenCode uses `/cospec-<command>`.
+
 ## Dependency and release updates
 
 Change workspace dependency pins centrally and regenerate Cargo.lock. Change

@@ -3,8 +3,6 @@
 import fcntl
 import os
 import pty
-import re
-import select
 import sqlite3
 import struct
 import subprocess
@@ -13,6 +11,7 @@ import termios
 import time
 
 import tomllib
+from terminal_driver import Terminal
 
 BASE = [
     sys.argv[1],
@@ -39,26 +38,18 @@ def session(expected, actions, expected_error=None):
     child = subprocess.Popen(
         BASE, stdin=slave, stdout=slave, stderr=slave, env=environment
     )
-    output = bytearray()
-
-    def read_for(seconds):
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if select.select([master], [], [], 0.02)[0]:
-                try:
-                    output.extend(os.read(master, 65536))
-                except OSError:
-                    break
+    terminal = Terminal(master, child, rows=38, columns=130)
+    output = terminal.output
+    read_for = terminal.read_for
 
     try:
-        deadline = time.monotonic() + 10
-        while True:
-            read_for(0.05)
-            assert child.poll() is None, bytes(output)
-            visible = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", output).lower()
-            if all(value.encode() in visible for value in expected):
-                break
-            assert time.monotonic() < deadline, bytes(output[-10000:])
+        terminal.wait(
+            lambda: all(
+                value.encode() in terminal.screen_text().lower()
+                for value in [*expected, "enter send"]
+            ),
+            f"initial selections {expected!r}",
+        )
         if expected_error is not None:
             with sqlite3.connect(
                 os.path.join(sys.argv[3], "memory.sqlite3")
@@ -69,27 +60,32 @@ def session(expected, actions, expected_error=None):
                     BEGIN SELECT RAISE(ABORT, 'preference write rejected'); END
                 """)
         for keys, choices in actions:
-            os.write(master, keys)
+            terminal.wait_idle()
+            if keys.startswith(b"/"):
+                terminal.command(keys.decode().rstrip("\r"))
+            else:
+                os.write(master, keys[:3])  # F2/F3/F4 opens a real selector.
+                terminal.wait_text(b"Esc back")
+                terminal.close_picker(keys[3:])
             deadline = time.monotonic() + 10
             while True:
                 read_for(0.05)
                 actual = configuration()
-                # Cursor-addressed terminal diffs can omit spaces that already
-                # occupy the right cells; each word must still be rendered.
-                visible = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", output)
+                # Assert the current rendered error, not historical output.
+                visible = terminal.screen_text()
                 error_visible = expected_error is None or all(
                     word in visible for word in expected_error.split()
                 )
-                if error_visible and all(
-                    actual.get(key) == value for key, value in choices.items()
+                if (
+                    b"enter send" in visible
+                    and error_visible
+                    and all(actual.get(key) == value for key, value in choices.items())
                 ):
                     break
                 assert child.poll() is None, bytes(output)
                 assert time.monotonic() < deadline, (actual, bytes(output[-10000:]))
         os.write(master, b"/quit\r")
-        read_for(0.4)
-        child.wait(timeout=5)
-        assert child.returncode == 0, bytes(output[-10000:])
+        terminal.wait_exit()
         assert termios.tcgetattr(slave) == before
     finally:
         if expected_error is not None:

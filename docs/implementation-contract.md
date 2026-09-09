@@ -12,7 +12,7 @@ Ownership during initial development:
 - core agent: `packages/kuru-core/**` (config, framework, SQLite memory, shared types).
 - connectors agent: `packages/kuru-connectors/**` (providers, JSON-RPC, MCP, tools).
 - workflow agent: root tooling/config, scripts, CI/release, docs, cospec artifacts.
-- primary agent: `packages/kuru-runtime/**`, `apps/tui/**`, integration and final QA.
+- primary agent: `packages/kuru-runtime/**`, `apps/kuru-tui/**`, integration and final QA.
 
 All crates use workspace dependencies. Changes to public interfaces must be
 communicated before consumers are changed. No independent commits or external

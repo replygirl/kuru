@@ -60,6 +60,7 @@
     "openspec/schemas/test/schema.yaml": "sha256:d12ff6534dba5e64dd6c2f425a46915e0d0fadb969d66c4565420023e7579386",
     "openspec/schemas/test/templates/proposal.md": "sha256:933eba24f543ffa5ecfc2761c78859933b9b05ca5500333f75c006ef2c3edc53",
     "openspec/schemas/test/templates/blocking-changes.md": "sha256:1ca785485ecf0b2e8373fda2d0afbdba927442a72077d8442fb867c20507bf31",
-    "openspec/schemas/test/templates/tasks.md": "sha256:c29089bd768eb42e61245fee351226085b99f55b20182b797f2c8d4489cc71f0"
+    "openspec/schemas/test/templates/tasks.md": "sha256:c29089bd768eb42e61245fee351226085b99f55b20182b797f2c8d4489cc71f0",
+    ".codex/rules/cospec.rules": "sha256:84cace0b330751c6c6b3f9c629a1fe7a5c1b184e4d050075b39ff6a895987fe5"
   }
 }

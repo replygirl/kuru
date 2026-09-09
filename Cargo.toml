@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["apps/tui", "packages/kuru-core", "packages/kuru-connectors", "packages/kuru-runtime"]
+members = [
+  "apps/kuru-tui",
+  "packages/kuru-core",
+  "packages/kuru-connectors",
+  "packages/kuru-runtime",
+]
 
 [workspace.package]
 version = "0.1.0"
