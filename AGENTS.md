@@ -68,7 +68,8 @@ lower the threshold to make coverage pass. Test observable state and contract
 failure modes, including live subprocess/HTTP fixture interactions.
 Keep fixtures isolated, drain subprocess output, and bound waits with useful
 failure diagnostics. Verify terminal behavior with real PTYs and inspect visual
-changes at practical terminal/browser sizes. Record live and local evidence
+changes at practical terminal/browser sizes. Synchronize terminal assertions with
+completed frames. Record live and local evidence
 separately; a successful build is not evidence of a successful deployment.
 
 Use conventional commits. Never bypass hk hooks. Do not commit directly to
