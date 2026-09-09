@@ -413,7 +413,7 @@ async fn update(
 ) -> Result<()> {
     let executable = std::env::current_exe()?;
     let destination = executable.parent().context("executable has no parent")?;
-    let mut command = if let Some(source) = source {
+    if let Some(source) = source {
         ensure!(
             version.is_none() && release_base.is_none(),
             "--source cannot be combined with release options"
@@ -423,29 +423,26 @@ async fn update(
             .arg(source.join("scripts/install.sh"))
             .arg("--source")
             .env("KURU_INSTALL_DIR", destination);
-        command
+        let status = command.status().await.context("could not launch updater")?;
+        ensure!(
+            status.success(),
+            "update failed; installed executable retained"
+        );
     } else {
         let version = version
             .context("provide --version VERSION for a verified release or --source CHECKOUT")?;
-        let mut command = tokio::process::Command::new("python3");
-        command
-            .args([
-                "-c",
-                include_str!("../../../scripts/install_release.py"),
-                "--version",
-                version,
-                "--install-dir",
-            ])
-            .arg(destination);
-        if let Some(base) = release_base {
-            command.args(["--release-base", base]);
-        }
-        command
-    };
-    let status = command.status().await.context("could not launch updater")?;
-    ensure!(
-        status.success(),
-        "update failed; installed executable retained"
-    );
+        let configured_base = std::env::var("KURU_RELEASE_BASE").ok();
+        let base = release_base
+            .or(configured_base.as_deref())
+            .context("--release-base or KURU_RELEASE_BASE is required")?;
+        let path = kuru_delivery::archive::install(base, version, destination, None)
+            .await
+            .context("update failed; installed executable retained")?;
+        println!(
+            "Installed Kuru {} at {}",
+            kuru_delivery::archive::checked_version(version)?,
+            path.display()
+        );
+    }
     Ok(())
 }

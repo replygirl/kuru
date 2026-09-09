@@ -1,13 +1,12 @@
 /target/
 /dist/
-/node_modules/
+node_modules/
 /.kuru/
 .env
 .env.*
 *.db
 *.db-shm
 *.db-wal
-__pycache__/
-*.pyc
 .DS_Store
-/.ruff_cache/
+apps/kuru-docs/.vitepress/cache/
+apps/kuru-docs/.vitepress/dist/

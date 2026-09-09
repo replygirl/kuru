@@ -5,12 +5,12 @@ hooks {
     fix = false
     steps {
       ["format"] {
-        glob = List("**/*.rs", "**/*.toml")
+        glob = List("**/*.rs", "**/*.toml", "apps/kuru-docs/**")
         check = "mise run format:check"
         exclusive = true
       }
       ["tooling"] {
-        glob = List("scripts/**", ".github/**", "Cargo.toml", "mise.toml", "AGENTS.md", "CLAUDE.md")
+        glob = List("scripts/**", ".github/**", "apps/kuru-docs/**", "packages/kuru-delivery/**", "**/Cargo.toml", "**/mise.toml", "AGENTS.md", "CLAUDE.md")
         check = "mise run lint:tooling"
       }
       ["cospec"] {
@@ -18,7 +18,7 @@ hooks {
         check = "mise run cospec:validate"
       }
       ["cospec-managed"] {
-        glob = List("openspec/schemas/**", ".claude/**")
+        glob = List("openspec/schemas/**", ".claude/**", ".agents/**", ".codex/**", ".opencode/**")
         check = "mise run cospec:managed:check"
       }
     }

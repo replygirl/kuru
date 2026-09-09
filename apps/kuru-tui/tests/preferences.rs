@@ -86,32 +86,6 @@ fn success(output: Output) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-#[cfg(unix)]
-#[test]
-fn terminal_selections_survive_restarts_picker_changes_and_failed_database_writes() {
-    let sandbox = Sandbox::new();
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/preferences_smoke.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_kuru"))
-        .arg(&sandbox.project)
-        .arg(&sandbox.data)
-        .env("XDG_CONFIG_HOME", sandbox.root.path().join("config"))
-        .output()
-        .unwrap();
-    success(output);
-    let sessions: Vec<kuru_runtime::Session> =
-        serde_json::from_str(&sandbox.run(&["sessions"])).unwrap();
-    assert_eq!(sessions.len(), 4);
-    assert!(sessions.iter().all(|session| session.turns == 0));
-    assert_eq!(sessions[0].mode, Mode::Jungian);
-    assert_eq!(sessions[1].mode, Mode::Freudian);
-    assert_eq!(sessions[2].mode, Mode::Freudian);
-    assert_eq!(sessions[3].mode, Mode::Freudian);
-}
-
 #[tokio::test]
 async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_selections() {
     let sandbox = Sandbox::new();

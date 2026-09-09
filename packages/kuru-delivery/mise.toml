@@ -1,0 +1,43 @@
+[tools]
+"aqua:cocogitto/cocogitto" = "7.0.0"
+"github:jdx/communique" = "1.3.5"
+
+[tasks.setup]
+run = "mise install"
+
+[tasks."coverage:workspace"]
+description = "Combine all package coverage with the delivery fixture toolchain"
+dir = "{{config_root}}/../.."
+run = "cargo llvm-cov --workspace --all-targets --all-features --locked --fail-under-lines 90 --lcov --output-path target/coverage.lcov"
+
+[tasks."build"]
+run = "cargo build -p kuru-delivery --all-features --locked"
+
+[tasks."build:release"]
+run = "cargo build -p kuru-delivery --release --all-features --locked"
+
+[tasks."test"]
+run = "cargo test -p kuru-delivery --all-targets --all-features --locked"
+
+[tasks."typecheck"]
+run = "cargo check -p kuru-delivery --all-targets --all-features --locked"
+
+[tasks."lint"]
+run = "cargo clippy -p kuru-delivery --all-targets --all-features --locked -- -D warnings"
+
+[tasks.tool]
+dir = "{{config_root}}/../.."
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery --"
+
+[tasks.release]
+dir = "{{config_root}}/../.."
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-release --"
+
+[tasks."check:repo"]
+run = "mise run tool -- repo --root ."
+
+[tasks.package]
+run = "mise run tool -- package"
+
+[tasks."test:install"]
+run = "cargo test -p kuru-delivery --all-features --locked archive::tests"

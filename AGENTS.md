@@ -8,10 +8,12 @@ are computational interpretations, not clinical treatment or claims of sentience
 ## Layout and boundaries
 
 - `apps/kuru-tui`: `kuru` binary, terminal rendering and command line.
+- `apps/kuru-docs`: curated public documentation site and theme.
 - `packages/kuru-core`: framework/configuration types and SQLite storage.
 - `packages/kuru-connectors`: inference providers, tool host, MCP and outbound A2A.
 - `packages/kuru-runtime`: actor pool, peer routing, relationships, dreaming and A2A ingress.
-- `scripts`: source/release installation, packaging and repository checks.
+- `packages/kuru-delivery`: native installer, archive packaging, release and repository tooling.
+- `scripts`: small shell entrypoints for source installation and commit checks.
 - `docs`: user and contributor documentation.
 - `openspec`: cospec-managed change artifacts and durable capability specs.
 
@@ -21,11 +23,23 @@ same change. Preserve unknown model/effort capabilities returned by providers.
 Do not concatenate unrelated private part histories into prompts. Retire parts
 by archiving and preserve reversibility and role coverage.
 
+Convention priority is: (1) the apps/ and packages/ monorepo structure,
+(2) mise's native monorepo task model, (3) Rust, (4) other tools. Each app or
+package owns its mise.toml and tasks. Root tasks aggregate or forward by mise
+address; they must not grow a parallel task workspace. Cargo's root workspace
+exists for shared Rust dependency resolution and combined coverage. Other
+language manifests belong to their owning app/package only when necessary.
+VitePress's Node/npm dependencies are local to apps/kuru-docs. Do not introduce
+Python, Bun, or a root JavaScript/Python project for delivery helpers.
+
 ## Development
 
 Use `mise install`, then `mise run setup`. All routine commands run through mise:
 `build`, `build:release`, `run`, `format:fix`, `format:check`, `lint`, `test`,
 `typecheck`, `coverage`, `test:install`, `lint:tooling`, and `check`.
+Use `docs:dev`, `docs:build`, `docs:preview` and `docs:check` for the docs site.
+Documentation builds and link/content checks are part of `check`; keep private
+verification records and local evidence outside the published app directory.
 Run `mise run check` before a commit. It includes meaningful behavioral tests
 and a 90% workspace line coverage gate. Do not exclude application modules or
 lower the threshold to make coverage pass. Test observable state and contract

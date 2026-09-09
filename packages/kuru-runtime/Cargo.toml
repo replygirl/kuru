@@ -9,8 +9,8 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 futures.workspace = true
-kuru-core = { path = "../kuru-core" }
-kuru-connectors = { path = "../kuru-connectors" }
+kuru-core.workspace = true
+kuru-connectors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

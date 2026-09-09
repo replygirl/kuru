@@ -1,0 +1,53 @@
+[package]
+name = "kuru-delivery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Kuru installation, packaging and maintainer tooling"
+
+[features]
+default = []
+tooling = [
+  "dep:clap",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:toml",
+  "dep:scraper",
+  "dep:roxmltree",
+  "dep:base64",
+]
+
+[[bin]]
+name = "kuru-delivery"
+path = "src/main.rs"
+required-features = ["tooling"]
+
+[[bin]]
+name = "kuru-release"
+path = "src/bin/kuru-release.rs"
+required-features = ["tooling"]
+
+[dependencies]
+anyhow.workspace = true
+base64 = { workspace = true, optional = true }
+sha2.workspace = true
+tar.workspace = true
+flate2.workspace = true
+tempfile.workspace = true
+url.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+clap = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+scraper = { workspace = true, optional = true }
+roxmltree = { workspace = true, optional = true }
+
+[dev-dependencies]
+axum.workspace = true
+
+[lints]
+workspace = true

@@ -1,5 +1,33 @@
 # Verification record
 
+## Native delivery and public documentation (2026-09-09)
+
+The complete package-owned mise gate passes **205 Rust tests** and **97.55%
+line coverage** (8435/8647), including the CLI and native delivery tooling.
+The 90% threshold remains unchanged. Rust replaces every Python installer,
+validator and PTY/protocol fixture; Node/npm stays local to the VitePress app.
+The source installer built and executed kuru 0.1.0 from an isolated destination,
+and the installed demo provider completed an offline conversation.
+
+The release suite uses actual Cocogitto and Communiqué binaries with disposable
+Git histories and local HTTP fixtures. It verifies scoped version stamping,
+signed-commit payloads, immutable tags, incomplete-draft recovery, checksum
+rejections, factual fixture notes and preserved reviewed output. No live release
+or tag was created. The release app's actual permissions and scoped repository
+access were verified; it bypasses only the PR/check ruleset.
+
+Standalone cospec's duplicated embedded entrypoint required a narrowly scoped
+compatibility preload. Tests verify a single JSON response and preserved clear,
+hard, soft and missing-artifact gates, including a checkout path with spaces.
+No external Bun or OpenSpec installation is required.
+
+The docs production build passes native link, anchor, sitemap and public-content
+checks. Chrome verification at 1440px and 390px covers light/dark, four framework
+portraits, keyboard activation, motion preferences, local search, deep reloads
+and mobile navigation. Seven screenshots were inspected; no overflow, clipping,
+page errors or missing resources remained. Hosted delivery evidence is recorded
+in the corresponding change ledgers and GitHub Actions runs.
+
 ## Hosted CI repair and portable repository layout
 
 The first hosted main run failed in the Linux terminal fixture at shutdown.

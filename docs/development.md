@@ -4,9 +4,27 @@ Install pinned tooling with `mise install`, then run `mise run setup`. Rust 1.98
 is declared in both mise and rust-toolchain.toml. Cargo.lock pins runtime
 transitives. The [dependency audit](dependencies.md) records latest stable
 versions and the exact upstream constraints on transitive updates. mise.lock contains platform-specific tool URLs and checksums.
-Bun's lockfile pins the development-only OpenSpec dependency used by cospec.
-This local dependency avoids a JSON-output defect observed in the standalone
-cospec embedded OpenSpec bundle; no reference checkout is required.
+Cospec is a standalone executable with embedded OpenSpec. Its validate/apply
+JSON and managed-file checks run without a project OpenSpec dependency. The
+pinned 0.7.0 release bundles two OpenSpec entrypoint calls into one file, causing
+duplicate execution. The cospec mise task scopes a small
+[compatibility preload](../packages/kuru-delivery/support/cospec-preload.cjs) to
+that exact bundle hash using cospec's own runtime. It preserves command arguments
+and the original gate; native integration tests prove clear, hard-blocked,
+soft-blocked and missing-artifact outcomes. Remove the preload after an upstream
+release fixes vendoring and passes those standalone tests.
+
+The architecture follows this order: apps/ and packages/ ownership, mise
+monorepo tasks, Rust, then other tools. Every app/package owns a mise.toml;
+root aliases use `//path:task` addresses. For example,
+`mise run //apps/kuru-tui:test` works from any directory, and `mise run test`
+inside that app runs its tests. Cargo's workspace shares dependency resolution
+and a single coverage report. It does not replace mise task ownership.
+
+Installation, packaging, release orchestration and repository checks live in
+the Rust package `packages/kuru-delivery`. No Python or Bun is needed. The
+VitePress docs app owns its Node pin, package.json and npm lockfile under
+`apps/kuru-docs`; its mise tasks invoke the installed tools directly.
 
 ## Commands
 
@@ -21,6 +39,9 @@ cospec embedded OpenSpec bundle; no reference checkout is required.
 | `mise run coverage` | Workspace LLVM line coverage, minimum 90% |
 | `mise run test:install` | Real archive/install and rejection tests |
 | `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
+| `mise run docs:dev` | Local VitePress server |
+| `mise run docs:check` | Production docs, local links, anchors and public content boundary |
+| `mise run release:version` | Conventional-commit version calculation without publication |
 | `mise run cospec:validate` | Strict validation of changes and durable specs |
 | `mise run cospec:managed:check` | Generated cospec-file drift |
 | `mise run check` | Complete required gate |
@@ -88,11 +109,14 @@ tool pins with the matching four-platform lock refresh:
 
 ```sh
 mise lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64
+mise -C apps/kuru-docs lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64
+mise -C packages/kuru-delivery lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64
 ```
 
 Commit the updated lockfile in the same change. CI detects lock drift. Update
 user documentation when flags, configuration, role behavior or contracts change.
-[Installation and updates](install.md) describes the tagged release workflow.
+[Release operations](release.md) describes manual dispatch, automatic versioning
+and publication; [installation and updates](install.md) covers using releases.
 
 ## Tests without credentials
 

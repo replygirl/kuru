@@ -1,6 +1,6 @@
 # Dependency audit
 
-Latest stable releases were checked on 2026-09-09 against the official crates.io sparse registry, npm registry, upstream GitHub releases and mise release metadata. Direct dependencies are exactly pinned; lockfiles resolve their compatible transitive dependencies. Prereleases are excluded.
+Releases were checked on 2026-09-09 against the official crates.io sparse registry, npm registry, upstream GitHub releases and mise release metadata. Direct dependencies are exactly pinned; lockfiles resolve their compatible transitive dependencies. Rust dependencies use stable releases. The docs app follows cospec's VitePress 2 preview architecture and pins the latest available alpha explicitly.
 
 ## Rust dependencies
 
@@ -28,26 +28,37 @@ Latest stable releases were checked on 2026-09-09 against the official crates.io
 | `cap-std` | `4.0.3` | [sparse index](https://index.crates.io/ca/p-/cap-std) |
 | `cap-fs-ext` | `4.0.3` | [sparse index](https://index.crates.io/ca/p-/cap-fs-ext) |
 | `nix` | `0.31.3` | [sparse index](https://index.crates.io/3/n/nix) |
+| `base64` | `0.23.1` | [sparse index](https://index.crates.io/ba/se/base64) |
+| `rustix` | `1.1.4` | [sparse index](https://index.crates.io/ru/st/rustix) |
+| `vt100` | `0.16.2` | [sparse index](https://index.crates.io/vt/10/vt100) |
+| `tar` | `0.4.46` | [sparse index](https://index.crates.io/3/t/tar) |
+| `flate2` | `1.1.10` | [sparse index](https://index.crates.io/fl/at/flate2) |
+| `scraper` | `0.27.0` | [sparse index](https://index.crates.io/sc/ra/scraper) |
+| `roxmltree` | `0.21.1` | [sparse index](https://index.crates.io/ro/xm/roxmltree) |
 
 ## Development tools
 
 | Tool | Stable pin |
 | --- | --- |
 | `rust` | `1.98.1` |
-| `bun` | `1.4.2` |
 | Codex (optional live-provider transport) | `0.153.4` |
-| `python` | `3.14.7` |
 | `github:aligned-team/cospec` | `0.7.0` |
 | `aqua:jdx/hk` | `1.58.1` |
 | `aqua:tamasfe/taplo` | `0.10.0` |
 | `aqua:koalaman/shellcheck` | `0.11.0` |
 | `aqua:rhysd/actionlint` | `1.7.12` |
-| `aqua:astral-sh/ruff` | `0.16.6` |
 | `cargo:cargo-llvm-cov` | `0.9.1` |
-| `@fission-ai/openspec` | `1.12.0` |
+| Node (docs app only) | `26.8.2` |
+| npm (bundled with Node) | `11.19.1` |
+| VitePress (docs app) | `2.0.0-alpha.20` |
+| `vitepress-plugin-llms` (docs app) | `1.13.5` |
+| `oxfmt` (docs app) | `0.67.0` |
+| `oxlint` (docs app) | `1.82.0` |
+| Cocogitto (delivery package) | `7.0.0` |
+| Communiqué (delivery package) | `1.3.5` |
 | CI mise | `2026.9.3` |
 
-Cospec is `0.7.0`, confirmed by both [GitHub releases](https://github.com/aligned-team/cospec/releases/tag/v0.7.0) and [npm](https://www.npmjs.com/package/@aligned-team/cospec). The mise latest endpoint returned an older release during the audit; it was not used to downgrade the verified newer release. OpenSpec is installed locally as the cospec wrapper dependency. Its latest 1.x API is validated by Kuru’s cospec gates.
+Cospec is `0.7.0`, confirmed by both [GitHub releases](https://github.com/aligned-team/cospec/releases/tag/v0.7.0) and [npm](https://www.npmjs.com/package/@aligned-team/cospec). The mise latest endpoint returned an older release during the audit; it was not used to downgrade the verified newer release. Its standalone executable embeds its supported OpenSpec version. No project OpenSpec, Bun or Python dependency is required.
 
 ## CI actions
 

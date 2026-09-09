@@ -404,7 +404,7 @@ impl Sse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{HttpFixture, Reply, Script};
+    use crate::test_support::{HttpFixture, Reply, StdioFixture, Step};
 
     fn http_config(url: &str) -> BTreeMap<String, McpConfig> {
         [(
@@ -457,23 +457,27 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_discovery_preserves_server_state_and_sequential_concurrency() {
-        let script = Script::new(
-            r#"
-import json,sys
-ready=False; count=0
-for line in sys.stdin:
- q=json.loads(line); m=q['method']; p=q.get('params',{})
- if m=='initialize': r={'protocolVersion':'2025-06-18','capabilities':{'tools':{}}}
- elif m=='notifications/initialized': ready=True; continue
- elif m=='tools/list':
-  assert ready
-  r={'tools':[{'name':'counter','inputSchema':{'type':'object'}}]}
- elif m=='tools/call':
-  assert ready and p['name']=='counter'
-  count+=1; r={'content':[{'type':'text','text':str(count)}]}
- print(json.dumps({'jsonrpc':'2.0','id':q['id'],'result':r}),flush=True)
-"#,
-        );
+        let counter = json!({"tools":[{"name":"counter","inputSchema":{"type":"object"}}]});
+        let script = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":counter})),
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"1"}]}}),
+            ),
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"2"}]}}),
+            ),
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":5,"result":counter})),
+            Step::Eof,
+        ]);
         let root = tempfile::tempdir().unwrap();
         let config = [(
             "stdio".into(),
@@ -497,6 +501,25 @@ for line in sys.stdin:
         assert_eq!(two["content"][0]["text"], "2");
         assert_eq!(hosts.specs().await.unwrap()[0].name, specs[0].name);
         hosts.shutdown().await.unwrap();
+        script.assert_completed(1);
+        let requests = script.conversations().remove(0);
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "tools/call",
+                "tools/list"
+            ]
+        );
+        assert_eq!(requests[3]["params"]["name"], "counter");
+        assert_eq!(requests[4]["params"]["name"], "counter");
     }
 
     #[tokio::test]
