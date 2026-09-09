@@ -288,6 +288,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn held_writer_times_out_without_mutation_and_operations_recover_after_release() {
+        use serde_json::json;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("held-writer.sqlite3");
+        let store = MemoryStore::open(&path).unwrap();
+        store.append("peer", "user", "retained").unwrap();
+        store.append("other", "user", "untouched").unwrap();
+        store.put("single", &json!("old-single")).unwrap();
+        store.put("batch", &json!("old-batch")).unwrap();
+
+        // Only this isolated test connection uses a short deadline. Hold the
+        // competing writer throughout every attempted application operation.
+        let timeout = Duration::from_millis(25);
+        store.lock().unwrap().busy_timeout(timeout).unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let batch = [
+            ("batch".into(), json!("new-batch")),
+            ("created".into(), json!("new-state")),
+        ];
+        for operation in ["append", "put", "put_many", "clear"] {
+            let started = Instant::now();
+            let error = match operation {
+                "append" => store.append("peer", "assistant", "added-once"),
+                "put" => store.put("single", &json!("new-single")),
+                "put_many" => store.put_many(&batch),
+                _ => store.clear("peer"),
+            }
+            .unwrap_err();
+            assert!(
+                started.elapsed() >= timeout,
+                "{operation} returned before its busy wait budget elapsed: {error:#}"
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<rusqlite::Error>()
+                    .unwrap()
+                    .sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy),
+                "{operation} must report the competing writer"
+            );
+            assert!(store.lock().unwrap().is_autocommit());
+            assert_eq!(
+                store.history("peer", 10).unwrap(),
+                [Message {
+                    role: "user".into(),
+                    content: "retained".into()
+                }]
+            );
+            assert_eq!(store.get("single").unwrap(), Some(json!("old-single")));
+            assert_eq!(store.get("batch").unwrap(), Some(json!("old-batch")));
+            assert_eq!(store.get("created").unwrap(), None);
+        }
+
+        holder.execute_batch("ROLLBACK").unwrap();
+        store.append("peer", "assistant", "added-once").unwrap();
+        store.put("single", &json!("new-single")).unwrap();
+        store.put_many(&batch).unwrap();
+        assert_eq!(
+            store.history("peer", 10).unwrap(),
+            [
+                Message {
+                    role: "user".into(),
+                    content: "retained".into()
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: "added-once".into()
+                }
+            ]
+        );
+        store.clear("peer").unwrap();
+        drop(store);
+        drop(holder);
+
+        let reopened = MemoryStore::open(&path).unwrap();
+        assert!(reopened.history("peer", 10).unwrap().is_empty());
+        assert_eq!(
+            reopened.history("other", 10).unwrap(),
+            [Message {
+                role: "user".into(),
+                content: "untouched".into()
+            }]
+        );
+        assert_eq!(reopened.get("single").unwrap(), Some(json!("new-single")));
+        assert_eq!(reopened.get("batch").unwrap(), Some(json!("new-batch")));
+        assert_eq!(reopened.get("created").unwrap(), Some(json!("new-state")));
+    }
+
+    #[test]
     fn wal_transition_waits_for_reserved_lock_and_preserves_data() {
         use std::sync::mpsc::{self, RecvTimeoutError};
 

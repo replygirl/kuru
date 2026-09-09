@@ -32,6 +32,11 @@ runtime, not a model acting as a permanent supervisor. Frameworks are switchable
 profiles; provider, authentication and protocol additions belong behind their
 existing boundaries.
 
+Dolt is the chosen next storage backend, in a separate PR after the initial
+release and before production adoption. That transition includes versioned memory
+updates and dreaming history, installation, and migration of development data.
+The current implementation still uses SQLite until that follow-up lands.
+
 Convention priority is: (1) the apps/ and packages/ monorepo structure,
 (2) mise's native monorepo task model, (3) Rust, (4) other tools. Each app or
 package owns its mise.toml and tasks. Root tasks aggregate or forward by mise

@@ -290,16 +290,30 @@ fn independent_handles_coordinate_durable_writes() {
     let path = dir.path().join("memory.sqlite3");
     let first = MemoryStore::open(&path).unwrap();
     let second = MemoryStore::open(&path).unwrap();
-    let worker = thread::spawn(move || {
-        for i in 0..40 {
-            second.append("peer", "second", &i.to_string()).unwrap();
-        }
-    });
     for i in 0..40 {
-        first.append("peer", "first", &i.to_string()).unwrap();
+        // Contend in pairs: SQLite bounds waiting but does not promise fairness
+        // between successive transactions from a producer that keeps writing.
+        let ready = Barrier::new(2);
+        let (first_result, second_result) = thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                ready.wait();
+                second.append("peer", "second", &i.to_string())
+            });
+            ready.wait();
+            let first_result = first.append("peer", "first", &i.to_string());
+            // Join before asserting either outcome so a failed write cannot
+            // strand its peer at a barrier for a later round.
+            (first_result, worker.join())
+        });
+        first_result.unwrap_or_else(|error| panic!("first writer failed in round {i}: {error:#}"));
+        second_result
+            .unwrap()
+            .unwrap_or_else(|error| panic!("second writer failed in round {i}: {error:#}"));
     }
-    worker.join().unwrap();
-    let history = first.history("peer", 100).unwrap();
+    drop(first);
+    drop(second);
+    let reopened = MemoryStore::open(&path).unwrap();
+    let history = reopened.history("peer", 100).unwrap();
     assert_eq!(history.len(), 80);
     assert_eq!(
         history
@@ -309,6 +323,14 @@ fn independent_handles_coordinate_durable_writes() {
             .len(),
         80
     );
+    for role in ["first", "second"] {
+        let contents: Vec<_> = history
+            .iter()
+            .filter(|message| message.role == role)
+            .map(|message| message.content.parse::<usize>().unwrap())
+            .collect();
+        assert_eq!(contents, (0..40).collect::<Vec<_>>());
+    }
 }
 
 #[test]
