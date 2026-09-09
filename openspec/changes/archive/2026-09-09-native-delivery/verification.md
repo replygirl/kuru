@@ -8,4 +8,4 @@
 ## 2. Delivery
 
 - [x] 2.1 @integration (agent) Run the complete gate -> mise run check exited 0 on 2026-09-09: 209 Rust tests passed, including actual fixture tools and the discovered memory-contention regressions, with 97.51% line coverage (8554/8772). Formatting, Clippy, metadata, shell/actions, docs and cospec gates passed. No application exclusions or threshold changes were introduced.
-- [ ] 2.2 @runtime (agent) Run GitHub CI on macOS and Ubuntu -> required checks exercise the native package tasks on actual hosted runners.
+- [x] 2.2 @runtime (agent) Run GitHub CI on macOS and Ubuntu -> run 34393197392 passed on macOS 14 and Ubuntu 24.04 at commit 1076f0aa69917241a9004bc7129c0bc0775957ba, including full mise checks, source installation, artifact upload and ci-gate. The Linux updater regressions and cross-process memory initialization pass on the actual hosted runner.

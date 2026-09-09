@@ -8,4 +8,4 @@
 ## 2. Verify equivalence
 
 - [x] 2.1 Complete local behavior/security/docs/release tests and unchanged coverage gate.
-- [ ] 2.2 Inspect actual browser/terminal behavior, hosted CI and archive observed evidence before the final branch commit.
+- [x] 2.2 Inspect actual browser/terminal behavior, hosted CI and archive observed evidence before the final branch commit.

@@ -43,8 +43,10 @@ The docs production build passes native link, anchor, sitemap and public-content
 checks. Chrome verification at 1440px and 390px covers light/dark, four framework
 portraits, keyboard activation, motion preferences, local search, deep reloads
 and mobile navigation. Seven screenshots were inspected; no overflow, clipping,
-page errors or missing resources remained. Hosted delivery evidence is recorded
-in the corresponding change ledgers and GitHub Actions runs.
+page errors or missing resources remained. [Hosted CI run 34393197392](https://github.com/replygirl/kuru/actions/runs/34393197392)
+passed on macOS 14 and Ubuntu 24.04, including the full gate, source installation,
+coverage/docs artifacts and ci-gate. Detailed evidence remains in the archived
+change ledgers; Pages deployment follows the reviewed merge.
 
 ## Hosted CI repair and portable repository layout
 
