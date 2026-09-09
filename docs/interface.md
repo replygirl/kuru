@@ -1,30 +1,77 @@
 # Terminal design
 
-Kuru's interface gives the peer pool a visible identity while keeping conversation
-and composition central. Ink backgrounds and quiet borders separate surfaces;
-mint, blue, lilac, amber and rose distinguish identities and activity. Labels
-accompany color, and ordinary terminal glyphs work without a special icon font.
+Kuru gives a changing peer pool a stable visual home: a spacious wordmark, an
+open conversation canvas and a composer that holds model, effort and framework
+values beside their shortcuts. Project and session context sit in the header.
+The status line carries active work, elapsed time, cancellations, failures and
+brief saved-setting confirmations. It stays quiet on an untouched welcome screen.
 
-The welcome screen introduces the current framework and its real members. During
-a conversation, the pool shows thinking, tool use and speaking states from runtime
-events. Relationships show their members, and peer exchanges show their endpoints.
-The display never invents progress percentages or prints private peer-message
-contents. Narrow panes retain the editor and conversation with a compact pool strip.
+Ink surfaces, mint, blue, lilac, amber and rose distinguish identities and activity.
+Color always accompanies readable labels. The ornamental alphabet is ordinary
+ASCII; node and control symbols use standard terminal glyphs without an icon font.
+
+## Framework portraits
+
+| Framework | Geometry | Meaningful content |
+| --- | --- | --- |
+| IFS | Broken concentric orbits | Actual parts in role clusters |
+| Polyvagal | Three layered flowing traces | Connection, mobilization, conservation |
+| Freudian | Open triangle and interference traces | Desire, reality, standards |
+| Jungian | Overlapping rosette contours | Patterns, shadow and shared memory |
+
+Names stay fixed while contours shimmer and a brief ripple responds to editing.
+Ornament does not represent sentience, inferred work or invented communication.
+Thinking, tools, speaking identities, relationship membership and message endpoints
+come from runtime events. Private peer messages and state notes stay out of the
+activity feed. Numbered nodes map to the adjacent roster in compact sidebars.
+
+The welcome scene uses the full canvas. During conversation, wide panes show a
+smaller scene and the live roster alongside messages; narrow panes preserve chat,
+status and composition. The editor expands for wrapped or multiline drafts, then
+scrolls while preserving the caret. Model, effort and framework controls wrap into
+two or three rows as needed. Very small terminals retain the editable draft.
+
+Pickers filter by typing or paste, mark the current value and scroll the selection
+into view. The framework picker previews geometry before committing a change;
+previews of other modes show their built-in members and are labeled as previews.
+No-match results remain editable. Settings cannot change halfway through active
+work; the status line explains that constraint without losing the draft.
 
 Conversation styling distinguishes speakers, headings, quotations, bullets, code
 fences, inline code and bold text. This is a small terminal presentation layer,
-not a full Markdown engine. Selectors highlight both the current option and the
-keyboard selection. All earlier keyboard controls remain available.
+not a full Markdown engine.
 
-Motion is limited to visual accents, activity indicators and a four-second welcome
-sequence. Animation uses an 80ms frame clock, with redraws driven by changes when
-settled. F6 toggles reduced motion; `KURU_REDUCED_MOTION=1` starts with it enabled.
-This option changes presentation only.
+## Motion and rendering
 
-The implementation stays inside `apps/tui`: `ui.rs` maps runtime events and input
-to view state, while `ui/render.rs` renders that state without accessing providers,
-memories or clocks. No new dependencies are needed for the visual system.
+Motion stays on by default: ambient frames are capped at 4 FPS, interaction and
+work at 12.5 FPS. A typing pulse decays over 1.1 seconds. Terminal focus reporting
+pauses decoration in background panes. `KURU_REDUCED_MOTION=1` provides a static
+startup accessibility override; useful work status and elapsed seconds still
+update. Animation never changes the draft or caret.
 
-Design references include OMP's [semantic theme colors](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/theme/schema.ts)
-and [bounded animated loader](https://github.com/can1357/oh-my-pi/blob/main/packages/tui/src/components/loader.ts).
-Kuru's palette and peer presentation are its own implementation.
+`apps/tui/src/ui.rs` maps events and input to view state and a supplied animation
+clock. `ui/render.rs` draws layout, text and controls. `ui/scene.rs` draws the four
+portraits from that state. Rendering never accesses providers or private memory.
+Transcript layout is cached until text or width changes. No dependencies were
+added for this presentation system.
+
+## References and review
+
+OMP's [semantic theme colors](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/modes/theme/schema.ts),
+[animated loader](https://github.com/can1357/oh-my-pi/blob/main/packages/tui/src/components/loader.ts)
+and [status line](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/tui/status-line.ts)
+informed the use of semantic accents and small purposeful motion.
+[OpenCode](https://github.com/anomalyco/opencode) and
+[Crush](https://github.com/charmbracelet/crush) informed the study of open terminal
+layouts and a stronger wordmark. Kuru's portraits and palette are original code.
+
+Export actual rendered terminal cells with:
+
+```sh
+KURU_VISUAL_ARTIFACTS=/tmp/kuru-visual mise exec -- cargo test -p kuru --test visual --locked
+mise exec -- cargo test -p kuru --test visual --locked frame_cost_profile -- --ignored --nocapture
+```
+
+The first command writes HTML and text review artifacts. The second explicitly
+runs the machine-dependent frame-cost profile, excluded from timing assertions
+in normal tests. See [the verification record](verification.md) for measurements.

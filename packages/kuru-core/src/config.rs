@@ -23,6 +23,76 @@ pub struct McpConfig {
     pub env: BTreeMap<String, String>,
 }
 
+/// Interactive choices belong to the canonical project, independent of chats
+/// and framework memory. Absence of a provider entry means no remembered choice;
+/// an entry whose effort is None explicitly requests the provider's default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectPreferences {
+    pub mode: Option<Mode>,
+    pub providers: BTreeMap<String, ModelPreference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPreference {
+    pub model: String,
+    pub effort: Option<String>,
+}
+
+/// Explicit invocation selections are applied before semantic validation, so a
+/// temporary framework override is checked against that framework's part count.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SelectionOverrides<'a> {
+    pub mode: Option<Mode>,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+}
+
+impl ProjectPreferences {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.providers.len() <= 64,
+            "too many saved provider choices"
+        );
+        for (provider, choice) in &self.providers {
+            alias("saved provider", provider)?;
+            nonempty("saved model", &choice.model, 256)?;
+            if let Some(effort) = &choice.effort {
+                nonempty("saved effort", effort, 128)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn overlay(
+        &self,
+        merged: &mut toml::Value,
+        provider: &str,
+        explicit_model: Option<&str>,
+    ) -> Result<()> {
+        self.validate()?;
+        if let Some(mode) = self.mode {
+            merged["mode"] = toml::Value::try_from(mode)?;
+        }
+        if let Some(choice) = self.providers.get(provider)
+            && explicit_model.is_none_or(|model| model == choice.model)
+        {
+            merged["model"] = choice.model.clone().into();
+            let table = merged
+                .as_table_mut()
+                .context("configuration is not a table")?;
+            if let Some(effort) = &choice.effort {
+                table.insert("effort".into(), effort.clone().into());
+            } else {
+                table.remove("effort");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -77,6 +147,26 @@ impl Config {
     /// path must exist. Maps merge recursively and arrays replace. Each layer is
     /// checked for unknown keys and field types; semantic checks run after merging.
     pub fn load(user: Option<&Path>, project: &Path, local: Option<&Path>) -> Result<Self> {
+        Self::load_with_preferences(
+            user,
+            project,
+            local,
+            &ProjectPreferences::default(),
+            SelectionOverrides::default(),
+        )
+    }
+
+    /// Remembered interactive choices override ordinary file defaults. An
+    /// explicit local file and CLI model/provider selection remain authoritative.
+    /// When an invocation changes model, it does not inherit another model's
+    /// remembered effort; its own file settings or provider default apply.
+    pub fn load_with_preferences(
+        user: Option<&Path>,
+        project: &Path,
+        local: Option<&Path>,
+        preferences: &ProjectPreferences,
+        overrides: SelectionOverrides<'_>,
+    ) -> Result<Self> {
         let ancestors = ancestor_directories(project)?;
         let mut layers = Vec::new();
         if let Some(path) = user {
@@ -87,9 +177,6 @@ impl Config {
                 .into_iter()
                 .map(|path| (path.join(".kuru/config.toml"), false)),
         );
-        if let Some(path) = local {
-            layers.push((path.to_path_buf(), true));
-        }
         let mut merged = toml::Value::try_from(Self::default())?;
         let mut total_bytes = 0;
         for (path, required) in layers {
@@ -111,7 +198,51 @@ impl Config {
                 .try_into()
                 .with_context(|| format!("invalid configuration in {}", path.display()))?;
         }
-        let config: Self = merged.try_into()?;
+        let local_patch = if let Some(path) = local {
+            let source = read_bounded(path, true)?.context("explicit configuration is missing")?;
+            total_bytes += source.len();
+            ensure!(
+                total_bytes <= MAX_COMBINED_BYTES,
+                "combined configuration exceeds 1 MiB"
+            );
+            Some(
+                toml::from_str::<toml::Value>(&source)
+                    .with_context(|| format!("cannot parse configuration {}", path.display()))?,
+            )
+        } else {
+            None
+        };
+        let provider = overrides
+            .provider
+            .or_else(|| local_patch.as_ref()?.get("provider")?.as_str())
+            .or_else(|| merged.get("provider")?.as_str())
+            .context("provider must be a string")?
+            .to_owned();
+        let explicit_model = overrides
+            .model
+            .or_else(|| local_patch.as_ref()?.get("model")?.as_str());
+        preferences.overlay(&mut merged, &provider, explicit_model)?;
+        if let Some(patch) = local_patch {
+            merge(&mut merged, patch);
+        }
+        let mut config: Self = merged.try_into().with_context(|| {
+            local.map_or_else(
+                || "invalid effective configuration".into(),
+                |path| format!("invalid configuration in {}", path.display()),
+            )
+        })?;
+        if let Some(mode) = overrides.mode {
+            config.mode = mode;
+        }
+        if let Some(provider) = overrides.provider {
+            config.provider = provider.into();
+        }
+        if let Some(model) = overrides.model {
+            config.model = model.into();
+        }
+        if let Some(effort) = overrides.effort {
+            config.effort = Some(effort.into());
+        }
         config.validate()?;
         Ok(config)
     }

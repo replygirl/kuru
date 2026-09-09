@@ -12,7 +12,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{Picker, View, editor_layout};
+use super::{Picker, View, editor_layout, scene};
 
 const INK: Color = Color::Rgb(15, 19, 30);
 const SURFACE: Color = Color::Rgb(21, 27, 42);
@@ -134,39 +134,50 @@ pub fn draw(frame: &mut Frame<'_>, view: &View) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    if area.height < 5 || area.width < 8 {
+    if area.height < 7 || area.width < 14 {
         draw_tiny(frame, view, area);
         return;
     }
-    let header_height = if area.height >= 14 { 3 } else { 1 };
-    let composer_height = if area.height >= 16 { 5 } else { 3 };
+    let control_rows = if area.width >= 72 {
+        1
+    } else if area.width >= 38 {
+        2
+    } else {
+        3
+    };
+    let input_rows = editor_layout(
+        &view.input,
+        view.cursor,
+        usize::from(area.width.saturating_sub(6)).max(1),
+    )
+    .0
+    .len()
+    .clamp(2, 5) as u16;
+    let dock_height = (input_rows + control_rows + 2).min(area.height.saturating_sub(3));
     let rows = Layout::vertical([
-        Constraint::Length(header_height),
+        Constraint::Length(if area.height >= 16 { 2 } else { 1 }),
         Constraint::Min(0),
-        Constraint::Length(composer_height),
+        Constraint::Length(1),
+        Constraint::Length(dock_height),
         Constraint::Length(1),
     ])
     .split(area);
     draw_header(frame, view, rows[0]);
-    let show_sidebar = area.width >= 96 && rows[1].height >= 12;
-    let columns = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(if show_sidebar { 34 } else { 0 }),
-    ])
-    .split(rows[1]);
-    if show_sidebar {
+    let welcome = view.show_scene && view.transcript.is_empty();
+    let sidebar = !welcome && area.width >= 108 && rows[1].height >= 17;
+    if welcome {
+        draw_welcome(frame, view, rows[1]);
+    } else if sidebar {
+        let columns =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(34)]).split(rows[1]);
         draw_conversation(frame, view, columns[0]);
         draw_sidebar(frame, view, columns[1]);
-    } else if rows[1].height >= 12 && !view.parts.is_empty() {
-        let compact =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(columns[0]);
-        draw_conversation(frame, view, compact[0]);
-        draw_peer_strip(frame, view, compact[1]);
     } else {
-        draw_conversation(frame, view, columns[0]);
+        draw_conversation(frame, view, rows[1]);
     }
-    draw_composer(frame, view, rows[2]);
-    draw_footer(frame, view, rows[3]);
+    draw_status(frame, view, rows[2]);
+    draw_composer(frame, view, rows[3]);
+    draw_footer(frame, view, rows[4]);
     if view.picker.is_some() {
         draw_picker(frame, view, area);
     }
@@ -186,50 +197,29 @@ fn draw_tiny(frame: &mut Frame<'_>, view: &View, area: Rect) {
 }
 
 fn draw_header(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    let mut spans = vec![Span::raw(" ")];
+    let mut spans = vec![Span::raw("  ")];
     spans.extend(
         "KURU"
             .chars()
             .enumerate()
-            .map(|(index, character)| Span::styled(character.to_string(), bold(PALETTE[index]))),
+            .map(|(i, c)| Span::styled(c.to_string(), bold(PALETTE[i]))),
     );
     spans.push(Span::styled("  /  ", style(EDGE)));
-    spans.push(Span::styled(view.mode.to_uppercase(), bold(LILAC)));
-    if area.width >= 48 {
-        spans.push(Span::styled("   ", style(MUTED)));
-        spans.push(Span::styled(
-            clipped(&view.model, usize::from(area.width.saturating_sub(36))),
-            style(TEXT),
-        ));
-        spans.push(Span::styled(format!("  {}", view.effort), style(AMBER)));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    if area.height >= 3 {
-        let hint = if view.transcript.is_empty() {
-            "A native pool of persistent peers"
-        } else {
-            "A shared conversation · independent memories"
-        };
-        frame.render_widget(
-            Paragraph::new(format!(" {hint}")).style(style(MUTED)),
-            Rect::new(area.x, area.y + 1, area.width, 1),
+    spans.push(Span::styled(
+        clipped(&view.project, usize::from(area.width.saturating_sub(38))),
+        style(MUTED),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    if area.width >= 62 {
+        let label = format!(
+            "{}  ·  {} turns  ",
+            view.session.chars().take(8).collect::<String>(),
+            view.turns
         );
-        let shift = if view.busy { phase(view) / 2 } else { 0 };
-        let line = Line::from(
-            (0..area.width)
-                .map(|x| {
-                    let index = (usize::from(x) * PALETTE.len() / usize::from(area.width) + shift)
-                        % PALETTE.len();
-                    Span::styled("━", style(PALETTE[index]))
-                })
-                .collect::<Vec<_>>(),
-        );
+        let width = label.width() as u16;
         frame.render_widget(
-            Paragraph::new(line),
-            Rect::new(area.x, area.y + 2, area.width, 1),
+            Paragraph::new(label).style(style(MUTED)),
+            Rect::new(area.right().saturating_sub(width), area.y, width, 1),
         );
     }
 }
@@ -238,25 +228,7 @@ fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let title = Line::from(vec![
-        Span::styled(" Conversation ", bold(TEXT)),
-        Span::styled(
-            if view.busy {
-                format!(" {} working ", spinner(view))
-            } else {
-                " ● ready ".into()
-            },
-            style(if view.busy { AMBER } else { MINT }),
-        ),
-    ]);
-    let block = panel(title, TEXT);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if view.transcript.is_empty() {
-        draw_welcome(frame, view, inner);
-        return;
-    }
-    let content = inset(inner, u16::from(inner.width >= 12), 0);
+    let content = inset(area, u16::from(area.width >= 12) * 2, 1);
     TRANSCRIPT.with_borrow_mut(|cache| {
         if cache.width != content.width || cache.source != view.transcript {
             cache.lines = wrap_lines(conversation_lines(view), usize::from(content.width.max(1)));
@@ -290,7 +262,8 @@ fn conversation_lines(view: &View) -> Vec<Line<'static>> {
     for (speaker, body) in &view.transcript {
         let color = match speaker.as_str() {
             "user" => BLUE,
-            "system" => AMBER,
+            "system" | "help" => AMBER,
+            "error" => ROSE,
             _ => identity_color(speaker),
         };
         let label = if speaker == "user" { "you" } else { speaker };
@@ -432,17 +405,18 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
 }
 
 fn draw_welcome(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    if area.height == 0 || area.width == 0 {
+    if area.width == 0 || area.height == 0 {
         return;
     }
-    // Keep the introduction together even in a very tall terminal pane.
-    let area = Rect::new(
+    let identity = scene::identity(&view.mode);
+    let tall = area.height >= 23 && area.width >= 46;
+    let total = area.height.min(if tall { 31 } else { 17 });
+    let body = Rect::new(
         area.x,
-        area.y + area.height.saturating_sub(32) / 2,
+        area.y + area.height.saturating_sub(total) / 2,
         area.width,
-        area.height.min(32),
+        total,
     );
-    let large = area.width >= 43 && area.height >= 13;
     let wordmark = [
         "██  ██  ██    ██  ██████   ██    ██",
         "██ ██   ██    ██  ██   ██  ██    ██",
@@ -450,19 +424,24 @@ fn draw_welcome(frame: &mut Frame<'_>, view: &View, area: Rect) {
         "██ ██   ██    ██  ██   ██  ██    ██",
         "██  ██   ██████   ██   ██   ██████ ",
     ];
-    let mut lines = vec![Line::default()];
-    if large {
-        let shift = phase(view) / 4;
+    let mut lines = vec![];
+    if tall {
         for line in wordmark {
             lines.push(
                 Line::from(
                     line.chars()
                         .enumerate()
-                        .map(|(index, character)| {
-                            Span::styled(
-                                character.to_string(),
-                                bold(PALETTE[(index / 7 + shift) % PALETTE.len()]),
-                            )
+                        .map(|(index, c)| {
+                            let color = if index < 7 {
+                                MINT
+                            } else if index < 17 {
+                                BLUE
+                            } else if index < 26 {
+                                LILAC
+                            } else {
+                                AMBER
+                            };
+                            Span::styled(c.to_string(), bold(color))
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -470,240 +449,58 @@ fn draw_welcome(frame: &mut Frame<'_>, view: &View, area: Rect) {
             );
         }
         lines.push(Line::default());
-    } else {
-        lines.push(
-            Line::from(Span::styled("Many voices. One conversation.", bold(MINT)))
-                .alignment(Alignment::Center),
-        );
     }
     lines.push(
-        Line::from(Span::styled(
-            if large {
-                "Many voices. One conversation."
-            } else {
-                "Your peers are ready."
-            },
-            style(TEXT),
-        ))
-        .alignment(Alignment::Center),
-    );
-    lines.push(
-        Line::from(Span::styled(
-            format!("{} · {} persistent peers", view.mode, view.parts.len()),
-            style(LILAC),
-        ))
-        .alignment(Alignment::Center),
+        Line::from(Span::styled("Many voices. One conversation.", style(TEXT)))
+            .alignment(Alignment::Center),
     );
     lines.push(Line::default());
     lines.push(
-        Line::from(Span::styled(
-            "Type a task to begin. /help opens the guide.",
-            style(MUTED),
-        ))
+        Line::from(vec![
+            Span::styled(
+                format!("{}  {}", identity.symbol, identity.title),
+                bold(identity.accent),
+            ),
+            Span::styled(format!("  /  {} parts", view.parts.len()), style(MUTED)),
+        ])
         .alignment(Alignment::Center),
     );
-    let text_height = (lines.len() as u16).min(area.height);
+    if body.width >= 48 {
+        lines.push(
+            Line::from(Span::styled(identity.description, style(MUTED)))
+                .alignment(Alignment::Center),
+        );
+    }
+    let text_height = lines.len() as u16;
     frame.render_widget(
         Paragraph::new(lines),
-        Rect::new(area.x, area.y, area.width, text_height),
+        Rect::new(body.x, body.y, body.width, text_height.min(body.height)),
     );
-    let graph_width = area.width.saturating_sub(2).min(72);
+    let width = body.width.saturating_sub(4).min(76);
     let graph = Rect::new(
-        area.x + area.width.saturating_sub(graph_width) / 2,
-        area.y + text_height,
-        graph_width,
-        area.height.saturating_sub(text_height + 1).min(16),
+        body.x + body.width.saturating_sub(width) / 2,
+        body.y + text_height.min(body.height),
+        width,
+        body.height.saturating_sub(text_height),
     );
-    if graph.height >= 9 && graph.width >= 40 && !view.parts.is_empty() {
-        draw_constellation(frame, view, graph);
-    } else if area.height >= text_height + 2 {
-        frame.render_widget(
-            Paragraph::new(
-                Line::from(vec![
-                    Span::styled("F2", bold(BLUE)),
-                    Span::styled(" model    ", style(MUTED)),
-                    Span::styled("F3", bold(AMBER)),
-                    Span::styled(" effort    ", style(MUTED)),
-                    Span::styled("F4", bold(LILAC)),
-                    Span::styled(" framework", style(MUTED)),
-                ])
-                .alignment(Alignment::Center),
-            ),
-            Rect::new(area.x, area.y + text_height + 1, area.width, 1),
-        );
-    }
-}
-
-fn draw_constellation(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    let count = view.parts.len().min(10);
-    let center_x = f64::from(area.width) / 2.0;
-    let center_y = f64::from(area.height - 2) / 2.0;
-    let compact = area.width < 40;
-    let radius_x = f64::from(area.width.saturating_sub(if compact { 8 } else { 24 })) / 2.0;
-    let radius_y = f64::from(area.height.saturating_sub(5)) / 2.0;
-    let positions = (0..count)
-        .map(|index| {
-            let angle =
-                std::f64::consts::TAU * index as f64 / count as f64 - std::f64::consts::FRAC_PI_2;
-            (
-                area.x + (center_x + radius_x * angle.cos()).round() as u16,
-                area.y + (center_y + radius_y * angle.sin()).round() as u16,
-            )
-        })
-        .collect::<Vec<_>>();
-    for relationship in &view.relationships {
-        for (index, member) in relationship.members.iter().enumerate() {
-            for other in &relationship.members[index + 1..] {
-                if let (Some(a), Some(b)) = (
-                    view.parts
-                        .iter()
-                        .take(count)
-                        .position(|(id, _)| id == member),
-                    view.parts
-                        .iter()
-                        .take(count)
-                        .position(|(id, _)| id == other),
-                ) {
-                    draw_edge(
-                        frame,
-                        positions[a],
-                        positions[b],
-                        relationship_color(relationship.kind),
-                    );
-                }
-            }
-        }
-    }
-    for (sender, recipient) in &view.routes {
-        if let (Some(a), Some(b)) = (
-            view.parts
-                .iter()
-                .take(count)
-                .position(|(id, _)| id == sender),
-            view.parts
-                .iter()
-                .take(count)
-                .position(|(id, _)| id == recipient),
-        ) {
-            draw_edge(frame, positions[a], positions[b], MINT);
-            if view.busy && view.motion {
-                let (start, end) = (positions[a], positions[b]);
-                let dx = i32::from(end.0) - i32::from(start.0);
-                let dy = i32::from(end.1) - i32::from(start.1);
-                let steps = dx.abs().max(dy.abs());
-                if steps > 1 {
-                    let step = (phase(view) % (steps as usize - 1) + 1) as i32;
-                    let x = i32::from(start.0) + dx * step / steps;
-                    let y = i32::from(start.1) + dy * step / steps;
-                    frame.render_widget(
-                        Paragraph::new("•").style(bold(MINT)),
-                        Rect::new(x as u16, y as u16, 1, 1),
-                    );
-                }
-            }
-        }
-    }
-    for (index, ((id, label), (x, y))) in view.parts.iter().zip(positions).enumerate() {
-        let color = identity_color(label);
-        let active = view
-            .part_activity
-            .get(id)
-            .is_some_and(|state| matches!(state.as_str(), "active" | "tool"));
-        let glyph = if active && view.busy {
-            spinner(view)
-        } else if id == &view.speaker_id {
-            "◆"
-        } else {
-            "●"
-        };
-        if compact {
-            frame.render_widget(
-                Paragraph::new(format!("{glyph}{}", index + 1)).style(bold(color).bg(SURFACE)),
-                Rect::new(x, y, 3, 1),
-            );
-        } else {
-            frame.render_widget(
-                Paragraph::new(glyph).style(bold(color).bg(SURFACE)),
-                Rect::new(x, y, 1, 1),
-            );
-            let name = clipped(&short_name(view, id), 13);
-            let width = name.width() as u16;
-            let left = x
-                .saturating_sub(width / 2)
-                .max(area.x)
-                .min(area.right().saturating_sub(width));
-            frame.render_widget(
-                Paragraph::new(name).style(style(color).bg(SURFACE)),
-                Rect::new(left, y + 1, width, 1),
-            );
-        }
-    }
-    frame.render_widget(
-        Paragraph::new(if compact {
-            "numbered peers · mint routes"
-        } else {
-            "independent peers · shared presence"
-        })
-        .alignment(Alignment::Center)
-        .style(style(MUTED)),
-        Rect::new(area.x, area.bottom() - 1, area.width, 1),
-    );
-}
-
-fn draw_edge(frame: &mut Frame<'_>, start: (u16, u16), end: (u16, u16), color: Color) {
-    let dx = i32::from(end.0) - i32::from(start.0);
-    let dy = i32::from(end.1) - i32::from(start.1);
-    let steps = dx.abs().max(dy.abs()).max(1);
-    for step in 1..steps {
-        let x = i32::from(start.0) + dx * step / steps;
-        let y = i32::from(start.1) + dy * step / steps;
-        frame.render_widget(
-            Paragraph::new("·").style(style(color)),
-            Rect::new(x as u16, y as u16, 1, 1),
-        );
-    }
-}
-
-fn draw_peer_strip(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    let mut spans = vec![
-        Span::styled(" ● ", style(MINT)),
-        Span::styled(format!("{} peers  ", view.parts.len()), style(MUTED)),
-    ];
-    for (index, (id, label)) in view.parts.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" · ", style(EDGE)));
-        }
-        spans.push(Span::styled(
-            short_name(view, id),
-            if id == &view.speaker_id {
-                bold(identity_color(label))
-            } else {
-                style(identity_color(label))
-            },
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    frame.render_widget(
-        Paragraph::new(" /parts explores the pool · /relate connects peers").style(style(MUTED)),
-        Rect::new(area.x, area.y + 1, area.width, 1),
-    );
+    scene::draw(frame, view, graph);
 }
 
 fn draw_sidebar(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    let block = panel(" Active parts ", MINT);
-    let mut inner = inset(block.inner(area), 1, 0);
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(style(EDGE))
+        .style(style(TEXT).bg(INK));
+    let mut inner = inset(block.inner(area), 2, 0);
     frame.render_widget(block, area);
-    let numbered = inner.height >= 30 && !view.transcript.is_empty() && !view.parts.is_empty();
+    let numbered = inner.height >= 26 && !view.parts.is_empty();
     if numbered {
-        draw_constellation(frame, view, Rect::new(inner.x, inner.y, inner.width, 10));
+        scene::draw(frame, view, Rect::new(inner.x, inner.y, inner.width, 10));
         inner = Rect::new(inner.x, inner.y + 11, inner.width, inner.height - 11);
     }
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("{} peers · equal standing", view.parts.len()),
+            format!("PARTS / {}", view.parts.len()),
             style(MUTED),
         )),
         Line::default(),
@@ -808,10 +605,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, view: &View, area: Rect) {
         lines.push(Line::from(Span::styled("Activity", bold(AMBER))));
         let available = usize::from(inner.height).saturating_sub(lines.len());
         if view.activity.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "Waiting for your next idea.",
-                style(MUTED),
-            )));
+            lines.push(Line::from(Span::styled("No activity yet.", style(MUTED))));
         } else {
             lines.extend(view.activity.iter().rev().take(available).map(|text| {
                 Line::from(Span::styled(
@@ -824,43 +618,181 @@ fn draw_sidebar(frame: &mut Frame<'_>, view: &View, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn dock_controls(view: &View, width: u16) -> Vec<Line<'static>> {
+    let identity = scene::identity(&view.mode);
+    let chip = |symbol: &str, value: String, key: &str, color: Color| {
+        vec![
+            Span::styled(format!("{symbol} "), style(color)),
+            Span::styled(value, bold(color)),
+            Span::styled(format!(" {key}  "), style(MUTED)),
+        ]
+    };
+    let effort_budget = if width >= 68 {
+        (width / 4).min(18)
+    } else if width >= 34 {
+        width.saturating_sub(identity.title.width() as u16 + 14)
+    } else {
+        width.saturating_sub(7)
+    };
+    let effort_value = clipped(&view.effort, usize::from(effort_budget));
+    let model_budget = if width >= 68 {
+        width.saturating_sub(effort_value.width() as u16 + identity.title.width() as u16 + 21)
+    } else {
+        width.saturating_sub(7)
+    };
+    let model = chip(
+        "◇",
+        clipped(&view.model, usize::from(model_budget)),
+        "F2",
+        BLUE,
+    );
+    let effort = chip("~", effort_value, "F3", AMBER);
+    let mode = chip(
+        identity.symbol,
+        clipped(identity.title, usize::from(width.saturating_sub(7))),
+        "F4",
+        identity.accent,
+    );
+    if width >= 68 {
+        vec![Line::from([model, effort, mode].concat())]
+    } else if width >= 34 {
+        vec![Line::from(model), Line::from([effort, mode].concat())]
+    } else {
+        vec![Line::from(model), Line::from(effort), Line::from(mode)]
+    }
+}
+
+fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let identity = scene::identity(&view.mode);
+    let error = view.status.starts_with("Failed") || view.status.starts_with("error");
+    if view.notice.is_none()
+        && !view.busy
+        && view.show_scene
+        && view.transcript.is_empty()
+        && !error
+        && view.status != "Cancelled"
+    {
+        return;
+    }
+    let (glyph, label, color) = if let Some(notice) = &view.notice {
+        (
+            if view.busy { "i" } else { "✓" },
+            notice.clone(),
+            identity.accent,
+        )
+    } else if view.busy {
+        let thinking = view
+            .part_activity
+            .values()
+            .filter(|s| matches!(s.as_str(), "active" | "tool"))
+            .count();
+        (
+            spinner(view),
+            format!(
+                "{}  ·  {}s{}",
+                view.status,
+                view.operation_ms / 1000,
+                if thinking > 0 {
+                    format!("  ·  {thinking} active")
+                } else {
+                    String::new()
+                }
+            ),
+            if error { ROSE } else { identity.accent },
+        )
+    } else if view.status == "Cancelled" || error {
+        (
+            if error { "!" } else { "-" },
+            view.status.clone(),
+            if error { ROSE } else { AMBER },
+        )
+    } else if view.speaker != "pool" && !view.show_scene {
+        (
+            "◆",
+            format!("{}  ·  {} parts present", view.speaker, view.parts.len()),
+            identity.accent,
+        )
+    } else {
+        (
+            identity.symbol,
+            format!("{} parts present", view.parts.len()),
+            MUTED,
+        )
+    };
+    let text = Line::from(vec![
+        Span::styled(format!("  {glyph} "), style(color)),
+        Span::styled(
+            clipped(&label, usize::from(area.width.saturating_sub(6))),
+            style(if error { ROSE } else { MUTED }),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(text), area);
+}
+
 fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let color = if view.busy { LILAC } else { MINT };
-    let title = if view.busy {
-        " Compose next message "
-    } else {
-        " Message "
-    };
-    let block = panel(title, color)
-        .border_style(style(color))
-        .style(style(TEXT).bg(RAISED));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let prompt_width = u16::from(inner.width >= 4) * 2;
-    if prompt_width > 0 {
-        frame.render_widget(
-            Paragraph::new("›").style(bold(color)),
-            Rect::new(inner.x, inner.y, 1, 1),
-        );
-    }
+    let accent = scene::identity(&view.mode).accent;
+    frame.render_widget(Block::default().style(style(TEXT).bg(SURFACE)), area);
+    let inner = inset(area, u16::from(area.width >= 8) * 2, 0);
+    let controls = dock_controls(view, inner.width);
+    let control_height = (controls.len() as u16).min(inner.height.saturating_sub(1));
+    let control_area = Rect::new(
+        inner.x,
+        inner.bottom().saturating_sub(control_height),
+        inner.width,
+        control_height,
+    );
+    frame.render_widget(Paragraph::new(controls), control_area);
     let input = Rect::new(
-        inner.x + prompt_width,
-        inner.y,
-        inner.width.saturating_sub(prompt_width),
-        inner.height,
+        inner.x.saturating_add(2).min(inner.right()),
+        inner.y + u16::from(inner.height > 2),
+        inner.width.saturating_sub(2),
+        inner.height.saturating_sub(control_height + 2).max(1),
+    );
+    let line = Line::from(
+        (0..area.width)
+            .map(|x| {
+                let center = (view.input_serial % u64::from(area.width.max(1))) as f32;
+                let distance = (f32::from(x) - center).abs();
+                let ripple = view.motion
+                    && view.focused
+                    && view.input_energy > 0.0
+                    && (distance - (1.0 - view.input_energy) * 28.0).abs() < 2.0;
+                Span::styled(
+                    if ripple {
+                        "-"
+                    } else if x % 5 == 0 {
+                        "."
+                    } else {
+                        " "
+                    },
+                    style(if ripple { accent } else { EDGE }),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect::new(area.x, area.y, area.width, 1),
     );
     if input.width == 0 || input.height == 0 {
         return;
     }
+    frame.render_widget(
+        Paragraph::new("›").style(bold(accent)),
+        Rect::new(inner.x, input.y, 1, 1),
+    );
     let (lines, x, y) = editor_layout(&view.input, view.cursor, usize::from(input.width));
     let scroll = y.saturating_sub(usize::from(input.height.saturating_sub(1)));
     if view.input.is_empty() {
         frame.render_widget(
             Paragraph::new(if view.busy {
-                "Keep a thought here while the pool works…"
+                "Keep your next thought here…"
             } else {
                 "What shall we explore or build?"
             })
@@ -873,22 +805,6 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
             input,
         );
     }
-    if area.width >= 38 {
-        let hint = if view.busy {
-            " Esc cancel · Alt+Enter newline "
-        } else {
-            " Enter send · Alt+Enter newline "
-        };
-        frame.render_widget(
-            Paragraph::new(hint).style(style(MUTED).bg(RAISED)),
-            Rect::new(
-                area.right().saturating_sub(hint.width() as u16 + 2),
-                area.bottom() - 1,
-                hint.width() as u16,
-                1,
-            ),
-        );
-    }
     if view.picker.is_none() {
         frame.set_cursor_position((
             input.x + (x as u16).min(input.width - 1),
@@ -898,71 +814,44 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
-    let detailed = area.width >= 90;
-    let mut controls = vec![];
-    if area.width >= 50 {
-        controls.extend([
-            Span::styled(" F2", bold(BLUE)),
-            Span::styled(if detailed { " model " } else { " " }, style(MUTED)),
-            Span::styled("F3", bold(AMBER)),
-            Span::styled(if detailed { " effort " } else { " " }, style(MUTED)),
-            Span::styled("F4", bold(LILAC)),
-            Span::styled(if detailed { " mode " } else { " " }, style(MUTED)),
-        ]);
+    let hint = if view.busy {
+        "  esc cancel  ·  alt+enter newline"
+    } else {
+        "  enter send  ·  alt+enter newline"
+    };
+    let mut spans = vec![Span::styled(hint, style(MUTED))];
+    if area.width >= 65 {
+        spans.push(Span::styled("  ·  /help", style(MUTED)));
     }
-    controls.push(Span::styled(" F6", bold(MINT)));
-    controls.push(Span::styled(
-        if view.motion {
-            " Motion: on "
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    if area.width >= 90 {
+        let label = if view.input.is_empty() {
+            "PgUp/PgDn history  ".into()
         } else {
-            " Motion: reduced "
-        },
-        style(MUTED),
-    ));
-    let controls = Line::from(controls);
-    let control_width = (controls.width() as u16).min(area.width);
-    let status_width = area.width.saturating_sub(control_width);
-    let status = view.status.split(" · ").next().unwrap_or(&view.status);
-    let color = if status.to_lowercase().contains("error") {
-        ROSE
-    } else if view.busy {
-        AMBER
-    } else {
-        MINT
-    };
-    let mut status_spans = vec![Span::styled(
-        if view.busy {
-            format!(" {} ", spinner(view))
-        } else {
-            " ● ".into()
-        },
-        style(color),
-    )];
-    let label = if status_width >= 25 && view.speaker != "pool" {
-        format!("{status} · {}", view.speaker)
-    } else {
-        status.to_owned()
-    };
-    status_spans.push(Span::styled(
-        clipped(&label, usize::from(status_width.saturating_sub(3))),
-        style(MUTED),
-    ));
-    frame.render_widget(
-        Paragraph::new(Line::from(status_spans)),
-        Rect::new(area.x, area.y, status_width, 1),
-    );
-    frame.render_widget(
-        Paragraph::new(controls),
-        Rect::new(area.x + status_width, area.y, control_width, 1),
-    );
+            format!("{} chars  ", view.input.chars().count())
+        };
+        let width = label.width() as u16;
+        frame.render_widget(
+            Paragraph::new(label).style(style(MUTED)),
+            Rect::new(area.right().saturating_sub(width), area.y, width, 1),
+        );
+    }
 }
 
 fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let options = view.options();
-    let width = area.width.saturating_sub(4).clamp(1, 72);
-    let height = (options.len() as u16 + 5)
-        .min(area.height.saturating_sub(2))
-        .max(1);
+    let modes = view.picker == Some(Picker::Modes);
+    let width = area
+        .width
+        .saturating_sub(4)
+        .clamp(1, if modes { 96 } else { 72 });
+    let height = (if modes {
+        22
+    } else {
+        options.len().max(4) as u16 + 7
+    })
+    .min(area.height.saturating_sub(2))
+    .max(1);
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -970,56 +859,144 @@ fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
         height,
     );
     frame.render_widget(Clear, popup);
-    let (title, color, description) = match view.picker {
-        Some(Picker::Models) => ("Models", BLUE, "Choose the voice behind your peers"),
-        Some(Picker::Efforts) => ("Efforts", AMBER, "Choose a supported reasoning effort"),
-        _ => ("Modes", LILAC, "Choose the shape of the peer pool"),
+    let (title, color) = match view.picker {
+        Some(Picker::Models) => ("Models", BLUE),
+        Some(Picker::Efforts) => ("Efforts", AMBER),
+        _ => ("Modes", LILAC),
     };
-    let block = panel(format!(" {title} · Enter selects "), color)
+    let block = panel(format!(" {title} "), color)
         .border_style(style(color))
         .style(style(TEXT).bg(RAISED));
-    let inner = block.inner(popup);
+    let inner = inset(block.inner(popup), 1, 0);
     frame.render_widget(block, popup);
-    if inner.height == 0 {
+    if inner.height == 0 || inner.width == 0 {
         return;
     }
     let rows = Layout::vertical([
-        Constraint::Length(u16::from(inner.height >= 4) * 2),
+        Constraint::Length(u16::from(inner.height >= 5) * 2),
         Constraint::Min(1),
-        Constraint::Length(u16::from(inner.height >= 3)),
+        Constraint::Length(u16::from(inner.height >= 4) * 2),
     ])
     .split(inner);
+    let query = if view.query.is_empty() {
+        "Type to filter…"
+    } else {
+        &view.query
+    };
     frame.render_widget(
-        Paragraph::new(format!(" {description}")).style(style(MUTED)),
+        Paragraph::new(Line::from(vec![
+            Span::styled(" / ", bold(color)),
+            Span::styled(
+                clipped(query, usize::from(rows[0].width.saturating_sub(4))),
+                style(if view.query.is_empty() { MUTED } else { TEXT }),
+            ),
+        ])),
         rows[0],
     );
+    let columns = if modes && inner.width >= 62 {
+        Layout::horizontal([Constraint::Length(21), Constraint::Min(0)])
+            .split(rows[1])
+            .to_vec()
+    } else {
+        vec![rows[1]]
+    };
     let items = options
         .iter()
-        .enumerate()
-        .map(|(index, label)| {
+        .map(|label| {
             let current = match view.picker {
                 Some(Picker::Models) => label == &view.model,
                 Some(Picker::Efforts) => label == &view.effort,
                 _ => label == &view.mode,
             };
+            let value = if modes {
+                scene::identity(label).title
+            } else {
+                label
+            };
             ListItem::new(Line::from(vec![
-                Span::raw(format!("{} {label}", if current { "●" } else { "○" })),
-                Span::raw(if index == view.selected { "  ←" } else { "" }),
+                Span::raw(format!("{} ", if current { "●" } else { " " })),
+                Span::raw(clipped(
+                    value,
+                    usize::from(columns[0].width.saturating_sub(5)),
+                )),
             ]))
         })
         .collect::<Vec<_>>();
-    let mut selected = ListState::default().with_selected(Some(view.selected));
-    frame.render_stateful_widget(
-        List::new(items)
-            .highlight_symbol(" › ")
-            .highlight_style(bold(INK).bg(color)),
-        rows[1],
-        &mut selected,
-    );
-    frame.render_widget(
-        Paragraph::new(" ↑↓ move · Enter selects · Esc back").style(style(MUTED)),
-        rows[2],
-    );
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" No matches. Backspace to edit.").style(style(MUTED)),
+            columns[0],
+        );
+    } else {
+        let mut selected = ListState::default().with_selected(Some(view.selected));
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("› ")
+                .highlight_style(bold(INK).bg(color)),
+            columns[0],
+            &mut selected,
+        );
+    }
+    if let Some(preview_area) = columns.get(1) {
+        frame.render_widget(Block::default().style(style(TEXT).bg(INK)), *preview_area);
+        if let Some(mode) = options.get(view.selected) {
+            let identity = scene::identity(mode);
+            let mut preview = view.clone();
+            preview.mode.clone_from(mode);
+            preview.busy = false;
+            preview.part_activity.clear();
+            preview.relationships.clear();
+            preview.routes.clear();
+            preview.speaker_id.clear();
+            if mode != &view.mode {
+                preview.parts = kuru_core::Framework::builtin(mode.parse().expect("built-in mode"))
+                    .parts
+                    .into_iter()
+                    .map(|part| (part.id, format!("{} · {}", part.name, part.role)))
+                    .collect();
+            }
+            let shape = Rect::new(
+                preview_area.x,
+                preview_area.y,
+                preview_area.width,
+                preview_area.height.saturating_sub(3),
+            );
+            scene::draw(frame, &preview, shape);
+            let caption = vec![
+                Line::from(Span::styled(
+                    format!("{} {}", identity.symbol, identity.title),
+                    bold(identity.accent),
+                ))
+                .alignment(Alignment::Center),
+                Line::from(Span::styled(identity.description, style(MUTED)))
+                    .alignment(Alignment::Center),
+                Line::from(Span::styled(
+                    if mode == &view.mode {
+                        "Current parts"
+                    } else {
+                        "Framework preview"
+                    },
+                    style(MUTED),
+                ))
+                .alignment(Alignment::Center),
+            ];
+            frame.render_widget(
+                Paragraph::new(caption),
+                Rect::new(
+                    preview_area.x,
+                    shape.bottom(),
+                    preview_area.width,
+                    preview_area.height.saturating_sub(shape.height),
+                ),
+            );
+        }
+    }
+    let guide = if rows[2].width >= 54 {
+        " ↑↓ move · Enter selects · Esc back · saved for project"
+    } else {
+        " Enter selects · Esc back"
+    };
+    frame.render_widget(Paragraph::new(guide).style(style(MUTED)), rows[2]);
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use kuru_connectors::{Provider, ToolHost, auth, provider};
-use kuru_core::{Config, MemoryStore, Mode, ModelInfo};
+use kuru_core::{Config, MemoryStore, Mode, ModelInfo, ProjectPreferences, SelectionOverrides};
 use kuru_runtime::Harness;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -122,20 +122,24 @@ pub fn paths(cli: &Cli) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
     Ok((cwd, data, user_config))
 }
 
-pub fn effective_config(cli: &Cli, cwd: &Path, user: Option<&Path>) -> Result<Config> {
-    let mut config = Config::load(user, cwd, cli.config.as_deref())?;
-    if let Some(mode) = cli.mode {
-        config.mode = mode;
-    }
-    if let Some(provider) = &cli.provider {
-        config.provider = provider.clone();
-    }
-    if let Some(model) = &cli.model {
-        config.model = model.clone();
-    }
-    if let Some(effort) = &cli.effort {
-        config.effort = Some(effort.clone());
-    }
+pub fn effective_config(
+    cli: &Cli,
+    cwd: &Path,
+    user: Option<&Path>,
+    preferences: &ProjectPreferences,
+) -> Result<Config> {
+    let mut config = Config::load_with_preferences(
+        user,
+        cwd,
+        cli.config.as_deref(),
+        preferences,
+        SelectionOverrides {
+            mode: cli.mode,
+            provider: cli.provider.as_deref(),
+            model: cli.model.as_deref(),
+            effort: cli.effort.as_deref(),
+        },
+    )?;
     if cli.allow_write {
         config.allow_write = true;
     }
@@ -203,7 +207,24 @@ pub async fn execute(cli: Cli) -> Result<()> {
         .await;
     }
     let (cwd, data, user) = paths(&cli)?;
-    let mut config = effective_config(&cli, &cwd, user.as_deref())?;
+    // A new installation can inspect configuration without creating state. An
+    // existing store supplies only this project's interactive choices, never a
+    // resumed transcript. Refuse tool-root storage before opening its database.
+    let existing_memory = if data.join("memory.sqlite3").try_exists()? {
+        ensure!(
+            !data.canonicalize()?.starts_with(&cwd),
+            "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
+        );
+        Some(MemoryStore::open(&data.join("memory.sqlite3"))?)
+    } else {
+        None
+    };
+    let preferences = existing_memory
+        .as_ref()
+        .map(|memory| Harness::load_preferences(memory, &cwd))
+        .transpose()?
+        .unwrap_or_default();
+    let mut config = effective_config(&cli, &cwd, user.as_deref(), &preferences)?;
     match &cli.command {
         Some(Command::Login { device: true }) => {
             let status = tokio::process::Command::new(&config.codex_command)
@@ -277,7 +298,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
         !data.starts_with(&cwd),
         "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
     );
-    let memory = MemoryStore::open(&data.join("memory.sqlite3"))?;
+    let memory = match existing_memory {
+        Some(memory) => memory,
+        None => MemoryStore::open(&data.join("memory.sqlite3"))?,
+    };
     if matches!(cli.command, Some(Command::Sessions)) {
         println!(
             "{}",

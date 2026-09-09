@@ -149,7 +149,7 @@ async fn welcome_shows_actual_framework_members_and_color_at_wide_and_compact_si
         view.motion = false;
         let (wide, _) = render(&view, 140, 50, &format!("welcome-{mode}"));
         let screen = text(&wide);
-        for label in ["KURU", "demo", "Active parts"] {
+        for label in ["KURU", "demo", "F2", "F3", "F4"] {
             assert!(screen.contains(label), "missing {label}:\n{screen}");
         }
         assert!(screen.to_ascii_lowercase().contains(&mode.to_string()));
@@ -250,7 +250,7 @@ async fn real_turn_events_keep_speaking_group_members_and_peer_routes_visible() 
 }
 
 #[tokio::test]
-async fn motion_changes_decoration_without_changing_text_and_can_be_disabled_during_work() {
+async fn motion_changes_decoration_without_changing_text_and_respects_static_override() {
     let (_project, harness, mut view) = fixture(Mode::Ifs);
     view.busy = true;
     view.transcript
@@ -299,8 +299,7 @@ async fn motion_changes_decoration_without_changing_text_and_can_be_disabled_dur
             );
         }
     }
-    view.key(key(KeyCode::F(6)));
-    assert!(!view.motion);
+    view.motion = false;
     let (still, _) = render(&view, 120, 45, "busy-reduced-motion");
     view.frame = 91;
     let (later, _) = render(&view, 120, 45, "busy-reduced-motion-later");
@@ -311,8 +310,6 @@ async fn motion_changes_decoration_without_changing_text_and_can_be_disabled_dur
     assert!(view.busy);
     view.key(key(KeyCode::Char('!')));
     assert_eq!(view.input, "Draft remains editable!");
-    view.key(key(KeyCode::F(6)));
-    assert!(view.motion);
 }
 
 #[tokio::test]
@@ -366,7 +363,15 @@ async fn unicode_editor_and_cursor_survive_resize_even_below_supported_layout_si
         view.key(key(KeyCode::Char(ch)));
     }
     let draft = view.input.clone();
-    for (width, height) in [(120, 35), (40, 15), (10, 5), (1, 1)] {
+    for (width, height) in [
+        (120, 35),
+        (40, 15),
+        (38, 7),
+        (20, 8),
+        (14, 7),
+        (10, 5),
+        (1, 1),
+    ] {
         let (buffer, cursor) = render(&view, width, height, &format!("editor-{width}x{height}"));
         assert!(cursor.0 < width && cursor.1 < height);
         if width >= 40 {
@@ -422,14 +427,154 @@ async fn rich_answer_preserves_prose_code_and_list_content_when_terminal_wraps()
 }
 
 #[tokio::test]
-async fn compact_footer_keeps_speaking_identity_and_current_operation_visible() {
+async fn composer_combines_values_with_hints_and_status_prioritizes_errors() {
     let (_project, _harness, mut view) = fixture(Mode::Freudian);
-    view.speaker = "Reality · ego".into();
-    view.status = "Cancelled".into();
+    view.model = "gpt-current-long-model-name".into();
+    view.effort = "high".into();
     view.motion = false;
+    for (width, height) in [(140, 50), (72, 25), (70, 25), (40, 20)] {
+        let (buffer, _) = render(&view, width, height, &format!("controls-{width}"));
+        let screen = text(&buffer);
+        let rows: Vec<_> = screen.lines().collect();
+        assert!(!rows[0].contains("gpt-"));
+        assert!(!screen.contains("Message"));
+        assert!(!screen.contains("Motion"));
+        for (value, hint) in [("gpt-", "F2"), ("high", "F3"), ("Freudian", "F4")] {
+            let row = rows.iter().rposition(|line| line.contains(hint)).unwrap();
+            assert!(
+                row >= usize::from(height) - 5,
+                "{hint} is away from composer"
+            );
+            assert!(
+                rows[row].contains(value),
+                "value separated from {hint}: {}",
+                rows[row]
+            );
+        }
+    }
+    view.model = "very-long-future-model-name-".repeat(5);
+    view.effort = "future-effort-level-".repeat(5);
+    for width in [38, 68, 72, 140] {
+        let (buffer, _) = render(&view, width, 25, &format!("future-controls-{width}"));
+        let screen = text(&buffer);
+        for key in ["F2", "F3", "F4"] {
+            assert!(
+                screen.contains(key),
+                "{key} lost for unknown long values at {width}"
+            );
+        }
+    }
+    view.model = "gpt-current-long-model-name".into();
+    view.effort = "high".into();
+    view.speaker = "Reality · ego".into();
+    view.show_scene = false;
+    view.status = "Cancelled".into();
     let (buffer, _) = render(&view, 70, 25, "compact-status");
-    let screen = text(&buffer);
-    let footer = screen.lines().last().unwrap();
-    assert!(footer.contains("Reality"), "speaker missing: {footer}");
-    assert!(footer.contains("Cancelled"), "operation missing: {footer}");
+    assert!(text(&buffer).contains("Cancelled"));
+    view.status = "Failed · details in conversation".into();
+    view.transcript.push((
+        "error".into(),
+        "Provider unavailable. Try another model.".into(),
+    ));
+    let (buffer, _) = render(&view, 70, 25, "provider-error");
+    assert!(text(&buffer).contains("Provider unavailable"));
+    assert!(text(&buffer).contains("Failed"));
+    view.status = "Complete".into();
+    let (buffer, _) = render(&view, 70, 25, "completed-status");
+    assert!(text(&buffer).contains("Reality · ego"));
+}
+
+#[tokio::test]
+async fn mode_picker_previews_selection_and_filtering_never_changes_the_live_pool() {
+    let (_project, _harness, mut view) = fixture(Mode::Ifs);
+    view.key(key(KeyCode::F(4)));
+    let original = view.parts.clone();
+    for mode in ["ifs", "polyvagal", "freudian", "jungian"] {
+        view.query = mode.into();
+        view.selected = 0;
+        let (buffer, _) = render(&view, 140, 50, &format!("picker-{mode}"));
+        let screen = text(&buffer);
+        assert!(screen.contains(if mode == "ifs" {
+            "Current parts"
+        } else {
+            "Framework preview"
+        }));
+        assert_eq!(view.parts, original);
+        assert_eq!(view.mode, "ifs");
+    }
+    view.query = "nonexistent".into();
+    let (buffer, _) = render(&view, 70, 22, "picker-no-matches");
+    assert!(text(&buffer).contains("No matches"));
+    assert!(view.key(key(KeyCode::Enter)).is_none());
+    assert!(view.picker.is_some());
+    view.key(key(KeyCode::Esc));
+    view.key(key(KeyCode::F(3)));
+    assert!(view.options().contains(&"default".into()));
+    assert_eq!(
+        view.key(key(KeyCode::Enter)).as_deref(),
+        Some("/effort default")
+    );
+}
+
+#[tokio::test]
+async fn ambient_and_typing_frames_leave_labels_and_editor_position_stable() {
+    let (_project, harness, mut view) = fixture(Mode::Jungian);
+    view.motion = true;
+    let (first, _) = render(&view, 140, 50, "ambient-zero");
+    view.advance_animation(std::time::Duration::from_secs(12));
+    let (ambient, _) = render(&view, 140, 50, "ambient-later");
+    assert_ne!(first, ambient, "ambient motion continues beyond welcome");
+    for c in "A thought".chars() {
+        view.key(key(KeyCode::Char(c)));
+    }
+    let (typed, cursor) = render(&view, 140, 50, "input-ripple-start");
+    view.advance_animation(std::time::Duration::from_millis(12500));
+    let (ripple, after) = render(&view, 140, 50, "input-ripple-later");
+    assert_ne!(typed, ripple);
+    assert_eq!(cursor, after);
+    for part in &harness.topology.parts {
+        let locate = |buffer: &Buffer| text(buffer).find(&part.name).unwrap();
+        assert_eq!(locate(&typed), locate(&ripple));
+    }
+    assert!(text(&ripple).contains("A thought"));
+    view.motion = false;
+    let (still, _) = render(&view, 140, 50, "ambient-static");
+    view.frame += 97;
+    view.input_energy = 0.8;
+    let (later, _) = render(&view, 140, 50, "ambient-static-later");
+    assert_eq!(still, later);
+}
+
+// Explicit profiling fixture, excluded from normal assertions because timings
+// depend on the machine. Exercises actual cells, not a separate scene mockup.
+#[tokio::test]
+#[ignore = "run explicitly with --ignored --nocapture to measure frame cost"]
+async fn frame_cost_profile() {
+    let (_project, _harness, mut view) = fixture(Mode::Ifs);
+    let mut terminal = Terminal::new(TestBackend::new(140, 50)).unwrap();
+    for state in ["welcome", "long conversation", "picker"] {
+        if state == "long conversation" {
+            view.transcript = (0..500)
+                .map(|i| {
+                    (
+                        "Self".into(),
+                        format!("Turn {i}: {}", "useful content ".repeat(40)),
+                    )
+                })
+                .collect();
+            view.show_scene = false;
+        } else if state == "picker" {
+            view.key(key(KeyCode::F(4)));
+        }
+        terminal.draw(|f| draw(f, &view)).unwrap();
+        let start = std::time::Instant::now();
+        for frame in 0..200 {
+            view.frame = frame;
+            terminal.draw(|f| draw(f, &view)).unwrap();
+        }
+        eprintln!(
+            "{state}: {:.3} ms/frame (200 frames, 140x50)",
+            start.elapsed().as_secs_f64() * 5.0
+        );
+    }
 }

@@ -14,3 +14,6 @@ mod tests;
 
 #[cfg(test)]
 mod review_tests;
+
+#[cfg(test)]
+mod preferences_tests;

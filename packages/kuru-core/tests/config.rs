@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
-use kuru_core::{Config, McpConfig, Mode, load_instructions};
+use kuru_core::{
+    Config, McpConfig, Mode, ModelPreference, ProjectPreferences, SelectionOverrides,
+    load_instructions,
+};
 use tempfile::TempDir;
 
 fn write(path: impl AsRef<Path>, text: impl AsRef<[u8]>) {
@@ -368,4 +371,169 @@ fn configured_peer_names_and_counts_are_bounded() {
             .to_string()
             .contains("64 MCP")
     );
+}
+
+#[test]
+fn remembered_selections_override_defaults_but_not_explicit_invocation_choices() {
+    let dir = TempDir::new().unwrap();
+    let user = dir.path().join("user.toml");
+    let local = dir.path().join("invocation.toml");
+    write(
+        &user,
+        "mode='ifs'\nmodel='user-model'\neffort='low'\nmax_rounds=5",
+    );
+    write(
+        dir.path().join(".kuru/config.toml"),
+        "mode='polyvagal'\nmodel='project-model'",
+    );
+    let preferences = ProjectPreferences {
+        mode: Some(Mode::Jungian),
+        providers: BTreeMap::from([
+            (
+                "codex".into(),
+                ModelPreference {
+                    model: "remembered-codex".into(),
+                    effort: Some("ultra".into()),
+                },
+            ),
+            (
+                "responses".into(),
+                ModelPreference {
+                    model: "remembered-api".into(),
+                    effort: None,
+                },
+            ),
+        ]),
+    };
+    let load = |local: Option<&Path>, provider, model| {
+        Config::load_with_preferences(
+            Some(&user),
+            dir.path(),
+            local,
+            &preferences,
+            SelectionOverrides {
+                provider,
+                model,
+                ..SelectionOverrides::default()
+            },
+        )
+        .unwrap()
+    };
+    let remembered = load(None, None, None);
+    assert_eq!(remembered.mode, Mode::Jungian);
+    assert_eq!(remembered.model, "remembered-codex");
+    assert_eq!(remembered.effort.as_deref(), Some("ultra"));
+    assert_eq!(remembered.max_rounds, 5);
+
+    // A provider override selects that provider's saved pair, including an
+    // explicit default effort which clears lower-level file defaults.
+    let api = load(None, Some("responses"), None);
+    assert_eq!(api.model, "remembered-api");
+    assert_eq!(api.effort, None);
+    let demo = load(None, Some("demo"), None);
+    assert_eq!(demo.model, "project-model");
+    assert_eq!(demo.effort.as_deref(), Some("low"));
+
+    write(
+        &local,
+        "mode='freudian'\nmodel='local-model'\neffort='medium'",
+    );
+    let explicit = load(Some(&local), None, None);
+    assert_eq!(explicit.mode, Mode::Freudian);
+    assert_eq!(explicit.model, "local-model");
+    assert_eq!(explicit.effort.as_deref(), Some("medium"));
+
+    // Overriding only the model must not retain its predecessor's saved ultra.
+    write(&local, "model='different-model'");
+    assert_eq!(
+        load(Some(&local), None, None).effort.as_deref(),
+        Some("low")
+    );
+    assert_eq!(
+        load(None, None, Some("cli-model")).effort.as_deref(),
+        Some("low")
+    );
+    assert_eq!(
+        load(None, None, Some("remembered-codex")).effort.as_deref(),
+        Some("ultra")
+    );
+    write(&local, "provider='responses'");
+    assert_eq!(load(Some(&local), None, None).model, "remembered-api");
+    assert_eq!(
+        load(Some(&local), Some("codex"), None).model,
+        "remembered-codex"
+    );
+}
+
+#[test]
+fn stored_preferences_reject_malformed_choices_without_restricting_future_capabilities() {
+    let dir = TempDir::new().unwrap();
+    let mut preferences = ProjectPreferences {
+        mode: None,
+        providers: BTreeMap::from([(
+            "future-provider".into(),
+            ModelPreference {
+                model: "future-model".into(),
+                effort: Some("future-effort".into()),
+            },
+        )]),
+    };
+    preferences.validate().unwrap();
+    for model in ["", " ", "with\0nul"] {
+        preferences
+            .providers
+            .get_mut("future-provider")
+            .unwrap()
+            .model = model.into();
+        assert!(
+            Config::load_with_preferences(
+                None,
+                dir.path(),
+                None,
+                &preferences,
+                SelectionOverrides::default()
+            )
+            .is_err()
+        );
+    }
+    preferences
+        .providers
+        .get_mut("future-provider")
+        .unwrap()
+        .model = "valid".into();
+    preferences
+        .providers
+        .get_mut("future-provider")
+        .unwrap()
+        .effort = Some("".into());
+    assert!(preferences.validate().is_err());
+    preferences.providers.clear();
+    preferences.providers.insert(
+        "bad/provider".into(),
+        ModelPreference {
+            model: "valid".into(),
+            effort: None,
+        },
+    );
+    assert!(preferences.validate().is_err());
+    preferences.providers = (0..65)
+        .map(|index| {
+            (
+                format!("provider-{index}"),
+                ModelPreference {
+                    model: "valid".into(),
+                    effort: None,
+                },
+            )
+        })
+        .collect();
+    assert!(preferences.validate().is_err());
+    for value in [
+        serde_json::json!({"mode":"unknown"}),
+        serde_json::json!({"unexpected":true}),
+        serde_json::json!({"providers":{"codex":{"model":42}}}),
+        serde_json::json!({"providers":{"codex":{"model":"x","extra":true}}}),
+    ] {
+        assert!(serde_json::from_value::<ProjectPreferences>(value).is_err());
+    }
 }

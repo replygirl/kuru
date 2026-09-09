@@ -63,16 +63,20 @@ def run_smoke(reduced_motion, full_session):
             assert time.monotonic() < deadline, "terminal did not become ready"
         read_for(0.2)
         assert b"\x1b[38;2;" in output, "truecolor terminal received no RGB colors"
-        # Observe actual terminal output while the welcome animation is active.
-        # Reduced motion should stop changing cells, not just hide a spinner.
+        # Ambient decoration stays alive after the former four-second cutoff.
+        # The startup accessibility override must leave every cell settled.
+        read_for(4.1)
         settled = len(output)
-        read_for(0.3)
+        read_for(0.7)
         assert (len(output) == settled) == reduced_motion, bytes(output[-4000:])
-        os.write(master, b"\x1b[17~")  # F6 toggles motion in the real event loop.
+        # Losing focus pauses ambient work, while the draft remains editable.
+        os.write(master, b"\x1b[O")
         read_for(0.2)
         settled = len(output)
-        read_for(0.3)
-        assert (len(output) == settled) != reduced_motion, bytes(output[-4000:])
+        read_for(0.4)
+        assert len(output) == settled, "unfocused terminal is still animating"
+        os.write(master, b"\x1b[I")
+        read_for(0.2)
         if full_session:
             for data in [
                 b"/help\r",

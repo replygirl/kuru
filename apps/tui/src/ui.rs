@@ -27,9 +27,10 @@ use unicode_width::UnicodeWidthChar;
 use crate::cli::validate_effort;
 
 mod render;
+mod scene;
 pub use render::draw;
 
-const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · F6 motion · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /dream · /undo-dream · /quit";
+const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /dream · /undo-dream · /quit\nModel, effort and mode selections are remembered for this project.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Picker {
@@ -63,16 +64,32 @@ pub struct View {
     pub focus: Option<String>,
     pub speaker_id: String,
     pub routes: Vec<(String, String)>,
+    pub project: String,
+    pub turns: usize,
+    pub input_energy: f32,
+    pub input_serial: u64,
+    pub focused: bool,
+    pub show_scene: bool,
+    pub query: String,
+    pub notice: Option<String>,
+    pub operation_ms: u64,
+    clock_ms: u64,
+    last_frame_ms: u64,
+    last_input_ms: Option<u64>,
+    operation_start: Option<u64>,
+    notice_until: u64,
 }
 
 impl View {
     pub fn new(harness: &Harness, models: Vec<ModelInfo>) -> Result<Self> {
+        let transcript: Vec<_> = harness
+            .history()?
+            .into_iter()
+            .map(|m| (m.role, m.content))
+            .collect();
+        let show_scene = transcript.is_empty();
         Ok(Self {
-            transcript: harness
-                .history()?
-                .into_iter()
-                .map(|m| (m.role, m.content))
-                .collect(),
+            transcript,
             input: String::new(),
             cursor: 0,
             mode: harness.config.mode.to_string(),
@@ -105,23 +122,87 @@ impl View {
             focus: harness.topology.focus.as_ref().map(|f| f.id.clone()),
             speaker_id: String::new(),
             routes: vec![],
+            project: harness
+                .cwd()
+                .file_name()
+                .unwrap_or(harness.cwd().as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            turns: harness.session.turns,
+            input_energy: 0.0,
+            input_serial: 0,
+            focused: true,
+            show_scene,
+            query: String::new(),
+            notice: None,
+            operation_ms: 0,
+            clock_ms: 0,
+            last_frame_ms: 0,
+            last_input_ms: None,
+            operation_start: None,
+            notice_until: 0,
         })
     }
 
-    /// Advance only while working or during the finite welcome sequence.
-    /// Elapsed time is supplied by the loop so rendering remains deterministic.
+    /// Ambient frames are slower than interaction frames; all motion uses this
+    /// supplied clock so scenes never infer state or read wall time themselves.
     pub fn advance_animation(&mut self, elapsed: Duration) -> bool {
-        let animated = self.motion
-            && (self.busy || (self.transcript.is_empty() && elapsed < Duration::from_secs(4)));
-        let next = (elapsed.as_millis() / 80).min(u64::MAX as u128) as u64;
-        if animated && next != self.frame {
-            self.frame = next;
+        let now = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        self.clock_ms = now;
+        self.input_energy = if self.motion && self.focused {
+            self.last_input_ms.map_or(0.0, |last| {
+                (1.0 - now.saturating_sub(last) as f32 / 1100.0).max(0.0)
+            })
+        } else {
+            0.0
+        };
+        let mut dirty = false;
+        if self.notice.is_some() && now >= self.notice_until {
+            self.notice = None;
+            dirty = true;
+        }
+        if let Some(start) = self.operation_start {
+            let duration = now.saturating_sub(start);
+            dirty |= duration / 1000 != self.operation_ms / 1000;
+            self.operation_ms = duration;
+        }
+        let interval = if self.busy || self.input_energy > 0.0 {
+            80
+        } else {
+            250
+        };
+        if self.motion && self.focused && now.saturating_sub(self.last_frame_ms) >= interval {
+            self.frame = now / 80;
+            self.last_frame_ms = now;
             return true;
         }
-        false
+        dirty
+    }
+
+    fn edited(&mut self) {
+        self.input_serial = self.input_serial.wrapping_add(1);
+        self.last_input_ms = Some(self.clock_ms);
+        self.input_energy = if self.motion && self.focused {
+            1.0
+        } else {
+            0.0
+        };
+    }
+
+    fn notify(&mut self, message: impl Into<String>) {
+        self.notice = Some(message.into());
+        self.notice_until = self.clock_ms.saturating_add(5000);
+    }
+
+    fn begin_operation(&mut self) {
+        self.busy = true;
+        self.notice = None;
+        self.operation_start = Some(self.clock_ms);
+        self.operation_ms = 0;
     }
 
     fn refresh(&mut self, harness: &Harness) {
+        self.turns = harness.session.turns;
         self.mode = harness.config.mode.to_string();
         self.model = harness.config.model.clone();
         self.effort = harness
@@ -160,6 +241,7 @@ impl View {
     }
 
     fn settle(&mut self) {
+        self.operation_start = None;
         for phase in self.part_activity.values_mut() {
             if phase != "error" {
                 *phase = "idle".into();
@@ -168,24 +250,40 @@ impl View {
     }
 
     pub fn options(&self) -> Vec<String> {
-        match self.picker {
+        let options: Vec<String> = match self.picker {
             Some(Picker::Models) => self.models.iter().map(|m| m.id.clone()).collect(),
-            Some(Picker::Efforts) => self
-                .models
-                .iter()
-                .find(|m| m.id == self.model)
-                .map(|m| m.efforts.clone())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| vec!["default".into()]),
+            Some(Picker::Efforts) => {
+                let mut efforts = vec!["default".to_owned()];
+                if let Some(model) = self.models.iter().find(|m| m.id == self.model) {
+                    efforts.extend(
+                        model
+                            .efforts
+                            .iter()
+                            .filter(|e| e.as_str() != "default")
+                            .cloned(),
+                    );
+                }
+                efforts
+            }
             Some(Picker::Modes) => ["ifs", "polyvagal", "freudian", "jungian"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
             None => vec![],
-        }
+        };
+        let query = self.query.to_lowercase();
+        options
+            .into_iter()
+            .filter(|option| option.to_lowercase().contains(&query))
+            .collect()
     }
 
     fn open_picker(&mut self, picker: Picker) {
+        if self.busy {
+            self.notify("Finish or cancel the current turn to change settings.");
+            return;
+        }
+        self.query.clear();
         let current = match picker {
             Picker::Models => &self.model,
             Picker::Efforts => &self.effort,
@@ -281,11 +379,6 @@ impl View {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Some(if self.busy { "/cancel" } else { "/quit" }.into());
         }
-        if key.code == KeyCode::F(6) {
-            self.motion = !self.motion;
-            self.frame = 0;
-            return None;
-        }
         if self.picker.is_some() {
             let len = self.options().len();
             match key.code {
@@ -294,12 +387,23 @@ impl View {
                 KeyCode::Down => self.selected = (self.selected + 1).min(len.saturating_sub(1)),
                 KeyCode::Enter => {
                     let value = self.options().get(self.selected).cloned();
+                    value.as_ref()?;
                     let command = match self.picker.take() {
                         Some(Picker::Models) => "/model",
                         Some(Picker::Efforts) => "/effort",
                         _ => "/mode",
                     };
                     return value.map(|v| format!("{command} {v}"));
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if self.query.len() < 256 {
+                        self.query.push(c);
+                    }
+                    self.selected = 0;
+                }
+                KeyCode::Backspace => {
+                    self.query.pop();
+                    self.selected = 0;
                 }
                 _ => {}
             }
@@ -340,11 +444,13 @@ impl View {
                     .map_or(0, |(i, _)| i);
                 self.input.drain(previous..self.cursor);
                 self.cursor = previous;
+                self.edited();
             }
             KeyCode::Delete if self.cursor < self.input.len() => {
                 let next =
                     self.cursor + self.input[self.cursor..].chars().next().unwrap().len_utf8();
                 self.input.drain(self.cursor..next);
+                self.edited();
             }
             KeyCode::Left => {
                 self.cursor = self.input[..self.cursor]
@@ -362,10 +468,27 @@ impl View {
         None
     }
 
+    pub fn paste(&mut self, text: &str) {
+        if self.picker.is_some() {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                if self.query.len() + c.len_utf8() > 256 {
+                    break;
+                }
+                self.query.push(c);
+            }
+            self.selected = 0;
+        } else {
+            for c in text.chars() {
+                self.insert(c);
+            }
+        }
+    }
+
     fn insert(&mut self, c: char) {
         if self.input.len() + c.len_utf8() <= 131_072 {
             self.input.insert(self.cursor, c);
             self.cursor += c.len_utf8();
+            self.edited();
         }
     }
 }
@@ -434,7 +557,8 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             io::stdout(),
             LeaveAlternateScreen,
-            event::DisableBracketedPaste
+            event::DisableBracketedPaste,
+            event::DisableFocusChange
         );
     }
 }
@@ -449,7 +573,8 @@ pub async fn run(harness: Harness, models: Vec<ModelInfo>) -> Result<()> {
     execute!(
         io::stdout(),
         EnterAlternateScreen,
-        event::EnableBracketedPaste
+        event::EnableBracketedPaste,
+        event::EnableFocusChange
     )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     run_loop(&mut terminal, harness, models).await
@@ -490,6 +615,9 @@ where
             if completed_generation != generation {
                 continue;
             }
+            while let Ok(event) = events.try_recv() {
+                view.event(event);
+            }
             view.busy = false;
             dirty = true;
             job = None;
@@ -499,14 +627,21 @@ where
             }
             match message {
                 Ok(text) => {
-                    if !text.is_empty() {
+                    if text.starts_with("Mode:")
+                        || text.starts_with("Model:")
+                        || text.starts_with("Effort:")
+                    {
+                        view.notify(format!("{text} · saved for this project"));
+                    } else if !text.is_empty() {
                         view.transcript.push(("kuru".into(), text));
+                        view.show_scene = false;
                     }
-                    view.status = "Ready".into();
+                    view.status = "Complete".into();
                 }
                 Err(error) => {
                     view.transcript.push(("error".into(), format!("{error:#}")));
-                    view.status = "Ready · previous operation failed".into();
+                    view.show_scene = false;
+                    view.status = "Failed · details in conversation".into();
                 }
             }
             let h = harness.lock().await;
@@ -520,7 +655,7 @@ where
                 .map_err(|e| anyhow::anyhow!("terminal draw: {e}"))?;
             dirty = false;
         }
-        let wait = if view.busy || (view.motion && started.elapsed() < Duration::from_secs(4)) {
+        let wait = if view.busy || view.input_energy > 0.0 {
             Duration::from_millis(25)
         } else {
             Duration::from_millis(100)
@@ -530,9 +665,15 @@ where
             let command = match event::read()? {
                 TerminalEvent::Key(key) => view.key(key),
                 TerminalEvent::Paste(text) => {
-                    for c in text.chars() {
-                        view.insert(c);
-                    }
+                    view.paste(&text);
+                    None
+                }
+                TerminalEvent::FocusGained => {
+                    view.focused = true;
+                    None
+                }
+                TerminalEvent::FocusLost => {
+                    view.focused = false;
                     None
                 }
                 _ => None,
@@ -543,18 +684,22 @@ where
                         job.abort();
                         let _ = job.await;
                     }
+                    while let Ok(event) = events.try_recv() {
+                        view.event(event);
+                    }
                     generation += 1;
                     quit_pending = false;
                     view.busy = false;
                     view.settle();
                     view.refresh(&*harness.lock().await);
+                    view.notice = None;
                     view.status = "Cancelled".into();
                 } else if command == "/quit" {
                     if let Some(job) = job.take() {
                         job.abort();
                         let _ = job.await;
                     }
-                    view.busy = true;
+                    view.begin_operation();
                     view.part_activity.clear();
                     view.routes.clear();
                     view.status = "Closing session".into();
@@ -573,6 +718,7 @@ where
                     }));
                 } else if command == "/help" {
                     view.transcript.push(("help".into(), HELP.into()));
+                    view.show_scene = false;
                 } else if !view.busy {
                     if command == "/model" {
                         view.open_picker(Picker::Models);
@@ -588,9 +734,10 @@ where
                     }
                     if !command.starts_with('/') {
                         view.transcript.push(("user".into(), command.clone()));
+                        view.show_scene = false;
                         view.scroll = 0;
                     }
-                    view.busy = true;
+                    view.begin_operation();
                     view.status = if command.starts_with('/') {
                         "Updating session"
                     } else {
@@ -629,11 +776,11 @@ pub async fn dispatch(
         }
         "/model" => {
             ensure!(!args.is_empty(), "model ID required");
-            harness.config.model = args.into();
-            harness.config.effort = models
+            let effort = models
                 .iter()
                 .find(|m| m.id == args)
                 .and_then(|m| m.default_effort.clone());
+            harness.set_model(args, effort)?;
             Ok(format!("Model: {args}"))
         }
         "/effort" => {
@@ -644,7 +791,7 @@ pub async fn dispatch(
                 Some(args)
             };
             validate_effort(models, &harness.config.model, effort)?;
-            harness.config.effort = effort.map(str::to_owned);
+            harness.set_effort(effort.map(str::to_owned))?;
             Ok(format!("Effort: {args}"))
         }
         "/focus" => {
@@ -714,27 +861,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn animation_has_a_fixed_cadence_finite_welcome_and_static_reduced_mode() {
+    async fn ambient_motion_continues_and_editing_accelerates_then_settles() {
         let (_dir, h, models) = fixture();
         let mut view = View::new(&h, models).unwrap();
         view.motion = true;
-        assert!(!view.advance_animation(Duration::from_millis(79)));
-        assert!(view.advance_animation(Duration::from_millis(80)));
-        assert_eq!(view.frame, 1);
-        assert!(!view.advance_animation(Duration::from_millis(159)));
-        assert!(!view.advance_animation(Duration::from_secs(4)));
-        assert_eq!(view.frame, 1);
-        view.transcript.push(("user".into(), "a task".into()));
-        assert!(!view.advance_animation(Duration::from_secs(5)));
-        view.busy = true;
+        assert!(!view.advance_animation(Duration::from_millis(249)));
+        assert!(view.advance_animation(Duration::from_millis(250)));
         assert!(view.advance_animation(Duration::from_secs(5)));
-        view.key(key(KeyCode::F(6)));
-        assert!(!view.motion);
-        assert_eq!(view.frame, 0);
-        assert!(!view.advance_animation(Duration::from_secs(6)));
-        assert_eq!(view.key(key(KeyCode::Esc)).as_deref(), Some("/cancel"));
-        view.key(key(KeyCode::F(6)));
-        assert!(view.advance_animation(Duration::from_secs(7)));
+        let ambient_frame = view.frame;
+        view.key(key(KeyCode::Char('a')));
+        assert_eq!(view.input_energy, 1.0);
+        assert!(!view.advance_animation(Duration::from_millis(5079)));
+        assert!(view.advance_animation(Duration::from_millis(5080)));
+        assert!(view.frame > ambient_frame);
+        assert!(view.input_energy > 0.0 && view.input_energy < 1.0);
+        view.advance_animation(Duration::from_millis(6200));
+        assert_eq!(view.input_energy, 0.0);
+        assert!(!view.advance_animation(Duration::from_millis(6280)));
+        view.focused = false;
+        assert!(!view.advance_animation(Duration::from_secs(7)));
+        view.focused = true;
+        assert!(view.advance_animation(Duration::from_secs(8)));
+        view.motion = false;
+        let still = view.frame;
+        view.key(key(KeyCode::Char('b')));
+        assert_eq!(view.input_energy, 0.0);
+        assert!(!view.advance_animation(Duration::from_secs(9)));
+        assert_eq!(view.frame, still);
+        // Accessibility pauses ornament; the actual elapsed operation clock remains useful.
+        view.begin_operation();
+        assert!(view.advance_animation(Duration::from_secs(10)));
+        assert_eq!(view.operation_ms, 1000);
+        view.settle();
+        view.notify("Saved");
+        assert!(view.advance_animation(Duration::from_secs(15)));
+        assert!(view.notice.is_none());
         for value in ["1", "true", "TRUE", "yes", "on"] {
             assert!(reduced_motion(Some(value)));
         }
@@ -866,7 +1027,7 @@ mod tests {
         let mut view = View::new(&h, models).unwrap();
         for (function, expected) in [
             (2, "/model demo"),
-            (3, "/effort high"),
+            (3, "/effort low"),
             (4, "/mode polyvagal"),
         ] {
             view.key(key(KeyCode::F(function)));
@@ -882,9 +1043,37 @@ mod tests {
         view.models.clear();
         view.key(key(KeyCode::F(2)));
         assert!(view.key(key(KeyCode::Enter)).is_none());
+        view.key(key(KeyCode::Esc));
         view.key(key(KeyCode::F(3)));
         assert_eq!(view.options(), vec!["default"]);
         assert_eq!(view.key(key(KeyCode::Enter)).unwrap(), "/effort default");
+    }
+
+    #[tokio::test]
+    async fn picker_search_and_paste_preserve_drafts_and_busy_settings_are_explained() {
+        let (_dir, h, models) = fixture();
+        let mut view = View::new(&h, models).unwrap();
+        view.paste("An unsent 猫 draft");
+        let draft = view.input.clone();
+        view.key(key(KeyCode::F(4)));
+        view.paste("JUN\n");
+        assert_eq!(view.query, "JUN");
+        assert_eq!(view.options(), vec!["jungian"]);
+        assert_eq!(view.input, draft);
+        view.key(key(KeyCode::Char('x')));
+        assert!(view.options().is_empty());
+        assert!(view.key(key(KeyCode::Enter)).is_none());
+        view.key(key(KeyCode::Backspace));
+        assert_eq!(
+            view.key(key(KeyCode::Enter)).as_deref(),
+            Some("/mode jungian")
+        );
+        assert_eq!(view.input, draft);
+        view.begin_operation();
+        view.key(key(KeyCode::F(2)));
+        assert!(view.picker.is_none());
+        assert!(view.notice.as_ref().unwrap().contains("current turn"));
+        assert_eq!(view.input, draft);
     }
 
     #[tokio::test]
@@ -923,7 +1112,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(text.contains("KURU"));
-        assert!(text.contains("Active parts"));
+        assert!(text.contains("PARTS /"));
         assert!(text.contains("Completed task"));
         view.picker = Some(Picker::Models);
         terminal.draw(|f| draw(f, &view)).unwrap();

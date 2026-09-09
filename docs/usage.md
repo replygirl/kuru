@@ -3,7 +3,7 @@
 Run `kuru --provider demo` for the offline terminal interface. Choose the
 `codex` provider after `kuru login`, or set `OPENAI_API_KEY` and select
 `--provider responses`. The selected model and effort are visible in the
-terminal status area; `kuru models` prints the provider's current catalog.
+composer beside their shortcuts; `kuru models` prints the provider's current catalog.
 
 ## Terminal controls
 
@@ -12,7 +12,7 @@ terminal status area; `kuru models` prints the provider's current catalog.
 | Enter | Send the input |
 | Alt+Enter | Insert a newline |
 | F2 / F3 / F4 | Select model / effort / framework |
-| F6 | Toggle animation / reduced motion |
+| Type / paste in a picker | Filter the available choices |
 | Escape | Close a picker or cancel active work |
 | Ctrl+C | Cancel active work; quit while idle |
 | Page Up / Page Down | Scroll the transcript |
@@ -42,11 +42,23 @@ memberships beside the conversation. Narrow panes prioritize chat and the editor
 The activity feed shows peer routing and phase changes without printing private
 peer messages or state notes.
 
-The welcome animation settles after four seconds. During work, small activity
-indicators animate at a maximum of 12.5 frames per second; an idle screen repaints
-only for changes. F6 disables motion for the current TUI. To start with reduced
-motion, use `KURU_REDUCED_MOTION=1 kuru`. State labels and keyboard controls work
-with motion disabled, and the interface needs no special icon font.
+Each framework has its own portrait: IFS orbits, polyvagal flows, a Freudian
+triangle and a Jungian rosette. Quiet ASCII contours animate while the pane has
+focus, at up to four frames per second. Typing adds a short ripple; editing and
+active work can redraw at up to 12.5 frames per second. Motion stays on by default.
+`KURU_REDUCED_MOTION=1 kuru` is an accessibility startup override that makes
+ornament static. The actual operation timer still updates. No special icon font
+is required.
+
+F2, F3 and F4 display the current value beside its shortcut in the composer.
+Pickers accept typed or pasted filters and keep your unsent draft. F4 previews
+the selected framework in wider panes; Enter applies it. The effort picker always
+includes `default`, which clears an explicit effort selection. Choices are saved
+for the current project and survive quit/relaunch. A new launch opens a new
+conversation; `--resume` restores an existing one. See [configuration precedence](configuration.md)
+for how temporary command-line and explicit configuration overrides interact with
+remembered choices.
+
 See [terminal design](interface.md) for the visual system and its implementation.
 
 ## Scripted conversations and sessions

@@ -261,3 +261,50 @@ fn real_pty_accepts_chat_navigation_commands_and_restores_terminal() {
     let sessions: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
     assert!(sessions.as_array().unwrap().iter().any(|s|s["label"]=="hello from a terminal" && s["turns"].as_u64().unwrap_or(0)>=1));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_turn() {
+    let env = Sandbox::new();
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(include_str!("fixtures/cancellation_smoke.py"))
+        .arg(env!("CARGO_BIN_EXE_kuru"))
+        .arg(&env.project)
+        .arg(&env.data)
+        .env("XDG_CONFIG_HOME", env.root.path().join("config"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sessions: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
+    assert_eq!(sessions.as_array().unwrap().len(), 1);
+    assert_eq!(sessions[0]["turns"], 1);
+    let session = sessions[0]["id"].as_str().unwrap();
+    let memory = kuru_core::MemoryStore::open(&env.data.join("memory.sqlite3")).unwrap();
+    let harness = kuru_runtime::Harness::new(
+        kuru_core::Config {
+            provider: "demo".into(),
+            ..kuru_core::Config::default()
+        },
+        &env.project,
+        memory,
+        std::sync::Arc::new(kuru_connectors::DemoProvider),
+        Some(session),
+    )
+    .unwrap();
+    let history = harness.history().unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|message| message.role == "user" && message.content == "Next thought")
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|message| message.content.contains("LATE_RESPONSE_MUST_STAY_ABSENT"))
+    );
+}

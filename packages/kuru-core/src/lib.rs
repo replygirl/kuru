@@ -8,7 +8,9 @@ mod framework;
 mod memory;
 mod types;
 
-pub use config::{Config, McpConfig, load_instructions};
+pub use config::{
+    Config, McpConfig, ModelPreference, ProjectPreferences, SelectionOverrides, load_instructions,
+};
 pub use framework::{Framework, Mode, Part, Relationship, RelationshipKind};
 pub use memory::MemoryStore;
 pub use types::{Completion, CompletionRequest, Message, ModelInfo, ToolCall, ToolSpec};

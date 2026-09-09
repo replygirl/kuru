@@ -1,6 +1,45 @@
 # Verification record
 
-## Visual update
+## Living interface and persistent choices
+
+The second 2026-09-09 interface pass passed `mise run check`: **145 Rust tests**,
+**11 installer tests**, and **97.63% workspace line coverage** (6797/6962).
+The explicit frame-cost profile is separate from those 145 tests and passed too.
+Clippy with warnings denied, formatting, tooling invariants, strict cospec
+validation and managed-file drift checks all passed. No dependencies changed.
+
+- Four actual PTY launches verify slash-command and F2/F3/F4 choices, fresh-process
+  restoration, cleared effort and a real SQLite rejection of the transaction's
+  final write. Additional tests cover provider pairs, invocation precedence,
+  canonical path/symlink scope, project isolation and session resumption.
+- The terminal smoke test observes ambient output after the old four-second
+  cutoff, no idle animation under the startup override, focus pause/resume,
+  navigation, paste, resize, chat and restored terminal attributes.
+- A delayed local HTTP provider and real terminal verify cancellation, busy
+  settings feedback, preserved drafts, rejection of late responses and successful
+  subsequent work. It reconstructs terminal cells for assertions because diffs
+  omit unchanged letters and spaces.
+- Nine visual integration tests and four scene tests check distinct portraits,
+  truthful peer routes/relationships, fixed labels and caret during animation,
+  compact controls, long future model/effort strings, selectors, Unicode editing,
+  narrow bounds, styled replies and error states. Actual colored Ratatui cell
+  exports were inspected for all four frameworks and interaction states.
+- At 140×50, 200-frame unoptimized profiles measured **1.212 ms/frame** for the
+  welcome, **2.256 ms/frame** for a 500-entry conversation and **2.726 ms/frame**
+  with its mode picker open. These are local render measurements, not provider
+  latency or cross-platform performance guarantees. Ambient scheduling is capped
+  at 4 FPS; editing and active work at 12.5 FPS.
+- The final OpenAI-backed build was relaunched in the existing cmux
+  `Kuru · new design` surface using the same project and preview data store.
+  Temporary visual-review browser tabs were closed. External provider completion
+  behavior was unchanged in this pass; the live inference checks below remain
+  the earlier baseline.
+
+Review artifacts: `KURU_VISUAL_ARTIFACTS=/tmp/kuru-visual mise exec -- cargo test
+-p kuru --test visual --locked`. The explicit profile command is documented in
+[terminal design](interface.md).
+
+## First visual update
 
 The 2026-09-09 design update passed `mise run check` with **127 Rust tests**,
 **11 installer tests** and **97.62% workspace line coverage** (5997/6143), including

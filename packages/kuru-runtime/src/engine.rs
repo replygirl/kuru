@@ -8,8 +8,8 @@ use anyhow::{Context, Result, bail, ensure};
 use futures::future::join_all;
 use kuru_connectors::{Provider, ToolHost, a2a_send};
 use kuru_core::{
-    Completion, Config, Framework, MemoryStore, Message, Mode, Part, Relationship,
-    RelationshipKind, ToolCall, ToolSpec, load_instructions,
+    Completion, Config, Framework, MemoryStore, Message, Mode, ModelPreference, Part,
+    ProjectPreferences, Relationship, RelationshipKind, ToolCall, ToolSpec, load_instructions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -190,6 +190,9 @@ impl Harness {
             .transpose()?
             .unwrap_or_default())
     }
+    pub fn load_preferences(memory: &MemoryStore, cwd: &Path) -> Result<ProjectPreferences> {
+        read_preferences(memory, &project_scope(cwd)?)
+    }
     pub fn namespace(&self, id: &str) -> String {
         format!("{}/{}/identity/{id}", self.scope, self.config.mode)
     }
@@ -271,10 +274,13 @@ impl Harness {
         config.validate()?;
         let topology = read_topology(&self.memory, &self.scope, mode)?;
         validate_topology(&topology, &config)?;
+        let mut preferences = read_preferences(&self.memory, &self.scope)?;
+        preferences.mode = Some(mode);
+        let update = self.preference_update(&preferences)?;
         let previous_config = std::mem::replace(&mut self.config, config);
         let previous_topology = std::mem::replace(&mut self.topology, topology);
         let previous_mode = std::mem::replace(&mut self.session.mode, mode);
-        if let Err(error) = self.save() {
+        if let Err(error) = self.save_with(vec![update]) {
             self.config = previous_config;
             self.topology = previous_topology;
             self.session.mode = previous_mode;
@@ -283,6 +289,38 @@ impl Harness {
         self.actors.clear();
         self.sync_actors();
         Ok(())
+    }
+
+    /// Commit the provider-specific pair before exposing the new live choice.
+    /// Callers validate advertised effort capabilities; Config validates shape.
+    pub fn set_model(&mut self, model: impl Into<String>, effort: Option<String>) -> Result<()> {
+        let mut config = self.config.clone();
+        config.model = model.into();
+        config.effort = effort;
+        config.validate()?;
+        let mut preferences = read_preferences(&self.memory, &self.scope)?;
+        preferences.providers.insert(
+            config.provider.clone(),
+            ModelPreference {
+                model: config.model.clone(),
+                effort: config.effort.clone(),
+            },
+        );
+        self.save_with(vec![self.preference_update(&preferences)?])?;
+        self.config = config;
+        Ok(())
+    }
+
+    pub fn set_effort(&mut self, effort: Option<String>) -> Result<()> {
+        self.set_model(self.config.model.clone(), effort)
+    }
+
+    fn preference_update(&self, preferences: &ProjectPreferences) -> Result<(String, Value)> {
+        preferences.validate()?;
+        Ok((
+            format!("{}/preferences", self.scope),
+            serde_json::to_value(preferences)?,
+        ))
     }
 
     pub fn resolve(&self, identity: &str) -> Result<String> {
@@ -890,6 +928,19 @@ fn read_topology(memory: &MemoryStore, scope: &str, mode: Mode) -> Result<Topolo
                 focus: None,
             })
         })
+}
+
+fn read_preferences(memory: &MemoryStore, scope: &str) -> Result<ProjectPreferences> {
+    let preferences: ProjectPreferences = memory
+        .get(&format!("{scope}/preferences"))?
+        .map(serde_json::from_value)
+        .transpose()
+        .context("invalid saved project preferences")?
+        .unwrap_or_default();
+    preferences
+        .validate()
+        .context("invalid saved project preferences")?;
+    Ok(preferences)
 }
 pub(crate) fn validate_topology(topology: &Topology, config: &Config) -> Result<()> {
     let active = topology
