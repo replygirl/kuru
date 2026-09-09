@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 use tokio::sync::Mutex;
 
@@ -130,12 +130,22 @@ pub enum Step {
 pub struct StdioFixture {
     directory: tempfile::TempDir,
     pub path: PathBuf,
+    // The fixture directory must disappear before its containing artifact.
+    _binary: Arc<CompiledPeer>,
 }
 impl StdioFixture {
     pub fn new(steps: impl IntoIterator<Item = Step>) -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        static BINARY: OnceLock<FixtureCache> = OnceLock::new();
+        Self::with_cache(steps, BINARY.get_or_init(FixtureCache::default))
+    }
+
+    fn with_cache(steps: impl IntoIterator<Item = Step>, cache: &FixtureCache) -> Self {
+        let binary = fixture_binary(cache);
+        // Keeping both paths on the same filesystem makes linking reliable even
+        // when the test process's workspace and temporary directory differ.
+        let directory = tempfile::tempdir_in(binary.directory.path()).unwrap();
         let path = directory.path().join("fixture");
-        std::fs::write(&path, fixture_binary()).unwrap();
+        std::fs::hard_link(&binary.path, &path).unwrap();
         let plan: String = steps
             .into_iter()
             .map(|step| match step {
@@ -150,12 +160,11 @@ impl StdioFixture {
             })
             .collect();
         std::fs::write(path.with_extension("plan"), plan).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            directory,
+            path,
+            _binary: binary,
         }
-        Self { directory, path }
     }
     pub fn command(&self) -> &str {
         self.path.to_str().unwrap()
@@ -194,34 +203,53 @@ impl StdioFixture {
     }
 }
 
-fn fixture_binary() -> &'static [u8] {
-    static BINARY: OnceLock<Vec<u8>> = OnceLock::new();
-    BINARY.get_or_init(|| {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("stdio_peer.rs");
-        let binary = directory.path().join("stdio_peer");
-        std::fs::write(&source, include_str!("../tests/fixtures/stdio_peer.rs")).unwrap();
-        let result =
-            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-                .args([
-                    "--edition=2024",
-                    "--forbid",
-                    "unsafe_code",
-                    "-C",
-                    "opt-level=1",
-                ])
-                .arg(&source)
-                .arg("-o")
-                .arg(&binary)
-                .output()
-                .expect("compile the native connector test peer with the Rust toolchain");
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        std::fs::read(binary).unwrap()
-    })
+struct CompiledPeer {
+    directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+type FixtureCache = StdMutex<Weak<CompiledPeer>>;
+
+fn fixture_binary(cache: &FixtureCache) -> Arc<CompiledPeer> {
+    let mut cached = cache.lock().unwrap();
+    if let Some(binary) = cached.upgrade() {
+        return binary;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("stdio_peer.rs");
+    let path = directory.path().join("stdio_peer");
+    std::fs::write(&source, include_str!("../tests/fixtures/stdio_peer.rs")).unwrap();
+    // Only the compiler opens executable bytes for writing. Wait for it to exit
+    // before publishing paths: the multithreaded test process never holds a
+    // writable executable descriptor that another fork could inherit (ETXTBSY).
+    let result =
+        std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .args([
+                "--edition=2024",
+                "--forbid",
+                "unsafe_code",
+                "-C",
+                "opt-level=1",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&path)
+            .output()
+            .expect("compile the native connector test peer with the Rust toolchain");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+    }
+    let binary = Arc::new(CompiledPeer { directory, path });
+    // A static strong reference would prevent TempDir cleanup at process exit.
+    *cached = Arc::downgrade(&binary);
+    binary
 }
 
 pub fn request() -> kuru_core::CompletionRequest {
@@ -239,5 +267,133 @@ pub fn request() -> kuru_core::CompletionRequest {
             description: "Read".into(),
             parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         }],
+    }
+}
+
+#[cfg(unix)]
+mod tests {
+    use super::{FixtureCache, StdioFixture, Step};
+    use serde_json::{Value, json};
+    use std::{os::unix::fs::MetadataExt, process::Stdio, time::Duration};
+    use tokio::{
+        io::AsyncReadExt, io::AsyncWriteExt, process::Command, sync::Barrier, time::timeout,
+    };
+
+    async fn exchange(fixture: &StdioFixture, request: Value, started: &Barrier) -> Value {
+        let mut child = Command::new(&fixture.path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the native fixture through its own executable path");
+        let mut input = child.stdin.take().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let mut errors = child.stderr.take().unwrap();
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let result = timeout(Duration::from_secs(10), async {
+            // Both subprocesses must be alive before either receives its input.
+            started.wait().await;
+            input.write_all(format!("{request}\n").as_bytes()).await?;
+            drop(input);
+            tokio::try_join!(
+                child.wait(),
+                output.read_to_string(&mut stdout),
+                errors.read_to_string(&mut stderr),
+            )
+        })
+        .await;
+        let status = match result {
+            Ok(Ok((status, _, _))) => status,
+            failure => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!("native fixture failed: {failure:?}; stdout={stdout:?}; stderr={stderr:?}");
+            }
+        };
+        assert!(
+            status.success(),
+            "native fixture failed: {status}; {stderr}"
+        );
+        serde_json::from_str(&stdout).expect("the fixture must return its exact JSON plan")
+    }
+
+    #[tokio::test]
+    async fn stdio_fixtures_share_executable_and_isolate_concurrent_plans() {
+        let first = StdioFixture::new([
+            Step::Read,
+            Step::Write(json!({"result": "first"})),
+            Step::Eof,
+        ]);
+        let second = StdioFixture::new([
+            Step::Read,
+            Step::Write(json!({"result": "second"})),
+            Step::Eof,
+        ]);
+        let first_metadata = std::fs::metadata(&first.path).unwrap();
+        let second_metadata = std::fs::metadata(&second.path).unwrap();
+        assert_eq!(
+            (first_metadata.dev(), first_metadata.ino()),
+            (second_metadata.dev(), second_metadata.ino()),
+            "fixtures must share an immutable executable instead of opening new executables for writing",
+        );
+        assert_eq!(first_metadata.mode() & 0o222, 0);
+        let first_request = json!({"id": 1, "method": "first"});
+        let second_request = json!({"id": 2, "method": "second"});
+        let started = Barrier::new(2);
+        let (first_reply, second_reply) = tokio::join!(
+            exchange(&first, first_request.clone(), &started),
+            exchange(&second, second_request.clone(), &started),
+        );
+        assert_eq!(first_reply, json!({"result": "first"}));
+        assert_eq!(second_reply, json!({"result": "second"}));
+        first.assert_completed(1);
+        second.assert_completed(1);
+        assert_eq!(first.conversations(), vec![vec![first_request]]);
+        assert_eq!(second.conversations(), vec![vec![second_request]]);
+    }
+
+    #[tokio::test]
+    async fn final_fixture_owner_cleans_artifact_and_cache_can_rebuild() {
+        // Global-cache owners in unrelated tests must not affect this proof.
+        let cache = FixtureCache::default();
+        let first = StdioFixture::with_cache([], &cache);
+        let second = StdioFixture::with_cache(
+            [Step::Read, Step::Write(json!("survivor")), Step::Eof],
+            &cache,
+        );
+        let artifact_directory = first._binary.directory.path().to_owned();
+        let first_directory = first.directory.path().to_owned();
+        let second_directory = second.directory.path().to_owned();
+        assert_eq!(artifact_directory, second._binary.directory.path());
+
+        drop(first);
+        assert!(!first_directory.exists());
+        assert!(artifact_directory.exists());
+        let started = Barrier::new(1);
+        assert_eq!(
+            exchange(&second, json!({"id": "survivor"}), &started).await,
+            json!("survivor"),
+        );
+        second.assert_completed(1);
+        drop(second);
+        assert!(!second_directory.exists());
+        assert!(!artifact_directory.exists());
+        assert!(cache.lock().unwrap().upgrade().is_none());
+
+        let replacement = StdioFixture::with_cache(
+            [Step::Read, Step::Write(json!("rebuilt")), Step::Eof],
+            &cache,
+        );
+        let replacement_directory = replacement._binary.directory.path().to_owned();
+        assert_eq!(
+            exchange(&replacement, json!({"id": "rebuilt"}), &started).await,
+            json!("rebuilt"),
+        );
+        replacement.assert_completed(1);
+        drop(replacement);
+        assert!(!replacement_directory.exists());
+        assert!(cache.lock().unwrap().upgrade().is_none());
     }
 }

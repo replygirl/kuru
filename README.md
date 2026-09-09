@@ -15,8 +15,8 @@ claim consciousness, reproduce a human nervous system, or provide therapy.
 ## Install from source
 
 The repository is [replygirl/kuru](https://github.com/replygirl/kuru), currently
-private while the project takes shape. Public availability is planned; no tagged
-release has been published yet. Clone with an authorized GitHub account:
+private while the project takes shape. Public availability is planned.
+Clone with an authorized GitHub account:
 
 ```sh
 gh repo clone replygirl/kuru
