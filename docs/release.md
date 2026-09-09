@@ -115,6 +115,16 @@ to work while the repository is private: download with `gh release download`,
 then install from the local directory. A release command requires a version that
 has actually been published.
 
+Release jobs inherit `MISE_LOCKED=1`, including nested package tasks. This keeps
+tool installation from extending lockfiles after source validation. The bump,
+native build and publish jobs explicitly install locked Rust/hk and disable
+automatic task-tool installation; their native subcommands do not need the notes
+toolchain. Validation, notes and docs jobs retain their package setup, with frozen
+locks. Version preparation checks for tracked setup changes before stamping, and
+the commit guard permits only Cargo.toml and Cargo.lock changes. An unexpected
+file is reported by name and must be fixed in source rather than reset or included
+in the version commit.
+
 ## Notes model and configuration
 
 `communique.toml` uses top-level `context` and `system_extra` plus `[defaults]`.

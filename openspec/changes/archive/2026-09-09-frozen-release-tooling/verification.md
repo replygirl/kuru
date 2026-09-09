@@ -1,0 +1,10 @@
+## 1. Immutable setup [critical]
+
+- [x] 1.1 @regression (agent) fresh pinned mise installation before/after frozen mode -> unlocked install in /tmp/kuru-release-setup.YYzMSD/repo added Taplo's checksum to mise.lock. Isolated mise 2026.9.3 install with --locked and forced reinstall with only MISE_LOCKED=1 both exited 0 and preserved exact lockfile bytes; installed Taplo 0.10.0 and hk 1.58.1 executed successfully. Evidence: /tmp/kuru-mise-release-repro.log, /tmp/kuru-frozen-probe-locked.log and /tmp/kuru-frozen-probe-env.log. The actual Linux job did not emit a diff; its observed implicit installs and guard failure are consistent with this reproduced cause.
+- [x] 1.2 @integration (agent) native commit guard on real tracked unrelated changes -> enhanced diagnostic regression failed before (omitted cog.toml) and passed after; the real Git/HTTP fixture confirms no additional API request occurs for the unrelated edit. Logs: /tmp/kuru-frozen-tooling-guard-before.log and /tmp/kuru-frozen-tooling-guard-after.log.
+- [x] 1.3 @integration (agent) full mise run check -> MISE_LOCKED=1 mise run check passed: 217 Rust tests, 97.55% line coverage (8867/9090), docs, format, strict lint, Actionlint and managed cospec checks. Log: /tmp/kuru-frozen-tooling-check.log.
+- [x] 1.4 @integration (agent) fresh Rust-only root task with scoped auto-install disabled -> pinned mise 2026.9.3 in a full clean clone installed only Rust 1.98.1 and hk 1.58.1; MISE_LOCKED=1 MISE_TASK_RUN_AUTO_INSTALL=false mise run release:tool -- stamp 0.1.0 exited 0. Pre/post git diff and final status stayed clean; installed-tool JSON contained only Rust/hk. Log: /tmp/kuru-frozen-lean-task.log. The earlier version subcommand probe correctly failed without Cocogitto, which belongs to the full planning toolchain; the actual bump stamp probe passed without adding it.
+
+## 2. Hosted recovery
+
+- [~] 2.1 @runtime (agent) corrected release on reviewed main -> defer: requires archived final commit, green hosted checks and continuing the authorized release; report run evidence with completion.

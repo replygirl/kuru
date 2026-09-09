@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Root aliases launch nested mise processes; freeze their lock writers too.
+  MISE_LOCKED: "1"
+
 concurrency:
   group: release
   cancel-in-progress: false
@@ -57,6 +61,8 @@ jobs:
   bump:
     needs: plan
     runs-on: ubuntu-24.04
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
     outputs:
       sha: ${{ steps.commit.outputs.sha }}
     steps:
@@ -71,6 +77,8 @@ jobs:
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      - name: Verify tool setup preserved the release source
+        run: git diff --exit-code --name-only HEAD
       - name: Stamp workspace package versions
         env:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
@@ -111,6 +119,8 @@ jobs:
 
   build:
     needs: [plan, bump, verify]
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
     strategy:
       fail-fast: false
       matrix:
@@ -188,6 +198,8 @@ jobs:
   publish:
     needs: [plan, bump, build, notes]
     runs-on: ubuntu-24.04
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
     permissions:
       contents: write
     steps:

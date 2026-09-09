@@ -558,13 +558,15 @@ async fn signed_api_commit_uses_expected_head_and_only_scoped_payloads() {
     assert!(error.contains("diverged"));
     assert!(!error.contains("private context"));
     fs::write(repo.root().join("cog.toml"), "# unrelated change\n").unwrap();
-    assert!(
+    let requests_before = server.state.lock().unwrap().calls.len();
+    assert_eq!(
         release::commit_version(repo.root(), &server.api, &head, v("0.2.0"))
             .await
             .unwrap_err()
-            .to_string()
-            .contains("unrelated")
+            .to_string(),
+        "release stamp changed unrelated files: cog.toml",
     );
+    assert_eq!(server.state.lock().unwrap().calls.len(), requests_before);
 }
 async fn comparison(repo: &Repo, base: &str, head: &str) -> Value {
     let commits = release::git(

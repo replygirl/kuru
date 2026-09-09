@@ -492,11 +492,15 @@ pub async fn commit_version(
     );
     let diff = git(root, &["diff", "HEAD", "--name-only"]).await?;
     let paths: Vec<_> = diff.lines().collect();
+    let unexpected: Vec<_> = paths
+        .iter()
+        .copied()
+        .filter(|path| !["Cargo.toml", "Cargo.lock"].contains(path))
+        .collect();
     ensure!(
-        paths
-            .iter()
-            .all(|p| ["Cargo.toml", "Cargo.lock"].contains(p)),
-        "release stamp changed unrelated files"
+        unexpected.is_empty(),
+        "release stamp changed unrelated files: {}",
+        unexpected.join(", ")
     );
     let current = api
         .required(Method::GET, &api.path("commits/main"), None)
