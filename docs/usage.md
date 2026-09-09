@@ -12,6 +12,7 @@ terminal status area; `kuru models` prints the provider's current catalog.
 | Enter | Send the input |
 | Alt+Enter | Insert a newline |
 | F2 / F3 / F4 | Select model / effort / framework |
+| F6 | Toggle animation / reduced motion |
 | Escape | Close a picker or cancel active work |
 | Ctrl+C | Cancel active work; quit while idle |
 | Page Up / Page Down | Scroll the transcript |
@@ -32,6 +33,21 @@ Supported relationship kinds are `protection`, `polarization` and `alliance`.
 Use `/parts` to find unambiguous identities; roles containing multiple members
 need a unique name or ID. The human user can inspect private memories; parts
 receive only the memory available to their own identity.
+
+## The live interface
+
+Kuru uses an ink background with distinct accents for roles, speakers and activity.
+Wide terminals show the peer constellation, current phases and relationship
+memberships beside the conversation. Narrow panes prioritize chat and the editor.
+The activity feed shows peer routing and phase changes without printing private
+peer messages or state notes.
+
+The welcome animation settles after four seconds. During work, small activity
+indicators animate at a maximum of 12.5 frames per second; an idle screen repaints
+only for changes. F6 disables motion for the current TUI. To start with reduced
+motion, use `KURU_REDUCED_MOTION=1 kuru`. State labels and keyboard controls work
+with motion disabled, and the interface needs no special icon font.
+See [terminal design](interface.md) for the visual system and its implementation.
 
 ## Scripted conversations and sessions
 

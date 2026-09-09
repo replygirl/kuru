@@ -1,5 +1,22 @@
 # Verification record
 
+## Visual update
+
+The 2026-09-09 design update passed `mise run check` with **127 Rust tests**,
+**11 installer tests** and **97.62% workspace line coverage** (5997/6143), including
+Clippy, formatting, tooling checks and strict cospec validation. No dependencies
+changed. Seven visual integration tests exercise all frameworks, real peer events,
+relationship membership, route animation, reduced motion, Markdown, long selectors,
+compact status and Unicode input. The real PTY test checks RGB output, F6, both
+motion startup modes, normal chat and terminal restoration.
+
+Actual Ratatui cell exports were visually inspected, and the OpenAI-backed build
+was opened in the cmux `Kuru · new design` tab with isolated preview state.
+`KURU_VISUAL_ARTIFACTS=/tmp/kuru-visual mise exec -- cargo test -p kuru --test visual`
+regenerates HTML/text review artifacts from the actual renderer.
+
+## Initial harness baseline
+
 Validated locally on macOS arm64 on 2026-09-09 with the versions recorded in
 [the dependency audit](dependencies.md).
 

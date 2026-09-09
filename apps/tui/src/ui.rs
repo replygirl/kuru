@@ -1,7 +1,8 @@
 use std::{
+    collections::BTreeMap,
     io::{self, IsTerminal},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, ensure};
@@ -10,15 +11,12 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use kuru_core::{Mode, ModelInfo};
+use kuru_core::{Mode, ModelInfo, Relationship};
 use kuru_runtime::{Event, Harness};
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    text::Line,
 };
 use tokio::{
     sync::{Mutex, broadcast, mpsc},
@@ -28,7 +26,10 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::cli::validate_effort;
 
-const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /dream · /undo-dream · /quit";
+mod render;
+pub use render::draw;
+
+const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · F6 motion · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /dream · /undo-dream · /quit";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Picker {
@@ -55,6 +56,13 @@ pub struct View {
     pub selected: usize,
     pub models: Vec<ModelInfo>,
     pub scroll: u16,
+    pub frame: u64,
+    pub motion: bool,
+    pub part_activity: BTreeMap<String, String>,
+    pub relationships: Vec<Relationship>,
+    pub focus: Option<String>,
+    pub speaker_id: String,
+    pub routes: Vec<(String, String)>,
 }
 
 impl View {
@@ -90,7 +98,73 @@ impl View {
             selected: 0,
             models,
             scroll: 0,
+            frame: 0,
+            motion: !reduced_motion(std::env::var("KURU_REDUCED_MOTION").ok().as_deref()),
+            part_activity: BTreeMap::new(),
+            relationships: live_relationships(harness),
+            focus: harness.topology.focus.as_ref().map(|f| f.id.clone()),
+            speaker_id: String::new(),
+            routes: vec![],
         })
+    }
+
+    /// Advance only while working or during the finite welcome sequence.
+    /// Elapsed time is supplied by the loop so rendering remains deterministic.
+    pub fn advance_animation(&mut self, elapsed: Duration) -> bool {
+        let animated = self.motion
+            && (self.busy || (self.transcript.is_empty() && elapsed < Duration::from_secs(4)));
+        let next = (elapsed.as_millis() / 80).min(u64::MAX as u128) as u64;
+        if animated && next != self.frame {
+            self.frame = next;
+            return true;
+        }
+        false
+    }
+
+    fn refresh(&mut self, harness: &Harness) {
+        self.mode = harness.config.mode.to_string();
+        self.model = harness.config.model.clone();
+        self.effort = harness
+            .config
+            .effort
+            .clone()
+            .unwrap_or_else(|| "default".into());
+        self.parts = harness
+            .topology
+            .parts
+            .iter()
+            .filter(|p| p.active)
+            .map(|p| (p.id.clone(), format!("{} · {}", p.name, p.role)))
+            .collect();
+        self.relationships = live_relationships(harness);
+        self.focus = harness.topology.focus.as_ref().map(|f| f.id.clone());
+        self.part_activity
+            .retain(|id, _| self.parts.iter().any(|(part, _)| part == id));
+        self.routes.retain(|(from, to)| {
+            self.parts.iter().any(|(id, _)| id == from) && self.parts.iter().any(|(id, _)| id == to)
+        });
+    }
+
+    fn actor_name(&self, id: &str) -> String {
+        self.parts
+            .iter()
+            .find(|(part, _)| part == id)
+            .map(|(_, name)| name.split(" · ").next().unwrap_or(name).to_owned())
+            .or_else(|| {
+                self.relationships
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.kind.to_string())
+            })
+            .unwrap_or_else(|| id.chars().take(16).collect())
+    }
+
+    fn settle(&mut self) {
+        for phase in self.part_activity.values_mut() {
+            if phase != "error" {
+                *phase = "idle".into();
+            }
+        }
     }
 
     pub fn options(&self) -> Vec<String> {
@@ -111,8 +185,66 @@ impl View {
         }
     }
 
+    fn open_picker(&mut self, picker: Picker) {
+        let current = match picker {
+            Picker::Models => &self.model,
+            Picker::Efforts => &self.effort,
+            Picker::Modes => &self.mode,
+        }
+        .clone();
+        self.picker = Some(picker);
+        self.selected = self
+            .options()
+            .iter()
+            .position(|option| option == &current)
+            .unwrap_or(0);
+    }
+
     pub fn event(&mut self, event: Event) {
+        if matches!(
+            event.kind.as_str(),
+            "active" | "idle" | "speaker" | "tool" | "error"
+        ) {
+            self.part_activity
+                .insert(event.actor.clone(), event.kind.clone());
+        }
+        let mut detail = event.detail.clone();
+        if event.kind == "peer" {
+            // Show routing, never the private message contained in the envelope.
+            detail = "peer message".into();
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.detail)
+                && let Some(to) = value
+                    .pointer("/params/message/metadata/recipient")
+                    .and_then(|v| v.as_str())
+            {
+                detail = format!("→ {}", self.actor_name(to));
+                self.routes.push((event.actor.clone(), to.into()));
+                if self.routes.len() > 6 {
+                    self.routes.remove(0);
+                }
+            }
+        } else if event.kind == "relationship" {
+            detail = "relationship updated".into();
+            if let Ok(relation) = serde_json::from_str::<Relationship>(&event.detail) {
+                detail = format!(
+                    "{} · {}",
+                    relation.kind,
+                    relation
+                        .members
+                        .iter()
+                        .map(|id| self.actor_name(id))
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                );
+                self.focus = Some(relation.id.clone());
+                self.relationships.retain(|r| r.id != relation.id);
+                self.relationships.push(relation);
+            }
+        } else if event.kind == "state" {
+            detail = "modeled state updated".into();
+        }
         if event.kind == "speaker" {
+            self.speaker_id = event.actor.clone();
             self.speaker = self
                 .parts
                 .iter()
@@ -129,13 +261,13 @@ impl View {
         if event.kind == "response" {
             self.transcript.push((self.speaker.clone(), event.detail));
         } else {
-            self.status = format!(
-                "{} · {}",
-                event.kind,
-                event.actor.chars().take(8).collect::<String>()
-            );
-            self.activity
-                .push(format!("{} {}", self.status, event.detail));
+            self.status = format!("{} · {}", event.kind, self.actor_name(&event.actor));
+            let detail: String = detail
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(140)
+                .collect();
+            self.activity.push(format!("{} · {}", self.status, detail));
             if self.activity.len() > 100 {
                 self.activity.remove(0);
             }
@@ -148,6 +280,11 @@ impl View {
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Some(if self.busy { "/cancel" } else { "/quit" }.into());
+        }
+        if key.code == KeyCode::F(6) {
+            self.motion = !self.motion;
+            self.frame = 0;
+            return None;
         }
         if self.picker.is_some() {
             let len = self.options().len();
@@ -170,16 +307,13 @@ impl View {
         }
         match key.code {
             KeyCode::F(2) => {
-                self.picker = Some(Picker::Models);
-                self.selected = 0;
+                self.open_picker(Picker::Models);
             }
             KeyCode::F(3) => {
-                self.picker = Some(Picker::Efforts);
-                self.selected = 0;
+                self.open_picker(Picker::Efforts);
             }
             KeyCode::F(4) => {
-                self.picker = Some(Picker::Modes);
-                self.selected = 0;
+                self.open_picker(Picker::Modes);
             }
             KeyCode::Esc if self.busy => return Some("/cancel".into()),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
@@ -236,188 +370,26 @@ impl View {
     }
 }
 
-pub fn draw(frame: &mut ratatui::Frame<'_>, view: &View) {
-    let area = frame.area();
-    let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Min(3),
-        Constraint::Length(5),
-        Constraint::Length(1),
-    ])
-    .split(area);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " KURU ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(
-                "  {} · {} · {}",
-                view.mode, view.model, view.effort
-            )),
-        ])),
-        rows[0],
-    );
-    let cols = Layout::horizontal(if area.width >= 90 {
-        vec![Constraint::Min(40), Constraint::Length(32)]
-    } else {
-        vec![Constraint::Min(10), Constraint::Length(0)]
-    })
-    .split(rows[1]);
-    let mut lines = vec![];
-    if view.transcript.is_empty() {
-        lines.push(Line::from(
-            "A conversation with a pool of persistent peers.",
-        ));
-        lines.push(Line::from(
-            "Type a task, or use /help to explore the parts.",
-        ));
-    }
-    for (speaker, text) in &view.transcript {
-        lines.push(Line::from(Span::styled(
-            speaker,
-            Style::default()
-                .fg(if speaker == "user" {
-                    Color::LightCyan
-                } else {
-                    Color::LightGreen
-                })
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.extend(text.lines().map(|line| Line::from(line.to_owned())));
-        lines.push(Line::default());
-    }
-    let width = cols[0].width.saturating_sub(2).max(1) as usize;
-    let line_count: usize = lines
+fn reduced_motion(value: Option<&str>) -> bool {
+    value.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn live_relationships(harness: &Harness) -> Vec<Relationship> {
+    harness
+        .topology
+        .relationships
         .iter()
-        .map(|line| line.width().div_ceil(width).max(1))
-        .sum();
-    let offset = line_count
-        .saturating_sub(cols[0].height.saturating_sub(2) as usize)
-        .min(u16::MAX as usize) as u16;
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((offset.saturating_sub(view.scroll), 0))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Conversation "),
-            ),
-        cols[0],
-    );
-    if cols[1].width > 0 {
-        let sidebar = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(cols[1]);
-        let parts = view
-            .parts
-            .iter()
-            .map(|(id, name)| {
-                ListItem::new(format!(
-                    "{name}\n{}",
-                    id.chars().take(8).collect::<String>()
-                ))
+        .filter(|r| {
+            r.members.iter().all(|id| {
+                harness
+                    .topology
+                    .parts
+                    .iter()
+                    .any(|p| p.active && p.id == *id)
             })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            List::new(parts).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Active parts "),
-            ),
-            sidebar[0],
-        );
-        let activity = view
-            .activity
-            .iter()
-            .rev()
-            .take(sidebar[1].height.saturating_sub(2) as usize)
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        frame.render_widget(
-            Paragraph::new(activity)
-                .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).title(" Activity ")),
-            sidebar[1],
-        );
-    }
-    let (input_lines, cursor_x, cursor_y) = editor_layout(
-        &view.input,
-        view.cursor,
-        rows[2].width.saturating_sub(2).max(1) as usize,
-    );
-    let input_scroll = cursor_y.saturating_sub(rows[2].height.saturating_sub(3) as usize);
-    frame.render_widget(
-        Paragraph::new(input_lines)
-            .scroll((input_scroll.min(u16::MAX as usize) as u16, 0))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::LightCyan))
-                    .title(if view.busy {
-                        " Compose next message · Esc cancels "
-                    } else {
-                        " Message · Enter sends · Alt+Enter newline "
-                    }),
-            ),
-        rows[2],
-    );
-    frame.render_widget(
-        Paragraph::new(format!(
-            " {} │ {} │ {} │ F2 model · F3 effort · F4 mode",
-            view.status,
-            view.speaker,
-            view.session.chars().take(8).collect::<String>()
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
-        rows[3],
-    );
-    if let Some(picker) = &view.picker {
-        let options = view.options();
-        let popup = centered(
-            area,
-            60.min(area.width),
-            (options.len() as u16 + 2).min(area.height),
-        );
-        frame.render_widget(Clear, popup);
-        let items = options
-            .iter()
-            .enumerate()
-            .map(|(i, label)| {
-                ListItem::new(label.clone()).style(if i == view.selected {
-                    Style::default().bg(Color::LightCyan).fg(Color::Black)
-                } else {
-                    Style::default()
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut state = ListState::default().with_selected(Some(view.selected));
-        frame.render_stateful_widget(
-            List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {picker:?} · Enter selects ")),
-            ),
-            popup,
-            &mut state,
-        );
-    } else {
-        frame.set_cursor_position((
-            rows[2]
-                .x
-                .saturating_add(1 + cursor_x as u16)
-                .min(area.right().saturating_sub(1)),
-            rows[2]
-                .y
-                .saturating_add(1 + cursor_y.saturating_sub(input_scroll) as u16)
-                .min(area.bottom().saturating_sub(1)),
-        ));
-    }
+        })
+        .cloned()
+        .collect()
 }
 
 fn editor_layout(input: &str, cursor: usize, width: usize) -> (Vec<Line<'static>>, usize, usize) {
@@ -452,15 +424,6 @@ fn editor_layout(input: &str, cursor: usize, width: usize) -> (Vec<Line<'static>
         lines.into_iter().map(Line::from).collect(),
         position.0,
         position.1,
-    )
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
     )
 }
 
@@ -507,15 +470,28 @@ where
     let mut job: Option<JoinHandle<()>> = None;
     let mut quit_pending = false;
     let mut generation = 0u64;
+    let started = Instant::now();
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|frame| draw(frame, &view))
-            .map_err(|e| anyhow::anyhow!("terminal draw: {e}"))?;
+        loop {
+            match events.try_recv() {
+                Ok(event) => {
+                    view.event(event);
+                    dirty = true;
+                }
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    view.activity.push(format!("{n} activity events omitted"));
+                    dirty = true;
+                }
+                Err(_) => break,
+            }
+        }
         while let Ok((completed_generation, message)) = rx.try_recv() {
             if completed_generation != generation {
                 continue;
             }
             view.busy = false;
+            dirty = true;
             job = None;
             if quit_pending {
                 message?;
@@ -534,27 +510,23 @@ where
                 }
             }
             let h = harness.lock().await;
-            view.mode = h.config.mode.to_string();
-            view.model = h.config.model.clone();
-            view.effort = h.config.effort.clone().unwrap_or_else(|| "default".into());
-            view.parts = h
-                .topology
-                .parts
-                .iter()
-                .filter(|p| p.active)
-                .map(|p| (p.id.clone(), format!("{} · {}", p.name, p.role)))
-                .collect();
+            view.refresh(&h);
+            view.settle();
         }
-        loop {
-            match events.try_recv() {
-                Ok(event) => view.event(event),
-                Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    view.activity.push(format!("{n} activity events omitted"))
-                }
-                Err(_) => break,
-            }
+        dirty |= view.advance_animation(started.elapsed());
+        if dirty {
+            terminal
+                .draw(|frame| draw(frame, &view))
+                .map_err(|e| anyhow::anyhow!("terminal draw: {e}"))?;
+            dirty = false;
         }
-        if event::poll(Duration::from_millis(30))? {
+        let wait = if view.busy || (view.motion && started.elapsed() < Duration::from_secs(4)) {
+            Duration::from_millis(25)
+        } else {
+            Duration::from_millis(100)
+        };
+        if event::poll(wait)? {
+            dirty = true;
             let command = match event::read()? {
                 TerminalEvent::Key(key) => view.key(key),
                 TerminalEvent::Paste(text) => {
@@ -574,6 +546,8 @@ where
                     generation += 1;
                     quit_pending = false;
                     view.busy = false;
+                    view.settle();
+                    view.refresh(&*harness.lock().await);
                     view.status = "Cancelled".into();
                 } else if command == "/quit" {
                     if let Some(job) = job.take() {
@@ -581,6 +555,8 @@ where
                         let _ = job.await;
                     }
                     view.busy = true;
+                    view.part_activity.clear();
+                    view.routes.clear();
                     view.status = "Closing session".into();
                     quit_pending = true;
                     generation += 1;
@@ -599,18 +575,15 @@ where
                     view.transcript.push(("help".into(), HELP.into()));
                 } else if !view.busy {
                     if command == "/model" {
-                        view.picker = Some(Picker::Models);
-                        view.selected = 0;
+                        view.open_picker(Picker::Models);
                         continue;
                     }
                     if command == "/effort" {
-                        view.picker = Some(Picker::Efforts);
-                        view.selected = 0;
+                        view.open_picker(Picker::Efforts);
                         continue;
                     }
                     if command == "/mode" {
-                        view.picker = Some(Picker::Modes);
-                        view.selected = 0;
+                        view.open_picker(Picker::Modes);
                         continue;
                     }
                     if !command.starts_with('/') {
@@ -618,6 +591,14 @@ where
                         view.scroll = 0;
                     }
                     view.busy = true;
+                    view.status = if command.starts_with('/') {
+                        "Updating session"
+                    } else {
+                        "Listening to the parts"
+                    }
+                    .into();
+                    view.part_activity.clear();
+                    view.routes.clear();
                     generation += 1;
                     let harness = harness.clone();
                     let tx = tx.clone();
@@ -730,6 +711,100 @@ mod tests {
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn animation_has_a_fixed_cadence_finite_welcome_and_static_reduced_mode() {
+        let (_dir, h, models) = fixture();
+        let mut view = View::new(&h, models).unwrap();
+        view.motion = true;
+        assert!(!view.advance_animation(Duration::from_millis(79)));
+        assert!(view.advance_animation(Duration::from_millis(80)));
+        assert_eq!(view.frame, 1);
+        assert!(!view.advance_animation(Duration::from_millis(159)));
+        assert!(!view.advance_animation(Duration::from_secs(4)));
+        assert_eq!(view.frame, 1);
+        view.transcript.push(("user".into(), "a task".into()));
+        assert!(!view.advance_animation(Duration::from_secs(5)));
+        view.busy = true;
+        assert!(view.advance_animation(Duration::from_secs(5)));
+        view.key(key(KeyCode::F(6)));
+        assert!(!view.motion);
+        assert_eq!(view.frame, 0);
+        assert!(!view.advance_animation(Duration::from_secs(6)));
+        assert_eq!(view.key(key(KeyCode::Esc)).as_deref(), Some("/cancel"));
+        view.key(key(KeyCode::F(6)));
+        assert!(view.advance_animation(Duration::from_secs(7)));
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(reduced_motion(Some(value)));
+        }
+        for value in [None, Some("0"), Some("false"), Some("")] {
+            assert!(!reduced_motion(value));
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_summarizes_routing_without_disclosing_peer_contents_or_state_notes() {
+        let (_dir, mut h, models) = fixture();
+        let mut view = View::new(&h, models).unwrap();
+        let from = h.topology.parts[0].id.clone();
+        let to = h.topology.parts[1].id.clone();
+        let envelope =
+            kuru_runtime::PeerMessage::new(&from, &to, "session", "PRIVATE MESSAGE").unwrap();
+        for _ in 0..8 {
+            view.event(Event {
+                kind: "peer".into(),
+                actor: from.clone(),
+                detail: envelope.rpc().to_string(),
+            });
+        }
+        assert_eq!(view.routes.len(), 6);
+        assert_eq!(view.routes.last(), Some(&(from.clone(), to.clone())));
+        view.event(Event {
+            kind: "state".into(),
+            actor: to.clone(),
+            detail: "{\"activation\":0.9,\"note\":\"PRIVATE NOTE\"}".into(),
+        });
+        let relation = h
+            .relate(
+                kuru_core::RelationshipKind::Alliance,
+                vec![from.clone(), to.clone()],
+            )
+            .unwrap();
+        view.event(Event {
+            kind: "relationship".into(),
+            actor: from.clone(),
+            detail: serde_json::to_string(&relation).unwrap(),
+        });
+        view.event(Event {
+            kind: "speaker".into(),
+            actor: relation.id.clone(),
+            detail: "alliance".into(),
+        });
+        assert_eq!(view.relationships, vec![relation.clone()]);
+        assert_eq!(view.focus.as_deref(), Some(relation.id.as_str()));
+        assert_eq!(view.speaker_id, relation.id);
+        let activity = view.activity.join("\n");
+        assert!(!activity.contains("PRIVATE"));
+        assert!(activity.contains(&h.topology.parts[1].name));
+        view.event(Event {
+            kind: "peer".into(),
+            actor: to.clone(),
+            detail: "malformed PRIVATE MESSAGE".into(),
+        });
+        assert!(!view.activity.last().unwrap().contains("PRIVATE"));
+        view.event(Event {
+            kind: "active".into(),
+            actor: to.clone(),
+            detail: "round 1".into(),
+        });
+        view.settle();
+        assert_eq!(view.part_activity[&to], "idle");
+        h.topology.parts[0].active = false;
+        view.refresh(&h);
+        assert!(view.relationships.is_empty());
+        assert!(view.routes.is_empty());
+        assert!(!view.parts.iter().any(|(id, _)| id == &from));
     }
 
     #[tokio::test]
