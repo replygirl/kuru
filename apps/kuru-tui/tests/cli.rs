@@ -50,7 +50,10 @@ impl Sandbox {
 fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     let env = Sandbox::new();
     assert!(env.success(&["--help"]).contains("peer"));
-    assert!(env.success(&["--version"]).starts_with("kuru 0."));
+    assert_eq!(
+        env.success(&["--version"]),
+        concat!("kuru ", env!("CARGO_PKG_VERSION"), "\n")
+    );
     let models: Value = serde_json::from_str(&env.success(&["models"])).unwrap();
     assert_eq!(models[0]["id"], "demo");
     assert!(env.success(&["config"]).contains("provider = \"demo\""));
@@ -236,96 +239,5 @@ fn supported_auth_commands_forward_to_native_codex_without_handling_tokens() {
     assert_eq!(
         std::fs::read_to_string(log).unwrap(),
         "login\nlogin --device-auth\nlogin status\nlogout\n"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn terminal_driver_drains_backpressure_and_bounds_stalled_processes() {
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/terminal_driver_regression.py"
-        ))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn real_pty_accepts_chat_navigation_commands_and_restores_terminal() {
-    let env = Sandbox::new();
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/tui_smoke.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_kuru"))
-        .arg(&env.project)
-        .arg(&env.data)
-        .env("XDG_CONFIG_HOME", env.root.path().join("config"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "PTY smoke failed: {}\n{}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let sessions: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
-    assert!(sessions.as_array().unwrap().iter().any(|s|s["label"]=="hello from a terminal" && s["turns"].as_u64().unwrap_or(0)>=1));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_turn() {
-    let env = Sandbox::new();
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/cancellation_smoke.py"
-        ))
-        .arg(env!("CARGO_BIN_EXE_kuru"))
-        .arg(&env.project)
-        .arg(&env.data)
-        .env("XDG_CONFIG_HOME", env.root.path().join("config"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let sessions: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
-    assert_eq!(sessions.as_array().unwrap().len(), 1);
-    assert_eq!(sessions[0]["turns"], 1);
-    let session = sessions[0]["id"].as_str().unwrap();
-    let memory = kuru_core::MemoryStore::open(&env.data.join("memory.sqlite3")).unwrap();
-    let harness = kuru_runtime::Harness::new(
-        kuru_core::Config {
-            provider: "demo".into(),
-            ..kuru_core::Config::default()
-        },
-        &env.project,
-        memory,
-        std::sync::Arc::new(kuru_connectors::DemoProvider),
-        Some(session),
-    )
-    .unwrap();
-    let history = harness.history().unwrap();
-    assert!(
-        history
-            .iter()
-            .any(|message| message.role == "user" && message.content == "Next thought")
-    );
-    assert!(
-        !history
-            .iter()
-            .any(|message| message.content.contains("LATE_RESPONSE_MUST_STAY_ABSENT"))
     );
 }

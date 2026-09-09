@@ -4,9 +4,35 @@ Install pinned tooling with `mise install`, then run `mise run setup`. Rust 1.98
 is declared in both mise and rust-toolchain.toml. Cargo.lock pins runtime
 transitives. The [dependency audit](dependencies.md) records latest stable
 versions and the exact upstream constraints on transitive updates. mise.lock contains platform-specific tool URLs and checksums.
-Bun's lockfile pins the development-only OpenSpec dependency used by cospec.
-This local dependency avoids a JSON-output defect observed in the standalone
-cospec embedded OpenSpec bundle; no reference checkout is required.
+Cospec is a standalone executable with embedded OpenSpec. Its validate/apply
+JSON and managed-file checks run without a project OpenSpec dependency. The
+pinned 0.7.0 release bundles two OpenSpec entrypoint calls into one file, causing
+duplicate execution. The cospec mise task scopes a small
+[compatibility preload](../packages/kuru-delivery/support/cospec-preload.cjs) to
+that exact bundle hash using cospec's own runtime. It preserves command arguments
+and the original gate; native integration tests prove clear, hard-blocked,
+soft-blocked and missing-artifact outcomes. Remove the preload after an upstream
+release fixes vendoring and passes those standalone tests.
+
+The architecture follows this order: apps/ and packages/ ownership, mise
+monorepo tasks, Rust, then other tools. Every app/package owns a mise.toml;
+root aliases use `//path:task` addresses. For example,
+`mise run //apps/kuru-tui:test` works from any directory, and `mise run test`
+inside that app runs its tests. Cargo's workspace shares dependency resolution
+and a single coverage report. It does not replace mise task ownership.
+
+Installation, packaging, release orchestration and repository checks live in
+the Rust package `packages/kuru-delivery`. No Python or Bun is needed. The
+VitePress docs app owns its Node pin, package.json and npm lockfile under
+`apps/kuru-docs`; its mise tasks invoke the installed tools directly.
+
+The delivery package activates Cocogitto and Communiqué only for its tests,
+combined coverage and release tasks. Its `setup` task preinstalls those tools
+with mise's `--include-task-tools` option. Communiqué 1.3.5 provides Linux x86_64
+and arm64 and macOS arm64 binaries; it does not publish an Intel macOS binary.
+Run the full maintainer gate on one of those supported platforms. Building,
+installing and packaging Kuru on Intel macOS uses the Rust tasks and does not
+require Communiqué or maintainer setup.
 
 ## Commands
 
@@ -21,6 +47,9 @@ cospec embedded OpenSpec bundle; no reference checkout is required.
 | `mise run coverage` | Workspace LLVM line coverage, minimum 90% |
 | `mise run test:install` | Real archive/install and rejection tests |
 | `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
+| `mise run docs:dev` | Local VitePress server |
+| `mise run docs:check` | Production docs, local links, anchors and public content boundary |
+| `mise run release:version` | Conventional-commit version calculation without publication |
 | `mise run cospec:validate` | Strict validation of changes and durable specs |
 | `mise run cospec:managed:check` | Generated cospec-file drift |
 | `mise run check` | Complete required gate |
@@ -88,11 +117,30 @@ tool pins with the matching four-platform lock refresh:
 
 ```sh
 mise lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64
+mise -C apps/kuru-docs lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64
+mise -C packages/kuru-delivery lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64
 ```
+
+Mise records available provenance for every platform, but normally verifies
+only the current platform's artifact. Before committing an updated Communiqué
+lock entry, verify the other supported archives as well. These commands download
+and verify artifact bytes; they neither install nor execute foreign binaries:
+
+```sh
+MISE_OS=linux MISE_ARCH=x86_64 mise -C packages/kuru-delivery lock github:jdx/communique --platform linux-x64
+MISE_OS=linux MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform linux-arm64
+MISE_OS=macos MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform macos-arm64
+```
+
+Review the resulting `provenance_verified` metadata alongside URLs and checksums.
+This also keeps CI installation from creating uncommitted verification metadata.
+See mise's [lockfile provenance contract](https://mise.jdx.dev/dev-tools/mise-lock.html#provenance-and-security)
+and [task tool configuration](https://mise.jdx.dev/tasks/task-configuration.html#tools).
 
 Commit the updated lockfile in the same change. CI detects lock drift. Update
 user documentation when flags, configuration, role behavior or contracts change.
-[Installation and updates](install.md) describes the tagged release workflow.
+[Release operations](release.md) describes manual dispatch, automatic versioning
+and publication; [installation and updates](install.md) covers using releases.
 
 ## Tests without credentials
 

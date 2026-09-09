@@ -2,8 +2,7 @@
 
 The executable is `kuru`; the Cargo package lives at `apps/kuru-tui`. Linux and macOS
 are the initial release targets. Building from source requires Rust 1.98.1 and a
-C compiler for SQLite. Python 3.10 or newer is required for binary release
-installation and updates; running chat does not invoke Python.
+C compiler for SQLite. Installation and self-updates use native Rust code.
 
 ## Direct source installation
 
@@ -37,14 +36,14 @@ the source revision you want before running it.
 ```sh
 mise trust
 mise install
-mise run setup
 mise run install
 ```
 
-`mise install` uses committed tool pins and the lockfile. `setup` installs the
-pinned OpenSpec dependency used by cospec and the Rust components needed for
-formatting, lint and coverage, then installs hk hooks. `install` runs the same
-source installer. This workflow works before a hosted release exists.
+`mise install` uses committed tool pins and the lockfile. `install` runs the same
+source installer. This workflow works before a hosted release exists on both
+Apple Silicon and Intel macOS, as well as Linux. The separate `mise run setup`
+command prepares maintainer checks and release-note tools; app installation
+does not require it. See [development](development.md) for that toolchain.
 
 ## Release archives
 
@@ -52,7 +51,7 @@ No tagged release exists yet. After a release is published and the repository
 is public, the versioned release installer can use:
 
 ```sh
-python3 scripts/install_release.py \
+bash scripts/install.sh \
   --release-base https://github.com/replygirl/kuru/releases/download/v0.1.0 \
   --version 0.1.0 \
   --install-dir "$HOME/.local/bin"
@@ -63,11 +62,13 @@ release with authenticated GitHub CLI and install from its local directory:
 
 ```sh
 gh release download v0.1.0 --repo replygirl/kuru --dir /tmp/kuru-release
-python3 scripts/install_release.py --release-base /tmp/kuru-release \
+bash scripts/install.sh --release-base /tmp/kuru-release \
   --version 0.1.0 --install-dir "$HOME/.local/bin"
 ```
 
-These release commands require that version to exist; creating the repository
+The checkout helper compiles the native installer using the pinned Rust
+toolchain. An already installed Kuru updates itself without a compiler or
+interpreter. These release commands require that version to exist; creating the repository
 does not create a release. The base directory
 must serve `SHA256SUMS` and `kuru-VERSION-TARGET.tar.gz`; local directories also
 work for offline installation. Remote sources require HTTPS. The installer
@@ -85,8 +86,8 @@ on older Linux systems or musl distributions.
 For a source install, install again from the desired checkout revision, or use
 `kuru update --source /path/to/kuru`. For a published binary release, use
 `kuru update --version VERSION --release-base HTTPS_VERSION_DIRECTORY`.
-The CLI embeds the same verified installer and calls local `python3`; its
-default destination is the directory containing the running executable. You
+The CLI uses the same native archive installer; its default destination is the
+directory containing the running executable. You
 can set `KURU_RELEASE_BASE` to a version directory for the release installer.
 Updates require an explicit version and do not silently fetch or install
 background updates. Mise-managed source installations use `mise run install`
@@ -94,9 +95,9 @@ after moving the checkout to the intended version.
 
 ## Releasing
 
-Maintainers change `[workspace.package].version`, regenerate Cargo.lock, pass
-`mise run check`, archive the cospec change, and publish a matching `vX.Y.Z` tag
-when release publication is authorized. The release workflow rejects mismatched
-tags, runs the full gate, builds all four native targets, creates archives and
-checksums, verifies the checksums, and attaches them to the GitHub release.
-No token needs to be placed in a local configuration file.
+Maintainers dispatch the Release workflow from main. It calculates the next
+version from conventional commits, runs the gate, creates a signed version
+commit with the scoped release app, builds four native targets, generates
+Communiqué notes, and publishes a complete release before deploying its docs.
+See [release operations](release.md) for credentials, retry rules and exact
+permissions. No token needs to be placed in a local configuration file.

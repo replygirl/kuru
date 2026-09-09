@@ -1,17 +1,123 @@
 name: Release
 
 on:
-  push:
-    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Conventional version bump
+        type: choice
+        options: [auto, major, minor, patch]
+        default: auto
+      resume_version:
+        description: Retry an unpublished version; requires resume_sha
+        type: string
+        default: ''
+      resume_sha:
+        description: Exact version commit SHA from the interrupted run
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      base_sha: ${{ steps.plan.outputs.base_sha }}
+      resume: ${{ steps.plan.outputs.resume }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Check release prerequisites
+        env:
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}
+        run: |
+          test -n "$RELEASE_APP_ID" || { echo 'Missing RELEASE_APP_ID variable'; exit 1; }
+          test -n "$RELEASE_APP_PRIVATE_KEY" || { echo 'Missing RELEASE_APP_PRIVATE_KEY secret'; exit 1; }
+          test -n "$ANTHROPIC_API_KEY" || { echo 'Missing ANTHROPIC_API_KEY_COMMUNIQUE secret'; exit 1; }
+      - run: mise run setup
+      - run: mise run check
+      - name: Select immutable release base and version
+        id: plan
+        env:
+          BUMP: ${{ inputs.bump }}
+          RESUME_VERSION: ${{ inputs.resume_version }}
+          RESUME_SHA: ${{ inputs.resume_sha }}
+        run: mise run release:tool -- plan --bump "$BUMP" --resume-version "$RESUME_VERSION" --resume-sha "$RESUME_SHA"
+
+  bump:
+    needs: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.commit.outputs.sha || steps.resume.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.base_sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.3
+          install_args: rust aqua:jdx/hk
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Reuse explicitly selected version commit
+        if: needs.plan.outputs.resume == 'true'
+        id: resume
+        env:
+          RELEASE_SHA: ${{ needs.plan.outputs.base_sha }}
+        run: printf 'sha=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+      - name: Stamp workspace package versions
+        if: needs.plan.outputs.resume != 'true'
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: mise run release:tool -- stamp "$RELEASE_VERSION"
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        if: needs.plan.outputs.resume != 'true'
+        id: app
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+      - name: Create signed commit with expected main head
+        if: needs.plan.outputs.resume != 'true'
+        id: commit
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          EXPECTED_SHA: ${{ needs.plan.outputs.base_sha }}
+        run: mise run release:tool -- commit --version "$RELEASE_VERSION" --expected-sha "$EXPECTED_SHA"
+
   verify:
+    needs: bump
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
@@ -20,18 +126,9 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
       - run: mise run setup
       - run: mise run check
-      - name: Match tag to workspace version
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          python3 - <<'PY'
-          import os, pathlib, tomllib
-          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version']
-          assert os.environ['RELEASE_TAG'] == f'v{version}', 'release tag must match workspace version'
-          PY
 
   build:
-    needs: verify
+    needs: [plan, bump, verify]
     strategy:
       fail-fast: false
       matrix:
@@ -47,45 +144,102 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+          persist-credentials: false
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           version: 2026.9.3
-          install_args: rust python
+          install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
-      - name: Build native executable
+      - name: Build and package native executable
         env:
           RELEASE_TARGET: ${{ matrix.target }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: |
-          cargo build --release --locked -p kuru --target "$RELEASE_TARGET"
-          "target/$RELEASE_TARGET/release/kuru" --version
-          python3 scripts/package_release.py --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$RELEASE_TAG"
+          mise run //apps/kuru-tui:build:release -- --target "$RELEASE_TARGET"
+          test "$("target/$RELEASE_TARGET/release/kuru" --version)" = "kuru $RELEASE_VERSION"
+          mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}
           path: dist/*
+          if-no-files-found: error
+
+  notes:
+    needs: [plan, bump, verify]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.3
+          install_args: rust aqua:jdx/hk
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Install package-owned release tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: mise run //packages/kuru-delivery:setup
+      - name: Generate notes without publishing
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: mise run release:tool -- notes --sha "$RELEASE_SHA" --version "$RELEASE_VERSION" --output RELEASE_NOTES.md
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes
+          path: RELEASE_NOTES.md
+          if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [plan, bump, build, notes]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.3
+          install_args: rust aqua:jdx/hk
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: release-*
+          pattern: release-*-*-*
           merge-multiple: true
           path: dist
-      - name: Assemble and verify checksums
-        run: |
-          cat dist/*.sha256 > dist/SHA256SUMS
-          cd dist
-          sha256sum --check SHA256SUMS
-      - name: Publish tagged release
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-notes
+      - name: Verify assets and publish complete draft
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$RELEASE_TAG" --verify-tag --generate-notes dist/*.tar.gz dist/SHA256SUMS
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
+        run: mise run release:tool -- publish --version "$RELEASE_VERSION" --sha "$RELEASE_SHA" --directory dist --notes RELEASE_NOTES.md
+
+  docs:
+    needs: [bump, publish]
+    uses: ./.github/workflows/pages.yml
+    with:
+      ref: ${{ needs.bump.outputs.sha }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write

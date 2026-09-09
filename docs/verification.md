@@ -1,5 +1,53 @@
 # Verification record
 
+## Native delivery and public documentation (2026-09-09)
+
+The complete package-owned mise gate passes **209 Rust tests** and **97.51%
+line coverage** (8554/8772), including the CLI and native delivery tooling.
+The 90% threshold remains unchanged. Rust replaces every Python installer,
+validator and PTY/protocol fixture; Node/npm stays local to the VitePress app.
+The source installer built and executed kuru 0.1.0 from an isolated destination,
+and the installed demo provider completed an offline conversation.
+The actual optimized macOS arm64 executable also completed a release roundtrip:
+native packaging, checksum-verified installation into a temporary directory and
+native self-update, followed by a successful version check.
+
+Hosted Ubuntu found a copied-executable launch failure before the updater ran,
+consistent with the Rust/Linux concurrent spawn and writable-descriptor race.
+Updater fixtures now prepare independent executables in a dedicated Rust child
+and wait for its exit before launch; no retry or timing delay masks the failure.
+The preserved-version assertion follows the crate version so release verification
+continues to work after a version bump.
+
+The pre-push gate also exposed concurrent SQLite initialization contention.
+A controlled WAL-transition regression failed immediately against the original
+implementation and passes with a five-second retry limited to SQLITE_BUSY at
+that transition. Deadline and non-busy errors, four independent initializing
+processes, the existing eight-thread startup and corruption checks all pass.
+The process fixture also exercises libtest's single-thread output format and
+bounds startup readiness with captured diagnostics and child cleanup.
+
+The release suite uses actual Cocogitto and Communiqué binaries with disposable
+Git histories and local HTTP fixtures. It verifies scoped version stamping,
+signed-commit payloads, immutable tags, incomplete-draft recovery, checksum
+rejections, factual fixture notes and preserved reviewed output. No live release
+or tag was created. The release app's actual permissions and scoped repository
+access were verified; it bypasses only the PR/check ruleset.
+
+Standalone cospec's duplicated embedded entrypoint required a narrowly scoped
+compatibility preload. Tests verify a single JSON response and preserved clear,
+hard, soft and missing-artifact gates, including a checkout path with spaces.
+No external Bun or OpenSpec installation is required.
+
+The docs production build passes native link, anchor, sitemap and public-content
+checks. Chrome verification at 1440px and 390px covers light/dark, four framework
+portraits, keyboard activation, motion preferences, local search, deep reloads
+and mobile navigation. Seven screenshots were inspected; no overflow, clipping,
+page errors or missing resources remained. [Hosted CI run 34393197392](https://github.com/replygirl/kuru/actions/runs/34393197392)
+passed on macOS 14 and Ubuntu 24.04, including the full gate, source installation,
+coverage/docs artifacts and ci-gate. Detailed evidence remains in the archived
+change ledgers; Pages deployment follows the reviewed merge.
+
 ## Hosted CI repair and portable repository layout
 
 The first hosted main run failed in the Linux terminal fixture at shutdown.

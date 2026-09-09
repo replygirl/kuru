@@ -1,0 +1,14 @@
+[tasks."build"]
+run = "cargo build -p kuru-runtime --all-features --locked"
+
+[tasks."build:release"]
+run = "cargo build -p kuru-runtime --release --all-features --locked"
+
+[tasks."test"]
+run = "cargo test -p kuru-runtime --all-targets --all-features --locked"
+
+[tasks."typecheck"]
+run = "cargo check -p kuru-runtime --all-targets --all-features --locked"
+
+[tasks."lint"]
+run = "cargo clippy -p kuru-runtime --all-targets --all-features --locked -- -D warnings"

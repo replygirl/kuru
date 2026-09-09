@@ -5,6 +5,7 @@ members = [
   "packages/kuru-core",
   "packages/kuru-connectors",
   "packages/kuru-runtime",
+  "packages/kuru-delivery",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ repository = "https://github.com/replygirl/kuru"
 
 [workspace.dependencies]
 anyhow = "=1.0.104"
+base64 = "=0.23.1"
 async-trait = "=0.1.92"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
@@ -39,10 +41,17 @@ url = "=2.5.8"
 unicode-width = "=0.2.2"
 cap-std = "=4.0.3"
 cap-fs-ext = "=4.0.3"
-nix = { version = "=0.31.3", features = ["signal", "process"] }
+nix = { version = "=0.31.3", features = ["signal", "process", "term", "poll", "fs"] }
+rustix = { version = "=1.1.4", features = ["termios"] }
+vt100 = "=0.16.2"
+tar = "=0.4.46"
+flate2 = "=1.1.10"
+scraper = "=0.27.0"
+roxmltree = "=0.21.1"
 kuru-core = { path = "packages/kuru-core" }
 kuru-connectors = { path = "packages/kuru-connectors" }
 kuru-runtime = { path = "packages/kuru-runtime" }
+kuru-delivery = { path = "packages/kuru-delivery" }
 
 [profile.release]
 lto = "thin"

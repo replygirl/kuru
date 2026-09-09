@@ -10,6 +10,8 @@ other models.
 Kuru treats psychological frameworks as computational metaphors. It does not
 claim consciousness, reproduce a human nervous system, or provide therapy.
 
+[Documentation](https://replygirl.github.io/kuru/) · [Development](docs/development.md)
+
 ## Install from source
 
 The repository is [replygirl/kuru](https://github.com/replygirl/kuru), currently
@@ -44,12 +46,11 @@ With [mise](https://mise.jdx.dev/), from the checkout:
 ```sh
 mise trust
 mise install
-mise run setup
 mise run install
 ```
 
-The mise path installs the pinned toolchain and development tools before
-building the same executable. Add your installation directory to `PATH`.
+The mise path installs the pinned toolchain before building the same executable.
+Maintainer setup is separate from app installation. Add your installation directory to `PATH`.
 See [installation and updates](docs/install.md) for release archives and updates.
 
 ## Start a conversation
@@ -104,15 +105,19 @@ and [development](docs/development.md) for boundaries and extension points.
 | Path | Responsibility |
 | --- | --- |
 | `apps/kuru-tui` | Terminal UI and `kuru` executable |
+| `apps/kuru-docs` | Public VitePress docs and its local Node/npm dependencies |
 | `packages/kuru-core` | Frameworks, configuration and SQLite memory |
 | `packages/kuru-connectors` | Providers, tools, MCP and outbound A2A |
 | `packages/kuru-runtime` | Actor pool, peer routing, relationships and dreaming |
+| `packages/kuru-delivery` | Native installation, release and repository tooling |
 | `openspec` | cospec change workflow and capability specifications |
-| `scripts` | Installation, releases and repository checks |
+| `scripts` | Small installation and commit-hook shell entrypoints |
 
 `mise run check` runs format, Clippy, behavioral tests, installer tests, workflow
-validation, cospec checks and a 90% workspace line-coverage gate. Releases are
-built by the tagged release workflow; nothing is published by local setup.
+validation, cospec checks, public docs checks and a 90% workspace line-coverage
+gate. Each app/package owns its mise tasks; root commands are aliases and
+aggregations. Releases use a manual workflow with conventional-commit versioning
+and Communiqué notes; nothing is published by local setup.
 The [verification record](docs/verification.md) includes measured coverage,
 live OpenAI checks and installation results.
 

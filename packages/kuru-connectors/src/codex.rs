@@ -301,49 +301,112 @@ pub async fn auth(command: &str, action: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Script, request};
+    use crate::test_support::{StdioFixture, Step, request};
 
-    const SERVER: &str = r#"
-import json, sys
-def send(x): print(json.dumps(x),flush=True)
-for line in sys.stdin:
- q=json.loads(line); m=q.get('method'); p=q.get('params',{}); i=q.get('id')
- if m=='initialize':
-  assert p['capabilities']['experimentalApi']
-  r={'userAgent':'fixture'}
- elif m=='initialized': continue
- elif m=='config/read': r={'config':{'mcp_servers':{'unsafe':{'enabled':True}}}}
- elif m=='model/list':
-  assert p['includeHidden']
-  if p['cursor'] is None:
-   r={'data':[{'model':'future-hidden','displayName':'Future Hidden','supportedReasoningEfforts':[{'reasoningEffort':'ultra-new'}],'defaultReasoningEffort':'ultra-new'}],'nextCursor':'next'}
-  else:
-   r={'data':[{'id':'preferred','isDefault':True}], 'nextCursor':None}
- elif m=='thread/start':
-  assert p['ephemeral'] and p['approvalPolicy']=='never'
-  assert p['permissions']=='kuru-inference' and 'sandbox' not in p
-  assert p['config']['features.shell_tool']==False and p['config']['agents.enabled']==False
-  assert p['config']['mcp_servers.unsafe.enabled']==False
-  assert p['environments']==[] and p['dynamicTools']==[]
-  r={'thread':{'id':'thread-a'}}
- elif m=='turn/start':
-  assert p['effort']=='future-effort'
-  assert p['outputSchema']['additionalProperties']==False
-  assert 'Actor-specific' not in p['input'][0]['text']
-  send({'method':'item/completed','params':{'threadId':'other','item':{'type':'agentMessage','text':'wrong actor'}}})
-  send({'id':900,'method':'item/tool/call','params':{'name':'shell'}})
-  reply=json.loads(sys.stdin.readline()); assert reply['id']==900 and 'error' in reply
-  send({'method':'thread/tokenUsage/updated','params':{'threadId':'thread-a','tokenUsage':{'total':{'inputTokens':7,'outputTokens':3}}}})
-  send({'method':'item/completed','params':{'threadId':'thread-a','item':{'type':'agentMessage','text':json.dumps({'text':'structured answer','calls':[{'name':'file_read','arguments_json':'{"path":"test.txt"}'}]})}}})
-  send({'method':'turn/completed','params':{'threadId':'thread-a','turn':{'status':'completed','items':[]}}})
-  r={'turn':{'id':'turn-a','status':'inProgress'}}
- else: raise Exception('unexpected method '+str(m))
- send({'id':i,'result':r})
-"#;
+    #[derive(Clone, Copy)]
+    enum Scenario {
+        Completion,
+        Failure,
+        Fallback,
+        Models,
+        StalledModels,
+    }
+
+    fn server(scenario: Scenario) -> StdioFixture {
+        let mut steps = vec![
+            Step::Read,
+            Step::Write(json!({"id":1,"result":{"userAgent":"fixture"}})),
+            Step::Read,
+        ];
+        if matches!(scenario, Scenario::Models | Scenario::StalledModels) {
+            steps.extend([
+                Step::Read,
+                Step::Write(json!({"id":2,"result":{"data":[{"model":"future-hidden","displayName":"Future Hidden","supportedReasoningEfforts":[{"reasoningEffort":"ultra-new"}],"defaultReasoningEffort":"ultra-new"}],"nextCursor":"next"}})),
+                Step::Read,
+                Step::Write(json!({"id":3,"result":{"data":[{"id":"preferred","isDefault":true}],"nextCursor":if matches!(scenario, Scenario::StalledModels) { json!("next") } else { Value::Null }}})),
+            ]);
+        } else {
+            steps.extend([
+                Step::Read,
+                Step::Write(json!({"id":2,"result":{"config":{"mcp_servers":{"unsafe":{"enabled":true}}}}})),
+                Step::Read,
+                Step::Write(json!({"id":3,"result":{"thread":{"id":"thread-a"}}})),
+                Step::Read,
+                Step::Write(json!({"method":"item/completed","params":{"threadId":"other","item":{"type":"agentMessage","text":"wrong actor"}}})),
+                Step::Write(json!({"id":900,"method":"item/tool/call","params":{"name":"shell"}})),
+                Step::Read,
+                Step::Write(json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-a","tokenUsage":{"total":{"inputTokens":7,"outputTokens":3}}}})),
+            ]);
+            if !matches!(scenario, Scenario::Fallback) {
+                let completion = json!({"text":"structured answer","calls":[{"name":"file_read","arguments_json":json!({"path":"test.txt"}).to_string()}]}).to_string();
+                steps.push(Step::Write(json!({"method":"item/completed","params":{"threadId":"thread-a","item":{"type":"agentMessage","text":completion}}})));
+            }
+            let turn = match scenario {
+                Scenario::Failure => {
+                    json!({"status":"failed","items":[],"error":{"message":"offline"}})
+                }
+                Scenario::Fallback => {
+                    json!({"status":"completed","items":[{"type":"agentMessage","text":json!({"text":"fallback","calls":[]}).to_string()}]})
+                }
+                _ => json!({"status":"completed","items":[]}),
+            };
+            steps.extend([
+                Step::Write(
+                    json!({"method":"turn/completed","params":{"threadId":"thread-a","turn":turn}}),
+                ),
+                Step::Write(
+                    json!({"id":4,"result":{"turn":{"id":"turn-a","status":"inProgress"}}}),
+                ),
+            ]);
+        }
+        steps.push(Step::Eof);
+        StdioFixture::new(steps)
+    }
+
+    fn assert_initialized(requests: &[Value]) {
+        assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(
+            requests[0]["params"]["capabilities"]["experimentalApi"],
+            true
+        );
+        assert_eq!(requests[1]["method"], "initialized");
+    }
+
+    fn assert_completion_requests(fixture: &StdioFixture, processes: usize) {
+        fixture.assert_completed(processes);
+        for requests in fixture.conversations() {
+            assert_initialized(&requests);
+            assert_eq!(requests.len(), 6);
+            assert_eq!(requests[2]["method"], "config/read");
+            assert_eq!(requests[3]["method"], "thread/start");
+            let thread = &requests[3]["params"];
+            assert_eq!(thread["ephemeral"], true);
+            assert_eq!(thread["approvalPolicy"], "never");
+            assert_eq!(thread["permissions"], "kuru-inference");
+            assert!(thread.get("sandbox").is_none());
+            assert_eq!(thread["config"]["features.shell_tool"], false);
+            assert_eq!(thread["config"]["agents.enabled"], false);
+            assert_eq!(thread["config"]["mcp_servers.unsafe.enabled"], false);
+            assert_eq!(thread["environments"], json!([]));
+            assert_eq!(thread["dynamicTools"], json!([]));
+            assert_eq!(requests[4]["method"], "turn/start");
+            let turn = &requests[4]["params"];
+            assert_eq!(turn["effort"], "future-effort");
+            assert_eq!(turn["outputSchema"]["additionalProperties"], false);
+            assert!(
+                !turn["input"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Actor-specific")
+            );
+            assert_eq!(requests[5]["id"], 900);
+            assert_eq!(requests[5]["error"]["code"], -32601);
+        }
+    }
 
     #[tokio::test]
     async fn app_server_structured_completion_enforces_isolation_and_buffers_early_events() {
-        let script = Script::new(SERVER);
+        let script = server(Scenario::Completion);
         let provider = CodexProvider::new(script.command());
         let result = provider.complete(request()).await.unwrap();
         assert_eq!(result.text, "structured answer");
@@ -353,17 +416,28 @@ for line in sys.stdin:
         let (one, two) = tokio::join!(provider.complete(request()), provider.complete(request()));
         assert!(one.is_ok() && two.is_ok());
         assert_ne!(one.unwrap().calls[0].id, two.unwrap().calls[0].id);
+        assert_completion_requests(&script, 3);
     }
 
     #[tokio::test]
     async fn model_catalog_paginates_hidden_models_and_preserves_new_efforts() {
-        let script = Script::new(SERVER);
+        let script = server(Scenario::Models);
         let provider = CodexProvider::new(script.command());
         let models = provider.models().await.unwrap();
         assert_eq!(models[0].id, "preferred");
         assert_eq!(models[1].efforts, vec!["ultra-new"]);
         assert_eq!(models[1].default_effort.as_deref(), Some("ultra-new"));
-        let script = Script::new(&SERVER.replace("'nextCursor':None", "'nextCursor':'next'"));
+        script.assert_completed(1);
+        let requests = script.conversations().remove(0);
+        assert_initialized(&requests);
+        assert_eq!(requests.len(), 4);
+        for request in &requests[2..] {
+            assert_eq!(request["method"], "model/list");
+            assert_eq!(request["params"]["includeHidden"], true);
+        }
+        assert!(requests[2]["params"]["cursor"].is_null());
+        assert_eq!(requests[3]["params"]["cursor"], "next");
+        let script = server(Scenario::StalledModels);
         assert!(
             CodexProvider::new(script.command())
                 .models()
@@ -376,10 +450,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn app_server_errors_and_completed_turn_item_fallback() {
-        let script = Script::new(&SERVER.replace(
-            "'status':'completed','items':[]",
-            "'status':'failed','items':[], 'error':{'message':'offline'}",
-        ));
+        let script = server(Scenario::Failure);
         assert!(
             CodexProvider::new(script.command())
                 .complete(request())
@@ -388,8 +459,8 @@ for line in sys.stdin:
                 .to_string()
                 .contains("offline")
         );
-        let fallback = SERVER.replace("send({'method':'item/completed','params':{'threadId':'thread-a','item':{'type':'agentMessage','text':json.dumps({'text':'structured answer','calls':[{'name':'file_read','arguments_json':'{\"path\":\"test.txt\"}'}]})}}})", "pass").replace("'status':'completed','items':[]", "'status':'completed','items':[{'type':'agentMessage','text':'{\"text\":\"fallback\",\"calls\":[]}' }]");
-        let script = Script::new(&fallback);
+        assert_completion_requests(&script, 1);
+        let script = server(Scenario::Fallback);
         assert_eq!(
             CodexProvider::new(script.command())
                 .complete(request())
@@ -398,6 +469,7 @@ for line in sys.stdin:
                 .text,
             "fallback"
         );
+        assert_completion_requests(&script, 1);
         assert!(
             CodexProvider::new("/not-installed/codex")
                 .models()
@@ -420,15 +492,14 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn auth_delegates_only_supported_native_commands() {
-        let script = Script::new(
-            "import sys\nassert sys.argv[1:] in [['login'],['logout'],['login','status']]\n",
-        );
+        let script = StdioFixture::new([Step::Auth]);
         for action in ["login", "logout", "status"] {
             auth(script.command(), action).await.unwrap();
         }
         assert!(auth(script.command(), "tokens").await.is_err());
         assert!(auth("/not-installed/codex", "login").await.is_err());
-        let failed = Script::new("import sys\nsys.exit(1)");
+        script.assert_completed(3);
+        let failed = StdioFixture::new([Step::Exit(1)]);
         assert!(auth(failed.command(), "login").await.is_err());
     }
 }

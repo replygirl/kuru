@@ -1,0 +1,42 @@
+[tools]
+node = "26.8.2"
+
+[tasks.setup]
+description = "Install this app's pinned Node runtime and dependencies"
+run = ["mise install node", "npm ci --no-audit --no-fund"]
+sources = ["package.json", "package-lock.json", "mise.toml"]
+outputs = [
+  "node_modules/.package-lock.json",
+  "node_modules/vitepress/bin/vitepress.js",
+  "node_modules/oxfmt/bin/oxfmt",
+]
+
+[tasks.dev]
+description = "Run the documentation server on loopback"
+depends = ["setup"]
+run = "node_modules/.bin/vitepress dev . --host 127.0.0.1"
+
+[tasks.build]
+description = "Build the public documentation site"
+depends = ["setup"]
+run = "node_modules/.bin/vitepress build ."
+
+[tasks.preview]
+description = "Preview the built documentation site on loopback"
+run = "node_modules/.bin/vitepress preview . --host 127.0.0.1"
+
+[tasks.lint]
+depends = ["setup"]
+run = "node_modules/.bin/oxlint .vitepress/config.mts .vitepress/theme"
+
+[tasks."format:check"]
+depends = ["setup"]
+run = "node_modules/.bin/oxfmt --check ."
+
+[tasks."format:fix"]
+depends = ["setup"]
+run = "node_modules/.bin/oxfmt --write ."
+
+[tasks.check]
+depends = ["build"]
+run = "mise run //packages/kuru-delivery:tool -- docs --root apps/kuru-docs/.vitepress/dist"

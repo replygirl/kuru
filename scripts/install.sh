@@ -22,5 +22,6 @@ if [[ "${1:-}" == "--source" ]]; then
   "$kuru_install_dir/kuru" --version
   echo "Installed at $kuru_install_dir/kuru; add $kuru_install_dir to PATH."
 else
-  exec python3 "$kuru_repo/scripts/install_release.py" "$@"
+  exec cargo run --manifest-path "$kuru_repo/Cargo.toml" --locked \
+    -p kuru-delivery --features tooling --bin kuru-delivery -- install "$@"
 fi

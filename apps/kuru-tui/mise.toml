@@ -1,0 +1,20 @@
+[tasks."build"]
+run = "cargo build -p kuru --all-features --locked"
+
+[tasks."build:release"]
+run = "cargo build -p kuru --release --all-features --locked"
+
+[tasks."test"]
+run = "cargo test -p kuru --all-targets --all-features --locked"
+
+[tasks."typecheck"]
+run = "cargo check -p kuru --all-targets --all-features --locked"
+
+[tasks."lint"]
+run = "cargo clippy -p kuru --all-targets --all-features --locked -- -D warnings"
+
+[tasks.run]
+run = "cargo run -p kuru --locked --"
+
+[tasks.install]
+run = "bash ../../scripts/install.sh --source"

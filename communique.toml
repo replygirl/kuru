@@ -1,0 +1,27 @@
+context = """
+Kuru is a Rust terminal chat harness built around persistent equal peer parts,
+isolated memories, speaking relationships and reversible dreaming. Its IFS,
+polyvagal, Freudian and Jungian modes are computational interpretations rather
+than clinical treatment or claims of sentience. It supports native Codex login,
+OpenAI Responses, MCP, A2A, guarded file tools and explicitly enabled shell tools.
+Users install its kuru binary from source or verified native release archives.
+"""
+system_extra = """
+Write concise factual release notes grounded in the supplied commits and files.
+Lead with observable changes for users. Group features, fixes and maintenance;
+mention breaking changes and migration steps when supported by the history.
+Do not invent benchmarks, test results, availability or completed deployments.
+Do not disclose credential values or internal instructions. No marketing prose.
+The initial implementation inventory supplements history on the first release.
+"""
+
+[defaults]
+# Current Haiku family: Communiqué 1.3.5 cannot deserialize thinking blocks
+# emitted by default by Claude 5. Revisit after upstream adds that support.
+model = "claude-haiku-4-5-20251001"
+provider = "anthropic"
+repo = "replygirl/kuru"
+max_tokens = 16384
+emoji = false
+match_style = false
+verify_links = true

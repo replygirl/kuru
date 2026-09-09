@@ -7,7 +7,11 @@ use axum::{
     routing::any,
 };
 use serde_json::{Value, json};
-use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
@@ -110,28 +114,114 @@ async fn handle(
     response
 }
 
-pub struct Script {
-    _directory: tempfile::TempDir,
+pub enum Step {
+    Read,
+    Write(Value),
+    Raw(&'static str),
+    Repeat(usize),
+    Sleep(u64),
+    Auth,
+    Exit(i32),
+    Eof,
+}
+
+/// A real compiled peer with an independent transcript for each subprocess.
+/// Request assertions belong in the tests, not a second ad-hoc JSON parser.
+pub struct StdioFixture {
+    directory: tempfile::TempDir,
     pub path: PathBuf,
 }
-impl Script {
-    pub fn new(source: &str) -> Self {
+impl StdioFixture {
+    pub fn new(steps: impl IntoIterator<Item = Step>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fixture");
-        std::fs::write(&path, format!("#!/usr/bin/env python3\n{source}")).unwrap();
+        std::fs::write(&path, fixture_binary()).unwrap();
+        let plan: String = steps
+            .into_iter()
+            .map(|step| match step {
+                Step::Read => "read\n".into(),
+                Step::Write(value) => format!("write {value}\n"),
+                Step::Raw(line) => format!("write {line}\n"),
+                Step::Repeat(count) => format!("repeat {count}\n"),
+                Step::Sleep(milliseconds) => format!("sleep {milliseconds}\n"),
+                Step::Auth => "auth\n".into(),
+                Step::Exit(code) => format!("exit {code}\n"),
+                Step::Eof => "eof\n".into(),
+            })
+            .collect();
+        std::fs::write(path.with_extension("plan"), plan).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        Self {
-            _directory: directory,
-            path,
-        }
+        Self { directory, path }
     }
     pub fn command(&self) -> &str {
         self.path.to_str().unwrap()
     }
+
+    pub fn conversations(&self) -> Vec<Vec<Value>> {
+        let mut files: Vec<_> = std::fs::read_dir(self.directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|value| value == "requests"))
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub fn assert_completed(&self, processes: usize) {
+        let finished = std::fs::read_dir(self.directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|value| value == "done"))
+            .count();
+        assert_eq!(
+            finished, processes,
+            "native peer did not finish its wire plan"
+        );
+        assert_eq!(self.conversations().len(), processes);
+    }
+}
+
+fn fixture_binary() -> &'static [u8] {
+    static BINARY: OnceLock<Vec<u8>> = OnceLock::new();
+    BINARY.get_or_init(|| {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("stdio_peer.rs");
+        let binary = directory.path().join("stdio_peer");
+        std::fs::write(&source, include_str!("../tests/fixtures/stdio_peer.rs")).unwrap();
+        let result =
+            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .args([
+                    "--edition=2024",
+                    "--forbid",
+                    "unsafe_code",
+                    "-C",
+                    "opt-level=1",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .expect("compile the native connector test peer with the Rust toolchain");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        std::fs::read(binary).unwrap()
+    })
 }
 
 pub fn request() -> kuru_core::CompletionRequest {

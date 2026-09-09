@@ -180,22 +180,23 @@ impl Drop for Rpc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IO_TIMEOUT, test_support::Script};
+    use crate::{
+        IO_TIMEOUT,
+        test_support::{StdioFixture, Step},
+    };
 
     #[tokio::test]
     async fn rpc_handles_pings_rejects_unsolicited_actions_and_preserves_notifications() {
-        let script = Script::new(
-            r#"
-import json,sys
-q=json.loads(sys.stdin.readline())
-for m in ['ping','dangerous']:
- print(json.dumps({'id':900,'method':m}),flush=True)
- r=json.loads(sys.stdin.readline()); assert ('result' in r) if m=='ping' else ('error' in r)
-print(json.dumps({'method':'notice','params':{'ready':True}}),flush=True)
-print(json.dumps({'id':q['id'],'result':{'answer':42}}),flush=True)
-for line in sys.stdin: pass
-"#,
-        );
+        let script = StdioFixture::new([
+            Step::Read,
+            Step::Write(json!({"id":900,"method":"ping"})),
+            Step::Read,
+            Step::Write(json!({"id":900,"method":"dangerous"})),
+            Step::Read,
+            Step::Write(json!({"method":"notice","params":{"ready":true}})),
+            Step::Write(json!({"id":1,"result":{"answer":42}})),
+            Step::Eof,
+        ]);
         let mut rpc = Rpc::spawn(script.command(), &[], &BTreeMap::new(), Path::new(".")).unwrap();
         assert_eq!(
             rpc.request("test", json!({}), IO_TIMEOUT).await.unwrap()["answer"],
@@ -204,32 +205,54 @@ for line in sys.stdin: pass
         assert_eq!(rpc.read().await.unwrap()["method"], "notice");
         rpc.close().await;
         assert!(rpc.send(json!({})).await.is_err());
+        script.assert_completed(1);
+        let requests = script.conversations().remove(0);
+        assert_eq!(requests[0]["method"], "test");
+        assert_eq!(requests[1], json!({"jsonrpc":"2.0","id":900,"result":{}}));
+        assert_eq!(requests[2]["id"], 900);
+        assert_eq!(requests[2]["error"]["code"], -32601);
     }
 
     #[tokio::test]
     async fn rpc_bounds_timeout_closed_peer_malformed_and_oversized_messages() {
         let scripts = [
-            ("import time\ntime.sleep(5)", "timed out"),
-            ("pass", "closed"),
-            ("print('not JSON',flush=True)", "invalid JSON"),
-            ("print('x'*2097153,flush=True)", "size limit"),
+            (vec![Step::Read, Step::Sleep(5000)], "timed out"),
+            (vec![Step::Read], "closed"),
+            (vec![Step::Read, Step::Raw("not JSON")], "invalid JSON"),
+            (vec![Step::Read, Step::Repeat(MAX_BYTES + 1)], "size limit"),
             (
-                "import json\nprint(json.dumps({'id':999,'result':{}}),flush=True)",
+                vec![Step::Read, Step::Write(json!({"id":999,"result":{}}))],
                 "unexpected",
             ),
         ];
-        for (source, expected) in scripts {
-            let script = Script::new(source);
+        for (steps, expected) in scripts {
+            let script = StdioFixture::new(
+                [Step::Write(json!({"method":"ready"}))]
+                    .into_iter()
+                    .chain(steps),
+            );
             let mut rpc =
                 Rpc::spawn(script.command(), &[], &BTreeMap::new(), Path::new(".")).unwrap();
-            let error = rpc
-                .request("test", json!({}), Duration::from_millis(200))
-                .await
-                .unwrap_err();
+            assert_eq!(
+                tokio::time::timeout(IO_TIMEOUT, rpc.read())
+                    .await
+                    .unwrap()
+                    .unwrap()["method"],
+                "ready"
+            );
+            // Only the deliberately stalled peer tests the short timeout.
+            // Malformed/oversized/closed replies test distinct failures and
+            // must allow normal process scheduling on loaded CI runners.
+            let deadline = if expected == "timed out" {
+                Duration::from_millis(200)
+            } else {
+                IO_TIMEOUT
+            };
+            let error = rpc.request("test", json!({}), deadline).await.unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
             rpc.close().await;
         }
-        let script = Script::new("import time\ntime.sleep(5)");
+        let script = StdioFixture::new([Step::Sleep(5000)]);
         let mut rpc = Rpc::spawn(script.command(), &[], &BTreeMap::new(), Path::new(".")).unwrap();
         assert!(
             rpc.send(json!({"text":"x".repeat(MAX_BYTES)}))

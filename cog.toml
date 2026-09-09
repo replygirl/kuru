@@ -1,0 +1,22 @@
+# Cocogitto calculates versions only. The release helper owns file changes.
+tag_prefix = "v"
+from_latest_tag = true
+ignore_merge_commits = true
+pre_bump_hooks = []
+post_bump_hooks = []
+
+[changelog]
+authors = []
+
+[commit_types]
+build = { bump_patch = true }
+chore = { bump_patch = true }
+ci = { bump_patch = true }
+docs = { bump_patch = true }
+feat = { bump_minor = true }
+fix = { bump_patch = true }
+perf = { bump_patch = true }
+refactor = { bump_patch = true }
+revert = { bump_patch = true }
+style = { bump_patch = true }
+test = { bump_patch = true }
