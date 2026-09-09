@@ -451,14 +451,11 @@ mod tests {
     #[tokio::test]
     async fn app_server_errors_and_completed_turn_item_fallback() {
         let script = server(Scenario::Failure);
-        assert!(
-            CodexProvider::new(script.command())
-                .complete(request())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("offline")
-        );
+        let error = CodexProvider::new(script.command())
+            .complete(request())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("offline"), "{error:#}");
         assert_completion_requests(&script, 1);
         let script = server(Scenario::Fallback);
         assert_eq!(
