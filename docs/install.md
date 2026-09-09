@@ -47,8 +47,8 @@ does not require it. See [development](development.md) for that toolchain.
 
 ## Release archives
 
-No tagged release exists yet. After a release is published and the repository
-is public, the versioned release installer can use:
+For a published release, once the repository is public, the versioned release
+installer can use:
 
 ```sh
 bash scripts/install.sh \
