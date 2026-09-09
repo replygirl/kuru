@@ -1,0 +1,112 @@
+min_version = "2026.7.7"
+monorepo_root = true
+
+[settings]
+experimental = true
+lockfile = true
+npm.package_manager = "bun"
+
+[env]
+HK_MISE = "1"
+HK_PKL_BACKEND = "pklr"
+
+[tools]
+rust = "1.98.1"
+bun = "1.4.2"
+codex = "0.153.4"
+python = "3.14.7"
+"github:aligned-team/cospec" = "0.7.0"
+"aqua:jdx/hk" = "1.58.1"
+"aqua:tamasfe/taplo" = "0.10.0"
+"aqua:koalaman/shellcheck" = "0.11.0"
+"aqua:rhysd/actionlint" = "1.7.12"
+"aqua:astral-sh/ruff" = "0.16.6"
+"cargo:cargo-llvm-cov" = "0.9.1"
+
+[monorepo]
+config_roots = ["apps/*", "packages/*"]
+
+[hooks]
+postinstall = "hk install --mise"
+
+[tasks.setup]
+description = "Install tooling dependencies and hooks"
+run = [
+  "bun install --frozen-lockfile",
+  "rustup component add rustfmt clippy llvm-tools-preview --toolchain 1.98.1",
+  "hk install --mise",
+]
+
+[tasks.cospec]
+description = "Run the pinned cospec CLI"
+run = "cospec"
+
+[tasks."cospec:validate"]
+run = "cospec validate --all --strict"
+
+[tasks."cospec:managed:check"]
+run = "cospec update --check"
+
+[tasks.build]
+run = "cargo build --workspace --locked"
+
+[tasks."build:release"]
+run = "cargo build --workspace --release --locked"
+
+[tasks.run]
+run = "cargo run --locked -p kuru --"
+
+[tasks.test]
+run = "cargo test --workspace --all-targets --locked"
+
+[tasks.typecheck]
+run = "cargo check --workspace --all-targets --locked"
+
+[tasks.lint]
+run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+
+[tasks."format:check"]
+run = [
+  "cargo fmt --all -- --check",
+  "taplo format --check",
+  "ruff format --check scripts apps/tui/tests/fixtures",
+]
+
+[tasks."format:fix"]
+run = ["cargo fmt --all", "taplo format", "ruff format scripts apps/tui/tests/fixtures"]
+
+[tasks.coverage]
+description = "Require at least 90% workspace line coverage, including CLI code"
+run = "cargo llvm-cov --workspace --all-targets --locked --fail-under-lines 90 --lcov --output-path target/coverage.lcov"
+
+[tasks."lint:tooling"]
+run = [
+  "shellcheck scripts/*.sh",
+  "actionlint",
+  "ruff check scripts apps/tui/tests/fixtures",
+  "python3 scripts/check_repo.py",
+]
+
+[tasks."test:install"]
+run = "python3 -m unittest discover -s scripts/tests -v"
+
+[tasks.install]
+description = "Build and install Kuru into KURU_INSTALL_DIR or ~/.local/bin"
+run = "bash scripts/install.sh --source"
+
+[tasks.package]
+description = "Package a release executable: --binary PATH --target TRIPLE --version VERSION"
+run = "python3 scripts/package_release.py"
+
+[tasks.check]
+description = "Full repository gate, including behavioral tests and 90% coverage"
+depends = [
+  "format:check",
+  "lint",
+  "test",
+  "coverage",
+  "lint:tooling",
+  "test:install",
+  "cospec:validate",
+  "cospec:managed:check",
+]

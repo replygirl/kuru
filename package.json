@@ -1,0 +1,8 @@
+{
+  "name": "kuru-dev-tools",
+  "private": true,
+  "description": "Pinned OpenSpec dependency for cospec's validated protocol wrapper",
+  "devDependencies": {
+    "@fission-ai/openspec": "1.12.0"
+  }
+}

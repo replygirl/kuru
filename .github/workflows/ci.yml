@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - run: mise run setup
+      - name: Tool lock drift
+        run: git diff --exit-code mise.lock bun.lock
+      - run: mise run check
+      - name: Source install smoke
+        env:
+          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
+        run: |
+          mise run install
+          "$KURU_INSTALL_DIR/kuru" --version
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-${{ matrix.os }}
+          path: target/coverage.lcov

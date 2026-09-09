@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["apps/tui", "packages/kuru-core", "packages/kuru-connectors", "packages/kuru-runtime"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "=1.0.104"
+async-trait = "=0.1.92"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+toml = "=1.1.5"
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+uuid = { version = "=1.26.0", features = ["v4", "v5", "serde"] }
+sha2 = "=0.11.0"
+tokio = { version = "=1.53.1", features = ["full"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
+futures = "=0.3.34"
+axum = "=0.8.9"
+tower = { version = "=0.5.3", features = ["util"] }
+ratatui = { version = "=0.30.2", default-features = false, features = [
+  "crossterm_0_29",
+  "layout-cache",
+] }
+crossterm = "=0.29.0"
+clap = { version = "=4.6.6", features = ["derive", "env"] }
+tempfile = "=3.27.0"
+url = "=2.5.8"
+unicode-width = "=0.2.2"
+cap-std = "=4.0.3"
+cap-fs-ext = "=4.0.3"
+nix = { version = "=0.31.3", features = ["signal", "process"] }
+kuru-core = { path = "packages/kuru-core" }
+kuru-connectors = { path = "packages/kuru-connectors" }
+kuru-runtime = { path = "packages/kuru-runtime" }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,3 @@
+exclude = ["target/**", "node_modules/**", "openspec/**"]
+[formatting]
+column_width = 100

@@ -1,0 +1,41 @@
+amends "package://github.com/jdx/hk/releases/download/v1.58.1/hk@1.58.1#/Config.pkl"
+
+hooks {
+  ["pre-commit"] {
+    fix = false
+    steps {
+      ["format"] {
+        glob = List("**/*.rs", "**/*.toml")
+        check = "mise run format:check"
+        exclusive = true
+      }
+      ["tooling"] {
+        glob = List("scripts/**", ".github/**", "Cargo.toml", "mise.toml", "AGENTS.md", "CLAUDE.md")
+        check = "mise run lint:tooling"
+      }
+      ["cospec"] {
+        glob = List("openspec/**")
+        check = "mise run cospec:validate"
+      }
+      ["cospec-managed"] {
+        glob = List("openspec/schemas/**", ".claude/**")
+        check = "mise run cospec:managed:check"
+      }
+    }
+  }
+  ["pre-push"] {
+    steps {
+      ["check"] {
+        check = "mise run check"
+        exclusive = true
+      }
+    }
+  }
+  ["commit-msg"] {
+    steps {
+      ["conventional"] {
+        check = #"bash scripts/check-commit.sh "{{commit_msg_file}}""#
+      }
+    }
+  }
+}

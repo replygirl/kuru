@@ -1,0 +1,101 @@
+# Configuration
+
+Kuru uses typed TOML. Layers merge in this order: user defaults, ancestor
+`.kuru/config.toml` files from outermost to innermost directory, and an explicit
+local configuration file. Later values win; tables merge recursively and arrays
+replace. Unknown keys, invalid types, unsupported provider names and invalid
+bounds fail with context. Each configuration file is bounded to 256 KiB and the
+combined input to 1 MiB.
+
+Use `kuru config` and `kuru --help` to inspect effective options and CLI overrides.
+`kuru config` redacts MCP environment values. User defaults are read from
+`$XDG_CONFIG_HOME/kuru/config.toml` or `~/.config/kuru/config.toml`; `--config`
+selects the final local layer. CLI flags take precedence over file values.
+Ancestor `AGENTS.md` files provide project instructions, ordered so local
+instructions have precedence. Kuru does not automatically follow arbitrary
+links in instruction files; repositories can put their applicable instructions
+in AGENTS.md itself.
+
+This example contains the default scalar values:
+
+```toml
+mode = "ifs"
+provider = "codex"
+model = "auto"
+max_rounds = 3
+max_tool_calls = 12
+max_parallel = 4
+dream_every = 8
+dream_on_exit = true
+max_parts = 16
+allow_shell = false
+allow_write = false
+codex_command = "codex"
+api_base = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+```
+
+`mode` is `ifs`, `polyvagal`, `freudian` or `jungian`. `provider` is `codex`,
+`responses` or `demo`. The optional `effort` field is a provider-advertised
+string, such as `effort = "high"`. Models and effort levels vary by account and
+provider; consult `kuru models` instead of relying on a hardcoded list.
+`model = "auto"` uses provider selection. Kuru preserves newly advertised effort
+strings. The API key itself never belongs in configuration.
+
+The public Responses `/models` catalog does not advertise a default chat model
+or supported reasoning efforts. With `provider = "responses"`, set an explicit
+`model` (or `--model`) and, when needed, `effort`. Kuru passes these through and
+surfaces provider validation errors; it does not select an arbitrary audio or
+embedding model from that catalog.
+
+`max_rounds` is 1–64, `max_tool_calls` 1–1024 and `max_parallel` 1–64.
+`max_parts` must fit the built-in topology and cannot exceed 128.
+`dream_every = 0` disables periodic dreaming; explicit and session-end dreaming
+remain separate. Set `dream_on_exit = false` to disable exit dreaming.
+
+## MCP servers
+
+A server has exactly one transport: `command` for stdio or `url` for HTTP.
+Aliases namespace the tools exposed to parts. At most 64 servers are accepted.
+
+```toml
+[mcp.local_service]
+command = "/absolute/path/to/mcp-server"
+args = ["--stdio"]
+
+[mcp.remote_service]
+url = "https://example.com/mcp"
+```
+
+Stdio servers may have an `env` table; avoid storing credentials in shared
+configuration. HTTP entries cannot contain process arguments or an environment
+table. Enabling an MCP server means granting the harness access to that server's
+tools; Kuru's built-in `allow_write` and `allow_shell` only govern its own tools.
+
+## External agents
+
+```toml
+[external_agents]
+research_peer = "https://example.com/a2a"
+```
+
+At most 64 endpoints are accepted. Use explicit trusted endpoints; credentials
+and fragments in URLs are rejected. See [protocols](protocols.md) for the supported
+A2A subset and local ingress controls.
+
+## Storage and authority
+
+Session and part histories are local durable data. The default store is
+`$XDG_DATA_HOME/kuru/memory.sqlite3` or `~/.local/share/kuru/memory.sqlite3`.
+`--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. An OS
+writer lock prevents competing Kuru processes from overwriting the same
+project topology; session listing remains available without a writer lock. Restrict access to the user
+data directory as you would a chat transcript. They are not included in source
+control and should never be exposed as a tool root.
+
+Writes and shell execution require opt-in through config or the corresponding
+CLI flags. Enabling shell permits subprocess activity with your account's
+permissions, including network access; the working directory does not constrain
+what a subprocess can access. Built-in file tools separately enforce canonical
+root containment, including symlinks, and protect instructions, configuration
+and state paths.

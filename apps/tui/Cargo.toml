@@ -1,0 +1,28 @@
+[package]
+name = "kuru"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A chat harness with a native pool of persistent peer agents"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+kuru-core = { path = "../../packages/kuru-core" }
+kuru-connectors = { path = "../../packages/kuru-connectors" }
+kuru-runtime = { path = "../../packages/kuru-runtime" }
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+sha2.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
