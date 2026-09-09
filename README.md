@@ -10,10 +10,18 @@ other models.
 Kuru treats psychological frameworks as computational metaphors. It does not
 claim consciousness, reproduce a human nervous system, or provide therapy.
 
-## Install from this checkout
+## Install from source
 
-Kuru has not been published to a public release repository. These source
-installation paths work from a checkout today. Building requires Rust 1.98.1,
+The repository is [replygirl/kuru](https://github.com/replygirl/kuru), currently
+private while the project takes shape. Public availability is planned; no tagged
+release has been published yet. Clone with an authorized GitHub account:
+
+```sh
+gh repo clone replygirl/kuru
+cd kuru
+```
+
+These source installation paths work today. Building requires Rust 1.98.1,
 a C compiler for bundled SQLite, and standard platform build tools.
 
 Direct installation with an existing Rust toolchain:
@@ -107,5 +115,9 @@ validation, cospec checks and a 90% workspace line-coverage gate. Releases are
 built by the tagged release workflow; nothing is published by local setup.
 The [verification record](docs/verification.md) includes measured coverage,
 live OpenAI checks and installation results.
+
+Development follows [aligned-team/cospec](https://github.com/aligned-team/cospec)
+as its reference standard. See [contributing](CONTRIBUTING.md) for the branch,
+review and cospec workflow, and [security](SECURITY.md) for private reporting.
 
 MIT licensed.

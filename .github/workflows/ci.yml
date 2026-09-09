@@ -42,3 +42,13 @@ jobs:
         with:
           name: coverage-${{ matrix.os }}
           path: target/coverage.lcov
+
+  ci-gate:
+    if: always()
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every platform check
+        env:
+          CHECK_RESULT: ${{ needs.check.result }}
+        run: test "$CHECK_RESULT" = success

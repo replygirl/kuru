@@ -7,6 +7,13 @@ installation and updates; running chat does not invoke Python.
 
 ## Direct source installation
 
+Clone the repository with an authorized GitHub account while it is private:
+
+```sh
+gh repo clone replygirl/kuru
+cd kuru
+```
+
 From the checkout:
 
 ```sh
@@ -41,17 +48,27 @@ source installer. This workflow works before a hosted release exists.
 
 ## Release archives
 
-No public release remote is configured in this checkout. When a release has
-been published, use the actual version directory for your repository:
+No tagged release exists yet. After a release is published and the repository
+is public, the versioned release installer can use:
 
 ```sh
 python3 scripts/install_release.py \
-  --release-base https://github.com/OWNER/REPO/releases/download/v0.1.0 \
+  --release-base https://github.com/replygirl/kuru/releases/download/v0.1.0 \
   --version 0.1.0 \
   --install-dir "$HOME/.local/bin"
 ```
 
-`OWNER/REPO` is a placeholder to replace after publication. The base directory
+While the repository is private, use source installation or download an available
+release with authenticated GitHub CLI and install from its local directory:
+
+```sh
+gh release download v0.1.0 --repo replygirl/kuru --dir /tmp/kuru-release
+python3 scripts/install_release.py --release-base /tmp/kuru-release \
+  --version 0.1.0 --install-dir "$HOME/.local/bin"
+```
+
+These release commands require that version to exist; creating the repository
+does not create a release. The base directory
 must serve `SHA256SUMS` and `kuru-VERSION-TARGET.tar.gz`; local directories also
 work for offline installation. Remote sources require HTTPS. The installer
 checks the archive's SHA-256 hash, exact expected entries, regular-file types,

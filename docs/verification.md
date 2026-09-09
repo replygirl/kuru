@@ -1,5 +1,21 @@
 # Verification record
 
+## Private GitHub repository preparation
+
+The initial hosting preparation for [replygirl/kuru](https://github.com/replygirl/kuru)
+passed `mise run check`: **147 Rust tests**, **11 installer tests**, and
+**97.64% coverage** (6731/6894), plus lint, format, workflow and cospec checks.
+Conventional PR-title positive/negative probes passed. A review of all 192 existing
+historical blobs found no credential-shaped content; no local state or credential
+artifacts were tracked. This is a scoped publication review, not a security audit.
+
+The repository was created privately, with squash-only merging, automatic merged
+branch deletion, issues enabled and unused wiki/projects disabled, matching the
+cospec reference. Source includes a stable `ci-gate`, PR-title validation,
+contributor/security guidance and authenticated private clone instructions.
+Hosted results are available in [GitHub Actions](https://github.com/replygirl/kuru/actions).
+No release tags or visibility change are part of initial repository creation.
+
 ## Quiet ambient correction
 
 The follow-up motion correction passed `mise run check` on 2026-09-09:
@@ -103,8 +119,8 @@ Validated locally on macOS arm64 on 2026-09-09 with the versions recorded in
 
 Fresh interactive browser login was not repeated; live checks used the existing
 supported Codex login. Login/device-login/status/logout command routing is tested
-with a subprocess fixture. Public GitHub CI and release publication have not run
-because this is a local repository; the workflows are statically validated.
+with a subprocess fixture. At the initial local baseline, hosted CI and release publication had not run;
+the workflows were statically validated. Current hosted checks are linked above.
 
 The [protocol documentation](protocols.md) lists the supported MCP/A2A subset.
 Jungian collective memory is project-scoped. Framework profiles are computational
