@@ -8,6 +8,16 @@ The 90% threshold remains unchanged. Rust replaces every Python installer,
 validator and PTY/protocol fixture; Node/npm stays local to the VitePress app.
 The source installer built and executed kuru 0.1.0 from an isolated destination,
 and the installed demo provider completed an offline conversation.
+The actual optimized macOS arm64 executable also completed a release roundtrip:
+native packaging, checksum-verified installation into a temporary directory and
+native self-update, followed by a successful version check.
+
+Hosted Ubuntu found a copied-executable launch failure before the updater ran,
+consistent with the Rust/Linux concurrent spawn and writable-descriptor race.
+Updater fixtures now prepare independent executables in a dedicated Rust child
+and wait for its exit before launch; no retry or timing delay masks the failure.
+The preserved-version assertion follows the crate version so release verification
+continues to work after a version bump.
 
 The release suite uses actual Cocogitto and Communiqué binaries with disposable
 Git histories and local HTTP fixtures. It verifies scoped version stamping,

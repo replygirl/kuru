@@ -50,7 +50,10 @@ impl Sandbox {
 fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     let env = Sandbox::new();
     assert!(env.success(&["--help"]).contains("peer"));
-    assert!(env.success(&["--version"]).starts_with("kuru 0."));
+    assert_eq!(
+        env.success(&["--version"]),
+        concat!("kuru ", env!("CARGO_PKG_VERSION"), "\n")
+    );
     let models: Value = serde_json::from_str(&env.success(&["models"])).unwrap();
     assert_eq!(models[0]["id"], "demo");
     assert!(env.success(&["config"]).contains("provider = \"demo\""));

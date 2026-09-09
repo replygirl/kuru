@@ -1,6 +1,42 @@
-use std::process::Command;
+use std::{path::Path, process::Command};
 
 use sha2::{Digest, Sha256};
+
+fn copy_executable(destination: &Path) {
+    // These tests spawn concurrently. Writing an executable in this process
+    // lets another thread's child inherit its writable descriptor before exec,
+    // even with CLOEXEC, causing Linux ETXTBSY after our copy has returned.
+    // Keep all executable writes in a separate process and wait for its exit:
+    // the test parent can never pass those descriptors to another child.
+    // https://github.com/rust-lang/rust/issues/114554
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "copy_executable_process",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("KURU_UPDATE_COPY_DESTINATION", destination)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "copy fixture failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// A test-only subprocess entry; both updater tests exercise it explicitly.
+// The copied executable has its own inode, so an updater regression cannot
+// modify Cargo's built executable through a hardlink.
+#[test]
+#[ignore = "subprocess entry exercised by both updater integration tests"]
+fn copy_executable_process() {
+    let destination = std::env::var_os("KURU_UPDATE_COPY_DESTINATION").unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_kuru"), destination).unwrap();
+}
 
 #[test]
 fn updater_replaces_the_running_binary_only_after_checksum_validation() {
@@ -10,7 +46,7 @@ fn updater_replaces_the_running_binary_only_after_checksum_validation() {
     std::fs::create_dir(&bin).unwrap();
     std::fs::create_dir(&release).unwrap();
     let executable = bin.join("kuru");
-    std::fs::copy(env!("CARGO_BIN_EXE_kuru"), &executable).unwrap();
+    copy_executable(&executable);
     let target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "aarch64-apple-darwin",
         ("macos", "x86_64") => "x86_64-apple-darwin",
@@ -51,7 +87,7 @@ fn updater_replaces_the_running_binary_only_after_checksum_validation() {
         Command::new(&executable).output().unwrap().stdout,
         b"updated-kuru\n"
     );
-    std::fs::copy(env!("CARGO_BIN_EXE_kuru"), &executable).unwrap();
+    copy_executable(&executable);
     std::fs::write(release.join("SHA256SUMS"), "bad checksum").unwrap();
     let before = std::fs::read(&executable).unwrap();
     let output = Command::new(&executable)
@@ -67,7 +103,7 @@ fn updater_replaces_the_running_binary_only_after_checksum_validation() {
             .output()
             .unwrap()
             .stdout
-            .starts_with(b"kuru 0.1.0")
+            .starts_with(concat!("kuru ", env!("CARGO_PKG_VERSION")).as_bytes())
     );
 }
 
@@ -79,7 +115,7 @@ fn source_update_passes_checkout_and_destination_without_shell_interpolation() {
     std::fs::create_dir(&bin).unwrap();
     std::fs::create_dir_all(source.join("scripts")).unwrap();
     let executable = bin.join("kuru");
-    std::fs::copy(env!("CARGO_BIN_EXE_kuru"), &executable).unwrap();
+    copy_executable(&executable);
     std::fs::write(source.join("scripts/install.sh"),"#!/bin/sh\nset -eu\ntest \"$1\" = --source\nprintf '%s' \"$KURU_INSTALL_DIR\" > \"$KURU_INSTALL_DIR/destination-check\"\n").unwrap();
     let output = Command::new(&executable)
         .args(["update", "--source"])
