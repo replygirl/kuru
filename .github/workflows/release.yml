@@ -121,6 +121,8 @@ jobs:
     needs: [plan, bump, verify]
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
+      # Archive jobs do not write Git commits or need repository-hook setup.
+      MISE_NO_HOOKS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -143,7 +145,7 @@ jobs:
         with:
           experimental: true
           version: 2026.9.3
-          install_args: rust aqua:jdx/hk
+          install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Build and package native executable

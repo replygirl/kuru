@@ -53,12 +53,49 @@ jobs:
           path: apps/kuru-docs/.vitepress/dist
           include-hidden-files: true
 
+  native-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      MISE_LOCKED: "1"
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      # Only omit mise's repository setup hook in these archive-only jobs.
+      MISE_NO_HOOKS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.3
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Build and package native executable
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          mise run //apps/kuru-tui:build:release -- --target "$RELEASE_TARGET"
+          version=$("target/$RELEASE_TARGET/release/kuru" --version)
+          version=${version#kuru }
+          mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$version"
+          git diff --exit-code --name-only HEAD
+
   ci-gate:
     if: always()
-    needs: check
+    needs: [check, native-build]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every platform check
         env:
           CHECK_RESULT: ${{ needs.check.result }}
-        run: test "$CHECK_RESULT" = success
+          NATIVE_BUILD_RESULT: ${{ needs.native-build.result }}
+        run: test "$CHECK_RESULT" = success && test "$NATIVE_BUILD_RESULT" = success
