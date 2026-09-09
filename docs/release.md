@@ -116,11 +116,14 @@ then install from the local directory. A release command requires a version that
 has actually been published.
 
 Release jobs inherit `MISE_LOCKED=1`, including nested package tasks. This keeps
-tool installation from extending lockfiles after source validation. The bump,
-native build and publish jobs explicitly install locked Rust/hk and disable
-automatic task-tool installation; their native subcommands do not need the notes
-toolchain. Validation, notes and docs jobs retain their package setup, with frozen
-locks. Version preparation checks for tracked setup changes before stamping, and
+tool installation from extending lockfiles after source validation. The bump
+and publish jobs explicitly install locked Rust/hk and disable automatic task-tool
+installation. Native build jobs install only Rust and set `MISE_NO_HOOKS=1` to
+omit mise's repository-setup postinstall hook; hk 1.58.1 has no Intel macOS asset,
+and archive construction does not create Git commits. Git hooks and full
+validation retain hk. These native subcommands do not need the notes toolchain.
+Validation, notes and docs jobs retain their package setup, with frozen locks.
+Version preparation checks for tracked setup changes before stamping, and
 the commit guard permits only Cargo.toml and Cargo.lock changes. An unexpected
 file is reported by name and must be fixed in source rather than reset or included
 in the version commit.
@@ -143,6 +146,10 @@ commit before the remote tag is created; the context supplies the target version
 Generated notes remain fallible prose, so inspect the release notes artifact when
 reviewing a run. The prompt requires factual changes and prohibits invented test
 results or deployment claims.
+It also bounds the release summary, supplies concrete provider/tool boundaries,
+and excludes uncommitted roadmap promises and repository-administration details.
+Compare generated claims with source; a successful notes job only proves that
+the tool produced an artifact.
 
 Upstream contracts: [Cocogitto versioning](https://docs.cocogitto.io/guide/bump.html),
 [Communiqué configuration](https://github.com/jdx/communique/blob/v1.3.5/src/config.rs),

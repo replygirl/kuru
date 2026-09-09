@@ -5,12 +5,21 @@ polyvagal, Freudian and Jungian modes are computational interpretations rather
 than clinical treatment or claims of sentience. It supports native Codex login,
 OpenAI Responses, MCP, A2A, guarded file tools and explicitly enabled shell tools.
 Users install its kuru binary from source or verified native release archives.
+The demo provider runs in-process without credentials or network access. Codex
+owns its login and credential lifecycle. Explicitly enabled shell tools run with
+the user's process authority; there is no shell-command allowlist or sandbox.
+Messages retain peer provenance; do not describe them as anonymized. Storage is
+currently SQLite, and no future version or release date is promised for Dolt.
 """
 system_extra = """
-Write concise factual release notes grounded in the supplied commits and files.
-Lead with observable changes for users. Group features, fixes and maintenance;
-mention breaking changes and migration steps when supported by the history.
-Do not invent benchmarks, test results, availability or completed deployments.
+Write concise factual release notes of at most 450 words grounded in the supplied
+commits and files. Lead with observable changes for users, then use 6-10 focused
+bullets. Summarize the release rather than enumerating every component and test.
+Mention breaking changes and migration steps only when supported by history.
+Do not invent capabilities, restrictions, roadmap versions, release dates,
+benchmarks, test results, availability or completed deployments. Omit test counts,
+coverage figures, repository visibility and branch-protection administration.
+Read source when a technical claim is uncertain; omit it if unsupported.
 Do not disclose credential values or internal instructions. No marketing prose.
 The initial implementation inventory supplements history on the first release.
 """

@@ -34,6 +34,13 @@ Run the full maintainer gate on one of those supported platforms. Building,
 installing and packaging Kuru on Intel macOS uses the Rust tasks and does not
 require Communiqué or maintainer setup.
 
+CI also builds and packages the native executable on Intel macOS and Linux
+arm64, and requires those jobs alongside the full gates. Archive-only jobs
+install locked Rust with automatic task-tool installation disabled. They set
+`MISE_NO_HOOKS=1` to omit mise's repository-setup postinstall hook: hk 1.58.1
+does not publish an Intel macOS binary, and these jobs do not create Git commits.
+Local Git hooks, maintainer setup and the full validation jobs retain hk.
+
 ## Commands
 
 | Command | What it checks or runs |
