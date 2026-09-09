@@ -19,7 +19,9 @@ ASCII; node and control symbols use standard terminal glyphs without an icon fon
 | Freudian | Open triangle and interference traces | Desire, reality, standards |
 | Jungian | Overlapping rosette contours | Patterns, shadow and shared memory |
 
-Names stay fixed while contours shimmer and a brief ripple responds to editing.
+Names and contour characters stay fixed. A faint color highlight moves through
+the existing lines over 24 seconds, independently of typing; composition does not
+trigger decoration or restart the ambient clock. The composer separator is static.
 Ornament does not represent sentience, inferred work or invented communication.
 Thinking, tools, speaking identities, relationship membership and message endpoints
 come from runtime events. Private peer messages and state notes stay out of the
@@ -43,8 +45,8 @@ not a full Markdown engine.
 
 ## Motion and rendering
 
-Motion stays on by default: ambient frames are capped at 4 FPS, interaction and
-work at 12.5 FPS. A typing pulse decays over 1.1 seconds. Terminal focus reporting
+Motion stays on by default: ambient frames are capped at 4 FPS and factual work
+indicators at 12.5 FPS. Editing does not accelerate animation. Terminal focus reporting
 pauses decoration in background panes. `KURU_REDUCED_MOTION=1` provides a static
 startup accessibility override; useful work status and elapsed seconds still
 update. Animation never changes the draft or caret.

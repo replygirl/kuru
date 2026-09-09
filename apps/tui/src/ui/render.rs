@@ -756,24 +756,7 @@ fn draw_composer(frame: &mut Frame<'_>, view: &View, area: Rect) {
     );
     let line = Line::from(
         (0..area.width)
-            .map(|x| {
-                let center = (view.input_serial % u64::from(area.width.max(1))) as f32;
-                let distance = (f32::from(x) - center).abs();
-                let ripple = view.motion
-                    && view.focused
-                    && view.input_energy > 0.0
-                    && (distance - (1.0 - view.input_energy) * 28.0).abs() < 2.0;
-                Span::styled(
-                    if ripple {
-                        "-"
-                    } else if x % 5 == 0 {
-                        "."
-                    } else {
-                        " "
-                    },
-                    style(if ripple { accent } else { EDGE }),
-                )
-            })
+            .map(|x| Span::styled(if x % 5 == 0 { "." } else { " " }, style(EDGE)))
             .collect::<Vec<_>>(),
     );
     frame.render_widget(

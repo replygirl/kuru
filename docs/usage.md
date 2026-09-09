@@ -44,8 +44,10 @@ peer messages or state notes.
 
 Each framework has its own portrait: IFS orbits, polyvagal flows, a Freudian
 triangle and a Jungian rosette. Quiet ASCII contours animate while the pane has
-focus, at up to four frames per second. Typing adds a short ripple; editing and
-active work can redraw at up to 12.5 frames per second. Motion stays on by default.
+focus, at up to four frames per second. A faint color highlight moves through
+fixed contour characters over 24 seconds. Typing leaves that rhythm and the composer
+decoration alone. Active work indicators can update at up to 12.5 frames per second.
+Motion stays on by default.
 `KURU_REDUCED_MOTION=1 kuru` is an accessibility startup override that makes
 ornament static. The actual operation timer still updates. No special icon font
 is required.

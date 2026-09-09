@@ -185,26 +185,24 @@ pub(super) fn draw(frame: &mut Frame<'_>, view: &View, area: Rect) {
         "jungian" => rosette(&mut canvas, phase, accent),
         _ => orbit(&mut canvas, phase, accent),
     }
-    if view.motion && view.input_energy > 0.0 {
-        input_ripple(&mut canvas, view.input_energy, view.input_serial, accent);
-    }
     let positions = positions(view, &canvas);
     draw_relationships(&mut canvas, view, &positions, phase);
     canvas.paint(frame, area);
     draw_peers(frame, view, area, &positions, compact);
 }
 
+// Time changes only dim color, never contour cells or glyphs. A full pass
+// takes 24 seconds, independent of typing and the busy-indicator frame rate.
+fn ambient_color(base: Color, phase: f64, offset: f64, accent: Color) -> Color {
+    let light = ((phase * TAU / 24.0 - offset).sin() + 1.0) as f32 / 2.0;
+    mix(base, mix(TRACE, accent, 0.12), light)
+}
+
 fn ornament(canvas: &mut Canvas, point: Point, index: usize, phase: f64, accent: Color) {
-    let shimmer = ((index as f64 * 0.075 - phase * 0.35).sin() + 1.0) / 2.0;
-    let bright = shimmer > 0.96;
     canvas.put(
         point,
-        if bright { ':' } else { '.' },
-        if bright {
-            mix(TRACE, accent, 0.27)
-        } else {
-            GHOST
-        },
+        '.',
+        ambient_color(GHOST, phase, index as f64 * 0.025, accent),
     );
 }
 
@@ -224,7 +222,7 @@ fn orbit(canvas: &mut Canvas, phase: f64, accent: Color) {
             continue;
         }
         let point = canvas.point(0.5 + 0.24 * angle.cos(), 0.48 + 0.24 * angle.sin());
-        ornament(canvas, point, step + 90, phase * 0.7, accent);
+        ornament(canvas, point, step + 90, phase, accent);
     }
 }
 
@@ -235,15 +233,10 @@ fn flowing_traces(canvas: &mut Canvas, phase: f64, accent: Color) {
             let t = f64::from(x) / f64::from(canvas.width.saturating_sub(1).max(1));
             let wave = (t * TAU * 1.2 + band as f64 * 0.8).sin() * 0.065;
             let point = canvas.point(t, baseline + wave);
-            let bright = ((t * TAU - phase * 0.4 + band as f64).sin() + 1.0) / 2.0 > 0.93;
             canvas.put(
                 point,
-                if bright { ':' } else { '-' },
-                if bright {
-                    mix(TRACE, accent, 0.32)
-                } else {
-                    GHOST
-                },
+                '-',
+                ambient_color(GHOST, phase, t * TAU + band as f64, accent),
             );
             if x % 4 == band {
                 let echo = canvas.point(t, baseline + wave + 0.08);
@@ -277,10 +270,7 @@ fn triangle(canvas: &mut Canvas, phase: f64, accent: Color) {
                     continue;
                 }
                 let point = interpolate(start, end, t);
-                let bright = (t * TAU - phase * 0.35 + side as f64).sin() > 0.9;
-                let glyph = if bright {
-                    '+'
-                } else if side == 1 {
+                let glyph = if side == 1 {
                     '-'
                 } else if side == 0 {
                     '/'
@@ -290,13 +280,12 @@ fn triangle(canvas: &mut Canvas, phase: f64, accent: Color) {
                 canvas.put(
                     point,
                     glyph,
-                    if bright {
-                        mix(TRACE, accent, 0.25)
-                    } else if layer == 0 {
-                        TRACE
-                    } else {
-                        GHOST
-                    },
+                    ambient_color(
+                        if layer == 0 { TRACE } else { GHOST },
+                        phase,
+                        t * TAU + side as f64,
+                        accent,
+                    ),
                 );
             }
         }
@@ -323,27 +312,6 @@ fn rosette(canvas: &mut Canvas, phase: f64, accent: Color) {
         let angle = step as f64 / 89.0 * TAU;
         let point = canvas.point(0.5 + 0.47 * angle.cos(), 0.47 + 0.45 * angle.sin());
         canvas.put(point, '.', GHOST);
-    }
-}
-
-fn input_ripple(canvas: &mut Canvas, energy: f32, serial: u64, accent: Color) {
-    let energy = energy.clamp(0.0, 1.0);
-    let radius = 0.08 + f64::from(1.0 - energy) * 0.70;
-    let offset = (serial % 3) as f64 * 0.012;
-    for step in 0..128 {
-        let angle = step as f64 / 127.0 * TAU;
-        let point = canvas.point(
-            0.5 + radius * angle.cos(),
-            0.55 + radius * 1.2 * angle.sin() + offset,
-        );
-        if step % 3 != 0 {
-            continue;
-        }
-        canvas.put(
-            point,
-            if energy > 0.65 { '+' } else { ':' },
-            mix(TRACE, accent, energy * 0.7),
-        );
     }
 }
 
@@ -566,7 +534,7 @@ mod tests {
                 .content
                 .iter()
                 .map(|cell| {
-                    if [GHOST, TRACE].contains(&cell.fg) {
+                    if matches!(cell.symbol(), "." | ":" | "-" | "/" | "\\") {
                         cell.symbol()
                     } else {
                         " "
@@ -579,21 +547,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_affects_only_portrait_and_reduced_motion_is_completely_static() {
+    async fn reduced_motion_freezes_contour_color_and_keeps_peer_names() {
         let mut view = view(Mode::Ifs);
-        let baseline = render(&view, 65, 14);
-        view.input_energy = 0.8;
-        view.input_serial = 4;
-        let input = render(&view, 65, 14);
-        assert_ne!(baseline, input);
-        for (_, label) in &view.parts {
-            assert!(text(&input).contains(name(label)));
-        }
         view.motion = false;
         let still = render(&view, 65, 14);
+        for (_, label) in &view.parts {
+            assert!(text(&still).contains(name(label)));
+        }
         view.frame = 900;
-        view.input_energy = 0.2;
-        view.input_serial = 9;
         assert_eq!(still, render(&view, 65, 14));
     }
 

@@ -154,7 +154,14 @@ def wait_text(marker):
 try:
     wait_text(b"KURU")
     os.write(master, b"Slow request\r")
-    assert started.wait(timeout=10), bytes(output[-6000:])
+    # Keep draining the PTY while waiting for the provider. A partial first
+    # frame can contain KURU before it fills the PTY buffer; blocking here can
+    # otherwise prevent the app from finishing its draw and consuming input.
+    deadline = time.monotonic() + 10
+    while not started.is_set():
+        read_for(0.05)
+        assert child.poll() is None, bytes(output[-6000:])
+        assert time.monotonic() < deadline, screen_text().decode()
     os.write(master, b"\x1b[200~Next thought\x1b[201~")
     os.write(master, b"\x1bOQ")  # F2 explains why settings are temporarily busy.
     wait_text(b"current turn")

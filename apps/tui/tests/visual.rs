@@ -517,7 +517,7 @@ async fn mode_picker_previews_selection_and_filtering_never_changes_the_live_poo
 }
 
 #[tokio::test]
-async fn ambient_and_typing_frames_leave_labels_and_editor_position_stable() {
+async fn ambient_time_preserves_labels_draft_caret_and_static_override() {
     let (_project, harness, mut view) = fixture(Mode::Jungian);
     view.motion = true;
     let (first, _) = render(&view, 140, 50, "ambient-zero");
@@ -527,20 +527,19 @@ async fn ambient_and_typing_frames_leave_labels_and_editor_position_stable() {
     for c in "A thought".chars() {
         view.key(key(KeyCode::Char(c)));
     }
-    let (typed, cursor) = render(&view, 140, 50, "input-ripple-start");
+    let (typed, cursor) = render(&view, 140, 50, "ambient-draft-start");
     view.advance_animation(std::time::Duration::from_millis(12500));
-    let (ripple, after) = render(&view, 140, 50, "input-ripple-later");
-    assert_ne!(typed, ripple);
+    let (later_frame, after) = render(&view, 140, 50, "ambient-draft-later");
+    assert_ne!(typed, later_frame);
     assert_eq!(cursor, after);
     for part in &harness.topology.parts {
         let locate = |buffer: &Buffer| text(buffer).find(&part.name).unwrap();
-        assert_eq!(locate(&typed), locate(&ripple));
+        assert_eq!(locate(&typed), locate(&later_frame));
     }
-    assert!(text(&ripple).contains("A thought"));
+    assert!(text(&later_frame).contains("A thought"));
     view.motion = false;
     let (still, _) = render(&view, 140, 50, "ambient-static");
     view.frame += 97;
-    view.input_energy = 0.8;
     let (later, _) = render(&view, 140, 50, "ambient-static-later");
     assert_eq!(still, later);
 }
@@ -576,5 +575,69 @@ async fn frame_cost_profile() {
             "{state}: {:.3} ms/frame (200 frames, 140x50)",
             start.elapsed().as_secs_f64() * 5.0
         );
+    }
+}
+
+#[tokio::test]
+async fn quiet_typing_leaves_portrait_and_composer_decoration_untouched() {
+    for mode in Mode::ALL {
+        let (_project, _harness, mut view) = fixture(mode);
+        view.motion = true;
+        let (baseline, _) = render(&view, 140, 50, &format!("quiet-before-{mode}"));
+        // Rows 0..45 include the complete scene and composer separator; the
+        // editable draft starts on row 45. The clock stays fixed throughout.
+        for c in "A thought".chars() {
+            view.key(key(KeyCode::Char(c)));
+            let (typed, _) = render(&view, 140, 50, &format!("quiet-typed-{mode}"));
+            assert!(
+                baseline.content[..140 * 45] == typed.content[..140 * 45],
+                "typing disturbed the {mode} portrait or composer decoration"
+            );
+        }
+        view.paste(" and a pasted continuation");
+        view.key(key(KeyCode::Backspace));
+        view.key(key(KeyCode::Home));
+        view.key(key(KeyCode::Delete));
+        let (edited, _) = render(&view, 140, 50, &format!("quiet-edited-{mode}"));
+        assert!(
+            baseline.content[..140 * 45] == edited.content[..140 * 45],
+            "paste/edit disturbed the {mode} scene"
+        );
+        assert_eq!(view.input, " thought and a pasted continuatio");
+    }
+}
+
+#[tokio::test]
+async fn quiet_ambient_keeps_every_glyph_fixed_and_changes_color_gradually() {
+    for mode in Mode::ALL {
+        let (_project, _harness, mut view) = fixture(mode);
+        view.motion = true;
+        let (baseline, _) = render(&view, 140, 50, &format!("quiet-ambient-zero-{mode}"));
+        let mut colored = false;
+        for frame in [75, 150, 225, 300] {
+            view.frame = frame;
+            let (later, _) = render(&view, 140, 50, &format!("quiet-ambient-{frame}-{mode}"));
+            assert!(
+                text(&baseline) == text(&later),
+                "ambient animation changed glyphs or positions in {mode}"
+            );
+            colored |= baseline != later;
+        }
+        assert!(
+            colored,
+            "{mode} should still have time-driven ambient color"
+        );
+        view.frame = 0;
+        let (first, _) = render(&view, 140, 50, "quiet-smooth-before");
+        view.advance_animation(std::time::Duration::from_millis(250));
+        let (next, _) = render(&view, 140, 50, "quiet-smooth-after");
+        for (a, b) in first.content.iter().zip(&next.content) {
+            if let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) = (a.fg, b.fg) {
+                assert!(
+                    ar.abs_diff(br).max(ag.abs_diff(bg)).max(ab.abs_diff(bb)) <= 2,
+                    "abrupt brightness step in {mode}"
+                );
+            }
+        }
     }
 }

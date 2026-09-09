@@ -62,23 +62,27 @@ decorative geometry from factual actor activity and relationship membership.
 
 ### Requirement: Bounded and optional motion
 
-The terminal interface SHALL enable restrained ambient animation by default and
-respond to editing with bounded, decaying visual feedback. Ambient presentation
-SHALL NOT invent actor work, message delivery or modeled emotional state. Idle
-animation SHALL run at no more than four frames per second and interactive/work
-animation at no more than 12.5 frames per second. The existing startup reduced-motion
-environment override SHALL preserve static equivalents without occupying normal
-control space with a motion toggle.
+The terminal SHALL enable quiet ambient color animation independent of input.
+Editing SHALL NOT trigger decoration, restart its phase or accelerate its cadence.
+Contour glyphs and positions SHALL remain fixed. Idle animation SHALL run at no
+more than four frames per second; factual work indicators at no more than 12.5.
+The startup reduced-motion override SHALL preserve static ornament and meaningful
+state labels. Ambient decoration SHALL NOT invent actor activity.
 
 #### Scenario: Settled idle interface
 - **WHEN** the interface is idle and then the user edits or pastes input
-- **THEN** a quiet ambient scene responds briefly to that input, while text, caret
-  and actor state remain stable and animation returns to its idle cadence.
+- **THEN** only the draft and relevant editor feedback change; quiet ambient color
+  continues on its existing clock without bursts, glyph flicker or new marks.
 
 #### Scenario: Reduced motion
 - **WHEN** KURU_REDUCED_MOTION=1 is set at launch
-- **THEN** ambient and input animations remain static while all meaningful state and
-  input updates remain available.
+- **THEN** ambient ornament remains static while meaningful state and input
+  updates remain available.
+
+#### Scenario: Stable contours
+- **WHEN** time advances through an ambient cycle without runtime events
+- **THEN** contour characters, actor names and their positions remain identical,
+  with only a gradual low-contrast color change over a 24-second period.
 
 ### Requirement: Durable interactive project preferences
 

@@ -1,5 +1,25 @@
 # Verification record
 
+## Quiet ambient correction
+
+The follow-up motion correction passed `mise run check` on 2026-09-09:
+**147 Rust tests**, **11 installer tests**, **97.64% workspace line coverage**
+(6731/6894), and all lint, format, tooling and cospec checks.
+
+Two new regressions failed against the prior implementation: typing changed
+portrait/composer cells, and ambient time changed contour characters. Both now
+pass across all four frameworks. Typing, paste and editing leave decoration
+alone; timed frames retain every glyph and position, with RGB channels changing
+by at most two levels per 250ms sample. The ambient cycle lasts 24 seconds.
+Existing mode selector, persistence, busy indicators, focus and static-motion
+checks pass. The earlier typing-ripple behavior described below is superseded.
+
+Actual terminal-cell exports were generated and the quiet Freudian contour was
+visually inspected. The existing cmux preview was refreshed with the same state
+store. The full gate also exposed a PTY fixture waiting for a provider while it
+stopped draining terminal output; the fixture now drains the PTY during that wait,
+preventing startup backpressure from causing a false cancellation-test timeout.
+
 ## Living interface and persistent choices
 
 The second 2026-09-09 interface pass passed `mise run check`: **145 Rust tests**,

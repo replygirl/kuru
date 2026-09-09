@@ -66,8 +66,6 @@ pub struct View {
     pub routes: Vec<(String, String)>,
     pub project: String,
     pub turns: usize,
-    pub input_energy: f32,
-    pub input_serial: u64,
     pub focused: bool,
     pub show_scene: bool,
     pub query: String,
@@ -75,7 +73,6 @@ pub struct View {
     pub operation_ms: u64,
     clock_ms: u64,
     last_frame_ms: u64,
-    last_input_ms: Option<u64>,
     operation_start: Option<u64>,
     notice_until: u64,
 }
@@ -129,8 +126,6 @@ impl View {
                 .to_string_lossy()
                 .into_owned(),
             turns: harness.session.turns,
-            input_energy: 0.0,
-            input_serial: 0,
             focused: true,
             show_scene,
             query: String::new(),
@@ -138,24 +133,16 @@ impl View {
             operation_ms: 0,
             clock_ms: 0,
             last_frame_ms: 0,
-            last_input_ms: None,
             operation_start: None,
             notice_until: 0,
         })
     }
 
-    /// Ambient frames are slower than interaction frames; all motion uses this
+    /// Ambient frames are slower than busy indicators; all motion uses this
     /// supplied clock so scenes never infer state or read wall time themselves.
     pub fn advance_animation(&mut self, elapsed: Duration) -> bool {
         let now = elapsed.as_millis().min(u64::MAX as u128) as u64;
         self.clock_ms = now;
-        self.input_energy = if self.motion && self.focused {
-            self.last_input_ms.map_or(0.0, |last| {
-                (1.0 - now.saturating_sub(last) as f32 / 1100.0).max(0.0)
-            })
-        } else {
-            0.0
-        };
         let mut dirty = false;
         if self.notice.is_some() && now >= self.notice_until {
             self.notice = None;
@@ -166,27 +153,13 @@ impl View {
             dirty |= duration / 1000 != self.operation_ms / 1000;
             self.operation_ms = duration;
         }
-        let interval = if self.busy || self.input_energy > 0.0 {
-            80
-        } else {
-            250
-        };
+        let interval = if self.busy { 80 } else { 250 };
         if self.motion && self.focused && now.saturating_sub(self.last_frame_ms) >= interval {
             self.frame = now / 80;
             self.last_frame_ms = now;
             return true;
         }
         dirty
-    }
-
-    fn edited(&mut self) {
-        self.input_serial = self.input_serial.wrapping_add(1);
-        self.last_input_ms = Some(self.clock_ms);
-        self.input_energy = if self.motion && self.focused {
-            1.0
-        } else {
-            0.0
-        };
     }
 
     fn notify(&mut self, message: impl Into<String>) {
@@ -444,13 +417,11 @@ impl View {
                     .map_or(0, |(i, _)| i);
                 self.input.drain(previous..self.cursor);
                 self.cursor = previous;
-                self.edited();
             }
             KeyCode::Delete if self.cursor < self.input.len() => {
                 let next =
                     self.cursor + self.input[self.cursor..].chars().next().unwrap().len_utf8();
                 self.input.drain(self.cursor..next);
-                self.edited();
             }
             KeyCode::Left => {
                 self.cursor = self.input[..self.cursor]
@@ -488,7 +459,6 @@ impl View {
         if self.input.len() + c.len_utf8() <= 131_072 {
             self.input.insert(self.cursor, c);
             self.cursor += c.len_utf8();
-            self.edited();
         }
     }
 }
@@ -655,7 +625,7 @@ where
                 .map_err(|e| anyhow::anyhow!("terminal draw: {e}"))?;
             dirty = false;
         }
-        let wait = if view.busy || view.input_energy > 0.0 {
+        let wait = if view.busy {
             Duration::from_millis(25)
         } else {
             Duration::from_millis(100)
@@ -861,7 +831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambient_motion_continues_and_editing_accelerates_then_settles() {
+    async fn ambient_clock_ignores_editing_and_preserves_busy_focus_and_static_behavior() {
         let (_dir, h, models) = fixture();
         let mut view = View::new(&h, models).unwrap();
         view.motion = true;
@@ -870,14 +840,15 @@ mod tests {
         assert!(view.advance_animation(Duration::from_secs(5)));
         let ambient_frame = view.frame;
         view.key(key(KeyCode::Char('a')));
-        assert_eq!(view.input_energy, 1.0);
-        assert!(!view.advance_animation(Duration::from_millis(5079)));
-        assert!(view.advance_animation(Duration::from_millis(5080)));
-        assert!(view.frame > ambient_frame);
-        assert!(view.input_energy > 0.0 && view.input_energy < 1.0);
-        view.advance_animation(Duration::from_millis(6200));
-        assert_eq!(view.input_energy, 0.0);
-        assert!(!view.advance_animation(Duration::from_millis(6280)));
+        view.paste(" pasted text");
+        assert_eq!(view.frame, ambient_frame);
+        assert!(!view.advance_animation(Duration::from_millis(5080)));
+        assert!(!view.advance_animation(Duration::from_millis(5249)));
+        assert!(view.advance_animation(Duration::from_millis(5250)));
+        view.begin_operation();
+        assert!(view.advance_animation(Duration::from_millis(5330)));
+        view.settle();
+        view.busy = false;
         view.focused = false;
         assert!(!view.advance_animation(Duration::from_secs(7)));
         view.focused = true;
@@ -885,7 +856,6 @@ mod tests {
         view.motion = false;
         let still = view.frame;
         view.key(key(KeyCode::Char('b')));
-        assert_eq!(view.input_energy, 0.0);
         assert!(!view.advance_animation(Duration::from_secs(9)));
         assert_eq!(view.frame, still);
         // Accessibility pauses ornament; the actual elapsed operation clock remains useful.
