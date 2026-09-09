@@ -201,6 +201,47 @@ impl StdioFixture {
         );
         assert_eq!(self.conversations().len(), processes);
     }
+
+    fn diagnostics(&self) -> String {
+        use std::io::Read;
+        let mut text = format!("native fixture {}", self.path.display());
+        let Ok(entries) = std::fs::read_dir(self.directory.path()) else {
+            return text;
+        };
+        let mut paths: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|extension| {
+                    ["started", "error", "requests", "done", "plan"]
+                        .iter()
+                        .any(|value| extension == *value)
+                })
+            })
+            .collect();
+        paths.sort();
+        for path in paths.into_iter().take(8) {
+            let mut bytes = Vec::new();
+            if let Ok(file) = std::fs::File::open(&path)
+                && file.take(2048).read_to_end(&mut bytes).is_ok()
+            {
+                text.push_str(&format!(
+                    "\n{}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&bytes)
+                ));
+            }
+        }
+        text
+    }
+}
+
+impl Drop for StdioFixture {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", self.diagnostics());
+        }
+    }
 }
 
 struct CompiledPeer {
@@ -274,13 +315,23 @@ pub fn request() -> kuru_core::CompletionRequest {
 mod tests {
     use super::{FixtureCache, StdioFixture, Step};
     use serde_json::{Value, json};
-    use std::{os::unix::fs::MetadataExt, process::Stdio, time::Duration};
+    use std::{os::unix::fs::MetadataExt, path::Path, process::Stdio, time::Duration};
     use tokio::{
         io::AsyncReadExt, io::AsyncWriteExt, process::Command, sync::Barrier, time::timeout,
     };
 
     async fn exchange(fixture: &StdioFixture, request: Value, started: &Barrier) -> Value {
-        let mut child = Command::new(&fixture.path)
+        exchange_program(fixture, &fixture.path, request, started).await
+    }
+
+    async fn exchange_program(
+        fixture: &StdioFixture,
+        program: &Path,
+        request: Value,
+        started: &Barrier,
+    ) -> Value {
+        let mut child = Command::new(program)
+            .arg0(&fixture.path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -295,9 +346,12 @@ mod tests {
         let result = timeout(Duration::from_secs(10), async {
             // Both subprocesses must be alive before either receives its input.
             started.wait().await;
-            input.write_all(format!("{request}\n").as_bytes()).await?;
-            drop(input);
-            tokio::try_join!(
+            tokio::join!(
+                async {
+                    let result = input.write_all(format!("{request}\n").as_bytes()).await;
+                    drop(input);
+                    result
+                },
                 child.wait(),
                 output.read_to_string(&mut stdout),
                 errors.read_to_string(&mut stderr),
@@ -305,7 +359,7 @@ mod tests {
         })
         .await;
         let status = match result {
-            Ok(Ok((status, _, _))) => status,
+            Ok((Ok(()), Ok(status), Ok(_), Ok(_))) => status,
             failure => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -317,6 +371,59 @@ mod tests {
             "native fixture failed: {status}; {stderr}"
         );
         serde_json::from_str(&stdout).expect("the fixture must return its exact JSON plan")
+    }
+
+    #[tokio::test]
+    async fn fixture_uses_absolute_invocation_path_for_its_wire_plan() {
+        let fixture = StdioFixture::with_cache(
+            [
+                Step::Read,
+                Step::Write(json!({"identity": "invocation"})),
+                Step::Eof,
+            ],
+            &FixtureCache::default(),
+        );
+        assert!(fixture.path.is_absolute());
+        assert!(!fixture._binary.path.with_extension("plan").exists());
+        let request = json!({"id": "invocation", "method": "identity"});
+        let started = Barrier::new(1);
+        let reply =
+            exchange_program(&fixture, &fixture._binary.path, request.clone(), &started).await;
+        assert_eq!(reply, json!({"identity": "invocation"}));
+        fixture.assert_completed(1);
+        assert_eq!(fixture.conversations(), vec![vec![request]]);
+    }
+
+    #[tokio::test]
+    async fn fixture_records_unexpected_failure_when_stderr_is_discarded() {
+        let fixture = StdioFixture::new([Step::Read]);
+        let mut child = Command::new(&fixture.path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = match timeout(Duration::from_secs(10), child.wait()).await {
+            Ok(result) => result.unwrap(),
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!(
+                    "fixture did not report closed input: {error}; {}",
+                    fixture.diagnostics()
+                );
+            }
+        };
+        assert_eq!(status.code(), Some(1));
+        let diagnostics = fixture.diagnostics();
+        assert!(diagnostics.contains(".started:"), "{diagnostics}");
+        assert!(diagnostics.contains("invocation="), "{diagnostics}");
+        assert!(
+            diagnostics.contains(".error: unexpected input during read"),
+            "{diagnostics}"
+        );
+        assert_eq!(fixture.conversations(), vec![Vec::<Value>::new()]);
     }
 
     #[tokio::test]
