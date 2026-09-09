@@ -33,11 +33,10 @@ With [mise](https://mise.jdx.dev/getting-started.html) installed, run these comm
 ```sh
 mise trust
 mise install
-mise run setup
 mise run install
 ```
 
-The committed tool pins and lockfile select the toolchain. `setup` installs development dependencies, Rust verification components, and hooks. `install` builds and installs `kuru` into `~/.local/bin`; `KURU_INSTALL_DIR` changes that destination.
+The committed tool pins and lockfile select the toolchain. `install` builds and installs `kuru` into `~/.local/bin`; `KURU_INSTALL_DIR` changes that destination. The separate `mise run setup` command prepares maintainer checks and release-note tools. App installation does not require it.
 
 Confirm the installation, then try the offline provider:
 

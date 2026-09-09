@@ -46,12 +46,11 @@ With [mise](https://mise.jdx.dev/), from the checkout:
 ```sh
 mise trust
 mise install
-mise run setup
 mise run install
 ```
 
-The mise path installs the pinned toolchain and development tools before
-building the same executable. Add your installation directory to `PATH`.
+The mise path installs the pinned toolchain before building the same executable.
+Maintainer setup is separate from app installation. Add your installation directory to `PATH`.
 See [installation and updates](docs/install.md) for release archives and updates.
 
 ## Start a conversation

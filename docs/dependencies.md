@@ -70,6 +70,7 @@ All actions are pinned to the immutable commit for the latest stable release.
 | `jdx/mise-action` | [`v4.3.0`](https://github.com/jdx/mise-action/releases/tag/v4.3.0) | `c2a87611a18de5b3828c5652fe268e992400cb5c` |
 | `actions/upload-artifact` | [`v7.0.1`](https://github.com/actions/upload-artifact/releases/tag/v7.0.1) | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` |
 | `actions/download-artifact` | [`v8.0.1`](https://github.com/actions/download-artifact/releases/tag/v8.0.1) | `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` |
+| `Swatinem/rust-cache` | [`v2.9.2`](https://github.com/Swatinem/rust-cache/releases/tag/v2.9.2) | `6323deb102c322ba6fcbdcafc7e3dddab59af2b6` |
 
 The reqwest 0.13 upgrade changes its TLS feature name to `rustls`; the capability filesystem crates move together to 4.0.3. Rust 1.98.1 is shared by mise and rust-toolchain.toml. Re-run format, lint, protocol tests and coverage after future updates instead of assuming minor version changes are compatible.
 

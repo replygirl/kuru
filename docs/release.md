@@ -34,6 +34,12 @@ Configure Pages to use GitHub Actions. Documentation deployment uses the reusabl
 Pages workflow with `contents: read`, `pages: write` and `id-token: write`.
 Deployment of public documentation does not change repository visibility.
 
+Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
+7.0.0 and Communiqué 1.3.5 pins. The latter has no Intel macOS release binary;
+native archive build jobs use only the Rust packaging task, so all four Kuru
+targets remain buildable. Full maintainer tests and notes generation run on
+Linux or Apple Silicon macOS. App installation does not require these tools.
+
 ## Choose and release a version
 
 After the change is reviewed, merged, and main's checks are green, open Actions →

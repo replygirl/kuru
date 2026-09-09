@@ -36,14 +36,14 @@ the source revision you want before running it.
 ```sh
 mise trust
 mise install
-mise run setup
 mise run install
 ```
 
-`mise install` uses committed tool pins and the lockfile. `setup` installs the
-package-owned tooling and the Rust components needed for formatting, lint and
-coverage, then installs hk hooks. Cospec is standalone. `install` runs the same
-source installer. This workflow works before a hosted release exists.
+`mise install` uses committed tool pins and the lockfile. `install` runs the same
+source installer. This workflow works before a hosted release exists on both
+Apple Silicon and Intel macOS, as well as Linux. The separate `mise run setup`
+command prepares maintainer checks and release-note tools; app installation
+does not require it. See [development](development.md) for that toolchain.
 
 ## Release archives
 

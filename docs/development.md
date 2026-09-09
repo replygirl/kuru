@@ -26,6 +26,14 @@ the Rust package `packages/kuru-delivery`. No Python or Bun is needed. The
 VitePress docs app owns its Node pin, package.json and npm lockfile under
 `apps/kuru-docs`; its mise tasks invoke the installed tools directly.
 
+The delivery package activates Cocogitto and Communiqué only for its tests,
+combined coverage and release tasks. Its `setup` task preinstalls those tools
+with mise's `--include-task-tools` option. Communiqué 1.3.5 provides Linux x86_64
+and arm64 and macOS arm64 binaries; it does not publish an Intel macOS binary.
+Run the full maintainer gate on one of those supported platforms. Building,
+installing and packaging Kuru on Intel macOS uses the Rust tasks and does not
+require Communiqué or maintainer setup.
+
 ## Commands
 
 | Command | What it checks or runs |
@@ -112,6 +120,22 @@ mise lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64
 mise -C apps/kuru-docs lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64
 mise -C packages/kuru-delivery lock --platform linux-x64,linux-arm64,macos-x64,macos-arm64
 ```
+
+Mise records available provenance for every platform, but normally verifies
+only the current platform's artifact. Before committing an updated Communiqué
+lock entry, verify the other supported archives as well. These commands download
+and verify artifact bytes; they neither install nor execute foreign binaries:
+
+```sh
+MISE_OS=linux MISE_ARCH=x86_64 mise -C packages/kuru-delivery lock github:jdx/communique --platform linux-x64
+MISE_OS=linux MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform linux-arm64
+MISE_OS=macos MISE_ARCH=aarch64 mise -C packages/kuru-delivery lock github:jdx/communique --platform macos-arm64
+```
+
+Review the resulting `provenance_verified` metadata alongside URLs and checksums.
+This also keeps CI installation from creating uncommitted verification metadata.
+See mise's [lockfile provenance contract](https://mise.jdx.dev/dev-tools/mise-lock.html#provenance-and-security)
+and [task tool configuration](https://mise.jdx.dev/tasks/task-configuration.html#tools).
 
 Commit the updated lockfile in the same change. CI detects lock drift. Update
 user documentation when flags, configuration, role behavior or contracts change.
