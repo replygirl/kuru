@@ -18,6 +18,11 @@ The monorepo uses `apps/` and `packages/`, centrally pinned tools and dependenci
 and hk hooks. Run commands through mise. See [development](docs/development.md)
 for the full task catalog and the meaningful 90% workspace coverage requirement.
 
+[AGENTS.md](AGENTS.md) is the shared instruction source for coding assistants;
+Claude Code imports it through `CLAUDE.md`. Cospec workflows are generated for
+Claude Code, Codex and OpenCode. See [agent setup](docs/development.md#coding-assistants)
+for their locations and regeneration commands.
+
 ## Changes and review
 
 Create a branch from `main`. Start substantive work with a typed cospec change:

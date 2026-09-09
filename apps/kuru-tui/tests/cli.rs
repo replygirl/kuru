@@ -241,11 +241,30 @@ fn supported_auth_commands_forward_to_native_codex_without_handling_tokens() {
 
 #[cfg(unix)]
 #[test]
+fn terminal_driver_drains_backpressure_and_bounds_stalled_processes() {
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/terminal_driver_regression.py"
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn real_pty_accepts_chat_navigation_commands_and_restores_terminal() {
     let env = Sandbox::new();
     let output = Command::new("python3")
-        .arg("-c")
-        .arg(include_str!("fixtures/tui_smoke.py"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tui_smoke.py"
+        ))
         .arg(env!("CARGO_BIN_EXE_kuru"))
         .arg(&env.project)
         .arg(&env.data)
@@ -267,8 +286,10 @@ fn real_pty_accepts_chat_navigation_commands_and_restores_terminal() {
 async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_turn() {
     let env = Sandbox::new();
     let output = Command::new("python3")
-        .arg("-c")
-        .arg(include_str!("fixtures/cancellation_smoke.py"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cancellation_smoke.py"
+        ))
         .arg(env!("CARGO_BIN_EXE_kuru"))
         .arg(&env.project)
         .arg(&env.data)

@@ -1,13 +1,14 @@
 import fcntl
 import os
 import pty
-import re
-import select
+import signal
 import struct
 import subprocess
 import sys
 import termios
-import time
+import threading
+
+from terminal_driver import Terminal
 
 
 def run_smoke(reduced_motion, full_session):
@@ -39,29 +40,19 @@ def run_smoke(reduced_motion, full_session):
         stderr=slave,
         env=environment,
     )
-    output = bytearray()
+    terminal = Terminal(master, child)
+    output = terminal.output
+    read_for = terminal.read_for
+    resume = None
 
-    def read_for(seconds):
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if select.select([master], [], [], 0.03)[0]:
-                try:
-                    output.extend(os.read(master, 65536))
-                except OSError:
-                    break
+    def pause_child():
+        nonlocal resume
+        os.kill(child.pid, signal.SIGSTOP)
+        resume = threading.Timer(1.0, os.kill, args=(child.pid, signal.SIGCONT))
+        resume.start()
 
     try:
-        # Wait for readiness, not a fixed startup delay: coverage and regular
-        # tests build/run concurrently, and process scheduling can vary in CI.
-        deadline = time.monotonic() + 10
-        while True:
-            read_for(0.05)
-            assert child.poll() is None, bytes(output)
-            visible_text = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", output)
-            if b"KURU" in visible_text:
-                break
-            assert time.monotonic() < deadline, "terminal did not become ready"
-        read_for(0.2)
+        terminal.wait_text(b"KURU", b"enter send")
         assert b"\x1b[38;2;" in output, "truecolor terminal received no RGB colors"
         # Ambient decoration stays alive after the former four-second cutoff.
         # The startup accessibility override must leave every cell settled.
@@ -78,36 +69,39 @@ def run_smoke(reduced_motion, full_session):
         os.write(master, b"\x1b[I")
         read_for(0.2)
         if full_session:
-            for data in [
-                b"/help\r",
-                b"hello from a terminal\r",
-                b"/parts\r",
-                b"\x1bOQ",
-                b"\r",
-                b"/effort default\r",
-                b"/mode jungian\r",
-                b"/model\r",
-                b"\x1b",
-                b"/effort\r",
-                b"\r",
-                b"/mode\r",
-                b"\x1b[B",
-                b"\r",
-                b"/dream\r",
-                b"/unknown\r",
-            ]:
-                os.write(master, data)
-                read_for(0.15)
+            terminal.command("/help")
+            pause_child()  # A real scheduling delay longer than the old 150 ms.
+            terminal.command("hello from a terminal")
+            resume.join()
+            terminal.command("/parts")
+            os.write(master, b"\x1bOQ")
+            terminal.wait_text(b"Models", b"Esc back")
+            terminal.close_picker(b"\r")
+            terminal.command("/effort default")
+            terminal.command("/mode jungian")
+            terminal.command("/model", picker=b"Models")
+            terminal.close_picker(b"\x1b")
+            terminal.command("/effort", picker=b"Efforts")
+            terminal.close_picker(b"\r")
+            terminal.command("/mode", picker=b"Modes")
+            terminal.close_picker(b"\x1b[B\r")
+            terminal.command("/dream")
+            terminal.command("/unknown")
+            terminal.wait_text(b"unknown command")
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 65, 0, 0))
+            terminal.rows, terminal.columns = 20, 65
             os.write(master, b"\x1b[200~pasted text\x1b[201~")
-            read_for(0.1)
-            os.write(master, b"\x01")
-            os.write(master, b"\r")
-            read_for(0.2)
+            terminal.wait_text(b"pasted text", b"enter send")
+            os.write(master, b"\x01\r")
+            terminal.wait_text(b"What shall we explore or build?", b"enter send")
+        terminal.wait_idle()
+        pause_child()
+        # Delay a full redraw beyond the old output-draining window at exit.
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 180, 0, 0))
+        terminal.rows, terminal.columns = 60, 180
         os.write(master, b"/quit\r")
-        read_for(0.5)
-        child.wait(timeout=5)
-        assert child.returncode == 0, bytes(output[-12000:])
+        terminal.wait_exit()
+        resume.join()
         # Ratatui emits cursor-addressed diffs, so typed characters need not be
         # contiguous in the byte stream. The durable transcript proves submission.
         assert b"demo" in output
@@ -115,6 +109,9 @@ def run_smoke(reduced_motion, full_session):
             "terminal attributes were not restored"
         )
     finally:
+        if resume is not None:
+            resume.cancel()
+            resume.join()
         if child.poll() is None:
             child.kill()
             child.wait()

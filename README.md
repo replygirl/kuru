@@ -28,7 +28,7 @@ Direct installation with an existing Rust toolchain:
 
 ```sh
 cd /path/to/kuru
-cargo install --path apps/tui --locked
+cargo install --path apps/kuru-tui --locked
 kuru --version
 ```
 
@@ -103,7 +103,7 @@ and [development](docs/development.md) for boundaries and extension points.
 
 | Path | Responsibility |
 | --- | --- |
-| `apps/tui` | Terminal UI and `kuru` executable |
+| `apps/kuru-tui` | Terminal UI and `kuru` executable |
 | `packages/kuru-core` | Frameworks, configuration and SQLite memory |
 | `packages/kuru-connectors` | Providers, tools, MCP and outbound A2A |
 | `packages/kuru-runtime` | Actor pool, peer routing, relationships and dreaming |

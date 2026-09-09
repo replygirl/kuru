@@ -19,10 +19,10 @@ for name, dependency in manifest["workspace"]["dependencies"].items():
     version = dependency if isinstance(dependency, str) else dependency.get("version")
     if version is not None and not version.startswith("="):
         errors.append(f"workspace dependency {name} must be exactly pinned")
-if (
-    root / "AGENTS.md"
-).read_text().strip() != "See [CLAUDE.md](./CLAUDE.md) for agent instructions.":
-    errors.append("AGENTS.md must delegate to the single CLAUDE.md instruction source")
+if not (root / "AGENTS.md").read_text().startswith("# Kuru\n"):
+    errors.append("AGENTS.md must contain the canonical repository instructions")
+if (root / "CLAUDE.md").read_text().strip() != "@AGENTS.md":
+    errors.append("CLAUDE.md must import the canonical instructions with @AGENTS.md")
 for directory in manifest["workspace"]["members"]:
     if not (root / directory / "Cargo.toml").is_file():
         errors.append(f"workspace member missing: {directory}")
