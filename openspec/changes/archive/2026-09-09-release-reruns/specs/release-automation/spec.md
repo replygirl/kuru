@@ -1,11 +1,4 @@
-# release-automation Specification
-
-## Purpose
-Prepare and publish reproducible Kuru releases from reviewed main history using
-manual dispatch, conventional versions, signed commits, complete verified
-artifacts, and generated release notes with recoverable publication steps.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Deliberate conventional version preparation
 
@@ -54,11 +47,3 @@ The workflow SHALL verify all four expected archives and checksums, generate not
 #### Scenario: Publication succeeded before the runner failed
 - **WHEN** retry finds a published release with the exact immutable tag, source marker and complete valid asset metadata
 - **THEN** publication succeeds without remote writes and the final documentation jobs can proceed
-
-### Requirement: Accurate release notes and instructions
-
-Release notes SHALL use supported Communiqué configuration and include initial implementation context for the first release. Documentation SHALL describe required credentials and preserve authenticated installation while the repository is private.
-
-#### Scenario: Initial commit contains the harness
-- **WHEN** the first release has no previous version tag
-- **THEN** notes generation receives the root commit inventory in addition to later conventional history

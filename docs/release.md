@@ -1,9 +1,9 @@
 # Releases
 
-Kuru releases use one manually dispatched workflow. Maintainers select a version
-bump; the workflow validates the source, creates a signed version commit when
-necessary, builds all four native archives, generates Communiqué notes, publishes
-a complete draft release, and deploys documentation from that exact commit.
+Kuru releases use one manually dispatched workflow with a version bump as its
+only input. The workflow validates the source, creates a signed version commit
+when necessary, builds all four native archives, generates Communiqué notes,
+publishes a complete draft release, and deploys documentation from that exact commit.
 Pushes and tags do not start release publication or deploy documentation.
 
 ## One-time setup
@@ -62,13 +62,19 @@ use `major` when intentionally declaring `1.0.0`.
 A release with no prior version tag starts from `0.0.0`. The initial feature
 history therefore selects `0.1.0`. If that already matches the manifest, no
 artificial version commit is created. The workflow rejects version downgrades,
-invalid version output, and automatic releases when HEAD is already tagged.
+invalid version output and conflicting release identities.
 
-Version calculation can be reviewed from a clean checkout; Cocogitto rejects
-untracked or uncommitted changes. Stamping then makes the local version change:
+If main is already at its tagged release commit or prepared version commit,
+dispatch reuses that version regardless of the selected strategy. New commits
+after that point cause the chosen strategy to calculate a new version. Recover
+an interrupted release by rerunning its existing workflow, especially when main
+has since advanced; a fresh dispatch starts from the current main revision.
+
+The dispatch plan can be reviewed from a clean checkout. Stamping then makes the
+local version change:
 
 ```sh
-mise run release:version -- auto
+mise run release:tool -- plan --bump auto
 mise run release:set-version -- 0.2.0
 ```
 
@@ -80,10 +86,13 @@ runtime is involved.
 ## Validation and publication order
 
 1. Check prerequisites and run the full repository gate on the selected main
-   revision, including meaningful tests, coverage, docs and cospec checks.
+   revision, including meaningful tests, coverage, docs and cospec checks. This
+   original dispatch SHA remains the base when all jobs are rerun.
 2. Stamp the workspace and local lockfile entries, then create the signed API
-   commit with an expected-head comparison. An unchanged version reuses the
-   checked commit after confirming main has not moved.
+   commit with an expected-head comparison. If an earlier attempt created that
+   commit, recover it by verifying its parent, release message and complete Git
+   tree against the expected stamp. An unchanged version reuses the checked
+   commit when it remains in main's history. Later main changes are excluded.
 3. Run the full gate again on that exact version commit. Build native archives
    on Linux x86_64/arm64 and macOS x86_64/arm64, verifying each binary's version.
 4. Generate notes in a separate job with a read-only GitHub token. No release
@@ -91,13 +100,17 @@ runtime is involved.
 5. Verify that all four expected archives exist and match their checksums.
    Create or reuse the immutable annotated tag, stage the notes and all assets
    in a draft, and verify uploaded asset digests before publishing by release ID.
+   A matching complete published release is verified and reused without replacing
+   its notes or assets, even if rebuilding produced different bytes.
+   GitHub selects the latest release by version and date; recovering an older
+   draft does not force it to become latest.
 6. Run `build-docs` after `bump` and `publish` succeed, checking out the exact
    released commit SHA. Build and validate the site, then publish its artifact
    through `deploy-docs`, the final release stage. These jobs are skipped if
    release publication fails.
 
-The archives retain the `kuru-VERSION-TARGET.tar.gz` naming convention and include
-`SHA256SUMS`. [Authenticated installation](install.md#release-archives) continues
+The archives retain the `kuru-VERSION-TARGET.tar.gz` naming convention and are
+published alongside `SHA256SUMS`. [Authenticated installation](install.md#release-archives) continues
 to work while the repository is private: download with `gh release download`,
 then install from the local directory. A release command requires a version that
 has actually been published.
@@ -130,20 +143,29 @@ Upstream contracts: [Cocogitto versioning](https://docs.cocogitto.io/guide/bump.
 
 A failed run never deletes or retargets a tag, force-pushes a commit, or replaces
 a published release. It can leave a checked version commit, an immutable tag,
-or a partial draft. Preserve the `bump` job's exact commit SHA and selected version.
+or a partial draft. Recovery does not require copying a version or commit SHA.
 
-Run Release again on `main`, supplying **both** `resume_version` and `resume_sha`.
-The workflow requires the SHA to be part of main's history and its workspace
-version to match. It reuses that identity instead of calculating another bump.
-A tag pointing to another commit, an unrelated draft, or a draft asset with a
-mismatched digest stops the run. Matching existing assets are retained, missing
-assets are uploaded, and publication occurs only after the draft is complete.
-A corrupted draft needs maintainer inspection; the workflow will not delete it.
+In the existing Release run, prefer **Re-run failed jobs**. **Re-run all jobs** is
+also supported: [GitHub preserves the original dispatch SHA](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
+the version commit is recovered even if its API response was lost, and repeated build/notes uploads
+replace only that run's temporary workflow artifacts. Later commits on main do
+not enter the release. A completed publication returns its existing URL after
+verifying the tag, source marker and published checksums; it remains unchanged.
+
+A tag pointing to another commit, an unrelated first commit after the original
+base, an unrelated draft, or a draft asset with a mismatched digest stops the run.
+Matching draft assets are retained, missing assets are uploaded, and publication
+occurs only after the draft is complete. A corrupted draft needs maintainer
+inspection; the workflow will not delete it. For a partial draft, rerunning only
+the failed jobs also retains the original build artifacts rather than rebuilding.
 
 If publication succeeded and only documentation failed, rerun `build-docs` and
 `deploy-docs` on that existing Release run in the Actions UI. They reuse the
 released commit SHA. Do not dispatch a separate docs workflow or cut another
 release just to redeploy documentation. The initial site also waits for the first
 authorized release.
+Each docs build uses an artifact name for that run attempt. The deploy job uses
+the successful build's recorded name, so rerunning only deployment uses the same
+artifact. If that artifact has expired, rerun the docs build and deployment jobs.
 The workflows themselves are implemented and tested without dispatching a live
 release during development.

@@ -30,10 +30,6 @@ enum Action {
     Plan {
         #[arg(long, default_value = "auto", value_parser = ["auto", "major", "minor", "patch"])]
         bump: String,
-        #[arg(long, default_value = "")]
-        resume_version: String,
-        #[arg(long, default_value = "")]
-        resume_sha: String,
     },
     Stamp {
         version: Version,
@@ -87,17 +83,12 @@ fn emit(values: &[(&str, &str)]) -> Result<()> {
 async fn execute(root: &Path, action: Action) -> Result<()> {
     match action {
         Action::Version { bump } => println!("{}", release::compute_version(root, &bump).await?),
-        Action::Plan {
-            bump,
-            resume_version,
-            resume_sha,
-        } => {
-            let plan = release::plan(root, &bump, &resume_version, &resume_sha).await?;
+        Action::Plan { bump } => {
+            let plan = release::plan(root, &bump).await?;
             emit(&[
                 ("version", &plan.version),
                 ("tag", &plan.tag),
                 ("base_sha", &plan.base_sha),
-                ("resume", if plan.resume { "true" } else { "false" }),
             ])?;
         }
         Action::Stamp { version } => println!(

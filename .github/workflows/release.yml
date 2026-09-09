@@ -8,14 +8,6 @@ on:
         type: choice
         options: [auto, major, minor, patch]
         default: auto
-      resume_version:
-        description: Retry an unpublished version; requires resume_sha
-        type: string
-        default: ''
-      resume_sha:
-        description: Exact version commit SHA from the interrupted run
-        type: string
-        default: ''
 
 permissions:
   contents: read
@@ -32,10 +24,11 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       base_sha: ${{ steps.plan.outputs.base_sha }}
-      resume: ${{ steps.plan.outputs.resume }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # GitHub preserves this event SHA when rerunning all jobs.
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
@@ -59,15 +52,13 @@ jobs:
         id: plan
         env:
           BUMP: ${{ inputs.bump }}
-          RESUME_VERSION: ${{ inputs.resume_version }}
-          RESUME_SHA: ${{ inputs.resume_sha }}
-        run: mise run release:tool -- plan --bump "$BUMP" --resume-version "$RESUME_VERSION" --resume-sha "$RESUME_SHA"
+        run: mise run release:tool -- plan --bump "$BUMP"
 
   bump:
     needs: plan
     runs-on: ubuntu-24.04
     outputs:
-      sha: ${{ steps.commit.outputs.sha || steps.resume.outputs.sha }}
+      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,27 +71,18 @@ jobs:
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
-      - name: Reuse explicitly selected version commit
-        if: needs.plan.outputs.resume == 'true'
-        id: resume
-        env:
-          RELEASE_SHA: ${{ needs.plan.outputs.base_sha }}
-        run: printf 'sha=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
       - name: Stamp workspace package versions
-        if: needs.plan.outputs.resume != 'true'
         env:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: mise run release:tool -- stamp "$RELEASE_VERSION"
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        if: needs.plan.outputs.resume != 'true'
         id: app
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
-      - name: Create signed commit with expected main head
-        if: needs.plan.outputs.resume != 'true'
+      - name: Create or recover the exact signed version commit
         id: commit
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -167,6 +149,7 @@ jobs:
           name: release-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+          overwrite: true
 
   notes:
     needs: [plan, bump, verify]
@@ -200,6 +183,7 @@ jobs:
           name: release-notes
           path: RELEASE_NOTES.md
           if-no-files-found: error
+          overwrite: true
 
   publish:
     needs: [plan, bump, build, notes]
@@ -240,6 +224,8 @@ jobs:
     name: Build docs
     needs: [bump, publish]
     runs-on: ubuntu-24.04
+    outputs:
+      artifact_name: ${{ steps.artifact.outputs.name }}
     permissions:
       contents: read
       pages: read
@@ -265,8 +251,14 @@ jobs:
         run: |
           mise run docs:build
           mise run //packages/kuru-delivery:tool -- docs --base "$KURU_DOCS_BASE"
+      - name: Select this build attempt's Pages artifact
+        id: artifact
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: printf 'name=github-pages-%s\n' "$RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
+          name: ${{ steps.artifact.outputs.name }}
           path: apps/kuru-docs/.vitepress/dist
 
   deploy-docs:
@@ -285,3 +277,6 @@ jobs:
     steps:
       - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
         id: deployment
+        with:
+          # A deploy-only retry retains the prior successful build's output.
+          artifact_name: ${{ needs.build-docs.outputs.artifact_name }}
