@@ -125,10 +125,17 @@ pub fn current_image() -> io::Result<CurrentImage> {
     regular_file_info(&file)?;
     parent.verify(name, &file)?;
     let actual = file_name(&file)?;
-    if mapped_name()? != actual || file_name(&file)? != actual || mapped_name()? != actual {
+    let mapped_before = mapped_name()?;
+    let actual_after = file_name(&file)?;
+    let mapped_after = mapped_name()?;
+    if mapped_before != actual || actual_after != actual || mapped_after != actual {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "loaded image no longer matches the installed file; restart Kuru before updating",
+            format!(
+                "loaded image no longer matches the installed file; restart Kuru before updating; \
+                 native UTF-16 names: file_before={actual:?}, mapping_before={mapped_before:?}, \
+                 file_after={actual_after:?}, mapping_after={mapped_after:?}"
+            ),
         ));
     }
     parent.verify(name, &file)?;

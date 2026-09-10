@@ -32,7 +32,7 @@ run_windows = 'cargo build -p kuru-memory --release --all-features --locked {% i
 env.RUST_TEST_THREADS = "2"
 env.KURU_TEST_SUPERVISOR_PREPARED = "1"
 depends = ["prefetch", "bundle:test-fixtures"]
-run = "cargo test -p kuru-memory --all-targets --all-features --locked"
+run = "cargo test -p kuru-memory --all-targets --all-features --locked --no-fail-fast"
 
 [tasks."bundle:test-fixtures"]
 description = "Prepare the actual upstream Windows ZIP for host-independent decoder tests"

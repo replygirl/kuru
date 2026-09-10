@@ -7,6 +7,80 @@ use kuru_platform::{
 use std::{ffi::OsString, path::Path, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub use crate::store::marker_fixture::ReadyMarkerObservation;
+
+pub fn ready_marker_options(
+    root: &Path,
+    binary: std::path::PathBuf,
+    supervisor: std::path::PathBuf,
+) -> crate::OpenOptions {
+    let mut options = crate::OpenOptions::new(
+        root.join("marker data café 東京"),
+        format!("project/{}", "6".repeat(64)),
+    );
+    options.config.dolt_binary = Some(binary);
+    options.config.offline = true;
+    options.config.startup_timeout_secs = 25;
+    options.supervisor = Some(supervisor);
+    options
+}
+
+/// Observe the actual initialization future without detaching it. Losing the
+/// outer channel cancels only the pause, then awaits normal database cleanup.
+pub async fn ready_marker(
+    options: crate::OpenOptions,
+    after_marker: bool,
+    observer: &mut Pipe,
+) -> Result<()> {
+    let (observation, release, opening) =
+        crate::store::marker_fixture::prepare(options, after_marker);
+    tokio::pin!(opening);
+    let observed = tokio::select! {
+        result = &mut opening => {
+            let store = result?;
+            store.close().await?;
+            anyhow::bail!("initialization completed without the requested marker observation");
+        }
+        observed = observation => observed,
+    };
+    let interaction = tokio::time::timeout(Duration::from_secs(40), async {
+        let observed = observed.context("initialization lost its marker observer")?;
+        let bytes = serde_json::to_vec(&observed)?;
+        ensure!(
+            bytes.len() <= 16 * 1024,
+            "marker observation exceeds frame bound"
+        );
+        observer.write_u32(bytes.len().try_into()?).await?;
+        observer.write_all(&bytes).await?;
+        observer.flush().await?;
+        let command = observer
+            .read_u8()
+            .await
+            .context("marker observer endpoint closed")?;
+        ensure!(command == b'C', "unexpected marker observer command");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("marker observer command deadline exceeded")
+    .and_then(|result| result);
+    let released = if interaction.is_ok() {
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("marker initialization lost its release receiver"))
+    } else {
+        // The only sender must be dropped before waiting on initialization.
+        drop(release);
+        Ok(())
+    };
+    let completed = match opening.await {
+        Ok(store) => store.close().await,
+        Err(error) => Err(error),
+    };
+    interaction?;
+    released?;
+    completed
+}
+
 pub fn environment() -> Result<Vec<(OsString, OsString)>> {
     let system = kuru_platform::windows::process::system_directory()?;
     let root = system.parent().context("system directory has no parent")?;

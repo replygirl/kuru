@@ -175,6 +175,8 @@ struct StoppedStage {
     _lease: LifecycleLease,
 }
 
+pub(crate) mod marker_fixture;
+
 impl MemoryStore {
     pub fn exists(data_dir: &Path, project_scope: &str) -> Result<bool> {
         let path = project_directory(data_dir, project_scope)?;
@@ -191,13 +193,14 @@ impl MemoryStore {
     }
 
     pub async fn open(options: OpenOptions) -> Result<Self> {
-        Self::open_inner(options, None, None).await
+        Self::open_inner(options, None, None, None).await
     }
 
     async fn open_inner(
         options: OpenOptions,
         temporary: Option<Arc<tempfile::TempDir>>,
         permit: Option<OwnedSemaphorePermit>,
+        mut marker_pause: Option<marker_fixture::ReadyMarkerPause>,
     ) -> Result<Self> {
         ensure!(
             (1..=300).contains(&options.config.startup_timeout_secs),
@@ -278,7 +281,21 @@ impl MemoryStore {
                         initial_revision,
                         migration: legacy.as_ref().map(|legacy| legacy.receipt.clone()),
                     };
+                    marker_fixture::reach(
+                        &mut marker_pause,
+                        marker_fixture::Boundary::Before,
+                        &staging,
+                        &activation,
+                    )
+                    .await?;
                     write_json(&staging.join("ready.json"), &activation)?;
+                    marker_fixture::reach(
+                        &mut marker_pause,
+                        marker_fixture::Boundary::After,
+                        &staging,
+                        &activation,
+                    )
+                    .await?;
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
@@ -332,7 +349,7 @@ impl MemoryStore {
         options.config.cache_dir = Some(test_cache());
         options.config.offline = true;
         options.supervisor = Some(test_supervisor()?);
-        Self::open_inner(options, Some(Arc::new(directory)), Some(permit)).await
+        Self::open_inner(options, Some(Arc::new(directory)), Some(permit), None).await
     }
 
     fn writable(&self) -> Result<()> {

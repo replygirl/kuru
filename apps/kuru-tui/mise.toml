@@ -34,7 +34,7 @@ run_windows = 'cargo build -p kuru --release --all-features --locked --target {%
 env.RUST_TEST_THREADS = "2"
 env.KURU_TEST_SUPERVISOR_PREPARED = "1"
 depends = ["//packages/kuru-memory:prefetch"]
-run = "cargo test -p kuru --all-targets --all-features --locked"
+run = "cargo test -p kuru --all-targets --all-features --locked --no-fail-fast"
 
 [tasks."typecheck"]
 depends = ["//packages/kuru-memory:bundle:prepare"]

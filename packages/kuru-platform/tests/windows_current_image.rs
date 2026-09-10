@@ -124,7 +124,7 @@ async fn current_image_is_pinned_while_reading_and_rejects_rebound_identical_pat
                 serde_json::from_str(&line(&mut output, "stale guard").await?)?;
             require(
                 result["accepted"] == false,
-                format!("mapped-file name failed to distinguish a stale loaded image: {result}"),
+                format!("mapped-file name failed to distinguish a stale loaded image: initial={held}; after rename={result}"),
             )?;
             require(
                 result["error"]
@@ -137,6 +137,10 @@ async fn current_image_is_pinned_while_reading_and_rejects_rebound_identical_pat
                 regular_file_info(&parent.read(OsStr::new("current image λ.exe"))?)?.identity
                     == replacement_id,
                 "replacement identity changed",
+            )?;
+            require(
+                held["diagnostic_only"] == false && held["initial_error"].is_null(),
+                format!("initial current-image trust failed (diagnostic fallback never satisfies acceptance): initial={held}; after rename={result}"),
             )?;
             Ok(())
         }

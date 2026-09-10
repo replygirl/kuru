@@ -180,3 +180,57 @@ type checking, documentation/cospec checks and ordinary plus instrumented suites
 passed. The log is `/tmp/kuru-native-portability-corrections-check.log`.
 Windows and Linux execution of these corrections remains pending; the current
 image change supplies diagnostics and does not claim to repair the guard failure.
+
+The next candidate adds actual creator-interruption fixtures immediately before
+and after ready-marker publication in the real initial import path, plus an
+observer-EOF cleanup control. A single private, bounded pause leaves public
+configuration unchanged and awaits existing database cleanup on ordinary errors.
+Two real-Dolt host tests passed in 6.03 seconds, covering release cancellation at
+both boundaries, recovery and successful continuation; memory type checking and
+strict Clippy also passed. The native process-kill cases remain unexecuted and
+are not established by these host controls. Logs are
+`/tmp/kuru-ready-marker-{typecheck,tests,lint}.log`.
+
+The next native run, [CI 34530648227](https://github.com/replygirl/kuru/actions/runs/34530648227)
+at `fffae33`, confirmed LF checkout behavior: cospec reported no managed drift
+and ShellCheck no longer rejected carriage returns. All 17 process/IPC cases,
+including partial-frame cancellation, passed. The current-image fixture reported
+`PermissionDenied` without an OS error: the two native path queries disagree for
+the unchanged loaded executable. Additional lossless path diagnostics now observe
+both the initial and renamed image. A diagnostic-only fallback lets that fixture
+complete the rename experiment, but cannot satisfy its acceptance assertion;
+production guard conditions are unchanged and remain unresolved.
+
+The full Windows job next found that opening a directory as configuration fails
+before its regular-file diagnostic. A preflight classification now gives the same
+actionable error on Windows while retaining opened-handle validation. Core tests
+and strict Clippy passed locally. CI continues independent tasks after failures,
+and ordinary package tests collect failures across test binaries. A disposable
+fixture verified that pinned mise completed independent work while retaining the
+failing task's exit status 37; thresholds and required checks are unchanged.
+
+The same `fffae33` run passed Linux ARM packaging, native Dolt verification and
+the packaged offline-runtime smoke. This confirms the hard-linked build-input
+correction on that target; it does not establish Windows application acceptance.
+
+The completed `fffae33` run also passed both macOS targets. The arm64 full check
+took 695.98 seconds and passed source-install and installed-runtime checks;
+Intel macOS passed 71 memory cases and packaged offline-runtime verification.
+Ubuntu x64 instead exhausted the hosted runner's disk: GitHub's annotation
+records `System.IO.IOException: No space left on device` while writing its worker
+log. No application assertion was established from that aborted job.
+
+The Ubuntu full-check job now removes only its unused preinstalled Android and
+Swift SDK roots before setup/cache restoration, reporting disk usage before and
+after. The paths are defined by the official runner image's
+[Android installer](https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/install-android-sdk.sh)
+and [Swift installer](https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/install-swift.sh).
+Cargo outputs, test coverage, the runner runtime and cache settings are retained;
+the reclaimed capacity and native result remain to be measured on CI.
+
+The local full `mise run check` for the new configuration, image diagnostics and
+marker fixtures passed in 688.55 seconds, with 14,305/14,731 covered workspace
+lines (97.11%). Ordinary and instrumented tests, formatting, strict lint, type
+checking, docs and cospec checks passed. The subsequent CI-only storage adjustment
+is checked separately through repository tooling. The full log is
+`/tmp/kuru-native-diagnostics-check.log`; no new Windows execution is claimed.

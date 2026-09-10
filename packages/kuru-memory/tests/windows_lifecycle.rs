@@ -105,7 +105,12 @@ impl Drop for Fixture {
     }
 }
 
-async fn fixture(owner: &mut Fixture, binary: &Path, lifetime: Lifetime, mode: &str) -> Result<()> {
+async fn spawn_fixture(
+    owner: &mut Fixture,
+    binary: &Path,
+    lifetime: Lifetime,
+    mode: &str,
+) -> Result<()> {
     let root = owner.path().to_owned();
     let listener = PrivateListener::bind()?;
     let mut command = NativeSpawnSpec::new(
@@ -127,6 +132,11 @@ async fn fixture(owner: &mut Fixture, binary: &Path, lifetime: Lifetime, mode: &
             .accept(owner.child.as_ref().unwrap(), Duration::from_secs(5))
             .await?,
     );
+    Ok(())
+}
+
+async fn fixture(owner: &mut Fixture, binary: &Path, lifetime: Lifetime, mode: &str) -> Result<()> {
+    spawn_fixture(owner, binary, lifetime, mode).await?;
     let mut ready = [0; 6];
     tokio::time::timeout(
         Duration::from_secs(30),
@@ -137,6 +147,354 @@ async fn fixture(owner: &mut Fixture, binary: &Path, lifetime: Lifetime, mode: &
         &ready == b"READY\n",
         "memory owner fixture did not finish its accepted operation"
     );
+    Ok(())
+}
+
+fn marker_seed(options: &kuru_memory::OpenOptions) -> Result<Vec<u8>> {
+    Directory::ensure_private(&options.data_dir)?;
+    let path = options.data_dir.join("memory.sqlite3");
+    let source = rusqlite::Connection::open(&path)?;
+    source.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA user_version=1; CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL); CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);")?;
+    source.pragma_update(None, "application_id", 0x4b55_5255_i64)?;
+    let namespace = format!("{}/transcript", options.project_scope);
+    for (sequence, role, content) in [
+        (7, "user", "accepted before marker"),
+        (11, "assistant", "preserved imported reply"),
+    ] {
+        source.execute(
+            "INSERT INTO messages VALUES (?1,?2,?3,?4)",
+            rusqlite::params![sequence, namespace, role, content],
+        )?;
+    }
+    source.execute(
+        "INSERT INTO messages VALUES (19,'project/other/transcript','user','unrelated original')",
+        [],
+    )?;
+    source.execute(
+        "INSERT INTO state VALUES (?1,'\"jungian\"')",
+        [format!("{}/framework", options.project_scope)],
+    )?;
+    source.execute(
+        "INSERT INTO state VALUES ('project/other/framework','\"kept\"')",
+        [],
+    )?;
+    source.close().map_err(|(_, error)| error)?;
+    Ok(std::fs::read(path)?)
+}
+
+async fn marker_rows(
+    options: &kuru_memory::OpenOptions,
+    binary: &Path,
+    directory: &Path,
+    expected_revision: &str,
+) -> Result<()> {
+    let server = Server::open(ServerOptions {
+        binary: binary.to_owned(),
+        directory: directory.to_owned(),
+        project_scope: options.project_scope.clone(),
+        supervisor: options
+            .supervisor
+            .clone()
+            .context("marker fixture has no supervisor")?,
+        timeout: Duration::from_secs(25),
+        read_only: true,
+        retained: None,
+        lifecycle_root: Some(options.data_dir.join("memory/lifecycles")),
+    })
+    .await?;
+    let pool = server.pool("main").await?;
+    let checked = async {
+        let rows = sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
+            "SELECT sequence, namespace, role, content FROM messages ORDER BY sequence",
+        )
+        .fetch_all(pool.as_ref())
+        .await?;
+        let namespace = format!("{}/transcript", options.project_scope).into_bytes();
+        ensure!(
+            rows == [
+                (
+                    7,
+                    namespace.clone(),
+                    b"user".to_vec(),
+                    "accepted before marker".into()
+                ),
+                (
+                    11,
+                    namespace,
+                    b"assistant".to_vec(),
+                    "preserved imported reply".into()
+                ),
+            ],
+            "marker recovery changed accepted rows or imported unrelated data"
+        );
+        let state =
+            sqlx::query_as::<_, (Vec<u8>, String)>("SELECT `key`, value FROM state ORDER BY `key`")
+                .fetch_all(pool.as_ref())
+                .await?;
+        ensure!(
+            state
+                == [(
+                    format!("{}/framework", options.project_scope).into_bytes(),
+                    "\"jungian\"".into()
+                )],
+            "marker recovery changed the accepted preference"
+        );
+        let revision: String = sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')")
+            .fetch_one(pool.as_ref())
+            .await?;
+        ensure!(
+            revision == expected_revision,
+            "marker recovery replayed a committed revision"
+        );
+        for message in [
+            "Initialize Kuru memory schema 1",
+            "Import preserved SQLite %",
+        ] {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM dolt_log WHERE message LIKE ?")
+                    .bind(message)
+                    .fetch_one(pool.as_ref())
+                    .await?;
+            ensure!(
+                count == 1,
+                "marker recovery created duplicate schema/import history"
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    pool.close().await;
+    let stopped = server.close().await;
+    checked?;
+    stopped
+}
+
+async fn marker_interruption(after_marker: bool, kill_creator: bool) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut owner = Fixture::new()?;
+    let binary = provision::provision(&Default::default(), &test_support::cache_dir()).await?;
+    let options = test_support::windows::ready_marker_options(
+        owner.path(),
+        binary.clone(),
+        env!("CARGO_BIN_EXE_kuru-memory-parent-fixture").into(),
+    );
+    let source = marker_seed(&options)?;
+    let unrelated = options.data_dir.join("memory/unrelated retained café 東京");
+    let unrelated_directory = Directory::ensure_private(&unrelated)?;
+    let unrelated_identity = unrelated_directory.identity();
+    {
+        use std::io::Write;
+        let mut file = unrelated_directory.create_new(std::ffi::OsStr::new("evidence"))?;
+        file.write_all(b"unrelated retained bytes")?;
+        file.sync_all()?;
+    }
+    let mode = if after_marker {
+        "marker-after"
+    } else {
+        "marker-before"
+    };
+    spawn_fixture(&mut owner, &binary, Lifetime::TrustedSupervisor, mode).await?;
+    let observed: test_support::windows::ReadyMarkerObservation =
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let channel = owner.channel.as_mut().unwrap();
+            let length = channel.read_u32().await? as usize;
+            ensure!(
+                length > 0 && length <= 16 * 1024,
+                "invalid marker observation frame length"
+            );
+            let mut bytes = vec![0; length];
+            channel.read_exact(&mut bytes).await?;
+            Ok::<_, anyhow::Error>(serde_json::from_slice(&bytes)?)
+        })
+        .await??;
+    assert_eq!(observed.after_marker, after_marker);
+    let active = options.data_dir.join("memory").join("6".repeat(64));
+    assert!(!active.exists());
+    assert_eq!(observed.stage.parent(), active.parent());
+    assert!(
+        observed
+            .stage
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(&format!("{}.staging-", "6".repeat(64)))
+    );
+    let stage = Directory::open(&observed.stage, Privacy::OwnerOnly, NameRetention::Movable)?;
+    assert_eq!(stage.identity().to_bytes(), observed.identity);
+    let marker = if after_marker {
+        let bytes = std::fs::read(observed.stage.join("ready.json"))?;
+        let record: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(record["format"], 1);
+        assert_eq!(record["project_scope"], options.project_scope);
+        assert_eq!(record["initial_revision"], observed.initial_revision);
+        assert_eq!(record["migration"]["messages"], 2);
+        assert_eq!(record["migration"]["state"], 1);
+        assert_eq!(record["migration"]["project_scope"], options.project_scope);
+        let snapshot = PathBuf::from(
+            record["migration"]["snapshot"]
+                .as_str()
+                .context("missing preserved snapshot")?,
+        );
+        assert_eq!(
+            snapshot.parent(),
+            Some(options.data_dir.join("memory/legacy").as_path())
+        );
+        let digest: String = Sha256::digest(std::fs::read(snapshot)?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(record["migration"]["source_sha256"], digest);
+        Some(bytes)
+    } else {
+        assert!(!observed.stage.join("ready.json").exists());
+        None
+    };
+    let locks = Directory::open(
+        &options.data_dir.join("memory/lifecycles"),
+        Privacy::OwnerOnly,
+        NameRetention::Pinned,
+    )?;
+    let key: String = observed
+        .identity
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let lock = locks.lock_file(std::ffi::OsStr::new(&format!("{key}.lock")))?;
+    assert!(matches!(
+        lock.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    ensure!(
+        owner.child.as_mut().unwrap().try_wait()?.is_none(),
+        "marker creator exited before the observed interruption"
+    );
+    if kill_creator {
+        owner.child.as_mut().unwrap().terminate()?;
+    } else {
+        owner
+            .channel
+            .as_mut()
+            .unwrap()
+            .close(Duration::from_secs(3))
+            .await?;
+    }
+    let status = owner
+        .child
+        .as_mut()
+        .unwrap()
+        .wait(Duration::from_secs(15))
+        .await?;
+    assert!(
+        !status.success(),
+        "interrupted marker creator unexpectedly completed activation"
+    );
+    owner
+        .channel
+        .as_mut()
+        .unwrap()
+        .close(Duration::from_secs(3))
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "marker supervisor did not finish owned database cleanup"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert!(!observed.stage.join("endpoint.json").exists());
+    drop(lock);
+    drop(stage);
+    let recovered = kuru_memory::MemoryStore::open(options.clone()).await?;
+    let revision = recovered.revision().await?;
+    let preserved = options
+        .data_dir
+        .join("memory/interrupted")
+        .join(observed.stage.file_name().unwrap());
+    if after_marker {
+        assert_eq!(revision, observed.initial_revision);
+        assert_eq!(
+            Directory::open(&active, Privacy::OwnerOnly, NameRetention::Movable)?
+                .identity()
+                .to_bytes(),
+            observed.identity
+        );
+        assert_eq!(std::fs::read(active.join("ready.json"))?, marker.unwrap());
+        assert!(!preserved.exists());
+    } else {
+        assert_ne!(
+            Directory::open(&active, Privacy::OwnerOnly, NameRetention::Movable)?
+                .identity()
+                .to_bytes(),
+            observed.identity
+        );
+        assert_eq!(
+            Directory::open(&preserved, Privacy::OwnerOnly, NameRetention::Movable)?
+                .identity()
+                .to_bytes(),
+            observed.identity
+        );
+        assert!(!preserved.join("ready.json").exists());
+        marker_rows(&options, &binary, &preserved, &observed.initial_revision).await?;
+    }
+    assert!(!observed.stage.exists());
+    recovered.close().await?;
+    marker_rows(&options, &binary, &active, &revision).await?;
+    let reopened = kuru_memory::MemoryStore::open(options.clone()).await?;
+    assert_eq!(reopened.revision().await?, revision);
+    assert_eq!(
+        reopened
+            .history(&format!("{}/transcript", options.project_scope), 20)
+            .await?
+            .len(),
+        2
+    );
+    assert_eq!(
+        reopened
+            .get(&format!("{}/framework", options.project_scope))
+            .await?,
+        Some(serde_json::json!("jungian"))
+    );
+    reopened.close().await?;
+    assert_eq!(
+        std::fs::read(options.data_dir.join("memory.sqlite3"))?,
+        source
+    );
+    assert_eq!(
+        Directory::open(&unrelated, Privacy::OwnerOnly, NameRetention::Movable)?.identity(),
+        unrelated_identity
+    );
+    assert_eq!(
+        std::fs::read(unrelated.join("evidence"))?,
+        b"unrelated retained bytes"
+    );
+    owner.descendants_stopped = true;
+    Ok(())
+}
+
+#[tokio::test]
+async fn creator_loss_before_ready_marker_preserves_committed_stage_and_imports_live_once()
+-> Result<()> {
+    marker_interruption(false, true).await
+}
+
+#[tokio::test]
+async fn creator_loss_after_ready_marker_reuses_the_exact_committed_physical_stage() -> Result<()> {
+    marker_interruption(true, true).await
+}
+
+#[tokio::test]
+async fn marker_observer_eof_awaits_cleanup_without_stranding_the_release_channel() -> Result<()> {
+    for after_marker in [false, true] {
+        marker_interruption(after_marker, false).await?;
+    }
     Ok(())
 }
 

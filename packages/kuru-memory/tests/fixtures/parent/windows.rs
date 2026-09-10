@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use kuru_memory::{
     server::{Server, ServerOptions},
-    test_support::windows::{environment, forced_engine_cleanup, partial_readiness},
+    test_support::windows::{
+        environment, forced_engine_cleanup, partial_readiness, ready_marker, ready_marker_options,
+    },
 };
 use kuru_platform::{
     fs::{Directory, NameRetention, Privacy},
@@ -33,6 +35,16 @@ pub async fn run() -> Result<()> {
     let mut parent = pipe::connect(&arguments[3], Duration::from_secs(5)).await?;
     if mode == "escalation" {
         forced_engine_cleanup(&root, &std::env::current_exe()?, &mut parent).await?;
+        parent.close(Duration::from_secs(3)).await?;
+        return Ok(());
+    }
+    if matches!(mode, "marker-before" | "marker-after") {
+        let options = ready_marker_options(
+            &root,
+            PathBuf::from(&arguments[2]),
+            std::env::current_exe()?,
+        );
+        ready_marker(options, mode == "marker-after", &mut parent).await?;
         parent.close(Duration::from_secs(3)).await?;
         return Ok(());
     }

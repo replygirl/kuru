@@ -18,7 +18,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     use std::{
         fs::{self, File},
         io::{Read, Write},
-        os::windows::ffi::OsStrExt,
+        os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
         process::Command,
         time::{Duration, Instant},
     };
@@ -40,32 +40,47 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match mode {
         "current-image" => {
             eprintln!("current-image: acquiring initial guard");
-            let image = match kuru_platform::windows::process::current_image() {
-                Ok(image) => image,
-                Err(error) => {
-                    println!(
-                        "{}",
-                        serde_json::json!({
+            let (image, diagnostic_file, initial_error) =
+                match kuru_platform::windows::process::current_image() {
+                    Ok(image) => (Some(image), None, None),
+                    Err(error) => {
+                        let diagnostic = serde_json::json!({
                             "stage":"initial_guard", "error":error.to_string(),
                             "kind":format!("{:?}", error.kind()), "os_error":error.raw_os_error(),
-                        })
-                    );
-                    std::io::stdout().flush()?;
-                    return Err(error.into());
-                }
-            };
+                        });
+                        eprintln!("current-image: diagnostic-only fallback after {diagnostic}");
+                        // This is exclusively a fixture handle for completing the
+                        // rename experiment. It confers no current-image trust, and
+                        // the parent MUST fail after collecting both observations.
+                        let file = File::options()
+                        .read(true)
+                        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+                        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+                        .open(std::env::current_exe()?)?;
+                        (None, Some(file), Some(diagnostic))
+                    }
+                };
             eprintln!("current-image: reading held identity");
-            let identity = kuru_platform::fs::regular_file_info(image.file())?
+            let held_file = image
+                .as_ref()
+                .map(|image| image.file())
+                .or(diagnostic_file.as_ref())
+                .ok_or("missing image experiment handle")?;
+            let identity = kuru_platform::fs::regular_file_info(held_file)?
                 .identity
                 .to_bytes();
             println!(
                 "{}",
-                serde_json::json!({"ready":"held", "identity":identity})
+                serde_json::json!({
+                    "ready":"held", "identity":identity,
+                    "diagnostic_only":diagnostic_file.is_some(), "initial_error":initial_error,
+                })
             );
             std::io::stdout().flush()?;
             let mut byte = [0];
             std::io::stdin().read_exact(&mut byte)?;
             drop(image);
+            drop(diagnostic_file);
             eprintln!("current-image: initial guard released");
             println!("released");
             std::io::stdout().flush()?;

@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::File,
+    fs::{self, File},
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
 };
@@ -469,6 +469,19 @@ fn ancestor_directories(project: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn read_bounded(path: &Path, required: bool) -> Result<Option<String>> {
+    // Windows rejects opening a directory before handle metadata is available.
+    // Classify ordinary wrong-type inputs first, then validate the opened file
+    // again so this pathname check is never the authority for the actual read.
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound && !required => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    ensure!(
+        metadata.is_file(),
+        "{} must be a regular file",
+        path.display()
+    );
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound && !required => return Ok(None),

@@ -5,7 +5,7 @@ run = "cargo build -p kuru-core --all-features --locked"
 run = "cargo build -p kuru-core --release --all-features --locked"
 
 [tasks."test"]
-run = "cargo test -p kuru-core --all-targets --all-features --locked"
+run = "cargo test -p kuru-core --all-targets --all-features --locked --no-fail-fast"
 
 [tasks."typecheck"]
 run = "cargo check -p kuru-core --all-targets --all-features --locked"
