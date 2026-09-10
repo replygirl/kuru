@@ -17,7 +17,7 @@ when applying that standard. AGENTS.md is canonical; CLAUDE.md imports it with
 - `packages/kuru-core`: framework/configuration types and SQLite storage.
 - `packages/kuru-connectors`: inference providers, tool host, MCP and outbound A2A.
 - `packages/kuru-runtime`: actor pool, peer routing, relationships, dreaming and A2A ingress.
-- `packages/kuru-delivery`: native installer, archive packaging, release and repository tooling.
+- `packages/kuru-delivery`: native updater, shell bootstrap, archive packaging, release and repository tooling.
 - `scripts`: small shell entrypoints for source installation and commit checks.
 - `docs`: user and contributor documentation.
 - `openspec`: cospec-managed change artifacts and durable capability specs.
@@ -49,6 +49,9 @@ Scope tools needed only by particular tasks to those package tasks, as the
 delivery package does for release-note tooling. Installation, packaging and docs
 tasks must remain independent of the notes toolchain. Add new language tooling only
 when necessary or clearly valuable, within its owning app or package.
+The compiler-free release bootstrap lives in `packages/kuru-delivery/support`;
+the root installation script forwards binary options and retains source builds.
+Keep bootstrap behavior tests and shell lint in the delivery package's mise tasks.
 
 Use current available dependency and tool releases, verify compatibility, and
 commit exact pins with the affected Cargo, npm and mise lockfiles. Pin workflow

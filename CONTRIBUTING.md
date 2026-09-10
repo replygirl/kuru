@@ -1,13 +1,12 @@
 # Contributing to Kuru
 
 Kuru follows [aligned-team/cospec](https://github.com/aligned-team/cospec) as its
-repository and change-workflow reference. The repository is private for now;
-public availability is planned. Contributions use the same process in either case.
+repository and change-workflow reference.
 
 ## Setup
 
 ```sh
-gh repo clone replygirl/kuru
+git clone https://github.com/replygirl/kuru.git
 cd kuru
 mise trust
 mise install
@@ -51,10 +50,10 @@ Resolve review threads and squash-merge accepted changes; remove merged branches
 Default-branch safeguards should reject deletion, force-pushes and unsigned commits.
 GitHub's squash merge produces the signed merge commit.
 
-## Releases and eventual public availability
+## Releases
 
-Creating or updating the private repository does not authorize release tags or a
-visibility change. Release publication is deliberate and uses the existing tagged
-workflow; see [installation and releases](docs/install.md). Before making the repo
-public, enable private vulnerability reporting and review the available GitHub
-code-scanning features. No paid security product is assumed by local development.
+Maintainers dispatch the Release workflow on `main`. It selects the version from
+conventional commits, verifies and publishes native archives with Communiqué
+notes, then deploys the documentation from the released commit. See
+[release operations](docs/release.md) for credentials and recovery, and
+[installation and updates](docs/install.md) for using the published binaries.

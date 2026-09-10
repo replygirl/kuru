@@ -63,7 +63,7 @@ export default defineConfig({
       {
         icon: "github",
         link: "https://github.com/replygirl/kuru",
-        ariaLabel: "Kuru source on GitHub (repository access required)",
+        ariaLabel: "Kuru source on GitHub",
       },
     ],
     footer: {

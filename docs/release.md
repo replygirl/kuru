@@ -36,7 +36,6 @@ Configure Pages to use GitHub Actions. Documentation builds and publishes in the
 final `build-docs` and `deploy-docs` jobs of `.github/workflows/release.yml`.
 The build job has `contents: read` and `pages: read`; only the deploy job receives
 `pages: write` and `id-token: write`. There is no standalone Pages workflow.
-Deployment of public documentation does not change repository visibility.
 
 Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
 7.0.0 and Communiqué 1.3.5 pins. The latter has no Intel macOS release binary;
@@ -114,10 +113,13 @@ runtime is involved.
    release publication fails.
 
 The archives retain the `kuru-VERSION-TARGET.tar.gz` naming convention and are
-published alongside `SHA256SUMS`. [Authenticated installation](install.md#release-archives) continues
-to work while the repository is private: download with `gh release download`,
-then install from the local directory. A release command requires a version that
-has actually been published.
+published alongside `SHA256SUMS`. Users install through mise or the package-owned
+[shell bootstrap](install.md#install-with-the-shell-bootstrap), which resolves
+latest to an explicit version and verifies its checksum before replacement.
+[Release directories](install.md#release-archives) also support HTTPS mirrors and
+offline installation. The bootstrap checks logical tar members and bounds both
+decompression and fixed-member extraction; the native Rust updater retains its
+raw-header validation. Neither path runs the candidate to validate it.
 
 Release jobs inherit `MISE_LOCKED=1`, including nested package tasks. This keeps
 tool installation from extending lockfiles after source validation. The bump

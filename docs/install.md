@@ -1,103 +1,160 @@
 # Installation and updates
 
-The executable is `kuru`; the Cargo package lives at `apps/kuru-tui`. Linux and macOS
-are the initial release targets. Building from source requires Rust 1.98.1 and a
-C compiler for SQLite. Installation and self-updates use native Rust code.
+Kuru ships native executables for macOS and Linux on arm64 and x86-64. Binary
+installation requires no Rust toolchain. The executable is `kuru`.
 
-## Direct source installation
+## Install with mise
 
-Clone the repository with an authorized GitHub account while it is private:
+With [mise](https://mise.jdx.dev/getting-started.html) installed and activated:
 
 ```sh
-gh repo clone replygirl/kuru
-cd kuru
+mise use -g github:replygirl/kuru
+kuru --version
 ```
 
-From the checkout:
+`mise use -g` installs the release and selects it in your global configuration.
+Omit `-g` to select it for the current project. `mise install
+github:replygirl/kuru@0.1.0` downloads an exact version without changing the active
+selection; run it explicitly with `mise exec github:replygirl/kuru@0.1.0 -- kuru`.
+
+To install and activate an exact version:
 
 ```sh
+mise use -g github:replygirl/kuru@0.1.0
+```
+
+Mise's GitHub backend applies a default release-age cooldown to latest-version
+resolution. A full `major.minor.patch` pin bypasses that cooldown when installing
+a newly published release. See [available releases](https://github.com/replygirl/kuru/releases).
+
+## Install with the shell bootstrap
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.sh | bash
+```
+
+The default destination is `~/.local/bin`. Add it to your shell's `PATH`, then try
+the offline provider:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+kuru --version
+kuru --provider demo
+```
+
+The bootstrap requires Bash 3.2 or newer, curl, tar, gzip, and either `sha256sum`
+or `shasum`, alongside standard macOS/Linux command-line utilities. It resolves
+latest once, then downloads the selected version's immutable archive and verifies
+its SHA-256 digest. It extracts only the executable into staging beside the
+destination and replaces it atomically after validation. It does not run the
+downloaded executable during installation.
+
+To choose a version and destination, download the script and pass options:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.sh -o /tmp/kuru-install.sh
+bash /tmp/kuru-install.sh --version 0.1.0 --install-dir "$HOME/.local/bin"
+```
+
+`KURU_INSTALL_DIR` also sets the destination; `--install-dir` takes precedence.
+Use `--help` for all options. An existing symlink or directory at the `kuru`
+destination is rejected. Before replacement, failed downloads, validation errors
+and handled interruptions preserve the previous executable and remove staging files.
+
+## Supported platforms
+
+| System | Architecture | Target |
+| --- | --- | --- |
+| macOS | Apple Silicon | `aarch64-apple-darwin` |
+| macOS | Intel | `x86_64-apple-darwin` |
+| Linux | ARM64 | `aarch64-unknown-linux-gnu` |
+| Linux | x86-64 | `x86_64-unknown-linux-gnu` |
+
+Linux archives are built on Ubuntu 24.04 and require a compatible glibc. Build
+from source on older Linux systems or musl distributions. The bootstrap detects
+the host; `--target` explicitly selects one of the supported archive targets.
+
+## Release archives
+
+Each release contains `SHA256SUMS` and `kuru-VERSION-TARGET.tar.gz`. To install from
+an HTTPS mirror, pass its literal version directory and an explicit version:
+
+```sh
+bash /tmp/kuru-install.sh --version 0.1.0 \
+  --release-base https://github.com/replygirl/kuru/releases/download/v0.1.0
+```
+
+For offline installation, download the matching archive and `SHA256SUMS` into
+one directory and use that directory as `--release-base`:
+
+```sh
+bash /tmp/kuru-install.sh --version 0.1.0 --release-base /path/to/release-files
+```
+
+`KURU_RELEASE_BASE` sets the same option; the CLI takes precedence. Custom bases
+require `--version` and are used directly, without appending another version
+directory. Remote sources and redirects must use HTTPS. Downloads and extraction
+are bounded, and checksums are verified before extraction. Checksums detect
+corruption; trust comes from the release source you choose.
+
+From a checkout, `bash scripts/install.sh` forwards these binary-install options
+to the same bootstrap.
+
+## Build from source
+
+Building requires Rust 1.98.1, a C compiler for bundled SQLite, and standard
+platform build tools:
+
+```sh
+git clone https://github.com/replygirl/kuru.git
+cd kuru
 cargo install --path apps/kuru-tui --locked
 ```
 
-Cargo installs under `$CARGO_HOME/bin`, normally `~/.cargo/bin`. For an arbitrary
-binary directory, run:
+Cargo installs under `$CARGO_HOME/bin`, normally `~/.cargo/bin`. For another
+binary directory:
 
 ```sh
 KURU_INSTALL_DIR="$HOME/.local/bin" bash scripts/install.sh --source
 ```
 
-The source installer builds the locked release profile, stages the executable
-in the destination filesystem and renames it into place. It refuses a symlink
-or directory at the `kuru` destination. It does not fetch source updates: select
-the source revision you want before running it.
-
-## Installation through mise
-
-```sh
-mise trust
-mise install
-mise run install
-```
-
-`mise install` uses committed tool pins and the lockfile. `install` runs the same
-source installer. This workflow works before a hosted release exists on both
-Apple Silicon and Intel macOS, as well as Linux. The separate `mise run setup`
-command prepares maintainer checks and release-note tools; app installation
-does not require it. See [development](development.md) for that toolchain.
-
-## Release archives
-
-For a published release, once the repository is public, the versioned release
-installer can use:
-
-```sh
-bash scripts/install.sh \
-  --release-base https://github.com/replygirl/kuru/releases/download/v0.1.0 \
-  --version 0.1.0 \
-  --install-dir "$HOME/.local/bin"
-```
-
-While the repository is private, use source installation or download an available
-release with authenticated GitHub CLI and install from its local directory:
-
-```sh
-gh release download v0.1.0 --repo replygirl/kuru --dir /tmp/kuru-release
-bash scripts/install.sh --release-base /tmp/kuru-release \
-  --version 0.1.0 --install-dir "$HOME/.local/bin"
-```
-
-The checkout helper compiles the native installer using the pinned Rust
-toolchain. An already installed Kuru updates itself without a compiler or
-interpreter. These release commands require that version to exist; creating the repository
-does not create a release. The base directory
-must serve `SHA256SUMS` and `kuru-VERSION-TARGET.tar.gz`; local directories also
-work for offline installation. Remote sources require HTTPS. The installer
-checks the archive's SHA-256 hash, exact expected entries, regular-file types,
-size bounds and executable permissions, then atomically replaces the binary.
-Checksums detect corruption; trust still comes from the release source you choose.
-
-Supported target triples are `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-`aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-gnu`. Linux archives are
-built on Ubuntu 24.04 and require a compatible glibc; use source installation
-on older Linux systems or musl distributions.
+The source installer builds the locked release profile and atomically replaces
+the executable. It refuses a symlink or directory at the destination and uses
+your selected checkout revision. Maintainers with the repository toolchain can
+run `mise run install`; see [development](development.md) for setup and platform
+requirements. App installation does not require the full maintainer toolchain.
 
 ## Updating
 
-For a source install, install again from the desired checkout revision, or use
-`kuru update --source /path/to/kuru`. For a published binary release, use
-`kuru update --version VERSION --release-base HTTPS_VERSION_DIRECTORY`.
-The CLI uses the same native archive installer; its default destination is the
-directory containing the running executable. You
-can set `KURU_RELEASE_BASE` to a version directory for the release installer.
-Updates require an explicit version and do not silently fetch or install
-background updates. Mise-managed source installations use `mise run install`
-after moving the checkout to the intended version.
+For a mise-managed binary selected as latest:
+
+```sh
+mise upgrade github:replygirl/kuru
+```
+
+For an exact pin, select the new version with `mise use -g
+github:replygirl/kuru@VERSION`. Use mise to update its managed binaries.
+
+For a shell installation, rerun the bootstrap to install latest, or choose an
+explicit release through Kuru's native updater:
+
+```sh
+kuru update --version 0.1.0 \
+  --release-base https://github.com/replygirl/kuru/releases/download/v0.1.0
+```
+
+Replace `0.1.0` in both places with the desired release. The updater requires an
+explicit version and release directory, which can also be a local directory.
+It validates the archive in Rust and defaults to replacing the running executable.
+It requires no compiler or interpreter. Kuru does not install background updates.
+
+For a source installation, select the desired revision and install it again, or
+run `kuru update --source /path/to/kuru`.
 
 ## Releasing
 
 Maintainers dispatch the Release workflow from main. It calculates the next
-version from conventional commits, runs the gate, creates a signed version
-commit with the scoped release app, builds four native targets, generates
-Communiqué notes, and publishes a complete release before deploying its docs.
-See [release operations](release.md) for credentials, retry rules and exact
-permissions. No token needs to be placed in a local configuration file.
+version from conventional commits, runs the gate, creates or recovers the signed
+version commit, builds four native targets, generates Communiqué notes, and
+publishes the release before deploying its docs. See [release operations](release.md)
+for credentials and recovery.

@@ -22,6 +22,5 @@ if [[ "${1:-}" == "--source" ]]; then
   "$kuru_install_dir/kuru" --version
   echo "Installed at $kuru_install_dir/kuru; add $kuru_install_dir to PATH."
 else
-  exec cargo run --manifest-path "$kuru_repo/Cargo.toml" --locked \
-    -p kuru-delivery --features tooling --bin kuru-delivery -- install "$@"
+  exec bash "$kuru_repo/packages/kuru-delivery/support/install.sh" "$@"
 fi
