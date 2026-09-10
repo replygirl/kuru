@@ -86,15 +86,18 @@ runtime is involved.
 
 ## Validation and publication order
 
-1. Check prerequisites and run the full repository gate on the selected main
-   revision, including meaningful tests, coverage, docs and cospec checks. This
-   original dispatch SHA remains the base when all jobs are rerun.
+1. Run the reusable quality jobs and native coverage workflow concurrently on
+   the selected main revision. Format, lint, typecheck, tooling, docs and cospec
+   have independent jobs; coverage executes the behavioral suite once. Both
+   workflows must pass before planning and checking publication prerequisites.
+   This original dispatch SHA remains the base when all jobs are rerun.
 2. Stamp the workspace and local lockfile entries, then create the signed API
    commit with an expected-head comparison. If an earlier attempt created that
    commit, recover it by verifying its parent, release message and complete Git
    tree against the expected stamp. An unchanged version reuses the checked
    commit when it remains in main's history. Later main changes are excluded.
-3. Run the full gate again on that exact version commit. Build native archives
+3. Run the same independent validation jobs on that exact version commit. Both
+   quality and coverage must pass before building native archives
    on Linux x86_64/arm64, macOS x86_64/arm64 and Windows x86_64 MSVC, verifying
    each binary's version and bundled offline engine. The Windows build uses a
    static CRT and validates its PE imports against the allowed system DLLs.

@@ -44,7 +44,6 @@ run = "cargo fmt --package kuru-platform -- --check"
 
 [tasks.coverage]
 description = "Require 90% native platform package line coverage"
-depends = ["test"]
 dir = "{{config_root}}/../.."
 run = "cargo llvm-cov -p kuru-platform --all-targets --all-features --locked --no-fail-fast --fail-under-lines 90 --lcov --output-path target/kuru-platform-coverage.lcov"
 

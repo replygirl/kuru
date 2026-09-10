@@ -124,10 +124,17 @@ and [installation](docs/install.md). All routine commands run through mise:
 Use `docs:dev`, `docs:build`, `docs:preview` and `docs:check` for the docs site.
 Package-scoped work uses native mise addresses, for example
 `mise run //packages/kuru-core:test`. Keep root tasks as aggregates or forwards.
-Documentation builds and link/content checks are part of `check`; keep private
+Run the relevant granular checks before committing. hk runs independent format,
+lint, typecheck, tooling, cospec, docs and coverage steps concurrently before a
+push; CI gives static categories separate Ubuntu jobs and runs native behavior,
+installation and updates on their supported platforms. Keep these scheduling
+units explicit instead of invoking `check` from hooks or workflows. The optional
+local `mise run check` aggregate uses the same task dependencies. Coverage already
+runs the behavioral suite; do not require an ordinary test pass before repeating
+it under instrumentation. Preserve the 90% workspace line coverage gate.
+Documentation builds and link/content checks are required; keep private
 verification records and local evidence outside the published app directory.
-Run `mise run check` before every commit. It includes meaningful behavioral tests
-and a 90% workspace line coverage gate. Do not exclude application modules or
+Do not exclude application modules or
 lower the threshold to make coverage pass. Test observable state and contract
 failure modes, including live subprocess/HTTP fixture interactions.
 Keep fixtures isolated, drain subprocess output, and bound waits with useful
@@ -153,7 +160,9 @@ snapshot: concurrent Cargo commands can replace their top-level executable
 aliases while another package's tests are running. Keep this preparation in the
 owning mise task. Combined coverage must use its own instrumented supervisor,
 with the ordinary snapshot opt-in explicitly cleared; never substitute an
-uninstrumented executable to make a coverage run pass.
+uninstrumented executable to make a coverage run pass. Independent checks may
+overlap, but do not start competing coverage writers or duplicate live test
+suites. Preserve package-owned preparation and Cargo's artifact locking.
 
 Use conventional commits. Never bypass hk hooks. Do not commit directly to
 main; use a branch and review. Publishing and release tags are external actions

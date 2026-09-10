@@ -5,9 +5,12 @@ hooks {
     fix = false
     steps {
       ["format"] {
-        glob = List("**/*.rs", "**/*.toml", "apps/kuru-docs/**")
-        check = "mise run format:check"
-        exclusive = true
+        glob = List("**/*.rs", "**/*.toml")
+        check = "mise run format:code"
+      }
+      ["docs"] {
+        glob = List("apps/kuru-docs/**")
+        check = "mise run //apps/kuru-docs:format:check"
       }
       ["tooling"] {
         glob = List("scripts/**", ".github/**", "apps/kuru-docs/**", "packages/kuru-delivery/**", "**/Cargo.toml", "**/mise.toml", "AGENTS.md", "CLAUDE.md")
@@ -25,9 +28,29 @@ hooks {
   }
   ["pre-push"] {
     steps {
-      ["check"] {
-        check = "mise run check"
-        exclusive = true
+      ["format"] {
+        check = "mise run format:code"
+      }
+      ["lint"] {
+        check = "mise run lint:rust"
+      }
+      ["typecheck"] {
+        check = "mise run typecheck"
+      }
+      ["coverage"] {
+        check = "mise run coverage"
+      }
+      ["tooling"] {
+        check = "mise run lint:tooling"
+      }
+      ["cospec"] {
+        check = "mise run cospec:validate"
+      }
+      ["cospec-managed"] {
+        check = "mise run cospec:managed:check"
+      }
+      ["docs"] {
+        check = "mise run docs:check"
       }
     }
   }

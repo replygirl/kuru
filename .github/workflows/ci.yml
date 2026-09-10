@@ -13,85 +13,28 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  MISE_LOCKED: "1"
+  MISE_NO_HOOKS: "1"
+
 jobs:
-  check:
-    env:
-      # Keep native test/link output within hosted runner storage while retaining
-      # source line tables for coverage and actionable failure backtraces.
-      CARGO_INCREMENTAL: "0"
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  quality:
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: ${{ github.sha }}
+      artifact-prefix: ci
+
+  native-tests:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-14, windows-2025]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Reserve space for bundled runtime coverage
-        if: matrix.os == 'ubuntu-24.04'
-        shell: bash
-        run: |
-          # This Rust/Node job does not use the hosted image's mobile or Swift SDKs.
-          # Keep Cargo outputs, coverage and the runner's own runtime intact.
-          df -h /
-          for sdk in /usr/local/lib/android /usr/share/swift; do
-            if [ -d "$sdk" ]; then
-              sudo du -sh "$sdk"
-              sudo rm -rf -- "$sdk"
-            fi
-          done
-          df -h /
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with:
-          experimental: true
-          version: 2026.9.4
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - run: mise run setup
-      - name: Tool lock drift
-        run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
-      - name: Cache Rust build dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-bin: false
-      - run: mise run --continue-on-error check
-      - name: Source install smoke
-        if: runner.os != 'Windows'
-        env:
-          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
-        run: |
-          mise run install
-          "$KURU_INSTALL_DIR/kuru" --version
-      - name: Native Windows source install smoke
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
-        run: |
-          mise run install
-          if ($LASTEXITCODE -ne 0) { throw 'Source installation failed' }
-          & "$env:KURU_INSTALL_DIR/kuru.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw 'Installed Kuru failed' }
-      - name: Verify installed offline runtime
-        env:
-          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
-        run: mise run //apps/kuru-tui:test:embedded-runtime
-      - name: Inspect native shipping DLL imports
-        if: runner.os == 'Windows'
-        env:
-          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
-        run: mise run //apps/kuru-tui:verify:windows-imports
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-${{ matrix.os }}
-          path: target/coverage.lcov
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: matrix.os == 'ubuntu-24.04'
-        with:
-          name: documentation-preview
-          path: apps/kuru-docs/.vitepress/dist
-          include-hidden-files: true
+    uses: ./.github/workflows/native-tests.yml
+    with:
+      ref: ${{ github.sha }}
+      os: ${{ matrix.os }}
+      install: true
+      artifact-prefix: ci
 
   native-build:
     strategy:
@@ -165,8 +108,8 @@ jobs:
         with:
           cache-bin: false
           shared-key: native-platform-windows
-      - name: Check native platform primitives
-        run: mise run --continue-on-error //packages/kuru-platform:check:native
+      - name: Test native platform primitives and require 90% coverage
+        run: mise run //packages/kuru-platform:coverage
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock Cargo.lock
       - name: Upload native platform coverage
@@ -178,12 +121,10 @@ jobs:
 
   ci-gate:
     if: always()
-    needs: [check, native-build, native-platform]
+    needs: [quality, native-tests, native-build, native-platform]
     runs-on: ubuntu-24.04
     steps:
-      - name: Require every platform check
+      - name: Require every static and native check
         env:
-          CHECK_RESULT: ${{ needs.check.result }}
-          NATIVE_BUILD_RESULT: ${{ needs.native-build.result }}
-          NATIVE_PLATFORM_RESULT: ${{ needs.native-platform.result }}
-        run: test "$CHECK_RESULT" = success && test "$NATIVE_BUILD_RESULT" = success && test "$NATIVE_PLATFORM_RESULT" = success
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$RESULTS"

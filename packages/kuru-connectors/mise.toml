@@ -13,3 +13,10 @@ run = "cargo check -p kuru-connectors --all-targets --all-features --locked"
 
 [tasks."lint"]
 run = "cargo clippy -p kuru-connectors --all-targets --all-features --locked -- -D warnings"
+
+[tasks."format:fixture:check"]
+description = "Check the shared native protocol fixture explicitly"
+run = "rustfmt --edition 2024 --check tests/fixtures/stdio_peer.rs"
+
+[tasks."format:fixture:fix"]
+run = "rustfmt --edition 2024 tests/fixtures/stdio_peer.rs"

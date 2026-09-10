@@ -48,5 +48,9 @@ run = "node_modules/.bin/oxfmt --write ."
 run_windows = "node node_modules/oxfmt/bin/oxfmt --write ."
 
 [tasks.check]
+description = "Validate documentation in one graph with shared dependency setup"
+depends = ["format:check", "lint", "check:content"]
+
+[tasks."check:content"]
 depends = ["build"]
 run = "mise run //packages/kuru-delivery:tool -- docs --root apps/kuru-docs/.vitepress/dist"

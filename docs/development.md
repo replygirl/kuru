@@ -30,18 +30,27 @@ VitePress docs app owns its Node/npm pins, package.json and npm lockfile under
 
 The delivery package activates Cocogitto and Communiqué only for its tests,
 combined coverage and release tasks. Its `setup` task preinstalls those tools
-with mise's `--include-task-tools` option. Communiqué 1.3.5 provides Linux x86_64
+with mise's `--include-task-tools` option; lean CI jobs use `setup:test-tools`
+to install only those two exact package-owned pins. Communiqué 1.3.5 provides Linux x86_64
 and arm64, macOS arm64 and Windows x86_64 binaries; it does not publish an Intel macOS binary.
 Run the full maintainer gate on one of those supported platforms. Building,
 installing and packaging Kuru on Intel macOS uses the Rust tasks and does not
 require Communiqué or maintainer setup.
 
-CI also builds and packages the native executable on Intel macOS and Linux
-arm64, and requires those jobs alongside the full gates. Archive-only jobs
-install locked Rust with automatic task-tool installation disabled. They set
-`MISE_NO_HOOKS=1` to omit mise's repository-setup postinstall hook: hk 1.58.1
-does not publish an Intel macOS binary, and these jobs do not create Git commits.
-Local Git hooks, maintainer setup and the full validation jobs retain hk.
+CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
+managed-file checks and documentation as separate Ubuntu jobs. Native coverage
+runs on Linux x86_64, macOS arm64 and Windows x86_64, followed by source
+installation and actual installed offline runtime tests. Linux Clippy does not
+analyze platform-specific conditional code; the native suites compile and test
+those branches. Intel macOS and Linux arm64 additionally build and package the
+native executable, exercise real memory and verify the packaged offline runtime.
+Windows primitives retain a separate native coverage job for early feedback.
+The required `ci-gate` accepts only success from every branch of this graph.
+
+CI installs only each job's tools before task activation, disables automatic
+installation of unrelated root tools, and uses `MISE_NO_HOOKS=1` because validation jobs do not create Git
+commits. Local Git hooks and maintainer setup retain hk. Archive-only Intel macOS
+jobs need neither hk nor Communiqué, which have no matching upstream binaries.
 
 On Windows, use the x86-64 MSVC Rust target with Visual Studio C++ Build Tools
 and the Windows SDK. The app-owned release task passes an explicit target and
@@ -67,19 +76,32 @@ bridge before any downloaded application can be trusted.
 | `mise run build:release` | Optimized release build |
 | `mise run run -- --provider demo` | Interactive offline harness |
 | `mise run format:fix` | Rust and TOML formatting |
+| `mise run format:check` | Rust, TOML and documentation formatting |
 | `mise run lint` | All-target Clippy with warnings as errors |
+| `mise run typecheck` | Rust compilation checks for all targets/features on the host |
 | `mise run test` | Workspace behavioral and protocol tests |
-| `mise run coverage` | Workspace LLVM line coverage, minimum 90% |
+| `mise run coverage` | Run the behavioral suite under LLVM instrumentation, minimum 90% workspace line coverage |
 | `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
 | `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
 | `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
 | `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
 | `mise run docs:dev` | Local VitePress server |
-| `mise run docs:check` | Production docs, local links, anchors and public content boundary |
+| `mise run docs:check` | Docs formatting/lint, production build, local links, anchors and public content boundary |
 | `mise run release:version` | Conventional-commit version calculation without publication |
 | `mise run cospec:validate` | Strict validation of changes and durable specs |
 | `mise run cospec:managed:check` | Generated cospec-file drift |
-| `mise run check` | Complete required gate |
+| `mise run check` | Optional local aggregate of independently schedulable quality checks |
+
+Choose individual commands for focused work. To request several independent
+checks together, use mise's task separator, for example
+`mise run format:code ::: lint:rust ::: typecheck`. `format:code` and `lint:rust`
+let CI and hooks keep documentation work in the app's single `docs:check` task
+graph, whose formatter, linter and build share one dependency installation.
+Task dependencies can overlap;
+Cargo still protects shared build artifacts with its own locks. A full coverage
+run already executes the behavioral tests, so neither CI nor hk first runs a
+duplicate ordinary suite. Keep only one coverage writer active per target
+directory, and preserve the instrumented child fixtures.
 
 Coverage includes the application and all packages. Do not exclude hard-to-test
 runtime paths or add tautological assertions to inflate the score. Favor tests
@@ -177,7 +199,7 @@ mise run cospec -- instructions proposal --change example-change
 mise run cospec -- validate example-change --strict
 mise run cospec -- apply example-change
 # Implement, test, and record actual evidence.
-mise run check
+mise run format:code ::: lint:rust ::: typecheck ::: coverage ::: lint:tooling ::: cospec:validate ::: cospec:managed:check ::: docs:check
 mise run cospec -- archive example-change
 ```
 
@@ -188,8 +210,8 @@ schemas and harness instructions are updated by cospec, not edited manually.
 After archival, replace any generated purpose placeholders in new durable specs
 with their capability purpose and rerun `mise run cospec:validate`.
 
-hk validates format/tooling/specs before commits, the full gate before pushes,
-and conventional commit titles. Hooks are installed by mise's postinstall and
+hk validates format/tooling/specs before commits, separate concurrent quality
+steps before pushes, and conventional commit titles. Hooks are installed by mise's postinstall and
 `mise run setup`. Fix failed checks instead of bypassing hooks.
 
 Git hooks export repository-selection variables, so a subprocess working directory
