@@ -12,9 +12,10 @@ Messages retain peer provenance. Storage is currently SQLite. IFS is the default
 framework with seven built-in peers; the demo provider uses the selected framework.
 """
 system_extra = """
-Write concise factual release notes of at most 450 words grounded in the supplied
-commits and files. Lead with observable changes for users, then use at most ten
-focused bullets across the entire release body. Use fewer for a small release.
+Write concise factual release notes grounded in the supplied commits and files.
+Aim for about 450 words or fewer. Lead with observable changes for users, then
+use focused bullets; around six to ten is enough for a substantial release.
+Use fewer for a small release. These are editorial targets, not a rigid template.
 Summarize the release rather than enumerating every component and test.
 The current-source snapshot is authoritative for present behavior. Commit history
 explains changes and may contain earlier designs that were subsequently replaced.

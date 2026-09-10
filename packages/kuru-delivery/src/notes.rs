@@ -196,27 +196,6 @@ pub async fn generate(
     );
     let text = fs::read_to_string(notes_path)?;
     ensure!(!text.trim().is_empty(), "Communiqué produced empty notes");
-    ensure!(
-        text.split_whitespace().count() <= 450,
-        "release notes must contain at most 450 words"
-    );
-    let bullets = text
-        .lines()
-        .filter(|line| {
-            let marker = line.split_whitespace().next().unwrap_or_default();
-            matches!(marker, "-" | "*" | "+")
-                || marker
-                    .strip_suffix('.')
-                    .or_else(|| marker.strip_suffix(')'))
-                    .is_some_and(|number| {
-                        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-        })
-        .count();
-    ensure!(
-        bullets <= 10,
-        "release notes must contain at most 10 bullets"
-    );
     let mut staged =
         tempfile::NamedTempFile::new_in(output.parent().unwrap_or_else(|| Path::new(".")))?;
     staged.write_all(text.as_bytes())?;
