@@ -50,6 +50,7 @@ impl ForeignRepository {
         .unwrap();
         // Fixture setup must be safe even before production sanitization exists.
         // It inherits no caller Git configuration, hooks or repository selectors.
+        let trace = temp.path().join("setup-trace.jsonl");
         for args in [
             &["init", "-b", "main"][..],
             &["config", "user.name", "Foreign caller"],
@@ -59,18 +60,37 @@ impl ForeignRepository {
             &["commit", "-m", "fix: sentinel caller commit"],
         ] {
             let output = Command::new("git")
+                // The sentinel must be quiescent before its complete snapshot.
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
                 .args(args)
                 .current_dir(&root)
                 .env_clear()
                 .env("PATH", std::env::var_os("PATH").unwrap())
                 .env("HOME", temp.path())
                 .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TRACE2_EVENT", &trace)
                 .output()
                 .unwrap();
             assert!(
                 output.status.success(),
                 "isolated fixture Git failed: {}",
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let events: Vec<serde_json::Value> = fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events.iter().any(|event| event["event"] == "start"));
+        for event in events
+            .iter()
+            .filter(|event| event["event"] == "child_start")
+        {
+            let args = event["argv"].as_array().unwrap();
+            assert!(
+                !args.iter().any(|arg| arg == "maintenance" || arg == "gc"),
+                "sentinel setup launched background-capable Git housekeeping: {args:?}"
             );
         }
         for name in ["grafts", "shallow"] {
