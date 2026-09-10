@@ -83,8 +83,10 @@ run = [
 ]
 
 [tasks.coverage]
+depends = ["test"]
 description = "Require 90% combined Rust line coverage, including CLI and delivery tooling"
 # The delivery package supplies its pinned external fixture tools to the combined run.
+# Finish ordinary tests before starting a second set of real database processes.
 run = "mise run //packages/kuru-delivery:coverage:workspace"
 
 [tasks."lint:tooling"]

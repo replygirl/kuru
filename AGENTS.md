@@ -63,6 +63,17 @@ The compiler-free release bootstrap lives in `packages/kuru-delivery/support`;
 the root installation script forwards binary options and retains source builds.
 Keep bootstrap behavior tests and shell lint in the delivery package's mise tasks.
 
+Portability and bundled runtime dependencies are product requirements. Installing
+Kuru must be sufficient to run it: ship required native runtime engines and their
+licenses with the application instead of asking users to install them or depending
+on a first-run download. Keep build-time preparation explicit in package-owned
+mise tasks. Each supported OS needs native CI that exercises actual memory,
+process cleanup, terminal interaction, installation and updating; compiling an
+executable or skipping platform tests does not establish support. Put OS-specific
+mechanics behind small shared boundaries and preserve privacy, ownership and
+recovery guarantees when porting them. Document support only after native checks
+demonstrate it.
+
 Use current available dependency and tool releases, verify compatibility, and
 commit exact pins with the affected Cargo, npm and mise lockfiles. Pin workflow
 actions by commit SHA. Do not loosen pins or remove verification to cure drift.

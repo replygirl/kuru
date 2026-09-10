@@ -22,6 +22,15 @@ use nix::{
 const TICK: Duration = Duration::from_millis(20);
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+pub fn startup_timeout(memory_startup: Duration) -> Duration {
+    // A fresh store starts a staging server, stops/reaps it, then starts the
+    // activated server before the first frame. Each startup allows two seconds
+    // for its supervisor handshake; staged shutdown allows 8s graceful + 3s
+    // forced reaping + 2s parent acknowledgment (kuru-memory's finish_owner).
+    // Subsequent frame/input waits retain the shorter READY_TIMEOUT.
+    (memory_startup + Duration::from_secs(2)) * 2 + Duration::from_secs(8 + 3 + 2) + READY_TIMEOUT
+}
+
 pub struct Terminal {
     child: Child,
     master: File,
@@ -118,16 +127,26 @@ impl Terminal {
             }
             ensure!(
                 Instant::now() < deadline,
-                "{description}: timed out\n{}",
+                "{description}: timed out after {timeout:?}; process {} is still running\n{}",
+                self.child.id(),
                 self.screen()
             );
         }
     }
 
     pub fn wait_text(&mut self, present: &[&str], absent: &[&str]) -> Result<()> {
+        self.wait_text_with_timeout(present, absent, READY_TIMEOUT)
+    }
+
+    pub fn wait_text_with_timeout(
+        &mut self,
+        present: &[&str],
+        absent: &[&str],
+        timeout: Duration,
+    ) -> Result<()> {
         self.wait(
             &format!("screen contains {present:?}, excludes {absent:?}"),
-            READY_TIMEOUT,
+            timeout,
             |terminal| {
                 let screen = terminal.screen();
                 Ok(present.iter().all(|value| screen.contains(value))

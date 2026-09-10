@@ -32,7 +32,7 @@ use tokio::sync::watch;
 mod memory;
 #[path = "support/terminal.rs"]
 mod terminal;
-use terminal::{READY_TIMEOUT, Terminal};
+use terminal::{READY_TIMEOUT, Terminal, startup_timeout};
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -40,6 +40,7 @@ struct Sandbox {
     root: tempfile::TempDir,
     project: PathBuf,
     data: PathBuf,
+    startup_timeout: Duration,
 }
 
 impl Sandbox {
@@ -48,11 +49,17 @@ impl Sandbox {
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project)?;
-        memory::configuration(root.path())?;
+        let configuration = memory::configuration(root.path())?;
+        let config: Config = toml::from_str(&std::fs::read_to_string(
+            configuration.join("kuru/config.toml"),
+        )?)?;
         Ok(Self {
             root,
             project,
             data,
+            startup_timeout: startup_timeout(Duration::from_secs(
+                config.memory.startup_timeout_secs,
+            )),
         })
     }
 
@@ -235,7 +242,7 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {
         command.env("KURU_REDUCED_MOTION", "1");
     }
     let mut terminal = Terminal::spawn(command, 35, 120)?;
-    terminal.wait_text(&["KURU", "enter send"], &[])?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
     assert!(
         terminal
             .output
@@ -375,7 +382,7 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
         .env("KURU_FIXTURE_KEY", "fixture")
         .env("KURU_REDUCED_MOTION", "1");
     let mut terminal = Terminal::spawn(command, 35, 120)?;
-    terminal.wait_text(&["KURU", "enter send"], &[])?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
     terminal.send(b"Slow request\r")?;
     terminal.wait("provider started", READY_TIMEOUT, |_| {
         Ok(started.load(Ordering::SeqCst))
@@ -556,7 +563,7 @@ async fn preferences_session(
     let mut command = sandbox.command("demo");
     command.env("KURU_REDUCED_MOTION", "1");
     let mut terminal = Terminal::spawn(command, 38, 130)?;
-    terminal.wait("initial selections", READY_TIMEOUT, |terminal| {
+    terminal.wait("initial selections", sandbox.startup_timeout, |terminal| {
         let screen = terminal.screen().to_lowercase();
         Ok(screen.contains("enter send") && expected.iter().all(|value| screen.contains(value)))
     })?;

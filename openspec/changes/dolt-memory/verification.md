@@ -22,3 +22,21 @@
 - [x] 4.1 @integration (agent) Run mise run check with real Dolt and updated documentation -> complete gate passed on 2026-09-10 in 307.67 seconds, including format, strict lint, all behavioral tests, docs build/link/anchor checks and cospec validation/managed drift. Actual coverage: 11,746 of 12,052 lines (97.4610 percent); no exclusions or threshold changes. Evidence: `/tmp/kuru-dolt-check-final-2.log` and generated `target/coverage.lcov`. The earlier instrumented failure-process fixture emitted a profiling file into its isolated data directory; using the native failure executable fixed the fixture while retaining strict directory validation.
 - [ ] 4.2 @integration (agent) Observe hosted native matrix and aggregate checks on the implementation PR commit -> record the tested SHA and all supported platform results; required checks also gate the final archive commit before merge.
 - [ ] 4.3 @manual (agent) Review AGENTS.md and install/config/memory docs against implemented behavior and archive the change -> future sessions have accurate package boundaries and workflow instructions.
+
+### Hosted correction evidence
+
+Initial PR commit `8f291032286547e779b14a682281c11c71f7aa57` passed macOS arm64
+full checks/source install, macOS Intel native build/memory, and Linux arm64 native
+build/memory in run `34485929265`. Ubuntu x64 passed all 53 memory and 44 runtime
+tests, but two instrumented PTY tests exceeded their ten-second first-frame wait
+while ordinary and coverage suites overlapped. This was a failed hosted gate.
+
+The correction sequences ordinary tests before coverage and derives only cold
+first-frame waits from the configured database lifecycle bounds. Subsequent
+interaction waits remain ten seconds; assertions and production timeouts are
+unchanged. The exact terminal suite passed five tests (one subprocess entry
+intentionally ignored), strict TUI lint passed, and the full local gate passed in
+332.87 seconds with 11,746 of 12,052 lines covered (97.4610 percent).
+Evidence: `/tmp/kuru-dolt-hosted-diagnosis.md` and
+`/tmp/kuru-dolt-hosted-fix-check.log`. Corrected hosted evidence remains pending
+in row 4.2; no hosted pass is inferred from the local repair.
