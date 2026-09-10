@@ -1527,6 +1527,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kuru-platform"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "kuru-runtime"
 version = "0.1.0"
 dependencies = [

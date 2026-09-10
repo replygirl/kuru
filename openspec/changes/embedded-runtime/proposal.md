@@ -24,8 +24,10 @@ fresh offline start. The user explicitly requires portable, bundled dependencies
 
 ### Modified Capabilities
 
-None. The companion native-windows change extends the platform set after this
-contract is established on the existing four native release targets.
+- `versioned-memory`: replace the existing-cache prerequisite with verified
+  bundled cold startup, including offline first use. The companion native-windows
+  change extends the platform set after this contract is established on the
+  existing four native release targets.
 
 ## Impact
 

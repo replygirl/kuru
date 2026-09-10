@@ -20,8 +20,8 @@
 ## 4. Repository and delivery [critical]
 
 - [x] 4.1 @integration (agent) Run mise run check with real Dolt and updated documentation -> complete gate passed on 2026-09-10 in 307.67 seconds, including format, strict lint, all behavioral tests, docs build/link/anchor checks and cospec validation/managed drift. Actual coverage: 11,746 of 12,052 lines (97.4610 percent); no exclusions or threshold changes. Evidence: `/tmp/kuru-dolt-check-final-2.log` and generated `target/coverage.lcov`. The earlier instrumented failure-process fixture emitted a profiling file into its isolated data directory; using the native failure executable fixed the fixture while retaining strict directory validation.
-- [ ] 4.2 @integration (agent) Observe hosted native matrix and aggregate checks on the implementation PR commit -> record the tested SHA and all supported platform results; required checks also gate the final archive commit before merge.
-- [ ] 4.3 @manual (agent) Review AGENTS.md and install/config/memory docs against implemented behavior and archive the change -> future sessions have accurate package boundaries and workflow instructions.
+- [x] 4.2 @integration (agent) Observe hosted native matrix and aggregate checks on the implementation PR commit -> run `34491443433` passed at `e7b34ead53742a97751400a1a69502a60c559c7e`: Ubuntu x64 and macOS arm64 full checks/source install, Linux arm64 and macOS Intel native build/package/actual memory tests, and aggregate ci-gate. Required checks also gate the final archive commit before merge.
+- [x] 4.3 @manual (agent) Review AGENTS.md and install/config/memory docs against implemented behavior -> package ownership, versioned transactions, candidate isolation, preserved migration, owned cleanup and cospec/release rules match the foundation. The current runtime-download documentation accurately describes this implementation and is explicitly replaced by the pending embedding change before merge.
 
 ### Hosted correction evidence
 
@@ -38,5 +38,8 @@ unchanged. The exact terminal suite passed five tests (one subprocess entry
 intentionally ignored), strict TUI lint passed, and the full local gate passed in
 332.87 seconds with 11,746 of 12,052 lines covered (97.4610 percent).
 Evidence: `/tmp/kuru-dolt-hosted-diagnosis.md` and
-`/tmp/kuru-dolt-hosted-fix-check.log`. Corrected hosted evidence remains pending
-in row 4.2; no hosted pass is inferred from the local repair.
+`/tmp/kuru-dolt-hosted-fix-check.log`. Corrected run `34491443433` subsequently
+completed successfully on all four native targets and ci-gate. Completed full
+job logs are `/tmp/kuru-dolt-ci-ubuntu-corrected.log` and
+`/tmp/kuru-dolt-ci-macos-arm.log`. This proves the Dolt foundation only; bundled
+offline startup and Windows application support retain their separate gates.

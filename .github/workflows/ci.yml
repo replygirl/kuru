@@ -25,7 +25,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.3
+          version: 2026.9.4
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - run: mise run setup
@@ -75,7 +75,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.3
+          version: 2026.9.4
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -91,13 +91,52 @@ jobs:
       - name: Verify native Dolt memory
         run: mise run //packages/kuru-memory:test
 
+  native-platform:
+    name: Native platform primitives (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      MISE_LOCKED: "1"
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      MISE_NO_HOOKS: "1"
+      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust cargo:cargo-llvm-cov
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Set up platform Rust components
+        run: mise run //packages/kuru-platform:setup
+      - name: Cache platform Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: native-platform-windows
+      - name: Check native platform primitives
+        run: mise run //packages/kuru-platform:check:native
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock Cargo.lock
+      - name: Upload native platform coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-native-platform-windows
+          path: target/kuru-platform-coverage.lcov
+          if-no-files-found: error
+
   ci-gate:
     if: always()
-    needs: [check, native-build]
+    needs: [check, native-build, native-platform]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every platform check
         env:
           CHECK_RESULT: ${{ needs.check.result }}
           NATIVE_BUILD_RESULT: ${{ needs.native-build.result }}
-        run: test "$CHECK_RESULT" = success && test "$NATIVE_BUILD_RESULT" = success
+          NATIVE_PLATFORM_RESULT: ${{ needs.native-platform.result }}
+        run: test "$CHECK_RESULT" = success && test "$NATIVE_BUILD_RESULT" = success && test "$NATIVE_PLATFORM_RESULT" = success

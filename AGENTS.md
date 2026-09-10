@@ -16,6 +16,7 @@ when applying that standard. AGENTS.md is canonical; CLAUDE.md imports it with
 - `apps/kuru-docs`: curated public documentation site and theme.
 - `packages/kuru-core`: framework/configuration types and shared contracts.
 - `packages/kuru-memory`: managed Dolt, private SQL lifecycle, versioned storage and legacy import.
+- `packages/kuru-platform`: checked native filesystems and Windows process/IPC primitives.
 - `packages/kuru-connectors`: inference providers, tool host, MCP and outbound A2A.
 - `packages/kuru-runtime`: actor pool, peer routing, relationships, dreaming and A2A ingress.
 - `packages/kuru-delivery`: native updater, shell bootstrap, archive packaging, release and repository tooling.
@@ -74,6 +75,19 @@ mechanics behind small shared boundaries and preserve privacy, ownership and
 recovery guarantees when porting them. Document support only after native checks
 demonstrate it.
 
+Keep platform mechanics independent of domain packages. Windows process creation
+and private asynchronous IPC live behind safe APIs in `kuru-platform`; filesystem
+operations retain handles and distinguish rejected from uncertain publication.
+Only its audited Windows interop modules may locally allow unsafe code under the
+package's deny-by-default policy. Every consumer retains the workspace prohibition.
+Platform CI proves those primitives; application support additionally requires the
+database, terminal, connector and delivery checks described above.
+Route concurrent Windows child creation through the platform process API. Its
+explicit handle list protects each child, but an unrelated legacy spawn can still
+inherit temporarily inheritable handles; Rust's private spawn lock cannot be
+coordinated by this library. Audit new process-launching dependencies and consumer
+call sites instead of claiming isolation across arbitrary spawn mechanisms.
+
 Use current available dependency and tool releases, verify compatibility, and
 commit exact pins with the affected Cargo, npm and mise lockfiles. Pin workflow
 actions by commit SHA. Do not loosen pins or remove verification to cure drift.
@@ -104,6 +118,9 @@ test runner's global environment. Verify terminal behavior with real PTYs and
 inspect visual changes at practical terminal/browser sizes. Synchronize terminal
 assertions with completed frames. Record live and local evidence separately;
 a successful build is not evidence of a successful deployment.
+Instrumented child fixtures must explicitly retain the runner's LLVM_PROFILE_FILE
+destination when clearing their environments, so their coverage is collected and
+profile files do not appear in source or private-state fixture directories.
 
 Use conventional commits. Never bypass hk hooks. Do not commit directly to
 main; use a branch and review. Publishing and release tags are external actions

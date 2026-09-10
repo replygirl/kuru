@@ -1,0 +1,577 @@
+//! Audited Windows security-descriptor ownership used by files and local pipes.
+#![allow(unsafe_code)]
+
+use std::ffi::c_void;
+use std::io;
+use std::mem::{size_of, zeroed};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::ptr::{null, null_mut};
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LocalFree};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
+};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+    DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetTokenInformation, INHERIT_ONLY_ACE,
+    IsValidAcl, IsValidSecurityDescriptor, IsValidSid, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TOKEN_USER, TokenUser,
+};
+use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+fn denied(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+fn checked_bool(value: i32) -> io::Result<()> {
+    if value == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Owns precisely one allocation returned by a documented LocalFree API.
+struct LocalMemory(*mut c_void);
+
+impl Drop for LocalMemory {
+    fn drop(&mut self) {
+        // SAFETY: the allocation came from GetSecurityInfo/SDDL/SID conversion,
+        // is uniquely owned here, and is not borrowed beyond this object's life.
+        unsafe {
+            LocalFree(self.0);
+        }
+    }
+}
+
+struct CurrentUser {
+    // usize storage supplies TOKEN_USER/SID alignment and keeps SID pointers live.
+    storage: Vec<usize>,
+    bytes: usize,
+}
+
+impl CurrentUser {
+    fn read() -> io::Result<Self> {
+        let mut token = null_mut();
+        // SAFETY: process pseudo-handle is only borrowed; token is an out slot.
+        checked_bool(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) })?;
+        // SAFETY: successful OpenProcessToken transfers one owned, non-null handle.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut bytes = 0;
+        // SAFETY: the null-buffer size query is documented; token remains live.
+        let status = unsafe {
+            GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut bytes)
+        };
+        let error = io::Error::last_os_error();
+        if status != 0
+            || error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+            || !(size_of::<TOKEN_USER>()..=65_536).contains(&(bytes as usize))
+        {
+            return Err(denied("invalid process-token user size"));
+        }
+        let mut user = Self {
+            storage: vec![0; (bytes as usize).div_ceil(size_of::<usize>())],
+            bytes: bytes as usize,
+        };
+        // SAFETY: aligned storage covers the requested byte count; no pointers
+        // into it are retained until GetTokenInformation has finished writing.
+        checked_bool(unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                user.storage.as_mut_ptr().cast(),
+                bytes,
+                &mut bytes,
+            )
+        })?;
+        if bytes as usize > user.bytes || (bytes as usize) < size_of::<TOKEN_USER>() {
+            return Err(denied("invalid process-token user result"));
+        }
+        user.bytes = bytes as usize;
+        user.sid()?;
+        Ok(user)
+    }
+
+    fn sid(&self) -> io::Result<PSID> {
+        // SAFETY: read() verifies size and alignment; the buffer is not mutated.
+        let sid = unsafe { (*self.storage.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        // SAFETY: storage owns the entire live allocation passed to this check.
+        unsafe { bounded_sid(sid, self.storage.as_ptr().cast(), self.bytes)? };
+        Ok(sid)
+    }
+
+    fn sid_string(&self) -> io::Result<String> {
+        let mut string = null_mut();
+        // SAFETY: sid() validates a live SID; the output allocation is unique.
+        checked_bool(unsafe { ConvertSidToStringSidW(self.sid()?, &mut string) })?;
+        let memory = LocalMemory(string.cast());
+        if memory.0.is_null() {
+            return Err(denied("missing process-token SID string"));
+        }
+        let mut length = 0;
+        // SAFETY: successful conversion guarantees a NUL-terminated string.
+        // A valid SID's textual representation is bounded; no arbitrary input
+        // pointer or externally supplied string reaches this scan.
+        unsafe {
+            while *string.add(length) != 0 {
+                length += 1;
+            }
+            String::from_utf16(std::slice::from_raw_parts(string, length))
+                .map_err(|_| denied("invalid process-token SID encoding"))
+        }
+    }
+}
+
+/// The caller must keep `buffer..buffer+bytes` allocated and readable. `sid`
+/// itself may be invalid; this routine validates its extent before reading it.
+unsafe fn bounded_sid(sid: PSID, buffer: *const u8, bytes: usize) -> io::Result<()> {
+    let start = buffer as usize;
+    let end = start
+        .checked_add(bytes)
+        .ok_or_else(|| denied("invalid SID allocation"))?;
+    let address = sid as usize;
+    if address < start
+        || address
+            .checked_add(8)
+            .is_none_or(|header_end| header_end > end)
+    {
+        return Err(denied("SID lies outside its allocation"));
+    }
+    // SAFETY: the SID's fixed header lies inside the live allocation; its count
+    // is read before validating the complete variable-length SID extent.
+    let count = unsafe { *sid.cast::<u8>().add(1) } as usize;
+    if address
+        .checked_add(8 + count * 4)
+        .is_none_or(|sid_end| sid_end > end)
+    {
+        return Err(denied("SID extends outside its allocation"));
+    }
+    // SAFETY: the complete SID extent has been checked above.
+    if unsafe { IsValidSid(sid) } == 0 {
+        return Err(denied("invalid SID"));
+    }
+    Ok(())
+}
+
+/// Retain this value until the native create call using attributes() returns.
+pub(crate) struct PrivateSecurity {
+    descriptor: LocalMemory,
+}
+
+impl PrivateSecurity {
+    pub(crate) fn new(access_mask: u32, inherit_children: bool) -> io::Result<Self> {
+        let sid = CurrentUser::read()?.sid_string()?;
+        let flags = if inherit_children { "OICI" } else { "" };
+        let sddl = format!("O:{sid}D:P(A;{flags};0x{access_mask:08x};;;{sid})");
+        let string: Vec<_> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = null_mut();
+        // SAFETY: the generated, NUL-terminated SDDL contains only a validated
+        // process SID, fixed syntax and a numeric mask. The result is LocalFree-owned.
+        checked_bool(unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                string.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        })?;
+        if descriptor.is_null() {
+            return Err(denied("missing private security descriptor"));
+        }
+        Ok(Self {
+            descriptor: LocalMemory(descriptor),
+        })
+    }
+
+    pub(crate) fn attributes(&self) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.descriptor.0,
+            bInheritHandle: 0,
+        }
+    }
+
+    fn dacl(&self) -> io::Result<*mut ACL> {
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = null_mut();
+        // SAFETY: the descriptor allocation is retained by self; outputs borrow it.
+        checked_bool(unsafe {
+            GetSecurityDescriptorDacl(self.descriptor.0, &mut present, &mut dacl, &mut defaulted)
+        })?;
+        if present == 0 || dacl.is_null() {
+            return Err(denied("private descriptor has no DACL"));
+        }
+        Ok(dacl)
+    }
+}
+
+/// Validate grants and ownership, returning whether inheritance is protected.
+pub(crate) fn private_status(handle: BorrowedHandle<'_>) -> io::Result<bool> {
+    let user = CurrentUser::read()?;
+    let mut owner = null_mut();
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the borrowed handle stays live; output component pointers borrow
+    // the single returned allocation, immediately retained below.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalMemory(descriptor);
+    if descriptor.0.is_null() || dacl.is_null() {
+        return Err(denied("private object requires a non-null DACL"));
+    }
+    // SAFETY: the successful API returned a live security descriptor.
+    if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 {
+        return Err(denied("invalid object security descriptor"));
+    }
+    // SAFETY: descriptor validity and ownership were established above.
+    let bytes = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
+    // SAFETY: GetSecurityInfo owns the complete descriptor allocation until drop.
+    unsafe { bounded_sid(owner, descriptor.0.cast(), bytes)? };
+    // SAFETY: both SID allocations remain live and have been checked.
+    if unsafe { EqualSid(owner, user.sid()?) } == 0 {
+        return Err(denied("private object belongs to another user"));
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: control/revision are writable outputs for the retained descriptor.
+    checked_bool(unsafe {
+        GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision)
+    })?;
+    // SAFETY: dacl is a component of the validated retained descriptor.
+    if unsafe { IsValidAcl(dacl) } == 0 {
+        return Err(denied("invalid object DACL"));
+    }
+    // SAFETY: zero is a valid initial integer-only ACL_SIZE_INFORMATION value.
+    let mut information: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+    // SAFETY: the DACL is valid, and output size exactly matches its allocation.
+    checked_bool(unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    })?;
+    let mut owner_grant = false;
+    for index in 0..information.AceCount {
+        let mut ace = null_mut();
+        // SAFETY: index is bounded by the native ACL count; ace borrows descriptor.
+        checked_bool(unsafe { GetAce(dacl, index, &mut ace) })?;
+        let start = descriptor.0 as usize;
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| denied("invalid ACL allocation"))?;
+        if (ace as usize) < start
+            || (ace as usize)
+                .checked_add(size_of::<ACE_HEADER>())
+                .is_none_or(|limit| limit > end)
+        {
+            return Err(denied("ACE header outside descriptor"));
+        }
+        // SAFETY: ACE_HEADER lies within the retained descriptor, alignment is
+        // not assumed when reading potentially unfamiliar native ACE layouts.
+        let header = unsafe { ace.cast::<ACE_HEADER>().read_unaligned() };
+        let ace_bytes = header.AceSize as usize;
+        if ace_bytes < size_of::<ACCESS_ALLOWED_ACE>()
+            || (ace as usize)
+                .checked_add(ace_bytes)
+                .is_none_or(|limit| limit > end)
+        {
+            return Err(denied("invalid ACE extent"));
+        }
+        if !matches!(
+            u32::from(header.AceType),
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+        ) {
+            return Err(denied("unmodeled private ACL entry"));
+        }
+        // SAFETY: these two simple ACE types share the checked fixed layout;
+        // the variable SID is separately bounded before any SID API reads it.
+        let entry = unsafe { ace.cast::<ACCESS_ALLOWED_ACE>().read_unaligned() };
+        let sid = (ace as *mut u8)
+            .wrapping_add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+            .cast();
+        // SAFETY: the complete ACE extent was checked inside the live descriptor.
+        unsafe { bounded_sid(sid, ace.cast(), ace_bytes)? };
+        if u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE && entry.Mask != 0 {
+            // SAFETY: both SIDs are valid and allocations remain live.
+            if unsafe { EqualSid(sid, user.sid()?) } == 0 {
+                return Err(denied("private object grants access to another principal"));
+            }
+            owner_grant |= u32::from(header.AceFlags) & INHERIT_ONLY_ACE == 0;
+        }
+    }
+    if !owner_grant {
+        return Err(denied("private object has no effective owner grant"));
+    }
+    Ok(control & SE_DACL_PROTECTED != 0)
+}
+
+pub(crate) fn require_private(
+    handle: BorrowedHandle<'_>,
+    require_protected: bool,
+) -> io::Result<()> {
+    if !private_status(handle)? && require_protected {
+        return Err(denied("private root must have a protected DACL"));
+    }
+    Ok(())
+}
+
+pub(crate) fn set_private(handle: BorrowedHandle<'_>, access_mask: u32) -> io::Result<()> {
+    require_private(handle, false)?;
+    let security = PrivateSecurity::new(access_mask, false)?;
+    // SAFETY: the handle and security allocation remain live for this call;
+    // setting only the DACL does not change the already-validated owner.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            security.dacl()?,
+            null(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::{Directory, NameRetention, Privacy};
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::windows::io::AsHandle;
+    use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+
+    fn descriptor(sddl: &str) -> PrivateSecurity {
+        let text: Vec<_> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut result = null_mut();
+        // SAFETY: fixture-generated SDDL is terminated and result is an out slot.
+        checked_bool(unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                SDDL_REVISION_1,
+                &mut result,
+                null_mut(),
+            )
+        })
+        .unwrap();
+        PrivateSecurity {
+            descriptor: LocalMemory(result),
+        }
+    }
+
+    fn set_dacl(file: &File, dacl: *const ACL) {
+        // SAFETY: the fixture owns a WRITE_DAC handle and keeps the descriptor
+        // alive; a null pointer intentionally constructs a real null-DACL case.
+        let result = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null(),
+            )
+        };
+        assert_eq!(result, 0, "fixture SetSecurityInfo failed: {result}");
+    }
+
+    fn security_text(file: &File) -> String {
+        let mut descriptor = null_mut();
+        // SAFETY: fixture handle is live; the one allocated descriptor is retained.
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        let descriptor = LocalMemory(descriptor);
+        let mut text = null_mut();
+        let mut length = 0;
+        // SAFETY: both descriptor and returned string have scoped RAII owners;
+        // the returned native length includes the terminator.
+        checked_bool(unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.0,
+                SDDL_REVISION_1,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut text,
+                &mut length,
+            )
+        })
+        .unwrap();
+        let _text = LocalMemory(text.cast());
+        // SAFETY: successful conversion provides exactly length UTF-16 units.
+        String::from_utf16(unsafe {
+            std::slice::from_raw_parts(text, length.saturating_sub(1) as usize)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn native_weak_and_null_acls_fail_without_silent_repair() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut file = directory.create_new(OsStr::new("record")).unwrap();
+        file.write_all(b"private original bytes").unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let weak = descriptor(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"));
+        set_dacl(&file, weak.dacl().unwrap());
+        let before = security_text(&file);
+        assert!(require_private(file.as_handle(), false).is_err());
+        assert!(directory.read(OsStr::new("record")).is_err());
+        assert_eq!(security_text(&file), before);
+        assert_eq!(
+            std::fs::read(directory.path().join("record")).unwrap(),
+            b"private original bytes"
+        );
+        set_dacl(&file, null());
+        let before = security_text(&file);
+        assert!(require_private(file.as_handle(), false).is_err());
+        assert_eq!(security_text(&file), before);
+    }
+
+    #[test]
+    fn private_file_publication_rejects_a_broad_candidate_acl_before_the_move() {
+        use crate::fs::{Publication, PublicationPhase};
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let ordinary =
+            Directory::open(private.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        private
+            .create_new(OsStr::new("published"))
+            .unwrap()
+            .write_all(b"private original")
+            .unwrap();
+        let mut candidate = private.create_new(OsStr::new("candidate")).unwrap();
+        candidate.write_all(b"ordinary candidate").unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let weak = descriptor(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"));
+        set_dacl(&candidate, weak.dacl().unwrap());
+        let before = security_text(&candidate);
+        assert!(require_private(candidate.as_handle(), false).is_err());
+        let error = private
+            .publish_file(
+                &ordinary,
+                OsStr::new("candidate"),
+                &candidate,
+                OsStr::new("published"),
+                Publication::ReplaceRegular,
+            )
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(
+            std::fs::read(private.path().join("published")).unwrap(),
+            b"private original"
+        );
+        assert_eq!(
+            std::fs::read(private.path().join("candidate")).unwrap(),
+            b"ordinary candidate"
+        );
+        assert_eq!(security_text(&candidate), before);
+    }
+
+    #[test]
+    fn an_unprotected_owner_only_root_needs_a_validated_private_ancestor() {
+        use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let security = PrivateSecurity::new(
+            windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+            true,
+        )
+        .unwrap();
+        // Open a writable ACL handle to this isolated directory. The production
+        // checked guard intentionally does not request mutation rights on dirs.
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(
+                windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                    | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+            )
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(directory.path())
+            .unwrap();
+        // SAFETY: fixture-only permission mutation of the retained private root;
+        // unprotecting deliberately allows its ordinary parent to supply grants.
+        assert_eq!(
+            unsafe {
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    security.dacl().unwrap(),
+                    null(),
+                )
+            },
+            0
+        );
+        let before = security_text(&file);
+        assert!(require_private(file.as_handle(), true).is_err());
+        assert!(
+            Directory::open(directory.path(), Privacy::OwnerOnly, NameRetention::Movable).is_err()
+        );
+        assert_eq!(security_text(&file), before);
+    }
+
+    #[test]
+    fn a_foreign_system_directory_owner_is_rejected_without_privilege_or_mutation() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            READ_CONTROL,
+        };
+        // Read only the public OS directory descriptor. Creating a foreign-owner
+        // temp object would require privileges that production and contributor
+        // tests do not need. No directory contents or private settings are read.
+        let path = std::env::var_os("SystemRoot").expect("native Windows must supply SystemRoot");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .unwrap();
+        let before = security_text(&file);
+        let error = require_private(file.as_handle(), false).unwrap_err();
+        assert!(error.to_string().contains("another user"), "{error}");
+        assert_eq!(security_text(&file), before);
+    }
+}

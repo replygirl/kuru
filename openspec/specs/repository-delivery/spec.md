@@ -54,3 +54,14 @@ Documentation SHALL describe cognition scope, commands, storage, permissions, pr
 #### Scenario: Installation choices
 - **WHEN** a user reads the README installation section
 - **THEN** mise and shell binary installation appear before source installation, with working command syntax and links to detailed platform and update instructions.
+
+### Requirement: Package-owned memory runtime verification
+
+The memory package SHALL own runtime provisioning and real Dolt integration
+fixtures through native mise tasks. Required tests MUST fail when Dolt cannot be
+provisioned or started. CI SHALL exercise the supported native release platforms;
+the existing workspace coverage threshold and release archive contract SHALL remain.
+
+#### Scenario: Missing test runtime
+- **WHEN** a required integration check cannot obtain its pinned Dolt executable
+- **THEN** the check fails with actionable diagnostics instead of skipping or substituting SQLite.

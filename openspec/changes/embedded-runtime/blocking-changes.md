@@ -2,7 +2,7 @@
 
 ## Blocked by
 
-- [ ] `dolt-memory` — verified full-Dolt catalog, provisioning and lifecycle being embedded
+- [x] `dolt-memory` — verified full-Dolt catalog, provisioning and lifecycle being embedded *(archived 2026-09-10)*
 
 ## Soft-blocked by
 

@@ -130,6 +130,13 @@ Do not convert a blocking Windows anonymous pipe into a Tokio wrapper and assume
 that cancellation can stop its worker thread. No TCP listener or public endpoint
 is introduced by this package.
 
+The channel owns each native OVERLAPPED operation, event and buffer through its
+actual completion. Explicit close cancels pending I/O and observes completion;
+timeout retains ownership for later cleanup. Dropping a Tokio write future or
+calling its named-pipe flush is insufficient evidence: the pinned Mio backend
+can retain a queued write after the public endpoint is dropped. Native fixtures
+must prove close while the stalled peer remains alive, then runtime shutdown.
+
 Rejected: globally named permissive pipes, endpoint-name secrecy as identity,
 blocking lifetime readers, and transport methods that own domain SQL framing.
 

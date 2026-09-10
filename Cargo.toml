@@ -7,6 +7,7 @@ members = [
   "packages/kuru-runtime",
   "packages/kuru-delivery",
   "packages/kuru-memory",
+  "packages/kuru-platform",
 ]
 
 [workspace.package]
@@ -50,11 +51,13 @@ tar = "=0.4.46"
 flate2 = "=1.1.10"
 scraper = "=0.27.0"
 roxmltree = "=0.21.1"
+windows-sys = { version = "=0.61.2", default-features = false }
 kuru-core = { path = "packages/kuru-core" }
 kuru-connectors = { path = "packages/kuru-connectors" }
 kuru-runtime = { path = "packages/kuru-runtime" }
 kuru-delivery = { path = "packages/kuru-delivery" }
 kuru-memory = { path = "packages/kuru-memory" }
+kuru-platform = { path = "packages/kuru-platform" }
 
 [profile.release]
 lto = "thin"

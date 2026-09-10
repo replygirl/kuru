@@ -24,4 +24,58 @@
 
 - [ ] 5.1 @integration (agent) Run package-owned format/lint/test/coverage tasks for all primitives on Windows and shared filesystem contracts on Unix without Dolt, bundles or consumer compilation -> actual fixture counts and native coverage pass with no required skips and the existing workspace floor is preserved.
 - [ ] 5.2 @integration (agent) Observe the required package-only windows-2025 job and aggregate gate at the candidate commit -> all real primitive checks pass and an injected fixture failure in local gate validation is not hidden by successful Unix/product jobs.
-- [ ] 5.3 @manual (agent) Review API/dependency tree, unsafe allowances, mise ownership and CI labels -> the library has no domain dependency, unsafe code is contained and no product Windows support claim has been introduced.
+- [x] 5.3 @manual (agent) Review API/dependency tree, unsafe allowances, mise ownership and CI labels -> the library has no domain dependency; Windows FFI is locally contained under package deny while consumers retain forbid; package mise/CI labels and guidance distinguish primitive proof from pending Windows product acceptance.
+
+### Local filesystem evidence, 2026-09-10
+
+On macOS arm64, `mise run //packages/kuru-platform:coverage` passed its ordinary
+and instrumented runs: fifteen filesystem integration tests and one real
+post-move uncertainty unit test. Native line coverage was 446/477 (93.50%):
+316/336 in the shared filesystem API and 130/141 in its Unix implementation.
+No production source was excluded. The raw-name fixture uses a direct native
+control: APFS rejected the invalid UTF-8 name, and Kuru preserved that error
+without creating a lossy replacement. Accepting filesystems must round-trip
+the exact bytes.
+
+Strict Unix lint and Windows-target Clippy passed after the native ACL/junction
+fixtures were added. Evidence is recorded in
+`/tmp/kuru-platform-fs-local-evidence.md`; the measured artifact is
+`target/kuru-platform-coverage.lcov`. These results do not execute Windows code.
+Native Windows evidence and the subsequent owned-pipe implementation remain
+pending; the combined acceptance rows above are therefore still unchecked.
+
+Two publication regressions subsequently failed against the initial code and
+passed after correction: weak candidate permissions are rejected before replacing
+a private destination, and directory moves reject implicit access-policy changes
+in either direction. Both preserve the source and destination on rejection.
+Streaming identity revalidation reduced transient descriptor use without dropping
+ancestor checks. The final macOS run passed seventeen integration tests and one
+unit, with 458/486 native lines covered (94.24%). Raw RED/GREEN, strict lint and
+coverage logs are `/tmp/kuru-platform-fs-publication-{red,green,clippy,coverage}.log`.
+
+The final Windows cross-target typecheck and strict Clippy passed with sixteen
+process/IPC integration cases authored. Source review drove owned native I/O
+completion, independent split-reader/writer wakeups and atomic fixture receipts.
+Both initial startup and established-tree owner-loss fixtures are present;
+atomic assignment before execution is the native JOB_LIST creation contract,
+not a claim of testing every instruction boundary. Actual Windows execution
+and coverage remain pending. Logs are
+`/tmp/kuru-platform-windows-{typecheck,clippy}.log`.
+
+Tool freshness review verified mise 2026.9.4 from the official release metadata
+and matching local SHA-256 before execution. CI and Release use that exact
+version; the release job structure and publication rules are unchanged.
+
+The complete `mise run check` passed locally with mise 2026.9.4 in 430.37 seconds,
+including actual Dolt behavior, new filesystem tests, strict lint/format, docs,
+cospec validation/managed drift and workspace coverage. Measured coverage was
+12,204/12,538 lines (97.3361%), without exclusions or a threshold change.
+Evidence: `/tmp/kuru-native-platform-check.log` and `target/coverage.lcov`.
+The native Windows job remains the next unobserved acceptance step.
+
+After forwarding the LLVM profile destination through cleared fixture
+environments, Windows-target Clippy and the complete gate passed again in
+343.39 seconds with the same 12,204/12,538 covered lines. No generated profile
+files remained in source directories. Logs are
+`/tmp/kuru-platform-profile-windows-lint.log` and
+`/tmp/kuru-native-platform-profile-check.log`.

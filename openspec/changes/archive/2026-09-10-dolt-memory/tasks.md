@@ -18,5 +18,9 @@
 ## 4. Completion
 
 - [x] 4.1 Integrate package-owned mise/CI fixtures, update docs and AGENTS.md, and run the full local quality gate.
-- [ ] 4.2 Commit the implementation through hooks, open the reviewed PR, observe hosted checks and resolve failures.
-- [ ] 4.3 Record observed evidence, strictly validate and archive cospec before the final branch commit; retain required checks for the normal merge.
+- [x] 4.2 Commit the implementation through hooks, open the reviewed PR, observe hosted checks and resolve failures.
+- [x] 4.3 Record observed evidence and strictly validate the completed foundation; retain required checks for the final archive commit and normal merge.
+
+Archive this completed foundation through cospec before the final branch commit.
+The PR remains draft while the separately gated embedding and Windows product
+changes are implemented and verified.

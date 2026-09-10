@@ -1,0 +1,742 @@
+#![cfg(all(windows, feature = "test-support"))]
+
+use kuru_platform::windows::{
+    pipe::{self, Pipe, PrivateListener},
+    process::{Console, Lifetime, NativeChild, NativeSpawnSpec, Stdio},
+};
+use std::{
+    ffi::{OsStr, OsString},
+    fs::{self, File, TryLockError},
+    io,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+const LIMIT: Duration = Duration::from_secs(8);
+const SHORT: Duration = Duration::from_millis(80);
+
+fn spec(root: &Path, args: &[&OsStr]) -> NativeSpawnSpec {
+    let mut spec = NativeSpawnSpec::new(
+        PathBuf::from(env!("CARGO_BIN_EXE_kuru-platform-process-fixture")),
+        root.to_owned(),
+    );
+    spec.args = args.iter().map(|arg| (*arg).to_owned()).collect();
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        spec.environment.push(("SystemRoot".into(), system_root));
+    }
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        spec.environment.push(("LLVM_PROFILE_FILE".into(), profile));
+    }
+    spec
+}
+
+async fn ready(child: &mut NativeChild) -> BufReader<Pipe> {
+    let mut reader = BufReader::new(child.take_stdout().expect("piped fixture stdout"));
+    let mut line = String::new();
+    tokio::time::timeout(LIMIT, reader.read_line(&mut line))
+        .await
+        .expect("fixture readiness deadline")
+        .expect("fixture readiness IO");
+    assert!(
+        !line.is_empty(),
+        "fixture {} exited before readiness",
+        child.id()
+    );
+    reader
+}
+
+async fn idle(root: &Path) -> NativeChild {
+    let mut spawn = spec(root, &[OsStr::new("idle")]);
+    spawn.stdout = Stdio::Pipe;
+    let mut child = spawn.spawn().await.unwrap();
+    ready(&mut child).await;
+    child
+}
+
+async fn unlocked(path: &Path) {
+    let deadline = tokio::time::Instant::now() + LIMIT;
+    loop {
+        let file = File::options().read(true).write(true).open(path).unwrap();
+        match file.try_lock() {
+            Ok(()) => return,
+            Err(TryLockError::WouldBlock) => (),
+            Err(error) => panic!("unexpected fixture lock failure: {error}"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "owned fixture retained {} after cleanup",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn native_arguments_environment_stdio_and_working_directory_round_trip() {
+    let root = tempfile::Builder::new()
+        .prefix("kuru native λ ")
+        .tempdir()
+        .unwrap();
+    let args = [
+        "",
+        "two words",
+        "quotes\"inside",
+        "trailing \\",
+        "\\\\\"",
+        "λ雪🦀",
+        "$HOME; & | > < %PATH% !",
+        "a\tb",
+    ];
+    let mut spawn = spec(root.path(), &[OsStr::new("capture")]);
+    spawn.args.extend(args.iter().map(OsString::from));
+    let raw_argument = OsString::from_wide(&[0xD800, b' ' as u16, 0xDC00]);
+    spawn.args.push(raw_argument.clone());
+    spawn
+        .environment
+        .push(("KURU_VALUE".into(), "exact λ & value".into()));
+    spawn.environment.push(("kuru_second".into(), "".into()));
+    spawn
+        .environment
+        .push(("KURU_WIDE".into(), raw_argument.clone()));
+    spawn.stdin = Stdio::Pipe;
+    spawn.stdout = Stdio::Pipe;
+    spawn.stderr = Stdio::Pipe;
+    let mut child = spawn.spawn().await.unwrap();
+    let mut input = child.take_stdin().unwrap();
+    input.write_all(b"exact input\n").await.unwrap();
+    input.flush().await.unwrap();
+    drop(input);
+    let mut output = child.take_stdout().unwrap();
+    let mut error = child.take_stderr().unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    tokio::time::timeout(LIMIT, async {
+        tokio::try_join!(
+            output.read_to_end(&mut stdout),
+            error.read_to_end(&mut stderr)
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(child.wait(LIMIT).await.unwrap().success());
+    assert!(child.try_wait().unwrap().unwrap().success());
+    child.terminate().unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(
+        report["args"].as_array().unwrap()[..args.len()],
+        serde_json::json!(args).as_array().unwrap()[..]
+    );
+    assert_eq!(
+        report["args_utf16"].as_array().unwrap().last().unwrap(),
+        &serde_json::json!(raw_argument.encode_wide().collect::<Vec<_>>())
+    );
+    assert_eq!(
+        report["wide_env"]["KURU_WIDE"],
+        serde_json::json!(raw_argument.encode_wide().collect::<Vec<_>>())
+    );
+    assert_eq!(report["stdin"], "exact input\n");
+    assert_eq!(report["cwd"], serde_json::json!(root.path()));
+    assert_eq!(report["env"]["KURU_VALUE"], "exact λ & value");
+    assert_eq!(report["env"]["kuru_second"], "");
+    assert!(
+        report["env"].get("PATH").is_none(),
+        "ambient environment must not leak"
+    );
+    assert_eq!(stderr, b"fixture stderr\n");
+}
+
+#[tokio::test]
+async fn invalid_creation_intent_fails_before_running_a_fixture() {
+    let root = tempfile::tempdir().unwrap();
+    for keys in [["Path", "PATH"], ["é", "É"]] {
+        let mut spawn = spec(root.path(), &[OsStr::new("idle")]);
+        spawn
+            .environment
+            .extend(keys.map(|key| (key.into(), "do-not-log-this".into())));
+        let error = spawn.spawn().await.err().expect("duplicate env must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!error.to_string().contains("do-not-log-this"));
+    }
+    for (key, value) in [("", "value"), ("A=B", "value"), ("A", "x\0y")] {
+        let mut spawn = spec(root.path(), &[OsStr::new("idle")]);
+        spawn.environment.push((key.into(), value.into()));
+        assert_eq!(
+            spawn.spawn().await.err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    for path in [
+        PathBuf::from("relative.exe"),
+        root.path().join("hidden.cmd"),
+        root.path().join("hidden.BAT"),
+    ] {
+        let mut spawn = spec(root.path(), &[]);
+        spawn.executable = path;
+        assert_eq!(
+            spawn.spawn().await.err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    let mut spawn = spec(root.path(), &[]);
+    spawn.cwd = "relative".into();
+    assert_eq!(
+        spawn.spawn().await.err().unwrap().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    for arg in ["bad\0arg".to_owned(), "x".repeat(33000)] {
+        let mut spawn = spec(root.path(), &[]);
+        spawn.args.push(arg.into());
+        assert_eq!(
+            spawn.spawn().await.err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    let mut missing = spec(root.path(), &[]);
+    missing.executable = root.path().join("missing.exe");
+    missing.stdin = Stdio::Pipe;
+    missing.stdout = Stdio::Pipe;
+    missing.stderr = Stdio::Pipe;
+    assert_eq!(
+        missing.spawn().await.err().unwrap().kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
+#[tokio::test]
+async fn timeout_retains_tree_ownership_and_termination_is_explicit() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = idle(root.path()).await;
+    assert_eq!(
+        child.wait(SHORT).await.unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        child.interrupt().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    child.terminate().unwrap();
+    assert!(!child.wait(LIMIT).await.unwrap().success());
+    child.terminate().unwrap();
+}
+
+#[tokio::test]
+async fn root_exit_does_not_hide_a_descendant_or_its_open_output() {
+    let root = tempfile::tempdir().unwrap();
+    let root_lock = root.path().join("root.lock");
+    let leaf_lock = root.path().join("leaf.lock");
+    let release = root.path().join("release");
+    let mut spawn = spec(
+        root.path(),
+        &[
+            OsStr::new("tree"),
+            root_lock.as_os_str(),
+            leaf_lock.as_os_str(),
+            release.as_os_str(),
+        ],
+    );
+    spawn.stdout = Stdio::Pipe;
+    let mut child = spawn.spawn().await.unwrap();
+    let mut output = BufReader::new(child.take_stdout().unwrap());
+    let mut lines = String::new();
+    for _ in 0..2 {
+        tokio::time::timeout(LIMIT, output.read_line(&mut lines))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(lines.contains("leaf-ready") && lines.contains("root-ready"));
+    unlocked(&root_lock).await; // actual root-owned lock released, not a sleep
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        child.wait(SHORT).await.unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    let mut remainder = String::new();
+    assert!(
+        tokio::time::timeout(SHORT, output.read_to_string(&mut remainder))
+            .await
+            .is_err()
+    );
+    fs::write(release, b"go").unwrap();
+    assert!(child.wait(LIMIT).await.unwrap().success());
+    tokio::time::timeout(LIMIT, output.read_to_string(&mut remainder))
+        .await
+        .unwrap()
+        .unwrap();
+    unlocked(&leaf_lock).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_handle_allowlists_keep_stdin_and_output_independent() {
+    let root = tempfile::tempdir().unwrap();
+    let make = || {
+        let mut child = spec(root.path(), &[OsStr::new("capture")]);
+        child.stdin = Stdio::Pipe;
+        child.stdout = Stdio::Pipe;
+        child
+    };
+    let (a, b) = tokio::join!(tokio::spawn(make().spawn()), tokio::spawn(make().spawn()));
+    let (mut a, mut b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
+    drop(a.take_stdin());
+    let mut output = Vec::new();
+    tokio::time::timeout(LIMIT, a.take_stdout().unwrap().read_to_end(&mut output))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(a.wait(LIMIT).await.unwrap().success());
+    assert!(
+        b.try_wait().unwrap().is_none(),
+        "other fixture still awaits its own input"
+    );
+    let mut input = b.take_stdin().unwrap();
+    input.write_all(b"second").await.unwrap();
+    input.flush().await.unwrap();
+    drop(input);
+    let mut output = Vec::new();
+    tokio::time::timeout(LIMIT, b.take_stdout().unwrap().read_to_end(&mut output))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output).unwrap()["stdin"],
+        "second"
+    );
+    assert!(b.wait(LIMIT).await.unwrap().success());
+}
+
+#[tokio::test]
+async fn owner_death_closes_its_job_and_leaves_an_unrelated_child_usable() {
+    let root = tempfile::tempdir().unwrap();
+    let mut unrelated = idle(root.path()).await;
+    let root_lock = root.path().join("root.lock");
+    let leaf_lock = root.path().join("leaf.lock");
+    let release = root.path().join("release");
+    let mut spawn = spec(
+        root.path(),
+        &[
+            OsStr::new("owner"),
+            root_lock.as_os_str(),
+            leaf_lock.as_os_str(),
+            release.as_os_str(),
+        ],
+    );
+    // No outer Job may mask whether the killed owner's inner Job closes.
+    spawn.lifetime = Lifetime::TrustedSupervisor;
+    spawn.stdout = Stdio::Pipe;
+    let mut owner = spawn.spawn().await.unwrap();
+    ready(&mut owner).await;
+    let lock = File::open(&leaf_lock).unwrap();
+    assert!(matches!(lock.try_lock(), Err(TryLockError::WouldBlock)));
+    owner.terminate().unwrap();
+    owner.wait(LIMIT).await.unwrap();
+    unlocked(&leaf_lock).await;
+    assert!(unrelated.try_wait().unwrap().is_none());
+    unrelated.terminate().unwrap();
+    unrelated.wait(LIMIT).await.unwrap();
+}
+
+#[tokio::test]
+async fn owner_loss_at_child_startup_prevents_work_and_preserves_unrelated_process() {
+    let root = tempfile::tempdir().unwrap();
+    let mut unrelated = idle(root.path()).await;
+    let started = root.path().join("startup.lock");
+    let release = root.path().join("release-startup");
+    let work = root.path().join("work");
+    let mut spawn = spec(
+        root.path(),
+        &[
+            OsStr::new("owner-startup"),
+            started.as_os_str(),
+            release.as_os_str(),
+            work.as_os_str(),
+        ],
+    );
+    // An outer Job would mask whether the startup child's actual owner cleans it.
+    spawn.lifetime = Lifetime::TrustedSupervisor;
+    spawn.stdout = Stdio::Pipe;
+    let mut owner = spawn.spawn().await.unwrap();
+    ready(&mut owner).await;
+    let lock = File::open(&started).unwrap();
+    assert!(matches!(lock.try_lock(), Err(TryLockError::WouldBlock)));
+    assert!(!work.exists());
+    owner.terminate().unwrap();
+    owner.wait(LIMIT).await.unwrap();
+    unlocked(&started).await;
+    assert!(
+        !work.exists(),
+        "startup child must not reach its work phase"
+    );
+    assert!(unrelated.try_wait().unwrap().is_none());
+    unrelated.terminate().unwrap();
+    unrelated.wait(LIMIT).await.unwrap();
+}
+
+#[tokio::test]
+async fn trusted_child_survives_its_creator_until_private_lifetime_eof() {
+    let root = tempfile::tempdir().unwrap();
+    let receipt = root.path().join("trusted-receipt");
+    let mut spawn = spec(
+        root.path(),
+        &[OsStr::new("trusted-owner"), receipt.as_os_str()],
+    );
+    spawn.lifetime = Lifetime::TrustedSupervisor;
+    spawn.stdout = Stdio::Pipe;
+    let mut owner = spawn.spawn().await.unwrap();
+    ready(&mut owner).await;
+    owner.terminate().unwrap();
+    owner.wait(LIMIT).await.unwrap();
+    tokio::time::timeout(LIMIT, async {
+        while !receipt.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("trusted child did not finish after creator EOF");
+    assert_eq!(fs::read(receipt).unwrap(), b"parent-lifetime");
+}
+
+#[tokio::test]
+async fn rendezvous_authenticates_the_connecting_child_and_eof_finishes_it() {
+    let root = tempfile::tempdir().unwrap();
+    let receipt = root.path().join("receipt");
+    let listener = PrivateListener::bind().unwrap();
+    assert_eq!(
+        PrivateListener::bind_at(listener.address())
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let mut spawn = spec(
+        root.path(),
+        &[
+            OsStr::new("rendezvous"),
+            listener.address(),
+            receipt.as_os_str(),
+        ],
+    );
+    spawn.stderr = Stdio::Pipe;
+    let mut child = spawn.spawn().await.unwrap();
+    let mut channel = tokio::spawn(listener.accept(&child, LIMIT))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut hello = [0; 9];
+    tokio::time::timeout(LIMIT, channel.read_exact(&mut hello))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&hello, b"connected");
+    let mut byte = [0];
+    assert!(
+        tokio::time::timeout(SHORT, channel.read(&mut byte))
+            .await
+            .is_err()
+    );
+    channel.write_all(b"private-payload").await.unwrap();
+    channel.flush().await.unwrap();
+    drop(channel);
+    assert!(child.wait(LIMIT).await.unwrap().success());
+    assert_eq!(fs::read(receipt).unwrap(), b"private-payload");
+}
+
+#[tokio::test]
+async fn split_duplex_tasks_keep_independent_read_and_write_wakeups() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = PrivateListener::bind().unwrap();
+    let mut child = spec(root.path(), &[OsStr::new("duplex"), listener.address()])
+        .spawn()
+        .await
+        .unwrap();
+    let channel = listener.accept(&child, LIMIT).await.unwrap();
+    let (mut reader, mut writer) = tokio::io::split(channel);
+    let pending_read = std::sync::Arc::new(tokio::sync::Notify::new());
+    let reader_signal = pending_read.clone();
+    let read = tokio::spawn(async move {
+        let mut reply = [0; 9];
+        {
+            let operation = reader.read_exact(&mut reply);
+            tokio::pin!(operation);
+            std::future::poll_fn(|cx| {
+                use std::future::Future;
+                let result = operation.as_mut().poll(cx);
+                if result.is_pending() {
+                    reader_signal.notify_one();
+                }
+                result
+            })
+            .await
+            .unwrap();
+        }
+        // Keep the reader alive until its response has been verified, without
+        // polling from any third task that could hide a lost wake registration.
+        assert_eq!(&reply, b"duplex-ok");
+    });
+    let write = tokio::spawn(async move {
+        pending_read.notified().await;
+        writer
+            .write_all(&vec![b'x'; 8 * 1024 * 1024])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+    });
+    let completed = tokio::time::timeout(LIMIT, async { tokio::try_join!(read, write) }).await;
+    if completed.is_err() {
+        child.terminate().unwrap();
+        child.wait(LIMIT).await.unwrap();
+        panic!("split pipe lost an independent read/write wakeup");
+    }
+    completed.unwrap().unwrap();
+    assert!(child.wait(LIMIT).await.unwrap().success());
+}
+
+#[tokio::test]
+async fn wrong_peer_and_nonlocal_names_are_rejected_without_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let mut expected = idle(root.path()).await;
+    let listener = PrivateListener::bind().unwrap();
+    // The test process opens this connection, not the expected live fixture.
+    let client = pipe::connect(listener.address(), LIMIT).await.unwrap();
+    assert_eq!(
+        listener
+            .accept(&expected, LIMIT)
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    drop(client);
+    for address in [
+        r"\\remote\pipe\kuru-test",
+        r"\\.\pipe\foreign",
+        r"\\.\pipe\kuru-",
+        r"\\.\pipe\kuru-bad\name",
+    ] {
+        assert_eq!(
+            PrivateListener::bind_at(OsStr::new(address))
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            pipe::connect(OsStr::new(address), SHORT)
+                .await
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    let listener = PrivateListener::bind().unwrap();
+    assert_eq!(
+        listener
+            .accept(&expected, SHORT)
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    expected.terminate().unwrap();
+    expected.wait(LIMIT).await.unwrap();
+}
+
+#[test]
+fn stalled_overlapped_write_closes_before_peer_exit_and_runtime_shutdown() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let child = runtime.block_on(async {
+            let listener = PrivateListener::bind().unwrap();
+            let spawn = spec(
+                &directory,
+                &[OsStr::new("rendezvous-stall"), listener.address()],
+            );
+            let mut child = spawn.spawn().await.unwrap();
+            let mut channel = listener.accept(&child, LIMIT).await.unwrap();
+            let mut hello = [0; 9];
+            tokio::time::timeout(LIMIT, channel.read_exact(&mut hello))
+                .await
+                .unwrap()
+                .unwrap();
+            let bytes = vec![b'x'; 8 * 1024 * 1024];
+            // First write queues an owned buffer. The second write and flush
+            // must wait for the stalled peer to consume it, not return early.
+            assert_eq!(channel.write(&bytes).await.unwrap(), bytes.len());
+            assert!(
+                tokio::time::timeout(SHORT, channel.write_all(b"second"))
+                    .await
+                    .is_err()
+            );
+            assert!(tokio::time::timeout(SHORT, channel.flush()).await.is_err());
+            assert!(child.try_wait().unwrap().is_none());
+            channel.close(LIMIT).await.unwrap();
+            assert!(channel.is_closed());
+            channel.close(LIMIT).await.unwrap();
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "close must not rely on peer exit"
+            );
+            assert_eq!(
+                channel.write_all(b"closed").await.unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            drop(channel);
+            child
+        });
+        drop(runtime);
+        sender
+            .send(child)
+            .unwrap_or_else(|_| panic!("cleanup receiver disappeared"));
+    });
+    let mut child = receiver
+        .recv_timeout(LIMIT * 2)
+        .expect("native I/O retained runtime after close");
+    thread.join().unwrap();
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "peer must outlive runtime cleanup"
+    );
+    child.terminate().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(child.wait(LIMIT)).unwrap();
+}
+
+#[tokio::test]
+async fn dropping_an_owned_job_releases_the_descendant_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let root_lock = root.path().join("root.lock");
+    let leaf_lock = root.path().join("leaf.lock");
+    let release = root.path().join("release");
+    let mut spawn = spec(
+        root.path(),
+        &[
+            OsStr::new("tree"),
+            root_lock.as_os_str(),
+            leaf_lock.as_os_str(),
+            release.as_os_str(),
+        ],
+    );
+    spawn.stdout = Stdio::Pipe;
+    let mut child = spawn.spawn().await.unwrap();
+    let mut output = BufReader::new(child.take_stdout().unwrap());
+    let mut lines = String::new();
+    for _ in 0..2 {
+        tokio::time::timeout(LIMIT, output.read_line(&mut lines))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(lines.contains("leaf-ready"));
+    drop(child);
+    unlocked(&leaf_lock).await;
+    let mut rest = String::new();
+    tokio::time::timeout(LIMIT, output.read_to_string(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_trusted_handle_does_not_terminate_its_lifetime_peer() {
+    let root = tempfile::tempdir().unwrap();
+    let receipt = root.path().join("receipt");
+    let listener = PrivateListener::bind().unwrap();
+    let mut spawn = spec(
+        root.path(),
+        &[
+            OsStr::new("rendezvous"),
+            listener.address(),
+            receipt.as_os_str(),
+        ],
+    );
+    spawn.lifetime = Lifetime::TrustedSupervisor;
+    let child = spawn.spawn().await.unwrap();
+    let mut channel = listener.accept(&child, LIMIT).await.unwrap();
+    let mut hello = [0; 9];
+    tokio::time::timeout(LIMIT, channel.read_exact(&mut hello))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(child);
+    channel
+        .write_all(b"still-owned-by-lifetime-channel")
+        .await
+        .unwrap();
+    channel.flush().await.unwrap();
+    drop(channel);
+    tokio::time::timeout(LIMIT, async {
+        while !receipt.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        fs::read(receipt).unwrap(),
+        b"still-owned-by-lifetime-channel"
+    );
+}
+
+#[test]
+fn cancelled_connect_does_not_strand_runtime_shutdown() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let address = format!(r"\\.\pipe\kuru-{}", uuid::Uuid::new_v4());
+            assert_eq!(
+                pipe::connect(OsStr::new(&address), SHORT)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+        });
+        drop(runtime);
+        sender.send(()).unwrap();
+    });
+    receiver
+        .recv_timeout(LIMIT)
+        .expect("cancelled native pipe stranded the Tokio runtime");
+    thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn explicit_file_stdio_and_console_group_interrupt_work() {
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("console-output");
+    let mut spawn = spec(root.path(), &[OsStr::new("console-owner")]);
+    spawn.console = Console::PrivateHidden;
+    spawn.stdout = Stdio::Handle(File::create(&output).unwrap().into());
+    spawn.inherited.push(
+        File::create(root.path().join("explicit-extra"))
+            .unwrap()
+            .into(),
+    );
+    let mut child = spawn.spawn().await.unwrap();
+    assert!(child.wait(LIMIT).await.unwrap().success());
+    assert!(
+        String::from_utf8(fs::read(output).unwrap())
+            .unwrap()
+            .contains("group-stopped")
+    );
+}
