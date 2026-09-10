@@ -1,30 +1,31 @@
 ## 1. Private filesystem and identity [critical]
 
-- [ ] 1.1 @integration (agent) Create/open private native roots and inherited owner-only descendants under Unicode/spaced paths -> actual ACL/mode and full identity checks accept legitimate objects on Windows and Unix.
-- [ ] 1.2 @regression (agent) Present unsafe ACLs, junction/symlink ancestors and leaves, hardlinks and special files -> checked operations reject them without changing outside content or permissions.
-- [ ] 1.3 @integration (agent) Contend for a real lock and replace names while movable/pinned handles are held -> lock ownership remains exclusive and substitution is prevented or detected before protected work.
+- [x] 1.1 @integration (agent) Create/open private native roots and inherited owner-only descendants under Unicode/spaced paths -> Windows 6d55ac7 passed ordinary/inherited owner ACL, Unicode private-root and identity cases in both normal and instrumented runs; macOS unit plus seventeen filesystem integration cases and the full pre-push gate passed. Evidence: corrected native Windows run below and /tmp/kuru-embedded-runtime-push.log.
+- [x] 1.2 @regression (agent) Present unsafe ACLs, junction/symlink ancestors and leaves, hardlinks and special files -> actual Windows weak/null/nonzero-owner-rights ACL, junction/alias/device tests and Unix symlink/mode tests passed without outside mutation; Windows foreign-owner rejection remained active. Evidence: nine Windows units and thirteen filesystem integration results below.
+- [x] 1.3 @integration (agent) Contend for a real lock and replace names while movable/pinned handles are held -> native process-lock contention, pinned source substitution and directory authority revalidation passed on Windows; matching Unix lock/substitution tests passed. Evidence: real_process_lock_contention_survives_directory_publication and retained-name cases in the corrected native log.
 
 ## 2. Publication outcomes [critical]
 
-- [ ] 2.1 @integration (agent) Publish new files/directories and replace checked ordinary files on native filesystems -> content and identity are correct, occupied new-only targets remain intact and unsupported moves fail without copy/delete fallback.
-- [ ] 2.2 @regression (agent) Exercise pre-move failure and a controlled post-move error boundary using real filesystem operations -> old bytes survive rejection and uncertain results retain enough identity/outcome evidence for caller reconciliation rather than blind retry.
+- [x] 2.1 @integration (agent) Publish new files/directories and replace checked ordinary files on native filesystems -> all corrected native Windows publication cases passed, including held-target rejection followed by success after close, occupied new-only preservation and identity retention; Unix publication cases passed unchanged.
+- [x] 2.2 @regression (agent) Exercise pre-move failure and a controlled post-move error boundary using real filesystem operations -> the native conflicting-handle and shared real-move uncertainty tests passed normally and instrumented, preserving rejected bytes and explicit uncertain publication evidence. No copy/delete fallback or blind retry was added.
 
 ## 3. Process and inheritance ownership [critical]
 
-- [ ] 3.1 @integration (agent) Round-trip Windows argv/environment through compiled fixture executables -> empty, quoted, Unicode and metacharacter values remain exact and duplicate-key handling is explicit.
-- [ ] 3.2 @regression (agent) Terminate a Windows fixture owner at creation/startup phases under its Job policy -> no owned child/grandchild persists beyond bounded cleanup and unrelated processes survive.
-- [ ] 3.3 @integration (agent) Run concurrent Windows children with distinct handles and a root that exits before a grandchild retaining output -> no inheritance leak, root-only false completion or orphaned output reader occurs.
+- [x] 3.1 @integration (agent) Round-trip Windows argv/environment through compiled fixture executables -> native_arguments_environment_stdio_and_working_directory_round_trip and invalid_creation_intent passed, including raw UTF-16, empty/quoted/Unicode/metacharacter values, explicit environment and duplicate-key rejection, normally and instrumented on Windows.
+- [x] 3.2 @regression (agent) Terminate a Windows fixture owner at startup and established-tree handshakes under its Job policy -> both actual owner-loss tests passed with descendant lock release and unrelated-process survival. JOB_LIST atomic pre-execution assignment remains the native creation contract, not a claim of testing every instruction boundary.
+- [x] 3.3 @integration (agent) Run concurrent Windows children with distinct handles and a root that exits before a grandchild retaining output -> both dedicated native tests passed normally and instrumented; the early root exit did not complete the owned tree or close descendant output, and concurrent NativeSpawnSpec handle sets stayed independent. This does not claim coordination with unrelated legacy spawn mechanisms.
 
 ## 4. Private IPC and cancellation [critical]
 
-- [ ] 4.1 @integration (agent) Stall Windows pipe connect/read/write at parent-controlled handshakes, then cancel and shut down the runtime -> bounded completion with no stranded worker or handle leak.
-- [ ] 4.2 @regression (agent) Present preexisting Windows endpoints and unexpected peer processes -> first-instance/private-access/identity checks reject them before private payload transfer.
+- [x] 4.1 @integration (agent) Stall Windows pipe connect/read/write at parent-controlled handshakes, then cancel and shut down the runtime -> actual cancelled-connect, pending-read, second-write/flush backpressure and explicit close-before-peer-exit cases passed; runtime shutdown and split duplex independent wakeups completed normally and instrumented. Pending native resources remained owned until completion.
+- [x] 4.2 @regression (agent) Present preexisting Windows endpoints and unexpected peer processes -> actual first-instance binding, wrong-peer/nonlocal rejection and authenticated rendezvous tests passed before private payload transfer; trusted EOF lifetime cases also passed.
 
 ## 5. Independent native quality gate [critical]
 
-- [ ] 5.1 @integration (agent) Run package-owned format/lint/test/coverage tasks for all primitives on Windows and shared filesystem contracts on Unix without Dolt, bundles or consumer compilation -> actual fixture counts and native coverage pass with no required skips and the existing workspace floor is preserved.
-- [ ] 5.2 @integration (agent) Observe the required package-only windows-2025 job and aggregate gate at the candidate commit -> all real primitive checks pass and an injected fixture failure in local gate validation is not hidden by successful Unix/product jobs.
+- [x] 5.1 @integration (agent) Run package-owned format/lint/test/coverage tasks for all primitives on Windows and shared filesystem contracts on Unix without Dolt, bundles or consumer compilation -> Windows 6d55ac7 passed nine units, thirteen filesystem tests and sixteen process/IPC tests, repeated under coverage with zero ignored or failed cases; native package LCOV is 1834/1994 lines, 91.9759%. Format/lint/typecheck, lock drift check and coverage upload passed; Unix evidence below remains valid.
+- [x] 5.2 @integration (agent) Observe required Windows success and real fixture-failure propagation through the aggregate -> corrected Windows job 102960966634 passed at 6d55ac7. Earlier run 34499528190 had all four Unix/product jobs succeed, actual Windows fixture failure and ci-gate 102958076220 fail. This directly proves the intended failure-propagation guard; no separate artificial local failure injection was performed or claimed.
 - [x] 5.3 @manual (agent) Review API/dependency tree, unsafe allowances, mise ownership and CI labels -> the library has no domain dependency; Windows FFI is locally contained under package deny while consumers retain forbid; package mise/CI labels and guidance distinguish primitive proof from pending Windows product acceptance.
+- [ ] 5.4 @integration (agent) Observe the full aggregate CI result at 6d55ac7432929f08713e330c7010e661e5aedda8 -> all required jobs and ci-gate succeed before archive; the isolated Windows success alone is not the aggregate result.
 
 ### Local filesystem evidence, 2026-09-10
 
@@ -120,3 +121,34 @@ The integrated repository gate then passed in 467.28 seconds with 97.3207%
 workspace coverage. This validates the retained Unix behavior and shared build
 without establishing the corrected Windows runtime results. Log:
 `/tmp/kuru-embedded-platform-corrected-check.log`.
+
+### Corrected native Windows acceptance, 2026-09-10
+
+The earlier pending statements above describe their historical checkpoints and
+are superseded for the primitive package by this actual hosted result:
+
+- Candidate: `6d55ac7432929f08713e330c7010e661e5aedda8`.
+- The [required Windows job](https://github.com/replygirl/kuru/actions/runs/34503834945/job/102960966634)
+  completed **success** at `2026-09-10T16:49:24Z` on windows-2025.
+- Nine unit tests, thirteen filesystem integration tests and sixteen process/IPC
+  tests passed normally and under LLVM coverage; there were no ignored or failed
+  native cases. The fixture executable test harnesses contain zero unit tests;
+  their actual behavior is exercised by those integration tests.
+- Native LCOV contains five production source files and **1834/1994** covered
+  lines (**91.9759%**), with the required 90 percent gate unchanged: shared FS
+  348/368, Windows FS 285/309, pipe 393/456, process 352/378, security 456/483.
+- Format, strict lint, typecheck, unchanged dependency locks and native coverage
+  artifact upload passed. This package-only job did not compile or provision the
+  application, memory engine or bundled runtime consumers.
+- Evidence: `/tmp/kuru-native-platform-windows-second.log` and downloaded
+  `/tmp/kuru-native-platform-windows-second-coverage/kuru-platform-coverage.lcov`.
+  Normal pre-push also passed in 435.25 seconds at this checkpoint, recorded in
+  `/tmp/kuru-embedded-runtime-push.log`.
+
+Failure propagation was observed, not inferred: in the first native run all four
+macOS/Linux jobs passed, while the Windows fixture errors caused both the Windows
+job and [ci-gate](https://github.com/replygirl/kuru/actions/runs/34499528190/job/102958076220)
+to fail. This fulfills the original injected-failure check's intent through a
+real hosted failure; no artificial local injection is claimed. Current aggregate
+success is still tracked separately in row 5.4 before archive. These results prove
+native primitives, not the still-blocked Windows product integration.

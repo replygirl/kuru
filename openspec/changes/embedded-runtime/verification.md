@@ -85,3 +85,47 @@ implementation remain pending.
 The full gate passed again after the Windows filesystem corrections and final
 integration guidance, in 467.28 seconds with the same 12,786/13,138 covered lines
 (97.3207%). Log: `/tmp/kuru-embedded-platform-corrected-check.log`.
+
+### Hosted checkpoint and CI storage correction
+
+At candidate `6d55ac7432929f08713e330c7010e661e5aedda8`, the native Linux ARM
+and Intel macOS jobs completed release build/package, real Dolt memory tests
+and installed/self-updated offline conversations. Linux ARM ran 57 memory
+tests; its executable/archive measured 51,730,640/40,148,150 bytes and packaged
+acceptance passed in 32.48 seconds. Intel macOS ran 58 memory tests; its
+executable/archive measured 55,802,432/43,225,512 bytes and acceptance passed in
+77.46 seconds. The platform-dependent build-input test counts differ because
+the macOS fixture also tests standard temporary-directory aliases. Evidence:
+`/tmp/kuru-embedded-runtime-hosted-checks.md` and the corresponding native logs.
+
+The [Ubuntu x64 full gate](https://github.com/replygirl/kuru/actions/runs/34503834945/job/102960966892)
+failed while linking with explicit `No space left on device` (OS 28). A memory
+provisioning test also printed a failure before the aggregate stopped, but its
+panic was not emitted; its cause is not inferred from the linker failure.
+The runner already disabled incremental compilation and excluded workspace
+crates from its dependency cache. The narrow correction sets dev/test debug
+information to `line-tables-only` in the full-check CI job before cache lookup;
+it retains source-line diagnostics, assertions, tests and the coverage floor.
+
+A fresh isolated local target using those profiles compiled and passed the
+actual packaged offline installation/update regression (88,287,272-byte
+executable; 47,120,716-byte archive). The independent platform coverage task
+retained exactly 458/486 covered lines (94.2387%) with one unit and seventeen
+integration cases in both ordinary and instrumented runs. Total target
+allocation was 2,056,716 KiB on macOS ARM; Linux allocation is still unmeasured.
+An initial sandbox refusal to start the local server was resolved through the
+normal execution permission, without a changed assertion or timeout. Tooling
+lint and actionlint passed. Evidence: `/tmp/kuru-ci-lines-evidence.md`.
+The corrected full local and hosted gates remain required before archive.
+
+The final macOS ARM job also completed successfully at `6d55ac7`: full check
+914.00 seconds with 12,786/13,138 covered lines (97.3207%), source installation
+147.35 seconds, and installed-runtime acceptance 25.21 seconds. Its installed
+executable/archive measured 52,184,496/40,661,955 bytes. The aggregate failed
+because Ubuntu x64 exhausted disk; no hosted corrected pass is claimed yet.
+
+The complete local gate with the proposed CI profile then passed in 518.17
+seconds, again covering exactly 12,786/13,138 lines (97.3207%). Its isolated
+target totaled 9.1 GiB after all ordinary and instrumented workspace suites;
+this is the macOS measurement, not an inferred Linux result. No source was
+excluded and no threshold changed. Log: `/tmp/kuru-ci-profile-full-check.log`.
