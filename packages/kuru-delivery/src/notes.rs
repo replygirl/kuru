@@ -4,6 +4,25 @@ use anyhow::{Context, Result, ensure};
 use std::{fs, io::Write, path::Path, time::Duration};
 use tokio::process::Command;
 
+const MAX_CONTEXT_BYTES: usize = 100_000;
+const PRODUCT_DOCS: [&str; 6] = [
+    "apps/kuru-docs/concepts/frameworks.md",
+    "apps/kuru-docs/concepts/memory.md",
+    "apps/kuru-docs/concepts/sessions.md",
+    "apps/kuru-docs/guide/authentication.md",
+    "apps/kuru-docs/reference/configuration.md",
+    "apps/kuru-docs/guide/first-conversation.md",
+];
+
+fn append_context(context: &mut String, text: &str) -> Result<()> {
+    ensure!(
+        context.len().saturating_add(text.len()) <= MAX_CONTEXT_BYTES,
+        "release notes context exceeds limit"
+    );
+    context.push_str(text);
+    Ok(())
+}
+
 pub async fn configuration(
     root: &Path,
     candidate: &str,
@@ -15,7 +34,7 @@ pub async fn configuration(
         "notes commit does not contain selected version"
     );
     let mut config: toml::Value =
-        toml::from_str(&fs::read_to_string(root.join("communique.toml"))?)?;
+        toml::from_str(&git(root, &["show", &format!("{candidate}:communique.toml")]).await?)?;
     let table = config
         .as_table_mut()
         .context("Communiqué configuration must be a table")?;
@@ -38,16 +57,21 @@ pub async fn configuration(
         .and_then(toml::Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    context.push_str(&format!(
-        "\n\nTarget release: v{selected}. Exact source commit: {candidate}."
-    ));
+    append_context(
+        &mut context,
+        &format!("\n\nTarget release: v{selected}. Exact source commit: {candidate}."),
+    )?;
     if previous.is_none() {
-        context.push_str("\n\nInitial implementation inventory (the root commit is excluded from the tool's automatic log range):\n");
+        append_context(
+            &mut context,
+            "\n\nInitial implementation inventory (the root commit is excluded from the tool's automatic log range):\n",
+        )?;
         for commit in git(root, &["rev-list", "--max-parents=0", candidate])
             .await?
             .lines()
         {
-            context.push_str(
+            append_context(
+                &mut context,
                 &git(
                     root,
                     &[
@@ -60,14 +84,20 @@ pub async fn configuration(
                     ],
                 )
                 .await?,
-            );
+            )?;
         }
-        context.push_str("\nUse repository documentation and files to describe this initial baseline as well as subsequent commits.");
     }
-    ensure!(
-        context.len() <= 100_000,
-        "initial release context exceeds limit"
-    );
+    append_context(
+        &mut context,
+        "\n\nCurrent product documentation (authoritative for present behavior at the exact source commit):\n",
+    )?;
+    for path in PRODUCT_DOCS {
+        append_context(&mut context, &format!("\n--- {path} @ {candidate} ---\n"))?;
+        append_context(
+            &mut context,
+            &git(root, &["show", &format!("{candidate}:{path}")]).await?,
+        )?;
+    }
     table.insert("context".into(), toml::Value::String(context));
     let defaults = table
         .get("defaults")
@@ -87,7 +117,7 @@ pub async fn configuration(
 }
 
 /// Explicit provider controls for isolated contract fixtures. Normal releases
-/// inherit their configured API key and use the provider's default HTTPS URL.
+/// inherit their configured API key and use the configured HTTPS URL.
 #[derive(Default)]
 pub struct ProviderOptions {
     pub endpoint: Option<String>,
@@ -118,6 +148,12 @@ pub async fn generate(
         fs::symlink_metadata(output).is_err(),
         "notes output already exists; choose an empty output path"
     );
+    ensure!(
+        git(root, &["status", "--porcelain", "--untracked-files=all"])
+            .await?
+            .is_empty(),
+        "notes checkout has uncommitted changes; repository tools must read the exact release commit"
+    );
     let temp = tempfile::tempdir()?;
     let config_path = temp.path().join("communique.toml");
     let notes_path = temp.path().join("notes.md");
@@ -139,7 +175,7 @@ pub async fn generate(
         command.args(["--base-url", endpoint]);
     }
     if let Some(key) = &provider.api_key {
-        command.env("ANTHROPIC_API_KEY", key);
+        command.env("OPENAI_API_KEY", key);
     }
     if provider.omit_github_context {
         command.env_remove("GITHUB_TOKEN").env_remove("GH_TOKEN");
@@ -160,6 +196,27 @@ pub async fn generate(
     );
     let text = fs::read_to_string(notes_path)?;
     ensure!(!text.trim().is_empty(), "Communiqué produced empty notes");
+    ensure!(
+        text.split_whitespace().count() <= 450,
+        "release notes must contain at most 450 words"
+    );
+    let bullets = text
+        .lines()
+        .filter(|line| {
+            let marker = line.split_whitespace().next().unwrap_or_default();
+            matches!(marker, "-" | "*" | "+")
+                || marker
+                    .strip_suffix('.')
+                    .or_else(|| marker.strip_suffix(')'))
+                    .is_some_and(|number| {
+                        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+        })
+        .count();
+    ensure!(
+        bullets <= 10,
+        "release notes must contain at most 10 bullets"
+    );
     let mut staged =
         tempfile::NamedTempFile::new_in(output.parent().unwrap_or_else(|| Path::new(".")))?;
     staged.write_all(text.as_bytes())?;

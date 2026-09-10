@@ -15,8 +15,14 @@ use std::{
     fs,
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tempfile::TempDir;
+
+const FRAMEWORKS: &str = "apps/kuru-docs/concepts/frameworks.md";
+const COMMITTED_FRAMEWORKS: &str = "# Frameworks\nCommitted IFS default: seven persistent peers.\n";
+const NOTES_BODY: &str = "Persistent peer conversations are now available.";
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 fn version(input: &str) -> Version {
     input.parse().unwrap()
 }
@@ -47,6 +53,34 @@ impl Fixture {
             include_str!("../../../communique.toml"),
         )
         .unwrap();
+        fs::write(root.join(".gitignore"), "/target/\n").unwrap();
+        for (path, text) in [
+            (FRAMEWORKS, COMMITTED_FRAMEWORKS),
+            (
+                "apps/kuru-docs/concepts/memory.md",
+                "Private part memories.",
+            ),
+            (
+                "apps/kuru-docs/concepts/sessions.md",
+                "Persistent sessions.",
+            ),
+            (
+                "apps/kuru-docs/guide/authentication.md",
+                "Codex owns login.",
+            ),
+            (
+                "apps/kuru-docs/reference/configuration.md",
+                "Project preferences persist.",
+            ),
+            (
+                "apps/kuru-docs/guide/first-conversation.md",
+                "Quiet ambient motion.",
+            ),
+        ] {
+            let file = root.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, text).unwrap();
+        }
         this.commit("feat: initial persistent peer harness").await;
         this
     }
@@ -65,16 +99,40 @@ impl Fixture {
             .await
             .unwrap()
     }
+    async fn generate(&self, api: &Api, output: &Path) -> anyhow::Result<()> {
+        tokio::time::timeout(
+            TEST_TIMEOUT,
+            notes::generate(
+                self.path(),
+                &self.head().await,
+                version("0.1.0"),
+                output,
+                &api.options(),
+            ),
+        )
+        .await
+        .expect("Communiqué fixture exceeded its deadline")
+    }
+    async fn assert_no_tag(&self) {
+        assert_eq!(release::git(self.path(), &["tag"]).await.unwrap(), "");
+    }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Reply {
-    Notes,
+    Notes(String),
     Unauthorized,
-    Thinking,
+    Malformed,
+    NativeThinking,
+}
+#[derive(Clone, Debug)]
+struct Call {
+    path: String,
+    authorized: bool,
+    body: Value,
 }
 struct Api {
     endpoint: String,
-    calls: Arc<Mutex<Vec<Value>>>,
+    calls: Arc<Mutex<Vec<Call>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Api {
@@ -82,18 +140,54 @@ impl Drop for Api {
         self.task.abort();
     }
 }
+fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
+    json!({
+        "choices": [{
+            "message": {
+                "role": "assistant", "content": null,
+                "tool_calls": [{
+                    "id": id, "type": "function",
+                    "function": {"name": name, "arguments": arguments.to_string()}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 10}
+    })
+}
 impl Api {
     async fn new(reply: Reply) -> Self {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let app=Router::new().fallback(move |State(calls):State<Arc<Mutex<Vec<Value>>>>, request:Request| async move {
-            assert_eq!(request.uri().path(),"/v1/messages");
-            assert_eq!(request.headers().get("x-api-key").unwrap(),"fixture-key");
-            let request:Value=serde_json::from_slice(&to_bytes(request.into_body(),4*1024*1024).await.unwrap()).unwrap(); calls.lock().unwrap().push(request);
-            let (status,value)=match reply {
-                Reply::Notes=>(StatusCode::OK,json!({"content":[{"type":"tool_use","id":"submit-fixture","name":"submit_release_notes","input":{"release_title":"Kuru 0.1.0","release_body":"Persistent peer conversations are now available."}}],"stop_reason":"tool_use","usage":{"input_tokens":20,"output_tokens":10}})),
-                Reply::Unauthorized=>(StatusCode::UNAUTHORIZED,json!({"error":{"type":"authentication_error","message":"fixture failure"}})),
-                Reply::Thinking=>(StatusCode::OK,json!({"content":[{"type":"thinking","thinking":"","signature":"fixture"},{"type":"text","text":"# Notes\nUnsupported response shape."}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":10}})),
-            }; (status,axum::Json(value)).into_response()
+        let app = Router::new().fallback(move |State(calls): State<Arc<Mutex<Vec<Call>>>>, request: Request| {
+            let reply = reply.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let authorized = if matches!(reply, Reply::NativeThinking) {
+                    request.headers().get("x-api-key").is_some_and(|value| value == "fixture-key")
+                } else {
+                    request.headers().get("authorization").is_some_and(|value| value == "Bearer fixture-key")
+                };
+                let body: Value = serde_json::from_slice(&to_bytes(request.into_body(), 4 * 1024 * 1024).await.unwrap()).unwrap();
+                let turn = {
+                    let mut calls = calls.lock().unwrap();
+                    calls.push(Call { path, authorized, body });
+                    calls.len()
+                };
+                let (status, value) = match reply {
+                    Reply::Notes(_) if turn == 1 => (StatusCode::OK, tool_call("read-fixture", "read_file", json!({"path": FRAMEWORKS}))),
+                    Reply::Notes(body) => (StatusCode::OK, tool_call("submit-fixture", "submit_release_notes", json!({
+                        "changelog": "- Persistent peer conversations.",
+                        "release_title": "Kuru 0.1.0", "release_body": body
+                    }))),
+                    Reply::Unauthorized => (StatusCode::UNAUTHORIZED, json!({"error": {"message": "sensitive provider payload: fixture-key"}})),
+                    Reply::Malformed => (StatusCode::OK, json!({"unexpected": "provider payload"})),
+                    Reply::NativeThinking => (StatusCode::OK, json!({
+                        "content": [{"type": "thinking", "thinking": "", "signature": "fixture"}, {"type": "text", "text": "# Notes\nUnsupported response shape."}],
+                        "stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 10}
+                    })),
+                };
+                (status, axum::Json(value)).into_response()
+            }
         }).with_state(calls.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -108,7 +202,7 @@ impl Api {
     }
     fn options(&self) -> ProviderOptions {
         ProviderOptions {
-            endpoint: Some(self.endpoint.clone()),
+            endpoint: Some(format!("{}/v1", self.endpoint)),
             api_key: Some("fixture-key".into()),
             omit_github_context: true,
         }
@@ -129,8 +223,21 @@ async fn initial_root_inventory_and_previous_release_are_in_supported_config() {
     assert!(context.contains("Target release: v0.1.0"));
     assert_eq!(
         config["defaults"]["model"].as_str(),
-        Some("claude-haiku-4-5-20251001")
+        Some("claude-sonnet-5")
     );
+    assert_eq!(config["defaults"]["provider"].as_str(), Some("openai"));
+    assert_eq!(
+        config["defaults"]["base_url"].as_str(),
+        Some("https://api.anthropic.com/v1")
+    );
+    for expected in [
+        COMMITTED_FRAMEWORKS,
+        "Codex owns login.",
+        "Project preferences persist.",
+        "Quiet ambient motion.",
+    ] {
+        assert!(context.contains(expected), "missing {expected}");
+    }
     release::git(repo.path(), &["tag", "v0.1.0"]).await.unwrap();
     fs::write(
         repo.path().join("Cargo.toml"),
@@ -145,27 +252,32 @@ async fn initial_root_inventory_and_previous_release_are_in_supported_config() {
     assert!(!text.contains("Initial implementation inventory"));
 }
 #[tokio::test]
-async fn actual_communique_uses_configured_model_and_atomically_writes_factual_notes() {
+async fn actual_communique_compatible_adapter_reads_source_then_submits_notes() {
     let repo = Fixture::new().await;
-    let api = Api::new(Reply::Notes).await;
+    let api = Api::new(Reply::Notes(NOTES_BODY.into())).await;
     let output = repo.path().join("notes.md");
-    notes::generate(
-        repo.path(),
-        &repo.head().await,
-        version("0.1.0"),
-        &output,
-        &api.options(),
-    )
-    .await
-    .unwrap();
+    repo.generate(&api, &output).await.unwrap();
     assert_eq!(
         fs::read_to_string(output).unwrap(),
         "# v0.1.0: Kuru 0.1.0\n\nPersistent peer conversations are now available."
     );
     let calls = api.calls.lock().unwrap().clone();
-    assert_eq!(calls.len(), 1);
-    let request = &calls[0];
-    assert_eq!(request["model"], "claude-haiku-4-5-20251001");
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(call.path, "/v1/chat/completions");
+        assert!(call.authorized);
+        assert_eq!(call.body["model"], "claude-sonnet-5");
+        assert_eq!(call.body["max_tokens"], 16384);
+        for absent in [
+            "thinking",
+            "temperature",
+            "reasoning_effort",
+            "max_completion_tokens",
+        ] {
+            assert!(call.body.get(absent).is_none(), "unexpected {absent}");
+        }
+    }
+    let request = &calls[0].body;
     assert!(
         request
             .to_string()
@@ -173,25 +285,32 @@ async fn actual_communique_uses_configured_model_and_atomically_writes_factual_n
     );
     assert!(request.to_string().contains("Target release: v0.1.0"));
     assert!(request.get("thinking").is_none());
+    let messages = calls[1].body["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| message["role"] == "assistant"
+        && message["tool_calls"][0]["id"] == "read-fixture"));
+    let result = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert_eq!(result["tool_call_id"], "read-fixture");
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap()
+            .contains(COMMITTED_FRAMEWORKS)
+    );
     assert_eq!(release::git(repo.path(), &["tag"]).await.unwrap(), "");
 }
 #[tokio::test]
-async fn actual_api_failure_and_unsupported_thinking_do_not_leave_output_or_tags() {
-    for reply in [Reply::Unauthorized, Reply::Thinking] {
+async fn actual_api_errors_do_not_expose_payloads_or_leave_output_or_tags() {
+    for reply in [Reply::Unauthorized, Reply::Malformed] {
         let repo = Fixture::new().await;
         let api = Api::new(reply).await;
         let output = repo.path().join("notes.md");
-        let error = notes::generate(
-            repo.path(),
-            &repo.head().await,
-            version("0.1.0"),
-            &output,
-            &api.options(),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let error = repo.generate(&api, &output).await.unwrap_err().to_string();
         assert!(error.contains("no release was published"));
+        assert!(!error.contains("fixture-key"));
+        assert!(!error.contains("provider payload"));
         assert!(!output.exists());
         assert_eq!(api.calls.lock().unwrap().len(), 1);
         assert_eq!(release::git(repo.path(), &["tag"]).await.unwrap(), "");
@@ -230,6 +349,7 @@ async fn notes_preserve_reviewed_output_and_reject_schema_or_version_mismatch() 
         "[system]\nmodel=\"incorrect-schema\"\n",
     )
     .unwrap();
+    let head = repo.commit("test: unsupported notes schema").await;
     assert!(
         notes::configuration(repo.path(), &head, version("0.1.0"))
             .await
@@ -242,6 +362,7 @@ async fn notes_preserve_reviewed_output_and_reject_schema_or_version_mismatch() 
         "[defaults]\nmodel=[]\n",
     )
     .unwrap();
+    let head = repo.commit("test: unsupported notes defaults").await;
     assert!(
         notes::configuration(repo.path(), &head, version("0.1.0"))
             .await
@@ -253,30 +374,35 @@ async fn notes_preserve_reviewed_output_and_reject_schema_or_version_mismatch() 
 #[tokio::test]
 async fn real_release_cli_generates_notes_and_reports_invalid_sha() {
     let repo = Fixture::new().await;
-    let api = Api::new(Reply::Notes).await;
+    let api = Api::new(Reply::Notes(NOTES_BODY.into())).await;
     let output = repo.path().join("notes.md");
-    let head = repo.head().await;
     let mut config: toml::Value = toml::from_str(include_str!("../../../communique.toml")).unwrap();
-    config["defaults"]
-        .as_table_mut()
-        .unwrap()
-        .insert("base_url".into(), toml::Value::String(api.endpoint.clone()));
+    config["defaults"].as_table_mut().unwrap().insert(
+        "base_url".into(),
+        toml::Value::String(format!("{}/v1", api.endpoint)),
+    );
     fs::write(
         repo.path().join("communique.toml"),
         toml::to_string(&config).unwrap(),
     )
     .unwrap();
-    let result = tokio::process::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
-        .arg("--root")
-        .arg(repo.path())
-        .args(["notes", "--version", "0.1.0", "--sha", &head, "--output"])
-        .arg(&output)
-        .env("ANTHROPIC_API_KEY", "fixture-key")
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .output()
-        .await
-        .unwrap();
+    let head = repo.commit("test: local notes endpoint").await;
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
+            .arg("--root")
+            .arg(repo.path())
+            .args(["notes", "--version", "0.1.0", "--sha", &head, "--output"])
+            .arg(&output)
+            .env("OPENAI_API_KEY", "fixture-key")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("release CLI fixture timed out")
+    .unwrap();
     assert!(
         result.status.success(),
         "{}",
@@ -287,21 +413,204 @@ async fn real_release_cli_generates_notes_and_reports_invalid_sha() {
             .unwrap()
             .contains("Persistent peer conversations")
     );
-    let result = tokio::process::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
-        .arg("--root")
-        .arg(repo.path())
-        .args([
-            "notes",
-            "--version",
-            "0.1.0",
-            "--sha",
-            "invalid",
-            "--output",
-            "unused",
-        ])
-        .output()
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
+            .arg("--root")
+            .arg(repo.path())
+            .args([
+                "notes",
+                "--version",
+                "0.1.0",
+                "--sha",
+                "invalid",
+                "--output",
+                "unused",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("invalid-input CLI fixture timed out")
+    .unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("full lowercase commit SHA"));
+}
+
+#[tokio::test]
+async fn snapshots_ignore_uncommitted_edits_and_generation_refuses_dirty_tools() {
+    let repo = Fixture::new().await;
+    let head = repo.head().await;
+    fs::write(repo.path().join(FRAMEWORKS), "UNCOMMITTED FALSE DEFAULT").unwrap();
+    fs::write(
+        repo.path().join("communique.toml"),
+        "context='UNCOMMITTED CONFIG'\n",
+    )
+    .unwrap();
+    let (text, _) = notes::configuration(repo.path(), &head, version("0.1.0"))
+        .await
+        .unwrap();
+    let config: toml::Value = toml::from_str(&text).unwrap();
+    assert!(
+        config["context"]
+            .as_str()
+            .unwrap()
+            .contains(COMMITTED_FRAMEWORKS)
+    );
+    assert!(!text.contains("UNCOMMITTED"));
+    let api = Api::new(Reply::Notes(NOTES_BODY.into())).await;
+    let output = repo.path().join("notes.md");
+    let error = repo.generate(&api, &output).await.unwrap_err().to_string();
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert!(api.calls.lock().unwrap().is_empty());
+    assert!(!output.exists());
+    repo.assert_no_tag().await;
+
+    fs::write(
+        repo.path().join("communique.toml"),
+        include_str!("../../../communique.toml"),
+    )
+    .unwrap();
+    fs::write(repo.path().join(FRAMEWORKS), "x".repeat(100_001)).unwrap();
+    let head = repo.commit("docs: oversized framework context").await;
+    let error = notes::configuration(repo.path(), &head, version("0.1.0"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("context exceeds limit"), "{error}");
+}
+
+#[tokio::test]
+async fn actual_native_anthropic_adapter_still_rejects_claude_five_thinking() {
+    let repo = Fixture::new().await;
+    let api = Api::new(Reply::NativeThinking).await;
+    let output = repo.path().join("notes.md");
+    // Explicitly exercise the old adapter, with its own fake key. This must
+    // reach the API and fail on the response shape, not missing credentials.
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        tokio::process::Command::new("communique")
+            .arg("--config")
+            .arg(repo.path().join("communique.toml"))
+            .args([
+                "generate",
+                "v0.1.0",
+                "--provider",
+                "anthropic",
+                "--model",
+                "claude-sonnet-5",
+                "--base-url",
+                &api.endpoint,
+                "--output",
+            ])
+            .arg(&output)
+            .current_dir(repo.path())
+            .kill_on_drop(true)
+            .env("ANTHROPIC_API_KEY", "fixture-key")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("LLM_API_KEY")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN")
+            .output(),
+    )
+    .await
+    .expect("native protocol fixture timed out")
+    .unwrap();
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(error.contains("unknown variant `thinking`"), "{error}");
+    println!(
+        "Actual native adapter rejected the thinking response: {}",
+        result.status
+    );
+    assert!(!output.exists());
+    {
+        let calls = api.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].path, "/v1/messages");
+        assert!(calls[0].authorized);
+        assert_eq!(calls[0].body["model"], "claude-sonnet-5");
+    }
+    repo.assert_no_tag().await;
+}
+
+async fn assert_invalid_notes(body: String, expected: &str) {
+    let repo = Fixture::new().await;
+    let api = Api::new(Reply::Notes(body)).await;
+    let output = repo.path().join("notes.md");
+    let error = repo.generate(&api, &output).await.unwrap_err().to_string();
+    assert!(error.contains(expected), "{error}");
+    assert!(!output.exists());
+    assert_eq!(api.calls.lock().unwrap().len(), 2);
+    repo.assert_no_tag().await;
+    fs::write(&output, "previous reviewed notes").unwrap();
+    let error = repo.generate(&api, &output).await.unwrap_err().to_string();
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&output).unwrap(),
+        "previous reviewed notes"
+    );
+    assert_eq!(api.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn actual_communique_overlong_bullet_list_is_rejected_before_publication() {
+    assert_invalid_notes(
+        (0..17).map(|i| format!("- Item {i}.\n")).collect(),
+        "at most 10 bullets",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn actual_communique_overlong_prose_is_rejected_before_publication() {
+    assert_invalid_notes("word ".repeat(451), "at most 450 words").await;
+}
+
+#[tokio::test]
+async fn current_source_guard_rejects_untracked_inputs_but_allows_ignored_builds() {
+    let repo = Fixture::new().await;
+    release::git(repo.path(), &["config", "status.showUntrackedFiles", "no"])
+        .await
+        .unwrap();
+    let api = Api::new(Reply::Notes(NOTES_BODY.into())).await;
+    let output = repo.path().join("notes.md");
+    let stale = repo.path().join("stale-notes.md");
+    fs::write(&stale, "Untracked stale behavior is not release source.").unwrap();
+    let error = repo.generate(&api, &output).await.unwrap_err().to_string();
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert!(api.calls.lock().unwrap().is_empty());
+    assert!(!output.exists());
+    repo.assert_no_tag().await;
+    fs::remove_file(stale).unwrap();
+    fs::create_dir(repo.path().join("target")).unwrap();
+    fs::write(
+        repo.path().join("target/build-output"),
+        "ignored build state",
+    )
+    .unwrap();
+    repo.generate(&api, &output).await.unwrap();
+    assert!(fs::read_to_string(output).unwrap().contains(NOTES_BODY));
+}
+
+#[tokio::test]
+async fn actual_communique_accepts_limit_boundaries_and_counts_other_list_markers() {
+    for body in [
+        // The generated title adds four whitespace-delimited words.
+        "word ".repeat(446),
+        (0..10).map(|i| format!("- Item {i}.\n")).collect(),
+    ] {
+        let repo = Fixture::new().await;
+        let api = Api::new(Reply::Notes(body)).await;
+        let output = repo.path().join("notes.md");
+        repo.generate(&api, &output).await.unwrap();
+        assert!(output.is_file());
+    }
+    for marker in ["*", "+", "1.", "2)"] {
+        assert_invalid_notes(
+            format!("  {marker} Item.\n").repeat(11),
+            "at most 10 bullets",
+        )
+        .await;
+    }
 }

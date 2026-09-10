@@ -19,9 +19,11 @@ only on `replygirl/kuru`. Configure these repository Actions values:
 | `RELEASE_APP_PRIVATE_KEY` | Secret | App key used to mint a short-lived installation token |
 | `ANTHROPIC_API_KEY_COMMUNIQUE` | Secret | Dedicated API key used only by release-notes generation |
 
-The notes job exposes the scoped Anthropic secret to Communiqué as
-`ANTHROPIC_API_KEY`. Do not create a generic repository secret with that name or
-place credentials in configuration files.
+The notes step exposes the scoped Anthropic secret to Communiqué as
+`OPENAI_API_KEY` for its OpenAI-compatible wire adapter, which calls Anthropic.
+Keep the repository secret named `ANTHROPIC_API_KEY_COMMUNIQUE`; no generic
+`OPENAI_API_KEY` or `ANTHROPIC_API_KEY` repository secret is needed. Do not place
+credentials in configuration files.
 
 The app needs a narrow exception to the rule requiring a pull request before a
 release version commit can reach main. Keep the separate rules requiring signed
@@ -95,8 +97,10 @@ runtime is involved.
    commit when it remains in main's history. Later main changes are excluded.
 3. Run the full gate again on that exact version commit. Build native archives
    on Linux x86_64/arm64 and macOS x86_64/arm64, verifying each binary's version.
-4. Generate notes in a separate job with a read-only GitHub token. No release
-   writes are available to that job. Its output is an artifact for publication.
+4. Generate notes in a separate job with a read-only GitHub token, alongside final
+   validation of the selected version commit. No release writes are available to
+   that job. Its output is an artifact for publication, which still waits for
+   validation and all four builds.
 5. Verify that all four expected archives exist and match their checksums.
    Create or reuse the immutable annotated tag, stage the notes and all assets
    in a draft, and verify uploaded asset digests before publishing by release ID.
@@ -131,29 +135,38 @@ in the version commit.
 ## Notes model and configuration
 
 `communique.toml` uses top-level `context` and `system_extra` plus `[defaults]`.
-The pinned tool is Communiqué 1.3.5. The model is the current Haiku family,
-`claude-haiku-4-5-20251001`, which produces response blocks supported by that tool.
-Communiqué's current Anthropic parser cannot deserialize the thinking blocks
-returned by default by Claude Sonnet 5 and Opus 5. A local integration fixture
-exercises both the supported response and that failure shape. Update the model
-when compatibility has been verified; do not silently switch to an incompatible
-model merely because its name is newer.
+The pinned tool is Communiqué 1.3.5. It uses `claude-sonnet-5` through
+Anthropic's official OpenAI-compatible endpoint. `provider = "openai"` selects
+the wire format; requests go directly to `https://api.anthropic.com/v1`, and the
+model and credentials remain Anthropic's. Only the notes step maps the existing
+`ANTHROPIC_API_KEY_COMMUNIQUE` secret to the adapter's `OPENAI_API_KEY` environment
+variable. No additional secret is needed.
 
-The first release includes the root commit inventory as additional context.
+Communiqué's native Anthropic parser cannot yet deserialize Claude 5 thinking
+blocks. The compatibility response omits those blocks while retaining tool calls.
+Return to the native adapter when upstream supports the response shape and the
+integration checks pass. This compatibility route cannot configure an
+`anthropic-workspace-id` header; use a key scoped to the intended workspace.
+
+Generation includes current product documentation from the exact selected commit.
+That snapshot determines current behavior; historical commits may describe
+earlier designs. Generation requires a clean checkout, including no nonignored
+untracked files, because repository search can read those too. Ignored build
+outputs may remain. The first release also includes the root commit inventory.
 This matters because Communiqué's automatic first-release log uses `ROOT..HEAD`,
 which omits the root commit itself. Notes are generated against the selected
 commit before the remote tag is created; the context supplies the target version.
-Generated notes remain fallible prose, so inspect the release notes artifact when
-reviewing a run. The prompt requires factual changes and prohibits invented test
-results or deployment claims.
-It also bounds the release summary, supplies concrete provider/tool boundaries,
-and excludes uncommitted roadmap promises and repository-administration details.
-Compare generated claims with source; a successful notes job only proves that
-the tool produced an artifact.
+The native wrapper rejects output over 450 words or ten bullets before creating
+an artifact. Real-tool fixtures exercise compatible API requests and tool-result
+replay, failure cleanup and output limits. These checks establish protocol and
+format behavior; generated prose remains fallible. Inspect actual notes against
+the selected source, including defaults, provider identities and configuration
+persistence. A successful notes job is not evidence that every claim is accurate.
 
 Upstream contracts: [Cocogitto versioning](https://docs.cocogitto.io/guide/bump.html),
 [Communiqué configuration](https://github.com/jdx/communique/blob/v1.3.5/src/config.rs),
-[Communiqué Anthropic parser](https://github.com/jdx/communique/blob/v1.3.5/src/providers/anthropic.rs),
+[Communiqué OpenAI adapter](https://github.com/jdx/communique/blob/v1.3.5/src/providers/openai.rs),
+[Anthropic API compatibility](https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk),
 [Claude Sonnet 5 response changes](https://platform.claude.com/docs/en/models/sonnet-5/whats-new-sonnet-5).
 
 ## Recover an interrupted run
