@@ -20,7 +20,8 @@ fn official_windows_archive_decodes_exact_pinned_payloads_on_every_host() {
                 .unwrap()
                 .parent()
                 .unwrap()
-                .join("target/kuru-bundles")
+                .join("target")
+                .join("kuru-bundles")
         });
     assert!(
         bundle_dir.is_absolute(),

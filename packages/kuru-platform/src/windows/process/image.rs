@@ -11,7 +11,8 @@ use std::{
 };
 use windows_sys::Win32::{
     Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, GetFinalPathNameByHandleW, VOLUME_NAME_NT,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_OPENED, FILE_SHARE_READ, GetFinalPathNameByHandleW,
+        VOLUME_NAME_NT,
     },
     System::{
         LibraryLoader::GetModuleHandleW, ProcessStatus::K32GetMappedFileNameW,
@@ -86,13 +87,15 @@ fn file_name(file: &File) -> io::Result<Vec<u16>> {
     let mut buffer = vec![0u16; 32_768];
     // SAFETY: the read-only file remains alive; the bounded writable buffer is
     // measured in UTF-16 code units. NT volume names match the mapping query's
-    // namespace without ambient drive-letter or DOS-device resolution.
+    // namespace without ambient drive-letter or DOS-device resolution. Preserve
+    // the opened spelling: the mapping can retain a short ancestor name while
+    // FILE_NAME_NORMALIZED would expand that same ancestor to its long name.
     let length = unsafe {
         GetFinalPathNameByHandleW(
             file.as_raw_handle(),
             buffer.as_mut_ptr(),
             buffer.len() as u32,
-            VOLUME_NAME_NT,
+            FILE_NAME_OPENED | VOLUME_NAME_NT,
         )
     };
     checked_name(buffer, length)

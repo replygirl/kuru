@@ -4,7 +4,7 @@
 use super::*;
 use crate::windows::security::{self, PrivateSecurity};
 use std::mem::size_of;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Prefix;
 use std::ptr::{null, null_mut};
@@ -23,9 +23,33 @@ use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
 
 pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
     match path.components().next() {
-        Some(Component::Prefix(prefix))
-            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) =>
-        {
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)) => {
+            // Ordinary Win32 paths accept either separator. Our internal \\?\
+            // prefix disables that conversion, so perform only this lossless
+            // UTF-16 substitution before entering the extended-path API.
+            let value: Vec<_> = path
+                .as_os_str()
+                .encode_wide()
+                .map(|unit| {
+                    if unit == u16::from(b'/') {
+                        u16::from(b'\\')
+                    } else {
+                        unit
+                    }
+                })
+                .collect();
+            Ok(std::ffi::OsString::from_wide(&value).into())
+        }
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_)) => {
+            if path
+                .as_os_str()
+                .encode_wide()
+                .any(|unit| unit == u16::from(b'/'))
+            {
+                return Err(invalid(
+                    "forward slash in explicit verbatim filesystem path",
+                ));
+            }
             Ok(path.to_path_buf())
         }
         _ => Err(invalid(
@@ -35,6 +59,7 @@ pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn wide(path: &Path) -> io::Result<Vec<u16>> {
+    let path = normalize(path)?;
     let mut value: Vec<_> = path.as_os_str().encode_wide().collect();
     if value.contains(&0) {
         return Err(invalid("NUL in native filesystem path"));
@@ -330,6 +355,27 @@ mod tests {
     use std::io::Write;
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+
+    #[test]
+    fn separator_conversion_preserves_raw_utf16_and_explicit_verbatim_policy() {
+        let ordinary = [67, 58, 92, 0xd800, 47, 0xdc00, 92, 65];
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&ordinary));
+        let normalized: Vec<_> = normalize(&path)
+            .unwrap()
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        assert_eq!(normalized, [67, 58, 92, 0xd800, 92, 0xdc00, 92, 65]);
+        let mut extended: Vec<_> = "\\\\?\\".encode_utf16().collect();
+        extended.extend(&normalized);
+        let expected = PathBuf::from(std::ffi::OsString::from_wide(&extended));
+        assert_eq!(normalize(&expected).unwrap(), expected);
+        extended.push(0);
+        assert_eq!(wide(&path).unwrap(), extended);
+        let mut invalid: Vec<_> = "\\\\?\\".encode_utf16().collect();
+        invalid.extend(ordinary);
+        assert!(normalize(Path::new(&std::ffi::OsString::from_wide(&invalid))).is_err());
+    }
     use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
 
     fn junction(path: &Path, destination: &Path) {

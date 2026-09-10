@@ -811,6 +811,62 @@ mod unix {
 #[cfg(windows)]
 mod windows {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::PathBuf;
+
+    #[test]
+    fn ordinary_mixed_separators_preserve_objects_without_reinterpreting_verbatim_paths() {
+        let (_temporary, directory) = fixture();
+        let name = OsStr::new("same object 日本語");
+        let mut original = directory.create_new(name).unwrap();
+        original.write_all(b"unchanged native bytes").unwrap();
+        let identity = regular_file_info(&original).unwrap().identity;
+
+        let mut ordinary: Vec<_> = directory.path().as_os_str().encode_wide().collect();
+        if ordinary.starts_with(&[92, 92, 63, 92]) {
+            ordinary.drain(..4);
+        }
+        // Keep the native drive root and change one actual directory separator.
+        let separator = ordinary
+            .iter()
+            .rposition(|unit| *unit == u16::from(b'\\'))
+            .unwrap();
+        assert!(separator > 2);
+        ordinary[separator] = u16::from(b'/');
+        let mut mixed = PathBuf::from(OsString::from_wide(&ordinary));
+        mixed.push("child");
+        let created = Directory::ensure_private(&mixed).unwrap();
+        let normal_child = directory.path().join("child");
+        let reopened =
+            Directory::open(&normal_child, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+        assert_eq!(created.identity(), reopened.identity());
+        let mixed_parent = Directory::open(
+            Path::new(&OsString::from_wide(&ordinary)),
+            Privacy::OwnerOnly,
+            NameRetention::Movable,
+        )
+        .unwrap();
+        assert_eq!(mixed_parent.identity(), directory.identity());
+        let file = mixed_parent.read(name).unwrap();
+        assert_eq!(regular_file_info(&file).unwrap().identity, identity);
+        assert_eq!(contents(file), b"unchanged native bytes");
+
+        // Explicit extended paths never reinterpret '/' as a separator.
+        let mut verbatim: Vec<_> = "\\\\?\\".encode_utf16().collect();
+        verbatim.extend(ordinary);
+        verbatim.extend("/forbidden".encode_utf16());
+        let error =
+            Directory::ensure_private(Path::new(&OsString::from_wide(&verbatim))).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!directory.path().join("forbidden").exists());
+        assert!(Directory::ensure_private(&mixed.join("trailing.")).is_err());
+        assert!(!normal_child.join("trailing").exists());
+        assert_eq!(
+            contents(directory.read(name).unwrap()),
+            b"unchanged native bytes"
+        );
+    }
 
     #[test]
     fn state_directories_reject_drive_relative_unc_and_device_roots_before_io() {

@@ -433,8 +433,12 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
     // This is deliberately authorized PowerShell source, not command argv.
     // Stock Windows PowerShell accepts UTF-16LE source; its actual exit status
     // is returned without a suffix that could accidentally replace `$?`.
+    // Headless progress (including first-use module discovery) is not a text
+    // diagnostic: Windows PowerShell 5.1 serializes it onto redirected stderr.
+    // Disable only progress before any cmdlet runs; preserve warning/error and
+    // literal stderr bytes, including text which happens to resemble CLIXML.
     let source = format!(
-        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
+        "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
     );
     let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let mut spec = NativeSpawnSpec::new(

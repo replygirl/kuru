@@ -234,3 +234,78 @@ lines (97.11%). Ordinary and instrumented tests, formatting, strict lint, type
 checking, docs and cospec checks passed. The subsequent CI-only storage adjustment
 is checked separately through repository tooling. The full log is
 `/tmp/kuru-native-diagnostics-check.log`; no new Windows execution is claimed.
+
+The next native candidate, `ab5fd52ea6bcc3e5eff25cd9b6e0afcf51acf17b`, ran in
+[CI 34533962889](https://github.com/replygirl/kuru/actions/runs/34533962889).
+Its Windows primitive job passed 49 cases in both ordinary and instrumented
+runs: 10 unit, 18 filesystem, four command/console and 17 process/IPC cases.
+The current-image fixture failed in both runs, so there is no completed native
+coverage measurement. The initial trace identified an opened short-name path
+(`RUNNER~1`) versus a normalized long-name path (`runneradmin`). The subsequent
+rename experiment stopped with sharing violation OS32: the fixture itself still
+held a delete-denying source handle. This did not establish whether the loaded
+mapping name follows a rename.
+
+The local image candidate now requests documented `FILE_NAME_OPENED` together
+with `VOLUME_NAME_NT`, preserving exact UTF-16 comparison and diagnostics. The
+fixture retains the parent and a movable same-identity source view, verifies
+the rejected first move preserved identity/bytes and an absent destination,
+then requires the actual moved identity/bytes and original-name absence before
+creating the byte-identical replacement. Stale-image rejection remains mandatory;
+a diagnostic fallback can never satisfy the test. Windows-target strict Clippy
+passed, but the opened-name comparison still requires the next native run to
+prove rename freshness. No case folding or undocumented image API was added.
+
+The full Windows job exposed three further independent blockers. Seven connector
+unit cases failed before subprocess startup because a Cargo output on `D:` could
+not be hard-linked into the temporary directory on `C:` (OS17). Both exact shell
+stderr tests also observed PowerShell's first-use progress serialized as CLIXML.
+The fixture now retains one bounded verified executable snapshot on its own
+volume before creating aliases; the shell prelude disables only progress display
+before any cmdlet. Native regressions retain exact Unicode/status assertions,
+literal CLIXML-looking stderr, warnings and errors. All 33 connector host tests
+and strict host Clippy passed; these corrections have no native result yet.
+
+Windows delivery compilation failed because the updater's spawned handoff future
+captured a shared `NativeChild` borrow across an await; its owned pipe state is
+intentionally not `Sync`. The local correction constructs the listener's owned
+peer-identity accept future before the handoff block, without adding `Sync` or
+changing process ownership. Strict host delivery Clippy passed in 2.57 seconds;
+native consumer compilation remains pending. The coordinated connector and
+delivery Windows-target Clippy attempts both stopped in `aws-lc-sys` 0.45.0
+before reaching consumer Rust checking because this macOS host has no Windows
+SDK `windows.h`. Both exited 101; no SDK, TLS or source-policy change was made
+to hide that limitation (`/tmp/kuru-windows-consumer-crosscheck.md`).
+
+Memory preparation was blocked by that delivery compilation failure and exposed
+a separate path error: `target/kuru-bundles` retained an ordinary forward slash
+when the platform added an extended-path prefix, producing OS123. Memory now
+joins native components separately and tests missing-directory, missing-file and
+verified default-input identities. The shared platform boundary converts only
+ordinary drive-path separator code units before adding its internal prefix;
+explicit verbatim paths with forward slashes still reject. Native identity/byte
+checks and raw unpaired-surrogate preservation are authored, while reparse and
+invalid-component guards remain intact. Six focused memory build-input tests and
+strict host Clippy passed; platform Windows-target Clippy passed in 0.85 seconds.
+Neither is native Windows behavior evidence. The full Windows application,
+bootstrap, updater and ConPTY suites remain blocked behind these compilation
+and setup failures.
+
+The same `ab5fd52` run passed the macOS arm64 full check (591.06 seconds), source
+installation and installed offline-runtime acceptance. Linux ARM passed native
+packaging, 72 memory cases and packaged offline-runtime acceptance (30.71 seconds).
+Intel macOS passed native packaging, 73 memory cases and packaged offline-runtime
+acceptance (103.60 seconds). Ubuntu x64 passed its full check in 34 minutes
+8 seconds and moved to source installation. Its SDK cleanup step succeeded;
+exact reclaimed bytes, source/offline acceptance and the completed job result
+are still pending. Logs are retained under `/tmp/kuru-windows-ab5fd52-*`; no
+acceptance checkbox is satisfied merely by these partial native or local
+cross-target results.
+
+The integrated local `mise run check` for these corrections passed in 460.00
+seconds on macOS arm64. Combined workspace coverage measured 14,304/14,731
+lines (97.1014%), with the unchanged 90% gate. Formatting, strict lint, type
+checking, docs/cospec validation and ordinary plus instrumented behavior passed.
+The log is `/tmp/kuru-native-corrections-check.log`. The corrected Windows
+image, command, bundle-path and updater behavior still requires native CI;
+this local pass does not satisfy those acceptance rows.

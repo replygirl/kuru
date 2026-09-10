@@ -266,19 +266,8 @@ fn fixture_binary(cache: &FixtureCache) -> Arc<CompiledPeer> {
     }
     let directory = tempfile::tempdir().unwrap();
     #[cfg(windows)]
-    let path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("kuru-connectors-stdio-fixture.exe");
-    #[cfg(windows)]
-    assert!(
-        path.is_file(),
-        "Cargo must build the native test-support binary: {}",
-        path.display()
-    );
+    let path = snapshot_peer(&cargo_peer(), directory.path())
+        .expect("snapshot the Cargo-built native connector test peer");
     #[cfg(unix)]
     let path = {
         let source = directory.path().join("stdio_peer.rs");
@@ -316,6 +305,98 @@ fn fixture_binary(cache: &FixtureCache) -> Arc<CompiledPeer> {
     // A static strong reference would prevent TempDir cleanup at process exit.
     *cached = Arc::downgrade(&binary);
     binary
+}
+
+#[cfg(windows)]
+fn cargo_peer() -> PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("kuru-connectors-stdio-fixture.exe")
+}
+
+#[cfg(windows)]
+fn snapshot_peer(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    use anyhow::{Context, ensure};
+    use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info};
+    use std::{
+        ffi::OsStr,
+        fs::File,
+        io::{Read, Seek, Write},
+        os::windows::fs::MetadataExt,
+    };
+
+    const LIMIT: u64 = 64 * 1024 * 1024;
+    fn read(file: &mut File) -> anyhow::Result<Vec<u8>> {
+        file.rewind()?;
+        let mut bytes = Vec::new();
+        file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= LIMIT,
+            "native fixture exceeds snapshot limit"
+        );
+        Ok(bytes)
+    }
+    fn open(path: &std::path::Path) -> anyhow::Result<File> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        ensure!(
+            metadata.is_file() && metadata.file_attributes() & 0x400 == 0,
+            "native fixture source must be a regular non-reparse file"
+        );
+        let file = File::open(path)?;
+        regular_file_info(&file)?;
+        Ok(file)
+    }
+
+    // Cargo's image and the OS temporary directory can be on different volumes.
+    // Snapshot once into the owning directory before making same-volume aliases.
+    // Cargo may legitimately hard-link its source; never modify that artifact.
+    let parent = Directory::open(
+        source.parent().context("fixture source has no parent")?,
+        Privacy::Inherited,
+        NameRetention::Pinned,
+    )?;
+    let mut input = open(source)?;
+    let before = regular_file_info(&input)?;
+    ensure!(
+        before.len != 0 && before.len <= LIMIT,
+        "invalid native fixture size"
+    );
+    let bytes = read(&mut input)?;
+    let named = open(source)?;
+    let after = regular_file_info(&input)?;
+    let current = regular_file_info(&named)?;
+    ensure!(
+        before.identity == after.identity
+            && before.identity == current.identity
+            && before.len == after.len
+            && before.len == current.len
+            && before.len == bytes.len() as u64
+            && read(&mut input)? == bytes,
+        "native fixture changed while snapshotting"
+    );
+    ensure!(
+        Directory::open(parent.path(), Privacy::Inherited, NameRetention::Pinned)?.identity()
+            == parent.identity(),
+        "native fixture source parent changed"
+    );
+    let output = Directory::open(destination, Privacy::Inherited, NameRetention::Pinned)?;
+    let name = OsStr::new("stdio_peer.exe");
+    let mut candidate = output.create_new(name)?;
+    candidate.write_all(&bytes)?;
+    candidate.sync_all()?;
+    ensure!(
+        read(&mut candidate)? == bytes,
+        "native fixture snapshot differs from source"
+    );
+    output.verify(name, &candidate)?;
+    Ok(output.path().join(name))
 }
 
 pub fn request() -> kuru_core::CompletionRequest {
@@ -564,6 +645,85 @@ mod tests {
         replacement.assert_completed(1);
         drop(replacement);
         assert!(!replacement_directory.exists());
+        assert!(cache.lock().unwrap().upgrade().is_none());
+    }
+}
+
+#[cfg(windows)]
+mod windows_tests {
+    use super::{CompiledPeer, FixtureCache, StdioFixture, Step, cargo_peer, snapshot_peer};
+    use crate::rpc::Rpc;
+    use kuru_platform::fs::regular_file_info;
+    use serde_json::json;
+    use std::{collections::BTreeMap, fs::File, sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn native_fixture_snapshot_survives_source_replacement_and_cleans_its_aliases() {
+        let sources = tempfile::tempdir().unwrap();
+        let source = sources.path().join("cargo-peer.exe");
+        std::fs::copy(cargo_peer(), &source).unwrap();
+        let compiled_link = sources.path().join("cargo-artifact.exe");
+        std::fs::hard_link(&source, &compiled_link).unwrap();
+        let original = File::open(&source).unwrap();
+        assert_eq!(regular_file_info(&original).unwrap().links, 2);
+        let directory = tempfile::tempdir().unwrap();
+        let path = snapshot_peer(&source, directory.path()).unwrap();
+        let snapshot = File::open(&path).unwrap();
+        assert_ne!(
+            regular_file_info(&original).unwrap().identity,
+            regular_file_info(&snapshot).unwrap().identity
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        drop((original, snapshot));
+        std::fs::remove_file(&source).unwrap();
+        std::fs::write(&source, b"replacement must never execute").unwrap();
+        assert_eq!(
+            std::fs::read(&compiled_link).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        let owned_directory = directory.path().to_owned();
+        let binary = Arc::new(CompiledPeer { directory, path });
+        let cache = FixtureCache::new(Arc::downgrade(&binary));
+        let fixture = StdioFixture::with_cache(
+            [Step::Read, Step::Write(json!({"snapshot":true})), Step::Eof],
+            &cache,
+        );
+        let source_image = File::open(&binary.path).unwrap();
+        let alias = File::open(&fixture.path).unwrap();
+        assert_eq!(
+            regular_file_info(&source_image).unwrap().identity,
+            regular_file_info(&alias).unwrap().identity
+        );
+        drop((source_image, alias));
+        let mut rpc = Rpc::spawn(
+            fixture.command(),
+            &[],
+            &BTreeMap::new(),
+            fixture.directory.path(),
+        )
+        .await
+        .unwrap();
+        let exchange = tokio::time::timeout(Duration::from_secs(10), async {
+            rpc.send(json!({"request":"retained snapshot"}))
+                .await
+                .unwrap();
+            rpc.read().await.unwrap()
+        })
+        .await;
+        rpc.close().await.unwrap();
+        assert_eq!(exchange.unwrap(), json!({"snapshot":true}));
+        fixture.assert_completed(1);
+        assert_eq!(
+            fixture.conversations(),
+            vec![vec![json!({"request":"retained snapshot"})]]
+        );
+        drop(rpc);
+        drop(fixture);
+        drop(binary);
+        assert!(!owned_directory.exists());
         assert!(cache.lock().unwrap().upgrade().is_none());
     }
 }

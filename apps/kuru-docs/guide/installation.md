@@ -11,13 +11,13 @@ mise use -g github:replygirl/kuru
 kuru --version
 ```
 
-This installs the native executable and selects it globally. Omit `-g` for a project-local selection. To install and activate an exact release:
+This installs the native executable and selects it globally. Omit `-g` for a project-local selection. To install and activate an exact release, replace `VERSION` in the examples below with a full `major.minor.patch` version from [releases](https://github.com/replygirl/kuru/releases) that includes your platform's archive:
 
 ```sh
-mise use -g github:replygirl/kuru@0.1.0
+mise use -g github:replygirl/kuru@VERSION
 ```
 
-Mise applies a release-age cooldown when resolving latest; a full `major.minor.patch` pin also lets you select a newly published release. `mise install github:replygirl/kuru@0.1.0` downloads the version without selecting it. Use `mise exec github:replygirl/kuru@0.1.0 -- kuru` to run that version explicitly.
+Mise applies a release-age cooldown when resolving latest; a full `major.minor.patch` pin also lets you select a newly published release. `mise install github:replygirl/kuru@VERSION` downloads the version without selecting it. Use `mise exec github:replygirl/kuru@VERSION -- kuru` to run that version explicitly.
 
 ## Install with the shell bootstrap
 
@@ -35,7 +35,7 @@ To choose a version and destination:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.sh -o /tmp/kuru-install.sh
-bash /tmp/kuru-install.sh --version 0.1.0 --install-dir "$HOME/.local/bin"
+bash /tmp/kuru-install.sh --version VERSION --install-dir "$HOME/.local/bin"
 ```
 
 `KURU_INSTALL_DIR` also sets the destination; the CLI option takes precedence. The installer resolves latest once to a specific version, verifies the archive checksum, and extracts only the executable into staging before replacing it atomically. It does not run the candidate during installation. It rejects symlink or directory destinations. Failures and handled interruptions before replacement preserve the existing executable.
@@ -85,17 +85,17 @@ Linux archives are built on Ubuntu 24.04 and need a compatible glibc. Linux supp
 
 ## Release archives and mirrors
 
-Each [release](https://github.com/replygirl/kuru/releases) contains `SHA256SUMS`, four `kuru-VERSION-TARGET.tar.gz` archives for macOS/Linux and `kuru-VERSION-x86_64-pc-windows-msvc.zip` for Windows. Archives contain the executable, `LICENSE` and `README.md`. To use a mirror, pass its HTTPS version directory and an explicit version:
+Release archives use `kuru-VERSION-TARGET.tar.gz` for macOS/Linux and `kuru-VERSION-x86_64-pc-windows-msvc.zip` for Windows, alongside `SHA256SUMS`. Archives contain the executable, `LICENSE` and `README.md`. To use a mirror, pass its HTTPS version directory and an explicit version:
 
 ```sh
-bash /tmp/kuru-install.sh --version 0.1.0 \
-  --release-base https://github.com/replygirl/kuru/releases/download/v0.1.0
+bash /tmp/kuru-install.sh --version VERSION \
+  --release-base https://github.com/replygirl/kuru/releases/download/vVERSION
 ```
 
 For offline installation, place the matching archive and `SHA256SUMS` in one local directory:
 
 ```sh
-bash /tmp/kuru-install.sh --version 0.1.0 --release-base /path/to/release-files
+bash /tmp/kuru-install.sh --version VERSION --release-base /path/to/release-files
 ```
 
 `KURU_RELEASE_BASE` sets the same option; the CLI overrides it. A custom base requires `--version` and is used directly. Remote downloads and redirects require HTTPS. Checksums are verified before extraction, and downloads and expanded output have size limits. Checksums detect corruption; choose a release source you trust.
@@ -173,7 +173,7 @@ kuru update --source /path/to/kuru
 | Symptom                                               | Next step                                                                                          |
 | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `kuru` is not found                                   | Activate mise or add the installation directory to `PATH`.                                         |
-| A new release is missing from mise's latest selection | Select its full version, such as `github:replygirl/kuru@0.1.0`.                                    |
+| A new release is missing from mise's latest selection | Select its full version with `github:replygirl/kuru@VERSION`.                                      |
 | Codex cannot be started                               | Try `kuru --provider demo`, then install Codex as described in [authentication](./authentication). |
 | A release cannot be downloaded                        | Check the version and release directory against the available release assets.                      |
 | State directory is inside the workspace               | Set `--data-dir` to a private directory outside the project.                                       |

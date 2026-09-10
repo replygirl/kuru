@@ -339,10 +339,27 @@ async fn stock_powershell_unicode_and_terminating_errors_are_observed() {
         },
     )
     .unwrap();
-    let result: Value = serde_json::from_str(&host.execute("shell", json!({"command":"[Console]::Out.Write('日本語 🦀'); [Console]::Error.Write('échec'); exit 0"})).await.unwrap()).unwrap();
+    let result: Value = serde_json::from_str(&host.execute("shell", json!({"command":"Write-Progress -Activity 'native progress' -Status 'working' -PercentComplete 50; [Console]::Out.Write('日本語 🦀'); [Console]::Error.Write('échec'); exit 0"})).await.unwrap()).unwrap();
     assert_eq!(result["stdout"], "日本語 🦀");
     assert_eq!(result["stderr"], "échec");
     assert_eq!(result["success"], true);
+    let literal: Value = serde_json::from_str(&host.execute("shell", json!({"command":"[Console]::Error.Write('#< CLIXML <Objs>literal diagnostic</Objs>')"})).await.unwrap()).unwrap();
+    assert_eq!(
+        literal["stderr"],
+        "#< CLIXML <Objs>literal diagnostic</Objs>"
+    );
+    let diagnostics: Value = serde_json::from_str(&host.execute("shell", json!({"command":"Write-Warning 'retained warning'; Write-Error 'retained error'; exit 9"})).await.unwrap()).unwrap();
+    assert_eq!(diagnostics["exit_code"], 9);
+    assert_eq!(diagnostics["success"], false);
+    let streams = format!("{}{}", diagnostics["stdout"], diagnostics["stderr"]);
+    assert!(streams.contains("retained warning"), "{diagnostics}");
+    assert!(
+        diagnostics["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("retained error"),
+        "{diagnostics}"
+    );
     let failed: Value = serde_json::from_str(
         &host
             .execute("shell", json!({"command":"throw 'native failure'"}))

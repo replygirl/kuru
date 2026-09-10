@@ -298,76 +298,79 @@ url = "https://github.com/openai/codex/releases/download/rust-v0.153.4/codex-pac
 url_api = "https://api.github.com/repos/openai/codex/releases/assets/545043424"
 
 [[tools."github:aligned-team/cospec"]]
-version = "0.7.0"
+version = "0.7.1"
 backend = "github:aligned-team/cospec"
-specifiers = ["0.7.0"]
+specifiers = ["0.7.1"]
 
 [tools."github:aligned-team/cospec"."platforms.linux-arm64"]
-checksum = "sha256:21d14cd9b0f2a3e41d8c98f1f75419b46750fc78c745e32a4dc706d479e2b0ff"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-linux-arm64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583555"
+checksum = "sha256:613a5267de54ec86dab997a5e0efeed6c9504554fa052cc70becb3531ac697f7"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504549"
 provenance = "github-attestations"
+provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.linux-arm64-musl"]
-checksum = "sha256:2643b57f10c93e4db85f57a9e8723e2515a9b06af9ce1620d4fcd552b62307d8"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-linux-arm64-musl.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583557"
+checksum = "sha256:62a49c3ca1308f8ef32dfc21646a1a97ffb00961f58775fafd66420179d9d4e3"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-arm64-musl.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504550"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.linux-x64"]
-checksum = "sha256:6615e61b9dc046cc55fc2a9d41bac596fa57f8efa6bedc4c4512f9cd91cedd60"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-linux-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583559"
+checksum = "sha256:8cc3f1747147f2e88d3ce89fc773f2e6d505e9382daef1c60bd8404d099ca8d0"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504548"
 provenance = "github-attestations"
+provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.linux-x64-baseline"]
-checksum = "sha256:6615e61b9dc046cc55fc2a9d41bac596fa57f8efa6bedc4c4512f9cd91cedd60"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-linux-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583559"
+checksum = "sha256:8cc3f1747147f2e88d3ce89fc773f2e6d505e9382daef1c60bd8404d099ca8d0"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504548"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.linux-x64-musl"]
-checksum = "sha256:6d81f467613ea3524ea5193cc62ddff59e6771a77246317854a629c659c3cec5"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-linux-x64-musl.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583554"
+checksum = "sha256:5da54ddeccbe0198deea3ff3cd553ba1b22ba1535afe872aa87668cd31654914"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-x64-musl.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504553"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.linux-x64-musl-baseline"]
-checksum = "sha256:6d81f467613ea3524ea5193cc62ddff59e6771a77246317854a629c659c3cec5"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-linux-x64-musl.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583554"
+checksum = "sha256:5da54ddeccbe0198deea3ff3cd553ba1b22ba1535afe872aa87668cd31654914"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-linux-x64-musl.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504553"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.macos-arm64"]
-checksum = "sha256:8546b9785321ab484973730dde3eaffbaa0af69e1b9b862ac17cc8945cd882fc"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-macos-arm64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583556"
+checksum = "sha256:2c94f407215a25d8c68408226fc0c11a158f984f9808e2a6316f4f8bacdee1af"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-macos-arm64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504552"
 provenance = "github-attestations"
 provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.macos-x64"]
-checksum = "sha256:cec45c4811559714ae338d251c69fd4d286e1ce627fd2b3e10a6411e7f1820e2"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-macos-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583630"
+checksum = "sha256:563079b5baaaf6d458d6f7dbda97f28e776e1afad6e43b6880607d8ac68e5a1b"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-macos-x64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504590"
 provenance = "github-attestations"
+provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.macos-x64-baseline"]
-checksum = "sha256:cec45c4811559714ae338d251c69fd4d286e1ce627fd2b3e10a6411e7f1820e2"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-macos-x64.tar.gz"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583630"
+checksum = "sha256:563079b5baaaf6d458d6f7dbda97f28e776e1afad6e43b6880607d8ac68e5a1b"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-macos-x64.tar.gz"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504590"
 provenance = "github-attestations"
 
 [tools."github:aligned-team/cospec"."platforms.windows-x64"]
-checksum = "sha256:26662e28e8fcdb64a84b9a85122e45debec4f7c683549e7d9a61f4528fe8b953"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-windows-x64.zip"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583641"
+checksum = "sha256:823a74cc156c5c40efeb87d2a0df6eb1980013ad1bc50fd0c3661f2a2108be02"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-windows-x64.zip"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504596"
 provenance = "github-attestations"
 provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.windows-x64-baseline"]
-checksum = "sha256:26662e28e8fcdb64a84b9a85122e45debec4f7c683549e7d9a61f4528fe8b953"
-url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-windows-x64.zip"
-url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583641"
+checksum = "sha256:823a74cc156c5c40efeb87d2a0df6eb1980013ad1bc50fd0c3661f2a2108be02"
+url = "https://github.com/aligned-team/cospec/releases/download/v0.7.1/cospec-0.7.1-windows-x64.zip"
+url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/555504596"
 provenance = "github-attestations"
 
 [[tools.rust]]

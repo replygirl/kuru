@@ -49,7 +49,11 @@ async fn current_image_is_pinned_while_reading_and_rejects_rebound_identical_pat
     let bytes = fs::read(env!("CARGO_BIN_EXE_kuru-platform-process-fixture")).unwrap();
     fs::write(&path, &bytes).unwrap();
     let parent = Directory::open(root.path(), Privacy::Inherited, NameRetention::Pinned).unwrap();
-    let original = parent.read(OsStr::new("current image λ.exe")).unwrap();
+    // Keep the ancestor pinned, but do not let this test's source read itself
+    // block rename: the child guard must be the only non-delete-sharing file.
+    let source = Directory::open(root.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+    assert_eq!(parent.identity(), source.identity());
+    let original = source.read(OsStr::new("current image λ.exe")).unwrap();
     let identity = regular_file_info(&original).unwrap().identity;
     drop(original);
     let mut spec = NativeSpawnSpec::new(path.clone(), root.path().to_owned());
@@ -78,11 +82,11 @@ async fn current_image_is_pinned_while_reading_and_rejects_rebound_identical_pat
                 held["identity"] == serde_json::json!(identity.to_bytes()),
                 format!("initial guard identity: {held}"),
             )?;
-            let original = parent.read(OsStr::new("current image λ.exe"))?;
+            let original = source.read(OsStr::new("current image λ.exe"))?;
             require(
                 parent
                     .rename_file(
-                        &parent,
+                        &source,
                         OsStr::new("current image λ.exe"),
                         &original,
                         OsStr::new("displaced.exe"),
@@ -92,6 +96,17 @@ async fn current_image_is_pinned_while_reading_and_rejects_rebound_identical_pat
                 "current-image trust guard allowed replacement while copying",
             )?;
             require(fs::read(&path)? == bytes, "held image bytes changed")?;
+            require(
+                regular_file_info(&source.read(OsStr::new("current image λ.exe"))?)?.identity
+                    == identity,
+                "rejected move changed the original image identity",
+            )?;
+            require(
+                source
+                    .read(OsStr::new("displaced.exe"))
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+                "rejected move created a displaced image",
+            )?;
             input.write_all(b"x").await?;
             input.flush().await?;
             let released = line(&mut output, "guard release").await?;
@@ -101,13 +116,27 @@ async fn current_image_is_pinned_while_reading_and_rejects_rebound_identical_pat
             )?;
             parent
                 .rename_file(
-                    &parent,
+                    &source,
                     OsStr::new("current image λ.exe"),
                     &original,
                     OsStr::new("displaced.exe"),
                     Publication::New,
                 )
                 .map_err(io::Error::other)?;
+            require(
+                regular_file_info(&parent.read(OsStr::new("displaced.exe"))?)?.identity == identity,
+                "successful move changed the original image identity",
+            )?;
+            require(
+                fs::read(root.path().join("displaced.exe"))? == bytes,
+                "successful move changed the original image bytes",
+            )?;
+            require(
+                source
+                    .read(OsStr::new("current image λ.exe"))
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+                "successful move retained the original image name",
+            )?;
             drop(original);
             fs::write(&path, &bytes)?;
             let replacement = parent.read(OsStr::new("current image λ.exe"))?;

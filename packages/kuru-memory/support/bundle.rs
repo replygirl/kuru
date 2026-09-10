@@ -189,7 +189,8 @@ pub fn bundle_directory(package: &Path, override_path: Option<&Path>) -> Result<
         .parent()
         .and_then(Path::parent)
         .context("memory package needs its workspace parent")?
-        .join("target/kuru-bundles"))
+        .join("target")
+        .join("kuru-bundles"))
 }
 
 pub fn prepared_archive(directory: &Path, asset: &Asset) -> PathBuf {
@@ -219,13 +220,18 @@ pub fn verified_archive(path: &Path, asset: &Asset) -> Result<Vec<u8>> {
 
 fn read_checked(path: &Path, limit: u64) -> Result<Vec<u8>> {
     ensure!(path.is_absolute(), "Dolt build input path must be absolute");
-    let parent = Directory::open(
-        path.parent().context("build input has no parent")?,
-        Privacy::Inherited,
-        NameRetention::Pinned,
-    )?;
+    let parent_path = path.parent().context("build input has no parent")?;
+    let parent = Directory::open(parent_path, Privacy::Inherited, NameRetention::Pinned)
+        .with_context(|| {
+            format!(
+                "open checked build-input directory {}",
+                parent_path.display()
+            )
+        })?;
     let name = path.file_name().context("build input has no name")?;
-    let mut file = parent.read(name)?;
+    let mut file = parent
+        .read(name)
+        .with_context(|| format!("open checked build-input file {}", path.display()))?;
     ensure!(
         regular_file_info(&file)?.len <= limit,
         "Dolt build input must be a bounded regular file without links"

@@ -24,7 +24,9 @@ kuru --version
 ```
 
 This installs and activates the native executable. To select an exact release,
-use `mise use -g github:replygirl/kuru@0.1.0`. Exact versions also bypass mise's
+use `mise use -g github:replygirl/kuru@VERSION`. Replace `VERSION` with a full
+`major.minor.patch` version from [releases](https://github.com/replygirl/kuru/releases)
+that includes an archive for your platform. Exact versions also bypass mise's
 release-age cooldown for newly published releases.
 
 ### macOS and Linux
@@ -97,7 +99,7 @@ kuru --provider demo
 ```
 
 The demo provider exercises the pool locally without credentials. For live
-OpenAI models, install the verified current Codex release (`npm install -g
+OpenAI models, install the repository's pinned Codex version (`npm install -g
 @openai/codex@0.153.4`, or the pinned tool through `mise install` from a maintainer
 checkout), authenticate through its supported login flow,
 and start Kuru with the default `codex` provider. Model and reasoning-effort

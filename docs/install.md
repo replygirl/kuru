@@ -14,15 +14,20 @@ kuru --version
 ```
 
 `mise use -g` installs the release and selects it in your global configuration.
-Omit `-g` to select it for the current project. `mise install
-github:replygirl/kuru@0.1.0` downloads an exact version without changing the active
-selection; run it explicitly with `mise exec github:replygirl/kuru@0.1.0 -- kuru`.
+Omit `-g` to select it for the current project.
 
-To install and activate an exact version:
+To install and activate an exact version, replace `VERSION` in the examples below
+with a full `major.minor.patch` version from
+[releases](https://github.com/replygirl/kuru/releases) that includes your platform's
+archive:
 
 ```sh
-mise use -g github:replygirl/kuru@0.1.0
+mise use -g github:replygirl/kuru@VERSION
 ```
+
+`mise install github:replygirl/kuru@VERSION` downloads that version without changing
+the active selection; run it explicitly with
+`mise exec github:replygirl/kuru@VERSION -- kuru`.
 
 Mise's GitHub backend applies a default release-age cooldown to latest-version
 resolution. A full `major.minor.patch` pin bypasses that cooldown when installing
@@ -56,7 +61,7 @@ To choose a version and destination, download the script and pass options:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.sh -o /tmp/kuru-install.sh
-bash /tmp/kuru-install.sh --version 0.1.0 --install-dir "$HOME/.local/bin"
+bash /tmp/kuru-install.sh --version VERSION --install-dir "$HOME/.local/bin"
 ```
 
 `KURU_INSTALL_DIR` also sets the destination; `--install-dir` takes precedence.
@@ -112,21 +117,22 @@ another supported tar target. PowerShell uses the Windows x86-64 ZIP and accepts
 
 ## Release archives
 
-Each release contains `SHA256SUMS`, four `kuru-VERSION-TARGET.tar.gz` archives and
-`kuru-VERSION-x86_64-pc-windows-msvc.zip`. Each archive includes the executable,
+Release archives use `kuru-VERSION-TARGET.tar.gz` for macOS/Linux and
+`kuru-VERSION-x86_64-pc-windows-msvc.zip` for Windows, alongside `SHA256SUMS`.
+Each archive includes the executable,
 `LICENSE` and `README.md`. To install from
 an HTTPS mirror, pass its literal version directory and an explicit version:
 
 ```sh
-bash /tmp/kuru-install.sh --version 0.1.0 \
-  --release-base https://github.com/replygirl/kuru/releases/download/v0.1.0
+bash /tmp/kuru-install.sh --version VERSION \
+  --release-base https://github.com/replygirl/kuru/releases/download/vVERSION
 ```
 
 For offline installation, download the matching archive and `SHA256SUMS` into
 one directory and use that directory as `--release-base`:
 
 ```sh
-bash /tmp/kuru-install.sh --version 0.1.0 --release-base /path/to/release-files
+bash /tmp/kuru-install.sh --version VERSION --release-base /path/to/release-files
 ```
 
 `KURU_RELEASE_BASE` sets the same option; the CLI takes precedence. Custom bases

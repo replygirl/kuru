@@ -756,8 +756,12 @@ async fn replace_bytes_owned(
     spec.inherited.push(parent_handle);
     configure(&mut spec)?;
     let mut child = spec.spawn().await?;
+    // Snapshot the retained peer identity before constructing the handoff
+    // future. NativeChild owns asynchronous pipe state and is Send, not Sync;
+    // the listener's owned accept future must not capture a shared child borrow.
+    let accept = listener.accept(&child, STARTUP);
     let operation = async {
-        let mut pipe = listener.accept(&child, STARTUP).await?;
+        let mut pipe = accept.await?;
         send(
             &mut pipe,
             &Request {

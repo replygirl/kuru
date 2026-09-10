@@ -20,7 +20,9 @@ const MANIFEST: &[u8] = include_bytes!("../support/dolt-assets.json");
 
 #[test]
 fn target_selection_uses_requested_target_and_generates_coherent_versioned_payload_pins() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("support/dolt-assets.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("support")
+        .join("dolt-assets.json");
     let manifest = Manifest::load(&path).unwrap();
     for target in [
         "aarch64-apple-darwin",
@@ -173,15 +175,73 @@ fn prepared_inputs_reject_missing_truncated_corrupt_linked_and_mismatched_target
 fn build_mirror_is_explicit_absolute_and_independent_of_cargo_output_target() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
-    let package = workspace.join("packages/kuru-memory");
+    let package = workspace.join("packages").join("kuru-memory");
     let mirror = root.path().join("offline mirror");
     assert_eq!(
         bundle_directory(&package, None).unwrap(),
-        workspace.join("target/kuru-bundles")
+        workspace.join("target").join("kuru-bundles")
     );
     assert_eq!(bundle_directory(&package, Some(&mirror)).unwrap(), mirror);
     assert!(bundle_directory(&package, Some(Path::new("relative"))).is_err());
     assert!(bundle_directory(Path::new("/"), None).is_err());
+}
+
+#[test]
+fn default_build_mirror_reads_native_paths_and_distinguishes_missing_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("build workspace café 東京");
+    let package = workspace.join("packages").join("kuru-memory");
+    fs::create_dir_all(&package).unwrap();
+    let directory = bundle_directory(&package, None).unwrap();
+    let bytes = b"verified local build input";
+    let mut manifest = Manifest::parse(MANIFEST).unwrap();
+    let asset = &mut manifest.assets[0];
+    asset.compressed_bytes = bytes.len() as u64;
+    asset.archive_sha256 = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let path = prepared_archive(&directory, asset);
+
+    let missing_directory = verified_archive(&path, asset).unwrap_err();
+    assert_eq!(
+        missing_directory
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert!(
+        missing_directory
+            .to_string()
+            .contains("build-input directory")
+    );
+
+    fs::create_dir_all(&directory).unwrap();
+    let missing_file = verified_archive(&path, asset).unwrap_err();
+    assert_eq!(
+        missing_file
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert!(missing_file.to_string().contains("build-input file"));
+
+    fs::write(&path, bytes).unwrap();
+    let original = fs::File::open(&path).unwrap();
+    let original_identity = kuru_platform::fs::regular_file_info(&original)
+        .unwrap()
+        .identity;
+    assert_eq!(verified_archive(&path, asset).unwrap(), bytes);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        kuru_platform::fs::regular_file_info(&fs::File::open(&path).unwrap())
+            .unwrap()
+            .identity,
+        original_identity,
+        "the verifier retains the prepared file instead of rewriting or replacing it"
+    );
 }
 
 #[cfg(target_os = "macos")]

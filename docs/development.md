@@ -6,13 +6,15 @@ transitives. The [dependency audit](dependencies.md) records latest stable
 versions and the exact upstream constraints on transitive updates. mise.lock contains platform-specific tool URLs and checksums.
 Cospec is a standalone executable with embedded OpenSpec. Its validate/apply
 JSON and managed-file checks run without a project OpenSpec dependency. The
-pinned 0.7.0 release bundles two OpenSpec entrypoint calls into one file, causing
-duplicate execution. The cospec mise task scopes a small
+pinned 0.7.1 release still needs the compatibility fix for its embedded
+OpenSpec 1.11.0 bundle: duplicate entrypoint execution makes the unpatched
+instructions command fail to return one JSON document. The cospec mise task scopes a small
 [compatibility preload](../packages/kuru-delivery/support/cospec-preload.cjs) to
 that exact bundle hash using cospec's own runtime. It preserves command arguments
-and the original gate; native integration tests prove clear, hard-blocked,
-soft-blocked and missing-artifact outcomes. Remove the preload after an upstream
-release fixes vendoring and passes those standalone tests.
+and the original gate; standalone contract tests cover clear, hard-blocked,
+soft-blocked and missing-artifact outcomes. Remove the preload only after an
+upstream release fixes vendoring and passes those tests without it. The 0.7.1
+archive-gate corrections do not satisfy that removal condition.
 
 The architecture follows this order: apps/ and packages/ ownership, mise
 monorepo tasks, Rust, then other tools. Every app/package owns a mise.toml;
@@ -23,7 +25,7 @@ and a single coverage report. It does not replace mise task ownership.
 
 Installation, packaging, release orchestration and repository checks live in
 the Rust package `packages/kuru-delivery`. No Python or Bun is needed. The
-VitePress docs app owns its Node pin, package.json and npm lockfile under
+VitePress docs app owns its Node/npm pins, package.json and npm lockfile under
 `apps/kuru-docs`; its mise tasks invoke the installed tools directly.
 
 The delivery package activates Cocogitto and Communiqué only for its tests,
