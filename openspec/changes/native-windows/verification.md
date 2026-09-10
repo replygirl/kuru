@@ -348,3 +348,17 @@ memory and ConPTY execution; none of those acceptance rows is checked by local
 cross-compilation. See `/tmp/kuru-native-delivery-a268-corrections.md` and
 `/tmp/kuru-docs-native-path-tests.log`. The concurrent `parallel-quality-gates`
 change changes scheduling, retaining the native behavior and coverage gates.
+
+## Native server fixture correction after d66780f
+
+Run `34542165125` at d66780f passed all seven independent static categories and
+Windows primitive coverage: 54 instrumented cases and 2,602/2,865 lines
+(90.8202%). Both new PowerShell startup and distinct-verbatim-target regressions
+passed natively. Windows bundle preparation also succeeded. Full application
+compilation then found E0308 in the A2A server fixture: two borrowed paths were
+passed to `NativeSpawnSpec::new`, which requires owned `PathBuf` arguments.
+The test now converts both explicitly; an audit of all 23 constructor calls
+found no other ownership mismatch. The focused macOS A2A server test and scoped
+strict Clippy passed. Windows application test execution is still pending;
+compilation stopped before that suite ran. Evidence:
+`/tmp/kuru-native-server-path-fix.md` and `/tmp/kuru-windows-d66780f-full.log`.
