@@ -1,27 +1,26 @@
-#![cfg(unix)]
 //! Compiler-free installed-runtime acceptance. This fixture sets offline=true
 //! and removes PATH tools; it does not install an OS egress firewall. Runtime
 //! download removal is also checked in the owning memory package/source review.
 
 use anyhow::{Context, Result, ensure};
 use kuru_core::MemoryConfig;
-use kuru_delivery::archive;
+use kuru_delivery::{archive, command::Command};
 use kuru_memory::{MemoryStore, OpenOptions};
+use kuru_platform::fs::{Directory, regular_file_info};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     ffi::OsStr,
     fs::{self, File},
     io::Read,
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::{Output, Stdio},
+    process::Output,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    process::Command,
-};
+#[cfg(unix)]
+use std::{os::unix::fs::PermissionsExt, process::Stdio};
+#[cfg(unix)]
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 const OUTPUT_LIMIT: u64 = 1024 * 1024;
 // Cold creation starts staging and active servers, each with the configured
@@ -47,6 +46,7 @@ fn digest(path: &Path) -> Result<String> {
         .collect())
 }
 
+#[cfg(unix)]
 async fn capture(stream: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     stream
@@ -60,6 +60,7 @@ async fn capture(stream: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+#[cfg(unix)]
 async fn execute(command: &mut Command) -> Result<Output> {
     command
         .stdin(Stdio::null())
@@ -92,6 +93,16 @@ async fn execute(command: &mut Command) -> Result<Output> {
         stdout,
         stderr,
     })
+}
+
+#[cfg(windows)]
+async fn execute(command: &mut Command) -> Result<Output> {
+    let output = kuru_delivery::command::output(command, COMMAND_TIMEOUT).await?;
+    ensure!(
+        output.stdout.len() as u64 <= OUTPUT_LIMIT && output.stderr.len() as u64 <= OUTPUT_LIMIT,
+        "fixture command exceeded output bound"
+    );
+    Ok(output)
 }
 
 struct Installation {
@@ -147,10 +158,15 @@ impl Installation {
         command
             .env_clear()
             .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("APPDATA", &self.config)
+            .env("LOCALAPPDATA", self.home.join("local"))
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_CACHE_HOME", self.home.join("cache"))
             .env("XDG_DATA_HOME", self.home.join("data"))
             .env("TMPDIR", &self.temporary)
+            .env("TMP", &self.temporary)
+            .env("TEMP", &self.temporary)
             .env("PATH", &self.empty_path)
             .current_dir(&self.project)
             .arg("-C")
@@ -161,6 +177,10 @@ impl Installation {
         // Preserve only the coverage destination, never ambient provider state.
         if let Some(path) = std::env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", path);
+        }
+        #[cfg(windows)]
+        if let Some(path) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", path);
         }
         command
     }
@@ -270,7 +290,13 @@ impl Installation {
             .join(version)
             .join(asset["target"].as_str().context("asset target")?);
         for (name, size, sha) in [
-            ("dolt", "executable_bytes", "executable_sha256"),
+            (
+                asset["executable_name"]
+                    .as_str()
+                    .context("manifest executable name")?,
+                "executable_bytes",
+                "executable_sha256",
+            ),
             ("LICENSES", "license_bytes", "license_sha256"),
         ] {
             let path = runtime.join(name);
@@ -299,6 +325,85 @@ impl Installation {
         );
         Ok(())
     }
+}
+
+#[cfg(unix)]
+async fn install_packaged(
+    _root: &Path,
+    releases: &Path,
+    version: &str,
+    install_dir: &Path,
+    target: &str,
+) -> Result<PathBuf> {
+    archive::install(
+        releases.to_str().context("local release path")?,
+        version,
+        install_dir,
+        Some(target),
+    )
+    .await
+}
+
+#[cfg(windows)]
+async fn install_packaged(
+    root: &Path,
+    releases: &Path,
+    version: &str,
+    install_dir: &Path,
+    target: &str,
+) -> Result<PathBuf> {
+    let system = kuru_platform::windows::process::system_directory()?;
+    let powershell = system.join("WindowsPowerShell/v1.0/powershell.exe");
+    ensure!(powershell.is_file(), "stock PowerShell 5.1 is required");
+    let isolated = root.join("bootstrap environment");
+    fs::create_dir(&isolated)?;
+    let empty_path = isolated.join("empty PATH");
+    fs::create_dir(&empty_path)?;
+    let bootstrap = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packages/kuru-delivery/support/install.ps1");
+    let mut command = Command::new(powershell);
+    command
+        .env_clear()
+        .env(
+            "SystemRoot",
+            system.parent().context("Windows system root")?,
+        )
+        .env("PROCESSOR_ARCHITECTURE", "AMD64")
+        .env("USERPROFILE", &isolated)
+        .env("APPDATA", &isolated)
+        .env("LOCALAPPDATA", &isolated)
+        .env("TMP", &isolated)
+        .env("TEMP", &isolated)
+        .env("PATH", &empty_path)
+        .current_dir(root)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(bootstrap)
+        .args(["-Version", version, "-Target", target, "-ReleaseBase"])
+        .arg(releases)
+        .arg("-InstallDir")
+        .arg(install_dir);
+    if let Some(value) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", value);
+    }
+    let output = execute(&mut command).await?;
+    ensure!(
+        output.status.success(),
+        "stock PowerShell could not install the genuine packaged Kuru: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        fs::read_dir(empty_path)?.next().is_none(),
+        "bootstrap added a PATH dependency"
+    );
+    Ok(install_dir.join("kuru.exe"))
 }
 
 async fn packaged_roundtrip(root: &Path) -> Result<()> {
@@ -335,21 +440,15 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         releases.join(format!("{name}.sha256")),
         releases.join("SHA256SUMS"),
     )?;
-    let installed = archive::install(
-        releases.to_str().context("local release path")?,
-        version,
-        &install_dir,
-        Some(target),
-    )
-    .await?;
+    let installed = install_packaged(root, &releases, version, &install_dir, target).await?;
     let original_digest = digest(&binary)?;
     ensure!(
         digest(&installed)? == original_digest,
         "direct installation changed the packaged executable"
     );
     ensure!(
-        fs::read_dir(&install_dir)?.count() == 1,
-        "installation must require only the Kuru executable"
+        fs::read_dir(&install_dir)?.count() == if cfg!(windows) { 2 } else { 1 },
+        "installation must contain only Kuru and the Windows update coordination directory"
     );
     let first = Installation::new(root, "direct", &project, &installed)?;
     let reported = execute(first.command().arg("--version")).await?;
@@ -366,7 +465,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         )
         .await?;
 
-    let previous_inode = fs::metadata(&installed)?.ino();
+    let previous_identity = regular_file_info(&File::open(&installed)?)?.identity;
     let output = execute(
         first
             .command()
@@ -380,7 +479,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     ensure!(
-        fs::metadata(&installed)?.ino() != previous_inode,
+        regular_file_info(&File::open(&installed)?)?.identity != previous_identity,
         "self-update did not replace the installed executable"
     );
     ensure!(
@@ -396,7 +495,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         )
         .await?;
     ensure!(
-        fs::read_dir(&install_dir)?.count() == 1,
+        fs::read_dir(&install_dir)?.count() == if cfg!(windows) { 2 } else { 1 },
         "self-update left a required companion executable"
     );
     eprintln!(
@@ -409,12 +508,13 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
 
 #[tokio::test]
 async fn packaged_install_and_update_preserve_complete_offline_memory() {
-    let root = tempfile::Builder::new()
-        .prefix("kuru-embedded-acceptance-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()
-        .unwrap();
-    if let Err(error) = packaged_roundtrip(root.path()).await {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("kuru-embedded-acceptance-");
+    #[cfg(unix)]
+    builder.permissions(fs::Permissions::from_mode(0o700));
+    let root = builder.tempdir().unwrap();
+    let private = Directory::ensure_private(&root.path().join("private")).unwrap();
+    if let Err(error) = packaged_roundtrip(private.path()).await {
         // Keep private diagnostics on failure; a timeout must never remove a
         // directory while an owned SQL supervisor may still be completing EOF.
         let path = root.keep();

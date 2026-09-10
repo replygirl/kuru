@@ -38,6 +38,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.to_str())
         .ok_or("missing fixture mode")?;
     match mode {
+        "current-image" => {
+            let image = kuru_platform::windows::process::current_image()?;
+            let identity = kuru_platform::fs::regular_file_info(image.file())?
+                .identity
+                .to_bytes();
+            println!(
+                "{}",
+                serde_json::json!({"ready":"held", "identity":identity})
+            );
+            std::io::stdout().flush()?;
+            let mut byte = [0];
+            std::io::stdin().read_exact(&mut byte)?;
+            drop(image);
+            println!("released");
+            std::io::stdout().flush()?;
+            std::io::stdin().read_exact(&mut byte)?;
+            let result = kuru_platform::windows::process::current_image();
+            println!(
+                "{}",
+                match result {
+                    Ok(image) =>
+                        serde_json::json!({"accepted":true,"identity":kuru_platform::fs::regular_file_info(image.file())?.identity.to_bytes()}),
+                    Err(error) => serde_json::json!({"accepted":false,"error":error.to_string()}),
+                }
+            );
+        }
+        "console-check" => {
+            kuru_platform::windows::console::verify_private_console_fixture()?;
+        }
         "capture" => {
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input)?;

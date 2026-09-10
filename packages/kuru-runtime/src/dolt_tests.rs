@@ -223,7 +223,7 @@ async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effect
 #[tokio::test]
 async fn undo_is_a_new_revision_that_preserves_later_chats_preferences_and_archived_history() {
     let project = tempfile::tempdir().unwrap();
-    let data = tempfile::tempdir().unwrap();
+    let data = kuru_memory::test_support::tempdir().unwrap();
     let options = kuru_memory::test_support::open_options(
         data.path().into(),
         crate::project_scope(project.path()).unwrap(),

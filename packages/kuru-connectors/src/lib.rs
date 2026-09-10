@@ -5,6 +5,8 @@ mod a2a;
 mod codex;
 mod http;
 mod mcp;
+#[cfg(windows)]
+mod process;
 mod providers;
 mod rpc;
 mod tools;
@@ -13,7 +15,7 @@ mod tools;
 mod test_support;
 
 pub use a2a::a2a_send;
-pub use codex::{CodexProvider, auth};
+pub use codex::{AuthAction, CodexProvider, auth};
 pub use providers::{DemoProvider, Provider, ResponsesProvider, provider};
 pub use tools::ToolHost;
 

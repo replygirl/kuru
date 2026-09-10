@@ -541,7 +541,7 @@ async fn dreaming_uses_isolated_actor_histories_and_runs_periodically() {
 #[tokio::test]
 async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() {
     let dir = tempfile::tempdir().unwrap();
-    let db = tempfile::tempdir().unwrap();
+    let db = kuru_memory::test_support::tempdir().unwrap();
     let fake = Fake::new(|_| answer("persisted answer"));
     let config = Config {
         provider: "demo".into(),

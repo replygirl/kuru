@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use kuru_platform::fs::{Directory, NameRetention, Privacy, Publication};
 use rusqlite::{
     Connection, OpenFlags,
     backup::{Backup, StepResult},
@@ -13,6 +14,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::files;
 use crate::store::{identifier, private_dir, private_file};
 
 #[derive(Debug)]
@@ -51,13 +53,11 @@ pub(crate) fn prepare(data_dir: &Path, project_scope: &str) -> Result<Option<Leg
         metadata.is_file(),
         "legacy memory must be a regular file, not a link"
     );
-    // macOS's /var is a symlink. Resolve ancestors while still refusing a linked
-    // database leaf with SQLite's NOFOLLOW flag.
-    let source = source
-        .parent()
-        .context("legacy memory has no parent")?
-        .canonicalize()?
-        .join("memory.sqlite3");
+    // Checked pinned handles protect names while SQLite's backup API supplies
+    // consistency with concurrent committed WAL writers. Normal SHM rebuilds
+    // are coordination, not a promise of byte-identical shared-memory indexes.
+    let pins = SourcePins::new(data_dir)?;
+    let source = pins.parent.path().join("memory.sqlite3");
     let source = Connection::open_with_flags(
         &source,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -68,9 +68,8 @@ pub(crate) fn prepare(data_dir: &Path, project_scope: &str) -> Result<Option<Leg
     private_dir(&snapshots)?;
     let candidate = snapshots.join(format!("{}.sqlite3", uuid::Uuid::new_v4()));
     let file = private_file(&candidate)?;
-    drop(file);
     let mut snapshot = Connection::open(&candidate)?;
-    // SQLite's backup API sees committed WAL content without changing the source.
+    // Backup sees accepted WAL content while preserving source DB/WAL data.
     let backup = Backup::new(&source, &mut snapshot)?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -130,23 +129,30 @@ pub(crate) fn prepare(data_dir: &Path, project_scope: &str) -> Result<Option<Leg
     drop(rows);
     drop(statement);
     drop(snapshot);
-    fs::File::open(&candidate)?.sync_all()?;
+    drop(source);
+    pins.verify()?;
+    // Retain the writable candidate through SQLite close: Windows cannot flush
+    // an unrelated read-only handle obtained after the backup.
+    file.sync_all()?;
+    let snapshot_directory = files::directory(&snapshots)?;
+    snapshot_directory.verify(files::name(&candidate)?, &file)?;
     let source_sha256 = digest(&candidate)?;
     let final_path = snapshots.join(format!("{source_sha256}.sqlite3"));
     if final_path.try_exists()? {
         ensure!(
-            fs::symlink_metadata(&final_path)?.is_file(),
-            "legacy snapshot is not a regular file"
-        );
-        ensure!(
             digest(&final_path)? == source_sha256,
             "legacy snapshot digest changed"
         );
-        fs::remove_file(&candidate)?;
+        snapshot_directory.remove_file(files::name(&candidate)?, file)?;
     } else {
-        fs::rename(&candidate, &final_path)?;
+        snapshot_directory.publish_file(
+            &snapshot_directory,
+            files::name(&candidate)?,
+            &file,
+            files::name(&final_path)?,
+            Publication::New,
+        )?;
     }
-    fs::File::open(&snapshots)?.sync_all()?;
     Ok(Some(LegacyImport {
         receipt: MigrationReceipt {
             source_sha256,
@@ -162,7 +168,7 @@ pub(crate) fn prepare(data_dir: &Path, project_scope: &str) -> Result<Option<Leg
 
 fn digest(path: &Path) -> Result<String> {
     use std::io::Read;
-    let mut file = fs::File::open(path)?;
+    let (parent, mut file) = files::read(path, Privacy::OwnerOnly)?;
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -172,11 +178,75 @@ fn digest(path: &Path) -> Result<String> {
         }
         hash.update(&buffer[..count]);
     }
+    parent.verify(files::name(path)?, &file)?;
     Ok(hash
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+struct SourcePins {
+    // This ordinary read policy preserves old Unix SQLite file permissions;
+    // the parent is independently private and Windows validates each DACL.
+    parent: Directory,
+    files: Vec<(String, fs::File)>,
+    absent: Vec<String>,
+}
+impl SourcePins {
+    fn new(path: &Path) -> Result<Self> {
+        files::directory(path)?;
+        let parent = Directory::open(path, Privacy::Inherited, NameRetention::Pinned)?;
+        let mut pins = Self {
+            parent,
+            files: Vec::new(),
+            absent: Vec::new(),
+        };
+        for name in [
+            "memory.sqlite3",
+            "memory.sqlite3-wal",
+            "memory.sqlite3-shm",
+            "memory.sqlite3-journal",
+        ] {
+            match pins.parent.read(std::ffi::OsStr::new(name)) {
+                Ok(file) => {
+                    #[cfg(windows)]
+                    kuru_platform::fs::require_private(&file)?;
+                    pins.files.push((name.into(), file));
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && name != "memory.sqlite3" =>
+                {
+                    pins.absent.push(name.into())
+                }
+                Err(error) => return Err(error).context("pin original SQLite memory and sidecars"),
+            }
+        }
+        pins.verify()?;
+        Ok(pins)
+    }
+
+    fn verify(&self) -> Result<()> {
+        for (name, file) in &self.files {
+            self.parent
+                .verify(std::ffi::OsStr::new(name), file)
+                .context("legacy SQLite source or sidecar was replaced")?;
+        }
+        // A missing SHM can legitimately be created by SQLite. Validate its
+        // resulting identity/type/privacy; do not call this a custom VFS.
+        for name in &self.absent {
+            match self.parent.read(std::ffi::OsStr::new(name)) {
+                Ok(file) => {
+                    #[cfg(windows)]
+                    kuru_platform::fs::require_private(&file)?;
+                    self.parent.verify(std::ffi::OsStr::new(name), &file)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("validate newly created SQLite sidecar"),
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate(connection: &Connection) -> Result<()> {
@@ -216,9 +286,79 @@ mod tests {
         database
     }
 
+    #[test]
+    fn committed_wal_without_shm_rebuilds_coordination_and_preserves_database_bytes() {
+        let origin = test_support::tempdir().unwrap();
+        let restored = test_support::tempdir().unwrap();
+        let scope = format!("project/{}", "7".repeat(64));
+        let source = legacy(&origin.path().join("memory.sqlite3"));
+        source.execute("INSERT INTO messages (namespace,role,content) VALUES (?1,'user','accepted in WAL')",
+            [format!("{scope}/transcript")]).unwrap();
+        assert!(origin.path().join("memory.sqlite3-shm").is_file());
+        // The committed writer is idle while this fixture copies DB and WAL.
+        // Omitting SHM models a legitimate restored legacy store, not an
+        // immutable SQLite URI or a custom VFS.
+        let originals: Vec<_> = ["memory.sqlite3", "memory.sqlite3-wal"]
+            .into_iter()
+            .map(|name| (name, fs::read(origin.path().join(name)).unwrap()))
+            .collect();
+        for (name, bytes) in &originals {
+            files::write(&restored.path().join(name), bytes).unwrap();
+        }
+        assert!(!restored.path().join("memory.sqlite3-shm").exists());
+        let imported = prepare(restored.path(), &scope).unwrap().unwrap();
+        assert_eq!(imported.messages.len(), 1);
+        assert_eq!(imported.messages[0].content, "accepted in WAL");
+        for (name, original) in originals {
+            assert_eq!(fs::read(restored.path().join(name)).unwrap(), original);
+        }
+        let snapshot = Connection::open_with_flags(
+            &imported.receipt.snapshot,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .query_row::<String, _, _>("SELECT content FROM messages", [], |row| row.get(0))
+                .unwrap(),
+            "accepted in WAL"
+        );
+    }
+
+    #[test]
+    fn held_sqlite_sidecar_identity_rejects_replacement_and_unsafe_new_sidecars() {
+        let root = test_support::tempdir().unwrap();
+        files::write(
+            &root.path().join("memory.sqlite3"),
+            b"identity fixture, never opened as SQLite",
+        )
+        .unwrap();
+        files::write(&root.path().join("memory.sqlite3-wal"), b"original WAL").unwrap();
+        let pins = SourcePins::new(root.path()).unwrap();
+        fs::rename(
+            root.path().join("memory.sqlite3-wal"),
+            root.path().join("retained-wal"),
+        )
+        .unwrap();
+        files::write(&root.path().join("memory.sqlite3-wal"), b"replacement WAL").unwrap();
+        assert!(pins.verify().is_err());
+        assert_eq!(
+            fs::read(root.path().join("retained-wal")).unwrap(),
+            b"original WAL"
+        );
+        drop(pins);
+        let pins = SourcePins::new(root.path()).unwrap();
+        fs::create_dir(root.path().join("memory.sqlite3-shm")).unwrap();
+        assert!(pins.verify().is_err());
+        assert_eq!(
+            fs::read(root.path().join("memory.sqlite3-wal")).unwrap(),
+            b"replacement WAL"
+        );
+    }
+
     #[tokio::test]
     async fn wal_import_preserves_original_other_projects_order_and_opaque_json() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = test_support::tempdir().unwrap();
         let scope = format!("project/{}", "b".repeat(64));
         let other_scope = format!("project/{}", "c".repeat(64));
         let path = directory.path().join("memory.sqlite3");
@@ -319,7 +459,7 @@ mod tests {
 
     #[test]
     fn corrupt_identity_schema_json_and_links_never_become_empty_memory() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = test_support::tempdir().unwrap();
         let scope = format!("project/{}", "d".repeat(64));
         assert!(prepare(directory.path(), &scope).unwrap().is_none());
         let path = directory.path().join("memory.sqlite3");
@@ -361,14 +501,17 @@ mod tests {
         drop(database);
         let target = directory.path().join("actual.sqlite3");
         fs::rename(&path, &target).unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &path).unwrap();
         assert!(prepare(directory.path(), &scope).is_err());
         assert!(target.is_file());
     }
 
     #[tokio::test]
     async fn a_new_project_imports_empty_scope_without_losing_other_projects() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = test_support::tempdir().unwrap();
         let scope = format!("project/{}", "e".repeat(64));
         let source = legacy(&directory.path().join("memory.sqlite3"));
         source.execute("INSERT INTO messages (namespace,role,content) VALUES ('project/other/transcript','user','preserved')", []).unwrap();

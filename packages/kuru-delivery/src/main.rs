@@ -28,6 +28,15 @@ enum Command {
         #[arg(long)]
         target: Option<String>,
     },
+    /// Install a trusted local source build without executing it.
+    InstallLocal {
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long, env = "KURU_INSTALL_DIR")]
+        install_dir: PathBuf,
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Create a reproducible release archive and its checksum.
     Package {
         #[arg(long)]
@@ -100,10 +109,8 @@ async fn main() -> Result<()> {
             target,
         } => {
             let directory = install_dir
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin"))
-                })
-                .context("provide --install-dir when HOME is unset")?;
+                .or_else(default_install_dir)
+                .context("provide --install-dir when the user installation directory is unset")?;
             let installed =
                 archive::install(&release_base, &version, &directory, target.as_deref()).await?;
             println!(
@@ -123,6 +130,16 @@ async fn main() -> Result<()> {
                 archive::package(&binary, &target, &version, &output)?.display()
             );
         }
+        Command::InstallLocal {
+            binary,
+            install_dir,
+            target,
+        } => {
+            println!(
+                "{}",
+                archive::install_local(&binary, &install_dir, target.as_deref())?.display()
+            );
+        }
         Command::Docs { root, base } => {
             let errors = docs::check(&root, &base)?;
             ensure!(errors.is_empty(), "{}", errors.join("\n"));
@@ -135,4 +152,12 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn default_install_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    return std::env::var_os("LOCALAPPDATA")
+        .map(|root| PathBuf::from(root).join("Programs/kuru/bin"));
+    #[cfg(unix)]
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin"))
 }

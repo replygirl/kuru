@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    process::Stdio,
     time::Duration,
 };
 
@@ -9,7 +8,11 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use kuru_core::{Completion, CompletionRequest, ModelInfo, ToolCall};
 use serde_json::{Value, json};
-use tokio::{process::Command, time::timeout};
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use tokio::process::Command;
+use tokio::time::timeout;
 
 use crate::{IO_TIMEOUT, Provider, rpc::Rpc};
 
@@ -42,7 +45,7 @@ impl CodexProvider {
             }
         }
         args.extend(["-c".into(), "mcp_servers={}".into()]);
-        let mut rpc = Rpc::spawn(&self.command, &args, &BTreeMap::new(), cwd)?;
+        let mut rpc = Rpc::spawn(&self.command, &args, &BTreeMap::new(), cwd).await?;
         rpc.request("initialize", json!({"clientInfo":{"name":"kuru","title":"Kuru peer harness","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), IO_TIMEOUT).await?;
         rpc.send(json!({"method":"initialized","params":{}}))
             .await?;
@@ -167,7 +170,7 @@ impl Provider for CodexProvider {
                 "Codex model pagination did not advance"
             );
         }
-        rpc.close().await;
+        rpc.close().await?;
         Ok(models)
     }
 
@@ -267,34 +270,92 @@ impl Provider for CodexProvider {
         let result = timeout(Duration::from_secs(600), operation)
             .await
             .context("Codex inference timed out")?;
-        rpc.close().await;
-        result
+        let cleanup = rpc.close().await;
+        match result {
+            Ok(value) => {
+                cleanup?;
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
 /// Delegate authentication to the supported Codex CLI; never read token stores.
-pub async fn auth(command: &str, action: &str) -> Result<()> {
+#[derive(Clone, Copy, Debug)]
+pub enum AuthAction {
+    Login,
+    DeviceLogin,
+    Logout,
+    Status,
+}
+
+pub async fn auth(command: &str, action: AuthAction) -> Result<()> {
+    auth_with_timeout(command, action, Duration::from_secs(600)).await
+}
+
+async fn auth_with_timeout(command: &str, action: AuthAction, duration: Duration) -> Result<()> {
     let args: &[&str] = match action {
-        "login" => &["login"],
-        "logout" => &["logout"],
-        "status" => &["login", "status"],
-        other => bail!("unknown authentication action: {other}"),
+        AuthAction::Login => &["login"],
+        AuthAction::DeviceLogin => &["login", "--device-auth"],
+        AuthAction::Logout => &["logout"],
+        AuthAction::Status => &["login", "status"],
     };
-    let mut child = Command::new(command)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .context("cannot start Codex authentication; install codex first")?;
-    let status = timeout(Duration::from_secs(600), child.wait())
-        .await
-        .context("Codex authentication timed out")??;
-    ensure!(
-        status.success(),
-        "Codex authentication exited with {status}"
-    );
+    #[cfg(unix)]
+    {
+        let mut child = Command::new(command)
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .process_group(0)
+            .spawn()
+            .context("cannot start Codex authentication; install codex first")?;
+        let _group = crate::tools::ProcessGroup(child.id());
+        let status = match timeout(duration, child.wait()).await {
+            Ok(result) => result?,
+            Err(_) => {
+                drop(_group);
+                let _ = child.start_kill();
+                let _ = timeout(Duration::from_secs(5), child.wait()).await;
+                bail!("Codex authentication timed out");
+            }
+        };
+        ensure!(
+            status.success(),
+            "Codex authentication exited with {status}"
+        );
+    }
+    #[cfg(windows)]
+    {
+        use kuru_platform::windows::process::{StandardStream, inherited_stdio};
+        let mut spec = crate::process::configured(
+            command,
+            &args.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+            &BTreeMap::new(),
+            &std::env::current_dir()?,
+        )?;
+        spec.stdin = inherited_stdio(StandardStream::Input)?;
+        spec.stdout = inherited_stdio(StandardStream::Output)?;
+        spec.stderr = inherited_stdio(StandardStream::Error)?;
+        let mut child = spec
+            .spawn()
+            .await
+            .context("cannot start Codex authentication")?;
+        let status = match child.wait(duration).await {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = crate::process::stop(&mut child).await;
+                return Err(error)
+                    .context("Codex authentication did not finish within its deadline");
+            }
+        };
+        ensure!(
+            status.success(),
+            "Codex authentication exited with {status}"
+        );
+    }
     Ok(())
 }
 
@@ -490,13 +551,33 @@ mod tests {
     #[tokio::test]
     async fn auth_delegates_only_supported_native_commands() {
         let script = StdioFixture::new([Step::Auth]);
-        for action in ["login", "logout", "status"] {
+        for action in [
+            AuthAction::Login,
+            AuthAction::DeviceLogin,
+            AuthAction::Logout,
+            AuthAction::Status,
+        ] {
             auth(script.command(), action).await.unwrap();
         }
-        assert!(auth(script.command(), "tokens").await.is_err());
-        assert!(auth("/not-installed/codex", "login").await.is_err());
-        script.assert_completed(3);
+        assert!(
+            auth("/not-installed/codex", AuthAction::Login)
+                .await
+                .is_err()
+        );
+        script.assert_completed(4);
         let failed = StdioFixture::new([Step::Exit(1)]);
-        assert!(auth(failed.command(), "login").await.is_err());
+        assert!(auth(failed.command(), AuthAction::Login).await.is_err());
+        let stalled = StdioFixture::new([Step::Auth, Step::Sleep(60_000)]);
+        let error = auth_with_timeout(
+            stalled.command(),
+            AuthAction::DeviceLogin,
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("time") || format!("{error:#}").contains("deadline"),
+            "{error:#}"
+        );
     }
 }

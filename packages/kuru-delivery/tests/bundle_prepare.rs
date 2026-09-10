@@ -1,5 +1,6 @@
 #![cfg(feature = "tooling")]
 
+use kuru_delivery::command::Command;
 use kuru_delivery::{
     archive::digest,
     bundle::{self, PrepareOptions},
@@ -7,10 +8,11 @@ use kuru_delivery::{
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
-use tokio::process::Command;
+#[path = "support/files.rs"]
+mod files;
+use files::{identity, mode, symlink};
 
 const TARGET: &str = "aarch64-apple-darwin";
 const OTHER: &str = "x86_64-unknown-linux-gnu";
@@ -78,22 +80,18 @@ impl Fixture {
     }
 }
 fn asset(target: &str, bytes: &[u8]) -> Value {
-    json!({ "target": target, "stem": "dolt-fixture", "url": "https://example.invalid/pinned.tar.gz",
+    json!({ "target": target, "stem": "dolt-fixture", "format": "tar.gz", "executable_name": "dolt", "url": "https://example.invalid/pinned.tar.gz",
         "compressed_bytes": bytes.len(), "archive_sha256": digest(bytes),
         "expanded_bytes": 100, "executable_bytes": 60, "executable_sha256": "b".repeat(64),
         "license_bytes": 20, "license_sha256": "c".repeat(64) })
 }
-fn mode(path: &Path, permissions: u32) {
-    fs::set_permissions(path, fs::Permissions::from_mode(permissions)).unwrap();
-}
 fn error(result: anyhow::Result<PathBuf>) -> String {
     format!("{:#}", result.unwrap_err())
 }
-async fn output(child: tokio::process::Child) -> std::process::Output {
-    tokio::time::timeout(std::time::Duration::from_secs(15), child.wait_with_output())
+async fn output(command: &mut Command) -> std::process::Output {
+    kuru_delivery::command::output(command, std::time::Duration::from_secs(15))
         .await
-        .expect("bundle CLI exceeded fixture deadline")
-        .unwrap()
+        .expect("bundle CLI exceeded fixture deadline or failed to execute")
 }
 
 #[tokio::test]
@@ -102,15 +100,31 @@ async fn local_import_is_private_exact_and_valid_cache_is_reused_offline() {
     let prepared = bundle::prepare(&fixture.options()).await.unwrap();
     assert_eq!(fs::read(&prepared).unwrap(), fixture.bytes);
     assert_eq!(prepared.file_name(), fixture.output().file_name());
-    assert_eq!(fs::metadata(&prepared).unwrap().mode() & 0o777, 0o400);
-    assert_eq!(fs::metadata(&fixture.cache).unwrap().mode() & 0o777, 0o700);
-    let before = fs::metadata(&prepared).unwrap();
+    kuru_platform::fs::require_private(&File::open(&prepared).unwrap()).unwrap();
+    kuru_platform::fs::Directory::open(
+        &fixture.cache,
+        kuru_platform::fs::Privacy::OwnerOnly,
+        kuru_platform::fs::NameRetention::Movable,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&prepared).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            fs::metadata(&fixture.cache).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    let before = identity(&prepared);
     fs::remove_file(&fixture.input).unwrap();
     let mut options = fixture.options();
     options.archive = None;
     assert_eq!(bundle::prepare(&options).await.unwrap(), prepared);
-    let after = fs::metadata(&prepared).unwrap();
-    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(before, identity(&prepared));
     fixture.clean_staging();
 }
 
@@ -159,10 +173,9 @@ async fn corrupt_or_truncated_input_never_publishes_and_preserves_existing_cache
     bundle::prepare(&fixture.options()).await.unwrap();
     mode(&fixture.output(), 0o600);
     fs::write(fixture.output(), &corrupt).unwrap();
-    let before = fs::metadata(fixture.output()).unwrap();
+    let before = identity(&fixture.output());
     assert!(error(bundle::prepare(&fixture.options()).await).contains("checksum mismatch"));
-    let after = fs::metadata(fixture.output()).unwrap();
-    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(before, identity(&fixture.output()));
     assert_eq!(fs::read(fixture.output()).unwrap(), corrupt);
     assert_eq!(fs::read(&fixture.input).unwrap(), fixture.bytes);
     fixture.clean_staging();
@@ -172,7 +185,8 @@ async fn corrupt_or_truncated_input_never_publishes_and_preserves_existing_cache
 async fn concurrent_cli_imports_converge_on_one_verified_file_and_stable_lock() {
     let fixture = Fixture::new();
     let spawn = || {
-        Command::new(env!("CARGO_BIN_EXE_kuru-delivery"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kuru-delivery"));
+        command
             .args([
                 "bundle",
                 "prepare",
@@ -187,15 +201,12 @@ async fn concurrent_cli_imports_converge_on_one_verified_file_and_stable_lock() 
             .arg("--archive")
             .arg(&fixture.input)
             .env_remove("KURU_DOLT_BUNDLE_DIR")
-            .kill_on_drop(true)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap()
+            .kill_on_drop(true);
+        command
     };
-    let first = spawn();
-    let second = spawn();
-    let (first, second) = tokio::join!(output(first), output(second));
+    let mut first = spawn();
+    let mut second = spawn();
+    let (first, second) = tokio::join!(output(&mut first), output(&mut second));
     assert!(
         first.status.success() && second.status.success(),
         "first: {}\nsecond: {}\ncache: {:?}",
@@ -214,13 +225,12 @@ async fn concurrent_cli_imports_converge_on_one_verified_file_and_stable_lock() 
     }
     assert_eq!(fs::read(fixture.output()).unwrap(), fixture.bytes);
     let lock = fixture.cache.join(".prepare.lock");
-    let before = fs::metadata(&lock).unwrap();
+    let before = identity(&lock);
     let held = File::options().read(true).write(true).open(&lock).unwrap();
     held.try_lock().unwrap();
     drop(held);
     bundle::prepare(&fixture.options()).await.unwrap();
-    let after = fs::metadata(&lock).unwrap();
-    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(before, identity(&lock));
     fixture.clean_staging();
 }
 
@@ -335,7 +345,8 @@ async fn cli_directory_precedence_and_conventional_default_are_explicit() {
     let fixture = Fixture::new();
     let override_dir = fixture.root.path().join("explicit");
     let environment_dir = fixture.root.path().join("environment");
-    let child = Command::new(env!("CARGO_BIN_EXE_kuru-delivery"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kuru-delivery"));
+    child
         .args([
             "bundle",
             "prepare",
@@ -355,12 +366,8 @@ async fn cli_directory_precedence_and_conventional_default_are_explicit() {
             "KURU_DOLT_BUNDLE_ARCHIVE",
             fixture.root.path().join("absent"),
         )
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let result = output(child).await;
+        .kill_on_drop(true);
+    let result = output(&mut child).await;
     assert!(
         result.status.success(),
         "{}",
@@ -372,19 +379,16 @@ async fn cli_directory_precedence_and_conventional_default_are_explicit() {
             .exists()
     );
     assert!(!environment_dir.exists());
-    let child = Command::new(env!("CARGO_BIN_EXE_kuru-delivery"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kuru-delivery"));
+    child
         .args(["bundle", "prepare", "--manifest"])
         .arg(&fixture.manifest)
         .env("KURU_DOLT_BUNDLE_DIR", &environment_dir)
         .env("KURU_DOLT_BUNDLE_TARGET", TARGET)
         .env("KURU_DOLT_BUNDLE_ARCHIVE", &fixture.input)
         .env("KURU_DOLT_BUNDLE_OFFLINE", "true")
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let result = output(child).await;
+        .kill_on_drop(true);
+    let result = output(&mut child).await;
     assert!(
         result.status.success(),
         "{}",

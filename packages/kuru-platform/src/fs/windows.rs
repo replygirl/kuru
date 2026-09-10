@@ -8,17 +8,16 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Prefix;
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
-};
+use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_ID_INFO,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FileAttributeTagInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
-    GetVolumeInformationByHandleW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileDispositionInfo, FileIdInfo,
+    FileStandardInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
+    READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
 
@@ -208,10 +207,7 @@ pub(super) fn create_directory(parent: &File, path: &Path) -> io::Result<()> {
     // SAFETY: path/descriptor/attributes remain live, attributes deny handle
     // inheritance and install the protected ACL atomically with creation.
     if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
-            return Err(error);
-        }
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -256,6 +252,48 @@ pub(super) fn seal_private(file: &File, executable: bool) -> io::Result<()> {
 pub(super) fn make_executable(_: &File) -> io::Result<()> {
     // Windows has no Unix executable mode; preserve the installed file's ACL.
     // Type/hash/version checks are separate from its extension and access policy.
+    Ok(())
+}
+
+pub(super) fn remove(
+    _: &File,
+    path: &Path,
+    held: File,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    let deletion = (|| -> io::Result<File> {
+        let deletion = open(
+            path,
+            DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NameRetention::Movable,
+            None,
+        )?;
+        if checked_file(&deletion)?.identity != checked_file(&held)?.identity {
+            return Err(denied("removal name no longer identifies the held object"));
+        }
+        Ok(deletion)
+    })()
+    .map_err(|error| (PublicationPhase::Rejected, error))?;
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: this DELETE-capable handle was checked against the retained full
+    // file identity. The class matches this exact live native structure. Use
+    // ordinary image-section checks, never POSIX unlink or ignored READONLY.
+    let status = unsafe {
+        SetFileInformationByHandle(
+            deletion.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if status == 0 {
+        return Err((PublicationPhase::Uncertain, io::Error::last_os_error()));
+    }
+    // Neither our deletion handle nor the caller's old read handle may retain
+    // a delete-pending object when the shared API checks actual disappearance.
+    drop(deletion);
+    drop(held);
     Ok(())
 }
 

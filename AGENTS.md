@@ -17,6 +17,7 @@ when applying that standard. AGENTS.md is canonical; CLAUDE.md imports it with
 - `packages/kuru-core`: framework/configuration types and shared contracts.
 - `packages/kuru-memory`: managed Dolt, private SQL lifecycle, versioned storage and legacy import.
 - `packages/kuru-platform`: checked native filesystems and Windows process/IPC primitives.
+- `packages/kuru-archive`: bounded archive codecs, independent of filesystems, targets and installation policy.
 - `packages/kuru-connectors`: inference providers, tool host, MCP and outbound A2A.
 - `packages/kuru-runtime`: actor pool, peer routing, relationships, dreaming and A2A ingress.
 - `packages/kuru-delivery`: native updater, shell bootstrap, archive packaging, release and repository tooling.
@@ -74,6 +75,12 @@ when necessary or clearly valuable, within its owning app or package.
 The compiler-free release bootstrap lives in `packages/kuru-delivery/support`;
 the root installation script forwards binary options and retains source builds.
 Keep bootstrap behavior tests and shell lint in the delivery package's mise tasks.
+The standalone Windows PowerShell bootstrap may use a minimal audited `Add-Type`
+Win32 bridge for native identity, ACLs and durable replacement before Kuru can be
+trusted or executed. Use only stock PowerShell/.NET facilities; add no separate
+compiler installation, language project or downloaded runtime. Native bootstrap
+tests must exercise that bridge. This exception does not relax Rust consumer
+unsafe-code rules or create an alternative application platform implementation.
 
 Portability and bundled runtime dependencies are product requirements. Installing
 Kuru must be sufficient to run it: ship required native runtime engines and their
@@ -93,6 +100,9 @@ Only its audited Windows interop modules may locally allow unsafe code under the
 package's deny-by-default policy. Every consumer retains the workspace prohibition.
 Platform CI proves those primitives; application support additionally requires the
 database, terminal, connector and delivery checks described above.
+Keep archive record parsing in `kuru-archive`; domain packages own exact payload
+inventories, hashes and private staging. Test physical duplicates and malformed
+records, including the prepared upstream Windows engine archive on every host.
 Route concurrent Windows child creation through the platform process API. Its
 explicit handle list protects each child, but an unrelated legacy spawn can still
 inherit temporarily inheritable handles; Rust's private spawn lock cannot be

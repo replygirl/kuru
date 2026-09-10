@@ -1,6 +1,7 @@
 use super::*;
 use flate2::{Compression, write::GzEncoder};
-use std::os::unix::fs::symlink;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, symlink};
 
 const SCRIPT: &[u8] = b"#!/bin/sh\nprintf 'dolt version 2.3.3\\n'\n";
 const LICENSE: &[u8] = b"Fixture license and dependency notices\n";
@@ -13,6 +14,7 @@ struct Fixture {
     expanded: u64,
     archive_digest: String,
     binary_digest: String,
+    binary_bytes: u64,
     license_digest: String,
 }
 
@@ -64,6 +66,7 @@ impl Fixture {
             expanded: expanded.len() as u64,
             archive_digest: digest(&bytes),
             binary_digest: digest(SCRIPT),
+            binary_bytes: SCRIPT.len() as u64,
             license_digest: digest(LICENSE),
             bytes,
         }
@@ -73,10 +76,12 @@ impl Fixture {
         Asset {
             target: "fixture-target",
             stem: "fixture",
+            format: "tar.gz",
+            executable_name: "dolt",
             compressed_bytes: self.bytes.len() as u64,
             archive_sha256: &self.archive_digest,
             expanded_bytes: self.expanded,
-            executable_bytes: SCRIPT.len() as u64,
+            executable_bytes: self.binary_bytes,
             executable_sha256: &self.binary_digest,
             license_bytes: LICENSE.len() as u64,
             license_sha256: &self.license_digest,
@@ -101,7 +106,7 @@ fn executable(path: &Path, content: &[u8]) {
 
 #[tokio::test]
 async fn installs_only_fixed_payloads_and_preserves_notices_and_previous_install() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = crate::test_support::tempdir().unwrap();
     let fixture = Fixture::new(|_| {});
     let candidate = fixture.extract(temporary.path()).unwrap();
     assert_eq!(fs::read(candidate.join("dolt")).unwrap(), SCRIPT);
@@ -246,7 +251,7 @@ async fn corrupt_cache_is_rejected_before_execution_and_links_are_never_adopted(
 
 #[tokio::test]
 async fn stable_lock_waits_times_out_and_does_not_delete_a_held_inode() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = crate::test_support::tempdir().unwrap();
     let first = cache_lock(temporary.path(), Duration::from_secs(1))
         .await
         .unwrap();
@@ -371,6 +376,10 @@ async fn isolated_probe_sees_only_private_settings_and_preserves_private_server_
         br#"{"sqlserver.global.server_uuid":"preserve","versioncheck.disabled":"false"}"#,
     )
     .unwrap();
+    // Dolt itself replaces its config with ordinary Unix permissions between
+    // starts. The private parent still confines it, and the next preparation
+    // must preserve identity settings while restoring a private new record.
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
     verify_version(&binary, &home).await.unwrap();
     let actual: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(actual["sqlserver.global.server_uuid"], "preserve");
@@ -388,6 +397,13 @@ async fn isolated_probe_sees_only_private_settings_and_preserves_private_server_
     symlink("/tmp/missing-config", &config).unwrap();
     assert!(prepare_private_home(&home).is_err());
     fs::remove_file(&config).unwrap();
+    assert_eq!(
+        fs::read_dir(home.join("root/.dolt/staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+    fs::remove_dir(home.join("root/.dolt/staging")).unwrap();
     fs::remove_dir(home.join("root/.dolt")).unwrap();
     symlink(temporary.path(), home.join("root/.dolt")).unwrap();
     assert!(prepare_private_home(&home).is_err());
@@ -573,6 +589,148 @@ async fn cancellation_retains_stage_and_lock_until_real_extraction_stops() {
     .await
     .unwrap();
     assert_eq!(fs::read(installed).unwrap(), SCRIPT);
+}
+
+async fn paused_probe(
+    cache: PathBuf,
+) -> (tokio::task::JoinHandle<Result<PathBuf>>, PathBuf, PathBuf) {
+    const CONTROLLED: &[u8] = b"#!/bin/sh\nprintf started > \"$TMPDIR/started\"\nIFS= read -r token < \"$TMPDIR/release\" || exit 17\nprintf 'dolt version 2.3.3\\n'\n";
+    static FIXTURE: std::sync::LazyLock<Fixture> = std::sync::LazyLock::new(|| {
+        let mut fixture = Fixture::new(|entries| entries[2].3 = CONTROLLED.to_vec());
+        fixture.binary_digest = digest(CONTROLLED);
+        fixture.binary_bytes = CONTROLLED.len() as u64;
+        fixture
+    });
+    let directory = cache;
+    let (staged, received) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        provision_with_extractor(
+            &MemoryConfig::default(),
+            &directory,
+            FIXTURE.spec(),
+            Cow::Borrowed(&FIXTURE.bytes),
+            move |bytes, candidate, asset| {
+                extract(bytes, candidate, asset)?;
+                let home = candidate.parent().unwrap().join("probe");
+                prepare_private_home(&home)?;
+                nix::unistd::mkfifo(
+                    &home.join("tmp/release"),
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )?;
+                staged.send((candidate.to_owned(), home)).unwrap();
+                Ok(())
+            },
+        )
+        .await
+    });
+    let (candidate, home) = tokio::time::timeout(Duration::from_secs(5), received)
+        .await
+        .unwrap()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !home.join("tmp/started").try_exists().unwrap() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "real version process never reached its FIFO barrier"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (task, candidate, home)
+}
+
+#[tokio::test]
+async fn cancellation_during_actual_probe_retains_stage_and_lock_but_never_activates() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let (task, candidate, home) = paused_probe(cache.clone()).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(
+        candidate.exists(),
+        "live version process must retain its candidate"
+    );
+    assert!(
+        home.exists(),
+        "live version process must retain its private home"
+    );
+    assert!(
+        cache_lock(&cache, Duration::from_millis(30)).await.is_err(),
+        "live version process must retain installation authority"
+    );
+    let release = nix::fcntl::open(
+        &home.join("tmp/release"),
+        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
+        nix::sys::stat::Mode::empty(),
+    )
+    .unwrap();
+    nix::unistd::write(&release, b"continue\n").unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(10)).await.unwrap();
+    drop(release);
+    assert!(!candidate.exists());
+    assert!(!home.exists());
+    assert_eq!(
+        fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(),
+        0,
+        "canceled caller cannot publish after a successful probe"
+    );
+    drop(lock);
+    let installed = provision_managed(
+        &MemoryConfig::default(),
+        &cache,
+        VALID_FIXTURE.spec(),
+        Cow::Borrowed(&VALID_FIXTURE.bytes),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(installed).unwrap(), SCRIPT);
+}
+
+#[test]
+fn runtime_destruction_during_probe_retains_process_resources_until_exit_without_activation() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (_task, candidate, home) = runtime.block_on(paused_probe(cache.clone()));
+    drop(runtime);
+    assert!(
+        candidate.exists(),
+        "destroying the caller executor removed the running probe's candidate"
+    );
+    assert!(
+        home.exists(),
+        "destroying the caller executor removed the running probe's home"
+    );
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(
+        observer
+            .block_on(cache_lock(&cache, Duration::from_millis(30)))
+            .is_err(),
+        "destroying the caller executor released a live probe's cache lease"
+    );
+    let release = nix::fcntl::open(
+        &home.join("tmp/release"),
+        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
+        nix::sys::stat::Mode::empty(),
+    )
+    .unwrap();
+    nix::unistd::write(&release, b"continue\n").unwrap();
+    let _lock = observer
+        .block_on(cache_lock(&cache, Duration::from_secs(10)))
+        .unwrap();
+    drop(release);
+    assert!(!candidate.exists());
+    assert!(!home.exists());
+    assert_eq!(
+        fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(),
+        0,
+        "a destroyed caller cannot activate a successfully completed probe"
+    );
 }
 
 #[tokio::test]

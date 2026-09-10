@@ -8,6 +8,8 @@ pub(crate) const EMBEDDED_ARCHIVE: &[u8] =
 pub(crate) struct Asset<'a> {
     pub target: &'a str,
     pub stem: &'a str,
+    pub format: &'a str,
+    pub executable_name: &'a str,
     pub compressed_bytes: u64,
     pub archive_sha256: &'a str,
     pub expanded_bytes: u64,

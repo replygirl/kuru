@@ -147,7 +147,10 @@ pub fn check(root: &Path) -> Result<Vec<String>> {
             let entry = entry?;
             let name = entry.file_name();
             if !entry.file_type()?.is_file()
-                || !matches!(name.to_str(), Some("check-commit.sh" | "install.sh"))
+                || !matches!(
+                    name.to_str(),
+                    Some("check-commit.sh" | "install.sh" | "install.ps1")
+                )
             {
                 errors.insert(format!(
                     "scripts/{}: helper implementation must belong to an app or package",

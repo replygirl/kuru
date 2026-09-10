@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
+        os: [ubuntu-24.04, macos-14, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,15 +43,31 @@ jobs:
           cache-bin: false
       - run: mise run check
       - name: Source install smoke
+        if: runner.os != 'Windows'
         env:
           KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
         run: |
           mise run install
           "$KURU_INSTALL_DIR/kuru" --version
+      - name: Native Windows source install smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
+        run: |
+          mise run install
+          if ($LASTEXITCODE -ne 0) { throw 'Source installation failed' }
+          & "$env:KURU_INSTALL_DIR/kuru.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Kuru failed' }
       - name: Verify installed offline runtime
         env:
-          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru
+          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
         run: mise run //apps/kuru-tui:test:embedded-runtime
+      - name: Inspect native shipping DLL imports
+        if: runner.os == 'Windows'
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
+        run: mise run //apps/kuru-tui:verify:windows-imports
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-${{ matrix.os }}
@@ -114,6 +130,9 @@ jobs:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
       CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

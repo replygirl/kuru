@@ -145,7 +145,11 @@ impl StdioFixture {
         // macOS can reject shared hardlinks if policy inspection races cleanup.
         // argv[0] still selects this fixture's independent plan and transcript.
         let directory = tempfile::tempdir_in(binary.directory.path()).unwrap();
-        let path = directory.path().join("fixture");
+        let path = directory.path().join(if cfg!(windows) {
+            "fixture.exe"
+        } else {
+            "fixture"
+        });
         #[cfg(unix)]
         std::os::unix::fs::symlink(&binary.path, &path).unwrap();
         #[cfg(not(unix))]
@@ -261,36 +265,53 @@ fn fixture_binary(cache: &FixtureCache) -> Arc<CompiledPeer> {
         return binary;
     }
     let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("stdio_peer.rs");
-    let path = directory.path().join("stdio_peer");
-    std::fs::write(&source, include_str!("../tests/fixtures/stdio_peer.rs")).unwrap();
-    // Only the compiler opens executable bytes for writing. Wait for it to exit
-    // before publishing paths: the multithreaded test process never holds a
-    // writable executable descriptor that another fork could inherit (ETXTBSY).
-    let result =
-        std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
-            .args([
-                "--edition=2024",
-                "--forbid",
-                "unsafe_code",
-                "-C",
-                "opt-level=1",
-            ])
-            .arg(&source)
-            .arg("-o")
-            .arg(&path)
-            .output()
-            .expect("compile the native connector test peer with the Rust toolchain");
+    #[cfg(windows)]
+    let path = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("kuru-connectors-stdio-fixture.exe");
+    #[cfg(windows)]
     assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+        path.is_file(),
+        "Cargo must build the native test-support binary: {}",
+        path.display()
     );
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
-    }
+    let path = {
+        let source = directory.path().join("stdio_peer.rs");
+        let path = directory.path().join("stdio_peer");
+        std::fs::write(&source, include_str!("../tests/fixtures/stdio_peer.rs")).unwrap();
+        // Only the compiler opens executable bytes for writing. Wait for it to exit
+        // before publishing paths: the multithreaded test process never holds a
+        // writable executable descriptor that another fork could inherit (ETXTBSY).
+        let result =
+            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .args([
+                    "--edition=2024",
+                    "--forbid",
+                    "unsafe_code",
+                    "-C",
+                    "opt-level=1",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&path)
+                .output()
+                .expect("compile the native connector test peer with the Rust toolchain");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        path
+    };
     let binary = Arc::new(CompiledPeer { directory, path });
     // A static strong reference would prevent TempDir cleanup at process exit.
     *cached = Arc::downgrade(&binary);

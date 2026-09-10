@@ -3,10 +3,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
+use kuru_delivery::command::BlockingCommand as Command;
 use kuru_delivery::docs;
+#[path = "support/files.rs"]
+mod files;
 
 struct Site {
     directory: tempfile::TempDir,
@@ -113,7 +115,7 @@ fn incorrect_base_and_encoded_traversal_are_rejected() {
 #[cfg(unix)]
 #[test]
 fn output_symlinks_cannot_publish_outside_files_or_directories() {
-    use std::os::unix::fs::symlink;
+    use files::symlink;
     let site = Site::new();
     let outside = site.directory.path().join("outside.html");
     fs::write(&outside, "outside").unwrap();
@@ -285,7 +287,7 @@ fn invalid_bases_bad_encoding_and_unreadable_html_fail_locally() {
 #[cfg(unix)]
 #[test]
 fn internal_symlinks_and_root_base_work_without_recursing_cycles() {
-    use std::os::unix::fs::symlink;
+    use files::symlink;
     let site = Site::new();
     site.write(
         "index.html",

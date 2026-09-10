@@ -523,16 +523,59 @@ fn editor_layout(input: &str, cursor: usize, width: usize) -> (Vec<Line<'static>
     )
 }
 
-struct TerminalGuard;
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
+/// Own terminal initialization and exact console restoration across errors.
+pub struct TerminalSession {
+    restored: bool,
+    #[cfg(windows)]
+    console: kuru_platform::windows::console::ConsoleModeGuard,
+}
+
+impl TerminalSession {
+    pub fn enter(output: &mut impl io::Write) -> Result<Self> {
+        // The guard precedes raw mode and every escape write: even partial
+        // initialization must restore the caller's original native state.
+        let guard = Self {
+            restored: false,
+            #[cfg(windows)]
+            console: kuru_platform::windows::console::ConsoleModeGuard::capture()?,
+        };
+        enable_raw_mode()?;
+        #[cfg(windows)]
+        guard.console.enable_virtual_terminal_output()?;
+        execute!(
+            output,
+            EnterAlternateScreen,
+            event::EnableBracketedPaste,
+            event::EnableFocusChange
+        )?;
+        Ok(guard)
+    }
+
+    pub fn restore(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        let raw = disable_raw_mode();
+        let screen = execute!(
             io::stdout(),
             LeaveAlternateScreen,
             event::DisableBracketedPaste,
             event::DisableFocusChange
         );
+        #[cfg(windows)]
+        let modes = self.console.restore();
+        raw?;
+        screen?;
+        #[cfg(windows)]
+        modes?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = self.restore();
     }
 }
 
@@ -541,16 +584,17 @@ pub async fn run(harness: Harness, models: Vec<ModelInfo>) -> Result<()> {
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "interactive mode requires a terminal; use kuru run PROMPT"
     );
-    enable_raw_mode()?;
-    let _guard = TerminalGuard;
-    execute!(
-        io::stdout(),
-        EnterAlternateScreen,
-        event::EnableBracketedPaste,
-        event::EnableFocusChange
-    )?;
+    let mut guard = TerminalSession::enter(&mut io::stdout())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    run_loop(&mut terminal, harness, models).await
+    let result = run_loop(&mut terminal, harness, models).await;
+    // Ratatui's Drop may show its cursor. Finish that while terminal output
+    // processing is still active, before restoring the caller's console modes.
+    drop(terminal);
+    let restored = guard.restore();
+    match result {
+        Ok(()) => restored,
+        Err(error) => Err(error),
+    }
 }
 
 async fn run_loop<B: Backend>(

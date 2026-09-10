@@ -1,0 +1,39 @@
+## 1. Complete default client and compatible transport [critical]
+
+- [ ] 1.1 @integration (agent) pin the audited official source and assets and exercise restricted app-server initialize/initialized, model-list pagination and preserved model/effort schema against the actual client -> exact candidate version, native target, requests and successful bounded responses recorded; no fake-client result substituted.
+- [ ] 1.2 @e2e (agent) run packaged Kuru default-provider discovery and supported login-help/status paths with empty client cache, isolated CODEX_HOME and no external developer tools on all five native targets -> client provisions locally, no missing helper/runtime download, actionable unauthenticated status and bounded cleanup.
+- [ ] 1.3 @integration (agent) exercise explicit external-client selection, missing override and unknown model/effort values -> auth and inference resolve the same deliberate client and no automatic fallback or capability loss occurs.
+- [ ] 1.4 @manual (human) perform supported login and one authenticated Kuru conversation using the bundled client without a separate Codex installation -> user-authorized native result recorded without reading, copying or printing credential stores; unauthenticated CI probes are not claimed as this result.
+- [ ] 1.5 @eval (agent) compare bundled-client request/response behavior for isolated peers, relationships, unknown effort values and proposed tools against the established restricted transport contract -> private context boundaries and Kuru-owned execution remain intact; no provider-native tool or peer-supervisor authority appears.
+
+## 2. Pinned local build and safe extraction [critical]
+
+- [ ] 2.1 @integration (agent) prepare official inputs through the owning native mise task, including verified offline mirror and concurrent preparation -> the shared byte-only engine returns one exact hash-addressed archive; checked-in notices verify locally and no connector/memory dependency cycle or physical archive certification is introduced.
+- [ ] 2.2 @regression (agent) run actual Cargo with missing, same-size corrupt, wrong-target and unsupported-target inputs, then verified local input with network disabled -> invalid inputs fail before an executable is emitted; valid prepared build succeeds without host fallback or runtime download code.
+- [ ] 2.3 @integration (agent) exercise exact-entry USTAR/GNU decoder and real filesystem publication with unexpected PAX/extension metadata, unsafe paths, duplicate/linked/device entries, truncation, excess sizes and notice/digest mismatches -> bounded failure preserves existing cache and never activates partial or aliased executables; no custom repack or general package extraction is introduced.
+- [ ] 2.4 @runtime (agent) cancel concurrent first-use extraction and retain a running client while another version is prepared on Unix and Windows -> private ownership, atomic activation, live-file lifetime and bounded process cleanup remain valid.
+- [ ] 2.5 @regression (agent) invoke default Dolt and explicit Codex preparation with both environment namespaces, CLI overrides, foreign CARGO_BUILD_TARGET and explicit host selection -> old Dolt defaults remain intact, kind/manifest mismatches reject, no unselected namespace changes behavior, and every helper executes natively while preparing the exact consumer target.
+
+## 3. Installed and updated complete executable [critical]
+
+- [ ] 3.1 @e2e (agent) install and self-update actual release-built Kuru on each of five native targets and repeat with independent empty Dolt/client caches -> offline demo memory and actual default-client initialize/discovery/login-help work without compilers or separately installed runtimes; binary and every notice digest match the manifest.
+- [ ] 3.2 @regression (agent) record source SHA/profile and actual release plus debug/instrumented packaged-test executable sizes, compressed archive bytes and expanded totals for all five targets; exercise checksum/size/format/cancellation failures in Rust and shell/PowerShell delivery paths -> Codex 128/320 MiB and outer 256 MiB bounds accept real complete artifacts, Dolt 64/128 MiB bounds remain unchanged, and rejected updates preserve existing executables; input-only sums and smaller substitute binaries are not acceptance.
+- [ ] 3.3 @manual (agent) review README and owning install/auth/development/security guides against actual commands and evidence -> no separate Codex/npm/Node prerequisite, no hidden first-use download, no untested platform or live-auth claim; deliberate external override documented.
+
+## 4. Repository and publication invariants [critical]
+
+- [ ] 4.1 @integration (agent) run full native mise check plus every five-target required CI job -> tests, format, lint, documentation checks and at least 90 percent meaningful workspace line coverage pass on recorded commits without exclusions or weakened assertions.
+- [ ] 4.2 @integration (agent) review workflow graph and installed-artifact probes -> strategy-only dispatch, immutable source/assets, retry behavior and release-final Pages jobs remain unchanged; native acceptance gates publication.
+- [x] 4.3 @integration (agent) strictly validate and apply the completed planning artifacts -> verified mise 2026.9.4 strict validation exit 0 with zero errors/warnings; actual apply exit 2 reports native-windows as the active hard blocker. The blocked response returns no contextFiles; all authored artifacts were read directly. Evidence /tmp/kuru-bundled-provider-client-validate.log and /tmp/kuru-bundled-provider-client-apply.json; no product implementation performed.
+- [x] 4.4 @manual (agent) resolve both explicit design gates against current delivery preparation, memory build/provision code and the measured five-target catalog -> decision 1 now specifies a shared byte-only engine, independent owner verifier, CLI/file boundary and namespace compatibility; decision 6 fixes Codex 128/320 MiB and outer 256 MiB caps without changing Dolt 64/128 MiB. All ten audited archive/member hashes remain in the design. Strict validation exit 0 (zero errors/warnings), actual apply exit 2 (native-windows), no returned contextFiles; evidence /tmp/kuru-bundled-provider-client-decisions-validate.log and /tmp/kuru-bundled-provider-client-decisions-apply.json. Actual combined five-target artifacts and authenticated behavior remain unrun acceptance, and no source or dependency pin changed.
+
+## Evidence boundary
+
+All product acceptance rows remain unrun while the hard dependency is active.
+The completed upstream audit is preparation, not five-platform acceptance:
+`/tmp/kuru-codex-bundle-audit.md`, exact five-target asset/notice catalog
+`/tmp/kuru-codex-bundle-proof/catalog.json` and actual macOS raw-executable trace
+`/tmp/kuru-codex-bundle-proof/standalone-app-server.log`. All five raw archives
+were downloaded and hashed; only macOS arm64 was executed. Preserve the
+distinction between an unauthenticated native handshake, a mocked inference
+response and live login.

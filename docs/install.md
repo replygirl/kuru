@@ -1,7 +1,8 @@
 # Installation and updates
 
-Kuru ships native executables for macOS and Linux on arm64 and x86-64. Binary
-installation requires no Rust toolchain. The executable is `kuru`.
+Kuru ships native executables for macOS and Linux on arm64 and x86-64, and Windows
+on x86-64. Binary installation requires no separately installed compiler, Dolt
+server or MSVC redistributable. Run it as `kuru` (`kuru.exe` on Windows).
 
 ## Install with mise
 
@@ -61,6 +62,34 @@ Use `--help` for all options. An existing symlink or directory at the `kuru`
 destination is rejected. Before replacement, failed downloads, validation errors
 and handled interruptions preserve the previous executable and remove staging files.
 
+## Install with PowerShell
+
+In Windows PowerShell 5.1 or newer:
+
+```powershell
+irm https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.ps1 | iex
+```
+
+The default destination is `$env:LOCALAPPDATA\Programs\kuru\bin`. Add that directory to
+your user `PATH`, then run `kuru --version` and `kuru --provider demo`. The script
+uses stock Windows PowerShell and .NET Framework. Its small native API bridge
+checks file identities, private staging and durable publication; no separate
+compiler installation is needed.
+
+To choose an exact version or use a local release directory:
+
+```powershell
+irm https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.ps1 -OutFile "$env:TEMP\kuru-install.ps1"
+& "$env:TEMP\kuru-install.ps1" -Version 0.1.0 -ReleaseBase C:\Downloads\kuru-release -InstallDir "$env:LOCALAPPDATA\Programs\kuru\bin"
+```
+
+`-InstallDir` and `-ReleaseBase` override `KURU_INSTALL_DIR` and
+`KURU_RELEASE_BASE`. A custom release directory requires `-Version`. The script
+freezes latest to an explicit version, verifies the ZIP checksum and its exact
+three regular members, and installs only `kuru.exe`. It never runs the downloaded
+candidate to validate it. Reparse points, extra hardlinks, unsafe names and
+unexpected installation objects are refused.
+
 ## Supported platforms
 
 | System | Architecture | Target |
@@ -69,6 +98,7 @@ and handled interruptions preserve the previous executable and remove staging fi
 | macOS | Intel | `x86_64-apple-darwin` |
 | Linux | ARM64 | `aarch64-unknown-linux-gnu` |
 | Linux | x86-64 | `x86_64-unknown-linux-gnu` |
+| Windows 10 version 1809 or newer | x86-64 | `x86_64-pc-windows-msvc` |
 
 Linux archives are built on Ubuntu 24.04 and require a compatible glibc. The
 supported Linux targets use GNU libc, including source builds with the bundled
@@ -77,7 +107,9 @@ the supported archive targets.
 
 ## Release archives
 
-Each release contains `SHA256SUMS` and `kuru-VERSION-TARGET.tar.gz`. To install from
+Each release contains `SHA256SUMS`, four `kuru-VERSION-TARGET.tar.gz` archives and
+`kuru-VERSION-x86_64-pc-windows-msvc.zip`. Each archive includes the executable,
+`LICENSE` and `README.md`. To install from
 an HTTPS mirror, pass its literal version directory and an explicit version:
 
 ```sh
@@ -99,7 +131,8 @@ are bounded, and checksums are verified before extraction. Checksums detect
 corruption; trust comes from the release source you choose.
 
 From a checkout, `bash scripts/install.sh` forwards these binary-install options
-to the same bootstrap.
+to the shell bootstrap; `& .\scripts\install.ps1` forwards PowerShell options to
+the Windows bootstrap.
 
 The executable includes its verified full-Dolt engine and upstream licenses.
 First memory use extracts them locally, so an offline installation also supports
@@ -116,8 +149,20 @@ cd kuru
 bash scripts/install.sh --source
 ```
 
+On Windows, install the Visual Studio C++ Build Tools and Windows SDK, then use
+the native PowerShell entrypoint from the checkout:
+
+```powershell
+& .\scripts\install.ps1 -Source
+```
+
+The owning mise task builds the explicit MSVC target with a static CRT. To set
+the destination, pass `-InstallDir` or set `KURU_INSTALL_DIR`; release-selection
+options are not source-build options.
+
 The source installer prepares the pinned Rust toolchain and verified engine
-archive through package-owned mise tasks, then installs into `~/.local/bin`.
+archive through package-owned mise tasks. It installs into `~/.local/bin` on
+macOS/Linux or `$env:LOCALAPPDATA\Programs\kuru\bin` on Windows.
 It builds for the current host and rejects a foreign `CARGO_BUILD_TARGET` before
 installing an executable; use the build task for cross-compilation.
 For another binary directory:
@@ -161,6 +206,15 @@ explicit version and release directory, which can also be a local directory.
 It validates the archive in Rust and defaults to replacing the running executable.
 It requires no compiler or interpreter. Kuru does not install background updates.
 
+On Windows, the current trusted executable performs replacement through a
+verified helper copy. It records publication before reporting success and waits
+for the old process to exit before cleanup. Close other old Kuru instances if
+cleanup remains pending. Rerunning the normal PowerShell installer reconciles
+the private receipt, including an interrupted update where `kuru.exe` is absent.
+It refuses an unknown replacement at that path. A verified helper cache entry is
+retained for recovery and occupies approximately one executable per updated
+current-version digest.
+
 For a source installation, select the desired revision and install it again, or
 run `kuru update --source /path/to/kuru`.
 
@@ -168,6 +222,6 @@ run `kuru update --source /path/to/kuru`.
 
 Maintainers dispatch the Release workflow from main. It calculates the next
 version from conventional commits, runs the gate, creates or recovers the signed
-version commit, builds four native targets, generates Communiqué notes, and
+version commit, builds five native targets, generates Communiqué notes, and
 publishes the release before deploying its docs. See [release operations](release.md)
 for credentials and recovery.

@@ -20,6 +20,18 @@ pub struct FileIdentity {
     object: [u8; 16],
 }
 
+impl FileIdentity {
+    /// Full identity for caller-owned lock keys: little-endian volume followed
+    /// by all sixteen opaque object-ID bytes. Only the retained handle makes
+    /// this identity authoritative; an old serialized key cannot prove liveness.
+    pub fn to_bytes(self) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&self.volume.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.object);
+        bytes
+    }
+}
+
 /// Information obtained from a regular disk file's actual open handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileInfo {
@@ -91,6 +103,35 @@ impl std::error::Error for PublicationError {
     }
 }
 
+/// Removal consumes the caller's file handle so Windows can finish ordinary
+/// deletion. An uncertain result requires reconciliation; it never authorizes
+/// deleting a new object which subsequently occupies the same name.
+#[derive(Debug)]
+pub struct RemovalError {
+    pub phase: PublicationPhase,
+    pub identity: Option<FileIdentity>,
+    pub path: PathBuf,
+    error: io::Error,
+}
+
+impl std::fmt::Display for RemovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} removal at {}: {}",
+            self.phase,
+            self.path.display(),
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for RemovalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 #[derive(Debug)]
 struct Anchor {
     path: PathBuf,
@@ -128,7 +169,7 @@ fn denied(message: &str) -> io::Error {
 }
 
 /// Child operations take one literal native component, preserving Unix names.
-fn component(name: &OsStr) -> io::Result<()> {
+pub fn validate_component(name: &OsStr) -> io::Result<()> {
     let mut parts = Path::new(name).components();
     if !matches!(parts.next(), Some(Component::Normal(value)) if value == name)
         || parts.next().is_some()
@@ -164,6 +205,10 @@ fn component(name: &OsStr) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn component(name: &OsStr) -> io::Result<()> {
+    validate_component(name)
 }
 
 /// Metadata inspection reports hardlink identity; checked opens reject links.
@@ -237,10 +282,14 @@ impl Directory {
             let file = match native::open_directory(parent, &path, retention) {
                 Ok(file) => file,
                 Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
-                    native::create_directory(
+                    match native::create_directory(
                         parent.ok_or_else(|| invalid("cannot create a volume root"))?,
                         &path,
-                    )?;
+                    ) {
+                        Ok(()) => (),
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+                        Err(error) => return Err(error),
+                    }
                     native::open_directory(parent, &path, retention)?
                 }
                 Err(error) => return Err(error),
@@ -299,6 +348,29 @@ impl Directory {
         Ok(())
     }
 
+    /// Whether this directory is the held ancestor or lies beneath it, using
+    /// full native identities rather than case-sensitive pathname prefixes.
+    /// Both retained directory paths must still identify their original objects.
+    pub fn is_within(&self, ancestor: &Directory) -> io::Result<bool> {
+        self.revalidate()?;
+        ancestor.revalidate()?;
+        Ok(self
+            .anchors
+            .iter()
+            .any(|anchor| anchor.identity == ancestor.identity()))
+    }
+
+    /// Exclusively create a protected private child, even under an ordinary
+    /// installation directory. Existing names are never adopted or repaired.
+    pub fn create_private_directory(&self, name: &OsStr) -> io::Result<Directory> {
+        component(name)?;
+        self.revalidate()?;
+        let path = self.path().join(name);
+        native::create_directory(&self.anchor().file, &path)?;
+        self.revalidate()?;
+        Self::open(&path, Privacy::OwnerOnly, NameRetention::Movable)
+    }
+
     fn open_file(&self, name: &OsStr, mode: OpenMode) -> io::Result<File> {
         component(name)?;
         self.revalidate()?;
@@ -353,6 +425,45 @@ impl Directory {
         Ok(())
     }
 
+    /// Remove exactly one checked regular file and consume its held handle.
+    /// Success means namespace disappearance was observed after closing our
+    /// handles. Other live handles or mapped images can leave removal uncertain.
+    /// This does not change ACLs/attributes, recursively delete, or retry.
+    pub fn remove_file(&self, name: &OsStr, file: File) -> Result<(), RemovalError> {
+        self.remove_file_then(name, file, || Ok(()))
+    }
+
+    fn remove_file_then(
+        &self,
+        name: &OsStr,
+        file: File,
+        after_remove: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), RemovalError> {
+        let identity = checked_file(&file).ok().map(|info| info.identity);
+        let path = self.path().join(name);
+        let failure = |phase, error| RemovalError {
+            phase,
+            identity,
+            path: path.clone(),
+            error,
+        };
+        self.verify(name, &file)
+            .map_err(|error| failure(PublicationPhase::Rejected, error))?;
+        native::remove(&self.anchor().file, &path, file)
+            .map_err(|(phase, error)| failure(phase, error))?;
+        after_remove().map_err(|error| failure(PublicationPhase::Uncertain, error))?;
+        self.revalidate()
+            .map_err(|error| failure(PublicationPhase::Uncertain, error))?;
+        match self.read(name) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(failure(PublicationPhase::Uncertain, error)),
+            Ok(_) => Err(failure(
+                PublicationPhase::Uncertain,
+                denied("removed name is still occupied"),
+            )),
+        }
+    }
+
     pub fn publish_file(
         &self,
         source: &Directory,
@@ -361,16 +472,30 @@ impl Directory {
         destination: &OsStr,
         policy: Publication,
     ) -> Result<(), PublicationError> {
-        self.publish_file_then(source, name, file, destination, policy, || Ok(()))
+        self.transfer_file_then((source, name, file), destination, policy, true, || Ok(()))
     }
 
-    fn publish_file_then(
+    /// Rename an unchanged existing file without flushing a read-only source.
+    /// This retains the same validation and native write-through move contract
+    /// as publication, but cannot establish durability for unwritten payloads.
+    /// Newly written candidates and receipts must use `publish_file` instead.
+    pub fn rename_file(
         &self,
         source: &Directory,
         name: &OsStr,
         file: &File,
         destination: &OsStr,
         policy: Publication,
+    ) -> Result<(), PublicationError> {
+        self.transfer_file_then((source, name, file), destination, policy, false, || Ok(()))
+    }
+
+    fn transfer_file_then(
+        &self,
+        (source, name, file): (&Directory, &OsStr, &File),
+        destination: &OsStr,
+        policy: Publication,
+        flush_payload: bool,
         after_move: impl FnOnce() -> io::Result<()>,
     ) -> Result<(), PublicationError> {
         let identity = checked_file(file).ok().map(|info| info.identity);
@@ -408,7 +533,10 @@ impl Directory {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            file.sync_all()
+            if flush_payload {
+                file.sync_all()?;
+            }
+            Ok(())
         };
         preflight().map_err(|error| failure(PublicationPhase::Rejected, error))?;
         native::publish(
@@ -494,6 +622,30 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn removal_reconciles_completion_failures_without_touching_new_occupants() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let name = OsStr::new("retired");
+        let file = directory.create_new(name).unwrap();
+        let error = directory
+            .remove_file_then(name, file, || Err(io::Error::other("completion failed")))
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert!(!directory.path().join(name).exists());
+        let file = directory.create_new(name).unwrap();
+        let error = directory
+            .remove_file_then(name, file, || {
+                directory.create_new(name)?.write_all(b"new occupant")
+            })
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert_eq!(
+            std::fs::read(directory.path().join(name)).unwrap(),
+            b"new occupant"
+        );
+    }
+
+    #[test]
     fn a_real_move_retains_reconciliation_evidence_when_completion_fails() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
@@ -501,12 +653,11 @@ mod tests {
         candidate.write_all(b"new committed bytes").unwrap();
         let identity = regular_file_info(&candidate).unwrap().identity;
         let error = directory
-            .publish_file_then(
-                &directory,
-                OsStr::new("candidate"),
-                &candidate,
+            .transfer_file_then(
+                (&directory, OsStr::new("candidate"), &candidate),
                 OsStr::new("published"),
                 Publication::New,
+                true,
                 || {
                     Err(io::Error::other(
                         "controlled completion failure after actual native move",

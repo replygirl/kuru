@@ -1,9 +1,9 @@
 //! Reproduce hook inheritance entirely inside disposable child processes.
+use kuru_delivery::command::BlockingCommand as Command;
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -103,7 +103,7 @@ impl ForeignRepository {
     pub async fn assert_test_isolated(&self, test: &str) {
         let root = self.temp.path().join("caller");
         let git = root.join(".git");
-        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        let mut command = kuru_delivery::command::Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", test, "--nocapture"])
             .current_dir(&root)

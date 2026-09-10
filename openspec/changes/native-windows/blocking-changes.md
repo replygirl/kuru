@@ -2,9 +2,9 @@
 
 ## Blocked by
 
-- [ ] `native-platform` — supplies the independently verified Rust filesystem, owned-process and private IPC primitives; this product change adopts them and verifies real consumers.
+- [x] `native-platform` — supplies the independently verified Rust filesystem, owned-process and private IPC primitives; this product change adopts them and verifies real consumers. *(archived 2026-09-10)*
 - [x] `dolt-memory` — supplies the async memory API, full Dolt schema, writer ownership, supervisor lifecycle, migration and candidate promotion contracts that the Windows implementation must preserve. *(archived 2026-09-10)*
-- [ ] `embedded-runtime` — supplies the package-owned verified bundle preparation and executable embedding contract; Windows adds its target without introducing runtime downloads.
+- [x] `embedded-runtime` — supplies the package-owned verified bundle preparation and executable embedding contract; Windows adds its target without introducing runtime downloads. *(archived 2026-09-10)*
 
 ## Soft-blocked by
 
@@ -12,8 +12,8 @@ None.
 
 ## Ordering and established foundations
 
-All three providers are active changes in this planning home. Their proposals were
-reviewed along with every other active proposal and the archived changes. The
+All three provider proposals were reviewed along with every other active proposal
+and the archived changes. The
 user's native Windows and embedded-runtime requirements establish these hard
 dependencies; this change does not make any provider depend on Windows product
 integration. `native-platform` is independently tested with compiled Rust

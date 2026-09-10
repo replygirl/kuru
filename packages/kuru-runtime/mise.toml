@@ -2,6 +2,7 @@
 kuru_runtime_build_target = "{{env.CARGO_BUILD_TARGET | default(value='host')}}"
 
 [tasks."build"]
+shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
 usage = 'flag "--target <target>" default="{{vars.kuru_runtime_build_target}}"'
 env.CARGO_BUILD_TARGET = false
 depends = [
@@ -11,8 +12,10 @@ depends = [
   ] },
 ]
 run = 'cargo build -p kuru-runtime --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru-runtime --all-features --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
 
 [tasks."build:release"]
+shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
 usage = 'flag "--target <target>" default="{{vars.kuru_runtime_build_target}}"'
 env.CARGO_BUILD_TARGET = false
 depends = [
@@ -22,8 +25,10 @@ depends = [
   ] },
 ]
 run = 'cargo build -p kuru-runtime --release --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru-runtime --release --all-features --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
 
 [tasks."test"]
+env.RUST_TEST_THREADS = "2"
 depends = ["//packages/kuru-memory:prefetch"]
 run = "cargo test -p kuru-runtime --all-targets --all-features --locked"
 

@@ -2,12 +2,15 @@
 
 use std::{
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
 };
 
 use kuru_delivery::archive::{TARGETS, archive_name, digest};
+use kuru_delivery::command::BlockingCommand as Command;
+#[path = "support/files.rs"]
+mod files;
+use files::symlink;
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -20,8 +23,10 @@ impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let binary = root.path().join("input binary");
-        fs::write(&binary, b"#!/bin/sh\nprintf 'native fixture 0.2.0\\n'\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        files::executable(
+            &binary,
+            &fs::read(env!("CARGO_BIN_EXE_kuru-delivery-fixture")).unwrap(),
+        );
         let release = root.path().join("release files");
         let destination = root.path().join("installed bin");
         fs::create_dir(&destination).unwrap();
@@ -113,8 +118,8 @@ fn real_package_and_env_configured_install_run_the_result() {
     let fixture = Fixture::new();
     let packaged = fixture.package();
     assert_eq!(
-        success(&packaged).trim(),
-        fixture.archive().to_str().unwrap()
+        fs::canonicalize(success(&packaged).trim()).unwrap(),
+        fs::canonicalize(fixture.archive()).unwrap()
     );
     fixture.checksums();
     let manifest = fs::read_to_string(fixture.release.join("SHA256SUMS")).unwrap();
@@ -126,7 +131,10 @@ fn real_package_and_env_configured_install_run_the_result() {
         .output()
         .unwrap();
     assert_eq!(success(&run), "native fixture 0.2.0\n");
-    assert_eq!(fs::read_dir(&fixture.destination).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(&fixture.destination).unwrap().count(),
+        1 + usize::from(cfg!(windows))
+    );
 
     let explicit = fixture.root.path().join("explicit destination");
     let output = fixture
@@ -255,12 +263,13 @@ fn cli_rejects_missing_inputs_invalid_versions_and_unsupported_targets() {
         .arg(&fixture.destination)
         .output()
         .unwrap();
-    failure(&target, "unsupported platform");
+    failure(&target, "unsupported release target");
     let no_home = fixture
         .command()
         .args(["install", "--version", "0.2.0", "--release-base"])
         .arg(&fixture.release)
         .env_remove("HOME")
+        .env_remove("LOCALAPPDATA")
         .output()
         .unwrap();
     failure(&no_home, "provide --install-dir");

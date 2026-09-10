@@ -7,6 +7,12 @@
 
 use super::pipe;
 use super::pipe::Pipe;
+mod command;
+mod image;
+pub use command::{
+    configured_command, environment_key_eq, merge_environment, resolve_executable, system_directory,
+};
+pub use image::{CurrentImage, current_image};
 use std::{
     cmp::Ordering,
     ffi::{OsStr, OsString, c_void},
@@ -24,13 +30,17 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
-        SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     },
     Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal},
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
     System::{
-        Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent},
+        Console::{
+            CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, GetStdHandle, STD_ERROR_HANDLE,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        },
         JobObjects::{
             CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -41,10 +51,11 @@ use windows_sys::Win32::{
         Threading::{
             CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
             CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-            GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
-            STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-            UpdateProcThreadAttribute, WaitForSingleObject,
+            GetCurrentProcess, GetExitCodeProcess, GetProcessId, InitializeProcThreadAttributeList,
+            LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
     UI::WindowsAndMessaging::SW_HIDE,
@@ -76,6 +87,66 @@ pub enum Stdio {
     Handle(OwnedHandle),
 }
 
+/// Select a caller's standard stream without passing an ambient raw handle to a consumer.
+pub enum StandardStream {
+    Input,
+    Output,
+    Error,
+}
+
+/// A private duplicate is included in this spawn's explicit handle allowlist.
+/// A caller without a console/redirected stream supplies NUL instead.
+pub fn inherited_stdio(stream: StandardStream) -> io::Result<Stdio> {
+    let channel = match stream {
+        StandardStream::Input => STD_INPUT_HANDLE,
+        StandardStream::Output => STD_OUTPUT_HANDLE,
+        StandardStream::Error => STD_ERROR_HANDLE,
+    };
+    // SAFETY: GetStdHandle returns a borrowed process-owned standard handle.
+    let handle = unsafe { GetStdHandle(channel) };
+    if handle.is_null() {
+        return Ok(Stdio::Null);
+    }
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let mut duplicate = ptr::null_mut();
+    // SAFETY: both process arguments are current-process pseudo handles, the
+    // original remains borrowed, and success initializes one owned duplicate.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful DuplicateHandle transfers this newly created handle.
+    Ok(Stdio::Handle(unsafe {
+        OwnedHandle::from_raw_handle(duplicate)
+    }))
+}
+
+/// Command parsing is explicit. Ordinary argv never gains interpreter syntax.
+#[derive(Default)]
+pub enum CommandSyntax {
+    #[default]
+    Argv,
+    /// Execute the resolved executable/script and literal args through system cmd.
+    CmdInvocation { switches: Vec<OsString> },
+    /// Caller deliberately supplied cmd source, not an ordinary argument vector.
+    CmdSource {
+        switches: Vec<OsString>,
+        source: OsString,
+    },
+}
+
 /// Complete creation intent. Arguments/environment are deliberately not Debug:
 /// they can contain caller credentials. Environment never inherits implicitly.
 pub struct NativeSpawnSpec {
@@ -89,6 +160,7 @@ pub struct NativeSpawnSpec {
     pub inherited: Vec<OwnedHandle>,
     pub lifetime: Lifetime,
     pub console: Console,
+    pub syntax: CommandSyntax,
 }
 
 impl NativeSpawnSpec {
@@ -104,6 +176,7 @@ impl NativeSpawnSpec {
             inherited: Vec::new(),
             lifetime: Lifetime::OwnedJob,
             console: Console::Inherit,
+            syntax: CommandSyntax::Argv,
         }
     }
 
@@ -113,16 +186,47 @@ impl NativeSpawnSpec {
                 "native executable and working directory must be absolute",
             ));
         }
-        if self.executable.extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
-        }) {
+        if matches!(self.syntax, CommandSyntax::Argv)
+            && self.executable.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+            })
+        {
             return Err(invalid(
                 "batch execution requires an explicit consumer shell policy",
             ));
         }
-        let executable = wide(self.executable.as_os_str())?;
+        let (executable, mut command_line) = match &self.syntax {
+            CommandSyntax::Argv => (
+                wide(self.executable.as_os_str())?,
+                command_line(self.executable.as_os_str(), &self.args)?,
+            ),
+            CommandSyntax::CmdInvocation { switches } => (
+                wide(system_directory()?.join("cmd.exe").as_os_str())?,
+                command::invocation_line(&self.executable, &self.args, switches, &self.cwd)?,
+            ),
+            CommandSyntax::CmdSource { switches, source } => {
+                if !self.args.is_empty() {
+                    return Err(invalid(
+                        "cmd source cannot also supply an ordinary argument vector",
+                    ));
+                }
+                (
+                    wide(system_directory()?.join("cmd.exe").as_os_str())?,
+                    command::source_line(switches, source)?,
+                )
+            }
+        };
+        if !matches!(self.syntax, CommandSyntax::Argv)
+            && self
+                .environment
+                .iter()
+                .any(|(_, value)| value.encode_wide().count() > 8191)
+        {
+            return Err(invalid(
+                "cmd cannot preserve an inherited environment value longer than 8191 units",
+            ));
+        }
         let cwd = wide(self.cwd.as_os_str())?;
-        let mut command_line = command_line(self.executable.as_os_str(), &self.args)?;
         let environment = environment(self.environment)?;
         let (stdin, input) = prepare_stdio(self.stdin, true).await?;
         let (stdout, output) = prepare_stdio(self.stdout, false).await?;
@@ -237,6 +341,11 @@ impl NativeChild {
     pub fn id(&self) -> u32 {
         self.id
     }
+
+    /// A wait/query-only duplicate; it cannot confer arbitrary PID authority.
+    pub fn duplicate_process_handle(&self) -> io::Result<OwnedHandle> {
+        duplicate_process(self.process.as_raw_handle())
+    }
     pub fn take_stdin(&mut self) -> Option<Pipe> {
         self.stdin.take()
     }
@@ -343,6 +452,78 @@ impl NativeChild {
         }
         Ok(())
     }
+}
+
+/// Retain a real handle to this process, rather than inheriting a pseudo-handle.
+pub fn current_process_handle() -> io::Result<OwnedHandle> {
+    // SAFETY: the process pseudo-handle is used only as an input to duplication.
+    duplicate_process(unsafe { GetCurrentProcess() })
+}
+
+/// Duplicate an inherited token without taking ownership of or closing that
+/// token. Verify the resulting object's type and expected process identity.
+/// The original inherited handle remains with its creator/OS until process exit.
+pub fn duplicate_inherited_process_handle(
+    value: usize,
+    expected_pid: u32,
+) -> io::Result<OwnedHandle> {
+    if value == 0 || value == usize::MAX || expected_pid == 0 {
+        return Err(invalid("invalid inherited process handle"));
+    }
+    let handle = duplicate_process(value as HANDLE)?;
+    // SAFETY: the duplicate is a retained owned kernel handle. GetProcessId
+    // validates its object type; no supplied process ID is opened or terminated.
+    let pid = unsafe { GetProcessId(handle.as_raw_handle()) };
+    if pid == 0 || pid != expected_pid {
+        return Err(invalid(
+            "inherited process handle does not match its expected process",
+        ));
+    }
+    Ok(handle)
+}
+
+fn duplicate_process(handle: HANDLE) -> io::Result<OwnedHandle> {
+    let mut duplicate = ptr::null_mut();
+    // SAFETY: DuplicateHandle validates an opaque source handle and writes one
+    // new handle to our output; failure never transfers ownership of the input.
+    let result = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut duplicate,
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            0,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful duplication returned a unique owned handle.
+    Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+}
+
+/// Wait on a retained process object, bounded without reopening its numeric PID.
+pub async fn wait_process_handle(handle: &OwnedHandle, timeout: Duration) -> io::Result<()> {
+    // SAFETY: the owned handle is retained for this call; reject a nonprocess.
+    if unsafe { GetProcessId(handle.as_raw_handle()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    while process_is_running(handle)? {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "retained process has not exited",
+            ));
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+        )
+        .await;
+    }
+    Ok(())
 }
 
 async fn prepare_stdio(stdio: Stdio, child_reads: bool) -> io::Result<(Option<Pipe>, OwnedHandle)> {
@@ -527,7 +708,12 @@ fn environment(values: Vec<(OsString, OsString)>) -> io::Result<Vec<u16>> {
         let key = wide(&key)?;
         let value = wide(&value)?;
         if key.len() <= 1
-            || key[..key.len() - 1].contains(&(b'=' as u16))
+            || (key[..key.len() - 1].contains(&(b'=' as u16))
+                && !(key.len() == 4
+                    && key[0] == b'=' as u16
+                    && ((b'A' as u16..=b'Z' as u16).contains(&key[1])
+                        || (b'a' as u16..=b'z' as u16).contains(&key[1]))
+                    && key[2] == b':' as u16))
             || key.len() > 32767
             || value.len() > 32767
         {

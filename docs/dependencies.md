@@ -4,7 +4,8 @@ Releases were checked on 2026-09-09 against the official crates.io sparse regist
 
 The Dolt change checked SQLx 0.9.0, UUID 1.26.1 and full Dolt 2.3.3 on
 2026-09-10. The memory package's catalog records the measured native archive,
-executable and license digests for all four supported targets.
+executable and license digests for each cataloged target. The Windows change
+also pins the native API bindings, strict ZIP codec and ConPTY test driver below.
 
 ## Rust dependencies
 
@@ -38,6 +39,10 @@ executable and license digests for all four supported targets.
 | `vt100` | `0.16.2` | [sparse index](https://index.crates.io/vt/10/vt100) |
 | `tar` | `0.4.46` | [sparse index](https://index.crates.io/3/t/tar) |
 | `flate2` | `1.1.10` | [sparse index](https://index.crates.io/fl/at/flate2) |
+| `zip` | `8.6.0` | [sparse index](https://index.crates.io/3/z/zip) |
+| `crc32fast` | `1.5.1` | [sparse index](https://index.crates.io/cr/c3/crc32fast) |
+| `windows-sys` | `0.61.2` | [sparse index](https://index.crates.io/wi/nd/windows-sys) |
+| `portable-pty` (Windows terminal tests) | `0.9.0` | [sparse index](https://index.crates.io/po/rt/portable-pty) |
 | `scraper` | `0.27.0` | [sparse index](https://index.crates.io/sc/ra/scraper) |
 | `roxmltree` | `0.21.1` | [sparse index](https://index.crates.io/ro/xm/roxmltree) |
 
@@ -61,7 +66,7 @@ executable and license digests for all four supported targets.
 | `oxlint` (docs app) | `1.82.0` |
 | Cocogitto (delivery package) | `7.0.0` |
 | Communiqué (delivery package) | `1.3.5` |
-| CI mise | `2026.9.3` |
+| CI mise | `2026.9.4` |
 
 Cospec is `0.7.0`, confirmed by both [GitHub releases](https://github.com/aligned-team/cospec/releases/tag/v0.7.0) and [npm](https://www.npmjs.com/package/@aligned-team/cospec). The mise latest endpoint returned an older release during the audit; it was not used to downgrade the verified newer release. Its standalone executable embeds its supported OpenSpec version. No project OpenSpec, Bun or Python dependency is required.
 

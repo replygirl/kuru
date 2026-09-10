@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::{
     fs::{self, File},
     io::{self, Read},

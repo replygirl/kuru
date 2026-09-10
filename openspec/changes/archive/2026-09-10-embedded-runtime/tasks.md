@@ -11,5 +11,5 @@
 
 ## 3. Integration and completion
 
-- [ ] 3.1 Run full mise check and native hosted packaged-runtime checks on the four existing targets; record actual coverage and tested SHA without weakening checks.
-- [ ] 3.2 Record acceptance evidence, strictly validate and archive this change before its final branch commit; preserve required PR checks before merge.
+- [x] 3.1 Run full mise check and native hosted packaged-runtime checks on the four existing targets; record actual coverage and tested SHA without weakening checks.
+- [x] 3.2 Record acceptance evidence, strictly validate and archive this change before its final branch commit; preserve required PR checks before merge.

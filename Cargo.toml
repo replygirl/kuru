@@ -8,6 +8,7 @@ members = [
   "packages/kuru-delivery",
   "packages/kuru-memory",
   "packages/kuru-platform",
+  "packages/kuru-archive",
 ]
 
 [workspace.package]
@@ -52,12 +53,16 @@ flate2 = "=1.1.10"
 scraper = "=0.27.0"
 roxmltree = "=0.21.1"
 windows-sys = { version = "=0.61.2", default-features = false }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
+crc32fast = "=1.5.1"
+portable-pty = "=0.9.0"
 kuru-core = { path = "packages/kuru-core" }
 kuru-connectors = { path = "packages/kuru-connectors" }
 kuru-runtime = { path = "packages/kuru-runtime" }
 kuru-delivery = { path = "packages/kuru-delivery" }
 kuru-memory = { path = "packages/kuru-memory" }
 kuru-platform = { path = "packages/kuru-platform" }
+kuru-archive = { path = "packages/kuru-archive" }
 
 [profile.release]
 lto = "thin"

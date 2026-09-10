@@ -1,4 +1,5 @@
-use std::{fs::OpenOptions, process::Command};
+use kuru_delivery::command::BlockingCommand as Command;
+use kuru_platform::fs::Directory;
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -27,18 +28,15 @@ fn writer_lease_rejects_a_second_process_and_releases_on_close() {
     let project = root.path().join("project");
     let data = root.path().join("data");
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::create_dir_all(data.join("locks")).unwrap();
+    let directory = Directory::ensure_private(&data.join("locks")).unwrap();
     let project = project.canonicalize().unwrap();
     let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
     let hash = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let lease = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(data.join("locks").join(format!("{hash}.lock")))
+    let lease = directory
+        .lock_file(std::ffi::OsStr::new(&format!("{hash}.lock")))
         .unwrap();
     lease.try_lock().unwrap();
     let mut args = arguments(&project, &data);
@@ -150,9 +148,10 @@ fn symlink_lock_directory_cannot_redirect_project_locks() {
     let project = root.path().join("project");
     let data = root.path().join("data");
     let outside = root.path().join("outside");
-    for path in [&project, &data, &outside] {
+    for path in [&project, &outside] {
         std::fs::create_dir_all(path).unwrap();
     }
+    Directory::ensure_private(&data).unwrap();
     std::os::unix::fs::symlink(&outside, data.join("locks")).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_kuru"))
         .args(arguments(&project, &data))
@@ -160,6 +159,10 @@ fn symlink_lock_directory_cannot_redirect_project_locks() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("regular directory"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("regular directory"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
 }

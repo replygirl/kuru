@@ -22,6 +22,174 @@ fn contents(mut file: File) -> Vec<u8> {
 }
 
 #[test]
+fn consuming_removal_deletes_only_the_retained_regular_file() {
+    let (_temporary, directory) = fixture();
+    let name = OsStr::new("retired 日本語");
+    let mut file = directory.create_new(name).unwrap();
+    file.write_all(b"retired bytes").unwrap();
+    directory.remove_file(name, file).unwrap();
+    assert!(!directory.path().join(name).exists());
+
+    let file = directory.create_new(name).unwrap();
+    let identity = regular_file_info(&file).unwrap().identity;
+    std::fs::rename(
+        directory.path().join(name),
+        directory.path().join("displaced"),
+    )
+    .unwrap();
+    directory
+        .create_new(name)
+        .unwrap()
+        .write_all(b"replacement")
+        .unwrap();
+    let error = directory.remove_file(name, file).unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert_eq!(error.identity, Some(identity));
+    assert!(error.to_string().contains("held object"));
+    assert!(std::error::Error::source(&error).is_some());
+    assert_eq!(contents(directory.read(name).unwrap()), b"replacement");
+    assert!(directory.path().join("displaced").is_file());
+
+    let file = directory.read(name).unwrap();
+    let error = directory
+        .remove_file(OsStr::new("../escape"), file)
+        .unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert_eq!(contents(directory.read(name).unwrap()), b"replacement");
+    let file = directory.read(name).unwrap();
+    std::fs::hard_link(directory.path().join(name), directory.path().join("alias")).unwrap();
+    assert_eq!(
+        directory.remove_file(name, file).unwrap_err().phase,
+        PublicationPhase::Rejected
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("alias")).unwrap(),
+        b"replacement"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn ordinary_windows_delete_pending_is_not_reported_as_completed_cleanup() {
+    let (_temporary, directory) = fixture();
+    let name = OsStr::new("pending");
+    let file = directory.create_new(name).unwrap();
+    let retained = file.try_clone().unwrap();
+    let error = directory.remove_file(name, file).unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Uncertain);
+    // Closing the other real handle completes ordinary deletion. No retry or
+    // POSIX disposition is allowed to hide the still-held object.
+    drop(retained);
+    assert_eq!(
+        directory.read(name).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn private_child_creation_is_exclusive_and_native_ancestry_survives_a_move() {
+    let (temporary, directory) = fixture();
+    let ordinary =
+        Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+    let child = ordinary
+        .create_private_directory(OsStr::new("stage privé 日本語"))
+        .unwrap();
+    let key = child.identity().to_bytes();
+    assert_ne!(key, directory.identity().to_bytes());
+    assert!(child.is_within(&ordinary).unwrap());
+    assert!(child.is_within(&child).unwrap());
+    assert!(!child.is_within(&directory).unwrap());
+    assert!(!ordinary.is_within(&child).unwrap());
+    assert_eq!(
+        ordinary
+            .create_private_directory(OsStr::new("stage privé 日本語"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    let marker = child.create_new(OsStr::new("marker")).unwrap();
+    require_private(&marker).unwrap();
+    drop(marker);
+    let moved = directory
+        .move_new_directory(&child, OsStr::new("active"))
+        .unwrap();
+    assert_eq!(moved.identity().to_bytes(), key);
+    assert!(moved.is_within(&directory).unwrap());
+    assert!(child.is_within(&ordinary).is_err());
+    let recreated = ordinary
+        .create_private_directory(OsStr::new("stage privé 日本語"))
+        .unwrap();
+    assert_ne!(recreated.identity().to_bytes(), key);
+    assert!(
+        ordinary
+            .create_private_directory(OsStr::new("../escape"))
+            .is_err()
+    );
+}
+
+#[test]
+fn unchanged_read_only_files_move_without_losing_identity_or_overwriting_names() {
+    let (_temporary, directory) = fixture();
+    let mut created = directory.create_new(OsStr::new("old")).unwrap();
+    created.write_all(b"durable unchanged original").unwrap();
+    created.sync_all().unwrap();
+    drop(created);
+    let held = directory.read(OsStr::new("old")).unwrap();
+    let identity = regular_file_info(&held).unwrap().identity;
+    #[cfg(windows)]
+    {
+        let error = directory
+            .publish_file(
+                &directory,
+                OsStr::new("old"),
+                &held,
+                OsStr::new("must-flush"),
+                Publication::New,
+            )
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert!(!directory.path().join("must-flush").exists());
+    }
+    directory
+        .rename_file(
+            &directory,
+            OsStr::new("old"),
+            &held,
+            OsStr::new("retained"),
+            Publication::New,
+        )
+        .unwrap();
+    directory.verify(OsStr::new("retained"), &held).unwrap();
+    assert_eq!(regular_file_info(&held).unwrap().identity, identity);
+    assert_eq!(
+        contents(held.try_clone().unwrap()),
+        b"durable unchanged original"
+    );
+    assert!(!directory.path().join("old").exists());
+    let mut other = directory.create_new(OsStr::new("other")).unwrap();
+    other.write_all(b"independent destination").unwrap();
+    other.sync_all().unwrap();
+    let error = directory
+        .rename_file(
+            &directory,
+            OsStr::new("retained"),
+            &held,
+            OsStr::new("other"),
+            Publication::New,
+        )
+        .unwrap_err();
+    assert_eq!(error.phase, PublicationPhase::Rejected);
+    assert_eq!(
+        contents(directory.read(OsStr::new("retained")).unwrap()),
+        b"durable unchanged original"
+    );
+    assert_eq!(
+        contents(directory.read(OsStr::new("other")).unwrap()),
+        b"independent destination"
+    );
+}
+
+#[test]
 fn private_creation_reopen_and_sealing_preserve_content_and_identity() {
     let (_temporary, directory) = fixture();
     let name = OsStr::new("mémoire 日本語");

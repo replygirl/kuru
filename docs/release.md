@@ -2,7 +2,7 @@
 
 Kuru releases use one manually dispatched workflow with a version bump as its
 only input. The workflow validates the source, creates a signed version commit
-when necessary, builds all four native archives, generates Communiqué notes,
+when necessary, builds all five native archives, generates Communiqué notes,
 publishes a complete draft release, and deploys documentation from that exact commit.
 Pushes and tags do not start release publication or deploy documentation.
 
@@ -39,7 +39,7 @@ The build job has `contents: read` and `pages: read`; only the deploy job receiv
 
 Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
 7.0.0 and Communiqué 1.3.5 pins. The latter has no Intel macOS release binary;
-native archive build jobs use only the Rust packaging task, so all four Kuru
+native archive build jobs use only the Rust packaging task, so all five Kuru
 targets remain buildable. Full maintainer tests and notes generation run on
 Linux or Apple Silicon macOS. App installation does not require these tools.
 
@@ -95,12 +95,14 @@ runtime is involved.
    tree against the expected stamp. An unchanged version reuses the checked
    commit when it remains in main's history. Later main changes are excluded.
 3. Run the full gate again on that exact version commit. Build native archives
-   on Linux x86_64/arm64 and macOS x86_64/arm64, verifying each binary's version.
+   on Linux x86_64/arm64, macOS x86_64/arm64 and Windows x86_64 MSVC, verifying
+   each binary's version and bundled offline engine. The Windows build uses a
+   static CRT and validates its PE imports against the allowed system DLLs.
 4. Generate notes in a separate job with a read-only GitHub token, alongside final
    validation of the selected version commit. No release writes are available to
    that job. Its output is an artifact for publication, which still waits for
-   validation and all four builds.
-5. Verify that all four expected archives exist and match their checksums.
+   validation and all five builds.
+5. Verify that all five expected archives exist and match their checksums.
    Create or reuse the immutable annotated tag, stage the notes and all assets
    in a draft, and verify uploaded asset digests before publishing by release ID.
    A matching complete published release is verified and reused without replacing
@@ -112,8 +114,10 @@ runtime is involved.
    through `deploy-docs`, the final release stage. These jobs are skipped if
    release publication fails.
 
-The archives retain the `kuru-VERSION-TARGET.tar.gz` naming convention and are
-published alongside `SHA256SUMS`. Users install through mise or the package-owned
+The four Unix archives retain `kuru-VERSION-TARGET.tar.gz`; Windows uses
+`kuru-VERSION-x86_64-pc-windows-msvc.zip` with exactly `kuru.exe`, `LICENSE` and
+`README.md`. All five are published alongside `SHA256SUMS`. Users install through
+mise or the package-owned
 [shell bootstrap](install.md#install-with-the-shell-bootstrap), which resolves
 latest to an explicit version and verifies its checksum before replacement.
 [Release directories](install.md#release-archives) also support HTTPS mirrors and
@@ -133,6 +137,84 @@ Version preparation checks for tracked setup changes before stamping, and
 the commit guard permits only Cargo.toml and Cargo.lock changes. An unexpected
 file is reported by name and must be fixed in source rather than reset or included
 in the version commit.
+
+## Pending Windows mise release check
+
+**Pending — requires the first authorized release containing a Windows artifact.**
+This operational check has not run. The pre-merge gate uses the real mise GitHub
+backend with simulated release metadata and actual candidate package bytes;
+that fixture does not establish published GitHub installation.
+
+After an authorized Release run publishes
+`kuru-VERSION-x86_64-pc-windows-msvc.zip`, perform this check on native Windows:
+
+1. Record the existing Release run URL, exact version and prepared commit SHA.
+   Confirm the published tag and complete five-target asset inventory, download
+   its Windows ZIP and `SHA256SUMS`, and verify the archive digest. Use that exact
+   version throughout; do not dispatch another release or use `latest`.
+2. Create an empty temporary root with separate project, home, config, data,
+   cache, state, system-config and temporary directories. Launch the pinned
+   native mise executable in a child process with an explicit environment.
+   Set `MISE_CONFIG_DIR`, `MISE_DATA_DIR`, `MISE_CACHE_DIR`, `MISE_STATE_DIR`,
+   `MISE_TMP_DIR`, `MISE_SYSTEM_CONFIG_DIR` and `MISE_SYSTEM_DATA_DIR` beneath
+   that root. Point `MISE_GLOBAL_CONFIG_FILE` and `MISE_SYSTEM_CONFIG_FILE` at
+   empty fixture files, set `MISE_CEILING_PATHS` to the root, and trust only the
+   isolated project with `MISE_TRUSTED_CONFIG_PATHS`. Also isolate HOME,
+   USERPROFILE, APPDATA, LOCALAPPDATA, TMP, TEMP and GH_CONFIG_DIR. Retain only
+   deliberate native system values and PATH prerequisites; no existing Kuru,
+   compiler, external Dolt, provider credentials or user tool shims.
+3. Start with no mise lockfile, token files, OAuth cache or inherited GitHub
+   token/proxy variables. In the isolated project's `mise.toml`, use the settings
+   below. Do not configure URL replacements, a custom API, asset pattern or direct
+   download URL. This check must contact ordinary GitHub endpoints and retain
+   default checksum/provenance verification.
+
+   ```toml
+   [settings]
+   use_versions_host = false
+   use_versions_host_track = false
+   netrc = false
+
+   [settings.github]
+   gh_cli_tokens = false
+   use_git_credentials = false
+   credential_command = ""
+   oauth_client_id = ""
+   ```
+
+4. Confirm `mise config ls` lists only the intended temporary files, then run
+   `mise use github:replygirl/kuru@VERSION`, `mise which kuru` and
+   `mise exec -- kuru --version`. Require the selected executable to live under
+   the isolated mise install directory and match both the release version and
+   the `kuru.exe` digest from the verified ZIP. A preexisting executable or a
+   successful local package test cannot satisfy this check. Do not use `-g`.
+5. Set the child process's `KURU_DATA_DIR` to an absolute `kuru-data` path beneath
+   the temporary root. In the project, create `.kuru/config.toml` with the settings
+   below, replacing the example cache path with an absolute path beneath that
+   same root. Neither Kuru's data nor engine-cache directory may already exist. Run
+   `mise exec -- kuru --provider demo --no-dream run "Published Windows check" --json`,
+   retain its `session`, and run
+   `mise exec -- kuru --provider demo --no-dream --resume SESSION run "Continue the saved conversation" --json`.
+   Require the same session and nonempty responses. Use `mise exec -- kuru memory status`,
+   `mise exec -- kuru memory history --limit 100` and `mise exec -- kuru sessions`
+   to verify the full Dolt version, durable revisions and session after reopening;
+   compare extracted engine/LICENSES hashes with the manifest at the released SHA.
+
+   ```toml
+   [memory]
+   cache_dir = 'C:\Temp\CHECK\kuru-engine-cache'
+   offline = true
+   ```
+
+Record the runner/OS, mise version, release/run URLs, version/commit, archive and
+installed executable digests, configuration isolation, command exit statuses,
+session/revision results and logs before changing this status to verified.
+Offline configuration and absent external tools prove the bundled-runtime path;
+record any separately enforced network restriction accurately. A failure stays
+pending with its diagnostics and is not repaired by replacing published assets.
+Observe owned process shutdown before deleting the temporary root. This procedure
+performs read-only release retrieval and isolated local installation; it does not
+publish a release or documentation and adds no workflow entrypoint.
 
 ## Notes model and configuration
 

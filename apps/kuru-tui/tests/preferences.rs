@@ -1,7 +1,8 @@
+use kuru_delivery::command::BlockingCommand as Command;
 use kuru_memory::MemoryStore;
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
     sync::Arc,
 };
 
@@ -215,7 +216,7 @@ async fn configuration_inspection_does_not_create_a_store_but_rejects_existing_t
     assert_eq!(sandbox.config(&[]).mode, Mode::Ifs);
     assert!(!sandbox.data.exists());
     let nested = sandbox.project.join("state");
-    std::fs::create_dir_all(&nested).unwrap();
+    kuru_platform::fs::Directory::ensure_private(&nested).unwrap();
     std::fs::write(nested.join("memory.sqlite3"), b"existing legacy store").unwrap();
     let output = sandbox
         .command_for(&sandbox.project, &nested, "demo")
@@ -223,7 +224,15 @@ async fn configuration_inspection_does_not_create_a_store_but_rejects_existing_t
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("outside the tool workspace"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outside the tool workspace"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(nested.join("memory.sqlite3")).unwrap(),
+        b"existing legacy store"
+    );
 }
 
 #[tokio::test]

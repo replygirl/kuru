@@ -112,16 +112,8 @@ async fn hook_environment_cannot_redirect_rooted_commands() {
         );
         release::run(
             repo.root(),
-            "/bin/sh",
-            &[
-                "-c",
-                r#"
-            test "$GIT_SSH_COMMAND" = fixture-ssh &&
-            test "$SSH_AUTH_SOCK" = fixture-agent &&
-            test "$GIT_ASKPASS" = fixture-askpass &&
-            test "$OPENAI_API_KEY" = fixture-inherited-key
-        "#,
-            ],
+            env!("CARGO_BIN_EXE_kuru-delivery-fixture"),
+            &["check-hook-env"],
         )
         .await
         .unwrap();
@@ -296,7 +288,7 @@ async fn plans_initial_release_and_reuses_prepared_or_tagged_heads_without_input
 async fn real_cli_calculates_plans_and_stamps_without_remote_credentials() {
     let repo = Repo::new().await;
     let binary = env!("CARGO_BIN_EXE_kuru-release");
-    let output = tokio::process::Command::new(binary)
+    let output = kuru_delivery::command::Command::new(binary)
         .arg("--root")
         .arg(repo.root())
         .args(["version", "auto"])
@@ -306,7 +298,7 @@ async fn real_cli_calculates_plans_and_stamps_without_remote_credentials() {
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "0.1.0");
     let outputs = repo.root().join("outputs");
-    let output = tokio::process::Command::new(binary)
+    let output = kuru_delivery::command::Command::new(binary)
         .arg("--root")
         .arg(repo.root())
         .args(["plan", "--bump", "auto"])
@@ -320,7 +312,7 @@ async fn real_cli_calculates_plans_and_stamps_without_remote_credentials() {
             .unwrap()
             .contains("version=0.1.0\n")
     );
-    let output = tokio::process::Command::new(binary)
+    let output = kuru_delivery::command::Command::new(binary)
         .arg("--root")
         .arg(repo.root())
         .args(["stamp", "0.2.0"])
@@ -332,7 +324,7 @@ async fn real_cli_calculates_plans_and_stamps_without_remote_credentials() {
         release::workspace_version(repo.root(), None).await.unwrap(),
         v("0.2.0")
     );
-    let output = tokio::process::Command::new(binary)
+    let output = kuru_delivery::command::Command::new(binary)
         .args(["commit", "--version", "0.2.0", "--expected-sha", A])
         .env_remove("GH_REPO")
         .env_remove("GH_TOKEN")
@@ -341,7 +333,7 @@ async fn real_cli_calculates_plans_and_stamps_without_remote_credentials() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("GH_REPO is required"));
-    let output = tokio::process::Command::new(binary)
+    let output = kuru_delivery::command::Command::new(binary)
         .args([
             "publish",
             "--version",
@@ -358,7 +350,7 @@ async fn real_cli_calculates_plans_and_stamps_without_remote_credentials() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("GH_TOKEN is required"));
-    let output = tokio::process::Command::new(binary)
+    let output = kuru_delivery::command::Command::new(binary)
         .args(["stamp", "1.0.0;id"])
         .output()
         .await
@@ -800,7 +792,7 @@ impl Archives {
         // Publication validates opaque packager output. Installer/package tests
         // independently validate tar contents; here each native asset is distinct.
         for target in release::TARGETS {
-            let name = format!("kuru-0.1.0-{target}.tar.gz");
+            let name = kuru_delivery::archive::archive_name("0.1.0", target).unwrap();
             let data = format!("verified native fixture {target}");
             fs::write(directory.join(&name), &data).unwrap();
             fs::write(
@@ -851,7 +843,7 @@ async fn interrupted_draft_resumes_missing_assets_then_publishes_exact_commit() 
     );
     {
         let remote = server.state.lock().unwrap();
-        assert_eq!(remote.uploads.len(), 5);
+        assert_eq!(remote.uploads.len(), 6);
         assert_eq!(remote.release.as_ref().unwrap()["draft"], false);
         assert!(
             remote.release.as_ref().unwrap()["body"]
@@ -881,7 +873,7 @@ async fn interrupted_draft_resumes_missing_assets_then_publishes_exact_commit() 
             .unwrap()
             .lines()
             .count(),
-        4
+        release::TARGETS.len()
     );
 }
 #[tokio::test]
@@ -972,7 +964,7 @@ async fn published_recovery_rejects_incomplete_or_mismatched_remote_content() {
 async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
     let archives = Archives::new();
     let server = Server::new(A).await;
-    let name = format!("kuru-0.1.0-{}.tar.gz", release::TARGETS[0]);
+    let name = kuru_delivery::archive::archive_name("0.1.0", release::TARGETS[0]).unwrap();
     let path = archives.directory.join(name);
     let original = fs::read(&path).unwrap();
     fs::remove_file(&path).unwrap();
@@ -982,7 +974,7 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("four supported")
+            .contains("five supported")
     );
     fs::write(&path, b"corrupt").unwrap();
     assert!(

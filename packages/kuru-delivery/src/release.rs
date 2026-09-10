@@ -1,5 +1,6 @@
 //! Conventional versioning and immutable GitHub release publication.
 use crate::archive::digest;
+use crate::command::Command;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, Method, StatusCode, Url};
@@ -12,14 +13,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::process::Command;
 
-pub const TARGETS: [&str; 4] = [
-    "aarch64-apple-darwin",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-];
+pub use crate::targets::TARGETS;
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,49 +56,21 @@ pub fn checked_sha(value: &str) -> Result<&str> {
 /// Select `root` independently of Git's inherited hook environment. Apply any
 /// deliberate repository overrides, such as a private index, after this call.
 pub fn rooted_command(root: &Path, program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.current_dir(root);
-    // Git's `rev-parse --local-env-vars` contract also applies to indirect Git
-    // users such as cog and Communiqué. Keep global signing/auth settings.
-    for key in [
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_IMPLICIT_WORK_TREE",
-        "GIT_GRAFT_FILE",
-        "GIT_INDEX_FILE",
-        "GIT_NO_REPLACE_OBJECTS",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_PREFIX",
-        "GIT_SHALLOW_FILE",
-        "GIT_COMMON_DIR",
-    ] {
-        command.env_remove(key);
-    }
-    command
+    crate::command::rooted(root, program)
 }
 pub async fn run(root: &Path, program: &str, args: &[&str]) -> Result<String> {
     command_output(rooted_command(root, program).args(args)).await
 }
 async fn command_output(command: &mut Command) -> Result<String> {
-    let program = command
-        .as_std()
-        .get_program()
+    let program = crate::command::program(command)
         .to_string_lossy()
         .into_owned();
-    let output = tokio::time::timeout(
+    let output = crate::command::output(
+        command.env("GIT_TERMINAL_PROMPT", "0").kill_on_drop(true),
         Duration::from_secs(180),
-        command
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .kill_on_drop(true)
-            .output(),
     )
     .await
-    .context("tool timed out")??;
+    .context("tool execution failed")?;
     ensure!(
         output.status.success(),
         "{program} failed ({})",
@@ -651,18 +618,18 @@ pub async fn ensure_tag(api: &GitHub, selected: Version, candidate: &str) -> Res
 pub fn assets(directory: &Path, selected: Version) -> Result<BTreeMap<String, String>> {
     let expected: BTreeSet<_> = TARGETS
         .iter()
-        .map(|target| format!("kuru-{selected}-{target}.tar.gz"))
-        .collect();
+        .map(|target| crate::archive::archive_name(&selected.to_string(), target))
+        .collect::<Result<_>>()?;
     let mut actual = BTreeSet::new();
     for entry in fs::read_dir(directory)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".tar.gz") {
+        if name.ends_with(".tar.gz") || name.ends_with(".zip") {
             actual.insert(name);
         }
     }
     ensure!(
         actual == expected,
-        "release must contain exactly four supported native archives"
+        "release must contain exactly five supported native archives"
     );
     let mut checksums = BTreeMap::new();
     for name in expected {
@@ -755,7 +722,7 @@ async fn published_url(api: &GitHub, release: &Value, selected: Version) -> Resu
     );
     let mut checksums = BTreeMap::new();
     for target in TARGETS {
-        let name = format!("kuru-{selected}-{target}.tar.gz");
+        let name = crate::archive::archive_name(&selected.to_string(), target)?;
         checksums.insert(
             name.clone(),
             crate::archive::expected_digest(&bytes, &name)?,

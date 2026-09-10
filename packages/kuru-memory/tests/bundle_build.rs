@@ -4,7 +4,17 @@ mod bundle;
 use bundle::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{fs, os::unix::fs::symlink, path::Path};
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+use std::{fs, path::Path};
+#[cfg(windows)]
+fn symlink(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Result<()> {
+    if source.as_ref().is_dir() {
+        std::os::windows::fs::symlink_dir(source, target)
+    } else {
+        std::os::windows::fs::symlink_file(source, target)
+    }
+}
 
 const MANIFEST: &[u8] = include_bytes!("../support/dolt-assets.json");
 
@@ -17,6 +27,7 @@ fn target_selection_uses_requested_target_and_generates_coherent_versioned_paylo
         "x86_64-apple-darwin",
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
     ] {
         let asset = manifest.select(target).unwrap();
         assert_eq!(asset.target, target);
@@ -31,7 +42,7 @@ fn target_selection_uses_requested_target_and_generates_coherent_versioned_paylo
         assert!(selected.contains(&asset.license_sha256));
         assert!(generated.contains(&format!("DOLT_VERSION: &str = {:?}", manifest.version)));
     }
-    for target in ["", "x86_64-pc-windows-msvc", "aarch64-unknown-linux-musl"] {
+    for target in ["", "aarch64-pc-windows-msvc", "aarch64-unknown-linux-musl"] {
         assert!(
             manifest
                 .select(target)
@@ -54,6 +65,11 @@ fn malformed_or_ambiguous_manifests_cannot_produce_a_bundle() {
         ("/upstream_commit", json!("bad")),
         ("/assets/0/target", json!("../escape")),
         ("/assets/0/stem", json!("dolt-linux-arm64")),
+        ("/assets/0/format", json!("zip")),
+        ("/assets/0/executable_name", json!("dolt.exe")),
+        ("/assets/4/format", json!("tar.gz")),
+        ("/assets/4/executable_name", json!("dolt")),
+        ("/assets/4/expanded_bytes", json!(130339212)),
         ("/assets/0/url", json!("http://localhost/archive")),
         ("/assets/0/compressed_bytes", json!(MAX_COMPRESSED + 1)),
         ("/assets/0/compressed_bytes", json!(0)),
@@ -128,9 +144,12 @@ fn prepared_inputs_reject_missing_truncated_corrupt_linked_and_mismatched_target
     symlink(&directory, &linked_parent).unwrap();
     assert!(verified_archive(&linked_parent.join(path.file_name().unwrap()), asset).is_err());
     assert!(verified_archive(&directory, asset).is_err());
-    let fifo = directory.join("fifo");
-    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
-    assert!(verified_archive(&fifo, asset).is_err());
+    #[cfg(unix)]
+    {
+        let fifo = directory.join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        assert!(verified_archive(&fifo, asset).is_err());
+    }
     assert!(verified_archive(Path::new("relative.archive"), asset).is_err());
     let traversal = directory
         .join("..")
@@ -152,25 +171,16 @@ fn prepared_inputs_reject_missing_truncated_corrupt_linked_and_mismatched_target
 
 #[test]
 fn build_mirror_is_explicit_absolute_and_independent_of_cargo_output_target() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let package = workspace.join("packages/kuru-memory");
+    let mirror = root.path().join("offline mirror");
     assert_eq!(
-        bundle_directory(Path::new("/workspace/packages/kuru-memory"), None).unwrap(),
-        Path::new("/workspace/target/kuru-bundles")
+        bundle_directory(&package, None).unwrap(),
+        workspace.join("target/kuru-bundles")
     );
-    assert_eq!(
-        bundle_directory(
-            Path::new("/workspace/packages/kuru-memory"),
-            Some(Path::new("/offline/mirror"))
-        )
-        .unwrap(),
-        Path::new("/offline/mirror")
-    );
-    assert!(
-        bundle_directory(
-            Path::new("/workspace/packages/kuru-memory"),
-            Some(Path::new("relative"))
-        )
-        .is_err()
-    );
+    assert_eq!(bundle_directory(&package, Some(&mirror)).unwrap(), mirror);
+    assert!(bundle_directory(&package, Some(Path::new("relative"))).is_err());
     assert!(bundle_directory(Path::new("/"), None).is_err());
 }
 

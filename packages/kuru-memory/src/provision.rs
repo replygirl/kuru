@@ -2,24 +2,25 @@
 
 pub use crate::catalog::DOLT_VERSION;
 use crate::catalog::{Asset, BUNDLED_ASSET, EMBEDDED_ARCHIVE, MAX_COMPRESSED, MAX_EXPANDED};
+use crate::files::{self, PrivateTemp};
 use anyhow::{Context, Result, bail, ensure};
 use flate2::bufread::GzDecoder;
 use kuru_core::MemoryConfig;
+use kuru_platform::fs::{Directory, NameRetention, Privacy, seal_private};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     borrow::Cow,
     collections::HashSet,
-    fs::{self, File, OpenOptions, TryLockError},
-    io::{Cursor, Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    fs::{self, File, TryLockError},
+    io::{Cursor, Read},
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    process::Command,
-};
+use tokio::io::{AsyncRead, AsyncReadExt};
+#[cfg(unix)]
+use tokio::process::Command;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,11 +35,7 @@ pub async fn provision(config: &MemoryConfig, default_cache: &Path) -> Result<Pa
         let binary = binary
             .canonicalize()
             .context("resolve configured Dolt executable")?;
-        let home = tempfile::Builder::new()
-            .prefix("kuru-dolt-version-")
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir()?;
-        verify_version(&binary, home.path()).await?;
+        private_probe(binary.clone()).await?;
         return Ok(binary);
     }
     provision_managed(
@@ -86,10 +83,7 @@ async fn provision_with_extractor(
         fs::symlink_metadata(&destination).is_err(),
         "Dolt cache destination is not a new directory"
     );
-    let staging = tempfile::Builder::new()
-        .prefix(".install-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in(&versions)?;
+    let staging = PrivateTemp::new(".install-", Some(&versions))?;
     let candidate = staging.path().join("runtime");
     let candidate_path = candidate.clone();
     let (staging, _lock, extraction) = tokio::task::spawn_blocking(move || {
@@ -100,15 +94,20 @@ async fn provision_with_extractor(
     })
     .await?;
     extraction?;
-    let probe_home = staging.path().join("probe");
-    verify_version(&candidate.join("dolt"), &probe_home).await?;
+    let (staging, _lock) = owned_probe(
+        candidate.join(asset.executable_name),
+        staging.path().join("probe"),
+        (staging, _lock),
+    )
+    .await?;
     activate(&candidate, &destination)?;
-    Ok(destination.join("dolt"))
+    drop(staging);
+    Ok(destination.join(asset.executable_name))
 }
 
 async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
     check_directory(directory)?;
-    let binary = directory.join("dolt");
+    let binary = directory.join(asset.executable_name);
     let executable = binary.clone();
     let executable_bytes = asset.executable_bytes;
     let executable_sha256 = asset.executable_sha256.to_owned();
@@ -120,12 +119,37 @@ async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
         verify_payload(&licenses, license_bytes, &license_sha256, false)
     })
     .await??;
-    let home = tempfile::Builder::new()
-        .prefix("kuru-dolt-version-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()?;
-    verify_version(&binary, home.path()).await?;
+    private_probe(binary.clone()).await?;
     Ok(binary)
+}
+
+async fn private_probe(binary: PathBuf) -> Result<()> {
+    let home = PrivateTemp::new("kuru-dolt-version-", None)?;
+    owned_probe(binary, home.path().to_owned(), home).await?;
+    Ok(())
+}
+
+async fn owned_probe<T: Send + 'static>(binary: PathBuf, home: PathBuf, retained: T) -> Result<T> {
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("kuru-dolt-probe".into())
+        .spawn(move || {
+            // This process owner must survive destruction of its caller's executor.
+            // Sending to a canceled caller drops retained resources here, only
+            // after the bounded probe and actual owned child reap have completed.
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("create owned Dolt probe executor")
+                .and_then(|runtime| runtime.block_on(verify_version(&binary, &home)));
+            let _ = send.send((retained, result));
+        })
+        .context("start owned Dolt probe thread")?;
+    let (retained, result) = receive
+        .await
+        .context("owned Dolt probe did not return its result")?;
+    result?;
+    Ok(retained)
 }
 
 fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
@@ -144,6 +168,13 @@ fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
     ensure!(
         asset.expanded_bytes <= MAX_EXPANDED,
         "pinned Dolt archive exceeds expanded byte budget"
+    );
+    if asset.format == "zip" {
+        return extract_zip(archive, destination, asset);
+    }
+    ensure!(
+        asset.format == "tar.gz",
+        "unsupported pinned Dolt archive format"
     );
     // Bound decompression before tar sees extension headers or payload lengths.
     let mut expanded = Vec::new();
@@ -208,11 +239,7 @@ fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
         let mut file = new_private_file(&path)?;
         let copied = std::io::copy(&mut entry, &mut file)?;
         ensure!(copied == length, "Dolt archive payload is truncated");
-        file.set_permissions(fs::Permissions::from_mode(if output == "dolt" {
-            0o500
-        } else {
-            0o400
-        }))?;
+        seal_private(&file, output == "dolt")?;
         file.sync_all()?;
         verify_payload(&path, length, checksum, output == "dolt")?;
     }
@@ -228,6 +255,7 @@ fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
         expanded[position..].iter().all(|byte| *byte == 0),
         "Dolt archive contains trailing tar data"
     );
+    #[cfg(unix)]
     File::open(destination)?.sync_all()?;
     Ok(())
 }
@@ -237,30 +265,111 @@ fn activate(candidate: &Path, destination: &Path) -> Result<()> {
         fs::symlink_metadata(destination).is_err(),
         "Dolt cache destination appeared during installation"
     );
-    fs::rename(candidate, destination).context("activate verified Dolt runtime")?;
-    File::open(
-        destination
-            .parent()
-            .context("Dolt cache requires a parent")?,
-    )?
-    .sync_all()?;
+    files::move_directory(&files::directory(candidate)?, destination)
+        .context("activate verified Dolt runtime")?;
     Ok(())
 }
 
-async fn cache_lock(directory: &Path, timeout: Duration) -> Result<File> {
+fn extract_zip(bytes: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
+    use kuru_archive::zip::{Archive, Limits, MemberKind, MemberSpec};
+    let directory = format!("{}/", asset.stem);
+    let bin_directory = format!("{}/bin/", asset.stem);
+    let executable = format!("{}/bin/{}", asset.stem, asset.executable_name);
+    let licenses = format!("{}/LICENSES", asset.stem);
+    let expected = [
+        MemberSpec {
+            name: &directory,
+            kind: MemberKind::Directory,
+            max_bytes: 0,
+            exact_bytes: Some(0),
+            unix_mode: Some(0o040755),
+        },
+        MemberSpec {
+            name: &bin_directory,
+            kind: MemberKind::Directory,
+            max_bytes: 0,
+            exact_bytes: Some(0),
+            unix_mode: Some(0o040755),
+        },
+        MemberSpec {
+            name: &executable,
+            kind: MemberKind::File,
+            max_bytes: asset.executable_bytes,
+            exact_bytes: Some(asset.executable_bytes),
+            unix_mode: Some(0o100755),
+        },
+        MemberSpec {
+            name: &licenses,
+            kind: MemberKind::File,
+            max_bytes: asset.license_bytes,
+            exact_bytes: Some(asset.license_bytes),
+            unix_mode: Some(0o100644),
+        },
+    ];
+    let mut archive = Archive::open(
+        bytes,
+        &expected,
+        Limits {
+            max_compressed_bytes: MAX_COMPRESSED,
+            max_expanded_bytes: asset.expanded_bytes,
+            allow_ntfs_timestamps: true,
+        },
+    )?;
+    private_directory(destination)?;
+    let parent = files::directory(destination)?;
+    for (member, output, size, digest, executable) in [
+        (
+            &executable,
+            asset.executable_name,
+            asset.executable_bytes,
+            asset.executable_sha256,
+            true,
+        ),
+        (
+            &licenses,
+            "LICENSES",
+            asset.license_bytes,
+            asset.license_sha256,
+            false,
+        ),
+    ] {
+        let mut file = parent.create_new(std::ffi::OsStr::new(output))?;
+        ensure!(
+            archive.copy(member, &mut file)? == size,
+            "Dolt ZIP payload size mismatch"
+        );
+        file.sync_all()?;
+        seal_private(&file, executable)?;
+        parent.verify(std::ffi::OsStr::new(output), &file)?;
+        drop(file);
+        verify_payload(&destination.join(output), size, digest, executable)?;
+    }
+    #[cfg(unix)]
+    File::open(destination)?.sync_all()?;
+    Ok(())
+}
+
+struct CacheLock {
+    file: File,
+    _directory: Directory,
+}
+impl std::ops::Deref for CacheLock {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+async fn cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
     let path = directory.join(".install.lock");
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&path)
+    let directory = Directory::open(directory, Privacy::OwnerOnly, NameRetention::Pinned)?;
+    let file = directory
+        .lock_file(files::name(&path)?)
         .context("open stable Dolt installation lock")?;
     checked_regular(&path, false)?;
     let start = tokio::time::Instant::now();
     loop {
+        directory.verify(files::name(&path)?, &file)?;
         match file.try_lock() {
             Ok(()) => break,
             Err(TryLockError::WouldBlock) => {
@@ -273,85 +382,46 @@ async fn cache_lock(directory: &Path, timeout: Duration) -> Result<File> {
             Err(error) => return Err(error).context("lock Dolt installation"),
         }
     }
-    let opened = file.metadata()?;
-    let named = fs::symlink_metadata(&path)?;
-    ensure!(
-        (opened.dev(), opened.ino()) == (named.dev(), named.ino()),
-        "Dolt installation lock was replaced while waiting"
-    );
-    Ok(file)
+    directory
+        .verify(files::name(&path)?, &file)
+        .context("Dolt installation lock was replaced while waiting")?;
+    Ok(CacheLock {
+        file,
+        _directory: directory,
+    })
 }
 
 pub(crate) fn private_directory(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => check_directory(path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(path)?;
-            check_directory(path)
-        }
-        Err(error) => Err(error).context("inspect private Dolt directory"),
-    }
+    files::private_dir(path).context("inspect private Dolt directory")
 }
 
 fn check_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "Dolt directory must be an ordinary directory: {}",
-        path.display()
-    );
-    ensure!(
-        metadata.uid() == nix::unistd::getuid().as_raw(),
-        "Dolt directory belongs to another user: {}",
-        path.display()
-    );
-    ensure!(
-        metadata.permissions().mode() & 0o077 == 0,
-        "Dolt directory must be private (mode 0700): {}",
-        path.display()
-    );
+    files::directory(path)?;
     Ok(())
 }
 
 fn checked_regular(path: &Path, executable: bool) -> Result<fs::Metadata> {
-    let metadata = fs::symlink_metadata(path)
+    let (_parent, file) = files::read(path, Privacy::Inherited)
         .with_context(|| format!("inspect Dolt file {}", path.display()))?;
-    ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.nlink() == 1,
-        "Dolt file must be a regular file without links: {}",
-        path.display()
-    );
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
     ensure!(
         !executable || metadata.permissions().mode() & 0o111 != 0,
         "configured Dolt file is not executable"
     );
+    #[cfg(windows)]
+    let _ = executable;
     Ok(metadata)
 }
 
 fn open_regular(path: &Path) -> Result<File> {
-    let expected = checked_regular(path, false)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)?;
-    let actual = file.metadata()?;
-    ensure!(
-        (expected.dev(), expected.ino()) == (actual.dev(), actual.ino()),
-        "Dolt file changed while opening"
-    );
+    let (_parent, file) = files::read(path, Privacy::Inherited)?;
     Ok(file)
 }
 
 fn new_private_file(path: &Path) -> Result<File> {
-    Ok(OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)?)
+    let parent = files::parent(path, Privacy::OwnerOnly, NameRetention::Movable)?;
+    Ok(parent.create_new(files::name(path)?)?)
 }
 
 fn verify_payload(path: &Path, size: u64, expected: &str, executable: bool) -> Result<()> {
@@ -362,6 +432,7 @@ fn verify_payload(path: &Path, size: u64, expected: &str, executable: bool) -> R
         path.display()
     );
     let mut file = open_regular(path)?;
+    kuru_platform::fs::require_private(&file)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -408,15 +479,11 @@ pub(crate) fn prepare_private_home(home: &Path) -> Result<()> {
     for key in ["metrics.disabled", "versioncheck.disabled"] {
         values.insert(key.to_string(), "true".into());
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(config.parent().unwrap())?;
-    serde_json::to_writer(&mut temporary, &values)?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(&config).map_err(|error| error.error)?;
-    File::open(config.parent().unwrap())?.sync_all()?;
+    files::write_dolt_config(&config, &serde_json::to_vec(&values)?)?;
     Ok(())
 }
 
+#[cfg(unix)]
 pub(crate) fn isolated_command(binary: &Path, home: &Path) -> Command {
     let mut command = Command::new(binary);
     command
@@ -440,21 +507,18 @@ pub async fn verify_version(binary: &Path, private_home: &Path) -> Result<()> {
 async fn verify_version_with_timeout(binary: &Path, home: &Path, timeout: Duration) -> Result<()> {
     checked_regular(binary, true)?;
     prepare_private_home(home)?;
-    let mut child = isolated_command(binary, home)
-        .arg("version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start configured Dolt executable")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("Dolt version stdout is missing")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("Dolt version stderr is missing")?;
+    let mut child = crate::engine::spawn(
+        binary,
+        home,
+        home,
+        vec!["version".into()],
+        Vec::new(),
+        false,
+    )
+    .await
+    .context("start configured Dolt executable")?;
+    let stdout = child.stdout().context("Dolt version stdout is missing")?;
+    let stderr = child.stderr().context("Dolt version stderr is missing")?;
     let result = tokio::time::timeout(timeout, async {
         let (status, stdout, _stderr) = tokio::try_join!(
             async { Ok::<_, anyhow::Error>(child.wait().await?) },
@@ -471,8 +535,18 @@ async fn verify_version_with_timeout(binary: &Path, home: &Path, timeout: Durati
     .await;
     let result = result.unwrap_or_else(|_| Err(anyhow::anyhow!("Dolt version probe timed out")));
     if result.is_err() {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        let _ = child.kill();
+        if child.wait().await.is_err() {
+            eprintln!(
+                "Dolt version cleanup is delayed; retaining the owned process and probe resources"
+            );
+            loop {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
     }
     result
 }
@@ -491,4 +565,6 @@ async fn bounded_output(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+mod native_tests;
+#[cfg(all(test, unix))]
 mod tests;

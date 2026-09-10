@@ -8,24 +8,34 @@ dir = "{{config_root}}/../.."
 env.CARGO_BUILD_TARGET = false
 env.RUSTFLAGS = false
 env.CARGO_ENCODED_RUSTFLAGS = false
+env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = false
 env.KURU_DOLT_BUNDLE_TARGET = "{{vars.kuru_memory_bundle_target}}"
 run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- bundle prepare"
 
 [tasks.build]
+shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
 usage = 'flag "--target <target>" default="{{vars.kuru_memory_bundle_target}}"'
 env.CARGO_BUILD_TARGET = false
 depends = [{ task = "bundle:prepare", args = ["--target", "{{usage.target}}"] }]
 run = 'cargo build -p kuru-memory --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru-memory --all-features --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
 
 [tasks."build:release"]
+shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
 usage = 'flag "--target <target>" default="{{vars.kuru_memory_bundle_target}}"'
 env.CARGO_BUILD_TARGET = false
 depends = [{ task = "bundle:prepare", args = ["--target", "{{usage.target}}"] }]
 run = 'cargo build -p kuru-memory --release --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru-memory --release --all-features --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
 
 [tasks.test]
-depends = ["prefetch"]
+env.RUST_TEST_THREADS = "2"
+depends = ["prefetch", "bundle:test-fixtures"]
 run = "cargo test -p kuru-memory --all-targets --all-features --locked"
+
+[tasks."bundle:test-fixtures"]
+description = "Prepare the actual upstream Windows ZIP for host-independent decoder tests"
+depends = [{ task = "bundle:prepare", args = ["--target", "x86_64-pc-windows-msvc"] }]
 
 [tasks.typecheck]
 depends = ["bundle:prepare"]

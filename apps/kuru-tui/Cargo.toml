@@ -1,10 +1,25 @@
 [package]
 name = "kuru"
+default-run = "kuru"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "A chat harness with a native pool of persistent peer agents"
+
+[features]
+default = []
+test-support = ["kuru-platform/test-support"]
+
+[[bin]]
+name = "kuru-terminal-windows-fixture"
+path = "tests/fixtures/windows_terminal.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "kuru-cli-windows-fixture"
+path = "tests/fixtures/windows_cli.rs"
+required-features = ["test-support"]
 
 [dependencies]
 kuru-delivery.workspace = true
@@ -12,6 +27,7 @@ anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 kuru-core.workspace = true
+kuru-platform.workspace = true
 kuru-memory.workspace = true
 kuru-connectors.workspace = true
 kuru-runtime.workspace = true
@@ -36,6 +52,10 @@ flate2.workspace = true
 [target.'cfg(unix)'.dev-dependencies]
 nix.workspace = true
 rustix.workspace = true
+vt100.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+portable-pty.workspace = true
 vt100.workspace = true
 
 [lints]

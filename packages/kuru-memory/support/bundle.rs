@@ -1,13 +1,12 @@
 //! Local build-input policy, shared with behavioral tests; never uses the network.
 use anyhow::{Context, Result, ensure};
+use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    fs::{self, OpenOptions},
     io::Read,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 pub const MAX_COMPRESSED: u64 = 64 * 1024 * 1024;
@@ -28,6 +27,8 @@ pub struct Manifest {
 pub struct Asset {
     pub target: String,
     pub stem: String,
+    pub format: String,
+    pub executable_name: String,
     pub url: String,
     pub compressed_bytes: u64,
     pub archive_sha256: String,
@@ -73,8 +74,8 @@ impl Manifest {
             "invalid Dolt upstream commit"
         );
         ensure!(
-            manifest.assets.len() == 4,
-            "Dolt manifest must cover the four supported targets"
+            manifest.assets.len() == 5,
+            "Dolt manifest must cover the five supported targets"
         );
         let mut targets = HashSet::new();
         for asset in &manifest.assets {
@@ -84,17 +85,27 @@ impl Manifest {
                 "x86_64-apple-darwin" => "dolt-darwin-amd64",
                 "aarch64-unknown-linux-gnu" => "dolt-linux-arm64",
                 "x86_64-unknown-linux-gnu" => "dolt-linux-amd64",
+                "x86_64-pc-windows-msvc" => "dolt-windows-amd64",
                 _ => anyhow::bail!("unsupported Dolt bundle target {}", asset.target),
             };
             ensure!(
                 asset.stem == stem,
                 "Dolt archive stem does not match target"
             );
+            let (format, executable_name) = if asset.target == "x86_64-pc-windows-msvc" {
+                ("zip", "dolt.exe")
+            } else {
+                ("tar.gz", "dolt")
+            };
+            ensure!(
+                asset.format == format && asset.executable_name == executable_name,
+                "Dolt archive format or executable does not match target"
+            );
             ensure!(
                 asset.url
                     == format!(
-                        "https://github.com/dolthub/dolt/releases/download/v{}/{}.tar.gz",
-                        manifest.version, stem
+                        "https://github.com/dolthub/dolt/releases/download/v{}/{}.{}",
+                        manifest.version, stem, format
                     ),
                 "Dolt archive URL does not match pinned release"
             );
@@ -112,7 +123,11 @@ impl Manifest {
                     && asset
                         .executable_bytes
                         .checked_add(asset.license_bytes)
-                        .is_some_and(|size| size < asset.expanded_bytes),
+                        .is_some_and(|size| if format == "zip" {
+                            size == asset.expanded_bytes
+                        } else {
+                            size < asset.expanded_bytes
+                        }),
                 "Dolt payload sizes exceed expanded archive"
             );
             for digest in [
@@ -139,9 +154,11 @@ impl Manifest {
         let selected = self.select(target)?;
         let render = |asset: &Asset| {
             format!(
-                "Asset {{ target: {:?}, stem: {:?}, compressed_bytes: {}, archive_sha256: {:?}, expanded_bytes: {}, executable_bytes: {}, executable_sha256: {:?}, license_bytes: {}, license_sha256: {:?} }}",
+                "Asset {{ target: {:?}, stem: {:?}, format: {:?}, executable_name: {:?}, compressed_bytes: {}, archive_sha256: {:?}, expanded_bytes: {}, executable_bytes: {}, executable_sha256: {:?}, license_bytes: {}, license_sha256: {:?} }}",
                 asset.target,
                 asset.stem,
+                asset.format,
+                asset.executable_name,
                 asset.compressed_bytes,
                 asset.archive_sha256,
                 asset.expanded_bytes,
@@ -152,7 +169,7 @@ impl Manifest {
             )
         };
         Ok(format!(
-            "pub const DOLT_VERSION: &str = {:?};\npub(crate) const BUNDLED_ASSET: Asset<'static> = {};\n#[cfg(test)]\npub(crate) const ASSETS: [Asset<'static>; 4] = [{}];\n",
+            "pub const DOLT_VERSION: &str = {:?};\npub(crate) const BUNDLED_ASSET: Asset<'static> = {};\n#[cfg(test)]\npub(crate) const ASSETS: [Asset<'static>; 5] = [{}];\n",
             self.version,
             render(selected),
             self.assets.iter().map(render).collect::<Vec<_>>().join(",")
@@ -202,53 +219,22 @@ pub fn verified_archive(path: &Path, asset: &Asset) -> Result<Vec<u8>> {
 
 fn read_checked(path: &Path, limit: u64) -> Result<Vec<u8>> {
     ensure!(path.is_absolute(), "Dolt build input path must be absolute");
-    let mut prefix = PathBuf::new();
-    for component in path
-        .parent()
-        .context("build input has no parent")?
-        .components()
-    {
-        ensure!(
-            !matches!(component, Component::ParentDir),
-            "Dolt build input cannot contain parent traversal"
-        );
-        prefix.push(component);
-        let metadata = fs::symlink_metadata(&prefix)?;
-        // macOS exposes these root-owned aliases even for standard temp paths.
-        let system_alias = cfg!(target_os = "macos")
-            && metadata.uid() == 0
-            && matches!(prefix.to_str(), Some("/tmp" | "/var" | "/etc"))
-            && metadata.file_type().is_symlink()
-            && Path::new("/").join(fs::read_link(&prefix)?)
-                == Path::new("/private").join(prefix.strip_prefix("/")?);
-        ensure!(
-            metadata.is_dir() || system_alias,
-            "Dolt build input ancestor must be an ordinary directory"
-        );
-    }
-    let before = fs::symlink_metadata(path)?;
+    let parent = Directory::open(
+        path.parent().context("build input has no parent")?,
+        Privacy::Inherited,
+        NameRetention::Pinned,
+    )?;
+    let name = path.file_name().context("build input has no name")?;
+    let mut file = parent.read(name)?;
     ensure!(
-        before.is_file() && before.nlink() == 1 && before.len() <= limit,
+        regular_file_info(&file)?.len <= limit,
         "Dolt build input must be a bounded regular file without links"
-    );
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)?;
-    let opened = file.metadata()?;
-    ensure!(
-        opened.is_file()
-            && opened.nlink() == 1
-            && (opened.dev(), opened.ino()) == (before.dev(), before.ino()),
-        "Dolt build input changed during open"
     );
     let mut bytes = Vec::new();
     (&mut file).take(limit + 1).read_to_end(&mut bytes)?;
-    let after = fs::symlink_metadata(path)?;
+    parent.verify(name, &file)?;
     ensure!(
-        bytes.len() as u64 <= limit
-            && (after.dev(), after.ino()) == (opened.dev(), opened.ino())
-            && after.nlink() == 1,
+        bytes.len() as u64 <= limit,
         "Dolt build input changed while reading"
     );
     Ok(bytes)

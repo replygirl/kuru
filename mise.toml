@@ -92,6 +92,7 @@ run = "mise run //packages/kuru-delivery:coverage:workspace"
 [tasks."lint:tooling"]
 depends = ["//packages/kuru-delivery:check:repo", "//packages/kuru-delivery:lint:shell"]
 run = ["shellcheck scripts/*.sh", "actionlint"]
+run_windows = ["shellcheck scripts/install.sh scripts/check-commit.sh", "actionlint"]
 
 [tasks."test:install"]
 run = "mise run //packages/kuru-delivery:test:install"
@@ -100,7 +101,7 @@ run = "mise run //packages/kuru-delivery:test:install"
 run = "mise run //packages/kuru-delivery:test"
 
 [tasks.install]
-description = "Build and install Kuru into KURU_INSTALL_DIR or ~/.local/bin"
+description = "Build and install Kuru into KURU_INSTALL_DIR or the native user installation directory"
 run = "mise run //apps/kuru-tui:install"
 
 [tasks.package]

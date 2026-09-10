@@ -18,12 +18,27 @@ use crate::Harness;
 pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            if let Err(error) = tokio::signal::ctrl_c().await {
+            if let Err(error) = shutdown_signal().await {
                 eprintln!("signal handler failed: {error}");
             }
         })
         .await?;
     Ok(())
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    return tokio::signal::ctrl_c().await;
+    #[cfg(windows)]
+    {
+        let mut interrupt = tokio::signal::windows::ctrl_c()?;
+        let mut process_group = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            _ = interrupt.recv() => {},
+            _ = process_group.recv() => {},
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

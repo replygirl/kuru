@@ -137,7 +137,7 @@ async fn in_flight_disconnect_waits_for_real_query_and_session_teardown() {
 
 #[tokio::test]
 async fn lost_commit_reply_recovers_one_durable_update_and_reopens_without_replay() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_support::tempdir().unwrap();
     let options = crate::test_support::open_options(
         directory.path().to_path_buf(),
         format!("project/{}", "e".repeat(64)),

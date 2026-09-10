@@ -2,15 +2,17 @@
 //! or depends on the runtime that will eventually consume its bytes.
 
 use anyhow::{Context, Result, bail, ensure};
-use rustix::fs::{CWD, Mode, OFlags, RenameFlags, mkdirat, openat, renameat_with};
+use kuru_platform::fs::{
+    Directory as CheckedDirectory, NameRetention, Privacy, Publication, require_private,
+    seal_private,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     ffi::OsStr,
-    fs::{self, File, Metadata, TryLockError},
+    fs::{File, TryLockError},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -44,6 +46,8 @@ struct Manifest {
 struct Asset {
     target: String,
     stem: String,
+    format: String,
+    executable_name: String,
     url: String,
     compressed_bytes: u64,
     archive_sha256: String,
@@ -102,6 +106,13 @@ fn manifest(path: &Path, target: &str) -> Result<Asset> {
         ensure!(
             identifier(&asset.target) && identifier(&asset.stem),
             "invalid target or stem in bundle manifest"
+        );
+        ensure!(
+            matches!(
+                (asset.format.as_str(), asset.executable_name.as_str()),
+                ("tar.gz", "dolt") | ("zip", "dolt.exe")
+            ),
+            "unsupported bundle format or executable name"
         );
         ensure!(
             targets.insert(&asset.target),
@@ -264,9 +275,7 @@ async fn prepare_asset(
         )
         .await?;
     }
-    staging
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o400))?;
+    seal_private(staging.as_file(), false)?;
     staging.as_file().sync_all()?;
     directory
         .revalidate()
@@ -279,18 +288,16 @@ async fn prepare_asset(
     directory
         .verify(staged_name, staging.as_file(), true)
         .context("verify staged archive before publication")?;
-    renameat_with(
-        directory.file(),
-        staged_name,
-        directory.file(),
-        name.as_str(),
-        RenameFlags::NOREPLACE,
-    )
-    .context("publish prepared bundle without replacement")?;
     directory
-        .file()
-        .sync_all()
-        .context("bundle was published but directory flush failed; verify it before retrying")?;
+        .native
+        .publish_file(
+            &directory.native,
+            staged_name,
+            staging.as_file(),
+            OsStr::new(&name),
+            Publication::New,
+        )
+        .context("publish prepared bundle without replacement")?;
     directory.verify(OsStr::new(&name), staging.as_file(), true)?;
     Ok(destination)
 }
@@ -367,19 +374,6 @@ fn absolute(path: &Path) -> Result<PathBuf> {
             .any(|part| matches!(part, Component::ParentDir)),
         "bundle paths must not contain parent traversal"
     );
-    #[cfg(target_os = "macos")]
-    for prefix in ["/tmp", "/var", "/etc"] {
-        if let Ok(relative) = path.strip_prefix(prefix) {
-            let metadata = fs::symlink_metadata(prefix)?;
-            let expected = Path::new("/private").join(prefix.trim_start_matches('/'));
-            if metadata.file_type().is_symlink()
-                && metadata.uid() == 0
-                && Path::new("/").join(fs::read_link(prefix)?) == expected
-            {
-                return Ok(expected.join(relative));
-            }
-        }
-    }
     Ok(path)
 }
 
@@ -397,132 +391,63 @@ fn input_parent(path: &Path) -> Result<(Directory, std::ffi::OsString)> {
     Ok((directory, name))
 }
 
-fn same(left: &Metadata, right: &Metadata) -> bool {
-    (left.dev(), left.ino()) == (right.dev(), right.ino())
-}
-fn private(metadata: &Metadata) -> Result<()> {
-    ensure!(
-        metadata.uid() == rustix::process::geteuid().as_raw() && metadata.mode() & 0o077 == 0,
-        "bundle cache object must be private and owned by the current user"
-    );
-    Ok(())
-}
-fn regular(file: &File, owner_only: bool) -> Result<Metadata> {
-    let metadata = file.metadata()?;
-    ensure!(
-        metadata.is_file() && metadata.nlink() == 1,
-        "bundle input must be an ordinary file without links"
-    );
-    if owner_only {
-        private(&metadata)?;
-    }
-    Ok(metadata)
-}
-
 struct Directory {
-    anchors: Vec<(PathBuf, File)>,
+    native: CheckedDirectory,
     private: bool,
 }
 impl Directory {
     fn open(path: &Path, create: bool, owner_only: bool) -> Result<Self> {
         let path = absolute(path)?;
-        let mut anchors: Vec<(PathBuf, File)> = Vec::new();
-        let mut paths: Vec<_> = path.ancestors().collect();
-        paths.reverse();
-        for path in paths {
-            let file = if let Some((_, parent)) = anchors.last() {
-                let name = path.file_name().context("invalid directory component")?;
-                let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-                match openat(parent, name, flags, Mode::empty()) {
-                    Ok(file) => file,
-                    Err(rustix::io::Errno::NOENT) if create => {
-                        match mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
-                            Ok(()) | Err(rustix::io::Errno::EXIST) => (),
-                            Err(error) => return Err(error.into()),
-                        }
-                        openat(parent, name, flags, Mode::empty())?
-                    }
-                    Err(error) => return Err(std::io::Error::from(error).into()),
-                }
-            } else {
-                openat(
-                    CWD,
-                    path,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )?
-            };
-            anchors.push((path.to_owned(), File::from(file)));
-        }
-        let directory = Self {
-            anchors,
-            private: owner_only,
+        let native = if create {
+            ensure!(owner_only, "new bundle directories must be private");
+            CheckedDirectory::ensure_private(&path)?
+        } else {
+            CheckedDirectory::open(
+                &path,
+                if owner_only {
+                    Privacy::OwnerOnly
+                } else {
+                    Privacy::Inherited
+                },
+                NameRetention::Movable,
+            )?
         };
-        if owner_only {
-            private(&directory.file().metadata()?)?;
-        }
-        Ok(directory)
-    }
-    fn file(&self) -> &File {
-        &self.anchors.last().expect("absolute directory root").1
+        Ok(Self {
+            native,
+            private: owner_only,
+        })
     }
     fn path(&self) -> &Path {
-        &self.anchors.last().expect("absolute directory root").0
+        self.native.path()
     }
     fn revalidate(&self) -> Result<()> {
         let current = Self::open(self.path(), false, self.private)?;
         ensure!(
-            current.anchors.len() == self.anchors.len(),
-            "bundle directory ancestry changed"
+            current.native.identity() == self.native.identity(),
+            "bundle directory or ancestor was replaced"
         );
-        for ((_, held), (_, named)) in self.anchors.iter().zip(&current.anchors) {
-            ensure!(
-                same(&held.metadata()?, &named.metadata()?),
-                "bundle directory or ancestor was replaced"
-            );
-        }
         Ok(())
     }
     fn read(&self, name: &OsStr, owner_only: bool) -> Result<File> {
-        let file = openat(
-            self.file(),
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(std::io::Error::from)?;
-        regular(&file, owner_only)?;
+        let file = self.native.read(name)?;
+        if owner_only {
+            require_private(&file)?;
+        }
         Ok(file)
     }
     fn verify(&self, name: &OsStr, held: &File, owner_only: bool) -> Result<()> {
-        self.revalidate()?;
-        let named = self.read(name, owner_only)?;
-        ensure!(
-            same(&regular(held, owner_only)?, &named.metadata()?),
-            "bundle file was replaced while owned"
-        );
+        if owner_only {
+            require_private(held)?;
+        }
+        self.native.verify(name, held)?;
         Ok(())
     }
     async fn lock(&self) -> Result<File> {
-        let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        let opened = openat(
-            self.file(),
-            LOCK_NAME,
-            flags | OFlags::CREATE | OFlags::EXCL,
-            Mode::from_raw_mode(0o600),
-        );
-        let opened = match opened {
-            Ok(file) => Ok(file),
-            Err(rustix::io::Errno::EXIST) => openat(self.file(), LOCK_NAME, flags, Mode::empty()),
-            Err(error) => Err(error),
-        };
-        let lock = File::from(
-            opened
-                .map_err(std::io::Error::from)
-                .context("create or open stable lock file")?,
-        );
-        regular(&lock, true)?;
+        let pinned =
+            CheckedDirectory::open(self.path(), Privacy::OwnerOnly, NameRetention::Pinned)?;
+        let lock = pinned
+            .lock_file(OsStr::new(LOCK_NAME))
+            .context("create or open stable lock file")?;
         let deadline = tokio::time::Instant::now() + LOCK_TIMEOUT;
         loop {
             match lock.try_lock() {
@@ -546,12 +471,18 @@ impl Directory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuru_platform::fs::regular_file_info;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn asset(bytes: &[u8]) -> Asset {
         Asset {
             target: "test-target".into(),
             stem: "dolt-fixture".into(),
+            format: "tar.gz".into(),
+            executable_name: "dolt".into(),
             url: String::new(),
             compressed_bytes: bytes.len() as u64,
             archive_sha256: crate::archive::digest(bytes),
@@ -685,12 +616,16 @@ mod tests {
         })
         .await
         .expect("fixture never observed the written partial download");
-        let before = fs::metadata(cache.join(LOCK_NAME)).unwrap();
+        let before = regular_file_info(&File::open(cache.join(LOCK_NAME)).unwrap())
+            .unwrap()
+            .identity;
         download.abort();
         assert!(download.await.unwrap_err().is_cancelled());
         assert_clean(&cache);
-        let after = fs::metadata(cache.join(LOCK_NAME)).unwrap();
-        assert!(same(&before, &after));
+        let after = regular_file_info(&File::open(cache.join(LOCK_NAME)).unwrap())
+            .unwrap()
+            .identity;
+        assert_eq!(before, after);
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
@@ -705,35 +640,62 @@ mod tests {
         let directory = Directory::open(&path, true, true).unwrap();
         let held = directory.lock().await.unwrap();
         let old_lock = path.join("old-lock");
-        fs::rename(path.join(LOCK_NAME), &old_lock).unwrap();
-        let replacement = File::options()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path.join(LOCK_NAME))
-            .unwrap();
-        replacement
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .unwrap();
-        replacement.try_lock().unwrap();
-        assert!(
+        #[cfg(windows)]
+        {
+            // The native pinned handle denies substitution instead of detecting
+            // it afterward. Both preserve one actual lock and the original bytes.
+            assert!(fs::rename(path.join(LOCK_NAME), &old_lock).is_err());
+            assert!(fs::rename(&path, root.path().join("retired")).is_err());
             directory
                 .verify(OsStr::new(LOCK_NAME), &held, true)
-                .is_err()
-        );
-        assert!(
-            File::options()
+                .unwrap();
+            assert!(
+                File::options()
+                    .read(true)
+                    .write(true)
+                    .open(path.join(LOCK_NAME))
+                    .unwrap()
+                    .try_lock()
+                    .is_err()
+            );
+            drop(held);
+            let replacement = directory.lock().await.unwrap();
+            directory
+                .verify(OsStr::new(LOCK_NAME), &replacement, true)
+                .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            fs::rename(path.join(LOCK_NAME), &old_lock).unwrap();
+            let replacement = File::options()
                 .read(true)
                 .write(true)
-                .open(&old_lock)
-                .unwrap()
-                .try_lock()
-                .is_err()
-        );
-        let old_directory = root.path().join("retired");
-        fs::rename(&path, &old_directory).unwrap();
-        Directory::open(&path, true, true).unwrap();
-        assert!(directory.revalidate().is_err());
-        assert!(old_directory.join("old-lock").is_file());
+                .create_new(true)
+                .open(path.join(LOCK_NAME))
+                .unwrap();
+            replacement
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .unwrap();
+            replacement.try_lock().unwrap();
+            assert!(
+                directory
+                    .verify(OsStr::new(LOCK_NAME), &held, true)
+                    .is_err()
+            );
+            assert!(
+                File::options()
+                    .read(true)
+                    .write(true)
+                    .open(&old_lock)
+                    .unwrap()
+                    .try_lock()
+                    .is_err()
+            );
+            let old_directory = root.path().join("retired");
+            fs::rename(&path, &old_directory).unwrap();
+            Directory::open(&path, true, true).unwrap();
+            assert!(directory.revalidate().is_err());
+            assert!(old_directory.join("old-lock").is_file());
+        }
     }
 }

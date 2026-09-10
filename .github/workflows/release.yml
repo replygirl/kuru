@@ -135,6 +135,8 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -149,6 +151,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Build and package native executable
+        if: runner.os != 'Windows'
         env:
           RELEASE_TARGET: ${{ matrix.target }}
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
@@ -156,10 +159,29 @@ jobs:
           mise run //apps/kuru-tui:build:release -- --target "$RELEASE_TARGET"
           test "$("target/$RELEASE_TARGET/release/kuru" --version)" = "kuru $RELEASE_VERSION"
           mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
+      - name: Build and package native Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mise run //apps/kuru-tui:build:release -- --target $env:RELEASE_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          $binary = "target/$env:RELEASE_TARGET/release/kuru.exe"
+          $version = & $binary --version
+          if ($LASTEXITCODE -ne 0 -or $version -ne "kuru $env:RELEASE_VERSION") { throw 'Release version mismatch' }
+          mise run package -- --binary $binary --target $env:RELEASE_TARGET --version $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed' }
       - name: Verify packaged offline runtime
         env:
-          KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru
+          KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
         run: mise run //apps/kuru-tui:test:embedded-runtime
+      - name: Inspect native shipping DLL imports
+        if: runner.os == 'Windows'
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru.exe
+        run: mise run //apps/kuru-tui:verify:windows-imports
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}

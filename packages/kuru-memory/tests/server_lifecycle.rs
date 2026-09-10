@@ -1,13 +1,17 @@
 use std::{
     fs,
     future::Future,
-    io::{BufRead, BufReader, Read, Write},
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{Arc, mpsc},
+    sync::Arc,
     task::Poll,
     time::Duration,
+};
+#[cfg(unix)]
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::fs::PermissionsExt,
+    process::{Command, Stdio},
+    sync::mpsc,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -46,6 +50,11 @@ fn options(root: &Path, binary: PathBuf) -> ServerOptions {
         timeout: Duration::from_secs(20),
         read_only: false,
         retained: None,
+        lifecycle_root: if cfg!(windows) {
+            Some(root.join("lifecycles"))
+        } else {
+            None
+        },
     }
 }
 
@@ -337,8 +346,7 @@ async fn wrong_credentials_directory_and_sql_identity_fail_without_server_takeov
     );
 
     let cloned = root.path().join("cloned identity");
-    fs::create_dir(&cloned)?;
-    fs::set_permissions(&cloned, fs::Permissions::from_mode(0o700))?;
+    kuru_platform::fs::Directory::ensure_private(&cloned)?;
     fs::copy(&identity_path, cloned.join("identity.json"))?;
     fs::copy(&endpoint_path, cloned.join("endpoint.json"))?;
     let mut wrong_directory = opts.clone();
@@ -401,7 +409,11 @@ async fn failed_engine_start_reaps_before_retrying_the_same_private_store() -> R
     let root = tempfile::tempdir()?;
     // A native failure process must not emit LLVM profiles into the private
     // store when its intentionally isolated environment omits LLVM_PROFILE_FILE.
-    let mut opts = options(root.path(), PathBuf::from("/usr/bin/false"));
+    #[cfg(unix)]
+    let failure = PathBuf::from("/usr/bin/false");
+    #[cfg(windows)]
+    let failure = kuru_platform::windows::process::system_directory()?.join("where.exe");
+    let mut opts = options(root.path(), failure);
     let error = Server::open(opts.clone()).await.unwrap_err();
     assert!(
         format!("{error:#}").contains("before readiness"),
@@ -414,6 +426,7 @@ async fn failed_engine_start_reaps_before_retrying_the_same_private_store() -> R
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn server_crash_parent_helper() -> Result<()> {
     let Some(root) = std::env::var_os("KURU_SERVER_FIXTURE_ROOT") else {
@@ -433,6 +446,7 @@ fn server_crash_parent_helper() -> Result<()> {
     })
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn parent_sigkill_closes_lifetime_pipe_and_allows_a_new_owner() -> Result<()> {
     let _permit = SERVERS.acquire().await?;
@@ -493,6 +507,7 @@ async fn parent_sigkill_closes_lifetime_pipe_and_allows_a_new_owner() -> Result<
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn supervisor_sigterm_reaps_and_exits_while_the_parent_pipe_is_open() -> Result<()> {
     let _permit = SERVERS.acquire().await?;
@@ -510,7 +525,7 @@ async fn supervisor_sigterm_reaps_and_exits_while_the_parent_pipe_is_open() -> R
     let mut output = child.stdout.take().context("supervisor stdout missing")?;
     let request = serde_json::to_vec(&serde_json::json!({
         "binary":binary, "directory":directory,
-        "project_scope":"signal-fixture", "timeout_millis":20000, "read_only":false
+        "project_scope":"signal-fixture", "timeout_millis":20000, "read_only":false, "lifecycle_root":null
     }))?;
     input.write_all(&u32::try_from(request.len())?.to_be_bytes())?;
     input.write_all(&request)?;

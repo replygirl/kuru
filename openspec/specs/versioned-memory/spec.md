@@ -8,18 +8,21 @@ isolated candidates and recoverable legacy imports.
 
 ### Requirement: Managed full Dolt storage
 
-Kuru SHALL use pinned full Dolt for live memory, provision verified official native
-assets without a compiler, preserve runtime licenses and support an existing
-verified cache offline. It MUST reject unsafe archives and corrupt executables
-before execution and SHALL NOT silently fall back to SQLite.
+Kuru SHALL use pinned full Dolt for live memory and include the verified official
+native archive and runtime licenses in its executable. It MUST provision the
+matching engine locally without a compiler, separate installation or runtime
+download, including on a first offline launch. It MUST reject unsafe archives
+and corrupt executables before execution and SHALL NOT silently fall back to
+SQLite. Existing verified caches MAY be reused; corrupt existing caches MUST fail
+explicitly without destructive repair.
 
 #### Scenario: First memory use
-- **WHEN** memory is opened without an installed runtime
-- **THEN** Kuru installs the matching verified pinned engine and opens a private project database.
+- **WHEN** memory is opened without an extracted runtime
+- **THEN** Kuru extracts its bundled matching verified pinned engine and opens a private project database without network access.
 
 #### Scenario: Offline cache
 - **WHEN** offline memory access uses a valid cached runtime
-- **THEN** memory opens without a download; a missing or invalid runtime gives a clear error.
+- **THEN** memory opens using that verified cache; an absent cache is initialized from bundled bytes, while an invalid existing cache gives a clear error.
 
 ### Requirement: Owned private server lifecycle
 

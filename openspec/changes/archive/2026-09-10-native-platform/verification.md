@@ -25,7 +25,7 @@
 - [x] 5.1 @integration (agent) Run package-owned format/lint/test/coverage tasks for all primitives on Windows and shared filesystem contracts on Unix without Dolt, bundles or consumer compilation -> Windows 6d55ac7 passed nine units, thirteen filesystem tests and sixteen process/IPC tests, repeated under coverage with zero ignored or failed cases; native package LCOV is 1834/1994 lines, 91.9759%. Format/lint/typecheck, lock drift check and coverage upload passed; Unix evidence below remains valid.
 - [x] 5.2 @integration (agent) Observe required Windows success and real fixture-failure propagation through the aggregate -> corrected Windows job 102960966634 passed at 6d55ac7. Earlier run 34499528190 had all four Unix/product jobs succeed, actual Windows fixture failure and ci-gate 102958076220 fail. This directly proves the intended failure-propagation guard; no separate artificial local failure injection was performed or claimed.
 - [x] 5.3 @manual (agent) Review API/dependency tree, unsafe allowances, mise ownership and CI labels -> the library has no domain dependency; Windows FFI is locally contained under package deny while consumers retain forbid; package mise/CI labels and guidance distinguish primitive proof from pending Windows product acceptance.
-- [ ] 5.4 @integration (agent) Observe the full aggregate CI result at 6d55ac7432929f08713e330c7010e661e5aedda8 -> all required jobs and ci-gate succeed before archive; the isolated Windows success alone is not the aggregate result.
+- [x] 5.4 @integration (agent) Observe the full aggregate CI result at ca68d7d2615dca1217c68a15172f97a8e7825320 -> all four application jobs, the Windows primitive job and ci-gate succeeded; the isolated Windows success alone was not used as the aggregate result.
 
 ### Local filesystem evidence, 2026-09-10
 
@@ -152,3 +152,18 @@ to fail. This fulfills the original injected-failure check's intent through a
 real hosted failure; no artificial local injection is claimed. Current aggregate
 success is still tracked separately in row 5.4 before archive. These results prove
 native primitives, not the still-blocked Windows product integration.
+
+### Final aggregate acceptance
+
+At `ca68d7d2615dca1217c68a15172f97a8e7825320`,
+[CI run 34507581204](https://github.com/replygirl/kuru/actions/runs/34507581204)
+completed successfully, including all four application targets and
+[aggregate job 102988252606](https://github.com/replygirl/kuru/actions/runs/34507581204/job/102988252606).
+The [Windows primitive job](https://github.com/replygirl/kuru/actions/runs/34507581204/job/102973453946)
+again passed all 38 native tests normally and instrumented, with unchanged
+1834/1994 line coverage (91.9759%). The final local gate and normal pre-push
+also passed, covering 12786/13138 workspace lines (97.3207%).
+Evidence: `/tmp/kuru-native-platform-windows-ca68d7d.log`, its downloaded
+coverage artifact, `/tmp/kuru-ci-profile-hosted-checks.md` and
+`/tmp/kuru-ci-profile-full-check.log`. These results complete this independent
+foundation; Windows application acceptance remains in its consuming change.

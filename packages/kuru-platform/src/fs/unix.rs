@@ -80,16 +80,13 @@ pub(super) fn open_directory(
 }
 
 pub(super) fn create_directory(parent: &File, path: &Path) -> io::Result<()> {
-    match mkdirat(
+    mkdirat(
         parent,
         path.file_name()
             .ok_or_else(|| invalid("missing directory name"))?,
         Mode::from_raw_mode(0o700),
-    ) {
-        Ok(()) => Ok(()),
-        Err(rustix::io::Errno::EXIST) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+    )?;
+    Ok(())
 }
 
 pub(super) fn open_file(
@@ -104,20 +101,31 @@ pub(super) fn open_file(
         OpenMode::Read => OFlags::RDONLY,
         OpenMode::ReadWrite => OFlags::RDWR,
         OpenMode::New => OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
-        OpenMode::Lock => OFlags::RDWR | OFlags::CREATE,
+        OpenMode::Lock => OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
     };
     let permissions = if privacy == Privacy::OwnerOnly {
         0o600
     } else {
         0o666
     };
-    Ok(File::from(openat(
-        parent,
-        path.file_name()
-            .ok_or_else(|| invalid("missing filename"))?,
-        flags,
-        Mode::from_raw_mode(permissions),
-    )?))
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("missing filename"))?;
+    let opened = openat(parent, name, flags, Mode::from_raw_mode(permissions));
+    let file = match opened {
+        Err(rustix::io::Errno::EXIST) if matches!(mode, OpenMode::Lock) => {
+            // Distinguish our exclusive creation from opening the stable object
+            // another owner created. Never recreate an object removed in between.
+            openat(
+                parent,
+                name,
+                flags & !(OFlags::CREATE | OFlags::EXCL),
+                Mode::empty(),
+            )?
+        }
+        result => result?,
+    };
+    Ok(File::from(file))
 }
 
 pub(super) fn seal_private(file: &File, executable: bool) -> io::Result<()> {
@@ -131,6 +139,23 @@ pub(super) fn seal_private(file: &File, executable: bool) -> io::Result<()> {
 pub(super) fn make_executable(file: &File) -> io::Result<()> {
     rustix::fs::fchmod(file, Mode::from_raw_mode(0o755))?;
     Ok(())
+}
+
+pub(super) fn remove(
+    parent: &File,
+    path: &Path,
+    held: File,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    rustix::fs::unlinkat(
+        parent,
+        path.file_name().unwrap(),
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(|error| (PublicationPhase::Rejected, error.into()))?;
+    drop(held);
+    parent
+        .sync_all()
+        .map_err(|error| (PublicationPhase::Uncertain, error))
 }
 
 pub(super) fn publish(

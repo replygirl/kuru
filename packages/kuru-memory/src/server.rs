@@ -6,17 +6,8 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
-    os::{
-        fd::{AsFd, OwnedFd},
-        unix::{
-            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-            process::CommandExt,
-        },
-    },
+    fs::{self, File},
     path::{Path, PathBuf},
-    process::{Child as SupervisorChild, Command, Stdio},
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
@@ -24,8 +15,28 @@ use std::{
     time::Duration,
 };
 
+use crate::{engine::Child, files};
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use nix::{fcntl::OFlag, sys::signal, unistd::Pid};
+use kuru_platform::fs::{Directory, NameRetention, Privacy};
+#[cfg(windows)]
+use kuru_platform::windows::{
+    pipe,
+    process::{Console, Lifetime, NativeChild as SupervisorChild, NativeSpawnSpec},
+};
+#[cfg(unix)]
+use std::{
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::process::CommandExt,
+    },
+    process::{Child as SupervisorChild, Command, Stdio},
+};
+#[cfg(unix)]
+use tokio::net::unix::pipe;
+#[cfg(unix)]
+type LifetimeSender = pipe::Sender;
+#[cfg(windows)]
+type LifetimeSender = pipe::Pipe;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{
     MySqlPool, Row,
@@ -33,8 +44,7 @@ use sqlx::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream, unix::pipe},
-    process::Child,
+    net::{TcpListener, TcpStream},
     sync::Mutex,
     time::{Instant, sleep, timeout},
 };
@@ -54,6 +64,9 @@ pub struct ServerOptions {
     pub timeout: Duration,
     pub read_only: bool,
     pub retained: Option<Arc<tempfile::TempDir>>,
+    /// Windows requires one stable external namespace for all names of this
+    /// physical store. Unix preserves its existing in-directory lease layout.
+    pub lifecycle_root: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -84,14 +97,14 @@ impl fmt::Debug for Server {
 // receive EOF and reap Dolt, including when an open/close future is cancelled.
 struct Owner {
     child: Option<SupervisorChild>,
-    lifetime: Option<pipe::Sender>,
+    lifetime: Option<LifetimeSender>,
     retained: Option<Arc<tempfile::TempDir>>,
 }
 
 impl Drop for Owner {
     fn drop(&mut self) {
         drop(self.lifetime.take());
-        let Some(mut child) = self.child.take() else {
+        let Some(child) = self.child.take() else {
             return;
         };
         let retained = self.retained.take();
@@ -99,30 +112,44 @@ impl Drop for Owner {
         // immediately after the last store handle. Keep fixture files until the
         // supervisor has confirmed that Dolt is reaped.
         std::thread::spawn(move || {
-            let deadline =
-                std::time::Instant::now() + CLOSE_GRACE + KILL_GRACE + Duration::from_secs(3);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(20))
-                    }
-                    _ => {
-                        if let Some(directory) = retained {
-                            eprintln!(
-                                "memory supervisor cleanup incomplete; preserved {}",
-                                directory.path().display()
-                            );
-                            // A live owned process must never outlive removal of
-                            // its data. Preserve the shared fixture on this rare
-                            // unreapable-process error instead of deleting it.
-                            std::mem::forget(directory);
-                        }
-                        return;
-                    }
-                }
-            }
+            observe_supervisor(
+                child,
+                retained,
+                CLOSE_GRACE + KILL_GRACE + Duration::from_secs(3),
+                SupervisorChild::try_wait,
+            )
         });
+    }
+}
+
+fn observe_supervisor(
+    mut child: SupervisorChild,
+    retained: Option<Arc<tempfile::TempDir>>,
+    warn_after: Duration,
+    mut status: impl FnMut(&mut SupervisorChild) -> std::io::Result<Option<std::process::ExitStatus>>,
+) {
+    let deadline = std::time::Instant::now() + warn_after;
+    let mut warned = false;
+    loop {
+        let result = status(&mut child);
+        if matches!(result, Ok(Some(_))) {
+            return;
+        }
+        if !warned && (result.is_err() || std::time::Instant::now() >= deadline) {
+            eprintln!(
+                "memory supervisor cleanup is delayed; retaining its process handle and resources{}",
+                retained
+                    .as_ref()
+                    .map_or_else(String::new, |directory| format!(
+                        " at {}",
+                        directory.path().display()
+                    ))
+            );
+            warned = true;
+        }
+        // This is continued observation of the same retained process. A close
+        // deadline or failed status query grants no permission to delete data.
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -152,6 +179,7 @@ struct Request {
     project_scope: String,
     timeout_millis: u64,
     read_only: bool,
+    lifecycle_root: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,21 +193,30 @@ impl Server {
     /// Hold the same stable lease as the supervisor until the caller completes
     /// a stopped-store rename and directory fsync. Closing an attached handle is
     /// not proof of quiescence: only acquiring this lease establishes it.
-    pub(crate) async fn quiescence(directory: &Path, wait: Duration) -> Result<File> {
+    #[cfg(all(test, unix))]
+    pub(crate) async fn quiescence(directory: &Path, wait: Duration) -> Result<LifecycleLease> {
+        Self::quiescence_at(directory, None, wait).await
+    }
+
+    pub(crate) async fn quiescence_at(
+        directory: &Path,
+        lifecycle_root: Option<&Path>,
+        wait: Duration,
+    ) -> Result<LifecycleLease> {
         ensure!(
             !wait.is_zero() && wait <= Duration::from_secs(300),
             "invalid memory quiescence timeout"
         );
         prepare_directory(directory, true)?;
         let directory = fs::canonicalize(directory)?;
-        let (directory_file, lock) = lifecycle_files(&directory)?;
+        let lease = LifecycleLease::new(&directory, lifecycle_root)?;
         let deadline = Instant::now() + wait;
         loop {
-            verify_lifecycle_files(&directory, &directory_file, &lock)?;
-            match lock.try_lock() {
+            lease.verify()?;
+            match lease.lock.try_lock() {
                 Ok(()) => {
-                    verify_lifecycle_files(&directory, &directory_file, &lock)?;
-                    return Ok(lock);
+                    lease.verify()?;
+                    return Ok(lease);
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     ensure!(
@@ -209,6 +246,7 @@ impl Server {
         );
         prepare_directory(&options.directory, options.read_only)?;
         let directory = fs::canonicalize(&options.directory)?;
+        LifecycleLease::validate_root(&directory, options.lifecycle_root.as_deref())?;
         if let Some(identity) = load_identity(&directory, &options.project_scope)? {
             // Validate a published endpoint even for a writer, but only readers
             // may borrow another parent's lifetime. A writer must wait for the
@@ -229,53 +267,103 @@ impl Server {
         }
 
         let request = Request {
-            binary: options.binary,
+            binary: options.binary.clone(),
             directory: directory.clone(),
             project_scope: options.project_scope.clone(),
             timeout_millis: options.timeout.as_millis().try_into()?,
             read_only: options.read_only,
+            lifecycle_root: options.lifecycle_root.clone(),
         };
-        let mut command = Command::new(options.supervisor);
-        command
-            .arg("--internal-dolt-supervisor")
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .current_dir(&directory)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0);
-        // The supervisor is this Rust program, so instrumented test binaries
-        // must retain their designated profile output through environment
-        // isolation. Never pass this or parent credentials to the Dolt engine.
-        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
-            command.env("LLVM_PROFILE_FILE", profile);
-        }
-        let mut child = command
-            .spawn()
-            .context("start memory lifetime supervisor")?;
-        let lifetime = child
-            .stdin
-            .take()
-            .context("supervisor lifetime pipe missing")?;
-        let output = child
-            .stdout
-            .take()
-            .context("supervisor readiness pipe missing")?;
-        let mut owner = Owner {
-            child: Some(child),
-            lifetime: None,
-            retained: options.retained,
+        #[cfg(unix)]
+        let (mut owner, response) = {
+            let mut command = Command::new(options.supervisor);
+            command
+                .arg("--internal-dolt-supervisor")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(&directory)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .process_group(0);
+            // The supervisor is this Rust program, so instrumented test binaries
+            // must retain their designated profile output through environment
+            // isolation. Never pass this or parent credentials to the Dolt engine.
+            if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+                command.env("LLVM_PROFILE_FILE", profile);
+            }
+            let mut child = command
+                .spawn()
+                .context("start memory lifetime supervisor")?;
+            let lifetime = child
+                .stdin
+                .take()
+                .context("supervisor lifetime pipe missing")?;
+            let output = child
+                .stdout
+                .take()
+                .context("supervisor readiness pipe missing")?;
+            let mut owner = Owner {
+                child: Some(child),
+                lifetime: None,
+                retained: options.retained.clone(),
+            };
+            owner.lifetime = Some(pipe::Sender::from_owned_fd(OwnedFd::from(lifetime))?);
+            let mut output = pipe::Receiver::from_owned_fd(OwnedFd::from(output))?;
+            let response = timeout(options.timeout + Duration::from_secs(2), async {
+                write_frame(owner.lifetime.as_mut().expect("owned lifetime"), &request).await?;
+                read_frame::<_, Response>(&mut output).await
+            })
+            .await
+            .context("memory supervisor readiness deadline exceeded")
+            .and_then(|response| response);
+            (owner, response)
         };
-        owner.lifetime = Some(pipe::Sender::from_owned_fd(OwnedFd::from(lifetime))?);
-        let mut output = pipe::Receiver::from_owned_fd(OwnedFd::from(output))?;
-        let response = timeout(options.timeout + Duration::from_secs(2), async {
-            write_frame(owner.lifetime.as_mut().expect("owned lifetime"), &request).await?;
-            read_frame::<_, Response>(&mut output).await
-        })
-        .await
-        .context("memory supervisor readiness deadline exceeded")
-        .and_then(|response| response);
+        #[cfg(windows)]
+        let (mut owner, response) = {
+            let listener = pipe::PrivateListener::bind()?;
+            let mut command = NativeSpawnSpec::new(options.supervisor.clone(), directory.clone());
+            command.args = vec![
+                "--internal-dolt-supervisor".into(),
+                listener.address().to_owned(),
+            ];
+            command.lifetime = Lifetime::TrustedSupervisor;
+            command.console = Console::PrivateHidden;
+            let system = kuru_platform::windows::process::system_directory()?;
+            let windows = system
+                .parent()
+                .context("Windows system directory has no parent")?;
+            command.environment = vec![
+                ("SystemRoot".into(), windows.as_os_str().into()),
+                ("WINDIR".into(), windows.as_os_str().into()),
+                ("PATH".into(), system.into_os_string()),
+            ];
+            if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+                command
+                    .environment
+                    .push(("LLVM_PROFILE_FILE".into(), profile));
+            }
+            let child = command
+                .spawn()
+                .await
+                .context("start memory lifetime supervisor")?;
+            let accept = listener.accept(&child, Duration::from_secs(5));
+            let mut owner = Owner {
+                child: Some(child),
+                lifetime: None,
+                retained: options.retained.clone(),
+            };
+            let response = timeout(options.timeout + Duration::from_secs(2), async {
+                owner.lifetime = Some(accept.await?);
+                let channel = owner.lifetime.as_mut().expect("owned lifetime");
+                write_frame(channel, &request).await?;
+                read_frame::<_, Response>(channel).await
+            })
+            .await
+            .context("memory supervisor readiness deadline exceeded")
+            .and_then(|response| response);
+            (owner, response)
+        };
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -408,10 +496,10 @@ impl Server {
         directory: impl Into<Arc<tempfile::TempDir>>,
     ) -> Result<()> {
         let directory = directory.into();
+        let ancestor =
+            Directory::open(directory.path(), Privacy::Inherited, NameRetention::Movable)?;
         ensure!(
-            self.0
-                .directory
-                .starts_with(fs::canonicalize(directory.path())?),
+            files::directory(&self.0.directory)?.is_within(&ancestor)?,
             "retained directory does not own memory storage"
         );
         let mut owner = self.0.owner.lock().await;
@@ -428,6 +516,10 @@ impl Server {
 }
 
 async fn finish_owner(owner: &mut Owner) -> Result<()> {
+    #[cfg(windows)]
+    if let Some(lifetime) = owner.lifetime.as_mut() {
+        lifetime.close(KILL_GRACE).await?;
+    }
     drop(owner.lifetime.take());
     let deadline = Instant::now() + CLOSE_GRACE + KILL_GRACE + Duration::from_secs(2);
     let status = loop {
@@ -466,73 +558,117 @@ fn validate_branch(branch: &str) -> Result<()> {
 }
 
 fn private_metadata(path: &Path, directory: bool) -> Result<fs::Metadata> {
-    let metadata = fs::symlink_metadata(path)?;
-    ensure!(
-        !metadata.file_type().is_symlink()
-            && if directory {
-                metadata.is_dir()
-            } else {
-                metadata.is_file() && metadata.nlink() == 1
-            },
-        "unsafe memory path type: {}",
-        path.display()
-    );
-    ensure!(
-        metadata.uid() == nix::unistd::geteuid().as_raw()
-            && metadata.permissions().mode() & 0o077 == 0,
-        "memory paths must be private and owned by the current user: {}",
-        path.display()
-    );
-    Ok(metadata)
+    if directory {
+        files::directory(path)?;
+        Ok(fs::symlink_metadata(path)?)
+    } else {
+        let (_directory, file) = files::read(path, Privacy::OwnerOnly)?;
+        Ok(file.metadata()?)
+    }
 }
 
 fn private_directory(path: &Path) -> Result<()> {
-    if !path.try_exists()? {
-        fs::create_dir_all(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    files::private_dir(path)
+}
+
+/// The external Windows lock has no descendant file handle in the moved store.
+#[derive(Debug)]
+pub(crate) struct LifecycleLease {
+    pub(crate) directory: Directory,
+    lock_directory: Directory,
+    lock_name: std::ffi::OsString,
+    lock: File,
+}
+
+impl std::ops::Deref for LifecycleLease {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.lock
     }
-    private_metadata(path, true)?;
-    Ok(())
 }
 
-fn lifecycle_files(directory: &Path) -> Result<(File, File)> {
-    let directory_file = OpenOptions::new()
-        .read(true)
-        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY).bits())
-        .open(directory)?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(OFlag::O_NOFOLLOW.bits())
-        .open(directory.join("lifecycle.lock"))?;
-    verify_lifecycle_files(directory, &directory_file, &lock)?;
-    Ok((directory_file, lock))
-}
+impl LifecycleLease {
+    fn validate_root(directory: &Path, root: Option<&Path>) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let _ = directory;
+            ensure!(
+                root.is_none(),
+                "Unix memory preserves its in-directory lifecycle lock"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let root =
+                root.context("Windows memory requires an explicit external lifecycle_root")?;
+            ensure!(
+                root.is_absolute(),
+                "Windows lifecycle_root must be absolute"
+            );
+            let store = files::directory(directory)?;
+            let root = Directory::ensure_private(root)?;
+            ensure!(
+                !root.is_within(&store)?,
+                "Windows lifecycle_root must not lie inside the moved memory store"
+            );
+        }
+        Ok(())
+    }
 
-fn verify_lifecycle_files(directory: &Path, directory_file: &File, lock: &File) -> Result<()> {
-    ensure!(
-        fs::canonicalize(directory)? == directory,
-        "memory lifecycle directory path changed"
-    );
-    let original_directory = directory_file.metadata()?;
-    let named_directory = private_metadata(directory, true)
-        .context("memory lifecycle directory was moved or replaced")?;
-    ensure!(
-        (original_directory.dev(), original_directory.ino())
-            == (named_directory.dev(), named_directory.ino()),
-        "memory lifecycle directory was moved or replaced"
-    );
-    let original_lock = lock.metadata()?;
-    let named_lock = private_metadata(&directory.join("lifecycle.lock"), false)
-        .context("memory lifecycle lock was moved or replaced")?;
-    ensure!(
-        (original_lock.dev(), original_lock.ino()) == (named_lock.dev(), named_lock.ino()),
-        "memory lifecycle lock was moved or replaced"
-    );
-    Ok(())
+    fn new(directory: &Path, root: Option<&Path>) -> Result<Self> {
+        Self::validate_root(directory, root)?;
+        let directory = files::directory(directory)?;
+        #[cfg(unix)]
+        let (lock_directory, lock_name): (_, std::ffi::OsString) =
+            (files::directory(directory.path())?, "lifecycle.lock".into());
+        #[cfg(windows)]
+        let (lock_directory, lock_name): (_, std::ffi::OsString) = {
+            let root = Directory::open(
+                root.expect("validated Windows lifecycle root"),
+                Privacy::OwnerOnly,
+                NameRetention::Pinned,
+            )?;
+            let key: String = directory
+                .identity()
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            (root, format!("{key}.lock").into())
+        };
+        let lock = lock_directory.lock_file(&lock_name)?;
+        let lease = Self {
+            directory,
+            lock_directory,
+            lock_name,
+            lock,
+        };
+        lease.verify()?;
+        Ok(lease)
+    }
+
+    fn verify(&self) -> Result<()> {
+        let named = files::directory(self.directory.path())
+            .context("memory lifecycle directory was moved or replaced")?;
+        ensure!(
+            named.identity() == self.directory.identity(),
+            "memory lifecycle directory was moved or replaced"
+        );
+        self.lock_directory
+            .verify(&self.lock_name, &self.lock)
+            .context("memory lifecycle lock was moved or replaced")?;
+        Ok(())
+    }
+
+    pub(crate) fn move_to(&mut self, destination: &Path) -> Result<()> {
+        self.verify()?;
+        self.directory = files::move_directory(&self.directory, destination)?;
+        #[cfg(unix)]
+        {
+            self.lock_directory = files::directory(self.directory.path())?;
+        }
+        self.verify()
+    }
 }
 
 fn prepare_directory(directory: &Path, read_only: bool) -> Result<()> {
@@ -575,14 +711,7 @@ fn read_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
         }
     }
     private_metadata(path, false)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(OFlag::O_NOFOLLOW.bits())
-        .open(path)?;
-    ensure!(file.metadata()?.nlink() == 1, "linked memory record");
-    let mut bytes = Vec::new();
-    file.take((RECORD_LIMIT + 1) as u64)
-        .read_to_end(&mut bytes)?;
+    let bytes = files::read_bytes(path, RECORD_LIMIT as u64)?;
     ensure!(
         bytes.len() <= RECORD_LIMIT,
         "memory record exceeds size limit"
@@ -593,24 +722,12 @@ fn read_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 }
 
 fn write_record(path: &Path, record: &impl Serialize) -> Result<()> {
-    let parent = path.parent().context("memory record parent missing")?;
     let bytes = serde_json::to_vec(record)?;
     ensure!(
         bytes.len() <= RECORD_LIMIT,
         "memory record exceeds size limit"
     );
-    // Keep transient filenames out of the recognized project-root inventory.
-    let staging = parent.join("staging");
-    private_directory(&staging)?;
-    let mut staged = tempfile::NamedTempFile::new_in(staging)?;
-    staged
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
-    staged.write_all(&bytes)?;
-    staged.as_file().sync_all()?;
-    staged.persist(path).map_err(|error| error.error)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    files::write(path, &bytes)
 }
 
 fn load_identity(directory: &Path, project_scope: &str) -> Result<Option<Identity>> {
@@ -678,7 +795,9 @@ async fn connect_pool(
                 let datadir: String = sqlx::query_scalar("SELECT @@datadir")
                     .fetch_one(&mut *connection)
                     .await?;
-                if fs::canonicalize(datadir).map_err(sqlx::Error::Io)? != expected_directory {
+                if !same_directory(Path::new(&datadir), &expected_directory)
+                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
+                {
                     return Err(sqlx::Error::Protocol(
                         "memory server data directory mismatch".into(),
                     ));
@@ -709,7 +828,7 @@ async fn verify_identity(pool: &MySqlPool, directory: &Path, identity: &Identity
             .fetch_one(pool)
             .await?;
         ensure!(
-            fs::canonicalize(datadir)? == directory.join("data"),
+            same_directory(Path::new(&datadir), &directory.join("data"))?,
             "memory server data directory mismatch"
         );
         let row =
@@ -786,16 +905,50 @@ async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, value: &impl Seriali
 
 /// Internal entrypoint shared by the application and package test helper.
 pub async fn supervisor_entry() -> Result<()> {
-    let mut input = pipe::Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)?;
-    let mut output = pipe::Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)?;
-    let request: Request = timeout(Duration::from_secs(5), read_frame(&mut input))
+    #[cfg(unix)]
+    {
+        let mut input =
+            pipe::Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)?;
+        let mut output =
+            pipe::Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)?;
+        let request: Request = timeout(Duration::from_secs(5), read_frame(&mut input))
+            .await
+            .context("memory supervisor configuration deadline exceeded")??;
+        supervisor_request(request, &mut input, &mut output).await
+    }
+    #[cfg(windows)]
+    {
+        let address = std::env::args_os()
+            .nth(2)
+            .context("Windows memory supervisor needs its private rendezvous address")?;
+        let started = Instant::now();
+        let mut channel = pipe::connect(&address, Duration::from_secs(5)).await?;
+        let request = timeout(
+            Duration::from_secs(5).saturating_sub(started.elapsed()),
+            read_frame::<_, Request>(&mut channel),
+        )
         .await
         .context("memory supervisor configuration deadline exceeded")??;
-    if let Err(error) = supervise(request, &mut input, &mut output).await {
+        let (mut input, mut output) = tokio::io::split(channel);
+        let result = supervisor_request(request, &mut input, &mut output).await;
+        let mut channel = input.unsplit(output);
+        let closed = channel.close(KILL_GRACE).await;
+        result?;
+        closed?;
+        Ok(())
+    }
+}
+
+async fn supervisor_request<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    request: Request,
+    input: &mut R,
+    output: &mut W,
+) -> Result<()> {
+    if let Err(error) = supervise(request, input, output).await {
         // No credentials are ever serialized in the response. SQL bootstrap
         // credential-setting failures are deliberately reported without SQL text.
         let message = format!("{error:#}");
-        let _ = write_frame(&mut output, &Response::Failed(message)).await;
+        let _ = timeout(KILL_GRACE, write_frame(output, &Response::Failed(message))).await;
         return Err(error);
     }
     Ok(())
@@ -816,12 +969,12 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         "memory directory must be canonical"
     );
     let deadline = Instant::now() + Duration::from_millis(request.timeout_millis);
-    let (directory_file, lock) = lifecycle_files(&request.directory)?;
+    let lease = LifecycleLease::new(&request.directory, request.lifecycle_root.as_deref())?;
     loop {
-        verify_lifecycle_files(&request.directory, &directory_file, &lock)?;
-        match lock.try_lock() {
+        lease.verify()?;
+        match lease.lock.try_lock() {
             Ok(()) => {
-                verify_lifecycle_files(&request.directory, &directory_file, &lock)?;
+                lease.verify()?;
                 break;
             }
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -882,7 +1035,9 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         private_directory(&request.directory.join(name))?;
     }
     crate::provision::prepare_private_home(&request.directory.join("home"))?;
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .context("reserve a private loopback port for Dolt")?;
     let port = listener.local_addr()?.port();
     ensure!(port >= 1024, "unsupported allocated Dolt port");
     drop(listener);
@@ -893,29 +1048,33 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let yaml = server_yaml(&request.directory, port)?;
     let config_path = request.directory.join("server.yaml");
     write_private(&config_path, yaml.as_bytes())?;
-    let mut command =
-        crate::provision::isolated_command(&request.binary, &request.directory.join("home"));
-    command
-        .arg("sql-server")
-        .arg("--config")
-        .arg(&config_path)
-        .env("DOLT_ROOT_PASSWORD", &identity.password)
-        .env("DOLT_ROOT_HOST", "localhost")
-        .current_dir(&request.directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut termination =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut child = command.spawn().context("start verified Dolt engine")?;
+    let mut signals = ShutdownSignals::new()?;
+    let mut child = crate::engine::spawn(
+        &request.binary,
+        &request.directory.join("home"),
+        &request.directory,
+        vec![
+            "sql-server".into(),
+            "--config".into(),
+            config_path.into_os_string(),
+        ],
+        vec![
+            (
+                "DOLT_ROOT_PASSWORD".into(),
+                identity.password.clone().into(),
+            ),
+            ("DOLT_ROOT_HOST".into(), "localhost".into()),
+        ],
+        true,
+    )
+    .await?;
     let log = Arc::new(Mutex::new(Vec::new()));
     let stdout = tokio::spawn(drain(
-        child.stdout.take().context("Dolt stdout missing")?,
+        child.stdout().context("Dolt stdout missing")?,
         log.clone(),
     ));
     let stderr = tokio::spawn(drain(
-        child.stderr.take().context("Dolt stderr missing")?,
+        child.stderr().context("Dolt stderr missing")?,
         log.clone(),
     ));
     let mut byte = [0];
@@ -923,16 +1082,14 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         tokio::select! {
             ready = start_database(&mut child, &request.directory, &mut identity, &endpoint, deadline) => ready,
             result = input.read(&mut byte) => { result?; Err(anyhow!("memory parent closed during startup")) },
-            _ = termination.recv() => Err(anyhow!("memory supervisor terminated during startup")),
-            _ = interrupt.recv() => Err(anyhow!("memory supervisor interrupted during startup")),
+            _ = signals.recv() => Err(anyhow!("memory supervisor terminated during startup")),
         }?;
         write_record(&request.directory.join("endpoint.json"), &endpoint)?;
         write_frame(output, &Response::Ready { endpoint: endpoint.clone(), owned: true }).await?;
         tokio::select! {
             status = child.wait() => { let status = status?; ensure!(status.success(), "Dolt exited unexpectedly ({status})"); Ok(()) },
             result = input.read(&mut byte) => { result?; Ok(()) },
-            _ = termination.recv() => Ok(()),
-            _ = interrupt.recv() => Ok(()),
+            _ = signals.recv() => Ok(()),
         }
     }.await;
     let stopped = stop_child(&mut child).await;
@@ -941,10 +1098,7 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         // cannot make the directory safe to move: retain this supervisor and
         // its lifecycle lease until the actual owned process has terminated.
         eprintln!("Dolt cleanup is delayed; retaining the memory lifecycle lease");
-        child
-            .wait()
-            .await
-            .context("await owned Dolt cleanup before releasing its lifecycle lease")?;
+        observe_dolt(&mut child, Child::try_wait).await;
     }
     let _ = timeout(Duration::from_secs(1), async {
         let _ = stdout.await;
@@ -959,8 +1113,7 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         && published.instance == endpoint.instance
         && published.port == endpoint.port
     {
-        fs::remove_file(request.directory.join("endpoint.json"))?;
-        File::open(&request.directory)?.sync_all()?;
+        retire_endpoint(&request.directory)?;
     }
     stopped?;
     run_result.with_context(|| {
@@ -969,7 +1122,75 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             request.directory.join("server.log").display()
         )
     })
-    // `lock` is released only after child cleanup and endpoint removal.
+    // `lease` is released only after child cleanup and endpoint retirement.
+}
+
+fn same_directory(actual: &Path, expected: &Path) -> Result<bool> {
+    Ok(files::directory(actual)?.identity() == files::directory(expected)?.identity())
+}
+
+async fn observe_dolt(
+    child: &mut Child,
+    mut status: impl FnMut(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+) {
+    // The caller retains the lifecycle lease throughout this observation.
+    // NativeChild only reports exit once its owned Job has no live processes.
+    loop {
+        if matches!(status(child), Ok(Some(_))) {
+            return;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn retire_endpoint(directory: &Path) -> Result<()> {
+    let parent = files::directory(directory)?;
+    let stage = Directory::ensure_private(&directory.join("staging"))?;
+    let source = std::ffi::OsStr::new("endpoint.json");
+    let file = parent.read(source)?;
+    let retired = format!("endpoint-{}.retired", Uuid::new_v4());
+    stage.rename_file(
+        &parent,
+        source,
+        &file,
+        std::ffi::OsStr::new(&retired),
+        kuru_platform::fs::Publication::New,
+    )?;
+    stage.remove_file(std::ffi::OsStr::new(&retired), file)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+struct ShutdownSignals {
+    termination: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+#[cfg(windows)]
+struct ShutdownSignals {
+    termination: tokio::signal::windows::CtrlBreak,
+    interrupt: tokio::signal::windows::CtrlC,
+}
+impl ShutdownSignals {
+    fn new() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                termination: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                termination: tokio::signal::windows::ctrl_break()?,
+                interrupt: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+    }
+    async fn recv(&mut self) {
+        tokio::select! { _ = self.termination.recv() => {}, _ = self.interrupt.recv() => {} }
+    }
 }
 
 fn server_yaml(directory: &Path, port: u16) -> Result<String> {
@@ -988,20 +1209,7 @@ fn server_yaml(directory: &Path, port: u16) -> Result<String> {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    if path.try_exists()? {
-        private_metadata(path, false)?;
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(OFlag::O_NOFOLLOW.bits())
-        .open(path)?;
-    ensure!(file.metadata()?.nlink() == 1, "linked memory output file");
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
+    files::write(path, bytes)
 }
 
 async fn drain<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<Vec<u8>>>) {
@@ -1069,9 +1277,8 @@ async fn initialize_database(
         .fetch_one(pool)
         .await?;
     ensure!(
-        fs::canonicalize(&datadir)
-            .with_context(|| format!("resolve Dolt bootstrap datadir {datadir:?}"))?
-            == directory.join("data"),
+        same_directory(Path::new(&datadir), &directory.join("data"))
+            .with_context(|| format!("resolve Dolt bootstrap datadir {datadir:?}"))?,
         "Dolt bootstrap data directory mismatch"
     );
     if !identity.initialized {
@@ -1121,30 +1328,12 @@ async fn initialize_database(
 }
 
 async fn stop_child(child: &mut Child) -> Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-    let pid: i32 = child
-        .id()
-        .context("owned Dolt child has no PID")?
-        .try_into()?;
-    // No other task reaps this child: its retained PID cannot name a different
-    // process between this check and signal, even if it exits in the meantime.
-    match signal::kill(Pid::from_raw(pid), signal::Signal::SIGTERM) {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-        Err(error) => return Err(error.into()),
-    }
-    if let Ok(result) = timeout(CLOSE_GRACE, child.wait()).await {
-        result?;
-        return Ok(());
-    }
-    child.start_kill()?;
-    timeout(KILL_GRACE, child.wait())
-        .await
-        .context("owned Dolt process did not reap after forced shutdown")??;
-    Ok(())
+    child.stop(CLOSE_GRACE, KILL_GRACE).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "server_tests.rs"]
 mod tests;
+#[cfg(all(test, windows))]
+#[path = "server/windows_tests.rs"]
+mod windows_tests;

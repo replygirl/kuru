@@ -1,8 +1,6 @@
+use kuru_delivery::command::BlockingCommand as Command;
 use serde_json::Value;
-use std::{
-    path::PathBuf,
-    process::{Command, Output},
-};
+use std::{path::PathBuf, process::Output};
 
 #[path = "support/memory.rs"]
 mod memory;
@@ -98,6 +96,11 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
 fn cli_file_crud_and_shell_require_real_capabilities() {
     let env = Sandbox::new();
     let tools: Value = serde_json::from_str(&env.success(&["tools"])).unwrap();
+    let shell_args = if cfg!(windows) {
+        r#"{"command":"[Console]::Write('shell-ok')"}"#
+    } else {
+        r#"{"command":"printf shell-ok"}"#
+    };
     assert!(
         tools
             .as_array()
@@ -133,24 +136,13 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
     ]);
     assert!(!env.project.join("notes.txt").exists());
     assert!(
-        !env.run(&[
-            "tool",
-            "shell",
-            "--args",
-            r#"{"command":"printf shell-ok"}"#
-        ])
-        .status
-        .success()
+        !env.run(&["tool", "shell", "--args", shell_args])
+            .status
+            .success()
     );
     assert!(
-        env.success(&[
-            "--allow-shell",
-            "tool",
-            "shell",
-            "--args",
-            r#"{"command":"printf shell-ok"}"#
-        ])
-        .contains("shell-ok")
+        env.success(&["--allow-shell", "tool", "shell", "--args", shell_args])
+            .contains("shell-ok")
     );
     assert!(
         !env.run(&["tool", "file_read", "--args", "bad-json"])
@@ -331,10 +323,27 @@ async fn sequential_commands_reap_owned_memory_before_returning_on_success_or_er
             Err(error) if error.kind() == std::io::ErrorKind::NotFound),
             "CLI returned while its owned endpoint was still published"
         );
+        #[cfg(unix)]
+        let lifecycle_path = store_path.join("lifecycle.lock");
+        #[cfg(windows)]
+        let lifecycle_path = {
+            use kuru_platform::fs::{Directory, NameRetention, Privacy};
+            let directory =
+                Directory::open(&store_path, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+            let key: String = directory
+                .identity()
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            env.data
+                .join("memory/lifecycles")
+                .join(format!("{key}.lock"))
+        };
         let lease = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(store_path.join("lifecycle.lock"))
+            .open(lifecycle_path)
             .unwrap();
         lease
             .try_lock()

@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use kuru_core::{MemoryConfig, Message};
+use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Connection, MySqlConnection, MySqlPool, Row};
@@ -15,9 +16,10 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::{
+    files,
     migration::{self, LegacyImport, MigrationReceipt},
     provision,
-    server::{Server, ServerOptions},
+    server::{LifecycleLease, Server, ServerOptions},
 };
 
 #[cfg(test)]
@@ -169,9 +171,8 @@ struct Activation {
 }
 
 struct StoppedStage {
-    path: PathBuf,
     // Hold the existing lifecycle inode through rename and directory fsync.
-    _lease: File,
+    _lease: LifecycleLease,
 }
 
 impl MemoryStore {
@@ -208,13 +209,15 @@ impl MemoryStore {
         private_dir(parent)?;
         let locks = parent.join("locks");
         private_dir(&locks)?;
+        let lock_directory = Directory::open(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
         let name = directory.file_name().context("project store has no name")?;
-        let lock = private_file(&locks.join(name))?;
+        let lock = lock_directory.lock_file(name)?;
         let lock = acquire_lock(
             lock,
             Duration::from_secs(options.config.startup_timeout_secs),
         )
         .await?;
+        lock_directory.verify(name, &lock)?;
         let binary =
             provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?;
         let supervisor = options
@@ -222,6 +225,10 @@ impl MemoryStore {
             .clone()
             .unwrap_or(std::env::current_exe()?);
         let timeout = Duration::from_secs(options.config.startup_timeout_secs);
+        #[cfg(unix)]
+        let lifecycle_root = None;
+        #[cfg(windows)]
+        let lifecycle_root = Some(options.data_dir.join("memory/lifecycles"));
         let make_options = |path: PathBuf, read_only| ServerOptions {
             binary: binary.clone(),
             directory: path,
@@ -230,6 +237,7 @@ impl MemoryStore {
             timeout,
             read_only,
             retained: temporary.clone(),
+            lifecycle_root: lifecycle_root.clone(),
         };
         if !Self::exists(&options.data_dir, &options.project_scope)? {
             ensure!(
@@ -247,7 +255,7 @@ impl MemoryStore {
                 &make_options,
             )
             .await?;
-            let staging = if let Some(staging) = recovered {
+            let mut staging = if let Some(staging) = recovered {
                 staging
             } else {
                 let staging = parent.join(format!(
@@ -278,16 +286,15 @@ impl MemoryStore {
                 let stopped = server.close().await;
                 initialized?;
                 stopped?;
-                let lease = Server::quiescence(&staging, timeout).await?;
-                StoppedStage {
-                    path: staging,
-                    _lease: lease,
-                }
+                let lease =
+                    Server::quiescence_at(&staging, lifecycle_root.as_deref(), timeout).await?;
+                StoppedStage { _lease: lease }
             };
             // A live Dolt data directory must never be renamed.
-            fs::rename(&staging.path, &directory)
+            staging
+                ._lease
+                .move_to(&directory)
                 .context("cannot activate validated Dolt memory")?;
-            File::open(parent)?.sync_all()?;
             drop(staging);
         }
         read_activation(&directory, &options.project_scope)?;
@@ -320,10 +327,8 @@ impl MemoryStore {
             .acquire_owned()
             .await?;
         let directory = tempfile::Builder::new().prefix("kuru-memory-").tempdir()?;
-        let mut options = OpenOptions::new(
-            directory.path().to_path_buf(),
-            format!("project/{}", "0".repeat(64)),
-        );
+        let data = directory.path().join("private");
+        let mut options = OpenOptions::new(data, format!("project/{}", "0".repeat(64)));
         options.config.cache_dir = Some(test_cache());
         options.config.offline = true;
         options.supervisor = Some(test_supervisor()?);
@@ -831,7 +836,13 @@ async fn recover_staging(
                 stage.display()
             );
         }
-        let lease = Server::quiescence(&stage, options(stage.clone(), false).timeout).await?;
+        let lease_options = options(stage.clone(), false);
+        let mut lease = Server::quiescence_at(
+            &stage,
+            lease_options.lifecycle_root.as_deref(),
+            lease_options.timeout,
+        )
+        .await?;
         let matches_source =
             activation
                 .as_ref()
@@ -846,10 +857,7 @@ async fn recover_staging(
                     _ => false,
                 });
         if matches_source && recovered.is_none() {
-            recovered = Some(StoppedStage {
-                path: stage,
-                _lease: lease,
-            });
+            recovered = Some(StoppedStage { _lease: lease });
         } else {
             let preserved = parent.join("interrupted");
             private_dir(&preserved)?;
@@ -859,9 +867,7 @@ async fn recover_staging(
                 fs::symlink_metadata(&destination).is_err(),
                 "interrupted import preservation path already exists"
             );
-            fs::rename(&stage, &destination)?;
-            File::open(&preserved)?.sync_all()?;
-            File::open(parent)?.sync_all()?;
+            lease.move_to(&destination)?;
             eprintln!(
                 "Preserved an interrupted memory import at {}",
                 destination.display()
@@ -892,14 +898,10 @@ fn project_directory(data: &Path, scope: &str) -> Result<PathBuf> {
 }
 fn read_activation(directory: &Path, scope: &str) -> Result<Activation> {
     let marker = directory.join("ready.json");
-    let metadata = fs::symlink_metadata(&marker).context(
+    let bytes = files::read_bytes(&marker, 16 * 1024).context(
         "project memory has no activation record; preserve the store and repair it before opening",
     )?;
-    ensure!(
-        metadata.is_file() && metadata.len() <= 16 * 1024,
-        "project memory activation record must be a bounded regular file"
-    );
-    let activation: Activation = serde_json::from_slice(&fs::read(&marker)?)?;
+    let activation: Activation = serde_json::from_slice(&bytes)?;
     ensure!(
         activation.format == 1 && activation.project_scope == scope,
         "project memory activation identity does not match"
@@ -907,50 +909,20 @@ fn read_activation(directory: &Path, scope: &str) -> Result<Activation> {
     Ok(activation)
 }
 pub(crate) fn private_dir(path: &Path) -> Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "private memory directory must not be a link or file: {}",
-            path.display()
-        );
-    }
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)?;
-    Ok(())
+    files::private_dir(path)
 }
 pub(crate) fn private_file(path: &Path) -> Result<File> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "private memory file must not be a link or directory: {}",
-            path.display()
-        );
+    let parent = files::parent(path, Privacy::OwnerOnly, NameRetention::Movable)?;
+    match parent.create_new(files::name(path)?) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(parent.read_write(files::name(path)?)?)
+        }
+        Err(error) => Err(error.into()),
     }
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
-    }
-    Ok(options.open(path)?)
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    use std::io::Write;
-    let parent = path.parent().context("record needs parent")?;
-    let temporary = parent.join(format!("record-{}.tmp", Uuid::new_v4()));
-    let mut file = private_file(&temporary)?;
-    file.write_all(&serde_json::to_vec(value)?)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    files::write(path, &serde_json::to_vec(value)?)
 }
 async fn acquire_lock(file: File, duration: Duration) -> Result<File> {
     let deadline = Instant::now() + duration;
@@ -984,7 +956,11 @@ pub(crate) fn test_supervisor() -> Result<PathBuf> {
     } else {
         parent
     };
-    let helper = directory.join("kuru-memory");
+    let helper = directory.join(if cfg!(windows) {
+        "kuru-memory.exe"
+    } else {
+        "kuru-memory"
+    });
     ensure!(
         helper.is_file(),
         "Dolt supervisor fixture is missing at {}; run mise run //packages/kuru-memory:build",
@@ -1052,7 +1028,7 @@ mod tests {
 
     #[tokio::test]
     async fn durable_store_reopens_readonly_and_rejects_schema_drift() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "a".repeat(64));
         let options =
             crate::test_support::open_options(directory.path().to_owned(), scope.clone()).unwrap();
@@ -1094,7 +1070,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_paths_and_stable_lock_fail_closed() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "a".repeat(64));
         assert!(!MemoryStore::exists(directory.path(), &scope).unwrap());
         for invalid in ["project/../../escape", "project/ABC", "bad"] {
@@ -1105,7 +1081,10 @@ mod tests {
         assert!(private_dir(&file).is_err());
         assert!(private_file(directory.path()).is_err());
         let link = directory.path().join("link");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&file, &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&file, &link).unwrap();
         assert!(private_file(&link).is_err());
         assert!(private_dir(&link).is_err());
         assert_eq!(fs::read_to_string(&file).unwrap(), "retained");
@@ -1125,7 +1104,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_activation_reuses_the_committed_stage_and_preserves_incomplete_work() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "f".repeat(64));
         let options =
             crate::test_support::open_options(data.path().to_owned(), scope.clone()).unwrap();
@@ -1143,6 +1122,7 @@ mod tests {
             active.with_file_name(format!("{}.staging-{}", "f".repeat(64), Uuid::new_v4()));
         private_dir(&incomplete).unwrap();
         // The supervisor creates its stable lock before writing store identity.
+        #[cfg(unix)]
         private_file(&incomplete.join("lifecycle.lock")).unwrap();
         let store = MemoryStore::open(options.clone()).await.unwrap();
         assert_eq!(
@@ -1171,7 +1151,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_cannot_move_a_stage_while_an_attached_owner_is_still_running() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "8".repeat(64));
         let mut options =
             crate::test_support::open_options(data.path().to_owned(), scope.clone()).unwrap();
@@ -1193,6 +1173,11 @@ mod tests {
             timeout: Duration::from_secs(30),
             read_only: false,
             retained: None,
+            lifecycle_root: if cfg!(windows) {
+                Some(data.path().join("memory/lifecycles"))
+            } else {
+                None
+            },
         })
         .await
         .unwrap();
@@ -1231,8 +1216,8 @@ mod tests {
                 }
             }
         }
-        let source = tempfile::tempdir().unwrap();
-        let restored = tempfile::tempdir().unwrap();
+        let source = crate::test_support::tempdir().unwrap();
+        let restored = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "9".repeat(64));
         let options =
             crate::test_support::open_options(source.path().to_owned(), scope.clone()).unwrap();

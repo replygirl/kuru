@@ -1,3 +1,6 @@
+#![cfg(unix)]
+// Native Windows loaded-image CLI acceptance lives in embedded_runtime.rs and
+// windows_cli.rs; these independent script payloads exercise Unix execution.
 use std::{path::Path, process::Command};
 
 use sha2::{Digest, Sha256};

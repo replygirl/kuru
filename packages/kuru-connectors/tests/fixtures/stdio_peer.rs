@@ -102,7 +102,7 @@ fn run(executable: &Path) -> io::Result<()> {
                         .map(String::as_str)
                         .collect::<Vec<_>>()
                         .as_slice(),
-                    ["login"] | ["logout"] | ["login", "status"]
+                    ["login"] | ["logout"] | ["login", "status"] | ["login", "--device-auth"]
                 ) {
                     return Err(io::Error::other("unexpected authentication arguments"));
                 }

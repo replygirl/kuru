@@ -15,27 +15,33 @@ outputs = [
 description = "Run the documentation server on loopback"
 depends = ["setup"]
 run = "node_modules/.bin/vitepress dev . --host 127.0.0.1"
+run_windows = "node node_modules/vitepress/bin/vitepress.js dev . --host 127.0.0.1"
 
 [tasks.build]
 description = "Build the public documentation site"
 depends = ["setup"]
 run = "node_modules/.bin/vitepress build ."
+run_windows = "node node_modules/vitepress/bin/vitepress.js build ."
 
 [tasks.preview]
 description = "Preview the built documentation site on loopback"
 run = "node_modules/.bin/vitepress preview . --host 127.0.0.1"
+run_windows = "node node_modules/vitepress/bin/vitepress.js preview . --host 127.0.0.1"
 
 [tasks.lint]
 depends = ["setup"]
 run = "node_modules/.bin/oxlint .vitepress/config.mts .vitepress/theme"
+run_windows = "node node_modules/oxlint/bin/oxlint .vitepress/config.mts .vitepress/theme"
 
 [tasks."format:check"]
 depends = ["setup"]
 run = "node_modules/.bin/oxfmt --check ."
+run_windows = "node node_modules/oxfmt/bin/oxfmt --check ."
 
 [tasks."format:fix"]
 depends = ["setup"]
 run = "node_modules/.bin/oxfmt --write ."
+run_windows = "node node_modules/oxfmt/bin/oxfmt --write ."
 
 [tasks.check]
 depends = ["build"]

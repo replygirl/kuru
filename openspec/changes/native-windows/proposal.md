@@ -37,7 +37,8 @@ supported platform.
 
 ## Impact
 
-Affected packages: new `packages/kuru-platform`; `kuru-memory`, `kuru-connectors`,
+Affected packages: the foundation's `packages/kuru-platform`, new pure codec
+`packages/kuru-archive`; `kuru-memory`, `kuru-connectors`,
 `kuru-delivery`, `kuru-runtime`, and `apps/kuru-tui` plus CI/release workflows and
 documentation. Platform primitives remain separate from cognition, provider,
 storage and packaging policy. No change to peer roles, memory namespaces or the

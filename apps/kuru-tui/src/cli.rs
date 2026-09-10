@@ -1,14 +1,15 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use kuru_connectors::{Provider, ToolHost, auth, provider};
+use kuru_connectors::{AuthAction, Provider, ToolHost, auth, provider};
 use kuru_core::{Config, Mode, ModelInfo, ProjectPreferences, SelectionOverrides};
 use kuru_memory::{MemoryStore, OpenOptions as MemoryOptions};
+use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_runtime::Harness;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -122,21 +123,47 @@ pub fn paths(cli: &Cli) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
         .canonicalize()
         .context("workspace directory does not exist")?;
     ensure!(cwd.is_dir(), "workspace must be a directory");
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is unset; configure the environment")?;
     let user_config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"))
-        .join("kuru/config.toml");
-    let user_config = user_config.exists().then_some(user_config);
-    let data = cli.data_dir.clone().unwrap_or_else(|| {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"))
-            .join("kuru")
-    });
+        .or_else(native_config_directory)
+        .map(|path| path.join("kuru/config.toml"))
+        .filter(|path| path.exists());
+    let data = cli
+        .data_dir
+        .clone()
+        .or_else(|| {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(native_data_directory)
+                .map(|path| path.join("kuru"))
+        })
+        .context("no user data directory is available; set --data-dir or KURU_DATA_DIR")?;
+    let data = if data.is_absolute() {
+        data
+    } else {
+        std::env::current_dir()?.join(data)
+    };
     Ok((cwd, data, user_config))
+}
+
+fn native_config_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    return std::env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
+        std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("AppData/Roaming"))
+    });
+    #[cfg(unix)]
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+}
+
+fn native_data_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    return std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("AppData/Local"))
+        });
+    #[cfg(unix)]
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
 }
 
 pub fn effective_config(
@@ -241,11 +268,8 @@ pub async fn execute(cli: Cli) -> Result<()> {
     };
     let migrate = legacy && !exists;
     let _lease = if writer || migrate {
-        std::fs::create_dir_all(&data)?;
-        ensure!(
-            !data.canonicalize()?.starts_with(&cwd),
-            "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
-        );
+        Directory::ensure_private(&data)?;
+        ensure_outside_workspace(&data, &cwd)?;
         Some(project_lease(&data, &cwd)?)
     } else {
         None
@@ -254,10 +278,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
     // existing store supplies only this project's interactive choices, never a
     // resumed transcript. Refuse tool-root storage before opening its database.
     let existing_memory = if exists || legacy {
-        ensure!(
-            !data.canonicalize()?.starts_with(&cwd),
-            "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
-        );
+        ensure_outside_workspace(&data, &cwd)?;
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config.clone();
         options.read_only = !writer && !migrate;
@@ -277,19 +298,13 @@ pub async fn execute(cli: Cli) -> Result<()> {
         let mut config = effective_config(&cli, &cwd, user.as_deref(), &preferences)?;
         match &cli.command {
             Some(Command::Login { device: true }) => {
-                let status = tokio::process::Command::new(&config.codex_command)
-                    .args(["login", "--device-auth"])
-                    .status()
-                    .await
-                    .context("install Codex to use ChatGPT authentication")?;
-                ensure!(status.success(), "Codex device login failed");
-                return Ok(());
+                return auth(&config.codex_command, AuthAction::DeviceLogin).await;
             }
             Some(Command::Login { device: false }) => {
-                return auth(&config.codex_command, "login").await;
+                return auth(&config.codex_command, AuthAction::Login).await;
             }
-            Some(Command::Logout) => return auth(&config.codex_command, "logout").await,
-            Some(Command::Auth) => return auth(&config.codex_command, "status").await,
+            Some(Command::Logout) => return auth(&config.codex_command, AuthAction::Logout).await,
+            Some(Command::Auth) => return auth(&config.codex_command, AuthAction::Status).await,
             Some(Command::Config) => {
                 let mut visible = config.clone();
                 for server in visible.mcp.values_mut() {
@@ -445,50 +460,43 @@ pub async fn execute(cli: Cli) -> Result<()> {
 
 /// Advisory OS locks release when the process exits, including crashes. Keep the
 /// file itself: unlinking lockfiles would allow competing locks on new inodes.
-fn project_lease(data: &Path, cwd: &Path) -> Result<File> {
-    let directory = data.join("locks");
-    if let Ok(metadata) = std::fs::symlink_metadata(&directory) {
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "project lock directory must be a regular directory"
-        );
-    }
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(&directory)?;
+struct ProjectLease {
+    _file: File,
+    _directory: Directory,
+}
+
+fn ensure_outside_workspace(data: &Path, workspace: &Path) -> Result<()> {
+    let data = Directory::open(data, Privacy::Inherited, NameRetention::Movable)?;
+    let workspace = Directory::open(workspace, Privacy::Inherited, NameRetention::Movable)?;
+    ensure!(
+        !data.is_within(&workspace)?,
+        "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
+    );
+    Ok(())
+}
+
+fn project_lease(data: &Path, cwd: &Path) -> Result<ProjectLease> {
+    let directory = Directory::ensure_private(&data.join("locks"))
+        .context("project lock directory must be a private regular directory")?;
     let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
     let name = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let path = directory.join(format!("{name}.lock"));
-    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "project lock must be a regular file"
-        );
-    }
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(path)
+    let name = std::ffi::OsString::from(format!("{name}.lock"));
+    let file = directory
+        .lock_file(&name)
         .context("cannot open the project writer lock")?;
     file.try_lock().map_err(|error| {
         anyhow::anyhow!(
             "project already has an active Kuru writer, or its lock could not be acquired: {error}"
         )
     })?;
-    Ok(file)
+    directory.verify(&name, &file)?;
+    Ok(ProjectLease {
+        _file: file,
+        _directory: directory,
+    })
 }
 
 async fn update(
@@ -496,23 +504,33 @@ async fn update(
     release_base: Option<&str>,
     source: Option<&Path>,
 ) -> Result<()> {
+    #[cfg(unix)]
     let executable = std::env::current_exe()?;
+    #[cfg(unix)]
     let destination = executable.parent().context("executable has no parent")?;
     if let Some(source) = source {
         ensure!(
             version.is_none() && release_base.is_none(),
             "--source cannot be combined with release options"
         );
-        let mut command = tokio::process::Command::new("bash");
-        command
-            .arg(source.join("scripts/install.sh"))
-            .arg("--source")
-            .env("KURU_INSTALL_DIR", destination);
-        let status = command.status().await.context("could not launch updater")?;
-        ensure!(
-            status.success(),
-            "update failed; installed executable retained"
-        );
+        #[cfg(unix)]
+        {
+            let mut command = tokio::process::Command::new("bash");
+            command
+                .arg(source.join("scripts/install.sh"))
+                .arg("--source")
+                .env("KURU_INSTALL_DIR", destination);
+            let status = command.status().await.context("could not launch updater")?;
+            ensure!(status.success(), "source update failed");
+        }
+        #[cfg(windows)]
+        {
+            let candidate = build_windows_source(source).await?;
+            let outcome =
+                kuru_delivery::update::replace_running_binary(&candidate, &update_helper_cache()?)
+                    .await?;
+            println!("Installed source build at {}", outcome.installed.display());
+        }
     } else {
         let version = version
             .context("provide --version VERSION for a verified release or --source CHECKOUT")?;
@@ -520,9 +538,14 @@ async fn update(
         let base = release_base
             .or(configured_base.as_deref())
             .context("--release-base or KURU_RELEASE_BASE is required")?;
+        #[cfg(unix)]
         let path = kuru_delivery::archive::install(base, version, destination, None)
             .await
-            .context("update failed; installed executable retained")?;
+            .context("update failed")?;
+        #[cfg(windows)]
+        let path = kuru_delivery::update::replace_running(base, version, &update_helper_cache()?)
+            .await?
+            .installed;
         println!(
             "Installed Kuru {} at {}",
             kuru_delivery::archive::checked_version(version)?,
@@ -530,4 +553,72 @@ async fn update(
         );
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn update_helper_cache() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(native_data_directory)
+        .context("set LOCALAPPDATA or XDG_CACHE_HOME for update recovery storage")?;
+    let path = base.join("kuru/update-helpers");
+    ensure!(
+        path.is_absolute(),
+        "update recovery cache must be an absolute path"
+    );
+    Ok(path)
+}
+
+#[cfg(windows)]
+async fn build_windows_source(source: &Path) -> Result<PathBuf> {
+    use kuru_delivery::command::{output, rooted};
+    use std::time::Duration;
+    let source = source
+        .canonicalize()
+        .context("source checkout does not exist")?;
+    let host = kuru_delivery::archive::host_target()?;
+    if let Some(target) = std::env::var_os("CARGO_BUILD_TARGET") {
+        ensure!(
+            target == "host" || target == host,
+            "source update requires the native target {host}"
+        );
+    }
+    for arguments in [
+        vec!["install", "rust"],
+        vec![
+            "run",
+            "//apps/kuru-tui:build:release",
+            "--",
+            "--target",
+            host,
+        ],
+    ] {
+        let mut command = rooted(&source, "mise");
+        command
+            .arg("-C")
+            .arg(&source)
+            .args(arguments)
+            .current_dir(&source)
+            .env("MISE_NO_HOOKS", "1")
+            .env("MISE_TASK_RUN_AUTO_INSTALL", "false")
+            .env_remove("CARGO_BUILD_TARGET");
+        let result = output(&mut command, Duration::from_secs(1800))
+            .await
+            .context("run source build through mise")?;
+        print!("{}", String::from_utf8_lossy(&result.stdout));
+        eprint!("{}", String::from_utf8_lossy(&result.stderr));
+        ensure!(
+            result.status.success(),
+            "source build failed before update publication"
+        );
+    }
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| source.join("target"));
+    let target = if target.is_absolute() {
+        target
+    } else {
+        source.join(target)
+    };
+    Ok(target.join(host).join("release/kuru.exe"))
 }

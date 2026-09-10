@@ -31,6 +31,10 @@ exact version selection.
 - **WHEN** a user selects a published Kuru version through mise's GitHub backend
 - **THEN** mise installs the matching native executable without a checkout or compiler and can activate it for invocation.
 
+#### Scenario: Candidate mise installation before publication
+- **WHEN** native acceptance routes the real mise GitHub backend through supported URL replacements to simulated release metadata and genuine packaged candidate bytes in isolated configuration
+- **THEN** native selection, checksum enforcement, installation, activation and persistent offline runtime behavior are verified without live fallback, and actual published installation remains a separately pending post-publication check rather than being claimed from the fixture.
+
 #### Scenario: Source installation
 - **WHEN** the source installer runs with an explicit writable destination
 - **THEN** the resulting executable reports its version and runs the offline demo with an initially empty runtime cache.

@@ -1,5 +1,6 @@
 use super::*;
-use std::os::unix::fs::symlink;
+use std::fs::OpenOptions;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::{future::Future, task::Poll};
 
 fn identity() -> Identity {
@@ -17,6 +18,121 @@ fn fixture() -> Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()?)
+}
+
+#[test]
+fn cleanup_observer_retains_real_child_and_directory_after_query_error_and_deadline() -> Result<()>
+{
+    use std::io::Write;
+    let root = Arc::new(fixture()?);
+    let path = root.path().to_owned();
+    fs::write(path.join("accepted"), b"preserved until exit")?;
+    let weak = Arc::downgrade(&root);
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "IFS= read -r token; exit 0"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut input = child.stdin.take().context("controlled child stdin")?;
+    let (observed, observation) = std::sync::mpsc::channel();
+    let (finished, completion) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut calls = 0;
+        observe_supervisor(child, Some(root), Duration::ZERO, |child| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::other("controlled status-query failure"));
+            }
+            let status = child.try_wait();
+            if calls == 2 {
+                observed
+                    .send(status.as_ref().is_ok_and(|status| status.is_none()))
+                    .unwrap();
+            }
+            status
+        });
+        finished.send(()).unwrap();
+    });
+    assert!(observation.recv_timeout(Duration::from_secs(3))?);
+    assert!(matches!(
+        completion.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert!(
+        weak.upgrade().is_some(),
+        "observer lost its actual retained directory"
+    );
+    assert_eq!(fs::read(path.join("accepted"))?, b"preserved until exit");
+    writeln!(input, "finish")?;
+    drop(input);
+    completion.recv_timeout(Duration::from_secs(3))?;
+    worker.join().unwrap();
+    assert!(
+        weak.upgrade().is_none(),
+        "completed observer leaked its owner"
+    );
+    assert!(
+        !path.exists(),
+        "directory must be deleted only after observed exit"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit() -> Result<()> {
+    let root = fixture()?;
+    let store = root.path().join("store");
+    private_directory(&store)?;
+    let lease = Server::quiescence(&store, Duration::from_secs(1)).await?;
+    let home = root.path().join("home");
+    crate::provision::prepare_private_home(&home)?;
+    let script = root.path().join("controlled-child");
+    fs::write(
+        &script,
+        b"#!/bin/sh\nIFS= read -r token < \"$TMPDIR/release\"\n",
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let fifo = home.join("tmp/release");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )?;
+    let release = nix::fcntl::open(
+        &fifo,
+        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    let mut child =
+        crate::engine::spawn(&script, &home, root.path(), Vec::new(), Vec::new(), true).await?;
+    let (observed, observation) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut observed = Some(observed);
+        observe_dolt(&mut child, |child| {
+            if let Some(observed) = observed.take() {
+                observed.send(()).unwrap();
+                return Err(std::io::Error::other(
+                    "controlled retained-child query failure",
+                ));
+            }
+            child.try_wait()
+        })
+        .await;
+        drop(lease);
+    });
+    tokio::time::timeout(Duration::from_secs(3), observation).await??;
+    assert!(
+        Server::quiescence(&store, Duration::from_millis(30))
+            .await
+            .is_err(),
+        "query failure released a live child's actual lease"
+    );
+    nix::unistd::write(&release, b"finish\n")?;
+    tokio::time::timeout(Duration::from_secs(3), task).await??;
+    drop(release);
+    drop(Server::quiescence(&store, Duration::from_secs(1)).await?);
+    Ok(())
 }
 
 #[test]
@@ -139,6 +255,7 @@ async fn supervisor_rejects_bad_configuration_and_parent_eof_without_spawning() 
         project_scope: "project/test".into(),
         timeout_millis: 100,
         read_only: false,
+        lifecycle_root: None,
     };
     let mut input = tokio::io::empty();
     let mut output = Vec::new();
@@ -181,6 +298,7 @@ async fn open_rejects_invalid_options_before_executable_lookup() -> Result<()> {
         timeout: Duration::from_secs(1),
         read_only: false,
         retained: None,
+        lifecycle_root: None,
     };
     let mut invalid = options();
     invalid.timeout = Duration::ZERO;
@@ -269,6 +387,7 @@ async fn waiting_supervisor_refuses_recreated_stage_after_original_lock_moves() 
         project_scope: "project/test".into(),
         timeout_millis: 1000,
         read_only: false,
+        lifecycle_root: None,
     };
     let (_parent, mut input) = tokio::io::duplex(1024);
     let mut output = Vec::new();
@@ -315,6 +434,7 @@ async fn closing_an_attached_handle_does_not_establish_quiescence() -> Result<()
         timeout: Duration::from_secs(20),
         read_only: false,
         retained: None,
+        lifecycle_root: None,
     };
     let owner = Server::open(options.clone()).await?;
     let attached = Server::open(ServerOptions {

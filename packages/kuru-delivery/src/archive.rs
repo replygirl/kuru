@@ -1,24 +1,27 @@
 //! Reproducible release archives and bounded, atomic installation.
 
+use crate::targets::{ArchiveFormat, Target};
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, GzBuilder, read::GzDecoder};
+use kuru_archive::zip::{self, Archive, Limits, MemberKind, MemberSpec, WriteMember};
+use kuru_platform::fs::{
+    Directory, NameRetention, Privacy, Publication, PublicationPhase, make_executable,
+    regular_file_info,
+};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashSet,
-    fs::{self, File, OpenOptions},
+    ffi::OsStr,
+    fs::{self, File},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-pub const TARGETS: [&str; 4] = [
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-unknown-linux-gnu",
-];
-const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
+pub use crate::targets::TARGETS;
+pub const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
 
 pub fn checked_version(value: &str) -> Result<&str> {
     let value = value.strip_prefix('v').unwrap_or(value);
@@ -39,22 +42,17 @@ pub fn checked_version(value: &str) -> Result<&str> {
 }
 
 pub fn host_target() -> Result<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Ok(TARGETS[0]),
-        ("macos", "x86_64") => Ok(TARGETS[1]),
-        ("linux", "aarch64") => Ok(TARGETS[2]),
-        ("linux", "x86_64") => Ok(TARGETS[3]),
-        _ => anyhow::bail!("unsupported platform; build from source with Rust"),
-    }
+    Ok(crate::targets::host()?.triple)
 }
 
 pub fn archive_name(version: &str, target: &str) -> Result<String> {
     let version = checked_version(version)?;
-    ensure!(
-        TARGETS.contains(&target),
-        "unsupported platform; build from source with Rust"
-    );
-    Ok(format!("kuru-{version}-{target}.tar.gz"))
+    let target = crate::targets::find(target)?;
+    Ok(format!(
+        "kuru-{version}-{}.{}",
+        target.triple,
+        target.format.extension()
+    ))
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -83,7 +81,12 @@ pub fn expected_digest(manifest: &[u8], filename: &str) -> Result<String> {
 }
 
 pub async fn read_asset(base: &str, name: &str, limit: usize) -> Result<Vec<u8>> {
-    if let Ok(mut base) = url::Url::parse(base) {
+    kuru_platform::fs::validate_component(OsStr::new(name))?;
+    let native_path = Path::new(base).is_absolute()
+        || base.starts_with("\\\\")
+        || (base.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && base.as_bytes().get(1) == Some(&b':'));
+    if let Some(mut base) = url::Url::parse(base).ok().filter(|_| !native_path) {
         ensure!(
             base.scheme() == "https"
                 && base.host_str().is_some()
@@ -118,12 +121,24 @@ pub async fn read_asset(base: &str, name: &str, limit: usize) -> Result<Vec<u8>>
         }
         Ok(bytes)
     } else {
-        bounded(
-            File::open(Path::new(base).join(name))?,
-            limit,
-            "release asset",
-        )
+        let directory = Directory::open(
+            &absolute(Path::new(base))?,
+            Privacy::Inherited,
+            NameRetention::Movable,
+        )?;
+        let mut input = directory.read(OsStr::new(name))?;
+        let bytes = bounded(&mut input, limit, "release asset")?;
+        directory.verify(OsStr::new(name), &input)?;
+        Ok(bytes)
     }
+}
+
+fn absolute(path: &Path) -> Result<PathBuf> {
+    Ok(if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    })
 }
 
 fn bounded(reader: impl Read, limit: usize, description: &str) -> Result<Vec<u8>> {
@@ -143,6 +158,39 @@ pub async fn install(
         Some(target) => target,
         None => host_target()?,
     };
+    let bytes = verified_binary(base, version, target).await?;
+    install_binary(&bytes, destination, crate::targets::find(target)?)
+}
+
+/// Install a trusted local build using the same bounded held-file publication
+/// path as release archives. This never runs the source executable.
+pub fn install_local(binary: &Path, destination: &Path, target: Option<&str>) -> Result<PathBuf> {
+    let target = crate::targets::find(match target {
+        Some(target) => target,
+        None => host_target()?,
+    })?;
+    let binary = absolute(binary)?;
+    let parent = Directory::open(
+        binary.parent().context("binary has no parent")?,
+        Privacy::Inherited,
+        NameRetention::Movable,
+    )?;
+    let name = binary.file_name().context("binary has no filename")?;
+    let mut source = parent.read(name)?;
+    #[cfg(unix)]
+    ensure!(
+        source.metadata()?.permissions().mode() & 0o111 != 0,
+        "local source is not executable"
+    );
+    let bytes = bounded(&mut source, MAX_ARCHIVE_BYTES, "local executable")?;
+    ensure!(!bytes.is_empty(), "local executable is empty");
+    parent.verify(name, &source)?;
+    install_binary(&bytes, destination, target)
+}
+
+/// Verify release checksum and the complete archive before exposing candidate bytes.
+/// This function never executes, installs or probes the candidate.
+pub async fn verified_binary(base: &str, version: &str, target: &str) -> Result<Vec<u8>> {
     let name = archive_name(version, target)?;
     let expected = expected_digest(&read_asset(base, "SHA256SUMS", 64 * 1024).await?, &name)?;
     let bytes = read_asset(base, &name, MAX_ARCHIVE_BYTES).await?;
@@ -150,17 +198,49 @@ pub async fn install(
         digest(&bytes) == expected,
         "release archive checksum mismatch; existing executable unchanged"
     );
-    install_archive(&bytes, destination, MAX_ARCHIVE_BYTES)
+    extract_binary(&bytes, crate::targets::find(target)?, MAX_ARCHIVE_BYTES)
 }
 
+#[cfg(test)]
 fn install_archive(bytes: &[u8], destination: &Path, limit: usize) -> Result<PathBuf> {
-    fs::create_dir_all(destination)?;
-    let executable = destination.join("kuru");
-    if let Ok(metadata) = fs::symlink_metadata(&executable) {
+    let target = crate::targets::find(TARGETS[0])?;
+    install_binary(&extract_binary(bytes, target, limit)?, destination, target)
+}
+
+fn zip_limits(limit: usize) -> Limits {
+    Limits {
+        max_compressed_bytes: limit as u64,
+        max_expanded_bytes: limit as u64,
+        allow_ntfs_timestamps: false,
+    }
+}
+
+fn extract_binary(bytes: &[u8], target: &Target, limit: usize) -> Result<Vec<u8>> {
+    ensure!(bytes.len() <= limit, "release archive exceeds size limit");
+    if target.format == ArchiveFormat::Zip {
+        let expected = [target.executable, "LICENSE", "README.md"].map(|name| MemberSpec {
+            name,
+            kind: MemberKind::File,
+            max_bytes: limit as u64,
+            exact_bytes: None,
+            unix_mode: Some(if name == target.executable {
+                0o100755
+            } else {
+                0o100644
+            }),
+        });
+        let mut archive = Archive::open(bytes, &expected, zip_limits(limit))?;
+        let mut binary = Vec::new();
+        archive.copy(target.executable, &mut binary)?;
         ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "destination kuru must be a regular file, not a symlink or directory"
+            !binary.is_empty(),
+            "release kuru entry is not an executable"
         );
+        // Validate every member's decoded CRC/size, including non-executable documentation.
+        for name in ["LICENSE", "README.md"] {
+            archive.copy(name, &mut std::io::sink())?;
+        }
+        return Ok(binary);
     }
     // Bound all expanded bytes before the tar parser can allocate for PAX or GNU metadata.
     let expanded = bounded(GzDecoder::new(bytes), limit, "expanded release archive")?;
@@ -195,20 +275,56 @@ fn install_archive(bytes: &[u8], destination: &Path, limit: usize) -> Result<Pat
             binary = Some(content);
         }
     }
-    let binary = binary.context("release archive must contain exactly one kuru executable")?;
-    let staging = tempfile::Builder::new()
-        .prefix(".kuru-install-")
-        .tempdir_in(destination)?;
-    let candidate = staging.path().join("kuru");
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&candidate)?;
-    output.write_all(&binary)?;
-    output.set_permissions(fs::Permissions::from_mode(0o755))?;
+    binary.context("release archive must contain exactly one kuru executable")
+}
+
+fn destination_directory(path: &Path) -> Result<Directory> {
+    let path = absolute(path)?;
+    match Directory::open(&path, Privacy::Inherited, NameRetention::Movable) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            drop(Directory::ensure_private(&path)?);
+            Ok(Directory::open(
+                &path,
+                Privacy::Inherited,
+                NameRetention::Movable,
+            )?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_binary(binary: &[u8], destination: &Path, target: &Target) -> Result<PathBuf> {
+    let destination = destination_directory(destination)?;
+    let name = OsStr::new(target.executable);
+    match destination.read(name) {
+        Ok(_) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error).context("destination must be a regular file, not a symlink, reparse point, hardlink or directory"),
+    }
+    #[cfg(windows)]
+    let _lease = crate::update::installation_guard(&destination)?;
+    let staging = crate::staging::Stage::create(&destination, ".kuru-install-")?;
+    // Create and validate the protected root before any candidate content exists.
+    // The ordinary payload retains the destination's executable access convention.
+    let stage = Directory::open(staging.path(), Privacy::Inherited, NameRetention::Movable)?;
+    let mut output = stage.create_new(name)?;
+    output.write_all(binary)?;
+    make_executable(&output)?;
     output.sync_all()?;
-    fs::rename(candidate, &executable)?;
-    Ok(executable)
+    if let Err(error) =
+        destination.publish_file(&stage, name, &output, name, Publication::ReplaceRegular)
+        && (error.phase != PublicationPhase::Uncertain
+            || destination.verify(name, &output).is_err())
+    {
+        return Err(error.into());
+    }
+    drop(output);
+    drop(stage);
+    staging
+        .finish()
+        .context("verified executable was installed, but private staging cleanup failed")?;
+    Ok(destination.path().join(name))
 }
 
 pub fn package(binary: &Path, target: &str, version: &str, output: &Path) -> Result<PathBuf> {
@@ -230,18 +346,27 @@ fn package_with_docs(
     license: &[u8],
     readme: &[u8],
 ) -> Result<PathBuf> {
-    let metadata =
-        fs::symlink_metadata(binary).context("binary must be an existing executable file")?;
+    let binary = absolute(binary)?;
+    let parent = Directory::open(
+        binary.parent().context("binary has no parent")?,
+        Privacy::Inherited,
+        NameRetention::Movable,
+    )?;
+    let input_name = binary.file_name().context("binary has no filename")?;
+    let mut input = parent
+        .read(input_name)
+        .context("binary must be an existing executable file")?;
+    let metadata = input.metadata()?;
+    let identity = regular_file_info(&input)?.identity;
+    #[cfg(unix)]
     ensure!(
-        metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.permissions().mode() & 0o111 != 0,
+        metadata.permissions().mode() & 0o111 != 0,
         "binary must be an existing executable file"
     );
     let name = archive_name(version, target)?;
-    fs::create_dir_all(output)?;
-    let archive = output.join(&name);
-    let checksum = output.join(format!("{name}.sha256"));
+    let output = destination_directory(output)?;
+    let archive = output.path().join(&name);
+    let checksum = output.path().join(format!("{name}.sha256"));
     for path in [&archive, &checksum] {
         match fs::symlink_metadata(path) {
             Ok(existing) => {
@@ -250,7 +375,7 @@ fn package_with_docs(
                     "package output must be a regular file, not a symlink or directory"
                 );
                 ensure!(
-                    (existing.dev(), existing.ino()) != (metadata.dev(), metadata.ino()),
+                    regular_file_info(&File::open(path)?)?.identity != identity,
                     "package output must not replace its input executable"
                 );
             }
@@ -258,6 +383,7 @@ fn package_with_docs(
             Err(error) => return Err(error).context("inspect package output"),
         }
     }
+    let target = crate::targets::find(target)?;
     let expanded_size = [metadata.len(), license.len() as u64, readme.len() as u64]
         .into_iter()
         .try_fold(1024u64, |total, size| {
@@ -273,44 +399,86 @@ fn package_with_docs(
     );
     // Build both artifacts privately. A read/compression/write failure must
     // not truncate an earlier release or publish a partial replacement.
-    let staging = tempfile::Builder::new()
-        .prefix(".kuru-package-")
-        .tempdir_in(output)?;
+    let staging = crate::staging::Stage::create(&output, ".kuru-package-")?;
     let candidate = staging.path().join(&name);
-    let candidate_checksum = staging.path().join("SHA256SUMS");
-    let gzip = GzBuilder::new()
-        .mtime(0)
-        .write(File::create(&candidate)?, Compression::default());
-    let mut stream = tar::Builder::new(gzip);
-    for (name, content, mode) in [
+    let contents = [
         (
-            "kuru",
-            bounded(File::open(binary)?, MAX_ARCHIVE_BYTES, "release executable")?,
+            target.executable,
+            bounded(&mut input, MAX_ARCHIVE_BYTES, "release executable")?,
             0o755,
         ),
         ("LICENSE", license.to_vec(), 0o644),
         ("README.md", readme.to_vec(), 0o644),
-    ] {
-        let mut header = tar::Header::new_ustar();
-        header.set_size(content.len() as u64);
-        header.set_mode(mode);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mtime(0);
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_cksum();
-        stream.append_data(&mut header, name, content.as_slice())?;
+    ];
+    parent.verify(input_name, &input)?;
+    match target.format {
+        ArchiveFormat::TarGz => {
+            let gzip = GzBuilder::new().mtime(0).write(
+                staging.directory().create_new(OsStr::new(&name))?,
+                Compression::default(),
+            );
+            let mut stream = tar::Builder::new(gzip);
+            for (name, content, mode) in &contents {
+                let mut header = tar::Header::new_ustar();
+                header.set_size(content.len() as u64);
+                header.set_mode(*mode);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_mtime(0);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
+                stream.append_data(&mut header, *name, content.as_slice())?;
+            }
+            stream.into_inner()?.finish()?.sync_all()?;
+        }
+        ArchiveFormat::Zip => {
+            let members: Vec<_> = contents
+                .iter()
+                .map(|(name, content, mode)| WriteMember {
+                    name,
+                    kind: MemberKind::File,
+                    bytes: content,
+                    executable: mode & 0o111 != 0,
+                })
+                .collect();
+            let bytes = zip::write(&members, zip_limits(MAX_ARCHIVE_BYTES))?;
+            let mut file = staging.directory().create_new(OsStr::new(&name))?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
     }
-    stream.into_inner()?.finish()?.sync_all()?;
-    let mut output_checksum = File::create(&candidate_checksum)?;
+    ensure!(
+        fs::metadata(&candidate)?.len() <= MAX_ARCHIVE_BYTES as u64,
+        "compressed release archive exceeds size limit"
+    );
+    let mut output_checksum = staging.directory().create_new(OsStr::new("SHA256SUMS"))?;
     writeln!(
         output_checksum,
         "{}  {name}",
         digest(&fs::read(&candidate)?)
     )?;
     output_checksum.sync_all()?;
-    fs::rename(candidate, &archive)?;
-    fs::rename(candidate_checksum, checksum)?;
+    drop(output_checksum);
+    let stage = staging.directory();
+    let archive_file = stage.read_write(OsStr::new(&name))?;
+    output.publish_file(
+        stage,
+        OsStr::new(&name),
+        &archive_file,
+        OsStr::new(&name),
+        Publication::ReplaceRegular,
+    )?;
+    let checksum_file = stage.read_write(OsStr::new("SHA256SUMS"))?;
+    output.publish_file(
+        stage,
+        OsStr::new("SHA256SUMS"),
+        &checksum_file,
+        checksum.file_name().context("missing checksum filename")?,
+        Publication::ReplaceRegular,
+    )?;
+    drop(archive_file);
+    drop(checksum_file);
+    staging.finish()?;
     Ok(archive)
 }
 

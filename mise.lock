@@ -362,6 +362,7 @@ checksum = "sha256:26662e28e8fcdb64a84b9a85122e45debec4f7c683549e7d9a61f4528fe8b
 url = "https://github.com/aligned-team/cospec/releases/download/v0.7.0/cospec-0.7.0-windows-x64.zip"
 url_api = "https://api.github.com/repos/aligned-team/cospec/releases/assets/552583641"
 provenance = "github-attestations"
+provenance_verified = true
 
 [tools."github:aligned-team/cospec"."platforms.windows-x64-baseline"]
 checksum = "sha256:26662e28e8fcdb64a84b9a85122e45debec4f7c683549e7d9a61f4528fe8b953"

@@ -26,7 +26,7 @@ fn memory_options(data: &std::path::Path, project: &std::path::Path) -> kuru_mem
 async fn preferences_survive_reopening_without_resuming_chats_or_crossing_project_boundaries() {
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
+    let state = kuru_memory::test_support::tempdir().unwrap();
     let options = memory_options(state.path(), project.path());
     let memory = MemoryStore::open(options.clone()).await.unwrap();
     let mut harness = Harness::new(
