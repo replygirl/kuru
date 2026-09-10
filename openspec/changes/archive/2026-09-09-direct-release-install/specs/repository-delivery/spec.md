@@ -1,19 +1,4 @@
-# repository-delivery Specification
-
-## Purpose
-Keep the Rust monorepo reproducible through pinned tools and dependencies,
-cospec change artifacts, meaningful coverage and automated quality gates.
-Provide documented source installation and verified, atomic release updates.
-
-## Requirements
-
-### Requirement: Reproducible workspace quality gates
-
-The repository SHALL use apps/ and packages/, pinned Rust/mise tooling, hk hooks, cospec change gates, Cargo.lock, and CI checks for format, lint, tests and at least 90% workspace line coverage from meaningful behavioral tests.
-
-#### Scenario: Coverage regression
-- **WHEN** measured workspace line coverage is below 90 percent
-- **THEN** the coverage check fails rather than silently reducing the threshold or excluding application code.
+## MODIFIED Requirements
 
 ### Requirement: Source and mise installation
 

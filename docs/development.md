@@ -52,7 +52,7 @@ Local Git hooks, maintainer setup and the full validation jobs retain hk.
 | `mise run lint` | All-target Clippy with warnings as errors |
 | `mise run test` | Workspace behavioral and protocol tests |
 | `mise run coverage` | Workspace LLVM line coverage, minimum 90% |
-| `mise run test:install` | Real archive/install and rejection tests |
+| `mise run test:install` | Native archive and real Bash bootstrap installation, rejection and interruption tests |
 | `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
 | `mise run docs:dev` | Local VitePress server |
 | `mise run docs:check` | Production docs, local links, anchors and public content boundary |

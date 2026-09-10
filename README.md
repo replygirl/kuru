@@ -12,46 +12,55 @@ claim consciousness, reproduce a human nervous system, or provide therapy.
 
 [Documentation](https://replygirl.github.io/kuru/) · [Development](docs/development.md)
 
-## Install from source
+## Install
 
-The repository is [replygirl/kuru](https://github.com/replygirl/kuru), currently
-private while the project takes shape. Public availability is planned.
-Clone with an authorized GitHub account:
+### mise
 
-```sh
-gh repo clone replygirl/kuru
-cd kuru
-```
-
-These source installation paths work today. Building requires Rust 1.98.1,
-a C compiler for bundled SQLite, and standard platform build tools.
-
-Direct installation with an existing Rust toolchain:
+With [mise](https://mise.jdx.dev/getting-started.html):
 
 ```sh
-cd /path/to/kuru
-cargo install --path apps/kuru-tui --locked
+mise use -g github:replygirl/kuru
 kuru --version
 ```
 
-This installs to Cargo's binary directory, normally `~/.cargo/bin`. To choose
-`~/.local/bin` or another destination, use the source installer:
+This installs and activates the native executable. To select an exact release,
+use `mise use -g github:replygirl/kuru@0.1.0`. Exact versions also bypass mise's
+release-age cooldown for newly published releases.
+
+### Shell
+
+Install the latest native release into `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+kuru --version
+```
+
+The installer selects your platform, verifies the archive checksum, and replaces
+the executable atomically. macOS and Linux on arm64 and x86-64 are supported;
+see [installation and updates](docs/install.md) for platform requirements,
+version selection, destinations and offline installation.
+
+### From source
+
+Building requires Rust 1.98.1, a C compiler for bundled SQLite, and standard
+platform build tools:
+
+```sh
+git clone https://github.com/replygirl/kuru.git
+cd kuru
+cargo install --path apps/kuru-tui --locked
+```
+
+Cargo installs into `~/.cargo/bin` by default. To choose another destination:
 
 ```sh
 KURU_INSTALL_DIR="$HOME/.local/bin" bash scripts/install.sh --source
 ```
 
-With [mise](https://mise.jdx.dev/), from the checkout:
-
-```sh
-mise trust
-mise install
-mise run install
-```
-
-The mise path installs the pinned toolchain before building the same executable.
-Maintainer setup is separate from app installation. Add your installation directory to `PATH`.
-See [installation and updates](docs/install.md) for release archives and updates.
+For the repository's pinned maintainer toolchain and mise tasks, see
+[development](docs/development.md).
 
 ## Start a conversation
 
@@ -62,7 +71,8 @@ kuru --provider demo
 
 The demo provider exercises the pool locally without credentials. For live
 OpenAI models, install the verified current Codex release (`npm install -g
-@openai/codex@0.153.4`, or the pinned tool through `mise install`), authenticate through its supported login flow,
+@openai/codex@0.153.4`, or the pinned tool through `mise install` from a maintainer
+checkout), authenticate through its supported login flow,
 and start Kuru with the default `codex` provider. Model and reasoning-effort
 choices are discovered from your provider at runtime. API-key users can select
 the `responses` provider with `OPENAI_API_KEY` set in their environment.
@@ -105,7 +115,7 @@ and [development](docs/development.md) for boundaries and extension points.
 | Path | Responsibility |
 | --- | --- |
 | `apps/kuru-tui` | Terminal UI and `kuru` executable |
-| `apps/kuru-docs` | Public VitePress docs and its local Node/npm dependencies |
+| `apps/kuru-docs` | VitePress docs and its local Node/npm dependencies |
 | `packages/kuru-core` | Frameworks, configuration and SQLite memory |
 | `packages/kuru-connectors` | Providers, tools, MCP and outbound A2A |
 | `packages/kuru-runtime` | Actor pool, peer routing, relationships and dreaming |

@@ -24,7 +24,12 @@ run = "cargo test -p kuru-delivery --all-targets --all-features --locked"
 run = "cargo check -p kuru-delivery --all-targets --all-features --locked"
 
 [tasks."lint"]
+depends = ["lint:shell"]
 run = "cargo clippy -p kuru-delivery --all-targets --all-features --locked -- -D warnings"
+
+[tasks."lint:shell"]
+description = "Check the compiler-free release bootstrap"
+run = "shellcheck support/install.sh"
 
 [tasks.tool]
 dir = "{{config_root}}/../.."
@@ -43,4 +48,7 @@ run = "mise run tool -- repo --root ."
 run = "mise run tool -- package"
 
 [tasks."test:install"]
-run = "cargo test -p kuru-delivery --all-features --locked archive::tests"
+run = [
+  "cargo test -p kuru-delivery --all-features --locked archive::tests",
+  "cargo test -p kuru-delivery --all-features --locked --test bootstrap_install",
+]

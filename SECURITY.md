@@ -1,20 +1,14 @@
 # Security policy
 
 Kuru runs locally and coordinates model providers, isolated peer memories, tools,
-MCP servers and A2A peers. There is no hosted Kuru service. During initial development,
-the current `main` branch is the supported version; after releases begin, report
-issues against the latest release.
+MCP servers and A2A peers. There is no hosted Kuru service. Report issues against
+the latest release.
 
 ## Reporting
 
-While this repository is private, authorized collaborators can report issues
-privately in [replygirl/kuru](https://github.com/replygirl/kuru/issues) or through
-an existing private channel with the maintainer. Do not include live credentials,
-private conversations or memory databases in reports.
-
-Before public availability, the maintainer will enable GitHub private vulnerability
-reporting. Once enabled, use [a private security advisory](https://github.com/replygirl/kuru/security/advisories/new)
-for vulnerabilities instead of a public issue. Include reproduction steps,
+Contact the [maintainer](https://github.com/replygirl) privately to arrange
+vulnerability disclosure. Do not post vulnerabilities in public issues or include
+live credentials, private conversations or memory databases. Include reproduction steps,
 affected versions and the impact you observed. Responses depend on maintainer
 availability; there is no response-time guarantee.
 
