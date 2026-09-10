@@ -1,0 +1,28 @@
+[tasks.build]
+run = "cargo build -p kuru-memory --all-features --locked"
+
+[tasks."build:release"]
+run = "cargo build -p kuru-memory --release --all-features --locked"
+
+[tasks.test]
+depends = ["prefetch"]
+run = "cargo test -p kuru-memory --all-targets --all-features --locked"
+
+[tasks.typecheck]
+run = "cargo check -p kuru-memory --all-targets --all-features --locked"
+
+[tasks.lint]
+run = "cargo clippy -p kuru-memory --all-targets --all-features --locked -- -D warnings"
+
+[tasks.prefetch]
+description = "Install and verify the pinned full-Dolt runtime for local tests"
+run = "cargo run -p kuru-memory --locked -- prefetch"
+
+[tasks."deps:lock"]
+description = "Resolve exact workspace dependency changes"
+run = "cargo generate-lockfile"
+
+[tasks."deps:fetch"]
+run = "cargo fetch --locked"
+[env]
+RUST_TEST_THREADS = "2"

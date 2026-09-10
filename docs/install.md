@@ -100,9 +100,13 @@ corruption; trust comes from the release source you choose.
 From a checkout, `bash scripts/install.sh` forwards these binary-install options
 to the same bootstrap.
 
+The application provisions its verified full-Dolt engine on first memory use.
+For offline operation, also prepare the engine cache or configure the supported
+Dolt executable before disconnecting. See [memory storage](memory.md).
+
 ## Build from source
 
-Building requires Rust 1.98.1, a C compiler for bundled SQLite, and standard
+Building requires Rust 1.98.1, a C compiler for the legacy SQLite importer, and standard
 platform build tools:
 
 ```sh

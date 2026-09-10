@@ -3,8 +3,14 @@ use std::{fs::OpenOptions, process::Command};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[path = "support/memory.rs"]
+mod memory;
+
 fn arguments(project: &std::path::Path, data: &std::path::Path) -> Vec<String> {
+    let configuration = memory::configuration(data.parent().unwrap()).unwrap();
     vec![
+        "--config".into(),
+        configuration.join("kuru/config.toml").display().to_string(),
         "-C".into(),
         project.display().to_string(),
         "--data-dir".into(),
@@ -43,6 +49,23 @@ fn writer_lease_rejects_a_second_process_and_releases_on_close() {
         .unwrap();
     assert!(!blocked.status.success());
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("active Kuru writer"));
+    // Even a read command needs the writer lease before importing a legacy file.
+    // An invalid marker proves the lease error precedes any attempt to parse it.
+    let legacy = data.join("memory.sqlite3");
+    std::fs::write(&legacy, b"legacy bytes must remain untouched").unwrap();
+    let blocked_migration = Command::new(env!("CARGO_BIN_EXE_kuru"))
+        .args(arguments(&project, &data))
+        .arg("sessions")
+        .output()
+        .unwrap();
+    assert!(!blocked_migration.status.success());
+    assert!(String::from_utf8_lossy(&blocked_migration.stderr).contains("active Kuru writer"));
+    assert_eq!(
+        std::fs::read(&legacy).unwrap(),
+        b"legacy bytes must remain untouched"
+    );
+    assert_eq!(std::fs::read_dir(&data).unwrap().count(), 2);
+    std::fs::remove_file(legacy).unwrap();
     drop(lease);
     let resumed = Command::new(env!("CARGO_BIN_EXE_kuru"))
         .args(&args)

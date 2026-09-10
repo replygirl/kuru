@@ -12,6 +12,7 @@ anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 kuru-core.workspace = true
+kuru-memory.workspace = true
 kuru-connectors.workspace = true
 kuru-runtime.workspace = true
 ratatui.workspace = true
@@ -28,6 +29,7 @@ tempfile.workspace = true
 axum.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
+sqlx.workspace = true
 tar.workspace = true
 flate2.workspace = true
 

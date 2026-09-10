@@ -42,9 +42,13 @@ the executable atomically. macOS and Linux on arm64 and x86-64 are supported;
 see [installation and updates](docs/install.md) for platform requirements,
 version selection, destinations and offline installation.
 
+First memory use installs a verified native Dolt runtime. Later runs reuse its
+local cache. See [memory storage](docs/memory.md) for offline setup, migration and
+revision history.
+
 ### From source
 
-Building requires Rust 1.98.1, a C compiler for bundled SQLite, and standard
+Building requires Rust 1.98.1, a C compiler for the legacy SQLite importer, and standard
 platform build tools:
 
 ```sh
@@ -104,7 +108,7 @@ from both the shared conversation and each member's private history.
 
 Dreaming gathers bounded proposals that can add or retire parts. Retired
 histories remain stored, each framework role remains represented, and topology
-changes can be reversed. Sessions persist locally in SQLite. Jungian collective
+changes can be reversed. Sessions persist locally in versioned Dolt databases. Jungian collective
 memory is scoped to the project in this first version.
 
 Read [usage and terminal controls](docs/usage.md), [architecture](docs/architecture.md), [protocols and tools](docs/protocols.md),
@@ -116,7 +120,8 @@ and [development](docs/development.md) for boundaries and extension points.
 | --- | --- |
 | `apps/kuru-tui` | Terminal UI and `kuru` executable |
 | `apps/kuru-docs` | VitePress docs and its local Node/npm dependencies |
-| `packages/kuru-core` | Frameworks, configuration and SQLite memory |
+| `packages/kuru-core` | Frameworks, configuration and shared contracts |
+| `packages/kuru-memory` | Managed Dolt and private versioned memory |
 | `packages/kuru-connectors` | Providers, tools, MCP and outbound A2A |
 | `packages/kuru-runtime` | Actor pool, peer routing, relationships and dreaming |
 | `packages/kuru-delivery` | Native installation, release and repository tooling |

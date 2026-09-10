@@ -1,0 +1,24 @@
+## 1. Engine installation and lifecycle [critical]
+
+- [x] 1.1 @integration (agent) Provision the pinned native runtime in isolated paths and exercise valid offline cache, invalid hashes/entries/links and failed activation -> 14 provisioning tests passed, including actual host offline execution, complete fixture download/extract/activation, concurrent first use and cancellation cleanup.
+- [x] 1.2 @integration (agent) Open real authenticated Dolt, reject wrong credentials/identity, restart and attach readers -> eleven actual lifecycle tests passed, including wrong credential/datadir/instance refusal, SELECT-only table and version-procedure denial, restart and forty short-lived branch pools. Two ownership regressions failed before the fix and passed afterward: writers wait for cold inspections to release ownership, and an independent second writer cannot attach.
+- [x] 1.3 @integration (agent) Kill a writer parent and observe lifetime supervisor cleanup with bounded waits -> actual parent SIGKILL, supervisor SIGTERM with its parent pipe held open, cancelled startup retention and deferred fixture deletion passed; the same store reopened after reaping.
+
+## 2. Storage and migration [critical]
+
+- [x] 2.1 @integration (agent) Exercise Unicode/case/NUL values, message ordering, validation and failing multirow batches through real SQL -> real Dolt tests passed for exact values, concurrent peer ordering and a duplicate operation constraint failing after a row update without exposing partial data.
+- [x] 2.2 @integration (agent) Race candidate promotion and reconcile a committed operation after a lost acknowledgement -> six recovery tests passed, including real wire COMMIT and DOLT_MERGE reply drops, original-session teardown barriers, exactly-once recovery and divergent-history refusal; stale candidate integration also passed.
+- [x] 2.3 @integration (agent) Import a multi-project legacy fixture with WAL data and opaque JSON; interrupt activation and restore a stopped-store copy -> WAL/source bytes and all-project snapshot remained intact, rows compared exactly, empty scopes opened, completed staging reused its revision, incomplete staging was preserved, and backup restored live and candidate history. Active-owner recovery and replaced directory/lock regressions passed; activation retains its quiescence lease through rename.
+
+## 3. Runtime and CLI [critical]
+
+- [x] 3.1 @integration (agent) Dream using candidate actor histories/notes/report, cancel before promotion and test a stale base -> all 44 runtime tests passed, including held/cancelled whole-dream isolation, stale promotion retaining concurrent live writes, and existing partial model rejection behavior. Two accepted-publication regressions failed before reconciliation barriers and passed afterward for later cognitive calls and turn completion.
+- [x] 3.2 @integration (agent) Dream, chat, change preferences, undo and reopen -> actual Dolt regression passed for new undo revision, retained later transcript/preferences and archived new-part history.
+- [x] 3.3 @integration (agent) Exercise first launch, remembered mode/session restoration, memory status/history and fresh config/help/version/update -> all TUI tests passed, including real PTYs, CLI inspection, saved choices, writer leases and malformed legacy refusal; core configuration tests passed.
+- [x] 3.4 @eval (agent) Run scripted peer-provider scenarios for private history, candidate dreaming and rejected proposals against actual Dolt -> per-peer private markers remained isolated in captured prompts, cancelled candidate inputs stayed absent from live history, and existing peer/proposal scenarios passed in the 44-test runtime suite.
+
+## 4. Repository and delivery [critical]
+
+- [x] 4.1 @integration (agent) Run mise run check with real Dolt and updated documentation -> complete gate passed on 2026-09-10 in 307.67 seconds, including format, strict lint, all behavioral tests, docs build/link/anchor checks and cospec validation/managed drift. Actual coverage: 11,746 of 12,052 lines (97.4610 percent); no exclusions or threshold changes. Evidence: `/tmp/kuru-dolt-check-final-2.log` and generated `target/coverage.lcov`. The earlier instrumented failure-process fixture emitted a profiling file into its isolated data directory; using the native failure executable fixed the fixture while retaining strict directory validation.
+- [ ] 4.2 @integration (agent) Observe hosted native matrix and aggregate checks on the implementation PR commit -> record the tested SHA and all supported platform results; required checks also gate the final archive commit before merge.
+- [ ] 4.3 @manual (agent) Review AGENTS.md and install/config/memory docs against implemented behavior and archive the change -> future sessions have accurate package boundaries and workflow instructions.

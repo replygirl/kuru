@@ -84,7 +84,7 @@ cd kuru
 cargo install --path apps/kuru-tui --locked
 ```
 
-Cargo installs into `$CARGO_HOME/bin`, normally `~/.cargo/bin`. Add that directory to your `PATH` if needed. SQLite is built with the application.
+Cargo installs into `$CARGO_HOME/bin`, normally `~/.cargo/bin`. Add that directory to your `PATH` if needed. The legacy SQLite importer is built with the application; live memory uses the verified native Dolt runtime provisioned on first use.
 
 To choose another destination:
 

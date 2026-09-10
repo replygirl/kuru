@@ -2,6 +2,10 @@
 
 Releases were checked on 2026-09-09 against the official crates.io sparse registry, npm registry, upstream GitHub releases and mise release metadata. Direct dependencies are exactly pinned; lockfiles resolve their compatible transitive dependencies. Rust dependencies use stable releases. The docs app follows cospec's VitePress 2 preview architecture and pins the latest available alpha explicitly.
 
+The Dolt change checked SQLx 0.9.0, UUID 1.26.1 and full Dolt 2.3.3 on
+2026-09-10. The memory package's catalog records the measured native archive,
+executable and license digests for all four supported targets.
+
 ## Rust dependencies
 
 | Dependency | Latest stable pin | Registry |
@@ -12,7 +16,8 @@ Releases were checked on 2026-09-09 against the official crates.io sparse regist
 | `serde_json` | `1.0.151` | [sparse index](https://index.crates.io/se/rd/serde_json) |
 | `toml` | `1.1.5+spec-1.1.0` | [sparse index](https://index.crates.io/to/ml/toml) |
 | `rusqlite` | `0.40.2` | [sparse index](https://index.crates.io/ru/sq/rusqlite) |
-| `uuid` | `1.26.0` | [sparse index](https://index.crates.io/uu/id/uuid) |
+| `uuid` | `1.26.1` | [sparse index](https://index.crates.io/uu/id/uuid) |
+| `sqlx` | `0.9.0` | [sparse index](https://index.crates.io/sq/lx/sqlx) |
 | `sha2` | `0.11.0` | [sparse index](https://index.crates.io/sh/a2/sha2) |
 | `tokio` | `1.53.1` | [sparse index](https://index.crates.io/to/ki/tokio) |
 | `reqwest` | `0.13.5` | [sparse index](https://index.crates.io/re/qw/reqwest) |

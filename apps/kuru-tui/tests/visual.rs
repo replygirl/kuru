@@ -1,9 +1,10 @@
+use kuru_memory::MemoryStore;
 use std::{collections::BTreeSet, fmt::Write as _, sync::Arc};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kuru::ui::{View, draw};
 use kuru_connectors::DemoProvider;
-use kuru_core::{Config, MemoryStore, Mode, ModelInfo, RelationshipKind};
+use kuru_core::{Config, Mode, ModelInfo, RelationshipKind};
 use kuru_runtime::{Event, Harness, PeerMessage};
 use ratatui::{
     Terminal,
@@ -13,7 +14,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-fn fixture(mode: Mode) -> (tempfile::TempDir, Harness, View) {
+async fn fixture(mode: Mode) -> (tempfile::TempDir, Harness, View) {
     let project = tempfile::tempdir().unwrap();
     let harness = Harness::new(
         Config {
@@ -25,10 +26,11 @@ fn fixture(mode: Mode) -> (tempfile::TempDir, Harness, View) {
             ..Config::default()
         },
         project.path(),
-        MemoryStore::in_memory().unwrap(),
+        MemoryStore::temporary().await.unwrap(),
         Arc::new(DemoProvider),
         None,
     )
+    .await
     .unwrap();
     let view = View::new(
         &harness,
@@ -39,6 +41,7 @@ fn fixture(mode: Mode) -> (tempfile::TempDir, Harness, View) {
             default_effort: Some("low".into()),
         }],
     )
+    .await
     .unwrap();
     (project, harness, view)
 }
@@ -145,7 +148,7 @@ fn html(buffer: &Buffer) -> String {
 #[tokio::test]
 async fn welcome_shows_actual_framework_members_and_color_at_wide_and_compact_sizes() {
     for mode in [Mode::Ifs, Mode::Polyvagal, Mode::Freudian, Mode::Jungian] {
-        let (_project, harness, mut view) = fixture(mode);
+        let (_project, harness, mut view) = fixture(mode).await;
         view.motion = false;
         let (wide, _) = render(&view, 140, 50, &format!("welcome-{mode}"));
         let screen = text(&wide);
@@ -179,13 +182,14 @@ async fn welcome_shows_actual_framework_members_and_color_at_wide_and_compact_si
 
 #[tokio::test]
 async fn real_turn_events_keep_speaking_group_members_and_peer_routes_visible() {
-    let (_project, mut harness, _) = fixture(Mode::Freudian);
+    let (_project, mut harness, _) = fixture(Mode::Freudian).await;
     let members = harness.topology.parts[..2]
         .iter()
         .map(|part| part.id.clone())
         .collect::<Vec<_>>();
     let relation = harness
         .relate(RelationshipKind::Alliance, members.clone())
+        .await
         .unwrap();
     let names = harness.topology.parts[..2]
         .iter()
@@ -206,7 +210,7 @@ async fn real_turn_events_keep_speaking_group_members_and_peer_routes_visible() 
         })
         .collect::<Vec<_>>()
         .join(" + ");
-    let mut view = View::new(&harness, vec![]).unwrap();
+    let mut view = View::new(&harness, vec![]).await.unwrap();
     view.motion = false;
     view.transcript
         .push(("user".into(), "Shared design".into()));
@@ -251,7 +255,7 @@ async fn real_turn_events_keep_speaking_group_members_and_peer_routes_visible() 
 
 #[tokio::test]
 async fn motion_changes_decoration_without_changing_text_and_respects_static_override() {
-    let (_project, harness, mut view) = fixture(Mode::Ifs);
+    let (_project, harness, mut view) = fixture(Mode::Ifs).await;
     view.busy = true;
     view.transcript
         .push(("user".into(), "Keep this content readable".into()));
@@ -314,7 +318,7 @@ async fn motion_changes_decoration_without_changing_text_and_respects_static_ove
 
 #[tokio::test]
 async fn long_model_catalog_scrolls_selection_into_view_and_preserves_draft() {
-    let (_project, _harness, mut view) = fixture(Mode::Freudian);
+    let (_project, _harness, mut view) = fixture(Mode::Freudian).await;
     view.input = "An unsent draft".into();
     view.cursor = view.input.len();
     view.models = (0..30)
@@ -354,7 +358,7 @@ async fn long_model_catalog_scrolls_selection_into_view_and_preserves_draft() {
 
 #[tokio::test]
 async fn unicode_editor_and_cursor_survive_resize_even_below_supported_layout_size() {
-    let (_project, _harness, mut view) = fixture(Mode::Jungian);
+    let (_project, _harness, mut view) = fixture(Mode::Jungian).await;
     for ch in "long draft 猫 🌿 ".repeat(6).chars() {
         view.key(key(KeyCode::Char(ch)));
     }
@@ -384,7 +388,7 @@ async fn unicode_editor_and_cursor_survive_resize_even_below_supported_layout_si
 
 #[tokio::test]
 async fn rich_answer_preserves_prose_code_and_list_content_when_terminal_wraps() {
-    let (_project, _harness, mut view) = fixture(Mode::Ifs);
+    let (_project, _harness, mut view) = fixture(Mode::Ifs).await;
     view.motion = false;
     view.transcript = vec![
         ("user".into(), "Show me the next step".into()),
@@ -428,7 +432,7 @@ async fn rich_answer_preserves_prose_code_and_list_content_when_terminal_wraps()
 
 #[tokio::test]
 async fn composer_combines_values_with_hints_and_status_prioritizes_errors() {
-    let (_project, _harness, mut view) = fixture(Mode::Freudian);
+    let (_project, _harness, mut view) = fixture(Mode::Freudian).await;
     view.model = "gpt-current-long-model-name".into();
     view.effort = "high".into();
     view.motion = false;
@@ -486,7 +490,7 @@ async fn composer_combines_values_with_hints_and_status_prioritizes_errors() {
 
 #[tokio::test]
 async fn mode_picker_previews_selection_and_filtering_never_changes_the_live_pool() {
-    let (_project, _harness, mut view) = fixture(Mode::Ifs);
+    let (_project, _harness, mut view) = fixture(Mode::Ifs).await;
     view.key(key(KeyCode::F(4)));
     let original = view.parts.clone();
     for mode in ["ifs", "polyvagal", "freudian", "jungian"] {
@@ -518,7 +522,7 @@ async fn mode_picker_previews_selection_and_filtering_never_changes_the_live_poo
 
 #[tokio::test]
 async fn ambient_time_preserves_labels_draft_caret_and_static_override() {
-    let (_project, harness, mut view) = fixture(Mode::Jungian);
+    let (_project, harness, mut view) = fixture(Mode::Jungian).await;
     view.motion = true;
     let (first, _) = render(&view, 140, 50, "ambient-zero");
     view.advance_animation(std::time::Duration::from_secs(12));
@@ -549,7 +553,7 @@ async fn ambient_time_preserves_labels_draft_caret_and_static_override() {
 #[tokio::test]
 #[ignore = "run explicitly with --ignored --nocapture to measure frame cost"]
 async fn frame_cost_profile() {
-    let (_project, _harness, mut view) = fixture(Mode::Ifs);
+    let (_project, _harness, mut view) = fixture(Mode::Ifs).await;
     let mut terminal = Terminal::new(TestBackend::new(140, 50)).unwrap();
     for state in ["welcome", "long conversation", "picker"] {
         if state == "long conversation" {
@@ -581,7 +585,7 @@ async fn frame_cost_profile() {
 #[tokio::test]
 async fn quiet_typing_leaves_portrait_and_composer_decoration_untouched() {
     for mode in Mode::ALL {
-        let (_project, _harness, mut view) = fixture(mode);
+        let (_project, _harness, mut view) = fixture(mode).await;
         view.motion = true;
         let (baseline, _) = render(&view, 140, 50, &format!("quiet-before-{mode}"));
         // Rows 0..45 include the complete scene and composer separator; the
@@ -610,7 +614,7 @@ async fn quiet_typing_leaves_portrait_and_composer_decoration_untouched() {
 #[tokio::test]
 async fn quiet_ambient_keeps_every_glyph_fixed_and_changes_color_gradually() {
     for mode in Mode::ALL {
-        let (_project, _harness, mut view) = fixture(mode);
+        let (_project, _harness, mut view) = fixture(mode).await;
         view.motion = true;
         let (baseline, _) = render(&view, 140, 50, &format!("quiet-ambient-zero-{mode}"));
         let mut colored = false;

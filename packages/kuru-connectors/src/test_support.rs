@@ -141,10 +141,14 @@ impl StdioFixture {
 
     fn with_cache(steps: impl IntoIterator<Item = Step>, cache: &FixtureCache) -> Self {
         let binary = fixture_binary(cache);
-        // Keeping both paths on the same filesystem makes linking reliable even
-        // when the test process's workspace and temporary directory differ.
+        // The image must keep a stable identity while sibling aliases retire:
+        // macOS can reject shared hardlinks if policy inspection races cleanup.
+        // argv[0] still selects this fixture's independent plan and transcript.
         let directory = tempfile::tempdir_in(binary.directory.path()).unwrap();
         let path = directory.path().join("fixture");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&binary.path, &path).unwrap();
+        #[cfg(not(unix))]
         std::fs::hard_link(&binary.path, &path).unwrap();
         let plan: String = steps
             .into_iter()
@@ -387,11 +391,49 @@ mod tests {
         assert!(!fixture._binary.path.with_extension("plan").exists());
         let request = json!({"id": "invocation", "method": "identity"});
         let started = Barrier::new(1);
-        let reply =
-            exchange_program(&fixture, &fixture._binary.path, request.clone(), &started).await;
-        assert_eq!(reply, json!({"identity": "invocation"}));
-        fixture.assert_completed(1);
-        assert_eq!(fixture.conversations(), vec![vec![request]]);
+        for program in [&fixture._binary.path, &fixture.path] {
+            let reply = exchange_program(&fixture, program, request.clone(), &started).await;
+            assert_eq!(reply, json!({"identity": "invocation"}));
+        }
+        fixture.assert_completed(2);
+        assert_eq!(
+            fixture.conversations(),
+            vec![vec![request.clone()], vec![request]],
+        );
+
+        let canonical_executable = fixture._binary.path.canonicalize().unwrap();
+        let identities: Vec<_> = std::fs::read_dir(fixture.directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "started")
+            })
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .collect();
+        assert_eq!(identities.len(), 2);
+        for identity in identities {
+            assert!(
+                identity.contains(&format!("invocation={:?}", fixture.path)),
+                "wire plans must retain their independent invocation path: {identity}",
+            );
+            // macOS may report the invocation symlink, whereas Linux resolves
+            // it. In either case the reported image must resolve to the shared
+            // artifact, not a disposable hardlink with a different pathname.
+            let reported_image = [&fixture.path, &fixture._binary.path, &canonical_executable]
+                .into_iter()
+                .find(|path| {
+                    identity
+                        .lines()
+                        .any(|line| line == format!("current_exe=Ok({path:?})"))
+                })
+                .unwrap_or_else(|| panic!("unexpected executable identity: {identity}"));
+            assert_eq!(
+                reported_image.canonicalize().unwrap(),
+                canonical_executable,
+                "the running image must resolve to the shared artifact after sibling aliases retire: {identity}",
+            );
+        }
     }
 
     #[tokio::test]

@@ -66,7 +66,7 @@ jobs:
     env:
       MISE_LOCKED: "1"
       MISE_TASK_RUN_AUTO_INSTALL: "false"
-      # Only omit mise's repository setup hook in these archive-only jobs.
+      # Native archive and memory tests need only the pinned Rust toolchain.
       MISE_NO_HOOKS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -88,6 +88,8 @@ jobs:
           version=${version#kuru }
           mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$version"
           git diff --exit-code --name-only HEAD
+      - name: Verify native Dolt memory
+        run: mise run //packages/kuru-memory:test
 
   ci-gate:
     if: always()

@@ -8,6 +8,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
+#[path = "support/memory.rs"]
+mod memory;
+
 struct Server(Child);
 
 impl Drop for Server {
@@ -41,7 +44,7 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
             "127.0.0.1:0",
         ])
         .env("KURU_A2A_TOKEN", "integration-token-123456")
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_CONFIG_HOME", memory::configuration(root.path())?)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;

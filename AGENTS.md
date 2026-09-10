@@ -14,7 +14,8 @@ when applying that standard. AGENTS.md is canonical; CLAUDE.md imports it with
 
 - `apps/kuru-tui`: `kuru` binary, terminal rendering and command line.
 - `apps/kuru-docs`: curated public documentation site and theme.
-- `packages/kuru-core`: framework/configuration types and SQLite storage.
+- `packages/kuru-core`: framework/configuration types and shared contracts.
+- `packages/kuru-memory`: managed Dolt, private SQL lifecycle, versioned storage and legacy import.
 - `packages/kuru-connectors`: inference providers, tool host, MCP and outbound A2A.
 - `packages/kuru-runtime`: actor pool, peer routing, relationships, dreaming and A2A ingress.
 - `packages/kuru-delivery`: native updater, shell bootstrap, archive packaging, release and repository tooling.
@@ -32,10 +33,19 @@ runtime, not a model acting as a permanent supervisor. Frameworks are switchable
 profiles; provider, authentication and protocol additions belong behind their
 existing boundaries.
 
-Dolt is the chosen next storage backend, in a separate PR after the initial
-release and before production adoption. That transition includes versioned memory
-updates and dreaming history, installation, and migration of development data.
-The current implementation still uses SQLite until that follow-up lands.
+Full Dolt is the live memory backend. Keep its pinned runtime, provisioning and
+actual database fixtures in `kuru-memory`; SQLite is only a read-only migration
+dependency. Preserve original legacy data and validate imports before activation.
+Each canonical project owns its revision history. Actor work carries an explicit
+live or candidate view; every dream write stays on its candidate until validated
+promotion. Undo adds a compensating revision and preserves later conversations.
+Keep transactions short, reconcile uncertain writes before further mutation, and
+publish in-memory topology/configuration only after persistence. Never kill a
+process or delete a held lock based on a stale PID or occupied port. The owned
+supervisor must reap Dolt before releasing its directory or lifecycle lease.
+Writable opens require ownership; attached inspection handles never control the
+owner's lifetime. Await command cleanup before releasing the project writer lease,
+and hold the stable lifecycle lock through migration/recovery directory moves.
 
 Convention priority is: (1) the apps/ and packages/ monorepo structure,
 (2) mise's native monorepo task model, (3) Rust, (4) other tools. Each app or

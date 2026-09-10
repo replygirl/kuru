@@ -95,6 +95,48 @@ impl ProjectPreferences {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    pub dolt_binary: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
+    pub offline: bool,
+    pub startup_timeout_secs: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            dolt_binary: None,
+            cache_dir: None,
+            offline: false,
+            startup_timeout_secs: 30,
+        }
+    }
+}
+
+impl MemoryConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=300).contains(&self.startup_timeout_secs),
+            "memory.startup_timeout_secs must be between 1 and 300"
+        );
+        for (label, path) in [
+            ("dolt_binary", &self.dolt_binary),
+            ("cache_dir", &self.cache_dir),
+        ] {
+            if let Some(path) = path {
+                ensure!(
+                    !path.as_os_str().is_empty()
+                        && !path.as_os_str().as_encoded_bytes().contains(&0),
+                    "memory.{label} must be a nonempty path without NUL characters"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub mode: Mode,
     pub provider: String,
@@ -114,6 +156,7 @@ pub struct Config {
     pub api_key_env: String,
     pub mcp: BTreeMap<String, McpConfig>,
     pub external_agents: BTreeMap<String, String>,
+    pub memory: MemoryConfig,
 }
 
 impl Default for Config {
@@ -136,6 +179,7 @@ impl Default for Config {
             api_key_env: "OPENAI_API_KEY".into(),
             mcp: BTreeMap::new(),
             external_agents: BTreeMap::new(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -161,6 +205,35 @@ impl Config {
     /// When an invocation changes model, it does not inherit another model's
     /// remembered effort; its own file settings or provider default apply.
     pub fn load_with_preferences(
+        user: Option<&Path>,
+        project: &Path,
+        local: Option<&Path>,
+        preferences: &ProjectPreferences,
+        overrides: SelectionOverrides<'_>,
+    ) -> Result<Self> {
+        let config = Self::load_unvalidated(user, project, local, preferences, overrides)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Storage bootstrap is independent of choices stored inside that storage.
+    pub fn load_memory(
+        user: Option<&Path>,
+        project: &Path,
+        local: Option<&Path>,
+    ) -> Result<MemoryConfig> {
+        let config = Self::load_unvalidated(
+            user,
+            project,
+            local,
+            &ProjectPreferences::default(),
+            SelectionOverrides::default(),
+        )?;
+        config.memory.validate()?;
+        Ok(config.memory)
+    }
+
+    fn load_unvalidated(
         user: Option<&Path>,
         project: &Path,
         local: Option<&Path>,
@@ -243,11 +316,11 @@ impl Config {
         if let Some(effort) = overrides.effort {
             config.effort = Some(effort.into());
         }
-        config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.memory.validate()?;
         ensure!(
             matches!(self.provider.as_str(), "codex" | "responses" | "demo"),
             "provider must be codex, responses, or demo"
@@ -443,4 +516,117 @@ pub fn load_instructions(project: &Path) -> Result<String> {
         combined.push('\n');
     }
     Ok(combined)
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn memory_options_validate_paths_timeouts_and_unknown_fields() {
+        assert_eq!(MemoryConfig::default().startup_timeout_secs, 30);
+        for timeout in [1, 300] {
+            MemoryConfig {
+                startup_timeout_secs: timeout,
+                ..MemoryConfig::default()
+            }
+            .validate()
+            .unwrap();
+        }
+        for timeout in [0, 301, u64::MAX] {
+            assert!(
+                MemoryConfig {
+                    startup_timeout_secs: timeout,
+                    ..MemoryConfig::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for path in ["", "bad\0path"] {
+            assert!(
+                MemoryConfig {
+                    dolt_binary: Some(path.into()),
+                    ..MemoryConfig::default()
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                MemoryConfig {
+                    cache_dir: Some(path.into()),
+                    ..MemoryConfig::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(toml::from_str::<MemoryConfig>("unknown_option = true").is_err());
+        assert!(toml::from_str::<MemoryConfig>("offline = 'yes'").is_err());
+        let config: MemoryConfig = toml::from_str(
+            "offline = true\ncache_dir = '/private/cache'\ndolt_binary = '/opt/dolt'\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.offline);
+        assert_eq!(
+            config.cache_dir.as_deref(),
+            Some(Path::new("/private/cache"))
+        );
+    }
+
+    #[test]
+    fn memory_bootstrap_merges_files_without_validating_unloaded_saved_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("user.toml");
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(project.join(".kuru")).unwrap();
+        std::fs::write(
+            &user,
+            "max_parts = 3\n[memory]\ncache_dir = '/shared/cache'\nstartup_timeout_secs = 12\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".kuru/config.toml"),
+            "[memory]\noffline = true\n",
+        )
+        .unwrap();
+        let memory = Config::load_memory(Some(&user), &project, None).unwrap();
+        assert!(memory.offline);
+        assert_eq!(memory.startup_timeout_secs, 12);
+        assert_eq!(
+            memory.cache_dir.as_deref(),
+            Some(Path::new("/shared/cache"))
+        );
+        // IFS needs more than three parts, but the stored Freudian choice is valid.
+        assert!(Config::load(Some(&user), &project, None).is_err());
+        let config = Config::load_with_preferences(
+            Some(&user),
+            &project,
+            None,
+            &ProjectPreferences {
+                mode: Some(Mode::Freudian),
+                ..ProjectPreferences::default()
+            },
+            SelectionOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(config.mode, Mode::Freudian);
+        assert_eq!(config.memory, memory);
+        let local = directory.path().join("local.toml");
+        std::fs::write(
+            &local,
+            "[memory]\noffline = false\nstartup_timeout_secs = 0\n",
+        )
+        .unwrap();
+        assert!(Config::load_memory(Some(&user), &project, Some(&local)).is_err());
+        std::fs::write(
+            &local,
+            "[memory]\noffline = false\nstartup_timeout_secs = 300\n",
+        )
+        .unwrap();
+        let memory = Config::load_memory(Some(&user), &project, Some(&local)).unwrap();
+        assert!(!memory.offline);
+        assert_eq!(memory.startup_timeout_secs, 300);
+    }
 }

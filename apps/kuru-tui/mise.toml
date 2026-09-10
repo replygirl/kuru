@@ -5,6 +5,7 @@ run = "cargo build -p kuru --all-features --locked"
 run = "cargo build -p kuru --release --all-features --locked"
 
 [tasks."test"]
+depends = ["//packages/kuru-memory:prefetch"]
 run = "cargo test -p kuru --all-targets --all-features --locked"
 
 [tasks."typecheck"]
@@ -18,3 +19,5 @@ run = "cargo run -p kuru --locked --"
 
 [tasks.install]
 run = "bash ../../scripts/install.sh --source"
+[env]
+RUST_TEST_THREADS = "2"

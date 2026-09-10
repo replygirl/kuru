@@ -158,6 +158,15 @@ and publication; [installation and updates](install.md) covers using releases.
 
 ## Tests without credentials
 
+Memory tests use actual full Dolt. `packages/kuru-memory` owns the verified engine
+prefetch, supervisor fixture and integration checks. Runtime/TUI test tasks depend
+on those fixtures; missing engines fail tests. Run
+`mise run //packages/kuru-memory:prefetch` to populate the test cache ahead of an
+offline run. Test helpers use isolated stores and a shared verified temporary
+cache, never the user's memory. The test runner uses two threads and limits
+simultaneous temporary servers. Do not replace these fixtures with SQLite or
+exclude memory modules from coverage.
+
 The demo provider allows offline process smoke tests. Protocol tests start
 local fake app-server, HTTP, MCP or A2A peers and exercise actual wire framing.
 Use temporary project roots and memory stores. Never inspect or copy the user's

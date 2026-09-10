@@ -10,6 +10,7 @@ anyhow.workspace = true
 axum.workspace = true
 futures.workspace = true
 kuru-core.workspace = true
+kuru-memory.workspace = true
 kuru-connectors.workspace = true
 serde.workspace = true
 serde_json.workspace = true

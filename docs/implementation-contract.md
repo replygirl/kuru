@@ -1,5 +1,12 @@
 # Initial implementation contract
 
+This document records the original implementation handoff. Current package
+boundaries and contributor requirements are maintained in [AGENTS.md](../AGENTS.md)
+and [architecture](architecture.md). In particular, live storage has moved from
+the initial SQLite API to asynchronous, versioned Dolt in `kuru-memory`; see
+[memory storage](memory.md). Historical interface sketches below are not current
+API documentation.
+
 Intent: Kuru is a Rust chat harness whose native unit of cognition is a pool of
 equal persistent parts. No LLM supervisor owns other actors. Frameworks define
 roles and tendencies; each part can message any peer, report modeled state,

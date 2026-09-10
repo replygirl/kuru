@@ -35,6 +35,8 @@ kuru --resume SESSION_ID undo-dream
 
 The terminal command `/undo-dream` restores the previous topology change. It is not an undo of every action or tool effect from a session.
 
+Every dream writes to an isolated Dolt candidate branch. Its histories, summaries and proposed membership become active together after validation. Cancellation before promotion leaves live memory unchanged. An accepted promotion may finish after cancellation; Kuru reconciles its result before further work. An outdated candidate cannot overwrite later conversations. Undo adds a compensating revision while preserving chats and preferences written afterward. Inspect revisions with `/memory-history` or `kuru memory history`.
+
 Dreaming uses provider calls and can add to the cost of a session. It is a bounded consolidation operation, not an unbounded background process.
 
 ## Choose the triggers

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use kuru_memory::MemoryStore;
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal},
@@ -30,7 +32,7 @@ mod render;
 mod scene;
 pub use render::draw;
 
-const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /dream · /undo-dream · /quit\nModel, effort and mode selections are remembered for this project.";
+const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /dream · /undo-dream · /quit\n/memory-status · /memory-history\nModel, effort and mode selections are remembered for this project.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Picker {
@@ -78,9 +80,10 @@ pub struct View {
 }
 
 impl View {
-    pub fn new(harness: &Harness, models: Vec<ModelInfo>) -> Result<Self> {
+    pub async fn new(harness: &Harness, models: Vec<ModelInfo>) -> Result<Self> {
         let transcript: Vec<_> = harness
-            .history()?
+            .history()
+            .await?
             .into_iter()
             .map(|m| (m.role, m.content))
             .collect();
@@ -558,7 +561,7 @@ async fn run_loop<B: Backend>(
 where
     B::Error: Send + Sync + 'static,
 {
-    let mut view = View::new(&harness, models)?;
+    let mut view = View::new(&harness, models).await?;
     let mut events = harness.subscribe();
     let harness = Arc::new(Mutex::new(harness));
     let (tx, mut rx) = mpsc::channel::<(u64, Result<String>)>(8);
@@ -736,12 +739,13 @@ pub async fn dispatch(
     models: &[ModelInfo],
     command: &str,
 ) -> Result<String> {
+    harness.reconcile().await?;
     let (name, args) = command.split_once(' ').unwrap_or((command, ""));
     let args = args.trim();
     match name {
         "/parts" => Ok(serde_json::to_string_pretty(&harness.topology)?),
         "/mode" => {
-            harness.set_mode(args.parse::<Mode>()?)?;
+            harness.set_mode(args.parse::<Mode>()?).await?;
             Ok(format!("Mode: {args}"))
         }
         "/model" => {
@@ -750,7 +754,7 @@ pub async fn dispatch(
                 .iter()
                 .find(|m| m.id == args)
                 .and_then(|m| m.default_effort.clone());
-            harness.set_model(args, effort)?;
+            harness.set_model(args, effort).await?;
             Ok(format!("Model: {args}"))
         }
         "/effort" => {
@@ -761,27 +765,39 @@ pub async fn dispatch(
                 Some(args)
             };
             validate_effort(models, &harness.config.model, effort)?;
-            harness.set_effort(effort.map(str::to_owned))?;
+            harness.set_effort(effort.map(str::to_owned)).await?;
             Ok(format!("Effort: {args}"))
         }
         "/focus" => {
-            harness.focus(if args == "auto" { None } else { Some(args) })?;
+            harness
+                .focus(if args == "auto" { None } else { Some(args) })
+                .await?;
             Ok(format!("Speaking focus: {args}"))
         }
         "/relate" => {
             let (kind, members) = args
                 .split_once(' ')
                 .context("usage: /relate alliance ID,ID")?;
-            let relation = harness.relate(
-                kind.parse()?,
-                members.split(',').map(|m| m.trim().to_owned()).collect(),
-            )?;
+            let relation = harness
+                .relate(
+                    kind.parse()?,
+                    members.split(',').map(|m| m.trim().to_owned()).collect(),
+                )
+                .await?;
             Ok(format!("Activated {} · {}", relation.kind, relation.id))
         }
-        "/memory" => Ok(serde_json::to_string_pretty(&harness.memory_for(args)?)?),
+        "/memory" => Ok(serde_json::to_string_pretty(
+            &harness.memory_for(args).await?,
+        )?),
+        "/memory-status" => Ok(serde_json::to_string_pretty(
+            &harness.memory_status().await?,
+        )?),
+        "/memory-history" => Ok(serde_json::to_string_pretty(
+            &harness.memory_revisions(20).await?,
+        )?),
         "/dream" => Ok(serde_json::to_string_pretty(&harness.dream().await?)?),
         "/undo-dream" => {
-            harness.undo_dream()?;
+            harness.undo_dream().await?;
             Ok("Previous membership restored.".into())
         }
         _ if command.starts_with('/') => anyhow::bail!("unknown command; use /help"),
@@ -798,10 +814,10 @@ use anyhow::Context;
 mod tests {
     use super::*;
     use kuru_connectors::DemoProvider;
-    use kuru_core::{Config, MemoryStore};
+    use kuru_core::Config;
     use ratatui::backend::TestBackend;
 
-    fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
+    async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             provider: "demo".into(),
@@ -813,10 +829,11 @@ mod tests {
         let h = Harness::new(
             config,
             dir.path(),
-            MemoryStore::in_memory().unwrap(),
+            MemoryStore::temporary().await.unwrap(),
             Arc::new(DemoProvider),
             None,
         )
+        .await
         .unwrap();
         let models = vec![ModelInfo {
             id: "demo".into(),
@@ -832,8 +849,8 @@ mod tests {
 
     #[tokio::test]
     async fn ambient_clock_ignores_editing_and_preserves_busy_focus_and_static_behavior() {
-        let (_dir, h, models) = fixture();
-        let mut view = View::new(&h, models).unwrap();
+        let (_dir, h, models) = fixture().await;
+        let mut view = View::new(&h, models).await.unwrap();
         view.motion = true;
         assert!(!view.advance_animation(Duration::from_millis(249)));
         assert!(view.advance_animation(Duration::from_millis(250)));
@@ -876,8 +893,8 @@ mod tests {
 
     #[tokio::test]
     async fn activity_summarizes_routing_without_disclosing_peer_contents_or_state_notes() {
-        let (_dir, mut h, models) = fixture();
-        let mut view = View::new(&h, models).unwrap();
+        let (_dir, mut h, models) = fixture().await;
+        let mut view = View::new(&h, models).await.unwrap();
         let from = h.topology.parts[0].id.clone();
         let to = h.topology.parts[1].id.clone();
         let envelope =
@@ -901,6 +918,7 @@ mod tests {
                 kuru_core::RelationshipKind::Alliance,
                 vec![from.clone(), to.clone()],
             )
+            .await
             .unwrap();
         view.event(Event {
             kind: "relationship".into(),
@@ -940,8 +958,8 @@ mod tests {
 
     #[tokio::test]
     async fn unicode_editor_supports_midline_editing_navigation_newlines_and_send() {
-        let (_dir, h, models) = fixture();
-        let mut view = View::new(&h, models).unwrap();
+        let (_dir, h, models) = fixture().await;
+        let mut view = View::new(&h, models).await.unwrap();
         for c in "a猫🌿".chars() {
             view.key(key(KeyCode::Char(c)));
         }
@@ -993,8 +1011,8 @@ mod tests {
 
     #[tokio::test]
     async fn pickers_select_models_efforts_modes_and_handle_empty_catalogs() {
-        let (_dir, h, models) = fixture();
-        let mut view = View::new(&h, models).unwrap();
+        let (_dir, h, models) = fixture().await;
+        let mut view = View::new(&h, models).await.unwrap();
         for (function, expected) in [
             (2, "/model demo"),
             (3, "/effort low"),
@@ -1021,8 +1039,8 @@ mod tests {
 
     #[tokio::test]
     async fn picker_search_and_paste_preserve_drafts_and_busy_settings_are_explained() {
-        let (_dir, h, models) = fixture();
-        let mut view = View::new(&h, models).unwrap();
+        let (_dir, h, models) = fixture().await;
+        let mut view = View::new(&h, models).await.unwrap();
         view.paste("An unsent 猫 draft");
         let draft = view.input.clone();
         view.key(key(KeyCode::F(4)));
@@ -1048,8 +1066,8 @@ mod tests {
 
     #[tokio::test]
     async fn rendering_handles_small_terminals_long_chats_activity_and_popups() {
-        let (_dir, h, models) = fixture();
-        let mut view = View::new(&h, models).unwrap();
+        let (_dir, h, models) = fixture().await;
+        let mut view = View::new(&h, models).await.unwrap();
         for size in [(120, 35), (60, 20), (10, 5), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
             terminal.draw(|f| draw(f, &view)).unwrap();
@@ -1099,7 +1117,7 @@ mod tests {
 
     #[tokio::test]
     async fn slash_commands_change_real_runtime_state_and_validate_errors() {
-        let (_dir, mut h, models) = fixture();
+        let (_dir, mut h, models) = fixture().await;
         assert!(
             dispatch(&mut h, &models, "/parts")
                 .await
@@ -1155,8 +1173,21 @@ mod tests {
             role: h.topology.parts[0].role.clone(),
             instruction: "Complement".into(),
         }])
+        .await
         .unwrap();
         dispatch(&mut h, &models, "/undo-dream").await.unwrap();
+        let status: serde_json::Value =
+            serde_json::from_str(&dispatch(&mut h, &models, "/memory-status").await.unwrap())
+                .unwrap();
+        assert_eq!(status["engine"], "dolt");
+        let revisions: serde_json::Value =
+            serde_json::from_str(&dispatch(&mut h, &models, "/memory-history").await.unwrap())
+                .unwrap();
+        assert!(
+            revisions
+                .as_array()
+                .is_some_and(|revisions| !revisions.is_empty())
+        );
         for bad in [
             "/unknown",
             "/relate",

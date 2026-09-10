@@ -21,7 +21,7 @@ Ancestor `AGENTS.md` files provide project instructions, with nearer files takin
 
 <kbd>F2</kbd>, <kbd>F3</kbd>, <kbd>F4</kbd> and their matching slash commands save model, effort, and framework choices immediately. They apply to the canonical project directory and selected data store. A symlink to that directory shares the choices; a different directory has its own.
 
-Preferences live in SQLite, not edits to project configuration. A save failure is reported before the new choice becomes active.
+Preferences live in the private Dolt store. A save failure is reported before the new choice becomes active.
 
 Models and efforts are remembered together for each provider. Selecting a model uses its advertised default effort. Selecting `default` in the effort picker, or `/effort default`, clears an explicit effort.
 
@@ -115,4 +115,14 @@ The example endpoints are placeholders. Choose trusted services and keep secrets
 | `KURU_INSTALL_DIR`            | Destination for source installation                   |
 | `KURU_RELEASE_BASE`           | Version directory for the release installer           |
 
-The default database is `~/.local/share/kuru/memory.sqlite3` when no XDG data directory is set. Keep state outside tool roots. [Memory](../concepts/memory) describes project scope and access boundaries.
+The default data directory is `~/.local/share/kuru` when no XDG data directory is set. Each project has a Dolt database under `memory/<project-hash>/`. Keep state outside tool roots. [Memory](../concepts/memory) describes project scope and access boundaries.
+
+```toml
+[memory]
+offline = false
+startup_timeout_secs = 30
+# cache_dir = "/absolute/path/to/dolt-cache"
+# dolt_binary = "/absolute/path/to/dolt"
+```
+
+Kuru installs its pinned full-Dolt runtime on first memory use. The default cache is `tools/dolt` inside the data directory. Offline mode requires a valid cache or explicit executable with the supported version. The startup timeout is 1–300 seconds. These settings control memory provisioning; provider network access is independent.

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+use kuru_memory::MemoryStore;
+
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -17,10 +19,17 @@ use axum::{
     extract::State,
     routing::{get, post},
 };
-use kuru_core::{Config, MemoryStore, Mode};
+use kuru_core::{Config, Mode};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::{
+    Connection, MySqlConnection,
+    mysql::{MySqlConnectOptions, MySqlSslMode},
+};
 use tokio::sync::watch;
 
+#[path = "support/memory.rs"]
+mod memory;
 #[path = "support/terminal.rs"]
 mod terminal;
 use terminal::{READY_TIMEOUT, Terminal};
@@ -39,6 +48,7 @@ impl Sandbox {
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project)?;
+        memory::configuration(root.path())?;
         Ok(Self {
             root,
             project,
@@ -393,11 +403,12 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
             ..Config::default()
         },
         &sandbox.project,
-        MemoryStore::open(&sandbox.data.join("memory.sqlite3"))?,
+        MemoryStore::open(memory_options(&sandbox)?).await?,
         Arc::new(kuru_connectors::DemoProvider),
         Some(&sessions[0].id),
-    )?;
-    let history = harness.history()?;
+    )
+    .await?;
+    let history = harness.history().await?;
     assert!(
         history
             .iter()
@@ -418,16 +429,125 @@ struct Selection<'a> {
     effort: Option<&'a str>,
 }
 
-struct RejectPreferences(rusqlite::Connection);
-impl Drop for RejectPreferences {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .execute_batch("DROP TRIGGER IF EXISTS reject_mode_update");
+fn memory_options(sandbox: &Sandbox) -> Result<kuru_memory::OpenOptions> {
+    kuru_memory::test_support::open_options(
+        sandbox.data.clone(),
+        kuru_runtime::project_scope(&sandbox.project)?,
+    )
+}
+
+// Fault injection owns no application handle: the real UI remains the sole
+// writer owner. Only this test's generated endpoint and credentials are read.
+struct InvalidSessionIndex {
+    connection: MySqlConnection,
+    key: String,
+    previous: String,
+    revision: String,
+}
+
+impl InvalidSessionIndex {
+    async fn inject(sandbox: &Sandbox) -> Result<Self> {
+        let mut options = memory_options(sandbox)?;
+        options.read_only = true;
+        let inspector = MemoryStore::open(options).await?;
+        let status = inspector.status().await;
+        inspector.close().await?;
+        let status = status?;
+        let directory = status.directory.canonicalize()?;
+        ensure!(
+            directory.starts_with(sandbox.data.canonicalize()?),
+            "fault injection must remain inside the isolated fixture"
+        );
+        #[derive(Deserialize)]
+        struct Identity {
+            instance: String,
+            project_scope: String,
+            password: String,
+        }
+        #[derive(Deserialize)]
+        struct Endpoint {
+            instance: String,
+            port: u16,
+        }
+        let identity: Identity =
+            serde_json::from_slice(&std::fs::read(directory.join("identity.json"))?)?;
+        let endpoint: Endpoint =
+            serde_json::from_slice(&std::fs::read(directory.join("endpoint.json"))?)?;
+        ensure!(
+            identity.instance == endpoint.instance && identity.project_scope == status.project,
+            "fixture memory endpoint identity mismatch"
+        );
+        let options = MySqlConnectOptions::new()
+            .host("127.0.0.1")
+            .port(endpoint.port)
+            .username("root")
+            .password(&identity.password)
+            .database("kuru/main")
+            .ssl_mode(MySqlSslMode::Disabled);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut connection = MySqlConnection::connect_with(&options).await?;
+            let key = format!("{}/sessions", status.project);
+            let previous = sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
+                .bind(key.as_bytes())
+                .fetch_one(&mut connection)
+                .await?;
+            let revision = sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')")
+                .fetch_one(&mut connection)
+                .await?;
+            let updated = sqlx::query("UPDATE state SET value = ? WHERE `key` = ?")
+                .bind(json!("invalid-session-index").to_string())
+                .bind(key.as_bytes())
+                .execute(&mut connection)
+                .await?;
+            ensure!(
+                updated.rows_affected() == 1,
+                "fixture session index missing"
+            );
+            Ok(Self {
+                connection,
+                key,
+                previous,
+                revision,
+            })
+        })
+        .await
+        .context("fixture SQL fault injection timed out")?
+    }
+
+    async fn restore(mut self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let updated = sqlx::query("UPDATE state SET value = ? WHERE `key` = ?")
+                .bind(&self.previous)
+                .bind(self.key.as_bytes())
+                .execute(&mut self.connection)
+                .await?;
+            ensure!(
+                updated.rows_affected() == 1,
+                "fixture session index missing"
+            );
+            let revision: String = sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')")
+                .fetch_one(&mut self.connection)
+                .await?;
+            ensure!(
+                revision == self.revision,
+                "rejected choice created a revision"
+            );
+            let dirty: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status")
+                .fetch_one(&mut self.connection)
+                .await?;
+            ensure!(
+                dirty == 0,
+                "restored fixture left uncommitted database changes"
+            );
+            self.connection.close().await?;
+            Ok(())
+        })
+        .await
+        .context("fixture SQL fault restoration timed out")?
     }
 }
 
-fn preferences_session(
+async fn preferences_session(
     sandbox: &Sandbox,
     expected: &[&str],
     selections: &[Selection<'_>],
@@ -440,14 +560,8 @@ fn preferences_session(
         let screen = terminal.screen().to_lowercase();
         Ok(screen.contains("enter send") && expected.iter().all(|value| screen.contains(value)))
     })?;
-    let _reject = if reject {
-        let connection = rusqlite::Connection::open(sandbox.data.join("memory.sqlite3"))?;
-        connection.execute_batch(
-            "CREATE TRIGGER reject_mode_update BEFORE UPDATE ON state
-             WHEN NEW.key LIKE '%/sessions'
-             BEGIN SELECT RAISE(ABORT, 'preference write rejected'); END",
-        )?;
-        Some(RejectPreferences(connection))
+    let rejected_index = if reject {
+        Some(InvalidSessionIndex::inject(sandbox).await?)
     } else {
         None
     };
@@ -474,19 +588,23 @@ fn preferences_session(
                     && actual.effort.as_deref() == selection.effort
                     && screen.contains("enter send")
                     && (!reject
-                        || "preference write rejected"
+                        || "invalid saved session index"
                             .split_whitespace()
                             .all(|word| screen.contains(word))))
             },
         )?;
+    }
+    if let Some(fault) = rejected_index {
+        fault.restore().await?;
     }
     terminal.send(b"/quit\r")?;
     terminal.wait_exit(EXIT_TIMEOUT)?;
     terminal.assert_restored()
 }
 
-#[test]
-fn terminal_selections_survive_restarts_picker_changes_and_failed_database_writes() -> Result<()> {
+#[tokio::test]
+async fn terminal_selections_survive_restarts_picker_changes_and_failed_database_writes()
+-> Result<()> {
     let sandbox = Sandbox::new()?;
     let initial = sandbox.config()?;
     preferences_session(
@@ -513,7 +631,8 @@ fn terminal_selections_survive_restarts_picker_changes_and_failed_database_write
             },
         ],
         false,
-    )?;
+    )
+    .await?;
     assert_eq!(sandbox.config()?.mode, Mode::Jungian);
     preferences_session(
         &sandbox,
@@ -545,8 +664,9 @@ fn terminal_selections_survive_restarts_picker_changes_and_failed_database_write
             },
         ],
         false,
-    )?;
-    preferences_session(&sandbox, &["demo", "freudian", "default"], &[], false)?;
+    )
+    .await?;
+    preferences_session(&sandbox, &["demo", "freudian", "default"], &[], false).await?;
     let current = sandbox.config()?;
     assert_eq!(
         (current.mode, current.model.as_str(), current.effort),
@@ -562,7 +682,8 @@ fn terminal_selections_survive_restarts_picker_changes_and_failed_database_write
             effort: None,
         }],
         true,
-    )?;
+    )
+    .await?;
     assert_eq!(sandbox.config()?.mode, Mode::Freudian);
     let sessions = sandbox.sessions()?;
     assert_eq!(sessions.len(), 4);

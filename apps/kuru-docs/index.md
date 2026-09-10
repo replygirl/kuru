@@ -22,7 +22,7 @@ hero:
 kuru --provider demo
 ```
 
-The demo is deterministic and offline. To do real work, [connect an inference provider](/guide/authentication), then choose a model and effort beside the composer.
+The demo provider is deterministic and needs no inference service. First memory use installs a verified native Dolt runtime; later runs reuse its local cache. To do real work, [connect an inference provider](/guide/authentication), then choose a model and effort beside the composer.
 
 ## Different perspectives. Shared work.
 

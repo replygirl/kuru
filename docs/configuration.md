@@ -21,7 +21,7 @@ Mode, model and effort choices made in the terminal with F2/F3/F4 or the matchin
 slash commands are saved immediately. Relaunching from the same canonical directory
 and data store restores those choices in a new conversation. A symlink to that
 directory shares its choices; another directory has its own. Kuru keeps these
-preferences in its private SQLite store and does not edit project configuration.
+preferences in its private Dolt store and does not edit project configuration.
 Persistence failures are reported before a new choice becomes active.
 
 Models and efforts are remembered together for each provider. `/model` selects the
@@ -106,13 +106,31 @@ A2A subset and local ingress controls.
 
 ## Storage and authority
 
-Session and part histories are local durable data. The default store is
-`$XDG_DATA_HOME/kuru/memory.sqlite3` or `~/.local/share/kuru/memory.sqlite3`.
+Session and part histories are local durable data. The default data directory is
+`$XDG_DATA_HOME/kuru` or `~/.local/share/kuru`. Each canonical project has a Dolt
+database under `memory/<project-hash>/`.
 `--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. An OS
 writer lock prevents competing Kuru processes from overwriting the same
 project topology; session listing remains available without a writer lock. Restrict access to the user
 data directory as you would a chat transcript. They are not included in source
 control and should never be exposed as a tool root.
+
+Kuru installs its pinned full-Dolt engine on first memory use and reuses the
+verified local cache afterward. These optional settings control provisioning:
+
+```toml
+[memory]
+offline = false
+startup_timeout_secs = 30
+# cache_dir = "/absolute/path/to/dolt-cache"
+# dolt_binary = "/absolute/path/to/dolt"
+```
+
+The default engine cache is `tools/dolt` inside the data directory. An explicit
+binary must report the supported pinned version. `offline = true` requires a
+valid cache or configured executable; it does not disable provider network calls.
+The startup timeout is 1–300 seconds. See [memory storage](memory.md) for migration,
+revision inspection and backup instructions.
 
 Writes and shell execution require opt-in through config or the corresponding
 CLI flags. Enabling shell permits subprocess activity with your account's

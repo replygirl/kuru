@@ -1,10 +1,11 @@
+use kuru_memory::MemoryStore;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use kuru_connectors::Provider;
 use kuru_core::{
-    Completion, CompletionRequest, Config, MemoryStore, Mode, ModelInfo, RelationshipKind, ToolCall,
+    Completion, CompletionRequest, Config, Mode, ModelInfo, RelationshipKind, ToolCall,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -69,15 +70,16 @@ fn config(mode: Mode) -> Config {
         ..Config::default()
     }
 }
-fn fixture(config: Config, provider: Arc<dyn Provider>) -> (TempDir, Harness) {
+async fn fixture(config: Config, provider: Arc<dyn Provider>) -> (TempDir, Harness) {
     let dir = TempDir::new().unwrap();
     let harness = Harness::new(
         config,
         dir.path(),
-        MemoryStore::in_memory().unwrap(),
+        MemoryStore::temporary().await.unwrap(),
         provider,
         None,
     )
+    .await
     .unwrap();
     (dir, harness)
 }
@@ -104,7 +106,8 @@ async fn tool_only_deliberation_proceeds_to_a_useful_speaking_turn() {
             ..config(Mode::Freudian)
         },
         provider.clone(),
-    );
+    )
+    .await;
     let output = harness.run("Do the work").await.unwrap();
     assert_eq!(output.text, "Completed the user's request");
     assert_eq!(harness.session.turns, 1);
@@ -142,7 +145,7 @@ async fn every_dream_call_gets_a_receipt_including_foreign_retirement_and_excess
         ],
         ..Completion::default()
     });
-    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider);
+    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider).await;
     let report = harness.dream().await.unwrap();
     assert_eq!(report.rejected.len(), 12);
     assert_eq!(report.summaries, 3);
@@ -150,6 +153,7 @@ async fn every_dream_call_gets_a_receipt_including_foreign_retirement_and_excess
     for part in &harness.topology.parts {
         let receipts: Vec<_> = harness
             .memory_for(&part.id)
+            .await
             .unwrap()
             .into_iter()
             .filter(|message| message.role == "tool")
@@ -183,12 +187,13 @@ async fn a_different_speaker_sees_public_answers_but_not_private_memories() {
             reply("A private draft")
         }
     });
-    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider.clone());
+    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider.clone()).await;
     let first = harness.topology.parts[0].id.clone();
     let second = harness.topology.parts[1].id.clone();
     harness
         .memory
         .append(&harness.namespace(&first), "user", "PRIVATE-MEMORY-ONLY")
+        .await
         .unwrap();
     harness
         .run_for("Suggest an implementation", Some(&first))
@@ -224,14 +229,16 @@ async fn a_different_speaker_sees_public_answers_but_not_private_memories() {
 #[tokio::test]
 async fn shared_transcript_is_bounded_and_unicode_safe() {
     let provider = RecordingProvider::new(|_| reply("Ready"));
-    let (_dir, harness) = fixture(config(Mode::Freudian), provider);
+    let (_dir, harness) = fixture(config(Mode::Freudian), provider).await;
     let key = format!("{}/transcript/{}", harness.scope, harness.session.id);
     harness
         .memory
         .append(&key, "assistant", &format!("a{}", "🪶".repeat(20_000)))
+        .await
         .unwrap();
     let instructions = harness
-        .instruction(&harness.topology.parts[0].id, "inspect")
+        .instruction(&harness.memory, &harness.topology.parts[0].id, "inspect")
+        .await
         .unwrap();
     assert!(instructions.contains("[truncated]"));
     assert!(instructions.contains("🪶"));
@@ -241,7 +248,7 @@ async fn shared_transcript_is_bounded_and_unicode_safe() {
 #[tokio::test]
 async fn archived_part_and_relationship_histories_remain_inspectable_without_routing_to_them() {
     let provider = RecordingProvider::new(|_| reply("Ready"));
-    let (_dir, mut harness) = fixture(config(Mode::Ifs), provider);
+    let (_dir, mut harness) = fixture(config(Mode::Ifs), provider).await;
     let retiring = harness
         .topology
         .parts
@@ -253,6 +260,7 @@ async fn archived_part_and_relationship_histories_remain_inspectable_without_rou
     let other = harness.topology.parts[0].id.clone();
     let relation = harness
         .relate(RelationshipKind::Protection, vec![retiring.clone(), other])
+        .await
         .unwrap();
     harness
         .memory
@@ -261,6 +269,7 @@ async fn archived_part_and_relationship_histories_remain_inspectable_without_rou
             "assistant",
             "retained part insight",
         )
+        .await
         .unwrap();
     harness
         .memory
@@ -269,12 +278,14 @@ async fn archived_part_and_relationship_histories_remain_inspectable_without_rou
             "assistant",
             "retained group insight",
         )
+        .await
         .unwrap();
     assert_eq!(
         harness
             .apply_dream(vec![DreamProposal::Retire {
                 id: retiring.clone()
             }])
+            .await
             .unwrap()
             .accepted
             .len(),
@@ -283,40 +294,42 @@ async fn archived_part_and_relationship_histories_remain_inspectable_without_rou
     assert!(harness.resolve(&retiring).is_err());
     assert!(harness.resolve(&relation.id).is_err());
     assert_eq!(
-        harness.memory_for(&retiring).unwrap()[0].content,
+        harness.memory_for(&retiring).await.unwrap()[0].content,
         "retained part insight"
     );
     assert_eq!(
-        harness.memory_for(&relation.id).unwrap()[0].content,
+        harness.memory_for(&relation.id).await.unwrap()[0].content,
         "retained group insight"
     );
-    harness.undo_dream().unwrap();
+    harness.undo_dream().await.unwrap();
     assert!(harness.resolve(&retiring).is_ok());
 }
 
 #[tokio::test]
 async fn undo_archives_new_members_and_preserves_their_memories() {
     let provider = RecordingProvider::new(|_| reply("Ready"));
-    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider);
+    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider).await;
     harness
         .apply_dream(vec![DreamProposal::Add {
             name: "Experiment".into(),
             role: "id".into(),
             instruction: "Explore new options".into(),
         }])
+        .await
         .unwrap();
     let added = harness.resolve("Experiment").unwrap();
     harness
         .memory
         .append(&harness.namespace(&added), "assistant", "new insight")
+        .await
         .unwrap();
-    harness.undo_dream().unwrap();
+    harness.undo_dream().await.unwrap();
     assert!(harness.resolve(&added).is_err());
     assert_eq!(
-        harness.memory_for(&added).unwrap()[0].content,
+        harness.memory_for(&added).await.unwrap()[0].content,
         "new insight"
     );
-    assert!(harness.undo_dream().is_err());
+    assert!(harness.undo_dream().await.is_err());
 }
 
 #[tokio::test]
@@ -352,7 +365,8 @@ async fn a_large_tool_batch_retains_all_current_receipts_for_protocol_replay() {
             ..config(Mode::Freudian)
         },
         provider,
-    );
+    )
+    .await;
     let output = harness.run("Remember this work").await.unwrap();
     assert_eq!(output.text, "Received 64 receipts");
 }
@@ -360,19 +374,20 @@ async fn a_large_tool_batch_retains_all_current_receipts_for_protocol_replay() {
 #[tokio::test]
 async fn failed_dream_save_restores_topology_and_leaves_undo_state_untouched() {
     let provider = RecordingProvider::new(|_| reply("Ready"));
-    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider);
+    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider).await;
     let before = serde_json::to_value(&harness.topology).unwrap();
     let sessions_key = format!("{}/sessions", harness.scope);
     harness
         .memory
         .put(&sessions_key, &json!("invalid-session-index"))
+        .await
         .unwrap();
     let proposal = DreamProposal::Add {
         name: "Experiment".into(),
         role: "id".into(),
         instruction: "Explore".into(),
     };
-    assert!(harness.apply_dream(vec![proposal]).is_err());
+    assert!(harness.apply_dream(vec![proposal]).await.is_err());
     assert_eq!(serde_json::to_value(&harness.topology).unwrap(), before);
     assert_eq!(
         harness
@@ -381,6 +396,7 @@ async fn failed_dream_save_restores_topology_and_leaves_undo_state_untouched() {
                 "{}/{}/topology",
                 harness.scope, harness.config.mode
             ))
+            .await
             .unwrap(),
         Some(before)
     );
@@ -391,6 +407,7 @@ async fn failed_dream_save_restores_topology_and_leaves_undo_state_untouched() {
                 "{}/{}/dream-undo",
                 harness.scope, harness.config.mode
             ))
+            .await
             .unwrap()
             .is_none()
     );
@@ -399,7 +416,7 @@ async fn failed_dream_save_restores_topology_and_leaves_undo_state_untouched() {
 #[tokio::test]
 async fn failed_mode_focus_and_relationship_saves_leave_the_running_pool_intact() {
     let provider = RecordingProvider::new(|_| reply("Ready"));
-    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider);
+    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider).await;
     let before = serde_json::to_value(&harness.topology).unwrap();
     let actors = harness.actors.keys().cloned().collect::<Vec<_>>();
     harness
@@ -408,18 +425,20 @@ async fn failed_mode_focus_and_relationship_saves_leave_the_running_pool_intact(
             &format!("{}/sessions", harness.scope),
             &json!("corrupt index"),
         )
+        .await
         .unwrap();
     let first = harness.topology.parts[0].id.clone();
     let second = harness.topology.parts[1].id.clone();
-    assert!(harness.focus(Some(&first)).is_err());
+    assert!(harness.focus(Some(&first)).await.is_err());
     assert_eq!(serde_json::to_value(&harness.topology).unwrap(), before);
     assert!(
         harness
             .relate(RelationshipKind::Alliance, vec![first, second])
+            .await
             .is_err()
     );
     assert_eq!(serde_json::to_value(&harness.topology).unwrap(), before);
-    assert!(harness.set_mode(Mode::Jungian).is_err());
+    assert!(harness.set_mode(Mode::Jungian).await.is_err());
     assert_eq!(harness.config.mode, Mode::Freudian);
     assert_eq!(harness.session.mode, Mode::Freudian);
     assert_eq!(serde_json::to_value(&harness.topology).unwrap(), before);
@@ -435,7 +454,8 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
             ..config(Mode::Freudian)
         },
         provider.clone(),
-    );
+    )
+    .await;
     let id = harness.topology.parts[0].id.clone();
     for _ in 0..16 {
         harness
@@ -445,6 +465,7 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
                 "note",
                 &"🪶".repeat(3000),
             )
+            .await
             .unwrap();
     }
     harness
@@ -454,6 +475,7 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
             "assistant",
             &"old history ".repeat(20_000),
         )
+        .await
         .unwrap();
     let inputs = (0..64)
         .map(|i| kuru_core::Message {
@@ -499,7 +521,7 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
 #[tokio::test]
 async fn malformed_current_tool_receipts_fail_before_provider_invocation() {
     let provider = RecordingProvider::new(|_| reply("Should not be reached"));
-    let (_dir, harness) = fixture(config(Mode::Freudian), provider.clone());
+    let (_dir, harness) = fixture(config(Mode::Freudian), provider.clone()).await;
     let id = &harness.topology.parts[0].id;
     for content in ["not JSON", "{}", "{\"call_id\":\"a\"}"] {
         let inputs = vec![kuru_core::Message {
@@ -516,8 +538,8 @@ async fn malformed_current_tool_receipts_fail_before_provider_invocation() {
     assert!(provider.requests.lock().unwrap().is_empty());
 }
 
-#[test]
-fn visible_truncation_respects_small_limits_and_utf8_boundaries() {
+#[tokio::test]
+async fn visible_truncation_respects_small_limits_and_utf8_boundaries() {
     for limit in [0, 1, 3, 10, 11, 12, 15, 40] {
         let text = crate::actor::truncate_text(&"🪶".repeat(30), limit);
         assert!(text.len() <= limit);
@@ -554,7 +576,7 @@ async fn a_models_relationship_proposal_selects_the_temporary_group_as_speaker()
             reply("Contribution ready")
         }
     });
-    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider.clone());
+    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider.clone()).await;
     let ids = harness
         .topology
         .parts
@@ -626,7 +648,7 @@ async fn a_speaking_peer_consults_another_peer_without_recursive_delegation() {
         }
         reply("A concise draft")
     });
-    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider.clone());
+    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider.clone()).await;
     let ids = harness
         .topology
         .parts
@@ -634,7 +656,7 @@ async fn a_speaking_peer_consults_another_peer_without_recursive_delegation() {
         .map(|part| part.id.clone())
         .collect::<Vec<_>>();
     *identities.lock().unwrap() = ids.clone();
-    harness.focus(Some(&ids[0])).unwrap();
+    harness.focus(Some(&ids[0])).await.unwrap();
     let output = harness
         .run("Finish and verify the implementation")
         .await
@@ -670,7 +692,7 @@ async fn partial_provider_failures_leave_other_peers_usable_and_total_failure_is
         }
         Ok(reply("Other peers completed the task"))
     });
-    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider);
+    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider).await;
     let failed_id = harness.topology.parts[0].id.clone();
     *failing.lock().unwrap() = failed_id.clone();
     let output = harness
@@ -686,11 +708,11 @@ async fn partial_provider_failures_leave_other_peers_usable_and_total_failure_is
             .any(|event| event.kind == "error" && event.actor == failed_id)
     );
     let all_failed = RecordingProvider::fallible(|_| anyhow::bail!("service unavailable"));
-    let (_other_dir, mut unavailable) = fixture(config(Mode::Freudian), all_failed);
+    let (_other_dir, mut unavailable) = fixture(config(Mode::Freudian), all_failed).await;
     let error = unavailable.run("Try a request").await.unwrap_err();
     assert!(error.to_string().contains("all peers failed"));
     assert_eq!(unavailable.session.turns, 0);
-    assert_eq!(unavailable.history().unwrap().len(), 1);
+    assert_eq!(unavailable.history().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -710,21 +732,25 @@ async fn dreaming_accepts_a_valid_model_proposal_and_failed_undo_remains_recover
         }
         reply("Consolidated private project knowledge")
     });
-    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider);
+    let (_dir, mut harness) = fixture(config(Mode::Freudian), provider).await;
     *proposer.lock().unwrap() = harness.topology.parts[0].id.clone();
     let report = harness.dream().await.unwrap();
     assert_eq!(report.accepted.len(), 1);
     assert!(report.rejected.is_empty());
     let new_part = harness.resolve("Possibility").unwrap();
-    let saved = serde_json::to_value(harness.sessions().unwrap()).unwrap();
+    let saved = serde_json::to_value(harness.sessions().await.unwrap()).unwrap();
     let key = format!("{}/sessions", harness.scope);
-    harness.memory.put(&key, &json!("corrupt index")).unwrap();
-    assert!(harness.undo_dream().is_err());
+    harness
+        .memory
+        .put(&key, &json!("corrupt index"))
+        .await
+        .unwrap();
+    assert!(harness.undo_dream().await.is_err());
     assert!(harness.resolve(&new_part).is_ok());
-    harness.memory.put(&key, &saved).unwrap();
-    harness.undo_dream().unwrap();
+    harness.memory.put(&key, &saved).await.unwrap();
+    harness.undo_dream().await.unwrap();
     assert!(harness.resolve(&new_part).is_err());
-    assert!(harness.memory_for(&new_part).is_ok());
+    assert!(harness.memory_for(&new_part).await.is_ok());
 }
 
 #[tokio::test]
@@ -771,11 +797,13 @@ async fn speaking_peers_send_only_explicit_messages_to_configured_external_a2a_a
             ..config(Mode::Freudian)
         },
         provider,
-    );
+    )
+    .await;
     for part in &harness.topology.parts {
         harness
             .memory
             .append(&harness.namespace(&part.id), "user", "PRIVATE-NOT-EXPORTED")
+            .await
             .unwrap();
     }
     let output = harness
@@ -838,7 +866,8 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
             ..config(Mode::Freudian)
         },
         provider.clone(),
-    );
+    )
+    .await;
     let shared = Arc::new(tokio::sync::Mutex::new(harness));
     let running = shared.clone();
     let task = tokio::spawn(async move { running.lock().await.run("Start a task").await });
@@ -870,8 +899,8 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
 }
 
 #[cfg(unix)]
-#[test]
-fn distinct_non_utf8_project_paths_cannot_share_memory_namespaces() {
+#[tokio::test]
+async fn distinct_non_utf8_project_paths_cannot_share_memory_namespaces() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
     let first = PathBuf::from(OsString::from_vec(vec![b'/', b'a', 0xff]));
     let second = PathBuf::from(OsString::from_vec(vec![b'/', b'a', 0xfe]));
@@ -880,4 +909,36 @@ fn distinct_non_utf8_project_paths_cannot_share_memory_namespaces() {
         crate::engine::path_hash(&first),
         crate::engine::path_hash(&second)
     );
+}
+
+#[tokio::test]
+async fn one_rejected_model_does_not_discard_other_peers_dream_summaries() {
+    let failing = Arc::new(Mutex::new(String::new()));
+    let selected = failing.clone();
+    let provider = RecordingProvider::fallible(move |request| {
+        if request.actor.ends_with(&*selected.lock().unwrap()) {
+            anyhow::bail!("one peer's model rejected the request");
+        }
+        Ok(reply("Retain this useful private summary"))
+    });
+    let (_project, mut harness) = fixture(config(Mode::Freudian), provider).await;
+    let failed = harness.topology.parts[0].id.clone();
+    *failing.lock().unwrap() = failed.clone();
+    let report = harness.dream().await.unwrap();
+    assert_eq!(report.summaries, 2);
+    assert_eq!(report.rejected.len(), 1);
+    assert!(report.rejected[0].contains(&failed));
+    for part in &harness.topology.parts {
+        let notes = harness
+            .memory
+            .history(&format!("{}/notes", harness.namespace(&part.id)), 10)
+            .await
+            .unwrap();
+        if part.id == failed {
+            assert!(notes.is_empty());
+        } else {
+            assert_eq!(notes[0].content, "Retain this useful private summary");
+        }
+    }
+    harness.shutdown(false).await.unwrap();
 }

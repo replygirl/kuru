@@ -7,7 +7,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use kuru_connectors::{Provider, ToolHost, auth, provider};
-use kuru_core::{Config, MemoryStore, Mode, ModelInfo, ProjectPreferences, SelectionOverrides};
+use kuru_core::{Config, Mode, ModelInfo, ProjectPreferences, SelectionOverrides};
+use kuru_memory::{MemoryStore, OpenOptions as MemoryOptions};
 use kuru_runtime::Harness;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -70,6 +71,11 @@ pub enum Command {
     /// Print merged effective configuration.
     Config,
     Sessions,
+    /// Inspect this project's memory store and revision history.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     /// Consolidate private memories and consider reversible membership changes.
     Dream,
     UndoDream,
@@ -96,6 +102,17 @@ pub enum Command {
         release_base: Option<String>,
         #[arg(long)]
         source: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommand {
+    /// Show the active project, engine version and revision.
+    Status,
+    /// List recent committed memory revisions.
+    History {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 
@@ -207,155 +224,223 @@ pub async fn execute(cli: Cli) -> Result<()> {
         .await;
     }
     let (cwd, data, user) = paths(&cli)?;
-    // A new installation can inspect configuration without creating state. An
-    // existing store supplies only this project's interactive choices, never a
-    // resumed transcript. Refuse tool-root storage before opening its database.
-    let existing_memory = if data.join("memory.sqlite3").try_exists()? {
+    let scope = kuru_runtime::project_scope(&cwd)?;
+    let memory_config = Config::load_memory(user.as_deref(), &cwd, cli.config.as_deref())?;
+    let writer = matches!(
+        cli.command,
+        None | Some(
+            Command::Run { .. } | Command::Dream | Command::UndoDream | Command::Serve { .. }
+        )
+    );
+    let exists = MemoryStore::exists(&data, &scope)?;
+    let legacy_path = data.join("memory.sqlite3");
+    let legacy = match std::fs::symlink_metadata(&legacy_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("cannot inspect legacy memory"),
+    };
+    let migrate = legacy && !exists;
+    let _lease = if writer || migrate {
+        std::fs::create_dir_all(&data)?;
         ensure!(
             !data.canonicalize()?.starts_with(&cwd),
             "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
         );
-        Some(MemoryStore::open(&data.join("memory.sqlite3"))?)
+        Some(project_lease(&data, &cwd)?)
     } else {
         None
     };
-    let preferences = existing_memory
-        .as_ref()
-        .map(|memory| Harness::load_preferences(memory, &cwd))
-        .transpose()?
-        .unwrap_or_default();
-    let mut config = effective_config(&cli, &cwd, user.as_deref(), &preferences)?;
-    match &cli.command {
-        Some(Command::Login { device: true }) => {
-            let status = tokio::process::Command::new(&config.codex_command)
-                .args(["login", "--device-auth"])
-                .status()
-                .await
-                .context("install Codex to use ChatGPT authentication")?;
-            ensure!(status.success(), "Codex device login failed");
-            return Ok(());
-        }
-        Some(Command::Login { device: false }) => {
-            return auth(&config.codex_command, "login").await;
-        }
-        Some(Command::Logout) => return auth(&config.codex_command, "logout").await,
-        Some(Command::Auth) => return auth(&config.codex_command, "status").await,
-        Some(Command::Config) => {
-            let mut visible = config.clone();
-            for server in visible.mcp.values_mut() {
-                for value in server.env.values_mut() {
-                    *value = "[redacted]".into();
-                }
-            }
-            println!("{}", toml::to_string_pretty(&visible)?);
-            return Ok(());
-        }
-        Some(Command::Tool { name, args }) => {
-            let host = ToolHost::new(&cwd, &config)?;
-            let result = async {
-                let arguments = serde_json::from_str(args)?;
-                host.specs().await?;
-                host.execute(name, arguments).await
-            }
-            .await;
-            let cleanup = host.shutdown().await;
-            println!("{}", result?);
-            cleanup?;
-            return Ok(());
-        }
-        Some(Command::Tools) => {
-            let host = ToolHost::new(&cwd, &config)?;
-            let specs = host.specs().await;
-            let cleanup = host.shutdown().await;
-            println!("{}", serde_json::to_string_pretty(&specs?)?);
-            cleanup?;
-            return Ok(());
-        }
-        _ => {}
-    }
-    let provider = provider(&config, &cwd)?;
-    if matches!(cli.command, Some(Command::Models)) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&provider.models().await?)?
+    // A new installation can inspect configuration without creating state. An
+    // existing store supplies only this project's interactive choices, never a
+    // resumed transcript. Refuse tool-root storage before opening its database.
+    let existing_memory = if exists || legacy {
+        ensure!(
+            !data.canonicalize()?.starts_with(&cwd),
+            "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
         );
-        return Ok(());
-    }
-    let models = if matches!(cli.command, Some(Command::Sessions | Command::UndoDream)) {
-        vec![]
+        let mut options = MemoryOptions::new(data.clone(), scope.clone());
+        options.config = memory_config.clone();
+        options.read_only = !writer && !migrate;
+        Some(MemoryStore::open(options).await?)
     } else {
-        select_model(&mut config, &provider).await?
+        None
     };
-    if matches!(cli.command, Some(Command::Sessions))
-        && !data.join("memory.sqlite3").try_exists()?
-    {
-        println!("[]");
-        return Ok(());
-    }
-    std::fs::create_dir_all(&data)?;
-    let data = data.canonicalize()?;
-    ensure!(
-        !data.starts_with(&cwd),
-        "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
-    );
-    let memory = match existing_memory {
-        Some(memory) => memory,
-        None => MemoryStore::open(&data.join("memory.sqlite3"))?,
-    };
-    if matches!(cli.command, Some(Command::Sessions)) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&Harness::list_sessions(&memory, &cwd)?)?
-        );
-        return Ok(());
-    }
-    let _lease = project_lease(&data, &cwd)?;
-    let mut harness = Harness::new(config, &cwd, memory, provider, cli.resume.as_deref())?;
-    match cli.command {
-        Some(Command::Run { prompt, json }) => {
-            let result = harness.run(&prompt).await;
-            let succeeded = result.is_ok();
-            if let Ok(result) = &result {
-                if json {
-                    println!("{}", serde_json::to_string_pretty(result)?);
-                } else {
-                    println!("{}", result.text);
-                }
+    // Keep cleanup outside every command/error return and retain the project
+    // lease until the owned supervisor has reaped Dolt.
+    let mut memory_to_close = existing_memory.clone();
+    let result = async {
+        let preferences = if let Some(memory) = &existing_memory {
+            Harness::load_preferences(memory, &cwd).await?
+        } else {
+            ProjectPreferences::default()
+        };
+        let mut config = effective_config(&cli, &cwd, user.as_deref(), &preferences)?;
+        match &cli.command {
+            Some(Command::Login { device: true }) => {
+                let status = tokio::process::Command::new(&config.codex_command)
+                    .args(["login", "--device-auth"])
+                    .status()
+                    .await
+                    .context("install Codex to use ChatGPT authentication")?;
+                ensure!(status.success(), "Codex device login failed");
+                return Ok(());
             }
-            let cleanup = harness.shutdown(succeeded).await;
-            result?;
-            cleanup?;
+            Some(Command::Login { device: false }) => {
+                return auth(&config.codex_command, "login").await;
+            }
+            Some(Command::Logout) => return auth(&config.codex_command, "logout").await,
+            Some(Command::Auth) => return auth(&config.codex_command, "status").await,
+            Some(Command::Config) => {
+                let mut visible = config.clone();
+                for server in visible.mcp.values_mut() {
+                    for value in server.env.values_mut() {
+                        *value = "[redacted]".into();
+                    }
+                }
+                println!("{}", toml::to_string_pretty(&visible)?);
+                return Ok(());
+            }
+            Some(Command::Sessions) => {
+                let sessions = if let Some(memory) = &existing_memory {
+                    Harness::list_sessions(memory, &cwd).await?
+                } else {
+                    vec![]
+                };
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+                return Ok(());
+            }
+            Some(Command::Memory { command }) => {
+                let memory = existing_memory
+                    .as_ref()
+                    .context("this project has no memory yet; start a conversation first")?;
+                match command {
+                    MemoryCommand::Status => {
+                        println!("{}", serde_json::to_string_pretty(&memory.status().await?)?)
+                    }
+                    MemoryCommand::History { limit } => {
+                        ensure!(
+                            (1..=1000).contains(limit),
+                            "memory history limit must be between 1 and 1000"
+                        );
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&memory.revisions(*limit).await?)?
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            Some(Command::Tool { name, args }) => {
+                let host = ToolHost::new(&cwd, &config)?;
+                let result = async {
+                    let arguments = serde_json::from_str(args)?;
+                    host.specs().await?;
+                    host.execute(name, arguments).await
+                }
+                .await;
+                let cleanup = host.shutdown().await;
+                println!("{}", result?);
+                cleanup?;
+                return Ok(());
+            }
+            Some(Command::Tools) => {
+                let host = ToolHost::new(&cwd, &config)?;
+                let specs = host.specs().await;
+                let cleanup = host.shutdown().await;
+                println!("{}", serde_json::to_string_pretty(&specs?)?);
+                cleanup?;
+                return Ok(());
+            }
+            _ => {}
         }
-
-        Some(Command::Dream) => {
-            println!("{}", serde_json::to_string_pretty(&harness.dream().await?)?);
-            harness.shutdown(false).await?;
-        }
-        Some(Command::UndoDream) => {
-            harness.undo_dream()?;
-            println!("Previous membership restored.");
-        }
-        Some(Command::Serve { bind, token_env }) => {
-            ensure!(
-                bind.ip().is_loopback(),
-                "v1 A2A listener must bind to loopback; put an authenticated gateway in front for remote access"
+        let provider = provider(&config, &cwd)?;
+        if matches!(cli.command, Some(Command::Models)) {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&provider.models().await?)?
             );
-            let token = std::env::var(&token_env).with_context(|| {
-                format!("set {token_env} to a bearer token of at least 16 characters")
-            })?;
-            let harness = Arc::new(Mutex::new(harness));
-            let listener = tokio::net::TcpListener::bind(bind).await?;
-            let actual = listener.local_addr()?;
-            let app =
-                kuru_runtime::server::router(harness.clone(), &format!("http://{actual}"), &token)?;
-            eprintln!("Kuru A2A listening on {actual}");
-            kuru_runtime::server::serve(listener, app).await?;
-            harness.lock().await.shutdown(false).await?;
+            return Ok(());
         }
-        None => crate::ui::run(harness, models).await?,
-        _ => unreachable!("early-return commands handled above"),
+        let models = if matches!(cli.command, Some(Command::UndoDream)) {
+            vec![]
+        } else {
+            select_model(&mut config, &provider).await?
+        };
+        std::fs::create_dir_all(&data)?;
+        let data = data.canonicalize()?;
+        ensure!(
+            !data.starts_with(&cwd),
+            "memory directory must be outside the tool workspace; set --data-dir to a separate directory"
+        );
+        let memory = match existing_memory {
+            Some(memory) => memory,
+            None => {
+                let mut options = MemoryOptions::new(data, scope);
+                options.config = memory_config;
+                MemoryStore::open(options).await?
+            }
+        };
+        memory_to_close = Some(memory.clone());
+        let mut harness = Harness::new(config, &cwd, memory, provider, cli.resume.as_deref()).await?;
+        match cli.command {
+            Some(Command::Run { prompt, json }) => {
+                let result = harness.run(&prompt).await;
+                let succeeded = result.is_ok();
+                if let Ok(result) = &result {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(result)?);
+                    } else {
+                        println!("{}", result.text);
+                    }
+                }
+                let cleanup = harness.shutdown(succeeded).await;
+                result?;
+                cleanup?;
+            }
+
+            Some(Command::Dream) => {
+                let result = harness.dream().await;
+                let cleanup = harness.shutdown(false).await;
+                println!("{}", serde_json::to_string_pretty(&result?)?);
+                cleanup?;
+            }
+            Some(Command::UndoDream) => {
+                let result = harness.undo_dream().await;
+                let cleanup = harness.shutdown(false).await;
+                result?;
+                cleanup?;
+                println!("Previous membership restored.");
+            }
+            Some(Command::Serve { bind, token_env }) => {
+                ensure!(
+                    bind.ip().is_loopback(),
+                    "v1 A2A listener must bind to loopback; put an authenticated gateway in front for remote access"
+                );
+                let token = std::env::var(&token_env).with_context(|| {
+                    format!("set {token_env} to a bearer token of at least 16 characters")
+                })?;
+                let harness = Arc::new(Mutex::new(harness));
+                let listener = tokio::net::TcpListener::bind(bind).await?;
+                let actual = listener.local_addr()?;
+                let app =
+                    kuru_runtime::server::router(harness.clone(), &format!("http://{actual}"), &token)?;
+                eprintln!("Kuru A2A listening on {actual}");
+                kuru_runtime::server::serve(listener, app).await?;
+                harness.lock().await.shutdown(false).await?;
+            }
+            None => crate::ui::run(harness, models).await?,
+            _ => unreachable!("early-return commands handled above"),
+        }
+        Ok::<_, anyhow::Error>(())
     }
-    Ok(())
+    .await;
+    let cleanup = if let Some(memory) = memory_to_close {
+        memory.close().await
+    } else {
+        Ok(())
+    };
+    result?;
+    cleanup
 }
 
 /// Advisory OS locks release when the process exits, including crashes. Keep the

@@ -4,6 +4,9 @@ use std::{
     process::{Command, Output},
 };
 
+#[path = "support/memory.rs"]
+mod memory;
+
 struct Sandbox {
     root: tempfile::TempDir,
     project: PathBuf,
@@ -15,6 +18,7 @@ impl Sandbox {
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project).unwrap();
+        memory::configuration(root.path()).unwrap();
         Self {
             root,
             project,
@@ -22,13 +26,16 @@ impl Sandbox {
         }
     }
     fn command(&self) -> Command {
+        self.command_for("demo")
+    }
+    fn command_for(&self, provider: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
         command
             .arg("-C")
             .arg(&self.project)
             .arg("--data-dir")
             .arg(&self.data)
-            .args(["--provider", "demo", "--no-dream"])
+            .args(["--provider", provider, "--no-dream"])
             .env("XDG_CONFIG_HOME", self.root.path().join("config"));
         command
     }
@@ -240,4 +247,175 @@ fn supported_auth_commands_forward_to_native_codex_without_handling_tokens() {
         std::fs::read_to_string(log).unwrap(),
         "login\nlogin --device-auth\nlogin status\nlogout\n"
     );
+}
+
+#[test]
+fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
+    let env = Sandbox::new();
+    let config_path = env.root.path().join("config/kuru/config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    // A deliberately unavailable explicit engine makes accidental provisioning observable.
+    std::fs::write(
+        &config_path,
+        format!(
+            "[memory]\noffline = true\ndolt_binary = {:?}\n",
+            env.root.path().join("does-not-exist").to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    for args in [
+        vec!["config"],
+        vec!["models"],
+        vec!["tools"],
+        vec!["sessions"],
+    ] {
+        env.success(&args);
+        assert!(!env.data.exists(), "fresh {args:?} created memory state");
+    }
+    let output = env.run(&["memory", "status"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+    assert!(!env.data.exists());
+    std::fs::write(&config_path, config).unwrap();
+    env.success(&["run", "Make a durable revision"]);
+    let sessions = env.success(&["sessions"]);
+    let status: Value = serde_json::from_str(&env.success(&["memory", "status"])).unwrap();
+    let history: Value =
+        serde_json::from_str(&env.success(&["memory", "history", "--limit", "2"])).unwrap();
+    assert_eq!(history.as_array().unwrap().len(), 2);
+    assert!(
+        history[0]["hash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty())
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&env.success(&["memory", "status"])).unwrap(),
+        status
+    );
+    assert_eq!(env.success(&["sessions"]), sessions);
+    for limit in ["0", "1001"] {
+        let output = env.run(&["memory", "history", "--limit", limit]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_legacy_link_is_rejected_instead_of_treated_as_fresh_memory() {
+    let env = Sandbox::new();
+    std::fs::create_dir(&env.data).unwrap();
+    let legacy = env.data.join("memory.sqlite3");
+    let missing = env.root.path().join("missing-legacy-target");
+    std::os::unix::fs::symlink(&missing, &legacy).unwrap();
+    let output = env.run(&["sessions"]);
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read_link(&legacy).unwrap(), missing);
+    assert!(output.stdout.is_empty());
+}
+
+#[tokio::test]
+async fn sequential_commands_reap_owned_memory_before_returning_on_success_or_error() {
+    use kuru_memory::MemoryStore;
+    use serde_json::json;
+
+    let env = Sandbox::new();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let store_path = env
+        .data
+        .join("memory")
+        .join(scope.strip_prefix("project/").unwrap());
+    let stopped = || {
+        assert!(
+            matches!(std::fs::symlink_metadata(store_path.join("endpoint.json")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "CLI returned while its owned endpoint was still published"
+        );
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store_path.join("lifecycle.lock"))
+            .unwrap();
+        lease
+            .try_lock()
+            .expect("CLI returned before its supervisor released the lifecycle lease");
+    };
+    env.success(&["run", "Seed memory for sequential inspection"]);
+    stopped();
+    for args in [
+        vec!["config"],
+        vec!["sessions"],
+        vec!["models"],
+        vec!["tools"],
+        vec!["memory", "status"],
+        vec!["memory", "history", "--limit", "1"],
+    ] {
+        env.success(&args);
+        stopped();
+    }
+    for (args, diagnostic) in [
+        (
+            vec!["memory", "history", "--limit", "0"],
+            "between 1 and 1000",
+        ),
+        (
+            vec!["tool", "file_read", "--args", "malformed"],
+            "expected value",
+        ),
+    ] {
+        let output = env.run(&args);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stopped();
+    }
+    let output = env
+        .command_for("unknown-provider")
+        .arg("models")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("provider must be"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stopped();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let memory = MemoryStore::open(options.clone()).await.unwrap();
+    memory
+        .put(
+            &format!("{scope}/preferences"),
+            &json!({"mode":"not-a-framework"}),
+        )
+        .await
+        .unwrap();
+    memory.close().await.unwrap();
+    let output = env.run(&["config"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("preferences"));
+    stopped();
+    let memory = MemoryStore::open(options).await.unwrap();
+    memory
+        .put(&format!("{scope}/preferences"), &json!({}))
+        .await
+        .unwrap();
+    memory.close().await.unwrap();
+    let invalid_config = env.root.path().join("invalid-selection.toml");
+    std::fs::write(&invalid_config, "max_parts = 1\n").unwrap();
+    let output = env
+        .command()
+        .arg("--config")
+        .arg(&invalid_config)
+        .arg("config")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("parts"));
+    stopped();
+    env.success(&["run", "The next command still works"]);
+    stopped();
 }

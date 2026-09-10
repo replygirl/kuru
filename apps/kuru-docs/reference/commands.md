@@ -29,6 +29,8 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 | `/focus auto`        | Return to contextual speaker selection                           |
 | `/relate KIND ID,ID` | Activate protection, polarization, or alliance among 2–4 members |
 | `/memory NAME_OR_ID` | Inspect an identity's stored memory                              |
+| `/memory-status`     | Inspect the project's memory store and current revision          |
+| `/memory-history`    | List committed memory revisions                                  |
 | `/dream`             | Run bounded consolidation                                        |
 | `/undo-dream`        | Restore the previous accepted topology change                    |
 | `/quit`              | End the session                                                  |
@@ -47,6 +49,8 @@ Model, effort, and framework selections made here are [saved for the project](./
 | `kuru models`                | Discover provider models and advertised efforts                                           |
 | `kuru config`                | Print merged configuration with MCP environment values redacted                           |
 | `kuru sessions`              | List saved sessions                                                                       |
+| `kuru memory status`         | Inspect the project store, branch and revision                                            |
+| `kuru memory history`        | List committed memory updates; use `--limit` to select 1–1000 entries                     |
 | `kuru dream`                 | Run explicit consolidation                                                                |
 | `kuru undo-dream`            | Restore the previous topology change                                                      |
 | `kuru tools`                 | Discover built-in and configured MCP tools                                                |
