@@ -19,6 +19,9 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[path = "support/repository_environment.rs"]
+mod repository_environment;
+
 const FRAMEWORKS: &str = "apps/kuru-docs/concepts/frameworks.md";
 const COMMITTED_FRAMEWORKS: &str = "# Frameworks\nCommitted IFS default: seven persistent peers.\n";
 const NOTES_BODY: &str = "Persistent peer conversations are now available.";
@@ -302,6 +305,15 @@ async fn actual_communique_compatible_adapter_reads_source_then_submits_notes() 
     );
     assert_eq!(release::git(repo.path(), &["tag"]).await.unwrap(), "");
 }
+
+#[tokio::test]
+async fn hook_environment_cannot_redirect_communique_source_tools() {
+    repository_environment::ForeignRepository::new()
+        .assert_test_isolated(
+            "actual_communique_compatible_adapter_reads_source_then_submits_notes",
+        )
+        .await;
+}
 #[tokio::test]
 async fn actual_api_errors_do_not_expose_payloads_or_leave_output_or_tags() {
     for reply in [Reply::Unauthorized, Reply::Malformed] {
@@ -490,7 +502,7 @@ async fn actual_native_anthropic_adapter_still_rejects_claude_five_thinking() {
     // reach the API and fail on the response shape, not missing credentials.
     let result = tokio::time::timeout(
         TEST_TIMEOUT,
-        tokio::process::Command::new("communique")
+        release::rooted_command(repo.path(), "communique")
             .arg("--config")
             .arg(repo.path().join("communique.toml"))
             .args([
@@ -505,7 +517,6 @@ async fn actual_native_anthropic_adapter_still_rejects_claude_five_thinking() {
                 "--output",
             ])
             .arg(&output)
-            .current_dir(repo.path())
             .kill_on_drop(true)
             .env("ANTHROPIC_API_KEY", "fixture-key")
             .env_remove("OPENAI_API_KEY")

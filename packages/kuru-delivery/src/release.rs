@@ -58,8 +58,36 @@ pub fn checked_sha(value: &str) -> Result<&str> {
     );
     Ok(value)
 }
+/// Select `root` independently of Git's inherited hook environment. Apply any
+/// deliberate repository overrides, such as a private index, after this call.
+pub fn rooted_command(root: &Path, program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.current_dir(root);
+    // Git's `rev-parse --local-env-vars` contract also applies to indirect Git
+    // users such as cog and Communiqué. Keep global signing/auth settings.
+    for key in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(key);
+    }
+    command
+}
 pub async fn run(root: &Path, program: &str, args: &[&str]) -> Result<String> {
-    command_output(Command::new(program).args(args).current_dir(root)).await
+    command_output(rooted_command(root, program).args(args)).await
 }
 async fn command_output(command: &mut Command) -> Result<String> {
     let program = command
@@ -565,9 +593,8 @@ async fn stamped_tree(root: &Path) -> Result<String> {
         &["write-tree"],
     ] {
         result = command_output(
-            Command::new("git")
+            rooted_command(root, "git")
                 .args(args)
-                .current_dir(root)
                 .env("GIT_INDEX_FILE", &index),
         )
         .await?;

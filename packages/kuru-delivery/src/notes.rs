@@ -1,8 +1,7 @@
 //! Generate bounded release notes with the pinned external Communiqué tool.
-use crate::release::{Version, checked_sha, git, workspace_version};
+use crate::release::{Version, checked_sha, git, rooted_command, workspace_version};
 use anyhow::{Context, Result, ensure};
 use std::{fs, io::Write, path::Path, time::Duration};
-use tokio::process::Command;
 
 const MAX_CONTEXT_BYTES: usize = 100_000;
 const PRODUCT_DOCS: [&str; 6] = [
@@ -158,7 +157,7 @@ pub async fn generate(
     let config_path = temp.path().join("communique.toml");
     let notes_path = temp.path().join("notes.md");
     fs::write(&config_path, config)?;
-    let mut command = Command::new("communique");
+    let mut command = rooted_command(root, "communique");
     command
         .args(["--config"])
         .arg(config_path)
@@ -166,11 +165,7 @@ pub async fn generate(
     if let Some(previous) = previous {
         command.arg(previous);
     }
-    command
-        .arg("--output")
-        .arg(&notes_path)
-        .current_dir(root)
-        .kill_on_drop(true);
+    command.arg("--output").arg(&notes_path).kill_on_drop(true);
     if let Some(endpoint) = &provider.endpoint {
         command.args(["--base-url", endpoint]);
     }
