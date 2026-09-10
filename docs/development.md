@@ -91,6 +91,13 @@ hk validates format/tooling/specs before commits, the full gate before pushes,
 and conventional commit titles. Hooks are installed by mise's postinstall and
 `mise run setup`. Fix failed checks instead of bypassing hooks.
 
+Git hooks export repository-selection variables, so a subprocess working directory
+alone does not isolate another checkout. Delivery's rooted command constructor
+clears that inherited context for Git and tools that invoke Git, then applies
+intentional overrides such as the temporary release index. Keep new repository
+subprocesses on that path and exercise foreign hook environments through child
+processes with temporary repositories. See [Git's hook documentation](https://git-scm.com/docs/githooks).
+
 ## Coding assistants
 
 [AGENTS.md](../AGENTS.md) is the canonical repository instruction source.

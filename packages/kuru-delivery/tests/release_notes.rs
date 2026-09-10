@@ -19,9 +19,13 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[path = "support/repository_environment.rs"]
+mod repository_environment;
+
 const FRAMEWORKS: &str = "apps/kuru-docs/concepts/frameworks.md";
 const COMMITTED_FRAMEWORKS: &str = "# Frameworks\nCommitted IFS default: seven persistent peers.\n";
 const NOTES_BODY: &str = "Persistent peer conversations are now available.";
+const NOTES_HEADING: &str = "# v0.1.0: Kuru 0.1.0\n\n";
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 fn version(input: &str) -> Version {
     input.parse().unwrap()
@@ -301,6 +305,15 @@ async fn actual_communique_compatible_adapter_reads_source_then_submits_notes() 
     );
     assert_eq!(release::git(repo.path(), &["tag"]).await.unwrap(), "");
 }
+
+#[tokio::test]
+async fn hook_environment_cannot_redirect_communique_source_tools() {
+    repository_environment::ForeignRepository::new()
+        .assert_test_isolated(
+            "actual_communique_compatible_adapter_reads_source_then_submits_notes",
+        )
+        .await;
+}
 #[tokio::test]
 async fn actual_api_errors_do_not_expose_payloads_or_leave_output_or_tags() {
     for reply in [Reply::Unauthorized, Reply::Malformed] {
@@ -489,7 +502,7 @@ async fn actual_native_anthropic_adapter_still_rejects_claude_five_thinking() {
     // reach the API and fail on the response shape, not missing credentials.
     let result = tokio::time::timeout(
         TEST_TIMEOUT,
-        tokio::process::Command::new("communique")
+        release::rooted_command(repo.path(), "communique")
             .arg("--config")
             .arg(repo.path().join("communique.toml"))
             .args([
@@ -504,7 +517,6 @@ async fn actual_native_anthropic_adapter_still_rejects_claude_five_thinking() {
                 "--output",
             ])
             .arg(&output)
-            .current_dir(repo.path())
             .kill_on_drop(true)
             .env("ANTHROPIC_API_KEY", "fixture-key")
             .env_remove("OPENAI_API_KEY")
@@ -553,18 +565,38 @@ async fn assert_invalid_notes(body: String, expected: &str) {
     assert_eq!(api.calls.lock().unwrap().len(), 2);
 }
 
-#[tokio::test]
-async fn actual_communique_overlong_bullet_list_is_rejected_before_publication() {
-    assert_invalid_notes(
-        (0..17).map(|i| format!("- Item {i}.\n")).collect(),
-        "at most 10 bullets",
-    )
-    .await;
+async fn assert_retained_notes(body: String) {
+    let repo = Fixture::new().await;
+    let expected = format!("{NOTES_HEADING}{body}");
+    let api = Api::new(Reply::Notes(body)).await;
+    let output = repo.path().join("notes.md");
+    repo.generate(&api, &output).await.unwrap();
+    assert_eq!(fs::read(&output).unwrap(), expected.as_bytes());
+    assert_eq!(api.calls.lock().unwrap().len(), 2);
+    repo.assert_no_tag().await;
+
+    // Retaining a readable draft must not introduce a second generation call
+    // or replace it when the operation is repeated for editorial review.
+    let error = repo.generate(&api, &output).await.unwrap_err().to_string();
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(fs::read(&output).unwrap(), expected.as_bytes());
+    assert_eq!(api.calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
-async fn actual_communique_overlong_prose_is_rejected_before_publication() {
-    assert_invalid_notes("word ".repeat(451), "at most 450 words").await;
+async fn actual_communique_retains_seventeen_bullets_without_rewriting() {
+    let body = (0..17).map(|i| format!("- Item {i}.\n")).collect();
+    assert_retained_notes(body).await;
+}
+
+#[tokio::test]
+async fn actual_communique_retains_451_words_without_rewriting() {
+    let body = "word ".repeat(447);
+    assert_eq!(
+        format!("{NOTES_HEADING}{body}").split_whitespace().count(),
+        451
+    );
+    assert_retained_notes(body).await;
 }
 
 #[tokio::test]
@@ -594,23 +626,16 @@ async fn current_source_guard_rejects_untracked_inputs_but_allows_ignored_builds
 }
 
 #[tokio::test]
-async fn actual_communique_accepts_limit_boundaries_and_counts_other_list_markers() {
-    for body in [
-        // The generated title adds four whitespace-delimited words.
-        "word ".repeat(446),
-        (0..10).map(|i| format!("- Item {i}.\n")).collect(),
-    ] {
-        let repo = Fixture::new().await;
-        let api = Api::new(Reply::Notes(body)).await;
-        let output = repo.path().join("notes.md");
-        repo.generate(&api, &output).await.unwrap();
-        assert!(output.is_file());
-    }
+async fn actual_communique_retains_other_markdown_list_markers() {
     for marker in ["*", "+", "1.", "2)"] {
-        assert_invalid_notes(
-            format!("  {marker} Item.\n").repeat(11),
-            "at most 10 bullets",
-        )
-        .await;
+        assert_retained_notes(format!("  {marker} Item.\n").repeat(11)).await;
     }
+}
+
+#[tokio::test]
+async fn actual_communique_retains_exact_byte_limit_but_rejects_oversized_output() {
+    let body = "é".repeat((100_000 - NOTES_HEADING.len()) / 2);
+    assert_eq!(NOTES_HEADING.len() + body.len(), 100_000);
+    assert_retained_notes(body.clone()).await;
+    assert_invalid_notes(format!("{body}x"), "notes must be a bounded regular file").await;
 }

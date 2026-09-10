@@ -17,6 +17,9 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[path = "support/repository_environment.rs"]
+mod repository_environment;
+
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
@@ -76,6 +79,70 @@ impl Repo {
         release::git(self.root(), &["tag", tag]).await.unwrap();
     }
 }
+#[tokio::test]
+async fn hook_environment_cannot_redirect_rooted_commands() {
+    if std::env::var_os(repository_environment::CHILD).is_some() {
+        let repo = Repo::new().await;
+        fs::write(
+            repo.root().join("requested.txt"),
+            "belongs to requested root",
+        )
+        .unwrap();
+        repo.commit("fix: update the requested repository").await;
+        assert_eq!(
+            release::git(repo.root(), &["show", "HEAD:requested.txt"])
+                .await
+                .unwrap(),
+            "belongs to requested root"
+        );
+        assert_eq!(
+            release::git(
+                repo.root(),
+                &["config", "--default", "clean", "--get", "fixture.hook"]
+            )
+            .await
+            .unwrap(),
+            "clean"
+        );
+        assert_eq!(
+            release::git(repo.root(), &["config", "--get", "user.signingkey"])
+                .await
+                .unwrap(),
+            "fixture-signing-key"
+        );
+        release::run(
+            repo.root(),
+            "/bin/sh",
+            &[
+                "-c",
+                r#"
+            test "$GIT_SSH_COMMAND" = fixture-ssh &&
+            test "$SSH_AUTH_SOCK" = fixture-agent &&
+            test "$GIT_ASKPASS" = fixture-askpass &&
+            test "$OPENAI_API_KEY" = fixture-inherited-key
+        "#,
+            ],
+        )
+        .await
+        .unwrap();
+        return;
+    }
+    repository_environment::ForeignRepository::new()
+        .assert_test_isolated("hook_environment_cannot_redirect_rooted_commands")
+        .await;
+}
+
+#[tokio::test]
+async fn hook_environment_preserves_versioning_and_private_recovery_index() {
+    let foreign = repository_environment::ForeignRepository::new();
+    for test in [
+        "actual_cog_conventional_history_and_noop_are_read_only",
+        "lost_bump_response_reuses_exact_tree_and_parent_even_after_main_advances",
+    ] {
+        foreign.assert_test_isolated(test).await;
+    }
+}
+
 #[tokio::test]
 async fn actual_cog_conventional_history_and_noop_are_read_only() {
     let repo = Repo::new().await;

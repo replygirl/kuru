@@ -1,8 +1,7 @@
 //! Generate bounded release notes with the pinned external Communiqué tool.
-use crate::release::{Version, checked_sha, git, workspace_version};
+use crate::release::{Version, checked_sha, git, rooted_command, workspace_version};
 use anyhow::{Context, Result, ensure};
 use std::{fs, io::Write, path::Path, time::Duration};
-use tokio::process::Command;
 
 const MAX_CONTEXT_BYTES: usize = 100_000;
 const PRODUCT_DOCS: [&str; 6] = [
@@ -158,7 +157,7 @@ pub async fn generate(
     let config_path = temp.path().join("communique.toml");
     let notes_path = temp.path().join("notes.md");
     fs::write(&config_path, config)?;
-    let mut command = Command::new("communique");
+    let mut command = rooted_command(root, "communique");
     command
         .args(["--config"])
         .arg(config_path)
@@ -166,11 +165,7 @@ pub async fn generate(
     if let Some(previous) = previous {
         command.arg(previous);
     }
-    command
-        .arg("--output")
-        .arg(&notes_path)
-        .current_dir(root)
-        .kill_on_drop(true);
+    command.arg("--output").arg(&notes_path).kill_on_drop(true);
     if let Some(endpoint) = &provider.endpoint {
         command.args(["--base-url", endpoint]);
     }
@@ -196,27 +191,6 @@ pub async fn generate(
     );
     let text = fs::read_to_string(notes_path)?;
     ensure!(!text.trim().is_empty(), "Communiqué produced empty notes");
-    ensure!(
-        text.split_whitespace().count() <= 450,
-        "release notes must contain at most 450 words"
-    );
-    let bullets = text
-        .lines()
-        .filter(|line| {
-            let marker = line.split_whitespace().next().unwrap_or_default();
-            matches!(marker, "-" | "*" | "+")
-                || marker
-                    .strip_suffix('.')
-                    .or_else(|| marker.strip_suffix(')'))
-                    .is_some_and(|number| {
-                        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-        })
-        .count();
-    ensure!(
-        bullets <= 10,
-        "release notes must contain at most 10 bullets"
-    );
     let mut staged =
         tempfile::NamedTempFile::new_in(output.parent().unwrap_or_else(|| Path::new(".")))?;
     staged.write_all(text.as_bytes())?;

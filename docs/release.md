@@ -156,10 +156,12 @@ outputs may remain. The first release also includes the root commit inventory.
 This matters because Communiqué's automatic first-release log uses `ROOT..HEAD`,
 which omits the root commit itself. Notes are generated against the selected
 commit before the remote tag is created; the context supplies the target version.
-The native wrapper rejects output over 450 words or ten bullets before creating
-an artifact. Real-tool fixtures exercise compatible API requests and tool-result
-replay, failure cleanup and output limits. These checks establish protocol and
-format behavior; generated prose remains fallible. Inspect actual notes against
+The native wrapper preserves complete generated Markdown in the notes artifact
+after checking that it is a nonempty regular UTF-8 file of at most 100 KB.
+Word and bullet targets guide the writing; exceeding them does not discard the
+draft or fail publication. Real-tool fixtures exercise compatible API requests,
+tool-result replay, failure cleanup and complete output preservation. These
+checks establish the delivery contract; generated prose remains fallible. Inspect actual notes against
 the selected source, including defaults, provider identities and configuration
 persistence. A successful notes job is not evidence that every claim is accurate.
 
