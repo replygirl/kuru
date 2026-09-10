@@ -48,7 +48,17 @@ impl Fixture {
             } else {
                 "shasum"
             };
-        symlink(system_tool(hash_tool), tools.join(hash_tool)).unwrap();
+        // macOS's Perl launcher locates shasum's versioned siblings from its
+        // invocation path. A relocated symlink breaks that lookup on macOS 14.
+        // The fixed system-tool paths contain no shell metacharacters.
+        executable(
+            &tools.join(hash_tool),
+            format!(
+                "#!/bin/bash\nexec '{}' \"$@\"\n",
+                system_tool(hash_tool).display()
+            )
+            .as_bytes(),
+        );
         executable(
             &tools.join("uname"),
             b"#!/bin/bash\ncase $1 in -s) printf '%s\\n' \"$FIXTURE_OS\";; -m) printf '%s\\n' \"$FIXTURE_ARCH\";; *) exit 90;; esac\n",
