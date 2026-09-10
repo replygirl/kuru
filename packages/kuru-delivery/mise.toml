@@ -12,6 +12,7 @@ run = "cargo llvm-cov --workspace --all-targets --all-features --locked --fail-u
 
 [tasks."coverage:workspace".env]
 RUST_TEST_THREADS = "2"
+KURU_TEST_SUPERVISOR_PREPARED = false
 
 [tasks."build"]
 run = "cargo build -p kuru-delivery --all-features --locked"

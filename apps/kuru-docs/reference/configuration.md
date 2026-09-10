@@ -7,7 +7,7 @@ Kuru uses typed TOML. Run `kuru config` to inspect the effective configuration; 
 Later layers take precedence:
 
 1. Built-in defaults.
-2. User defaults at `$XDG_CONFIG_HOME/kuru/config.toml`, or `~/.config/kuru/config.toml`.
+2. User defaults at `$XDG_CONFIG_HOME/kuru/config.toml` when set; otherwise `~/.config/kuru/config.toml` on macOS/Linux or `$env:APPDATA\kuru\config.toml` on Windows.
 3. Ancestor `.kuru/config.toml` files, from outermost to nearest directory.
 4. Remembered interactive choices for the project.
 5. An explicit `--config PATH` file.
@@ -105,17 +105,21 @@ The example endpoints are placeholders. Choose trusted services and keep secrets
 
 ## Storage and environment
 
-| Variable or option            | Purpose                                               |
-| ----------------------------- | ----------------------------------------------------- |
-| `XDG_CONFIG_HOME`             | User configuration base directory                     |
-| `XDG_DATA_HOME`               | User data base directory                              |
-| `KURU_DATA_DIR`, `--data-dir` | Separate Kuru storage directory                       |
-| `KURU_REDUCED_MOTION=1`       | Static TUI ornament; operation indicators remain live |
-| `KURU_A2A_TOKEN`              | Default bearer-token variable for `serve`             |
-| `KURU_INSTALL_DIR`            | Destination for source installation                   |
-| `KURU_RELEASE_BASE`           | Version directory for the release installer           |
+| Variable or option            | Purpose                                                              |
+| ----------------------------- | -------------------------------------------------------------------- |
+| `XDG_CONFIG_HOME`             | User configuration base directory                                    |
+| `XDG_DATA_HOME`               | User data base directory                                             |
+| `APPDATA`, `LOCALAPPDATA`     | Windows configuration and data defaults when XDG overrides are unset |
+| `USERPROFILE`                 | Windows fallback for `AppData\Roaming` and `AppData\Local`           |
+| `KURU_DATA_DIR`, `--data-dir` | Separate Kuru storage directory                                      |
+| `KURU_REDUCED_MOTION=1`       | Static TUI ornament; operation indicators remain live                |
+| `KURU_A2A_TOKEN`              | Default bearer-token variable for `serve`                            |
+| `KURU_INSTALL_DIR`            | Destination for direct or source installation                        |
+| `KURU_RELEASE_BASE`           | Version directory for the release installer                          |
 
-The default data directory is `~/.local/share/kuru` when no XDG data directory is set. Each project has a Dolt database under `memory/<project-hash>/`. Keep state outside tool roots. [Memory](../concepts/memory) describes project scope and access boundaries.
+When no XDG data directory is set, the default is `~/.local/share/kuru` on macOS/Linux or `$env:LOCALAPPDATA\kuru` on Windows. If Windows application-data variables are unset, `USERPROFILE` supplies `AppData\Roaming` for configuration and `AppData\Local` for data. Each project has a Dolt database under `memory/<project-hash>/`. Keep state outside tool roots. [Memory](../concepts/memory) describes project scope and access boundaries.
+
+Windows memory and engine caches require local volumes with persistent ACLs. UNC shares and device paths are not supported state locations.
 
 ```toml
 [memory]

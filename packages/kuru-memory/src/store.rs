@@ -945,6 +945,9 @@ pub(crate) fn test_cache() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("kuru-dolt-test-cache"))
 }
 pub(crate) fn test_supervisor() -> Result<PathBuf> {
+    if let Some(snapshot) = crate::test_support::prepared_supervisor()? {
+        return Ok(snapshot);
+    }
     let executable = std::env::current_exe()?;
     let parent = executable
         .parent()

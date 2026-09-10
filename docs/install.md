@@ -30,6 +30,8 @@ a newly published release. See [available releases](https://github.com/replygirl
 
 ## Install with the shell bootstrap
 
+On macOS or Linux:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.sh | bash
 ```
@@ -64,7 +66,7 @@ and handled interruptions preserve the previous executable and remove staging fi
 
 ## Install with PowerShell
 
-In Windows PowerShell 5.1 or newer:
+In stock Windows PowerShell 5.1:
 
 ```powershell
 irm https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.ps1 | iex
@@ -80,10 +82,12 @@ To choose an exact version or use a local release directory:
 
 ```powershell
 irm https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.ps1 -OutFile "$env:TEMP\kuru-install.ps1"
-& "$env:TEMP\kuru-install.ps1" -Version 0.1.0 -ReleaseBase C:\Downloads\kuru-release -InstallDir "$env:LOCALAPPDATA\Programs\kuru\bin"
+& "$env:TEMP\kuru-install.ps1" -Version VERSION -ReleaseBase C:\Downloads\kuru-release -InstallDir "$env:LOCALAPPDATA\Programs\kuru\bin"
 ```
 
-`-InstallDir` and `-ReleaseBase` override `KURU_INSTALL_DIR` and
+Replace `VERSION` with the release stored in that directory. Choose an ordinary
+directory on a local drive for installation. `-InstallDir`
+and `-ReleaseBase` override `KURU_INSTALL_DIR` and
 `KURU_RELEASE_BASE`. A custom release directory requires `-Version`. The script
 freezes latest to an explicit version, verifies the ZIP checksum and its exact
 three regular members, and installs only `kuru.exe`. It never runs the downloaded
@@ -102,8 +106,9 @@ unexpected installation objects are refused.
 
 Linux archives are built on Ubuntu 24.04 and require a compatible glibc. The
 supported Linux targets use GNU libc, including source builds with the bundled
-engine. The bootstrap detects the host; `--target` explicitly selects one of
-the supported archive targets.
+engine. The shell bootstrap detects its macOS/Linux host; `--target` selects
+another supported tar target. PowerShell uses the Windows x86-64 ZIP and accepts
+`-Target x86_64-pc-windows-msvc` explicitly.
 
 ## Release archives
 
@@ -193,15 +198,15 @@ mise upgrade github:replygirl/kuru
 For an exact pin, select the new version with `mise use -g
 github:replygirl/kuru@VERSION`. Use mise to update its managed binaries.
 
-For a shell installation, rerun the bootstrap to install latest, or choose an
+For a direct installation, rerun the corresponding bootstrap to install latest, or choose an
 explicit release through Kuru's native updater:
 
 ```sh
-kuru update --version 0.1.0 \
-  --release-base https://github.com/replygirl/kuru/releases/download/v0.1.0
+kuru update --version VERSION --release-base https://github.com/replygirl/kuru/releases/download/vVERSION
 ```
 
-Replace `0.1.0` in both places with the desired release. The updater requires an
+Replace `VERSION` in both places with the desired release. This command also
+works in PowerShell. The updater requires an
 explicit version and release directory, which can also be a local directory.
 It validates the archive in Rust and defaults to replacing the running executable.
 It requires no compiler or interpreter. Kuru does not install background updates.

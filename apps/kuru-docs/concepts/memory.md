@@ -43,7 +43,7 @@ Kuru stores durable state in a separate Dolt database for each project:
 $XDG_DATA_HOME/kuru/memory/<canonical-project-hash>/
 ```
 
-If `XDG_DATA_HOME` is unset, the data directory is `~/.local/share/kuru`. `--data-dir` or `KURU_DATA_DIR` chooses a separate directory. Keep it outside the tool workspace and restrict access as you would any chat history.
+If `XDG_DATA_HOME` is unset, the data directory is `~/.local/share/kuru` on macOS/Linux or `$env:LOCALAPPDATA\kuru` on Windows, with `$env:USERPROFILE\AppData\Local\kuru` as its Windows fallback. `--data-dir` or `KURU_DATA_DIR` chooses a separate directory. Keep it outside the tool workspace and restrict access as you would any chat history.
 
 Kuru includes its verified native Dolt engine and license notices in the executable. First memory use extracts them locally, including when offline; later runs verify and reuse the cache at `tools/dolt` inside the data directory. No separate engine installation or runtime download is needed. `memory.cache_dir` selects another extraction directory. Corrupt existing caches fail explicitly and remain preserved.
 

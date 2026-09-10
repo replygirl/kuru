@@ -187,6 +187,17 @@ mod windows {
                 .push((name.as_ref().to_owned(), value.as_ref().to_owned()));
             self
         }
+        pub fn envs<I, K, V>(&mut self, values: I) -> &mut Self
+        where
+            I: IntoIterator<Item = (K, V)>,
+            K: AsRef<OsStr>,
+            V: AsRef<OsStr>,
+        {
+            for (name, value) in values {
+                self.env(name, value);
+            }
+            self
+        }
         pub fn env_remove(&mut self, name: impl AsRef<OsStr>) -> &mut Self {
             self.environment
                 .retain(|(key, _)| !environment_key_eq(key, name.as_ref()));

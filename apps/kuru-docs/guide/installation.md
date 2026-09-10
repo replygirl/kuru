@@ -1,6 +1,6 @@
 # Installation & updates
 
-Kuru ships native executables for macOS and Linux, with the verified full-Dolt engine and its licenses included. Install with mise or the shell bootstrap, then run `kuru`.
+Kuru ships native executables for macOS, Linux and Windows, with the verified full-Dolt engine and its licenses included. Install with mise or your platform's bootstrap, then run `kuru`.
 
 ## Install with mise
 
@@ -20,6 +20,8 @@ mise use -g github:replygirl/kuru@0.1.0
 Mise applies a release-age cooldown when resolving latest; a full `major.minor.patch` pin also lets you select a newly published release. `mise install github:replygirl/kuru@0.1.0` downloads the version without selecting it. Use `mise exec github:replygirl/kuru@0.1.0 -- kuru` to run that version explicitly.
 
 ## Install with the shell bootstrap
+
+On macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.sh | bash
@@ -46,20 +48,44 @@ kuru --provider demo
 
 Continue with [your first conversation](./first-conversation) or [authentication](./authentication) for live inference.
 
+## Install with PowerShell
+
+In stock Windows PowerShell 5.1:
+
+```powershell
+irm https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.ps1 | iex
+$env:PATH = "$env:LOCALAPPDATA\Programs\kuru\bin;$env:PATH"
+kuru --version
+```
+
+The default destination is `$env:LOCALAPPDATA\Programs\kuru\bin`. Add it to your user `PATH` for future terminals. Installation uses stock PowerShell/.NET facilities and needs no separately installed compiler, Dolt server or MSVC redistributable.
+
+To select a release and destination, download the script first:
+
+```powershell
+irm https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.ps1 -OutFile "$env:TEMP\kuru-install.ps1"
+& "$env:TEMP\kuru-install.ps1" -Version VERSION -InstallDir C:\Tools\kuru\bin
+```
+
+Replace `VERSION` with a version from [releases](https://github.com/replygirl/kuru/releases). `-InstallDir` overrides `KURU_INSTALL_DIR`; use an ordinary directory on a local drive. `-ReleaseBase` overrides `KURU_RELEASE_BASE` and accepts an HTTPS version directory or a local directory containing the Windows ZIP and `SHA256SUMS`. A custom base requires `-Version`.
+
+The bootstrap freezes latest to an explicit version, verifies the ZIP checksum and its exact three regular members, then publishes `kuru.exe` from private staging. It refuses reparse points, extra hardlinks and ambiguous names. It does not execute the downloaded candidate for validation. A private `.kuru-update` directory beside the executable coordinates installation and recovery.
+
 ## Supported platforms
 
-| System | Architecture  | Target                      |
-| ------ | ------------- | --------------------------- |
-| macOS  | Apple Silicon | `aarch64-apple-darwin`      |
-| macOS  | Intel         | `x86_64-apple-darwin`       |
-| Linux  | ARM64         | `aarch64-unknown-linux-gnu` |
-| Linux  | x86-64        | `x86_64-unknown-linux-gnu`  |
+| System                           | Architecture  | Target                      |
+| -------------------------------- | ------------- | --------------------------- |
+| macOS                            | Apple Silicon | `aarch64-apple-darwin`      |
+| macOS                            | Intel         | `x86_64-apple-darwin`       |
+| Linux                            | ARM64         | `aarch64-unknown-linux-gnu` |
+| Linux                            | x86-64        | `x86_64-unknown-linux-gnu`  |
+| Windows 10 version 1809 or newer | x86-64        | `x86_64-pc-windows-msvc`    |
 
-Linux archives are built on Ubuntu 24.04 and need a compatible glibc. Linux support uses GNU targets; musl targets are not supported. `--target` overrides the bootstrap's host detection with one of these targets.
+Linux archives are built on Ubuntu 24.04 and need a compatible glibc. Linux support uses GNU targets; musl targets are not supported. The shell bootstrap's `--target` overrides host detection for supported tar targets. PowerShell selects Windows x86-64 and accepts `-Target x86_64-pc-windows-msvc` explicitly.
 
 ## Release archives and mirrors
 
-Each [release](https://github.com/replygirl/kuru/releases) contains `SHA256SUMS` and a `kuru-VERSION-TARGET.tar.gz` archive for each platform. To use a mirror, pass its HTTPS version directory and an explicit version:
+Each [release](https://github.com/replygirl/kuru/releases) contains `SHA256SUMS`, four `kuru-VERSION-TARGET.tar.gz` archives for macOS/Linux and `kuru-VERSION-x86_64-pc-windows-msvc.zip` for Windows. Archives contain the executable, `LICENSE` and `README.md`. To use a mirror, pass its HTTPS version directory and an explicit version:
 
 ```sh
 bash /tmp/kuru-install.sh --version 0.1.0 \
@@ -84,13 +110,21 @@ cd kuru
 bash scripts/install.sh --source
 ```
 
-The source installer prepares the pinned Rust toolchain and verified engine archive through package-owned mise tasks, then installs the complete executable into `~/.local/bin`. Add that directory to your `PATH` if needed.
+On Windows, install Visual Studio C++ Build Tools and the Windows SDK, then run this from the checkout:
+
+```powershell
+& .\scripts\install.ps1 -Source
+```
+
+The source installer prepares the pinned Rust toolchain and verified engine archive through package-owned mise tasks. It installs the complete executable into `~/.local/bin` on macOS/Linux or `$env:LOCALAPPDATA\Programs\kuru\bin` on Windows. Add that directory to your `PATH` if needed.
 
 To choose another destination:
 
 ```sh
 KURU_INSTALL_DIR="$HOME/.local/bin" bash scripts/install.sh --source
 ```
+
+On Windows, use `& .\scripts\install.ps1 -Source -InstallDir C:\Tools\kuru\bin`. Release-selection options do not apply to source builds. The Windows task builds the explicit MSVC target with a static C runtime.
 
 The source installer builds the locked release profile for the current host and replaces the executable atomically. It refuses a symlink or directory at the destination and uses the current checkout revision. From a configured maintainer checkout, `mise run install` performs the same source installation. Source installation prepares only its required tooling; it does not require the full maintainer setup.
 
@@ -118,14 +152,15 @@ mise upgrade github:replygirl/kuru
 
 For an exact pin, select the new version with `mise use -g github:replygirl/kuru@VERSION`. Update mise-managed binaries through mise.
 
-For a shell installation, rerun the bootstrap to install latest, or select an explicit release with Kuru's native updater:
+For a direct installation, rerun your platform's bootstrap to install latest, or select an explicit release with Kuru's native updater:
 
 ```sh
-kuru update --version 0.1.0 \
-  --release-base https://github.com/replygirl/kuru/releases/download/v0.1.0
+kuru update --version VERSION --release-base https://github.com/replygirl/kuru/releases/download/vVERSION
 ```
 
-Replace `0.1.0` in both places with the desired version. A local release directory also works. The updater validates the archive in Rust and defaults to replacing the running executable. No compiler or interpreter is required. Updates are explicit; Kuru does not install background updates.
+Replace `VERSION` in both places with the desired version. This command also works in PowerShell; a local release directory also works. The updater validates the archive in Rust and replaces the running executable. No compiler or interpreter is required. Updates are explicit; Kuru does not install background updates.
+
+On Windows, a verified copy of the current running executable performs publication and records its result before success is reported. It waits for the original process to exit before deleting the displaced image. The trusted helper stays in a private cache for recovery. Close other old Kuru instances if cleanup remains pending, then rerun the normal PowerShell installer. It reconciles the receipt even if an interrupted update left `kuru.exe` absent, and refuses an unknown occupant at that path. `-Recover` performs recovery alone.
 
 For a source installation, select the desired revision and install again, or run:
 

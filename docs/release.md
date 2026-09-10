@@ -41,7 +41,7 @@ Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
 7.0.0 and Communiqué 1.3.5 pins. The latter has no Intel macOS release binary;
 native archive build jobs use only the Rust packaging task, so all five Kuru
 targets remain buildable. Full maintainer tests and notes generation run on
-Linux or Apple Silicon macOS. App installation does not require these tools.
+Linux, Apple Silicon macOS or Windows x86_64. App installation does not require these tools.
 
 ## Choose and release a version
 
@@ -118,12 +118,14 @@ The four Unix archives retain `kuru-VERSION-TARGET.tar.gz`; Windows uses
 `kuru-VERSION-x86_64-pc-windows-msvc.zip` with exactly `kuru.exe`, `LICENSE` and
 `README.md`. All five are published alongside `SHA256SUMS`. Users install through
 mise or the package-owned
-[shell bootstrap](install.md#install-with-the-shell-bootstrap), which resolves
-latest to an explicit version and verifies its checksum before replacement.
+[shell](install.md#install-with-the-shell-bootstrap) and
+[PowerShell](install.md#install-with-powershell) bootstraps, which resolve
+latest to an explicit version and verify its checksum before replacement.
 [Release directories](install.md#release-archives) also support HTTPS mirrors and
-offline installation. The bootstrap checks logical tar members and bounds both
+offline installation. The shell bootstrap checks logical tar members and bounds
 decompression and fixed-member extraction; the native Rust updater retains its
-raw-header validation. Neither path runs the candidate to validate it.
+raw-header validation. Windows ZIP paths require exactly three regular members.
+No installer runs the candidate to validate it.
 
 Release jobs inherit `MISE_LOCKED=1`, including nested package tasks. This keeps
 tool installation from extending lockfiles after source validation. The bump
@@ -138,12 +140,11 @@ the commit guard permits only Cargo.toml and Cargo.lock changes. An unexpected
 file is reported by name and must be fixed in source rather than reset or included
 in the version commit.
 
-## Pending Windows mise release check
+## Verify published Windows installation
 
-**Pending — requires the first authorized release containing a Windows artifact.**
-This operational check has not run. The pre-merge gate uses the real mise GitHub
+The pre-merge gate uses the real mise GitHub
 backend with simulated release metadata and actual candidate package bytes;
-that fixture does not establish published GitHub installation.
+verify published GitHub installation separately using this procedure.
 
 After an authorized Release run publishes
 `kuru-VERSION-x86_64-pc-windows-msvc.zip`, perform this check on native Windows:
@@ -208,10 +209,10 @@ After an authorized Release run publishes
 
 Record the runner/OS, mise version, release/run URLs, version/commit, archive and
 installed executable digests, configuration isolation, command exit statuses,
-session/revision results and logs before changing this status to verified.
+session/revision results and logs in the change's verification record.
 Offline configuration and absent external tools prove the bundled-runtime path;
-record any separately enforced network restriction accurately. A failure stays
-pending with its diagnostics and is not repaired by replacing published assets.
+record any separately enforced network restriction accurately. Preserve failure
+diagnostics without replacing published assets to repair the check.
 Observe owned process shutdown before deleting the temporary root. This procedure
 performs read-only release retrieval and isolated local installation; it does not
 publish a release or documentation and adds no workflow entrypoint.

@@ -20,3 +20,6 @@ mod preferences_tests;
 
 #[cfg(test)]
 mod dolt_tests;
+
+#[cfg(all(test, windows))]
+mod windows_tool_tests;

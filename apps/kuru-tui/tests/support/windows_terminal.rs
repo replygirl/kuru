@@ -261,6 +261,7 @@ impl Terminal {
                     report["before"] == report["after"],
                     "native console modes differ: {report}"
                 );
+                self.close_output(READY)?;
                 return Ok(report);
             }
             ensure!(
@@ -269,6 +270,39 @@ impl Terminal {
                 self.screen()
             );
         }
+    }
+
+    fn close_output(&mut self, timeout: Duration) -> Result<()> {
+        let writer = self.writer.take();
+        let master = self.master.take();
+        let reader = self
+            .reader
+            .take()
+            .context("console reader already closed")?;
+        // ClosePseudoConsole can wait for output consumption. Keep the reader
+        // live while closing, and bound the observer's wait for both owners.
+        let closing = std::thread::spawn(move || {
+            drop(writer);
+            drop(master);
+        });
+        let deadline = Instant::now() + timeout;
+        while !reader.is_finished() || !closing.is_finished() {
+            self.read_for(TICK)?;
+            ensure!(
+                Instant::now() < deadline,
+                "ConPTY cleanup timed out: reader_done={}, close_done={}\n{}",
+                reader.is_finished(),
+                closing.is_finished(),
+                self.screen()
+            );
+        }
+        closing
+            .join()
+            .map_err(|_| anyhow::anyhow!("ConPTY close thread panicked"))?;
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("ConPTY reader thread panicked"))?;
+        Ok(())
     }
 }
 

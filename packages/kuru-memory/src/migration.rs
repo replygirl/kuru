@@ -276,6 +276,9 @@ mod tests {
     use crate::{MemoryStore, test_support};
     use serde_json::json;
 
+    fn fixture() -> test_support::TempDir {
+        test_support::TempDir::new("kuru-legacy memory café 東京-", None).unwrap()
+    }
     fn legacy(path: &Path) -> Connection {
         let database = Connection::open(path).unwrap();
         database.execute_batch("PRAGMA journal_mode=WAL; PRAGMA application_id=1263882837; PRAGMA user_version=1; CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL); CREATE TABLE state (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);").unwrap();
@@ -288,8 +291,8 @@ mod tests {
 
     #[test]
     fn committed_wal_without_shm_rebuilds_coordination_and_preserves_database_bytes() {
-        let origin = test_support::tempdir().unwrap();
-        let restored = test_support::tempdir().unwrap();
+        let origin = fixture();
+        let restored = fixture();
         let scope = format!("project/{}", "7".repeat(64));
         let source = legacy(&origin.path().join("memory.sqlite3"));
         source.execute("INSERT INTO messages (namespace,role,content) VALUES (?1,'user','accepted in WAL')",
@@ -327,7 +330,7 @@ mod tests {
 
     #[test]
     fn held_sqlite_sidecar_identity_rejects_replacement_and_unsafe_new_sidecars() {
-        let root = test_support::tempdir().unwrap();
+        let root = fixture();
         files::write(
             &root.path().join("memory.sqlite3"),
             b"identity fixture, never opened as SQLite",
@@ -335,18 +338,48 @@ mod tests {
         .unwrap();
         files::write(&root.path().join("memory.sqlite3-wal"), b"original WAL").unwrap();
         let pins = SourcePins::new(root.path()).unwrap();
-        fs::rename(
-            root.path().join("memory.sqlite3-wal"),
-            root.path().join("retained-wal"),
-        )
-        .unwrap();
-        files::write(&root.path().join("memory.sqlite3-wal"), b"replacement WAL").unwrap();
-        assert!(pins.verify().is_err());
+        #[cfg(unix)]
+        {
+            fs::rename(
+                root.path().join("memory.sqlite3-wal"),
+                root.path().join("retained-wal"),
+            )
+            .unwrap();
+            files::write(&root.path().join("memory.sqlite3-wal"), b"replacement WAL").unwrap();
+            assert!(pins.verify().is_err());
+        }
+        #[cfg(windows)]
+        {
+            // Windows pins deny delete sharing. Replacing either the database
+            // or WAL is rejected while these exact source handles remain open.
+            for (name, bytes) in [
+                (
+                    "memory.sqlite3",
+                    b"identity fixture, never opened as SQLite".as_slice(),
+                ),
+                ("memory.sqlite3-wal", b"original WAL".as_slice()),
+            ] {
+                let moved = root.path().join(format!("retained-{name}"));
+                assert!(fs::rename(root.path().join(name), &moved).is_err());
+                assert!(!moved.exists());
+                assert_eq!(fs::read(root.path().join(name)).unwrap(), bytes);
+                pins.verify().unwrap();
+            }
+        }
+        drop(pins);
+        #[cfg(windows)]
+        {
+            fs::rename(
+                root.path().join("memory.sqlite3-wal"),
+                root.path().join("retained-wal"),
+            )
+            .unwrap();
+            files::write(&root.path().join("memory.sqlite3-wal"), b"replacement WAL").unwrap();
+        }
         assert_eq!(
             fs::read(root.path().join("retained-wal")).unwrap(),
             b"original WAL"
         );
-        drop(pins);
         let pins = SourcePins::new(root.path()).unwrap();
         fs::create_dir(root.path().join("memory.sqlite3-shm")).unwrap();
         assert!(pins.verify().is_err());
@@ -358,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn wal_import_preserves_original_other_projects_order_and_opaque_json() {
-        let directory = test_support::tempdir().unwrap();
+        let directory = fixture();
         let scope = format!("project/{}", "b".repeat(64));
         let other_scope = format!("project/{}", "c".repeat(64));
         let path = directory.path().join("memory.sqlite3");
@@ -459,7 +492,7 @@ mod tests {
 
     #[test]
     fn corrupt_identity_schema_json_and_links_never_become_empty_memory() {
-        let directory = test_support::tempdir().unwrap();
+        let directory = fixture();
         let scope = format!("project/{}", "d".repeat(64));
         assert!(prepare(directory.path(), &scope).unwrap().is_none());
         let path = directory.path().join("memory.sqlite3");
@@ -511,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_project_imports_empty_scope_without_losing_other_projects() {
-        let directory = test_support::tempdir().unwrap();
+        let directory = fixture();
         let scope = format!("project/{}", "e".repeat(64));
         let source = legacy(&directory.path().join("memory.sqlite3"));
         source.execute("INSERT INTO messages (namespace,role,content) VALUES ('project/other/transcript','user','preserved')", []).unwrap();

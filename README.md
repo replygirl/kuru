@@ -27,7 +27,7 @@ This installs and activates the native executable. To select an exact release,
 use `mise use -g github:replygirl/kuru@0.1.0`. Exact versions also bypass mise's
 release-age cooldown for newly published releases.
 
-### Shell
+### macOS and Linux
 
 Install the latest native release into `~/.local/bin`:
 
@@ -38,7 +38,21 @@ kuru --version
 ```
 
 The installer selects your platform, verifies the archive checksum, and replaces
-the executable atomically. macOS and Linux on arm64 and x86-64 are supported;
+the executable atomically.
+
+### Windows
+
+In Windows PowerShell 5.1:
+
+```powershell
+irm https://raw.githubusercontent.com/replygirl/kuru/main/packages/kuru-delivery/support/install.ps1 | iex
+$env:PATH = "$env:LOCALAPPDATA\Programs\kuru\bin;$env:PATH"
+kuru --version
+```
+
+Add that installation directory to your user `PATH` for future terminals. Binary
+installation needs no separately installed compiler or MSVC redistributable.
+The native targets are macOS/Linux arm64 and x86-64, and Windows x86-64;
 see [installation and updates](docs/install.md) for platform requirements,
 version selection, destinations and offline installation.
 
@@ -58,11 +72,19 @@ cd kuru
 bash scripts/install.sh --source
 ```
 
-The executable installs into `~/.local/bin`. To choose another destination:
+On Windows, install the Visual Studio C++ Build Tools and Windows SDK, then run
+`& .\scripts\install.ps1 -Source` from the checkout. The source installers prepare
+their build inputs through package-owned mise tasks.
+
+The executable installs into `~/.local/bin` on macOS/Linux or
+`$env:LOCALAPPDATA\Programs\kuru\bin` on Windows. To choose another destination
+on macOS/Linux:
 
 ```sh
 KURU_INSTALL_DIR="$HOME/.local/bin" bash scripts/install.sh --source
 ```
+
+On Windows, pass `-InstallDir C:\Tools\kuru\bin` to the source entrypoint.
 
 For the repository's pinned maintainer toolchain and mise tasks, see
 [development](docs/development.md).
@@ -123,6 +145,8 @@ and [development](docs/development.md) for boundaries and extension points.
 | `apps/kuru-docs` | VitePress docs and its local Node/npm dependencies |
 | `packages/kuru-core` | Frameworks, configuration and shared contracts |
 | `packages/kuru-memory` | Managed Dolt and private versioned memory |
+| `packages/kuru-platform` | Checked filesystems and Windows process/IPC primitives |
+| `packages/kuru-archive` | Bounded archive codecs shared by delivery and memory |
 | `packages/kuru-connectors` | Providers, tools, MCP and outbound A2A |
 | `packages/kuru-runtime` | Actor pool, peer routing, relationships and dreaming |
 | `packages/kuru-delivery` | Native installation, release and repository tooling |

@@ -172,8 +172,21 @@ impl Sandbox {
 async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> Result<()> {
     let _serial = SERIAL.lock().await;
     let sandbox = Sandbox::new()?;
-    let mut terminal =
-        sandbox.start("first", "app", &["--mode", "freudian"], false, "demo", &[])?;
+    let mut terminal = sandbox.start(
+        "first",
+        "app",
+        &[
+            "--mode",
+            "freudian",
+            "--model",
+            "persistent-demo",
+            "--effort",
+            "high",
+        ],
+        false,
+        "demo",
+        &[],
+    )?;
     terminal.text(&["KURU", "enter send"], sandbox.startup)?;
     let animated = terminal.output.len();
     terminal.read_for(Duration::from_millis(700))?;
@@ -191,25 +204,53 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
         "native focus loss continued drawing after its completed composer frame"
     );
     terminal.focus(true)?;
-    terminal.send(&[127; 11])?;
+    terminal.send(b"!")?;
+    terminal.composer("focus draft!")?;
+    let resumed_frame = terminal.output.len();
+    terminal.read_for(Duration::from_millis(700))?;
+    ensure!(
+        terminal.output.len() > resumed_frame,
+        "native focus return did not resume animation after a completed frame"
+    );
+    terminal.send(&[127; 12])?;
     terminal.text(&["What shall we explore"], READY)?;
     terminal.command("hello from native Windows")?;
     terminal.text(&["demo"], READY)?;
-    for (keys, label) in [
-        (b"\x1bOQ".as_slice(), "Models"),
-        (b"\x1bOR".as_slice(), "Efforts"),
-        (b"\x1bOS".as_slice(), "Modes"),
+    // Start from different persisted values, then select through real picker
+    // keys. Demo offers one model and its default effort; no catalog is faked.
+    terminal.send(b"\x1bOQ")?;
+    terminal.text(&["Models", "demo", "Esc back"], READY)?;
+    terminal.send(b"\r")?;
+    terminal.text(
+        &["Model: demo", "saved for this project", "enter send"],
+        READY,
+    )?;
+    terminal.command("/effort high")?;
+    for (keys, label, selection, receipt) in [
+        (
+            b"\x1bOR".as_slice(),
+            "Efforts",
+            b"\r".as_slice(),
+            "Effort: default",
+        ),
+        (
+            b"\x1bOS".as_slice(),
+            "Modes",
+            b"\x1b[B\r".as_slice(),
+            "Mode: jungian",
+        ),
     ] {
         terminal.send(keys)?;
         terminal.text(&[label, "Esc back"], READY)?;
-        terminal.send(b"\x1b")?;
-        terminal.wait("picker dismissed", READY, |terminal| {
-            !terminal.screen().contains("Esc back")
+        terminal.send(selection)?;
+        terminal.wait("picker selection persisted", READY, |terminal| {
+            let screen = terminal.screen();
+            !screen.contains("Esc back")
+                && screen.contains(receipt)
+                && screen.contains("saved for this project")
+                && screen.contains("enter send")
         })?;
     }
-    terminal.command("/mode jungian")?;
-    terminal.command("/model persistent-demo")?;
-    terminal.command("/effort high")?;
     terminal.resize(24, 80)?;
     terminal.send(b"navigation draft")?;
     terminal.composer("navigation draft")?;
@@ -222,7 +263,7 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
     let saved = sandbox.config()?;
     assert_eq!(
         (saved.mode, saved.model.as_str(), saved.effort.as_deref()),
-        (Mode::Jungian, "persistent-demo", Some("high"))
+        (Mode::Jungian, "demo", None)
     );
     let sessions: Vec<kuru_runtime::Session> = serde_json::from_str(&sandbox.output("sessions")?)?;
     ensure!(
@@ -234,7 +275,7 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
 
     let mut reopened = sandbox.start("reopened", "app", &[], true, "demo", &[])?;
     reopened.text(
-        &["persistent-demo", "jungian", "high", "enter send"],
+        &["demo", "jungian", "default", "enter send"],
         sandbox.startup,
     )?;
     reopened.send(b"reduced draft")?;

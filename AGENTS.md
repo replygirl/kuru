@@ -142,6 +142,12 @@ a successful build is not evidence of a successful deployment.
 Instrumented child fixtures must explicitly retain the runner's LLVM_PROFILE_FILE
 destination when clearing their environments, so their coverage is collected and
 profile files do not appear in source or private-state fixture directories.
+Ordinary real-memory test tasks use the memory package's prepared supervisor
+snapshot: concurrent Cargo commands can replace their top-level executable
+aliases while another package's tests are running. Keep this preparation in the
+owning mise task. Combined coverage must use its own instrumented supervisor,
+with the ordinary snapshot opt-in explicitly cleared; never substitute an
+uninstrumented executable to make a coverage run pass.
 
 Use conventional commits. Never bypass hk hooks. Do not commit directly to
 main; use a branch and review. Publishing and release tags are external actions

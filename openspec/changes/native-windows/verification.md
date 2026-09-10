@@ -27,7 +27,7 @@
 
 ## 5. Embedded bundle and ZIP validation [critical]
 
-- [ ] 5.1 @e2e (agent) Run only the actual packaged Windows executable with an empty cache, no external Dolt/compiler on PATH and runtime network unavailable -> version, persistent offline demo, license extraction, revision inspection and reopened conversation all succeed.
+- [ ] 5.1 @e2e (agent) Run only the actual packaged Windows executable with an empty cache, no external Dolt/compiler on PATH and memory configured offline -> version, persistent offline demo, license extraction, revision inspection and reopened conversation all succeed; inspect runtime provisioning for the absence of download paths and distinguish this from an OS egress firewall test.
 - [ ] 5.2 @integration (agent) Prepare the Windows bundle through the memory-owned mise task, then build from local verified inputs without network -> the executable contains the target payload, not the host payload; missing/corrupt input fails the build.
 - [ ] 5.3 @regression (agent) Feed duplicate physical ZIP records, inconsistent local/central metadata, links, encryption, extra members and compressed/expanded/final-output overflow fixtures -> validation rejects before executable probing or publication and preserves an existing cache/install.
 - [ ] 5.4 @integration (agent) Inspect actual shipping Kuru and embedded Dolt PE imports and build with explicit MSVC target/static CRT settings -> only OS DLLs are required and host proc macros/build scripts still compile normally.
@@ -43,7 +43,7 @@
 
 - [ ] 7.1 @e2e (agent) Run real ConPTY chat, selector, navigation, resize and cancellation scenarios -> rendered state and persistent choices match expected behavior without relying solely on a virtual buffer.
 - [ ] 7.2 @regression (agent) Send native focus-loss events and wait for a completed render frame -> no later animation bytes appear while unfocused; focus return resumes appropriate behavior.
-- [ ] 7.3 @integration (agent) Exit the TUI normally and through startup/interaction errors -> native console modes and owned processes are restored/closed; Unix restoration assertions still execute on Unix.
+- [ ] 7.3 @integration (agent) Exit the TUI normally and exercise partial terminal initialization plus an error after entering terminal mode -> native console modes and owned processes are restored/closed through the shared session guard; Unix restoration assertions still execute on Unix.
 
 ## 8. Compiler-free installation and loaded-image update [critical]
 
@@ -102,6 +102,25 @@ seconds on 2026-09-10. Combined workspace coverage measured 13,791/14,193 lines
 documentation validation and ordinary plus instrumented behavioral suites all
 passed. The log is `/tmp/kuru-native-windows-full-check.log`; this local result
 does not establish Windows consumer acceptance.
+
+A repeated pre-push gate exposed a concurrent Cargo fixture race: another
+package could start tests while Cargo replaced the top-level supervisor
+executable. The memory-owned prefetch now publishes a private, immutable
+supervisor snapshot for ordinary test tasks. A regression removes and replaces
+an isolated copy of the actual compiled alias, then starts Dolt and reopens its
+committed data through the retained snapshot. That regression, the corrupted
+snapshot case and strict memory Clippy passed. Combined coverage explicitly
+clears the ordinary snapshot opt-in and uses its instrumented executable.
+
+The corrected full `mise run check` passed in 464.29 seconds, with 13,919/14,353
+covered workspace lines (96.98%). The log is
+`/tmp/kuru-native-windows-followup-check.log`. This includes the Unicode/spaced
+migration fixtures and preserves all existing Unix behavior. Native picker
+selection, focus-resume and reader-cleanup checks, modeled Windows tool replay,
+drive/UNC classification and pinned DB/WAL assertions are authored but await
+Windows execution. Platform Windows-target Clippy passed the added path tests.
+The Windows command facade's missing `envs` method was also corrected before
+native consumer CI; host cfg checks alone could not have detected that omission.
 
 Native Windows consumer compilation and execution remain pending on CI. A local
 cross-target attempt stopped in aws-lc's C compilation because the macOS host

@@ -813,6 +813,34 @@ mod windows {
     use super::*;
 
     #[test]
+    fn state_directories_reject_drive_relative_unc_and_device_roots_before_io() {
+        let (_temporary, directory) = fixture();
+        for path in [
+            r"C:relative-state",
+            r"\root-relative-state",
+            r"\\kuru-invalid-server\share\state",
+            r"\\?\UNC\kuru-invalid-server\share\state",
+            r"\\.\C:\state",
+        ] {
+            let error = Directory::ensure_private(Path::new(path))
+                .expect_err("non-local or ambiguous state root was accepted");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{path}: {error}"
+            );
+        }
+        // Accepted local volume paths still create real private state, including
+        // canonical extended-length paths returned by Windows itself.
+        let state = directory.path().join("native local state 日本語");
+        let created = Directory::ensure_private(&state).unwrap();
+        let canonical = state.canonicalize().unwrap();
+        let reopened =
+            Directory::open(&canonical, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+        assert_eq!(created.identity(), reopened.identity());
+    }
+
+    #[test]
     fn native_device_stream_and_normalized_alias_names_are_rejected() {
         let (_temporary, directory) = fixture();
         for name in [

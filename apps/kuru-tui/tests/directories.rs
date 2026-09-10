@@ -68,6 +68,62 @@ fn explicit_and_xdg_directories_work_without_an_ambient_home() {
 
 #[cfg(windows)]
 #[test]
+fn native_path_selection_preserves_drive_and_unc_roots_and_uses_the_invocation_directory() {
+    use clap::Parser;
+    use kuru::cli::{Cli, paths};
+    use kuru_platform::fs::Directory;
+    use std::ffi::OsStr;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("different workspace");
+    std::fs::create_dir(&project).unwrap();
+    let select = |data: &Path| {
+        let cli = Cli::try_parse_from([
+            OsStr::new("kuru"),
+            OsStr::new("-C"),
+            project.as_os_str(),
+            OsStr::new("--data-dir"),
+            data.as_os_str(),
+            OsStr::new("config"),
+        ])
+        .unwrap();
+        paths(&cli).unwrap().1
+    };
+    let absolute = root.path().join("drive state 日本語");
+    assert_eq!(select(&absolute), absolute);
+    let state = Directory::ensure_private(&select(&absolute)).unwrap();
+    assert_eq!(
+        state.path().canonicalize().unwrap(),
+        absolute.canonicalize().unwrap()
+    );
+
+    let relative = Path::new("relative state");
+    assert_eq!(
+        select(relative),
+        std::env::current_dir().unwrap().join(relative)
+    );
+    assert_ne!(select(relative), project.join(relative));
+
+    for network in [
+        r"\\kuru-invalid-server\share\state",
+        r"\\?\UNC\kuru-invalid-server\share\state",
+    ] {
+        let selected = select(Path::new(network));
+        assert_eq!(
+            selected,
+            Path::new(network),
+            "UNC became local relative state"
+        );
+        assert_eq!(
+            Directory::ensure_private(&selected).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput,
+            "unsupported UNC state must fail before any network filesystem access"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn native_roaming_and_local_defaults_and_explicit_precedence_survive_real_reopen() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("workspace 日本語");

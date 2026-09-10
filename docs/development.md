@@ -41,6 +41,18 @@ install locked Rust with automatic task-tool installation disabled. They set
 does not publish an Intel macOS binary, and these jobs do not create Git commits.
 Local Git hooks, maintainer setup and the full validation jobs retain hk.
 
+On Windows, use the x86-64 MSVC Rust target with Visual Studio C++ Build Tools
+and the Windows SDK. The app-owned release task passes an explicit target and
+links the C runtime statically; host build tools and procedural macros keep
+their normal host configuration. Shipping PE import checks inspect both Kuru
+and its embedded Dolt executable for external runtime DLL requirements.
+
+`kuru-platform` owns checked filesystem operations and Windows process/IPC
+mechanics; `kuru-archive` owns bounded ZIP decoding. Consumers keep their own
+payload policies and use those shared primitives. The PowerShell bootstrap
+lives in delivery support and uses stock .NET facilities for its small native
+bridge before any downloaded application can be trusted.
+
 ## Commands
 
 | Command | What it checks or runs |
@@ -52,7 +64,9 @@ Local Git hooks, maintainer setup and the full validation jobs retain hk.
 | `mise run lint` | All-target Clippy with warnings as errors |
 | `mise run test` | Workspace behavioral and protocol tests |
 | `mise run coverage` | Workspace LLVM line coverage, minimum 90% |
-| `mise run test:install` | Native archive and real Bash bootstrap installation, rejection and interruption tests |
+| `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
+| `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
+| `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
 | `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
 | `mise run docs:dev` | Local VitePress server |
 | `mise run docs:check` | Production docs, local links, anchors and public content boundary |
@@ -127,9 +141,26 @@ Cargo's build script selects by `TARGET`, verifies local bytes again and copies
 those verified bytes into its output. It does not download or execute an engine.
 Direct Cargo builds therefore require prior preparation; missing or corrupt
 inputs fail with the matching mise command. Use
-`bash scripts/install.sh --source` for source installation: it prepares Rust and
-the bundled input through mise, then installs the complete executable. See
+`bash scripts/install.sh --source` on macOS/Linux or
+`& .\scripts\install.ps1 -Source` in Windows PowerShell for source installation.
+These entrypoints prepare Rust and the bundled input through mise, then install
+the complete executable. See
 [installation](install.md#build-from-source) for requirements and destinations.
+
+For an offline Windows build, import the manifest's matching ZIP, then build:
+
+```powershell
+$env:KURU_DOLT_BUNDLE_DIR = 'C:\BuildInputs\kuru'
+mise run //packages/kuru-memory:bundle:prepare -- --target x86_64-pc-windows-msvc --archive C:\Downloads\dolt-windows-amd64.zip --offline
+$env:KURU_DOLT_BUNDLE_OFFLINE = 'true'
+mise run //apps/kuru-tui:build:release -- --target x86_64-pc-windows-msvc
+```
+
+The shipping binary is under `target/x86_64-pc-windows-msvc/release/kuru.exe`
+unless `CARGO_TARGET_DIR` selects another target directory. For its native import
+check, set `KURU_EMBEDDED_TEST_BINARY` to that absolute path and run
+`mise run //apps/kuru-tui:verify:windows-imports`. This maintainer check uses MSVC
+tools; the installed application does not.
 
 ## Change workflow
 
@@ -240,3 +271,11 @@ local fake app-server, HTTP, MCP or A2A peers and exercise actual wire framing.
 Use temporary project roots and memory stores. Never inspect or copy the user's
 Codex credential file to construct test fixtures; supported auth status and
 model discovery commands are the intended read-only probes.
+
+Windows tests use native process Jobs, private pipes and ConPTY. The delivery
+fixtures run stock PowerShell and exercise loaded-image replacement and receipt
+recovery. The app's mise fixture installs genuine packaged Kuru through the
+actual GitHub backend with isolated simulated release metadata, then reopens
+offline memory. This local fixture and the later check of published GitHub
+assets provide separate evidence. A host build that excludes Windows tests
+does not establish their behavior or coverage.

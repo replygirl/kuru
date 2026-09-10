@@ -10,8 +10,11 @@ combined input to 1 MiB.
 
 Use `kuru config` and `kuru --help` to inspect effective options and CLI overrides.
 `kuru config` redacts MCP environment values. User defaults are read from
-`$XDG_CONFIG_HOME/kuru/config.toml` or `~/.config/kuru/config.toml`; `--config`
-selects the final local layer. CLI flags take precedence over file values.
+`$XDG_CONFIG_HOME/kuru/config.toml` when set. Otherwise, Kuru uses
+`~/.config/kuru/config.toml` on macOS/Linux or
+`$env:APPDATA\kuru\config.toml` on Windows. Windows also falls back to
+`$env:USERPROFILE\AppData\Roaming` when `APPDATA` is unset. `--config` selects the
+final local layer. CLI flags take precedence over file values.
 Ancestor `AGENTS.md` files provide project instructions, ordered so local
 instructions have precedence. Kuru does not automatically follow arbitrary
 links in instruction files; repositories can put their applicable instructions
@@ -107,9 +110,13 @@ A2A subset and local ingress controls.
 ## Storage and authority
 
 Session and part histories are local durable data. The default data directory is
-`$XDG_DATA_HOME/kuru` or `~/.local/share/kuru`. Each canonical project has a Dolt
+`$XDG_DATA_HOME/kuru` when set, otherwise `~/.local/share/kuru` on macOS/Linux or
+`$env:LOCALAPPDATA\kuru` on Windows. If `LOCALAPPDATA` is unset, Windows falls
+back to `$env:USERPROFILE\AppData\Local\kuru`. Each canonical project has a Dolt
 database under `memory/<project-hash>/`.
-`--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. An OS
+`--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. On Windows,
+memory and engine caches require local volumes with persistent ACLs; UNC shares
+and device paths are not supported state locations. An OS
 writer lock prevents competing Kuru processes from overwriting the same
 project topology; session listing remains available without a writer lock. Restrict access to the user
 data directory as you would a chat transcript. They are not included in source
