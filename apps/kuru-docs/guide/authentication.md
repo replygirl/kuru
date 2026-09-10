@@ -64,4 +64,4 @@ This provider calls the [OpenAI Responses API](https://developers.openai.com/api
 kuru --provider demo --mode jungian
 ```
 
-The demo provider requires neither network access nor credentials. Kuru's first memory use still needs its verified Dolt runtime; prepare the cache or configure an executable before working offline. The demo lets you explore the interface, framework choices, memory, and session controls. Its predictable responses do not test live model access.
+The demo provider requires neither network access nor credentials. Kuru's bundled Dolt engine supports a first offline conversation with an empty cache. The demo lets you explore the interface, framework choices, memory, and session controls. Its predictable responses do not test live model access.

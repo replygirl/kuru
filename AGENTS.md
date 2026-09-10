@@ -48,6 +48,17 @@ Writable opens require ownership; attached inspection handles never control the
 owner's lifetime. Await command cleanup before releasing the project writer lease,
 and hold the stable lifecycle lock through migration/recovery directory moves.
 
+Every ordinary Kuru executable embeds its target's verified full-Dolt archive
+and upstream licenses. `kuru-memory` owns the authoritative asset manifest,
+local-only build verifier and `bundle:prepare` mise task; the independent
+`kuru-delivery` helper prepares bounded, checksum-verified build inputs without
+compiling memory. Cargo selects by `TARGET` and fails missing or corrupt inputs;
+never add a host fallback or an unbundled build. Runtime provisioning extracts
+the embedded bytes and must not download an engine. Keep build-input mirrors
+separate from runtime memory settings, route source builds through package-owned
+mise dependencies, and verify packaged cold offline conversations after install
+and update. See [bundled build inputs](docs/development.md#bundled-engine-build-inputs).
+
 Convention priority is: (1) the apps/ and packages/ monorepo structure,
 (2) mise's native monorepo task model, (3) Rust, (4) other tools. Each app or
 package owns its mise.toml and tasks. Root tasks aggregate or forward by mise

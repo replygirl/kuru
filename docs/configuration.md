@@ -115,8 +115,9 @@ project topology; session listing remains available without a writer lock. Restr
 data directory as you would a chat transcript. They are not included in source
 control and should never be exposed as a tool root.
 
-Kuru installs its pinned full-Dolt engine on first memory use and reuses the
-verified local cache afterward. These optional settings control provisioning:
+Kuru includes its pinned full-Dolt engine and licenses in the executable. First
+memory use verifies and extracts them locally; later runs reuse the verified
+cache. These optional settings control the extracted runtime:
 
 ```toml
 [memory]
@@ -126,11 +127,14 @@ startup_timeout_secs = 30
 # dolt_binary = "/absolute/path/to/dolt"
 ```
 
-The default engine cache is `tools/dolt` inside the data directory. An explicit
-binary must report the supported pinned version. `offline = true` requires a
-valid cache or configured executable; it does not disable provider network calls.
-The startup timeout is 1–300 seconds. See [memory storage](memory.md) for migration,
-revision inspection and backup instructions.
+The default engine cache is `tools/dolt` inside the data directory. A fresh cache
+works offline without a separate engine installation. `offline` remains accepted
+for compatibility; bundled engine provisioning never uses HTTP, and this setting
+does not disable provider network calls. `dolt_binary` is an optional development
+override that must report the supported exact version. Corrupt existing caches
+fail without automatic repair. The startup timeout is 1–300 seconds. See
+[memory storage](memory.md) for migration, revision inspection and backups, or
+[development](development.md#bundled-engine-build-inputs) for build-input settings.
 
 Writes and shell execution require opt-in through config or the corresponding
 CLI flags. Enabling shell permits subprocess activity with your account's

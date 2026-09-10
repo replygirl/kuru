@@ -79,3 +79,44 @@ environments, Windows-target Clippy and the complete gate passed again in
 files remained in source directories. Logs are
 `/tmp/kuru-platform-profile-windows-lint.log` and
 `/tmp/kuru-native-platform-profile-check.log`.
+
+### First native Windows run
+
+Required Windows job
+<https://github.com/replygirl/kuru/actions/runs/34499528190/job/102946492180>
+ran for candidate `3d00bebda8e277858cb9adafccf717db1fe4b372`. Tool setup and
+native compilation/lint reached the real tests: seven unit tests passed, then
+nine filesystem integration tests passed and four failed. Failures exposed
+open-target/open-descendant rename restrictions and a default token-owner
+difference for inherited private objects. The dedicated sixteen process/IPC
+tests did not execute because Cargo stopped after the failed filesystem binary;
+native coverage also remains unmeasured. Package test tasks now request
+`--no-fail-fast` to collect independent binary failures while retaining a failing
+gate. No test retry or threshold relaxation was added.
+
+The lock-contention fixture did execute its first native child successfully:
+an owned Job, inherited output pipe and bounded wait returned the expected
+busy result. This is narrow evidence only, not a substitute for the dedicated
+process suite. Diagnosis and corrections remain in progress.
+Evidence: `/tmp/kuru-native-platform-windows-first.md` and corresponding `.log`.
+
+The corrections retain write-through publication and exercise its real Windows
+restrictions explicitly. A held replacement target must remain unchanged on
+failure; closing it permits publication. Directory tests close descendant data
+handles while retaining directory authority, and keep the lifecycle lock beside
+the directory being moved. Unix old-handle behavior remains tested.
+
+New private Windows descriptors inherit a zero-access OWNER RIGHTS entry.
+Alternate ownership is accepted only for the actual TokenOwner with effective
+suppression of implicit owner access; positive grants remain restricted to
+TokenUser. Added native ACL cases inspect ordinary creation and sealing, then
+verify missing, inherit-only and nonzero owner-rights entries are handled without
+repair. Windows-target typecheck and strict Clippy passed; macOS passed its one
+unit and seventeen filesystem integration tests, plus strict lint and formatting.
+These corrected Windows cases still await native execution. Evidence:
+`/tmp/kuru-platform-windows-fs-fix-evidence.md`.
+
+The integrated repository gate then passed in 467.28 seconds with 97.3207%
+workspace coverage. This validates the retained Unix behavior and shared build
+without establishing the corrected Windows runtime results. Log:
+`/tmp/kuru-embedded-platform-corrected-check.log`.

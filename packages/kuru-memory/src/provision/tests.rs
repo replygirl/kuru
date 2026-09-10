@@ -73,7 +73,6 @@ impl Fixture {
         Asset {
             target: "fixture-target",
             stem: "fixture",
-            url: "https://example.invalid/fixture.tar.gz",
             compressed_bytes: self.bytes.len() as u64,
             archive_sha256: &self.archive_digest,
             expanded_bytes: self.expanded,
@@ -85,10 +84,8 @@ impl Fixture {
     }
 
     fn extract(&self, directory: &Path) -> Result<PathBuf> {
-        let archive = directory.join("asset.tar.gz");
-        fs::write(&archive, &self.bytes)?;
         let candidate = directory.join("candidate");
-        extract(&archive, &candidate, self.spec())?;
+        extract(&self.bytes, &candidate, self.spec())?;
         Ok(candidate)
     }
 }
@@ -172,20 +169,20 @@ fn rejects_archive_links_duplicates_missing_entries_metadata_and_bad_payloads() 
 fn rejects_compressed_corruption_truncation_expansion_and_trailing_data() {
     let original = Fixture::new(|_| {});
     let temporary = tempfile::tempdir().unwrap();
-    let archive = temporary.path().join("archive");
     let destination = temporary.path().join("candidate");
-    fs::write(&archive, &original.bytes).unwrap();
     let mut spec = original.spec();
     spec.archive_sha256 = "incorrect";
-    assert!(extract(&archive, &destination, spec).is_err());
+    assert!(extract(&original.bytes, &destination, spec).is_err());
     spec = original.spec();
     spec.expanded_bytes -= 1;
-    assert!(extract(&archive, &destination, spec).is_err());
+    assert!(extract(&original.bytes, &destination, spec).is_err());
     spec.expanded_bytes = MAX_EXPANDED + 1;
-    assert!(extract(&archive, &destination, spec).is_err());
+    assert!(extract(&original.bytes, &destination, spec).is_err());
     spec = original.spec();
     spec.compressed_bytes += 1;
-    assert!(extract(&archive, &destination, spec).is_err());
+    assert!(extract(&original.bytes, &destination, spec).is_err());
+    spec.compressed_bytes = MAX_COMPRESSED + 1;
+    assert!(extract(&original.bytes, &destination, spec).is_err());
     let mut expanded = Vec::new();
     GzDecoder::new(original.bytes.as_slice())
         .read_to_end(&mut expanded)
@@ -397,39 +394,31 @@ async fn isolated_probe_sees_only_private_settings_and_preserves_private_server_
 }
 
 #[tokio::test]
-async fn explicit_binary_wins_and_missing_offline_cache_is_actionable() {
+async fn explicit_binary_wins_and_invalid_configured_cache_is_preserved() {
     let temporary = tempfile::tempdir().unwrap();
-    let cache = temporary.path().join("cache");
-    let mut config = MemoryConfig {
-        offline: true,
-        ..Default::default()
-    };
-    let failure = provision(&config, &cache).await.unwrap_err().to_string();
-    assert!(failure.contains("run once online"));
+    let cache = temporary.path().join("unused-cache");
     let binary = temporary.path().join("explicit-dolt");
     executable(&binary, SCRIPT);
-    config.dolt_binary = Some(binary.clone());
+    let mut config = MemoryConfig {
+        offline: true,
+        dolt_binary: Some(binary.clone()),
+        ..Default::default()
+    };
     assert_eq!(
         provision(&config, &cache).await.unwrap(),
         binary.canonicalize().unwrap()
     );
+    assert!(!cache.exists());
     config.dolt_binary = None;
     config.cache_dir = Some(temporary.path().join("configured-cache"));
-    assert!(
-        provision(&config, &cache)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("configured-cache")
-    );
-    let asset = host_asset().unwrap();
     let invalid = config
         .cache_dir
         .as_ref()
         .unwrap()
         .join(DOLT_VERSION)
-        .join(asset.target);
+        .join(BUNDLED_ASSET.target);
     private_directory(&invalid).unwrap();
+    fs::write(invalid.join("sentinel"), b"existing data").unwrap();
     assert!(
         provision(&config, &cache)
             .await
@@ -437,124 +426,51 @@ async fn explicit_binary_wins_and_missing_offline_cache_is_actionable() {
             .to_string()
             .contains("cache is invalid")
     );
-}
-
-async fn http_response(
-    body: Vec<u8>,
-    content_length: Option<usize>,
-    status: &str,
-) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let status = status.to_owned();
-    let task = tokio::spawn(async move {
-        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
-        let mut request = Vec::new();
-        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-            let mut buffer = [0_u8; 512];
-            let size = socket.read(&mut buffer).await.unwrap();
-            assert!(size > 0, "fixture client closed before its HTTP headers");
-            request.extend_from_slice(&buffer[..size]);
-            assert!(request.len() <= 4096);
-        }
-        let header = format!(
-            "HTTP/1.1 {status}\r\nConnection: close\r\n{}\r\n",
-            content_length
-                .map(|size| format!("Content-Length: {size}\r\n"))
-                .unwrap_or_default()
-        );
-        let _ = socket.write_all(header.as_bytes()).await;
-        let _ = socket.write_all(&body).await;
-        let _ = socket.shutdown().await;
-    });
-    (format!("http://{address}/dolt.tar.gz"), task)
-}
-
-#[tokio::test]
-async fn download_checks_status_declared_streamed_sizes_and_checksum_before_installation() {
-    let fixture = Fixture::new(|_| {});
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .unwrap();
-    for (body, length, status, accepted) in [
-        (
-            fixture.bytes.clone(),
-            Some(fixture.bytes.len()),
-            "200 OK",
-            true,
-        ),
-        (fixture.bytes.clone(), None, "200 OK", true),
-        (
-            fixture.bytes.clone(),
-            Some(fixture.bytes.len() + 1),
-            "200 OK",
-            false,
-        ),
-        (vec![], None, "200 OK", false),
-        (vec![b'x'; fixture.bytes.len() + 1], None, "200 OK", false),
-        (vec![b'x'; fixture.bytes.len()], None, "200 OK", false),
-        (vec![], Some(0), "404 Not Found", false),
-    ] {
-        let temporary = tempfile::tempdir().unwrap();
-        let (url, server) = http_response(body, length, status).await;
-        let result = download(
-            &client,
-            &url,
-            &temporary.path().join("archive"),
-            fixture.spec(),
-        )
-        .await;
-        assert_eq!(result.is_ok(), accepted, "{result:?}");
-        server.await.unwrap();
-    }
-    let temporary = tempfile::tempdir().unwrap();
-    let mut oversized = fixture.spec();
-    oversized.compressed_bytes = MAX_COMPRESSED + 1;
-    assert!(
-        download(
-            &client,
-            fixture.spec().url,
-            &temporary.path().join("oversized"),
-            oversized
-        )
-        .await
-        .is_err()
+    assert_eq!(
+        fs::read(invalid.join("sentinel")).unwrap(),
+        b"existing data"
     );
+    assert!(!cache.exists());
 }
 
 #[tokio::test]
-async fn first_use_downloads_once_then_concurrent_and_offline_open_reuse_the_atomic_cache() {
+async fn concurrent_cold_offline_extraction_activates_once_and_preserves_notices() {
     let temporary = tempfile::tempdir().unwrap();
     let cache = temporary.path().join("cache");
     let fixture = &*VALID_FIXTURE;
-    let (url, server) =
-        http_response(fixture.bytes.clone(), Some(fixture.bytes.len()), "200 OK").await;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .unwrap();
-    let config = MemoryConfig::default();
-    let (first, second) = tokio::join!(
-        provision_managed(&config, &cache, fixture.spec(), &client, &url),
-        provision_managed(&config, &cache, fixture.spec(), &client, &url),
-    );
-    let installed = first.unwrap();
-    assert_eq!(installed, second.unwrap());
-    server.await.unwrap();
-    let offline = MemoryConfig {
+    let config = MemoryConfig {
         offline: true,
         ..Default::default()
     };
+    let (first, second) = tokio::join!(
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes)
+        ),
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes)
+        ),
+    );
+    let installed = first.unwrap();
+    assert_eq!(installed, second.unwrap());
+    let inode = fs::metadata(&installed).unwrap().ino();
     assert_eq!(
-        provision_managed(&offline, &cache, fixture.spec(), &client, &url)
-            .await
-            .unwrap(),
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes)
+        )
+        .await
+        .unwrap(),
         installed
     );
+    assert_eq!(fs::metadata(&installed).unwrap().ino(), inode);
     assert_eq!(fs::read(installed).unwrap(), SCRIPT);
     assert_eq!(
         fs::read(cache.join(DOLT_VERSION).join("fixture-target/LICENSES")).unwrap(),
@@ -564,116 +480,152 @@ async fn first_use_downloads_once_then_concurrent_and_offline_open_reuse_the_ato
 }
 
 #[tokio::test]
-async fn failed_download_leaves_no_active_or_partial_install_and_can_be_retried() {
+async fn corrupt_embedded_bytes_never_activate_and_valid_retry_succeeds() {
     let temporary = tempfile::tempdir().unwrap();
     let cache = temporary.path().join("cache");
     let fixture = &*VALID_FIXTURE;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .unwrap();
-    let (url, server) = http_response(vec![b'!'; fixture.bytes.len()], None, "200 OK").await;
-    assert!(
-        provision_managed(
-            &MemoryConfig::default(),
-            &cache,
-            fixture.spec(),
-            &client,
-            &url
-        )
-        .await
-        .is_err()
-    );
-    server.await.unwrap();
-    assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 0);
-    let (url, server) = http_response(fixture.bytes.clone(), None, "200 OK").await;
-    provision_managed(
-        &MemoryConfig::default(),
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+    for bytes in [
+        vec![],
+        vec![b'!'; fixture.bytes.len()],
+        fixture.bytes[..fixture.bytes.len() - 1].to_vec(),
+    ] {
+        assert!(
+            provision_managed(&config, &cache, fixture.spec(), Cow::Owned(bytes))
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 0);
+    }
+    let binary = provision_managed(
+        &config,
         &cache,
         fixture.spec(),
-        &client,
-        &url,
+        Cow::Borrowed(&fixture.bytes),
     )
     .await
     .unwrap();
-    server.await.unwrap();
-    assert!(
-        cache
-            .join(DOLT_VERSION)
-            .join("fixture-target/dolt")
-            .exists()
+    assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
+    // A corrupt bundle cannot trigger replacement or destructive repair of an
+    // already verified immutable cache.
+    assert_eq!(
+        provision_managed(&config, &cache, fixture.spec(), Cow::Borrowed(b"bad"))
+            .await
+            .unwrap(),
+        binary
     );
 }
 
 #[tokio::test]
-async fn cancellation_during_download_releases_lock_and_removes_unactivated_stage() {
+async fn cancellation_retains_stage_and_lock_until_real_extraction_stops() {
     let temporary = tempfile::tempdir().unwrap();
     let cache = temporary.path().join("cache");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/stall", listener.local_addr().unwrap());
-    let (started, received) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut byte = [0_u8; 1];
-        socket.read_exact(&mut byte).await.unwrap();
-        socket
-            .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        started.send(()).unwrap();
-        std::future::pending::<()>().await;
-    });
     let directory = cache.clone();
+    let (started, received) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
     let task = tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .build()
-            .unwrap();
-        provision_managed(
-            &MemoryConfig::default(),
+        provision_with_extractor(
+            &MemoryConfig {
+                offline: true,
+                ..Default::default()
+            },
             &directory,
             VALID_FIXTURE.spec(),
-            &client,
-            &url,
+            Cow::Borrowed(&VALID_FIXTURE.bytes),
+            move |bytes, candidate, asset| {
+                private_directory(candidate)?;
+                started.send(candidate.to_path_buf()).unwrap();
+                wait.recv_timeout(Duration::from_secs(10))
+                    .context("release extraction fixture")?;
+                extract(bytes, candidate, asset)
+            },
         )
         .await
     });
-    tokio::time::timeout(Duration::from_secs(3), received)
+    let stage = tokio::time::timeout(Duration::from_secs(5), received)
         .await
         .unwrap()
         .unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    server.abort();
-    let _ = server.await;
+    assert!(
+        stage.exists(),
+        "cancelled caller cannot delete the worker's stage"
+    );
+    assert!(
+        cache_lock(&cache, Duration::from_millis(30)).await.is_err(),
+        "worker retains installation lock until its filesystem writes stop"
+    );
+    release.send(()).unwrap();
+    let _lock = cache_lock(&cache, Duration::from_secs(10)).await.unwrap();
+    assert!(!stage.exists());
     assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 0);
-    cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    drop(_lock);
+    let installed = provision_managed(
+        &MemoryConfig::default(),
+        &cache,
+        VALID_FIXTURE.spec(),
+        Cow::Borrowed(&VALID_FIXTURE.bytes),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(installed).unwrap(), SCRIPT);
 }
 
 #[tokio::test]
-async fn real_prefetched_engine_runs_from_a_verified_cache_with_offline_policy() {
-    // The package's mise pretest task provisions this cache. A missing runtime is
-    // a required integration failure, never a reason to skip or substitute SQLite.
-    let cache = std::env::var_os("KURU_DOLT_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("kuru-dolt-test-cache"));
+async fn actual_embedded_engine_starts_offline_from_empty_cache_and_reuses_verified_payloads() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("empty offline café cache");
     let config = MemoryConfig {
         offline: true,
         ..Default::default()
     };
+    assert!(!cache.exists());
     let binary = provision(&config, &cache)
         .await
-        .expect("mise memory pretest must provision the pinned real Dolt engine");
-    let temporary = tempfile::tempdir().unwrap();
+        .expect("embedded Dolt must support offline first use");
+    let asset = BUNDLED_ASSET;
+    verify_payload(
+        &binary,
+        asset.executable_bytes,
+        asset.executable_sha256,
+        true,
+    )
+    .unwrap();
+    verify_payload(
+        &binary.parent().unwrap().join("LICENSES"),
+        asset.license_bytes,
+        asset.license_sha256,
+        false,
+    )
+    .unwrap();
+    let inode = fs::metadata(&binary).unwrap().ino();
+    assert_eq!(provision(&config, &cache).await.unwrap(), binary);
+    assert_eq!(fs::metadata(&binary).unwrap().ino(), inode);
     verify_version(&binary, &temporary.path().join("actual engine café"))
         .await
         .unwrap();
-    let asset = host_asset().unwrap();
-    assert_eq!(fs::metadata(&binary).unwrap().len(), asset.executable_bytes);
-    assert_eq!(
-        fs::metadata(binary.parent().unwrap().join("LICENSES"))
-            .unwrap()
-            .len(),
-        asset.license_bytes
-    );
+    assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn corrupt_actual_embedded_archive_is_rejected_without_executing_or_activating() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let mut bytes = EMBEDDED_ARCHIVE.to_vec();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x80;
+    let failure = provision_managed(
+        &MemoryConfig::default(),
+        &cache,
+        BUNDLED_ASSET,
+        Cow::Owned(bytes),
+    )
+    .await
+    .unwrap_err();
+    assert!(failure.to_string().contains("checksum mismatch"));
+    assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 0);
 }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use kuru_delivery::{archive, docs, repo};
+use kuru_delivery::{archive, bundle, docs, repo};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -12,6 +12,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Prepare verified local build inputs without compiling their consumer.
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
+    },
     /// Install a checksum-verified release atomically.
     Install {
         #[arg(long)]
@@ -48,9 +53,46 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum BundleCommand {
+    Prepare {
+        #[arg(long, default_value = "packages/kuru-memory/support/dolt-assets.json")]
+        manifest: PathBuf,
+        #[arg(long, env = "KURU_DOLT_BUNDLE_TARGET", default_value = "host")]
+        target: String,
+        #[arg(long, env = "KURU_DOLT_BUNDLE_DIR")]
+        bundle_dir: Option<PathBuf>,
+        #[arg(long, env = "KURU_DOLT_BUNDLE_ARCHIVE")]
+        archive: Option<PathBuf>,
+        #[arg(long, env = "KURU_DOLT_BUNDLE_OFFLINE")]
+        offline: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Bundle {
+            command:
+                BundleCommand::Prepare {
+                    manifest,
+                    target,
+                    bundle_dir,
+                    archive,
+                    offline,
+                },
+        } => {
+            let bundle_dir = bundle::bundle_directory(&manifest, bundle_dir)?;
+            let prepared = bundle::prepare(&bundle::PrepareOptions {
+                manifest,
+                target,
+                bundle_dir,
+                archive,
+                offline,
+            })
+            .await?;
+            println!("{}", prepared.display());
+        }
         Command::Install {
             version,
             release_base,

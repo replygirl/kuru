@@ -1,21 +1,43 @@
+[vars]
+# Capture the consumer target before the preparation task clears Cargo's target.
+kuru_memory_bundle_target = "{{env.CARGO_BUILD_TARGET | default(value='host')}}"
+
+[tasks."bundle:prepare"]
+description = "Prepare the verified engine archive embedded by the next build"
+dir = "{{config_root}}/../.."
+env.CARGO_BUILD_TARGET = false
+env.RUSTFLAGS = false
+env.CARGO_ENCODED_RUSTFLAGS = false
+env.KURU_DOLT_BUNDLE_TARGET = "{{vars.kuru_memory_bundle_target}}"
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- bundle prepare"
+
 [tasks.build]
-run = "cargo build -p kuru-memory --all-features --locked"
+usage = 'flag "--target <target>" default="{{vars.kuru_memory_bundle_target}}"'
+env.CARGO_BUILD_TARGET = false
+depends = [{ task = "bundle:prepare", args = ["--target", "{{usage.target}}"] }]
+run = 'cargo build -p kuru-memory --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
 
 [tasks."build:release"]
-run = "cargo build -p kuru-memory --release --all-features --locked"
+usage = 'flag "--target <target>" default="{{vars.kuru_memory_bundle_target}}"'
+env.CARGO_BUILD_TARGET = false
+depends = [{ task = "bundle:prepare", args = ["--target", "{{usage.target}}"] }]
+run = 'cargo build -p kuru-memory --release --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
 
 [tasks.test]
 depends = ["prefetch"]
 run = "cargo test -p kuru-memory --all-targets --all-features --locked"
 
 [tasks.typecheck]
+depends = ["bundle:prepare"]
 run = "cargo check -p kuru-memory --all-targets --all-features --locked"
 
 [tasks.lint]
+depends = ["bundle:prepare"]
 run = "cargo clippy -p kuru-memory --all-targets --all-features --locked -- -D warnings"
 
 [tasks.prefetch]
-description = "Install and verify the pinned full-Dolt runtime for local tests"
+description = "Extract and verify the bundled full-Dolt runtime for local tests"
+depends = ["bundle:prepare"]
 run = "cargo run -p kuru-memory --locked -- prefetch"
 
 [tasks."deps:lock"]

@@ -2,6 +2,8 @@
 
 pub mod archive;
 #[cfg(feature = "tooling")]
+pub mod bundle;
+#[cfg(feature = "tooling")]
 pub mod docs;
 #[cfg(feature = "tooling")]
 pub mod notes;

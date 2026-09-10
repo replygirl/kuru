@@ -30,7 +30,7 @@ run = "cargo build -p kuru-platform --all-features --locked"
 run = "cargo build -p kuru-platform --release --all-features --locked"
 
 [tasks.test]
-run = "cargo test -p kuru-platform --all-targets --all-features --locked"
+run = "cargo test -p kuru-platform --all-targets --all-features --locked --no-fail-fast"
 
 [tasks.typecheck]
 run = "cargo check -p kuru-platform --all-targets --all-features --locked"
@@ -45,7 +45,7 @@ run = "cargo fmt --package kuru-platform -- --check"
 description = "Require 90% native platform package line coverage"
 depends = ["test"]
 dir = "{{config_root}}/../.."
-run = "cargo llvm-cov -p kuru-platform --all-targets --all-features --locked --fail-under-lines 90 --lcov --output-path target/kuru-platform-coverage.lcov"
+run = "cargo llvm-cov -p kuru-platform --all-targets --all-features --locked --no-fail-fast --fail-under-lines 90 --lcov --output-path target/kuru-platform-coverage.lcov"
 
 [tasks."check:native"]
 description = "Check platform primitives without building application or database consumers"

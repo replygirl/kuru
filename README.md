@@ -42,22 +42,23 @@ the executable atomically. macOS and Linux on arm64 and x86-64 are supported;
 see [installation and updates](docs/install.md) for platform requirements,
 version selection, destinations and offline installation.
 
-First memory use installs a verified native Dolt runtime. Later runs reuse its
-local cache. See [memory storage](docs/memory.md) for offline setup, migration and
-revision history.
+Kuru includes its native Dolt engine and licenses. First memory use extracts them
+locally, including offline. See [memory storage](docs/memory.md) for migration
+and revision history.
 
 ### From source
 
-Building requires Rust 1.98.1, a C compiler for the legacy SQLite importer, and standard
-platform build tools:
+Building requires mise, a C compiler for the legacy SQLite importer, and standard
+platform build tools. The source installer prepares the pinned Rust toolchain
+and bundled engine input:
 
 ```sh
 git clone https://github.com/replygirl/kuru.git
 cd kuru
-cargo install --path apps/kuru-tui --locked
+bash scripts/install.sh --source
 ```
 
-Cargo installs into `~/.cargo/bin` by default. To choose another destination:
+The executable installs into `~/.local/bin`. To choose another destination:
 
 ```sh
 KURU_INSTALL_DIR="$HOME/.local/bin" bash scripts/install.sh --source

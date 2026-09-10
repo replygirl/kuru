@@ -125,4 +125,6 @@ startup_timeout_secs = 30
 # dolt_binary = "/absolute/path/to/dolt"
 ```
 
-Kuru installs its pinned full-Dolt runtime on first memory use. The default cache is `tools/dolt` inside the data directory. Offline mode requires a valid cache or explicit executable with the supported version. The startup timeout is 1–300 seconds. These settings control memory provisioning; provider network access is independent.
+Kuru includes its pinned full-Dolt engine and licenses. First memory use extracts them locally into `tools/dolt` inside the data directory, or the configured `cache_dir`; an empty cache works offline. Existing caches are verified, and corrupt entries fail without automatic repair.
+
+`offline` remains accepted for compatibility; bundled engine provisioning never uses HTTP. `dolt_binary` is an optional development override and must report the supported exact version. The startup timeout is 1–300 seconds. Provider network access is independent of these memory settings.

@@ -1,17 +1,38 @@
+[vars]
+kuru_runtime_build_target = "{{env.CARGO_BUILD_TARGET | default(value='host')}}"
+
 [tasks."build"]
-run = "cargo build -p kuru-runtime --all-features --locked"
+usage = 'flag "--target <target>" default="{{vars.kuru_runtime_build_target}}"'
+env.CARGO_BUILD_TARGET = false
+depends = [
+  { task = "//packages/kuru-memory:bundle:prepare", args = [
+    "--target",
+    "{{usage.target}}",
+  ] },
+]
+run = 'cargo build -p kuru-runtime --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
 
 [tasks."build:release"]
-run = "cargo build -p kuru-runtime --release --all-features --locked"
+usage = 'flag "--target <target>" default="{{vars.kuru_runtime_build_target}}"'
+env.CARGO_BUILD_TARGET = false
+depends = [
+  { task = "//packages/kuru-memory:bundle:prepare", args = [
+    "--target",
+    "{{usage.target}}",
+  ] },
+]
+run = 'cargo build -p kuru-runtime --release --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
 
 [tasks."test"]
 depends = ["//packages/kuru-memory:prefetch"]
 run = "cargo test -p kuru-runtime --all-targets --all-features --locked"
 
 [tasks."typecheck"]
+depends = ["//packages/kuru-memory:bundle:prepare"]
 run = "cargo check -p kuru-runtime --all-targets --all-features --locked"
 
 [tasks."lint"]
+depends = ["//packages/kuru-memory:bundle:prepare"]
 run = "cargo clippy -p kuru-runtime --all-targets --all-features --locked -- -D warnings"
 [env]
 RUST_TEST_THREADS = "2"

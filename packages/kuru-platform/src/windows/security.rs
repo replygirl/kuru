@@ -15,9 +15,9 @@ use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
     DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
     GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetTokenInformation, INHERIT_ONLY_ACE,
-    IsValidAcl, IsValidSecurityDescriptor, IsValidSid, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_USER, TokenUser,
+    IsValidAcl, IsValidSecurityDescriptor, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_OWNER,
+    TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser, WinCreatorOwnerRightsSid,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -48,13 +48,27 @@ impl Drop for LocalMemory {
 }
 
 struct CurrentUser {
-    // usize storage supplies TOKEN_USER/SID alignment and keeps SID pointers live.
+    // usize storage supplies TOKEN_USER/TOKEN_OWNER alignment and keeps SIDs live.
     storage: Vec<usize>,
     bytes: usize,
+    default_owner: bool,
 }
 
 impl CurrentUser {
     fn read() -> io::Result<Self> {
+        Self::read_kind(false)
+    }
+
+    fn owner() -> io::Result<Self> {
+        Self::read_kind(true)
+    }
+
+    fn read_kind(default_owner: bool) -> io::Result<Self> {
+        let (kind, minimum) = if default_owner {
+            (TokenOwner, size_of::<TOKEN_OWNER>())
+        } else {
+            (TokenUser, size_of::<TOKEN_USER>())
+        };
         let mut token = null_mut();
         // SAFETY: process pseudo-handle is only borrowed; token is an out slot.
         checked_bool(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) })?;
@@ -62,32 +76,32 @@ impl CurrentUser {
         let token = unsafe { OwnedHandle::from_raw_handle(token) };
         let mut bytes = 0;
         // SAFETY: the null-buffer size query is documented; token remains live.
-        let status = unsafe {
-            GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut bytes)
-        };
+        let status =
+            unsafe { GetTokenInformation(token.as_raw_handle(), kind, null_mut(), 0, &mut bytes) };
         let error = io::Error::last_os_error();
         if status != 0
             || error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
-            || !(size_of::<TOKEN_USER>()..=65_536).contains(&(bytes as usize))
+            || !(minimum..=65_536).contains(&(bytes as usize))
         {
             return Err(denied("invalid process-token user size"));
         }
         let mut user = Self {
             storage: vec![0; (bytes as usize).div_ceil(size_of::<usize>())],
             bytes: bytes as usize,
+            default_owner,
         };
         // SAFETY: aligned storage covers the requested byte count; no pointers
         // into it are retained until GetTokenInformation has finished writing.
         checked_bool(unsafe {
             GetTokenInformation(
                 token.as_raw_handle(),
-                TokenUser,
+                kind,
                 user.storage.as_mut_ptr().cast(),
                 bytes,
                 &mut bytes,
             )
         })?;
-        if bytes as usize > user.bytes || (bytes as usize) < size_of::<TOKEN_USER>() {
+        if bytes as usize > user.bytes || (bytes as usize) < minimum {
             return Err(denied("invalid process-token user result"));
         }
         user.bytes = bytes as usize;
@@ -97,7 +111,13 @@ impl CurrentUser {
 
     fn sid(&self) -> io::Result<PSID> {
         // SAFETY: read() verifies size and alignment; the buffer is not mutated.
-        let sid = unsafe { (*self.storage.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let sid = unsafe {
+            if self.default_owner {
+                (*self.storage.as_ptr().cast::<TOKEN_OWNER>()).Owner
+            } else {
+                (*self.storage.as_ptr().cast::<TOKEN_USER>()).User.Sid
+            }
+        };
         // SAFETY: storage owns the entire live allocation passed to this check.
         unsafe { bounded_sid(sid, self.storage.as_ptr().cast(), self.bytes)? };
         Ok(sid)
@@ -165,7 +185,12 @@ impl PrivateSecurity {
     pub(crate) fn new(access_mask: u32, inherit_children: bool) -> io::Result<Self> {
         let sid = CurrentUser::read()?.sid_string()?;
         let flags = if inherit_children { "OICI" } else { "" };
-        let sddl = format!("O:{sid}D:P(A;{flags};0x{access_mask:08x};;;{sid})");
+        // Ordinary child creation inherits the DACL but uses TokenOwner, which
+        // can be a group under elevation. OWNER RIGHTS with zero access disables
+        // the owner's implicit READ_CONTROL/WRITE_DAC without denying the user's
+        // explicit grants. Keep it when sealing an inherited file as well.
+        let sddl =
+            format!("O:{sid}D:P(A;{flags};0x{access_mask:08x};;;{sid})(A;{flags};0x00000000;;;OW)");
         let string: Vec<_> = sddl.encode_utf16().chain(Some(0)).collect();
         let mut descriptor = null_mut();
         // SAFETY: the generated, NUL-terminated SDDL contains only a validated
@@ -245,8 +270,13 @@ pub(crate) fn private_status(handle: BorrowedHandle<'_>) -> io::Result<bool> {
     // SAFETY: GetSecurityInfo owns the complete descriptor allocation until drop.
     unsafe { bounded_sid(owner, descriptor.0.cast(), bytes)? };
     // SAFETY: both SID allocations remain live and have been checked.
-    if unsafe { EqualSid(owner, user.sid()?) } == 0 {
-        return Err(denied("private object belongs to another user"));
+    let user_owned = unsafe { EqualSid(owner, user.sid()?) } != 0;
+    if !user_owned {
+        let default_owner = CurrentUser::owner()?;
+        // SAFETY: the default-owner query validates and retains its SID too.
+        if unsafe { EqualSid(owner, default_owner.sid()?) } == 0 {
+            return Err(denied("private object belongs to another user"));
+        }
     }
     let mut control = 0;
     let mut revision = 0;
@@ -270,6 +300,7 @@ pub(crate) fn private_status(handle: BorrowedHandle<'_>) -> io::Result<bool> {
         )
     })?;
     let mut owner_grant = false;
+    let mut implicit_owner_rights_suppressed = false;
     for index in 0..information.AceCount {
         let mut ace = null_mut();
         // SAFETY: index is bounded by the native ACL count; ace borrows descriptor.
@@ -310,6 +341,15 @@ pub(crate) fn private_status(handle: BorrowedHandle<'_>) -> io::Result<bool> {
             .cast();
         // SAFETY: the complete ACE extent was checked inside the live descriptor.
         unsafe { bounded_sid(sid, ace.cast(), ace_bytes)? };
+        // SAFETY: bounded_sid checked the complete live ACE SID. Only an
+        // effective, zero-rights allow ACE is accepted as ownership suppression;
+        // inherit-only entries do not protect this object itself.
+        if unsafe { IsWellKnownSid(sid, WinCreatorOwnerRightsSid) } != 0 {
+            if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE || entry.Mask != 0 {
+                return Err(denied("private object has unsupported owner rights"));
+            }
+            implicit_owner_rights_suppressed |= u32::from(header.AceFlags) & INHERIT_ONLY_ACE == 0;
+        }
         if u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE && entry.Mask != 0 {
             // SAFETY: both SIDs are valid and allocations remain live.
             if unsafe { EqualSid(sid, user.sid()?) } == 0 {
@@ -320,6 +360,9 @@ pub(crate) fn private_status(handle: BorrowedHandle<'_>) -> io::Result<bool> {
     }
     if !owner_grant {
         return Err(denied("private object has no effective owner grant"));
+    }
+    if !user_owned && !implicit_owner_rights_suppressed {
+        return Err(denied("private default owner retains implicit access"));
     }
     Ok(control & SE_DACL_PROTECTED != 0)
 }
@@ -441,6 +484,114 @@ mod tests {
             std::slice::from_raw_parts(text, length.saturating_sub(1) as usize)
         })
         .unwrap()
+    }
+
+    fn default_owned_file(directory: &Directory) -> (File, bool) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+        // No supplied descriptor: this is ordinary native child creation, as
+        // used by an external engine. Only the requested handle rights differ.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+            .open(directory.path().join("ordinary-child"))
+            .unwrap();
+        let mut owner = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: this fixture holds the file and owns the returned descriptor.
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        let descriptor = LocalMemory(descriptor);
+        let default_owner = CurrentUser::owner().unwrap();
+        let user = CurrentUser::read().unwrap();
+        // SAFETY: the native descriptor and queried token allocations remain
+        // live; check the returned SID's extent before comparing it.
+        unsafe {
+            bounded_sid(
+                owner,
+                descriptor.0.cast(),
+                GetSecurityDescriptorLength(descriptor.0) as usize,
+            )
+            .unwrap();
+            assert_ne!(EqualSid(owner, default_owner.sid().unwrap()), 0);
+        }
+        // SAFETY: both complete SIDs are validated and live.
+        let user_owned = unsafe { EqualSid(owner, user.sid().unwrap()) } != 0;
+        eprintln!("ordinary native child: TokenOwner equals TokenUser = {user_owned}");
+        (file, user_owned)
+    }
+
+    #[test]
+    fn ordinary_creation_and_sealing_preserve_private_default_owner_rights() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let (mut file, _) = default_owned_file(&directory);
+        file.write_all(b"ordinary child remains private").unwrap();
+        require_private(file.as_handle(), false).unwrap();
+        assert!(security_text(&file).contains(";;;OW)"));
+        directory
+            .read(std::ffi::OsStr::new("ordinary-child"))
+            .unwrap();
+        set_private(
+            file.as_handle(),
+            windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ,
+        )
+        .unwrap();
+        require_private(file.as_handle(), true).unwrap();
+        assert!(security_text(&file).contains(";;;OW)"));
+        assert_eq!(
+            std::fs::read(directory.path().join("ordinary-child")).unwrap(),
+            b"ordinary child remains private"
+        );
+    }
+
+    #[test]
+    fn default_owner_privacy_checks_effective_zero_rights_without_repair() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let (mut file, user_owned) = default_owned_file(&directory);
+        file.write_all(b"unchanged private content").unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        for (owner_rights, valid_for_user_owner) in [
+            ("", true),
+            ("(A;IO;0x00000000;;;OW)", true),
+            ("(A;;FR;;;OW)", false),
+        ] {
+            let acl = descriptor(&format!("O:{sid}D:P(A;;FA;;;{sid}){owner_rights}"));
+            set_dacl(&file, acl.dacl().unwrap());
+            let before = security_text(&file);
+            let checked = require_private(file.as_handle(), false);
+            // A user owner already has the allowed user's implicit rights.
+            // A distinct default group owner must never retain them. Both
+            // branches assert their actual native token contract, without
+            // requiring privileges or mutating the process token for a fixture.
+            assert_eq!(
+                checked.is_ok(),
+                user_owned && valid_for_user_owner,
+                "{owner_rights}: {checked:?}"
+            );
+            assert_eq!(security_text(&file), before);
+            assert_eq!(
+                std::fs::read(directory.path().join("ordinary-child")).unwrap(),
+                b"unchanged private content"
+            );
+        }
     }
 
     #[test]

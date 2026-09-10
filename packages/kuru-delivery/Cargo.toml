@@ -17,6 +17,7 @@ tooling = [
   "dep:scraper",
   "dep:roxmltree",
   "dep:base64",
+  "dep:rustix",
 ]
 
 [[bin]]
@@ -45,6 +46,9 @@ serde_json = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 scraper = { workspace = true, optional = true }
 roxmltree = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true, features = ["fs", "process"] }
 
 [dev-dependencies]
 axum.workspace = true

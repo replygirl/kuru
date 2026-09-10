@@ -7,7 +7,7 @@ cd /path/to/project
 kuru --provider demo
 ```
 
-The demo provider needs no credentials or inference service. First memory use downloads the verified Dolt runtime; later launches reuse its cache. See [local storage](../concepts/memory#local-storage) for details.
+The demo provider needs no credentials or network access. Kuru includes its verified Dolt engine and licenses; first memory use extracts them locally, and later launches reuse the cache. See [local storage](../concepts/memory#local-storage) for details.
 
 Or select the project without changing directories:
 

@@ -70,9 +70,10 @@ and handled interruptions preserve the previous executable and remove staging fi
 | Linux | ARM64 | `aarch64-unknown-linux-gnu` |
 | Linux | x86-64 | `x86_64-unknown-linux-gnu` |
 
-Linux archives are built on Ubuntu 24.04 and require a compatible glibc. Build
-from source on older Linux systems or musl distributions. The bootstrap detects
-the host; `--target` explicitly selects one of the supported archive targets.
+Linux archives are built on Ubuntu 24.04 and require a compatible glibc. The
+supported Linux targets use GNU libc, including source builds with the bundled
+engine. The bootstrap detects the host; `--target` explicitly selects one of
+the supported archive targets.
 
 ## Release archives
 
@@ -100,23 +101,26 @@ corruption; trust comes from the release source you choose.
 From a checkout, `bash scripts/install.sh` forwards these binary-install options
 to the same bootstrap.
 
-The application provisions its verified full-Dolt engine on first memory use.
-For offline operation, also prepare the engine cache or configure the supported
-Dolt executable before disconnecting. See [memory storage](memory.md).
+The executable includes its verified full-Dolt engine and upstream licenses.
+First memory use extracts them locally, so an offline installation also supports
+a first offline demo conversation. See [memory storage](memory.md).
 
 ## Build from source
 
-Building requires Rust 1.98.1, a C compiler for the legacy SQLite importer, and standard
+Building requires mise, a C compiler for the legacy SQLite importer, and standard
 platform build tools:
 
 ```sh
 git clone https://github.com/replygirl/kuru.git
 cd kuru
-cargo install --path apps/kuru-tui --locked
+bash scripts/install.sh --source
 ```
 
-Cargo installs under `$CARGO_HOME/bin`, normally `~/.cargo/bin`. For another
-binary directory:
+The source installer prepares the pinned Rust toolchain and verified engine
+archive through package-owned mise tasks, then installs into `~/.local/bin`.
+It builds for the current host and rejects a foreign `CARGO_BUILD_TARGET` before
+installing an executable; use the build task for cross-compilation.
+For another binary directory:
 
 ```sh
 KURU_INSTALL_DIR="$HOME/.local/bin" bash scripts/install.sh --source
@@ -126,7 +130,12 @@ The source installer builds the locked release profile and atomically replaces
 the executable. It refuses a symlink or directory at the destination and uses
 your selected checkout revision. Maintainers with the repository toolchain can
 run `mise run install`; see [development](development.md) for setup and platform
-requirements. App installation does not require the full maintainer toolchain.
+requirements. Source installation does not require the full maintainer toolchain;
+it omits mise's repository-setup postinstall hook while preparing Rust. It does
+not alter Git commit or push hooks.
+
+For direct Cargo builds or offline source preparation, see the
+[bundled engine build inputs](development.md#bundled-engine-build-inputs) guide.
 
 ## Updating
 

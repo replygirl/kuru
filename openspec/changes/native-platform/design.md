@@ -55,8 +55,15 @@ Verify held/name identities after acquiring locks and around publication. Unix
 uses corresponding no-follow relative operations and dev/inode identity.
 
 Create the requested private root with an owner-only protected DACL at creation
-on Windows and private modes on Unix. Require the process-token owner, persistent
-ACL capability and owner-only grants. Descendants may inherit an owner-only ACL
+on Windows and private modes on Unix. Require the process-token user as each new
+private root's owner, persistent ACL capability and user-only positive grants.
+Ordinary Windows child creation inherits its DACL but takes its owner from
+TokenOwner, which can differ from TokenUser under elevation. Include an
+inheritable zero-access OWNER RIGHTS ACE in new private descriptors to suppress
+implicit owner READ_CONTROL/WRITE_DAC. Accept a different owner only when it is
+exactly the current TokenOwner and that suppression is effective; never accept
+an unrestricted group owner or repair an existing ACL. Preserve the suppression
+when sealing an inherited file. Descendants may inherit an owner-only ACL
 through the validated private chain; do not require a protected bit on every
 descendant. Existing unsafe ownership/permissions fail without repair. Structural
 ancestors are checked but are not required to be user-owned. Standard `File`
@@ -79,6 +86,17 @@ writable candidate and use same-volume native publication. Unix uses relative
 rename/no-replace plus parent synchronization; Windows uses explicit native
 write-through moves without COPY_ALLOWED. Do not substitute directory
 `sync_all` on Windows or a cross-volume copy/delete fallback.
+
+Windows native write-through replacement requires closed destination data
+handles, and directory moves require closed descendant data handles. Keep stable
+lifecycle locks outside the stopped directory being published. Movable sharing
+does not imply POSIX open-file replacement. Native tests exercise rejection with
+held destination handles, preserve bytes and identity, then explicitly close
+those handles before verifying publication. Directory substitution fixtures retain
+the old directory guard while closing data handles required by Windows. Preserve
+Unix retained-old-file behavior separately. These restrictions follow the native
+[rename contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information);
+do not add POSIX rename flags with unverified durability merely to match Unix.
 
 A pre-move rejection leaves the old object intact. A native error after a move
 may be uncertain: preserve held identities and return enough outcome context

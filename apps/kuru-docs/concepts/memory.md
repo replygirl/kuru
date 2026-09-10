@@ -45,7 +45,9 @@ $XDG_DATA_HOME/kuru/memory/<canonical-project-hash>/
 
 If `XDG_DATA_HOME` is unset, the data directory is `~/.local/share/kuru`. `--data-dir` or `KURU_DATA_DIR` chooses a separate directory. Keep it outside the tool workspace and restrict access as you would any chat history.
 
-Kuru installs a verified native Dolt runtime on first use and reuses its local cache. The authenticated SQL sidecar runs only while its owning Kuru process needs it. Existing SQLite data is imported from a consistent snapshot; the original and snapshot remain preserved.
+Kuru includes its verified native Dolt engine and license notices in the executable. First memory use extracts them locally, including when offline; later runs verify and reuse the cache at `tools/dolt` inside the data directory. No separate engine installation or runtime download is needed. `memory.cache_dir` selects another extraction directory. Corrupt existing caches fail explicitly and remain preserved.
+
+The authenticated SQL sidecar runs only while its owning Kuru process needs it. Existing SQLite data is imported from a consistent snapshot; the original and snapshot remain preserved.
 
 Use `kuru memory status` to inspect the store and current revision, or `kuru memory history` to list committed changes. Dream candidates stay private until promotion. Undo adds a compensating revision and preserves later conversations.
 

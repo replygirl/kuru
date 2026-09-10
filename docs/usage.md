@@ -1,8 +1,9 @@
 # Using Kuru
 
 Run `kuru --provider demo` to explore the terminal without provider credentials.
-First memory use installs the verified Dolt runtime; subsequent demo sessions can
-run offline with its cache. See [memory storage](memory.md) for offline setup. Choose the
+The executable includes the verified Dolt engine, so the first demo conversation
+works offline with an empty cache. See [memory storage](memory.md) for local
+extraction and storage details. Choose the
 `codex` provider after `kuru login`, or set `OPENAI_API_KEY` and select
 `--provider responses`. The selected model and effort are visible in the
 composer beside their shortcuts; `kuru models` prints the provider's current catalog.

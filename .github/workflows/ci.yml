@@ -42,6 +42,10 @@ jobs:
         run: |
           mise run install
           "$KURU_INSTALL_DIR/kuru" --version
+      - name: Verify installed offline runtime
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru
+        run: mise run //apps/kuru-tui:test:embedded-runtime
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-${{ matrix.os }}
@@ -90,6 +94,10 @@ jobs:
           git diff --exit-code --name-only HEAD
       - name: Verify native Dolt memory
         run: mise run //packages/kuru-memory:test
+      - name: Verify packaged offline runtime
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru
+        run: mise run //apps/kuru-tui:test:embedded-runtime
 
   native-platform:
     name: Native platform primitives (Windows)

@@ -14,6 +14,22 @@ File publication validates the candidate against the destination's access policy
 before moving it. Directory moves require matching policies; changing a
 directory's access policy is a separate, explicit operation.
 
+On Windows, close destination data handles before replacement and all descendant
+data handles before a directory move. Keep lifecycle locks beside the directory
+being moved, so their ownership survives publication. Movable handles permit
+delete sharing; they do not remove these native restrictions. A failed native
+move still requires identity reconciliation before another attempt.
+
+Private Windows roots explicitly belong to the current token user. Ordinary
+descendants can receive a different default token owner under elevation. New
+private ACLs therefore include an inheritable zero-access OWNER RIGHTS entry,
+which suppresses the owner's implicit access. Validation accepts that alternate
+owner only when it exactly matches the current token's default owner and this
+suppression is effective. Positive grants still belong only to the token user;
+existing unsafe ACLs are rejected without repair. See Microsoft's
+[ownership rules](https://learn.microsoft.com/en-us/windows/win32/secauthz/owner-of-a-new-object)
+and [OWNER RIGHTS semantics](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-special-identities-groups#owner-rights).
+
 Windows processes receive explicit executable, argument, environment, stdio and
 lifetime descriptions. Owned jobs are assigned during process creation and retain
 the process tree through cleanup. A trusted supervisor has an explicit separate

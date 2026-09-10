@@ -1,22 +1,23 @@
 //! Bounded, private installation of the exact supported full-Dolt engine.
 
 pub use crate::catalog::DOLT_VERSION;
-use crate::catalog::{Asset, MAX_COMPRESSED, MAX_EXPANDED, host_asset};
+use crate::catalog::{Asset, BUNDLED_ASSET, EMBEDDED_ARCHIVE, MAX_COMPRESSED, MAX_EXPANDED};
 use anyhow::{Context, Result, bail, ensure};
 use flate2::bufread::GzDecoder;
 use kuru_core::MemoryConfig;
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::HashSet,
     fs::{self, File, OpenOptions, TryLockError},
-    io::{BufReader, Cursor, Read, Write},
+    io::{Cursor, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt},
     process::Command,
 };
 
@@ -24,8 +25,9 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTPUT_LIMIT: u64 = 4096;
 
-/// Find or install the pinned engine. An explicit binary still passes the version
-/// guard; automatic cache entries also pass their immutable payload checksums.
+/// Extract the bundled engine or reuse its verified cache, including offline
+/// first use. An explicit development binary still passes the exact version
+/// guard; managed entries also pass their immutable payload checksums.
 pub async fn provision(config: &MemoryConfig, default_cache: &Path) -> Result<PathBuf> {
     if let Some(binary) = &config.dolt_binary {
         checked_regular(binary, true)?;
@@ -39,22 +41,30 @@ pub async fn provision(config: &MemoryConfig, default_cache: &Path) -> Result<Pa
         verify_version(&binary, home.path()).await?;
         return Ok(binary);
     }
-    let asset = host_asset()?;
-    let client = reqwest::Client::builder()
-        .https_only(true)
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(120))
-        .user_agent(concat!("kuru/", env!("CARGO_PKG_VERSION")))
-        .build()?;
-    provision_managed(config, default_cache, asset, &client, asset.url).await
+    provision_managed(
+        config,
+        default_cache,
+        BUNDLED_ASSET,
+        Cow::Borrowed(EMBEDDED_ARCHIVE),
+    )
+    .await
 }
 
 async fn provision_managed(
     config: &MemoryConfig,
     default_cache: &Path,
     asset: Asset<'static>,
-    client: &reqwest::Client,
-    url: &str,
+    archive: Cow<'static, [u8]>,
+) -> Result<PathBuf> {
+    provision_with_extractor(config, default_cache, asset, archive, extract).await
+}
+
+async fn provision_with_extractor(
+    config: &MemoryConfig,
+    default_cache: &Path,
+    asset: Asset<'static>,
+    archive: Cow<'static, [u8]>,
+    extractor: impl FnOnce(&[u8], &Path, Asset<'static>) -> Result<()> + Send + 'static,
 ) -> Result<PathBuf> {
     let cache = config.cache_dir.as_deref().unwrap_or(default_cache);
     private_directory(cache)?;
@@ -76,25 +86,17 @@ async fn provision_managed(
         fs::symlink_metadata(&destination).is_err(),
         "Dolt cache destination is not a new directory"
     );
-    ensure!(
-        !config.offline,
-        "Dolt {DOLT_VERSION} is not cached at {}; run once online or configure memory.dolt_binary",
-        destination.display()
-    );
     let staging = tempfile::Builder::new()
         .prefix(".install-")
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(&versions)?;
-    let archive = staging.path().join("download.tar.gz");
-    download(client, url, &archive, asset).await
-        .context("download pinned Dolt runtime; an existing cache or memory.dolt_binary supports offline use")?;
     let candidate = staging.path().join("runtime");
     let candidate_path = candidate.clone();
-    let (staging, extraction) = tokio::task::spawn_blocking(move || {
-        let result = extract(&archive, &candidate_path, asset);
-        // Retain temporary-directory ownership until the worker exits, even if
-        // the calling future is cancelled during decompression.
-        (staging, result)
+    let (staging, _lock, extraction) = tokio::task::spawn_blocking(move || {
+        let result = extractor(&archive, &candidate_path, asset);
+        // Keep the stage and stable lock until the worker exits, even if its
+        // caller is cancelled. Drop the stage before releasing the lock.
+        (staging, _lock, result)
     })
     .await?;
     extraction?;
@@ -126,60 +128,26 @@ async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
     Ok(binary)
 }
 
-async fn download(
-    client: &reqwest::Client,
-    url: &str,
-    output: &Path,
-    asset: Asset<'_>,
-) -> Result<()> {
+fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
     ensure!(
-        asset.compressed_bytes <= MAX_COMPRESSED,
+        asset.compressed_bytes > 0 && asset.compressed_bytes <= MAX_COMPRESSED,
         "pinned Dolt archive exceeds compressed byte budget"
     );
-    let mut response = client.get(url).send().await?.error_for_status()?;
     ensure!(
-        response
-            .content_length()
-            .is_none_or(|length| length == asset.compressed_bytes),
-        "Dolt archive Content-Length does not match the pinned asset"
+        archive.len() as u64 == asset.compressed_bytes,
+        "bundled Dolt archive size does not match its pin"
     );
-    let mut file = tokio::fs::File::from_std(new_private_file(output)?);
-    let mut digest = Sha256::new();
-    let mut size = 0_u64;
-    while let Some(chunk) = response.chunk().await? {
-        size = size
-            .checked_add(chunk.len() as u64)
-            .context("Dolt archive size overflow")?;
-        ensure!(
-            size <= asset.compressed_bytes && size <= MAX_COMPRESSED,
-            "Dolt archive exceeds pinned size"
-        );
-        digest.update(&chunk);
-        file.write_all(&chunk).await?;
-    }
-    ensure!(size == asset.compressed_bytes, "Dolt archive is truncated");
     ensure!(
-        hex_digest(&digest.finalize()) == asset.archive_sha256,
-        "Dolt archive checksum mismatch; no payload was executed"
+        hex_digest(&Sha256::digest(archive)) == asset.archive_sha256,
+        "bundled Dolt archive checksum mismatch; no payload was executed"
     );
-    file.sync_all().await?;
-    Ok(())
-}
-
-fn extract(archive_path: &Path, destination: &Path, asset: Asset<'_>) -> Result<()> {
-    verify_payload(
-        archive_path,
-        asset.compressed_bytes,
-        asset.archive_sha256,
-        false,
-    )?;
     ensure!(
         asset.expanded_bytes <= MAX_EXPANDED,
         "pinned Dolt archive exceeds expanded byte budget"
     );
     // Bound decompression before tar sees extension headers or payload lengths.
     let mut expanded = Vec::new();
-    let mut decoder = GzDecoder::new(BufReader::new(open_regular(archive_path)?));
+    let mut decoder = GzDecoder::new(Cursor::new(archive));
     (&mut decoder)
         .take(asset.expanded_bytes + 1)
         .read_to_end(&mut expanded)?;
@@ -188,7 +156,7 @@ fn extract(archive_path: &Path, destination: &Path, asset: Asset<'_>) -> Result<
         "Dolt expanded archive size does not match its pin"
     );
     ensure!(
-        decoder.into_inner().read(&mut [0_u8; 1])? == 0,
+        Read::read(&mut decoder.into_inner(), &mut [0_u8; 1])? == 0,
         "Dolt archive contains trailing compressed data"
     );
     private_directory(destination)?;

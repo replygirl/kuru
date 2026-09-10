@@ -175,6 +175,33 @@ fn checked_publication_preserves_occupied_targets_then_replaces_atomically() {
         fs::read(directory.path().join("published")).unwrap(),
         b"old bytes"
     );
+    #[cfg(windows)]
+    {
+        // Movable grants delete sharing; native write-through replacement still
+        // requires the destination to have no outstanding data handles.
+        let old_identity = regular_file_info(&old).unwrap().identity;
+        let error = directory
+            .publish_file(
+                &directory,
+                OsStr::new("candidate"),
+                &new,
+                OsStr::new("published"),
+                Publication::ReplaceRegular,
+            )
+            .unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert_eq!(error.source_identity, Some(identity));
+        directory.verify(OsStr::new("published"), &old).unwrap();
+        directory.verify(OsStr::new("candidate"), &new).unwrap();
+        assert_eq!(regular_file_info(&old).unwrap().identity, old_identity);
+        assert_eq!(fs::read(&error.destination).unwrap(), b"old bytes");
+        assert_eq!(
+            fs::read(directory.path().join("candidate")).unwrap(),
+            b"new bytes"
+        );
+        old.rewind().unwrap();
+        assert_eq!(contents(old), b"old bytes");
+    }
     directory
         .publish_file(
             &directory,
@@ -195,8 +222,11 @@ fn checked_publication_preserves_occupied_targets_then_replaces_atomically() {
         b"new bytes"
     );
     assert!(!directory.path().join("candidate").exists());
-    old.rewind().unwrap();
-    assert_eq!(contents(old), b"old bytes");
+    #[cfg(unix)]
+    {
+        old.rewind().unwrap();
+        assert_eq!(contents(old), b"old bytes");
+    }
 }
 
 #[test]
@@ -275,7 +305,11 @@ fn directory_substitution_invalidates_previously_held_authority() {
     let (temporary, directory) = fixture();
     let mut file = directory.create_new(OsStr::new("record")).unwrap();
     file.write_all(b"original").unwrap();
+    #[cfg(windows)]
+    drop(file); // Native directory moves require closed descendant data handles.
     fs::rename(directory.path(), temporary.path().join("retired")).unwrap();
+    #[cfg(windows)]
+    let file = File::open(temporary.path().join("retired/record")).unwrap();
     let replacement = Directory::ensure_private(directory.path()).unwrap();
     replacement
         .create_new(OsStr::new("record"))
@@ -333,10 +367,18 @@ fn directory_moves_do_not_implicitly_convert_privacy_in_either_direction() {
 fn real_process_lock_contention_survives_directory_publication() {
     let (_temporary, parent) = fixture();
     let source = Directory::ensure_private(&parent.path().join("stage")).unwrap();
-    let lock = source.lock_file(OsStr::new("lifecycle.lock")).unwrap();
+    source
+        .create_new(OsStr::new("record"))
+        .unwrap()
+        .write_all(b"closed candidate")
+        .unwrap();
+    // Lifecycle ownership is stable outside the stopped candidate being moved.
+    // An open descendant would prevent a native Windows directory rename.
+    let lock = parent.lock_file(OsStr::new("lifecycle.lock")).unwrap();
     lock.try_lock().unwrap();
-    source.verify(OsStr::new("lifecycle.lock"), &lock).unwrap();
-    assert_eq!(lock_attempt(source.path()), "busy\n");
+    let lock_identity = regular_file_info(&lock).unwrap().identity;
+    parent.verify(OsStr::new("lifecycle.lock"), &lock).unwrap();
+    assert_eq!(lock_attempt(parent.path()), "busy\n");
     let occupied = Directory::ensure_private(&parent.path().join("occupied")).unwrap();
     let error = parent
         .move_new_directory(&source, OsStr::new("occupied"))
@@ -347,10 +389,15 @@ fn real_process_lock_contention_survives_directory_publication() {
         .move_new_directory(&source, OsStr::new("active"))
         .unwrap();
     assert_eq!(moved.identity(), source.identity());
-    moved.verify(OsStr::new("lifecycle.lock"), &lock).unwrap();
-    assert_eq!(lock_attempt(moved.path()), "busy\n");
+    assert_eq!(
+        contents(moved.read(OsStr::new("record")).unwrap()),
+        b"closed candidate"
+    );
+    parent.verify(OsStr::new("lifecycle.lock"), &lock).unwrap();
+    assert_eq!(regular_file_info(&lock).unwrap().identity, lock_identity);
+    assert_eq!(lock_attempt(parent.path()), "busy\n");
     drop(lock);
-    assert_eq!(lock_attempt(moved.path()), "acquired\n");
+    assert_eq!(lock_attempt(parent.path()), "acquired\n");
 }
 
 #[cfg(all(unix, feature = "test-support"))]

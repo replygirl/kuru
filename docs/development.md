@@ -67,6 +67,70 @@ that observe peer routing, context isolation, persistence, bounded failure,
 protocol payloads and real CLI output. Live authenticated-provider checks are
 separate from deterministic fixture tests and must be reported accurately.
 
+## Bundled engine build inputs
+
+Every Kuru executable contains its target's pinned full-Dolt archive and license
+notices. Installed applications extract this engine locally, including on a
+first offline launch. The archive is a build input; memory provisioning never
+downloads it at runtime.
+
+`packages/kuru-memory/support/dolt-assets.json` owns the exact version, target,
+upstream URL, sizes and digests. The memory package's `bundle:prepare` task invokes
+the independent Rust delivery helper to download and verify that input. Ordinary
+mise build, run, test and check tasks prepare their inputs through dependencies.
+To prepare explicitly:
+
+```sh
+mise run //packages/kuru-memory:bundle:prepare
+mise run //apps/kuru-tui:build:release
+```
+
+The default cache is `target/kuru-bundles` at the workspace root. Each archive is
+named `<archive_sha256>.archive`. `KURU_DOLT_BUNDLE_DIR` selects another absolute
+directory for both preparation and compilation. Valid files are reverified and
+reused; corrupt or unsafe entries fail without replacement. This build cache is
+separate from the installed application's extracted `memory.cache_dir`.
+
+Choose a supported target explicitly when preparing or building for it:
+
+```sh
+mise run //packages/kuru-memory:bundle:prepare -- --target x86_64-unknown-linux-gnu
+mise run //apps/kuru-tui:build:release -- --target x86_64-unknown-linux-gnu
+```
+
+The default target is the host; `CARGO_BUILD_TARGET` also selects the consumer
+target. Preparation runs its helper on the build host and never executes the
+selected archive. Cross-compilation still requires the appropriate Rust target
+and platform linker. Unsupported targets fail without substituting a host archive.
+
+For an offline source build, obtain the matching pinned archive from the manifest
+and import it into a writable build-input cache:
+
+```sh
+KURU_DOLT_BUNDLE_DIR=/absolute/path/to/build-inputs \
+  mise run //packages/kuru-memory:bundle:prepare -- \
+  --target x86_64-unknown-linux-gnu \
+  --archive /absolute/path/to/dolt-linux-amd64.tar.gz --offline
+
+KURU_DOLT_BUNDLE_DIR=/absolute/path/to/build-inputs \
+KURU_DOLT_BUNDLE_OFFLINE=true \
+  mise run //apps/kuru-tui:build:release -- --target x86_64-unknown-linux-gnu
+```
+
+Local imports receive the same size and checksum validation as downloads. The
+build-only `KURU_DOLT_BUNDLE_ARCHIVE` variable also supplies a local archive;
+`KURU_DOLT_BUNDLE_OFFLINE=true` refuses missing prepared inputs without downloading.
+These settings govern engine preparation, so prepare the pinned Rust toolchain
+and Cargo dependencies separately before going offline.
+
+Cargo's build script selects by `TARGET`, verifies local bytes again and copies
+those verified bytes into its output. It does not download or execute an engine.
+Direct Cargo builds therefore require prior preparation; missing or corrupt
+inputs fail with the matching mise command. Use
+`bash scripts/install.sh --source` for source installation: it prepares Rust and
+the bundled input through mise, then installs the complete executable. See
+[installation](install.md#build-from-source) for requirements and destinations.
+
 ## Change workflow
 
 ```sh
@@ -158,12 +222,15 @@ and publication; [installation and updates](install.md) covers using releases.
 
 ## Tests without credentials
 
-Memory tests use actual full Dolt. `packages/kuru-memory` owns the verified engine
-prefetch, supervisor fixture and integration checks. Runtime/TUI test tasks depend
-on those fixtures; missing engines fail tests. Run
-`mise run //packages/kuru-memory:prefetch` to populate the test cache ahead of an
-offline run. Test helpers use isolated stores and a shared verified temporary
-cache, never the user's memory. The test runner uses two threads and limits
+Memory tests use actual full Dolt. `packages/kuru-memory` owns bundled extraction,
+the supervisor fixture and integration checks. Runtime/TUI test tasks depend on
+those fixtures. `mise run //packages/kuru-memory:prefetch` extracts and verifies
+the embedded engine into the shared test cache. Its build dependency prepares
+the archive as described above, downloading it only when needed and permitted.
+Cold-cache tests
+also exercise first offline extraction, so a populated cache is not a runtime
+prerequisite. Test helpers use isolated stores, never the user's memory.
+The test runner uses two threads and limits
 simultaneous temporary servers. Do not replace these fixtures with SQLite or
 exclude memory modules from coverage.
 

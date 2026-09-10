@@ -1,6 +1,6 @@
 # Installation & updates
 
-Kuru ships native executables for macOS and Linux. Install with mise or the shell bootstrap, then run `kuru`.
+Kuru ships native executables for macOS and Linux, with the verified full-Dolt engine and its licenses included. Install with mise or the shell bootstrap, then run `kuru`.
 
 ## Install with mise
 
@@ -55,7 +55,7 @@ Continue with [your first conversation](./first-conversation) or [authentication
 | Linux  | ARM64         | `aarch64-unknown-linux-gnu` |
 | Linux  | x86-64        | `x86_64-unknown-linux-gnu`  |
 
-Linux archives are built on Ubuntu 24.04 and need a compatible glibc. Build from source on older Linux systems or musl distributions. `--target` overrides the bootstrap's host detection with one of these targets.
+Linux archives are built on Ubuntu 24.04 and need a compatible glibc. Linux support uses GNU targets; musl targets are not supported. `--target` overrides the bootstrap's host detection with one of these targets.
 
 ## Release archives and mirrors
 
@@ -76,15 +76,15 @@ bash /tmp/kuru-install.sh --version 0.1.0 --release-base /path/to/release-files
 
 ## Build from source
 
-Install Rust 1.98.1 and a C compiler, then:
+Install mise, a C compiler for the legacy SQLite importer, and standard platform build tools, then:
 
 ```sh
 git clone https://github.com/replygirl/kuru.git
 cd kuru
-cargo install --path apps/kuru-tui --locked
+bash scripts/install.sh --source
 ```
 
-Cargo installs into `$CARGO_HOME/bin`, normally `~/.cargo/bin`. Add that directory to your `PATH` if needed. The legacy SQLite importer is built with the application; live memory uses the verified native Dolt runtime provisioned on first use.
+The source installer prepares the pinned Rust toolchain and verified engine archive through package-owned mise tasks, then installs the complete executable into `~/.local/bin`. Add that directory to your `PATH` if needed.
 
 To choose another destination:
 
@@ -92,7 +92,21 @@ To choose another destination:
 KURU_INSTALL_DIR="$HOME/.local/bin" bash scripts/install.sh --source
 ```
 
-The source installer builds the locked release profile and replaces the executable atomically. It refuses a symlink or directory at the destination and uses the current checkout revision. From a configured maintainer checkout, `mise run install` performs the same source installation. Binary installation does not require the repository's maintainer tools.
+The source installer builds the locked release profile for the current host and replaces the executable atomically. It refuses a symlink or directory at the destination and uses the current checkout revision. From a configured maintainer checkout, `mise run install` performs the same source installation. Source installation prepares only its required tooling; it does not require the full maintainer setup.
+
+### Prepare engine build inputs
+
+Ordinary mise build tasks prepare the engine archive automatically. To import a pinned archive for an offline build:
+
+```sh
+mise run //packages/kuru-memory:bundle:prepare -- \
+  --target x86_64-unknown-linux-gnu \
+  --archive /absolute/path/to/dolt-linux-amd64.tar.gz --offline
+```
+
+Select your target and its matching archive from `packages/kuru-memory/support/dolt-assets.json`. Imported bytes receive the same size and checksum verification as downloads. `KURU_DOLT_BUNDLE_DIR` selects an absolute build-input cache for preparation and compilation; `KURU_DOLT_BUNDLE_OFFLINE=true` prevents preparation from downloading missing archives. The Rust toolchain and Cargo dependencies also need to be available before building offline.
+
+Cargo embeds verified local input for its actual target and never downloads an engine itself. Prepare that input before a direct Cargo build. See the [developer build-input guide](https://github.com/replygirl/kuru/blob/main/docs/development.md#bundled-engine-build-inputs) for explicit target builds and mirrors. Installed Kuru extracts its bundled engine locally, so a first offline demo conversation needs no build cache or compiler.
 
 ## Updating {#update-deliberately}
 

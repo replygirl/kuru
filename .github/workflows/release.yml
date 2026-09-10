@@ -156,6 +156,10 @@ jobs:
           mise run //apps/kuru-tui:build:release -- --target "$RELEASE_TARGET"
           test "$("target/$RELEASE_TARGET/release/kuru" --version)" = "kuru $RELEASE_VERSION"
           mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
+      - name: Verify packaged offline runtime
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru
+        run: mise run //apps/kuru-tui:test:embedded-runtime
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}

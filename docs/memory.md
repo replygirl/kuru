@@ -17,16 +17,20 @@ committed memory updates. These commands do not expose database credentials.
 
 ## Runtime and offline use
 
-On first memory use Kuru downloads the pinned native Dolt release, verifies the
-archive and executable, and preserves its license notices. No compiler or manual
-server setup is required. The cache is `tools/dolt` inside the Kuru data directory;
-`memory.cache_dir` selects another location. Subsequent runs use the verified cache.
+Every Kuru executable includes the pinned native Dolt archive and its license
+notices. First memory use verifies and extracts those bytes locally; it needs no
+network, compiler or separate engine installation. The cache is `tools/dolt`
+inside the Kuru data directory; `memory.cache_dir` selects another location.
+Subsequent runs verify and reuse the extracted engine. Corrupt existing caches
+fail explicitly and remain preserved for inspection.
 
-For offline startup, first run Kuru while online or install the supported full-Dolt
-executable separately and set `memory.dolt_binary`. Set `memory.offline = true` to
-prevent runtime downloads. The exact supported engine version and platform pins
-live in `packages/kuru-memory/src/catalog.rs`. Provider access is configured
-independently; `--provider demo` needs no inference service.
+`memory.offline` remains accepted for configuration compatibility; bundled engine
+provisioning always works offline. An explicit `memory.dolt_binary` is an optional
+development override and must report the supported exact version. The authoritative
+engine and platform pins live in `packages/kuru-memory/support/dolt-assets.json`.
+Provider access is configured independently; `--provider demo` needs no inference
+service. Build-time preparation is described in
+[development](development.md#bundled-engine-build-inputs).
 
 Fresh `--help`, `--version`, `config` and `update` do not provision a memory engine.
 Reading saved project preferences requires an existing store. See

@@ -1,13 +1,13 @@
 ## 1. Build inputs
 
-- [ ] 1.1 Consolidate the authoritative memory asset manifest and add native delivery preparation with local/offline input support; verify corrupt, missing, mismatched and concurrent prepared input behavior.
-- [ ] 1.2 Add a local-only TARGET-aware memory build script and mise preparation dependencies; verify a clean mise build and explicit Cargo failure for missing/corrupt target input.
+- [x] 1.1 Consolidate the authoritative memory asset manifest and add native delivery preparation with local/offline input support; verify corrupt, missing, mismatched and concurrent prepared input behavior.
+- [x] 1.2 Add a local-only TARGET-aware memory build script and mise preparation dependencies; verify a clean mise build and explicit Cargo failure for missing/corrupt target input.
 
 ## 2. Complete runtime
 
-- [ ] 2.1 Replace runtime downloads with embedded-byte extraction while retaining existing cache, license, version and cancellation safeguards; run actual-engine and adversarial provisioning tests.
-- [ ] 2.2 Route source install and native build/package workflows through target preparation; exercise packaged offline chat/reopen and native installer/update roundtrips with empty caches.
-- [ ] 2.3 Update AGENTS.md and owning installation/development/memory guides; review every install path for a single Kuru dependency contract and remove stale runtime-download instructions.
+- [x] 2.1 Replace runtime downloads with embedded-byte extraction while retaining existing cache, license, version and cancellation safeguards; run actual-engine and adversarial provisioning tests.
+- [x] 2.2 Route source install and native build/package workflows through target preparation; exercise packaged offline chat/reopen and native installer/update roundtrips with empty caches.
+- [x] 2.3 Update AGENTS.md and owning installation/development/memory guides; review every install path for a single Kuru dependency contract and remove stale runtime-download instructions.
 
 ## 3. Integration and completion
 
