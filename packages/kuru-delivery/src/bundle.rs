@@ -233,9 +233,11 @@ async fn prepare_asset(
         options.archive.is_some() || !options.offline,
         "prepared bundle is missing in offline mode; import the pinned archive with --archive"
     );
-    let mut staging = tempfile::Builder::new()
-        .prefix(".bundle-")
-        .tempfile_in(directory.path())?;
+    // The platform creates the file with the native access needed to seal its
+    // DACL. A generic tempfile handle has write access but not WRITE_DAC on Windows.
+    let stage = crate::staging::Stage::create(&directory.native, ".bundle-")?;
+    let staged_name = OsStr::new("archive");
+    let mut staging = stage.directory().create_new(staged_name)?;
     if let Some(path) = &options.archive {
         let (source, name) = input_parent(path).context("open local archive directory")?;
         let mut file = source.read(&name, false).context("open local archive")?;
@@ -268,37 +270,31 @@ async fn prepare_asset(
             .https_only(true)
             .timeout(Duration::from_secs(120))
             .build()?;
-        download(
-            client.unwrap_or(&default_client),
-            asset,
-            staging.as_file_mut(),
-        )
-        .await?;
+        download(client.unwrap_or(&default_client), asset, &mut staging).await?;
     }
-    seal_private(staging.as_file(), false)?;
-    staging.as_file().sync_all()?;
+    seal_private(&staging, false)?;
+    staging.sync_all()?;
     directory
         .revalidate()
         .context("verify cache directory before publication")?;
     directory.verify(OsStr::new(LOCK_NAME), &lock, true)?;
-    let staged_name = staging
-        .path()
-        .file_name()
-        .context("missing staged bundle filename")?;
-    directory
-        .verify(staged_name, staging.as_file(), true)
+    stage
+        .directory()
+        .verify(staged_name, &staging)
         .context("verify staged archive before publication")?;
     directory
         .native
         .publish_file(
-            &directory.native,
+            stage.directory(),
             staged_name,
-            staging.as_file(),
+            &staging,
             OsStr::new(&name),
             Publication::New,
         )
         .context("publish prepared bundle without replacement")?;
-    directory.verify(OsStr::new(&name), staging.as_file(), true)?;
+    directory.verify(OsStr::new(&name), &staging, true)?;
+    drop(staging);
+    stage.finish()?;
     Ok(destination)
 }
 
@@ -606,7 +602,8 @@ mod tests {
                     .filter_map(Result::ok)
                     .any(|entry| {
                         entry.file_name().to_string_lossy().starts_with(".bundle-")
-                            && entry.metadata().unwrap().len() == 4
+                            && fs::metadata(entry.path().join("archive"))
+                                .is_ok_and(|metadata| metadata.len() == 4)
                     });
                 if staged {
                     break;

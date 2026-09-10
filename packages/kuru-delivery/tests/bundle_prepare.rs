@@ -101,6 +101,11 @@ async fn local_import_is_private_exact_and_valid_cache_is_reused_offline() {
     assert_eq!(fs::read(&prepared).unwrap(), fixture.bytes);
     assert_eq!(prepared.file_name(), fixture.output().file_name());
     kuru_platform::fs::require_private(&File::open(&prepared).unwrap()).unwrap();
+    #[cfg(windows)]
+    assert!(
+        File::options().write(true).open(&prepared).is_err(),
+        "published build input must retain its sealed read-only DACL"
+    );
     kuru_platform::fs::Directory::open(
         &fixture.cache,
         kuru_platform::fs::Privacy::OwnerOnly,

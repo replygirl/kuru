@@ -309,3 +309,42 @@ checking, docs/cospec validation and ordinary plus instrumented behavior passed.
 The log is `/tmp/kuru-native-corrections-check.log`. The corrected Windows
 image, command, bundle-path and updater behavior still requires native CI;
 this local pass does not satisfy those acceptance rows.
+
+## Native results and delivery corrections after a268ad9
+
+GitHub CI run `34538076381` at exact commit
+`a268ad9c30783cb300274ca9f2ccecabd860d90f` completed with all four Unix jobs and
+Windows primitives passing; the full Windows job and required aggregate failed.
+Windows primitives passed 52 ordinary and 52 instrumented cases, including real
+loaded-image move/replacement identities, ordinary separator conversion and raw
+UTF-16 preservation. Native platform coverage was 2,590/2,839 lines (91.2293%).
+Ubuntu workspace coverage was 14,293/14,720 lines (97.0992%); its full check,
+source installation and installed offline-runtime probe passed. The native
+Windows connector suite passed 29 unit and five integration tests. Evidence is
+in `/tmp/kuru-windows-a268ad9-results.md` and the corresponding native job logs.
+
+Full Windows then exposed missing WRITE_DAC access on generic temporary archive
+handles and a stock PowerShell startup failure on configured launches. Bundle
+preparation now uses the existing checked private Stage/Directory constructor.
+The command boundary avoids introducing verbatim executable/cwd syntax when a
+valid ordinary UTF-16 spelling resolves to exactly the same canonical target;
+long, ambiguous and special spellings retain their original form. A new native
+regression compares direct and configured PowerShell launches with identical
+minimal environments and requires actual Framework initialization and a script
+marker. Another protects distinct trailing-dot targets.
+
+Bootstrap fixtures now require cause-specific rejection or the actual archive
+verification marker. Its preexisting cancellation test did reach that marker;
+it was not an early-startup false pass. The corrupt-helper fixture now substitutes
+a checked object while retaining and restoring the sealed original identity,
+instead of attempting to write a correctly read-only helper. The docs fixture
+keeps its exact rejection assertion using native path separators.
+
+Scoped macOS checks passed three bundle transport/cancellation/lock units, nine
+bundle preparation integration cases, 13 docs validation cases and strict host
+delivery Clippy. Platform Windows-target strict Clippy passed. These corrections
+still require actual Windows bundle sealing, PowerShell, installation/updating,
+memory and ConPTY execution; none of those acceptance rows is checked by local
+cross-compilation. See `/tmp/kuru-native-delivery-a268-corrections.md` and
+`/tmp/kuru-docs-native-path-tests.log`. The concurrent `parallel-quality-gates`
+change changes scheduling, retaining the native behavior and coverage gates.

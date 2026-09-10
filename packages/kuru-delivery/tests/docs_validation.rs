@@ -192,9 +192,17 @@ fn repository_only_pages_and_private_artifacts_fail() {
         ".codex/auth.json",
     ] {
         let path = site.write(name, "fixture only");
+        // Discovery joins native directory entries; these inputs use URL-style
+        // separators to describe the fixture on every host.
+        let relative: PathBuf = Path::new(name).components().collect();
+        let expected = format!(
+            "{}: repository-only or private artifact",
+            relative.display()
+        );
+        let errors = site.errors();
         assert!(
-            site.errors()
-                .contains(&format!("{name}: repository-only or private artifact"))
+            errors.contains(&expected),
+            "missing exact private-artifact rejection {expected:?} for {name:?}: {errors:?}"
         );
         fs::remove_file(path).unwrap();
     }

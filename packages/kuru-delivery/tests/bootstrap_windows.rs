@@ -7,7 +7,10 @@ use kuru_delivery::{
     command::{Command, output},
 };
 use kuru_platform::{
-    fs::{Directory, NameRetention, Privacy, regular_file_info, require_private},
+    fs::{
+        Directory, NameRetention, Privacy, Publication, regular_file_info, require_private,
+        seal_private,
+    },
     windows::{
         pipe::Pipe,
         process::{NativeChild, NativeSpawnSpec, Stdio, system_directory},
@@ -15,7 +18,8 @@ use kuru_platform::{
 };
 use std::{
     ffi::{OsStr, OsString},
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Output,
     time::Duration,
@@ -338,25 +342,45 @@ async fn default_install_destination_uses_local_app_data_programs_and_recover_ne
 #[tokio::test]
 async fn malformed_manifest_hash_and_zip_fail_before_changing_existing_native_identity() {
     let fixture = Fixture::new();
+    // A bootstrap startup failure cannot satisfy any rejection below. Exercise
+    // the same process path successfully against a separate destination first.
+    let control = fixture.root.path().join("valid control");
+    success(
+        &fixture
+            .run(fixture.command().arg("-InstallDir").arg(&control))
+            .await,
+    );
+    fixture.installed(&control);
     let identity = regular_file_info(&fs::File::open(fixture.install.join("kuru.exe")).unwrap())
         .unwrap()
         .identity;
     let original_manifest = fs::read(fixture.release.join("SHA256SUMS")).unwrap();
     let mut duplicate = original_manifest.clone();
     duplicate.extend_from_slice(&original_manifest);
-    for manifest in [
-        b"not a checksum\n".to_vec(),
-        duplicate,
-        vec![b'x'; 65537],
-        original_manifest
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| if index < 64 { b'0' } else { *byte })
-            .collect(),
+    for (manifest, diagnostic) in [
+        (b"not a checksum\n".to_vec(), "Malformed checksum manifest"),
+        (
+            duplicate,
+            "Checksum manifest must name the release archive exactly once",
+        ),
+        (vec![b'x'; 65537], "exceeds"),
+        (
+            original_manifest
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| if index < 64 { b'0' } else { *byte })
+                .collect(),
+            "Release archive checksum mismatch",
+        ),
     ] {
         fs::write(fixture.release.join("SHA256SUMS"), manifest).unwrap();
         let result = fixture.run(&mut fixture.command()).await;
         assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(diagnostic),
+            "unexpected rejection: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         fixture.unchanged();
     }
     let members = || {
@@ -417,6 +441,11 @@ async fn malformed_manifest_hash_and_zip_fail_before_changing_existing_native_id
         fixture.replace_archive(&malformed);
         let result = fixture.run(&mut fixture.command()).await;
         assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("Verifying Kuru release archive."),
+            "ZIP validation was never reached: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
         fixture.unchanged();
         assert_eq!(
             regular_file_info(&fs::File::open(fixture.install.join("kuru.exe")).unwrap())
@@ -446,6 +475,11 @@ async fn aliases_hardlinks_private_acl_and_busy_install_lease_fail_closed() {
     fs::hard_link(fixture.install.join("kuru.exe"), &other).unwrap();
     let result = fixture.run(&mut fixture.command()).await;
     assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("hard-linked files are forbidden"),
+        "hardlink validation was not reached: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert_eq!(fs::read(&other).unwrap(), fixture.original);
     fs::remove_file(other).unwrap();
     fixture.unchanged();
@@ -645,6 +679,7 @@ async fn killing_actual_bootstrap_during_large_verified_archive_work_keeps_old_b
         "Verifying Kuru release archive."
     );
     assert!(child.try_wait().unwrap().is_none());
+    assert!(fixture.install.join(".kuru-update/install.lock").is_file());
     terminate(&mut child, &mut stdout, &mut stderr).await;
     fixture.unchanged();
     let state = Directory::open(
@@ -691,7 +726,32 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
     let helper = Path::new(receipt["helper"].as_str().unwrap());
     let mut corrupt = fixture.original.clone();
     corrupt[0] ^= 1;
-    fs::write(helper, &corrupt).unwrap();
+    // The real cached helper is deliberately sealed. Preserve that object,
+    // present a private corrupt substitute, then restore its original identity;
+    // do not grant write access to an immutable trusted executable for a test.
+    let cache = Directory::open(
+        helper.parent().unwrap(),
+        Privacy::OwnerOnly,
+        NameRetention::Pinned,
+    )
+    .unwrap();
+    let helper_name = helper.file_name().unwrap();
+    let retained_name = OsStr::new("retained-original.exe");
+    let original = cache.read(helper_name).unwrap();
+    cache
+        .rename_file(
+            &cache,
+            helper_name,
+            &original,
+            retained_name,
+            Publication::New,
+        )
+        .unwrap();
+    let mut substituted = cache.create_new(helper_name).unwrap();
+    substituted.write_all(&corrupt).unwrap();
+    seal_private(&substituted, true).unwrap();
+    substituted.sync_all().unwrap();
+    drop(substituted);
     let result = fixture.run(fixture.command().arg("-Recover")).await;
     assert!(!result.status.success());
     assert!(
@@ -699,7 +759,20 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
             .contains("Trusted helper identity or checksum changed")
     );
     assert!(!fixture.install.join("kuru.exe").exists());
-    fs::write(helper, &fixture.original).unwrap();
+    cache
+        .remove_file(helper_name, cache.read(helper_name).unwrap())
+        .unwrap();
+    cache
+        .rename_file(
+            &cache,
+            retained_name,
+            &original,
+            helper_name,
+            Publication::New,
+        )
+        .unwrap();
+    drop(original);
+    drop(cache);
     let result = fixture.run(fixture.command().arg("-Recover")).await;
     success(&result);
     fixture.unchanged();

@@ -167,7 +167,7 @@ pub fn configured_command(
     cwd: &Path,
     environment: Vec<(OsString, OsString)>,
 ) -> io::Result<NativeSpawnSpec> {
-    let cwd = cwd.canonicalize()?;
+    let cwd = launch_path(cwd.canonicalize()?);
     let mut spec = if is_cmd(program, &cwd, &environment)? {
         let separator = args
             .iter()
@@ -213,8 +213,42 @@ pub fn configured_command(
         }
         spec
     };
+    spec.executable = launch_path(spec.executable);
     spec.environment = environment;
     Ok(spec)
+}
+
+// Legacy applications, including Windows PowerShell's .NET Framework host,
+// interpret their own executable/cwd paths. Avoid introducing extended syntax
+// for an ordinary path, but only if resolving that spelling gives exactly the
+// same canonical UTF-16 target. Filesystem authority APIs retain their own form.
+fn launch_path(path: PathBuf) -> PathBuf {
+    let units: Vec<_> = path.as_os_str().encode_wide().collect();
+    let candidate = match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(_) => units[4..].to_vec(),
+            Prefix::VerbatimUNC(_, _) => [vec![b'\\' as u16; 2], units[8..].to_vec()].concat(),
+            _ => return path,
+        },
+        _ => return path,
+    };
+    if candidate.len() >= 260 {
+        return path;
+    }
+    let candidate = PathBuf::from(OsString::from_wide(&candidate));
+    if candidate.components().any(|part| {
+        matches!(part, Component::Normal(name) if crate::fs::validate_component(name).is_err())
+    }) {
+        return path;
+    }
+    if candidate
+        .canonicalize()
+        .is_ok_and(|resolved| resolved == path)
+    {
+        candidate
+    } else {
+        path
+    }
 }
 
 fn validate_switches(switches: &[OsString], literal: bool) -> io::Result<()> {

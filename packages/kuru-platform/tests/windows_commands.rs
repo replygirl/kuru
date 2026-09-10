@@ -1,7 +1,7 @@
 #![cfg(all(windows, feature = "test-support"))]
 
 use kuru_platform::windows::process::{
-    StandardStream, Stdio, configured_command, current_process_handle,
+    NativeSpawnSpec, StandardStream, Stdio, configured_command, current_process_handle,
     duplicate_inherited_process_handle, environment_key_eq, inherited_stdio, merge_environment,
     resolve_executable, system_directory, wait_process_handle,
 };
@@ -167,6 +167,103 @@ async fn command_resolution_and_representability_fail_before_execution() {
     .unwrap();
     source.args.push("ambiguous".into());
     assert!(source.spawn().await.is_err());
+}
+
+#[tokio::test]
+async fn configured_stock_powershell_starts_like_direct_spawn_with_the_same_isolated_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("native shell 日本語");
+    std::fs::create_dir(&cwd).unwrap();
+    let system = system_directory().unwrap();
+    let shell = system.join("WindowsPowerShell/v1.0/powershell.exe");
+    assert!(shell.is_file(), "stock PowerShell 5.1 is required");
+    let marker = cwd.join("script-reached");
+    let mut env: Vec<(OsString, OsString)> = vec![
+        ("SystemRoot".into(), system.parent().unwrap().into()),
+        ("PROCESSOR_ARCHITECTURE".into(), "AMD64".into()),
+        ("PATH".into(), "".into()),
+        ("USERPROFILE".into(), cwd.clone().into()),
+        ("LOCALAPPDATA".into(), cwd.clone().into()),
+        ("TMP".into(), cwd.clone().into()),
+        ("TEMP".into(), cwd.clone().into()),
+        ("KURU_PROBE".into(), marker.clone().into()),
+    ];
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        env.push(("LLVM_PROFILE_FILE".into(), profile));
+    }
+    let args: Vec<OsString> = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        "$ErrorActionPreference='Stop'; if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'requires 5.1' }; $null=[Net.ServicePointManager]::SecurityProtocol; [IO.File]::WriteAllText($env:KURU_PROBE,'reached'); [Console]::WriteLine('ready:5.1')"]
+        .map(Into::into).into();
+    let mut direct = NativeSpawnSpec::new(shell.clone(), cwd.clone());
+    direct.args = args.clone();
+    direct.environment = env.clone();
+    let configured =
+        configured_command(shell.as_os_str(), &args, &cwd.canonicalize().unwrap(), env).unwrap();
+    assert_eq!(
+        configured.executable.canonicalize().unwrap(),
+        shell.canonicalize().unwrap()
+    );
+    assert_eq!(
+        configured.cwd.canonicalize().unwrap(),
+        cwd.canonicalize().unwrap()
+    );
+    for (label, mut spec) in [("direct", direct), ("configured", configured)] {
+        spec.stdout = Stdio::Pipe;
+        spec.stderr = Stdio::Pipe;
+        let mut child = spec.spawn().await.unwrap();
+        let mut stdout = child.take_stdout().unwrap();
+        let mut stderr = child.take_stderr().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut limited_stdout = (&mut stdout).take(65537);
+            let mut limited_stderr = (&mut stderr).take(65537);
+            tokio::try_join!(
+                limited_stdout.read_to_end(&mut out),
+                limited_stderr.read_to_end(&mut err)
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(out.len() <= 65536 && err.len() <= 65536);
+        stdout.close(Duration::from_secs(5)).await.unwrap();
+        stderr.close(Duration::from_secs(5)).await.unwrap();
+        let status = child.wait(Duration::from_secs(5)).await.unwrap();
+        assert!(
+            status.success(),
+            "{label}: {status}; stdout={}; stderr={}",
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&err)
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap().trim(),
+            "ready:5.1",
+            "{label}"
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"reached", "{label}");
+        std::fs::remove_file(&marker).unwrap();
+    }
+}
+
+#[test]
+fn configured_launch_paths_do_not_normalize_a_distinct_verbatim_target() {
+    let root = tempfile::tempdir().unwrap();
+    let ordinary = root.path().join("different");
+    std::fs::create_dir(&ordinary).unwrap();
+    std::fs::write(ordinary.join("peer.exe"), b"ordinary alias").unwrap();
+    let exact = root.path().canonicalize().unwrap().join("different.");
+    std::fs::create_dir(&exact).unwrap();
+    std::fs::write(exact.join("peer.exe"), b"verbatim target").unwrap();
+    let executable = exact.join("peer.exe").canonicalize().unwrap();
+    let spec = configured_command(executable.as_os_str(), &[], &exact, vec![]).unwrap();
+    assert_eq!(spec.executable, executable);
+    assert_eq!(spec.cwd, exact.canonicalize().unwrap());
+    assert_eq!(std::fs::read(spec.executable).unwrap(), b"verbatim target");
+    assert_eq!(
+        std::fs::read(ordinary.join("peer.exe")).unwrap(),
+        b"ordinary alias"
+    );
 }
 
 #[tokio::test]
