@@ -162,9 +162,23 @@ async fn verified_zip_wrong_inventory_modes_and_crc_preserve_previous_image() {
 #[test]
 fn all_five_assets_share_catalog_naming_and_keep_four_ustar_contracts() {
     let root = tempfile::tempdir().unwrap();
-    let binary = Path::new(env!("CARGO_BIN_EXE_kuru-delivery-fixture"));
+    // Cargo's top-level binary aliases have multiple links on Linux. Make that
+    // source shape explicit on every host rather than relying on Cargo's choice.
+    let binary = root.path().join("compiled fixture");
+    fs::copy(env!("CARGO_BIN_EXE_kuru-delivery-fixture"), &binary).unwrap();
+    let alias = root.path().join("cargo alias");
+    fs::hard_link(&binary, &alias).unwrap();
+    let identity = files::identity(&binary);
+    let expected_payload = fs::read(&binary).unwrap();
+    let checked = kuru_platform::fs::Directory::open(
+        root.path(),
+        kuru_platform::fs::Privacy::Inherited,
+        kuru_platform::fs::NameRetention::Movable,
+    )
+    .unwrap();
+    assert!(checked.read(alias.file_name().unwrap()).is_err());
     for target in &targets::CATALOG {
-        let path = archive::package(binary, target.triple, "0.2.0", root.path()).unwrap();
+        let path = archive::package(&alias, target.triple, "0.2.0", root.path()).unwrap();
         assert!(path.ends_with(archive::archive_name("0.2.0", target.triple).unwrap()));
         if target.format == ArchiveFormat::TarGz {
             let input = fs::read(path).unwrap();
@@ -173,8 +187,13 @@ fn all_five_assets_share_catalog_naming_and_keep_four_ustar_contracts() {
                 .entries()
                 .unwrap()
                 .map(|entry| {
-                    let entry = entry.unwrap();
+                    let mut entry = entry.unwrap();
                     assert!(entry.header().entry_type().is_file());
+                    if entry.path_bytes().as_ref() == b"kuru" {
+                        let mut payload = Vec::new();
+                        std::io::Read::read_to_end(&mut entry, &mut payload).unwrap();
+                        assert_eq!(payload, expected_payload);
+                    }
                     (entry.path_bytes().to_vec(), entry.header().mode().unwrap())
                 })
                 .collect();
@@ -186,6 +205,32 @@ fn all_five_assets_share_catalog_naming_and_keep_four_ustar_contracts() {
                     (b"README.md".to_vec(), 0o644)
                 ]
             );
+        } else {
+            let bytes = fs::read(path).unwrap();
+            let expected = ["kuru.exe", "LICENSE", "README.md"].map(|name| MemberSpec {
+                name,
+                kind: MemberKind::File,
+                max_bytes: MAX_ARCHIVE_BYTES as u64,
+                exact_bytes: None,
+                unix_mode: Some(if name == "kuru.exe" {
+                    0o100755
+                } else {
+                    0o100644
+                }),
+            });
+            let mut archive = Archive::open(&bytes, &expected, limits()).unwrap();
+            let mut payload = Vec::new();
+            archive.copy("kuru.exe", &mut payload).unwrap();
+            assert_eq!(payload, expected_payload);
         }
+        assert_eq!(files::identity(&binary), identity);
+        assert_eq!(files::identity(&alias), identity);
+        assert_eq!(fs::read(&binary).unwrap(), expected_payload);
     }
+    assert_eq!(
+        kuru_platform::fs::regular_file_info(&fs::File::open(&binary).unwrap())
+            .unwrap()
+            .links,
+        2
+    );
 }

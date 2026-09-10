@@ -98,10 +98,26 @@ fn write_in(parent: &Directory, name: &OsStr, bytes: &[u8]) -> Result<()> {
 
 /// Preserve a stopped directory's identity through an uncertain native move.
 pub(crate) fn move_directory(source: &Directory, destination: &Path) -> Result<Directory> {
+    move_directory_with(source, destination, |parent, source, name| {
+        parent
+            .move_new_directory(source, name)
+            .map_err(|error| (error.phase, anyhow::Error::from(error)))
+    })
+}
+
+fn move_directory_with(
+    source: &Directory,
+    destination: &Path,
+    publish: impl FnOnce(
+        &Directory,
+        &Directory,
+        &OsStr,
+    ) -> std::result::Result<Directory, (PublicationPhase, anyhow::Error)>,
+) -> Result<Directory> {
     let parent = parent(destination, Privacy::OwnerOnly, NameRetention::Movable)?;
-    match parent.move_new_directory(source, name(destination)?) {
+    match publish(&parent, source, name(destination)?) {
         Ok(moved) => Ok(moved),
-        Err(error) if error.phase == PublicationPhase::Uncertain => {
+        Err((PublicationPhase::Uncertain, error)) => {
             let moved = directory(destination)
                 .with_context(|| format!("uncertain memory directory publication: {error}"))?;
             ensure!(
@@ -114,8 +130,26 @@ pub(crate) fn move_directory(source: &Directory, destination: &Path) -> Result<D
             );
             Ok(moved)
         }
-        Err(error) => Err(error.into()),
+        Err((_, error)) => Err(error),
     }
+}
+
+/// Test-only completion observer after the actual checked native move. A
+/// controlled completion error enters the ordinary identity reconciliation;
+/// the observer never replaces the filesystem operation or runs in production.
+#[cfg(test)]
+pub(crate) fn move_directory_observed(
+    source: &Directory,
+    destination: &Path,
+    observer: impl FnOnce(&Directory) -> Result<()>,
+) -> Result<Directory> {
+    move_directory_with(source, destination, |parent, source, name| {
+        let moved = parent
+            .move_new_directory(source, name)
+            .map_err(|error| (error.phase, anyhow::Error::from(error)))?;
+        observer(&moved).map_err(|error| (PublicationPhase::Uncertain, error))?;
+        Ok(moved)
+    })
 }
 
 /// TempDir owns only the disposable outer container. Private data is created

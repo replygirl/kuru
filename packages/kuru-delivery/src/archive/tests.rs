@@ -373,6 +373,68 @@ fn packaging_requires_a_regular_executable_and_known_target() {
 }
 
 #[test]
+fn local_install_snapshots_linked_build_input_but_rejects_linked_destination() {
+    let fixture = Fixture::new();
+    let binary = fixture._root.path().join("compiled");
+    files::executable(&binary, b"trusted compiled bytes");
+    let alias = fixture._root.path().join("cargo alias");
+    fs::hard_link(&binary, &alias).unwrap();
+    let original = files::identity(&binary);
+    let target = crate::targets::host().unwrap();
+    let installed = install_local(&alias, &fixture.destination, Some(target.triple)).unwrap();
+    assert_eq!(fs::read(&installed).unwrap(), b"trusted compiled bytes");
+    let installed_info = regular_file_info(&File::open(&installed).unwrap()).unwrap();
+    assert_eq!(installed_info.links, 1);
+    assert_ne!(installed_info.identity, original);
+    let installed_alias = fixture._root.path().join("installed alias");
+    fs::hard_link(&installed, &installed_alias).unwrap();
+    let error = install_local(&alias, &fixture.destination, Some(target.triple)).unwrap_err();
+    assert!(format!("{error:#}").contains("hardlink"), "{error:#}");
+    assert_eq!(files::identity(&installed), installed_info.identity);
+    assert_eq!(files::identity(&installed_alias), installed_info.identity);
+    assert_eq!(
+        fs::read(&installed_alias).unwrap(),
+        b"trusted compiled bytes"
+    );
+    assert_eq!(files::identity(&binary), original);
+    assert_eq!(files::identity(&alias), original);
+    assert_eq!(
+        regular_file_info(&File::open(&binary).unwrap())
+            .unwrap()
+            .links,
+        2
+    );
+}
+
+#[test]
+fn build_snapshot_rejects_same_size_mutation_and_replaced_source_name() {
+    for replace_name in [false, true] {
+        let fixture = Fixture::new();
+        let source = fixture._root.path().join("compiled");
+        files::executable(&source, b"old compiled image");
+        let parent = Directory::open(
+            fixture._root.path(),
+            Privacy::Inherited,
+            NameRetention::Movable,
+        )
+        .unwrap();
+        let name = source.file_name().unwrap();
+        let mut input = open_build_input(&parent, name).unwrap();
+        let before = regular_file_info(&input).unwrap();
+        let bytes = bounded(&mut input, MAX_ARCHIVE_BYTES, "test input").unwrap();
+        if replace_name {
+            fs::rename(&source, fixture._root.path().join("retained original")).unwrap();
+        }
+        files::executable(&source, b"new compiled image");
+        assert_eq!(fs::metadata(&source).unwrap().len(), bytes.len() as u64);
+        assert_eq!(files::identity(&source) == before.identity, !replace_name);
+        let error = verify_build_snapshot(&parent, name, &mut input, before, &bytes).unwrap_err();
+        assert!(error.to_string().contains("changed"), "{error:#}");
+        assert_eq!(fs::read(&source).unwrap(), b"new compiled image");
+    }
+}
+
+#[test]
 fn packaging_rejects_hardlinked_outputs_without_modifying_the_input() {
     for checksum in [false, true] {
         let fixture = Fixture::new();

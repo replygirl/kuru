@@ -1106,6 +1106,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn real_directory_move_completion_error_reconciles_identity_before_stage_recovery() {
+        let data = crate::test_support::tempdir().unwrap();
+        let scope = format!("project/{}", "7".repeat(64));
+        let options =
+            crate::test_support::open_options(data.path().to_owned(), scope.clone()).unwrap();
+        let store = MemoryStore::open(options.clone()).await.unwrap();
+        let initial = store.revision().await.unwrap();
+        let active = project_directory(data.path(), &scope).unwrap();
+        store.close().await.unwrap();
+        drop(store);
+        let namespace = cfg!(windows).then(|| data.path().join("memory/lifecycles"));
+        let mut lease =
+            Server::quiescence_at(&active, namespace.as_deref(), Duration::from_secs(5))
+                .await
+                .unwrap();
+        let identity = lease.directory.identity();
+        let marker = fs::read(active.join("ready.json")).unwrap();
+        let occupied = active.with_file_name("unrelated destination café 東京");
+        private_dir(&occupied).unwrap();
+        files::write(&occupied.join("evidence"), b"unrelated retained bytes").unwrap();
+        assert!(files::move_directory(&lease.directory, &occupied).is_err());
+        assert_eq!(files::directory(&active).unwrap().identity(), identity);
+        assert_eq!(
+            fs::read(occupied.join("evidence")).unwrap(),
+            b"unrelated retained bytes"
+        );
+        let stage = active.with_file_name(format!("{}.staging-{}", "7".repeat(64), Uuid::new_v4()));
+        let observed = std::cell::Cell::new(false);
+        lease
+            .move_to_observed(&stage, |moved| {
+                assert_eq!(moved.identity(), identity);
+                assert_eq!(fs::read(moved.path().join("ready.json"))?, marker);
+                assert!(!active.exists());
+                observed.set(true);
+                Err(anyhow::anyhow!(
+                    "fixture completion error after the actual directory move"
+                ))
+            })
+            .unwrap();
+        assert!(
+            observed.get(),
+            "the fixture must cross the actual native move boundary"
+        );
+        assert_eq!(lease.directory.identity(), identity);
+        assert!(
+            Server::quiescence_at(&stage, namespace.as_deref(), Duration::from_millis(20))
+                .await
+                .is_err()
+        );
+        drop(lease);
+        let recovered = MemoryStore::open(options).await.unwrap();
+        assert_eq!(recovered.revision().await.unwrap(), initial);
+        assert_eq!(files::directory(&active).unwrap().identity(), identity);
+        assert!(!stage.exists());
+        assert_eq!(fs::read(active.join("ready.json")).unwrap(), marker);
+        assert_eq!(
+            fs::read(occupied.join("evidence")).unwrap(),
+            b"unrelated retained bytes"
+        );
+        recovered.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn interrupted_activation_reuses_the_committed_stage_and_preserves_incomplete_work() {
         let data = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "f".repeat(64));

@@ -50,8 +50,29 @@ async fn lifecycle_namespace_is_explicit_external_and_bound_to_full_native_ident
     let recreated = Server::quiescence_at(&stage, Some(&namespace), Duration::from_secs(1)).await?;
     assert_ne!(recreated.directory.identity(), identity);
     drop(recreated);
+    let interrupted_parent = root.path().join("interrupted café 東京");
+    private_directory(&interrupted_parent)?;
+    let interrupted = interrupted_parent.join("preserved-stage");
+    owner.move_to(&interrupted)?;
+    assert!(!active.exists());
+    assert_eq!(owner.directory.identity(), identity);
+    assert_eq!(
+        kuru_platform::fs::regular_file_info(&owner.lock)?.identity,
+        lock_identity
+    );
+    assert!(
+        Server::quiescence_at(&interrupted, Some(&namespace), Duration::from_millis(10))
+            .await
+            .is_err()
+    );
     drop(owner);
-    drop(Server::quiescence_at(&active, Some(&namespace), Duration::from_secs(1)).await?);
+    let recovered =
+        Server::quiescence_at(&interrupted, Some(&namespace), Duration::from_secs(1)).await?;
+    assert_eq!(recovered.directory.identity(), identity);
+    assert_eq!(
+        kuru_platform::fs::regular_file_info(&recovered.lock)?.identity,
+        lock_identity
+    );
     Ok(())
 }
 

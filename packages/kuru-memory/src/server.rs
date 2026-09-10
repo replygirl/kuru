@@ -669,6 +669,21 @@ impl LifecycleLease {
         }
         self.verify()
     }
+
+    #[cfg(test)]
+    pub(crate) fn move_to_observed(
+        &mut self,
+        destination: &Path,
+        observer: impl FnOnce(&Directory) -> Result<()>,
+    ) -> Result<()> {
+        self.verify()?;
+        self.directory = files::move_directory_observed(&self.directory, destination, observer)?;
+        #[cfg(unix)]
+        {
+            self.lock_directory = files::directory(self.directory.path())?;
+        }
+        self.verify()
+    }
 }
 
 fn prepare_directory(directory: &Path, read_only: bool) -> Result<()> {
@@ -1337,3 +1352,6 @@ mod tests;
 #[cfg(all(test, windows))]
 #[path = "server/windows_tests.rs"]
 mod windows_tests;
+
+#[cfg(windows)]
+pub(crate) mod windows_fixture;

@@ -31,6 +31,10 @@ const STARTUP: Duration = Duration::from_secs(10);
 const CLEANUP: Duration = Duration::from_secs(10);
 const JSON_LIMIT: usize = 64 * 1024;
 
+// Ordinary callers supply a no-op. Maintainer fixtures observe completed
+// filesystem boundaries without choosing outcomes or changing receipt bytes.
+type Observer = dyn FnMut(&str, &Receipt) -> Result<()> + Send;
+
 #[derive(Debug)]
 pub struct UpdateOutcome {
     pub installed: PathBuf,
@@ -325,6 +329,14 @@ fn checked_parent(receipt: &Receipt) -> Result<Directory> {
 }
 
 fn cleanup(directory: &Directory, receipt: &mut Receipt) -> Result<()> {
+    cleanup_observed(directory, receipt, &mut |_, _| Ok(()))
+}
+
+fn cleanup_observed(
+    directory: &Directory,
+    receipt: &mut Receipt,
+    observer: &mut Observer,
+) -> Result<()> {
     let parent = checked_parent(receipt)?;
     drop(verified(&parent, &receipt.installed, &receipt.replacement)?);
     if !absent(&parent, &receipt.displaced)? {
@@ -338,6 +350,7 @@ fn cleanup(directory: &Directory, receipt: &mut Receipt) -> Result<()> {
             return Ok(());
         }
     }
+    observer("old_removed_before_complete", receipt)?;
     if !absent(directory, &receipt.backup)? {
         let backup = verified(directory, &receipt.backup, &receipt.rollback)?;
         directory.remove_file(OsStr::new(&receipt.backup), backup)?;
@@ -531,12 +544,16 @@ fn prepare(directory: &Directory, request: &Request) -> Result<Receipt> {
     Ok(receipt)
 }
 
-fn publish(directory: &Directory, receipt: &mut Receipt) -> Result<()> {
-    move_original(directory, receipt)?;
-    publish_candidate(directory, receipt)
+fn publish(directory: &Directory, receipt: &mut Receipt, observer: &mut Observer) -> Result<()> {
+    move_original(directory, receipt, observer)?;
+    publish_candidate(directory, receipt, observer)
 }
 
-fn move_original(directory: &Directory, receipt: &mut Receipt) -> Result<()> {
+fn move_original(
+    directory: &Directory,
+    receipt: &mut Receipt,
+    observer: &mut Observer,
+) -> Result<()> {
     let parent = checked_parent(receipt)?;
     let original = verified(&parent, &receipt.installed, &receipt.original)?;
     drop(verified(
@@ -557,11 +574,16 @@ fn move_original(directory: &Directory, receipt: &mut Receipt) -> Result<()> {
         return Err(error.into());
     }
     drop(original);
+    observer("old_moved_before_receipt", receipt)?;
     receipt.phase = Phase::OldMoved;
     save(directory, receipt)
 }
 
-fn publish_candidate(directory: &Directory, receipt: &mut Receipt) -> Result<()> {
+fn publish_candidate(
+    directory: &Directory,
+    receipt: &mut Receipt,
+    observer: &mut Observer,
+) -> Result<()> {
     let parent = checked_parent(receipt)?;
     let replacement = directory.read_write(OsStr::new(&receipt.candidate))?;
     drop(verified(
@@ -583,6 +605,7 @@ fn publish_candidate(directory: &Directory, receipt: &mut Receipt) -> Result<()>
     }
     drop(replacement);
     drop(verified(&parent, &receipt.installed, &receipt.replacement)?);
+    observer("candidate_moved_before_receipt", receipt)?;
     receipt.phase = Phase::Published;
     save(directory, receipt)
 }
@@ -632,6 +655,11 @@ pub async fn replace_running_binary(
     candidate: &Path,
     helper_cache: &Path,
 ) -> Result<UpdateOutcome> {
+    let bytes = candidate_bytes(candidate)?;
+    replace_bytes(&bytes, helper_cache).await
+}
+
+fn candidate_bytes(candidate: &Path) -> Result<Vec<u8>> {
     let directory = open(
         candidate.parent().context("candidate has no parent")?,
         false,
@@ -649,7 +677,7 @@ pub async fn replace_running_binary(
         "source build changed during verification"
     );
     directory.verify(name, &file)?;
-    replace_bytes(&bytes, helper_cache).await
+    Ok(bytes)
 }
 
 async fn replace_bytes(bytes: &[u8], helper_cache: &Path) -> Result<UpdateOutcome> {
@@ -658,10 +686,15 @@ async fn replace_bytes(bytes: &[u8], helper_cache: &Path) -> Result<UpdateOutcom
     // Accepted publication outlives cancellation of the UI/CLI waiter. Its
     // owned task retains the channel and scratch source until helper ownership
     // is acknowledged or its bounded request budget has ended.
-    tokio::spawn(async move { replace_bytes_owned(&bytes, &helper_cache).await }).await?
+    tokio::spawn(async move { replace_bytes_owned(&bytes, &helper_cache, |_| Ok(())).await })
+        .await?
 }
 
-async fn replace_bytes_owned(bytes: &[u8], helper_cache: &Path) -> Result<UpdateOutcome> {
+async fn replace_bytes_owned(
+    bytes: &[u8],
+    helper_cache: &Path,
+    configure: impl FnOnce(&mut NativeSpawnSpec) -> Result<()> + Send,
+) -> Result<UpdateOutcome> {
     let mut running = current_image().context("verify the actual loaded updater image")?;
     let current = running.path().to_owned();
     let parent = open(
@@ -721,6 +754,7 @@ async fn replace_bytes_owned(bytes: &[u8], helper_cache: &Path) -> Result<Update
         serde_json::to_string(&start)?.into(),
     ];
     spec.inherited.push(parent_handle);
+    configure(&mut spec)?;
     let mut child = spec.spawn().await?;
     let operation = async {
         let mut pipe = listener.accept(&child, STARTUP).await?;
@@ -778,6 +812,10 @@ async fn replace_bytes_owned(bytes: &[u8], helper_cache: &Path) -> Result<Update
 
 /// Explicit internal mode used by the application and its native test fixture.
 pub async fn run_helper(arguments: Vec<OsString>) -> Result<()> {
+    run_helper_observed(arguments, &mut |_, _| Ok(())).await
+}
+
+async fn run_helper_observed(arguments: Vec<OsString>, observer: &mut Observer) -> Result<()> {
     ensure!(arguments.len() == 1, "invalid internal update invocation");
     let encoded = arguments[0]
         .to_str()
@@ -812,7 +850,8 @@ pub async fn run_helper(arguments: Vec<OsString>) -> Result<()> {
     let _lease = lock(&directory)?;
     let _running = checked_helper(&request.helper, &request.helper_image)?;
     let mut receipt = prepare(&directory, &request)?;
-    if let Err(error) = publish(&directory, &mut receipt) {
+    observer("prepared", &receipt)?;
+    if let Err(error) = publish(&directory, &mut receipt, observer) {
         let reconciliation = recover(&directory, &mut receipt);
         if !matches!(
             receipt.phase,
@@ -822,6 +861,7 @@ pub async fn run_helper(arguments: Vec<OsString>) -> Result<()> {
             return Err(error).context("publication failed; recovery receipt retained");
         }
     }
+    observer("candidate_published", &receipt)?;
     send(
         &mut pipe,
         &Acknowledgment {
@@ -836,7 +876,7 @@ pub async fn run_helper(arguments: Vec<OsString>) -> Result<()> {
         save(&directory, &receipt)?;
         return Ok(());
     }
-    cleanup(&directory, &mut receipt)
+    cleanup_observed(&directory, &mut receipt, observer)
 }
 
 fn checked_helper(
@@ -865,6 +905,78 @@ fn checked_helper(
 #[cfg(feature = "tooling")]
 pub mod test_support {
     use super::*;
+
+    fn checked_checkpoint(value: &str) -> Result<()> {
+        ensure!(
+            matches!(
+                value,
+                "none"
+                    | "prepared"
+                    | "old_moved_before_receipt"
+                    | "candidate_moved_before_receipt"
+                    | "candidate_published"
+                    | "old_removed_before_complete"
+            ),
+            "unknown fixture update checkpoint"
+        );
+        Ok(())
+    }
+
+    /// The fixture alone selects a checkpoint and forwards its native stdio.
+    /// Ordinary application invocation and serialized update receipts are unchanged.
+    pub async fn replace_running_binary_observed(
+        candidate: &Path,
+        cache: &Path,
+        checkpoint: &str,
+    ) -> Result<UpdateOutcome> {
+        checked_checkpoint(checkpoint)?;
+        let bytes = candidate_bytes(candidate)?;
+        let cache = cache.to_owned();
+        let checkpoint = checkpoint.to_owned();
+        tokio::spawn(async move {
+            replace_bytes_owned(&bytes, &cache, move |spec| {
+                use kuru_platform::windows::process::{StandardStream, inherited_stdio};
+                spec.args
+                    .extend(["--fixture-checkpoint".into(), checkpoint.into()]);
+                spec.stdin = inherited_stdio(StandardStream::Input)?;
+                spec.stdout = inherited_stdio(StandardStream::Output)?;
+                spec.stderr = inherited_stdio(StandardStream::Error)?;
+                // Instrumented helpers must retain their explicit profile
+                // destination; only fixture marker authority is also passed.
+                for key in ["LLVM_PROFILE_FILE", "KURU_EXECUTION_MARKER"] {
+                    if let Some(value) = std::env::var_os(key) {
+                        spec.environment.push((key.into(), value));
+                    }
+                }
+                Ok(())
+            })
+            .await
+        })
+        .await?
+    }
+
+    /// Called only by the compiled fixture after it removes its extra arguments.
+    /// The production parser still receives exactly its original JSON argument.
+    pub async fn run_helper_observed(arguments: Vec<OsString>, checkpoint: &str) -> Result<()> {
+        checked_checkpoint(checkpoint)?;
+        let checkpoint = checkpoint.to_owned();
+        let mut observer = move |reached: &str, receipt: &Receipt| {
+            if reached == checkpoint {
+                println!(
+                    "{}",
+                    serde_json::json!({"checkpoint":reached,"operation":receipt.operation,"phase":receipt.phase,"helper_pid":std::process::id()})
+                );
+                std::io::stdout().flush()?;
+                // The owner kills and reaps this Job after the exact marker.
+                // Input is retained to prevent EOF, never timing-polled.
+                let mut byte = [0];
+                std::io::stdin().read_exact(&mut byte)?;
+                anyhow::bail!("fixture checkpoint was resumed instead of terminated");
+            }
+            Ok(())
+        };
+        super::run_helper_observed(arguments, &mut observer).await
+    }
 
     pub async fn hold_crash_gap(candidate: &Path, cache_path: &Path) -> Result<()> {
         let current = std::env::current_exe()?;
@@ -915,7 +1027,7 @@ pub mod test_support {
         )?;
         source.finish()?;
         drop((original_file, helper_file, input));
-        move_original(&directory, &mut receipt)?;
+        move_original(&directory, &mut receipt, &mut |_, _| Ok(()))?;
         println!(
             "{}",
             serde_json::json!({"ready":"old_moved","receipt":directory.path().join(RECEIPT)})
@@ -1035,7 +1147,7 @@ mod tests {
         for published in [false, true] {
             let mut fixture = Fixture::new();
             if published {
-                publish(&fixture.state, &mut fixture.receipt).unwrap();
+                publish(&fixture.state, &mut fixture.receipt, &mut |_, _| Ok(())).unwrap();
             }
             let lease = installation_guard(&fixture.parent).unwrap();
             assert!(load(&fixture.state).unwrap().is_none());

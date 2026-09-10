@@ -12,7 +12,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn line(pipe: &mut Pipe) -> String {
+fn require(condition: bool, message: impl Into<String>) -> io::Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(io::Error::other(message.into()))
+    }
+}
+
+async fn line(pipe: &mut Pipe, stage: &str) -> io::Result<String> {
     tokio::time::timeout(TIMEOUT, async {
         let mut output = Vec::new();
         loop {
@@ -30,8 +38,8 @@ async fn line(pipe: &mut Pipe) -> String {
         String::from_utf8(output).map_err(io::Error::other)
     })
     .await
-    .expect("native image fixture did not acknowledge")
-    .unwrap()
+    .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, format!("{stage}: {error}")))?
+    .map_err(|error| io::Error::new(error.kind(), format!("{stage}: {error}")))
 }
 
 #[tokio::test]
@@ -58,72 +66,130 @@ async fn current_image_is_pinned_while_reading_and_rejects_rebound_identical_pat
     let mut input = child.take_stdin().unwrap();
     let mut output = child.take_stdout().unwrap();
     let mut errors = child.take_stderr().unwrap();
-    let held: serde_json::Value = serde_json::from_str(&line(&mut output).await).unwrap();
-    assert_eq!(held["ready"], "held");
-    assert_eq!(held["identity"], serde_json::json!(identity.to_bytes()));
-    let original = parent.read(OsStr::new("current image λ.exe")).unwrap();
-    assert!(
-        parent
-            .rename_file(
-                &parent,
-                OsStr::new("current image λ.exe"),
-                &original,
-                OsStr::new("displaced.exe"),
-                Publication::New,
-            )
-            .is_err(),
-        "current-image trust guard allowed replacement while copying"
-    );
-    assert_eq!(fs::read(&path).unwrap(), bytes);
-    input.write_all(b"x").await.unwrap();
-    input.flush().await.unwrap();
-    assert_eq!(line(&mut output).await.trim(), "released");
-    parent
-        .rename_file(
-            &parent,
-            OsStr::new("current image λ.exe"),
-            &original,
-            OsStr::new("displaced.exe"),
-            Publication::New,
+    let exercise = async {
+        let result: io::Result<()> = async {
+            let held: serde_json::Value =
+                serde_json::from_str(&line(&mut output, "initial guard").await?)?;
+            require(
+                held["ready"] == "held",
+                format!("initial guard acknowledgment: {held}"),
+            )?;
+            require(
+                held["identity"] == serde_json::json!(identity.to_bytes()),
+                format!("initial guard identity: {held}"),
+            )?;
+            let original = parent.read(OsStr::new("current image λ.exe"))?;
+            require(
+                parent
+                    .rename_file(
+                        &parent,
+                        OsStr::new("current image λ.exe"),
+                        &original,
+                        OsStr::new("displaced.exe"),
+                        Publication::New,
+                    )
+                    .is_err(),
+                "current-image trust guard allowed replacement while copying",
+            )?;
+            require(fs::read(&path)? == bytes, "held image bytes changed")?;
+            input.write_all(b"x").await?;
+            input.flush().await?;
+            let released = line(&mut output, "guard release").await?;
+            require(
+                released.trim() == "released",
+                format!("guard release acknowledgment: {released}"),
+            )?;
+            parent
+                .rename_file(
+                    &parent,
+                    OsStr::new("current image λ.exe"),
+                    &original,
+                    OsStr::new("displaced.exe"),
+                    Publication::New,
+                )
+                .map_err(io::Error::other)?;
+            drop(original);
+            fs::write(&path, &bytes)?;
+            let replacement = parent.read(OsStr::new("current image λ.exe"))?;
+            let replacement_id = regular_file_info(&replacement)?.identity;
+            require(
+                identity != replacement_id,
+                "replacement retained the old identity",
+            )?;
+            drop(replacement);
+            require(child.try_wait()?.is_none(), "old mapped image exited")?;
+            input.write_all(b"x").await?;
+            input.flush().await?;
+            let result: serde_json::Value =
+                serde_json::from_str(&line(&mut output, "stale guard").await?)?;
+            require(
+                result["accepted"] == false,
+                format!("mapped-file name failed to distinguish a stale loaded image: {result}"),
+            )?;
+            require(
+                result["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("loaded image")),
+                format!("stale guard error: {result}"),
+            )?;
+            require(fs::read(&path)? == bytes, "replacement bytes changed")?;
+            require(
+                regular_file_info(&parent.read(OsStr::new("current image λ.exe"))?)?.identity
+                    == replacement_id,
+                "replacement identity changed",
+            )?;
+            Ok(())
+        }
+        .await;
+        // Preserve the pre-cleanup status in diagnostics. A failed assertion must
+        // still terminate/reap the owned tree and observe closure of every pipe.
+        let before_cleanup = child.try_wait();
+        let terminated = if result.is_err() {
+            child.terminate()
+        } else {
+            Ok(())
+        };
+        let input_closed = input.close(TIMEOUT).await;
+        let output_closed = output.close(TIMEOUT).await;
+        let status = child.wait(TIMEOUT).await;
+        let forced_cleanup = if status.is_err() {
+            let terminated = child.terminate();
+            let waited = child.wait(TIMEOUT).await;
+            Some((terminated, waited))
+        } else {
+            None
+        };
+        (
+            result,
+            before_cleanup,
+            terminated,
+            input_closed,
+            output_closed,
+            status,
+            forced_cleanup,
         )
-        .unwrap();
-    drop(original);
-    fs::write(&path, &bytes).unwrap();
-    let replacement = parent.read(OsStr::new("current image λ.exe")).unwrap();
-    let replacement_id = regular_file_info(&replacement).unwrap().identity;
-    assert_ne!(identity, replacement_id);
-    drop(replacement);
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "old mapped image exited"
-    );
-    input.write_all(b"x").await.unwrap();
-    input.flush().await.unwrap();
-    let result: serde_json::Value = serde_json::from_str(&line(&mut output).await).unwrap();
-    assert_eq!(
-        result["accepted"], false,
-        "mapped-file name failed to distinguish a stale loaded image: {result}"
-    );
-    assert!(result["error"].as_str().unwrap().contains("loaded image"));
-    input.close(TIMEOUT).await.unwrap();
-    output.close(TIMEOUT).await.unwrap();
+    };
     let mut stderr = Vec::new();
-    tokio::time::timeout(TIMEOUT, (&mut errors).take(65536).read_to_end(&mut stderr))
-        .await
-        .unwrap()
-        .unwrap();
-    let status = child.wait(TIMEOUT).await.unwrap();
-    errors.close(TIMEOUT).await.unwrap();
+    let drain = async {
+        let read = tokio::time::timeout(
+            TIMEOUT * 6,
+            (&mut errors).take(65537).read_to_end(&mut stderr),
+        )
+        .await;
+        let closed = errors.close(TIMEOUT).await;
+        (read, closed)
+    };
+    let (exercise, drain) = tokio::join!(exercise, drain);
     assert!(
-        status.success(),
-        "{status}: {}",
+        exercise.0.is_ok()
+            && exercise.2.is_ok()
+            && exercise.3.is_ok()
+            && exercise.4.is_ok()
+            && exercise.5.as_ref().is_ok_and(|status| status.success())
+            && drain.0.as_ref().is_ok_and(|result| result.is_ok())
+            && drain.1.is_ok()
+            && stderr.len() <= 65536,
+        "image fixture result/cleanup: {exercise:?}; stderr drain: {drain:?}\nstderr: {}",
         String::from_utf8_lossy(&stderr)
-    );
-    assert_eq!(fs::read(&path).unwrap(), bytes);
-    assert_eq!(
-        regular_file_info(&parent.read(OsStr::new("current image λ.exe")).unwrap())
-            .unwrap()
-            .identity,
-        replacement_id
     );
 }

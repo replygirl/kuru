@@ -1,9 +1,13 @@
 #![cfg(all(windows, feature = "tooling"))]
 
+use anyhow::{Context, Result, ensure};
 use kuru_delivery::{archive::digest, command::BlockingCommand as Command};
 use kuru_platform::{
     fs::{Directory, NameRetention, Privacy, regular_file_info, require_private},
-    windows::process::{NativeSpawnSpec, Stdio},
+    windows::{
+        pipe::Pipe,
+        process::{NativeChild, NativeSpawnSpec, Stdio, system_directory},
+    },
 };
 use std::{
     ffi::OsStr,
@@ -60,6 +64,9 @@ impl Fixture {
             self.cache.clone().into(),
         ];
         spec.environment = vec![("KURU_EXECUTION_MARKER".into(), self.marker.clone().into())];
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            spec.environment.push(("LLVM_PROFILE_FILE".into(), profile));
+        }
         spec.stdin = Stdio::Pipe;
         spec.stdout = Stdio::Pipe;
         spec.stderr = Stdio::Pipe;
@@ -70,6 +77,388 @@ impl Fixture {
         serde_json::from_slice(&fs::read(self.directory.join(".kuru-update/receipt.json")).unwrap())
             .unwrap()
     }
+}
+
+async fn record(pipe: &mut Pipe) -> Result<serde_json::Value> {
+    tokio::time::timeout(TIMEOUT, async {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = pipe
+                .read_u8()
+                .await
+                .context("checkpoint pipe closed before its marker")?;
+            if byte == b'\n' {
+                break;
+            }
+            ensure!(bytes.len() < 65536, "checkpoint output exceeded limit");
+            bytes.push(byte);
+        }
+        serde_json::from_slice(&bytes).context("fixture checkpoint is not JSON")
+    })
+    .await
+    .context("fixture checkpoint deadline expired")?
+}
+
+async fn error_output(mut pipe: Pipe) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let read = (&mut pipe).take(65537).read_to_end(&mut bytes).await;
+    let close = pipe.close(TIMEOUT).await;
+    read?;
+    close?;
+    ensure!(bytes.len() <= 65536, "fixture stderr exceeded limit");
+    Ok(bytes)
+}
+
+fn file_identity(path: &Path) -> Result<[u8; 24]> {
+    Ok(regular_file_info(&fs::File::open(path)?)?
+        .identity
+        .to_bytes())
+}
+
+fn receipt_image(receipt: &serde_json::Value, key: &str) -> Result<[u8; 24]> {
+    serde_json::from_value(receipt[key]["identity"].clone()).context("receipt image identity")
+}
+
+fn read_receipt(fixture: &Fixture) -> Result<serde_json::Value> {
+    Ok(serde_json::from_slice(&fs::read(
+        fixture.directory.join(".kuru-update/receipt.json"),
+    )?)?)
+}
+
+fn recover(fixture: &Fixture) -> Result<()> {
+    let system = system_directory()?;
+    let powershell = system.join("WindowsPowerShell/v1.0/powershell.exe");
+    ensure!(
+        powershell.is_file(),
+        "stock Windows PowerShell 5.1 is required"
+    );
+    let environment = fixture._root.path().join("recovery environment");
+    fs::create_dir(&environment)?;
+    let empty_path = environment.join("empty PATH");
+    fs::create_dir(&empty_path)?;
+    let mut command = Command::new(powershell);
+    command
+        .current_dir(&environment)
+        .env_clear()
+        .env(
+            "SystemRoot",
+            system.parent().context("Windows system root")?,
+        )
+        .env("PROCESSOR_ARCHITECTURE", "AMD64")
+        .env("USERPROFILE", &environment)
+        .env("APPDATA", &environment)
+        .env("LOCALAPPDATA", &environment)
+        .env("HOME", &environment)
+        .env("TMP", &environment)
+        .env("TEMP", &environment)
+        .env("PATH", &empty_path)
+        .env("KURU_EXECUTION_MARKER", &fixture.marker)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("support/install.ps1"))
+        .arg("-Recover")
+        .arg("-InstallDir")
+        .arg(&fixture.directory);
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let output = command.output()?;
+    ensure!(
+        output.status.success(),
+        "actual PowerShell recovery failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        fs::read_dir(empty_path)?.next().is_none(),
+        "recovery introduced a PATH dependency"
+    );
+    Ok(())
+}
+
+fn reconciled(
+    fixture: &Fixture,
+    before: &serde_json::Value,
+    installed_identity: [u8; 24],
+    new: bool,
+) -> Result<()> {
+    let receipt = read_receipt(fixture)?;
+    ensure!(
+        receipt["operation"] == before["operation"],
+        "recovery replaced the original transaction"
+    );
+    ensure!(
+        receipt["phase"] == if new { "complete" } else { "rolled_back" },
+        "unexpected terminal phase: {receipt}"
+    );
+    ensure!(
+        file_identity(&fixture.current)? == installed_identity,
+        "recovery changed the accepted installed identity"
+    );
+    let expected_bytes = if new {
+        fixture.replacement.as_slice()
+    } else {
+        fixture.original.as_slice()
+    };
+    ensure!(
+        fs::read(&fixture.current)?.as_slice() == expected_bytes,
+        "recovery selected incorrect bytes"
+    );
+    let state_path = fixture.directory.join(".kuru-update");
+    for (parent, key) in [
+        (&fixture.directory, "displaced"),
+        (&state_path, "candidate"),
+        (&state_path, "backup"),
+    ] {
+        ensure!(
+            !parent
+                .join(receipt[key].as_str().context("receipt name")?)
+                .try_exists()?,
+            "recorded {key} remained after recovery"
+        );
+    }
+    let helper = Path::new(receipt["helper"].as_str().context("helper path")?);
+    ensure!(
+        fs::read(helper)? == fixture.original,
+        "retained helper differs from trusted original"
+    );
+    require_private(&fs::File::open(helper)?)?;
+    let state = Directory::open(
+        &fixture.directory.join(".kuru-update"),
+        Privacy::OwnerOnly,
+        NameRetention::Pinned,
+    )?;
+    let lease = state.lock_file(OsStr::new("install.lock"))?;
+    lease
+        .try_lock()
+        .context("recovery leaked its install lease")?;
+    ensure!(
+        !fixture.marker.exists(),
+        "candidate executed during update or recovery"
+    );
+    ensure!(
+        fs::read(fixture.directory.join("unrelated.txt"))?
+            == b"retain unrelated installation content",
+        "unrelated install content changed"
+    );
+    Ok(())
+}
+
+async fn stop(child: &mut NativeChild, input: &mut Pipe, output: &mut Pipe) -> Result<()> {
+    child.terminate()?;
+    child
+        .wait(TIMEOUT)
+        .await
+        .context("fixture Job did not become quiescent")?;
+    input.close(TIMEOUT).await?;
+    output.close(TIMEOUT).await?;
+    Ok(())
+}
+
+async fn interrupted(checkpoint: &str, phase: &str, new: bool) -> Result<()> {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.directory.join("unrelated.txt"),
+        b"retain unrelated installation content",
+    )?;
+    let original_identity = file_identity(&fixture.current)?;
+    let mut spec = fixture.spawn();
+    spec.args[0] = "update-observed".into();
+    spec.args.push(checkpoint.into());
+    let mut child = spec.spawn().await?;
+    let mut input = child.take_stdin().context("fixture stdin")?;
+    let mut output = child.take_stdout().context("fixture stdout")?;
+    let error = tokio::spawn(error_output(child.take_stderr().context("fixture stderr")?));
+    let mut stopped = false;
+    let result = async {
+        let mut parent_acknowledged = false;
+        loop {
+            let marker = record(&mut output).await?;
+            if marker["parent_acknowledged"] == true {
+                parent_acknowledged = true;
+                continue;
+            }
+            if marker.get("installed").is_some() {
+                continue;
+            }
+            ensure!(
+                marker["checkpoint"] == checkpoint && marker["phase"] == phase,
+                "unexpected checkpoint {marker}"
+            );
+            ensure!(
+                marker["helper_pid"].as_u64().context("helper PID")? != u64::from(child.id()),
+                "checkpoint came from parent, not real helper"
+            );
+            let receipt = read_receipt(&fixture)?;
+            ensure!(
+                marker["operation"] == receipt["operation"],
+                "checkpoint does not identify persisted transaction"
+            );
+            break;
+        }
+        ensure!(
+            child.try_wait()?.is_none(),
+            "checkpoint did not hold the real owned Job"
+        );
+        ensure!(
+            parent_acknowledged == (checkpoint == "old_removed_before_complete"),
+            "ACK occurred at the wrong publication boundary"
+        );
+        let receipt = read_receipt(&fixture)?;
+        ensure!(
+            receipt["phase"] == phase,
+            "durable receipt moved past selected checkpoint"
+        );
+        ensure!(
+            receipt_image(&receipt, "original")? == original_identity,
+            "receipt lost original identity"
+        );
+        let expected = if new {
+            receipt_image(&receipt, "replacement")?
+        } else {
+            original_identity
+        };
+        if checkpoint == "old_moved_before_receipt" {
+            ensure!(
+                !fixture.current.try_exists()?,
+                "first move did not remove installed name"
+            );
+        } else {
+            ensure!(
+                file_identity(&fixture.current)? == expected,
+                "installed identity does not match reached boundary"
+            );
+        }
+        let old = fixture
+            .directory
+            .join(receipt["displaced"].as_str().context("old name")?);
+        if matches!(checkpoint, "prepared" | "old_removed_before_complete") {
+            ensure!(
+                !old.try_exists()?,
+                "unexpected displaced image at checkpoint"
+            );
+        } else {
+            ensure!(
+                file_identity(&old)? == original_identity && fs::read(&old)? == fixture.original,
+                "displaced original changed"
+            );
+        }
+        ensure!(
+            !fixture.marker.exists(),
+            "candidate executed before checkpoint"
+        );
+        stop(&mut child, &mut input, &mut output).await?;
+        stopped = true;
+        recover(&fixture)?;
+        reconciled(&fixture, &receipt, expected, new)
+    }
+    .await;
+    let cleanup = if stopped {
+        Ok(())
+    } else {
+        stop(&mut child, &mut input, &mut output).await
+    };
+    let error = tokio::time::timeout(TIMEOUT, error).await;
+    if let Err(failure) = result.and(cleanup) {
+        let retained = fixture._root.keep();
+        anyhow::bail!(
+            "{checkpoint}: {failure:#}; stderr={error:?}; retained {}",
+            retained.display()
+        );
+    }
+    let bytes = error.context("stderr task timed out")???;
+    ensure!(
+        bytes.is_empty(),
+        "unexpected helper stderr: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn killed_helper_after_prepared_receipt_recovers_original_identity() -> Result<()> {
+    interrupted("prepared", "prepared", false).await
+}
+
+#[tokio::test]
+async fn killed_helper_after_old_move_before_receipt_recovers_original_identity() -> Result<()> {
+    interrupted("old_moved_before_receipt", "prepared", false).await
+}
+
+#[tokio::test]
+async fn killed_helper_after_candidate_move_before_receipt_keeps_new_identity() -> Result<()> {
+    interrupted("candidate_moved_before_receipt", "old_moved", true).await
+}
+
+#[tokio::test]
+async fn killed_helper_after_published_receipt_before_ack_keeps_new_identity() -> Result<()> {
+    interrupted("candidate_published", "published", true).await
+}
+
+#[tokio::test]
+async fn killed_helper_after_old_cleanup_before_complete_finishes_recovery() -> Result<()> {
+    interrupted("old_removed_before_complete", "published", true).await
+}
+
+#[tokio::test]
+async fn post_ack_parent_loss_leaves_actual_helper_to_finish_owned_cleanup() -> Result<()> {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.directory.join("unrelated.txt"),
+        b"retain unrelated installation content",
+    )?;
+    let mut spec = fixture.spawn();
+    spec.args[0] = "update-parent-loss".into();
+    let mut child = spec.spawn().await?;
+    let mut input = child.take_stdin().context("fixture stdin")?;
+    let mut output = child.take_stdout().context("fixture stdout")?;
+    let error = tokio::spawn(error_output(child.take_stderr().context("fixture stderr")?));
+    let result = async {
+        let installed = record(&mut output).await?;
+        ensure!(
+            installed["installed"].is_string() && installed["cleanup_pending"] == true,
+            "parent did not report verified publication"
+        );
+        ensure!(
+            record(&mut output).await?["parent_acknowledged"] == true,
+            "parent loss preceded acknowledgment"
+        );
+        let status = child.wait(TIMEOUT).await?;
+        ensure!(
+            status.code() == Some(42),
+            "expected deliberate parent loss, got {status}"
+        );
+        let receipt = read_receipt(&fixture)?;
+        reconciled(
+            &fixture,
+            &receipt,
+            receipt_image(&receipt, "replacement")?,
+            true,
+        )
+    }
+    .await;
+    let cleanup = stop(&mut child, &mut input, &mut output).await;
+    let error = tokio::time::timeout(TIMEOUT, error).await;
+    if let Err(failure) = result.and(cleanup) {
+        let retained = fixture._root.keep();
+        anyhow::bail!(
+            "post-ACK parent loss: {failure:#}; stderr={error:?}; retained {}",
+            retained.display()
+        );
+    }
+    let bytes = error.context("stderr task timed out")???;
+    ensure!(
+        bytes.is_empty(),
+        "unexpected helper stderr: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    Ok(())
 }
 
 async fn line(pipe: &mut kuru_platform::windows::pipe::Pipe) -> String {

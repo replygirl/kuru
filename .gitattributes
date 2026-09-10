@@ -1,0 +1,3 @@
+# Keep scripts and generated-file checks identical on every checkout, including
+# Windows installations of Git with core.autocrlf=true. Binary files stay binary.
+* text=auto eol=lf

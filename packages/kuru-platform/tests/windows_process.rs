@@ -693,6 +693,64 @@ async fn dropping_a_trusted_handle_does_not_terminate_its_lifetime_peer() {
 }
 
 #[test]
+fn cancelled_partial_frame_closes_pipe_and_reaps_peer_before_runtime_shutdown() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().to_owned();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = PrivateListener::bind().unwrap();
+            let mut spawn = spec(
+                &directory,
+                &[OsStr::new("rendezvous-partial-frame"), listener.address()],
+            );
+            spawn.stdout = Stdio::Pipe;
+            let mut child = spawn.spawn().await.unwrap();
+            let mut channel = BufReader::new(listener.accept(&child, LIMIT).await.unwrap());
+            let mut output = BufReader::new(child.take_stdout().unwrap());
+            let mut sent = String::new();
+            tokio::time::timeout(LIMIT, output.read_line(&mut sent))
+                .await
+                .expect("partial-frame peer did not acknowledge its completed write")
+                .unwrap();
+            assert_eq!(sent.trim(), "partial-frame-sent");
+            let mut frame = Vec::new();
+            // read_until retains the actual received prefix when cancelled.
+            // The peer acknowledged flush and cannot supply a frame delimiter.
+            assert!(
+                tokio::time::timeout(SHORT, channel.read_until(b'\n', &mut frame))
+                    .await
+                    .is_err(),
+                "an incomplete frame was reported as complete"
+            );
+            assert_eq!(frame, b"{\"frame\":");
+            assert!(child.try_wait().unwrap().is_none());
+            channel.get_mut().close(LIMIT).await.unwrap();
+            assert!(channel.get_ref().is_closed());
+            drop(channel);
+            let mut remainder = Vec::new();
+            tokio::time::timeout(LIMIT, (&mut output).take(4096).read_to_end(&mut remainder))
+                .await
+                .expect("partial-frame peer retained output after lifetime EOF")
+                .unwrap();
+            assert_eq!(remainder, b"partial-frame-eof\n");
+            output.get_mut().close(LIMIT).await.unwrap();
+            assert!(child.wait(LIMIT).await.unwrap().success());
+        });
+        drop(runtime);
+        sender.send(()).unwrap();
+    });
+    receiver
+        .recv_timeout(LIMIT * 4)
+        .expect("partial-frame cancellation stranded its child, pipe or Tokio runtime");
+    thread.join().unwrap();
+}
+
+#[test]
 fn cancelled_connect_does_not_strand_runtime_shutdown() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {

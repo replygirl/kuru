@@ -186,6 +186,56 @@ async fn cache_lease_uses_actual_identity_and_retains_contention_until_owner_dro
 
 #[cfg(windows)]
 #[tokio::test]
+async fn concurrent_cold_windows_provision_publishes_one_verified_native_identity() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("concurrent empty cache café 東京");
+    let config = MemoryConfig {
+        offline: true,
+        cache_dir: Some(cache.clone()),
+        ..Default::default()
+    };
+    let start = tokio::sync::Barrier::new(2);
+    let open = || async {
+        start.wait().await;
+        let binary = provision(&config, &cache).await.unwrap();
+        let (_parent, file) = files::read(&binary, Privacy::OwnerOnly).unwrap();
+        (binary, regular_file_info(&file).unwrap().identity)
+    };
+    // Provisioning supplies bounded lock/probe waits. Retain this root until
+    // both calls finish, including their independently owned extraction workers.
+    let (first, second) = tokio::join!(open(), open());
+    assert_eq!(first, second);
+    for (name, size, digest) in [
+        (
+            "dolt.exe",
+            BUNDLED_ASSET.executable_bytes,
+            BUNDLED_ASSET.executable_sha256,
+        ),
+        (
+            "LICENSES",
+            BUNDLED_ASSET.license_bytes,
+            BUNDLED_ASSET.license_sha256,
+        ),
+    ] {
+        let path = first.0.with_file_name(name);
+        let (_parent, file) = files::read(&path, Privacy::OwnerOnly).unwrap();
+        kuru_platform::fs::require_private(&file).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), size);
+        assert_eq!(hex_digest(&Sha256::digest(fs::read(path).unwrap())), digest);
+    }
+    let warm = provision(&config, &cache).await.unwrap();
+    let (_parent, file) = files::read(&warm, Privacy::OwnerOnly).unwrap();
+    assert_eq!(warm, first.0);
+    assert_eq!(regular_file_info(&file).unwrap().identity, first.1);
+    let entries: Vec<_> = fs::read_dir(cache.join(DOLT_VERSION))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [std::ffi::OsString::from(BUNDLED_ASSET.target)]);
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_before_execution() {
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("empty cache 東京");

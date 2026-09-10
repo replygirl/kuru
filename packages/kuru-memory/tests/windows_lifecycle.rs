@@ -105,7 +105,7 @@ impl Drop for Fixture {
     }
 }
 
-async fn fixture(owner: &mut Fixture, binary: &Path, lifetime: Lifetime) -> Result<()> {
+async fn fixture(owner: &mut Fixture, binary: &Path, lifetime: Lifetime, mode: &str) -> Result<()> {
     let root = owner.path().to_owned();
     let listener = PrivateListener::bind()?;
     let mut command = NativeSpawnSpec::new(
@@ -116,6 +116,7 @@ async fn fixture(owner: &mut Fixture, binary: &Path, lifetime: Lifetime) -> Resu
         root.as_os_str().into(),
         binary.as_os_str().into(),
         listener.address().into(),
+        mode.into(),
     ];
     command.environment = environment()?;
     command.lifetime = lifetime;
@@ -139,7 +140,7 @@ async fn fixture(owner: &mut Fixture, binary: &Path, lifetime: Lifetime) -> Resu
     Ok(())
 }
 
-async fn loss(whole_job: bool) -> Result<()> {
+async fn loss(whole_job: bool, mode: &str) -> Result<()> {
     let mut owner = Fixture::new()?;
     let binary = provision::provision(&Default::default(), &test_support::cache_dir()).await?;
     let lifetime = if whole_job {
@@ -147,7 +148,7 @@ async fn loss(whole_job: bool) -> Result<()> {
     } else {
         Lifetime::TrustedSupervisor
     };
-    fixture(&mut owner, &binary, lifetime).await?;
+    fixture(&mut owner, &binary, lifetime, mode).await?;
     let opts = options(owner.path(), binary);
     let store = Directory::open(&opts.directory, Privacy::OwnerOnly, NameRetention::Movable)?;
     let locks = Directory::open(
@@ -162,6 +163,16 @@ async fn loss(whole_job: bool) -> Result<()> {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     let lock = locks.lock_file(std::ffi::OsStr::new(&format!("{key}.lock")))?;
+    assert!(matches!(
+        lock.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    let mut contender = opts.clone();
+    contender.timeout = Duration::from_millis(200);
+    assert!(
+        Server::open(contender).await.is_err(),
+        "a second writable server overlapped the retained owner"
+    );
     assert!(matches!(
         lock.try_lock(),
         Err(std::fs::TryLockError::WouldBlock)
@@ -203,12 +214,39 @@ async fn loss(whole_job: bool) -> Result<()> {
     drop(lock);
     let recovered = Server::open(opts).await?;
     let pool = recovered.pool("main").await?;
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT value FROM owner_receipt WHERE id=1")
+    if mode == "partial-ready" {
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT project_scope FROM kuru_instance WHERE singleton=1"
+            )
             .fetch_one(pool.as_ref())
             .await?,
-        "accepted before creator loss"
-    );
+            "native-owner-fixture"
+        );
+    } else {
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT value FROM owner_receipt WHERE id=1")
+                .fetch_one(pool.as_ref())
+                .await?,
+            "accepted before creator loss"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM owner_receipt WHERE id=2")
+                .fetch_one(pool.as_ref())
+                .await?,
+            0,
+            "the unfinished accepted transaction reached durable live state"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM dolt_log WHERE message='owner fixture accepted receipt'",
+            )
+            .fetch_one(pool.as_ref())
+            .await?,
+            1,
+            "creator recovery replayed the accepted revision"
+        );
+    }
     pool.close().await;
     recovered.close().await?;
     owner.descendants_stopped = true;
@@ -217,12 +255,91 @@ async fn loss(whole_job: bool) -> Result<()> {
 
 #[tokio::test]
 async fn creator_only_loss_reaps_dolt_and_preserves_accepted_sql() -> Result<()> {
-    loss(false).await
+    loss(false, "committed").await
 }
 
 #[tokio::test]
 async fn enclosing_job_loss_contains_the_tree_and_reopens_committed_state() -> Result<()> {
-    loss(true).await
+    loss(true, "committed").await
+}
+
+#[tokio::test]
+async fn creator_loss_during_observed_inflight_sql_preserves_only_the_committed_revision()
+-> Result<()> {
+    loss(false, "inflight").await
+}
+
+#[tokio::test]
+async fn creator_loss_after_partial_readiness_consumption_reaps_the_initialized_database()
+-> Result<()> {
+    loss(false, "partial-ready").await
+}
+
+#[tokio::test]
+async fn normal_headless_dolt_close_reaps_the_supervisor_and_reopens_accepted_sql() -> Result<()> {
+    let mut owner = Fixture::new()?;
+    let binary = provision::provision(&Default::default(), &test_support::cache_dir()).await?;
+    fixture(
+        &mut owner,
+        &binary,
+        Lifetime::TrustedSupervisor,
+        "committed",
+    )
+    .await?;
+    owner.channel.as_mut().unwrap().write_all(b"C").await?;
+    owner.channel.as_mut().unwrap().flush().await?;
+    let status = owner
+        .child
+        .as_mut()
+        .unwrap()
+        .wait(Duration::from_secs(15))
+        .await?;
+    assert!(
+        status.success(),
+        "real Dolt normal close did not complete: {status}"
+    );
+    let opts = options(owner.path(), binary);
+    assert!(!opts.directory.join("endpoint.json").exists());
+    let reopened = Server::open(opts).await?;
+    let pool = reopened.pool("main").await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT value FROM owner_receipt WHERE id=1")
+            .fetch_one(pool.as_ref())
+            .await?,
+        "accepted before creator loss"
+    );
+    pool.close().await;
+    reopened.close().await?;
+    owner.descendants_stopped = true;
+    Ok(())
+}
+
+#[tokio::test]
+async fn actual_engine_adapter_escalates_after_observed_break_and_reaps_locked_descendant()
+-> Result<()> {
+    let mut owner = Fixture::new()?;
+    fixture(
+        &mut owner,
+        Path::new(env!("CARGO_BIN_EXE_kuru-memory-parent-fixture")),
+        Lifetime::OwnedJob,
+        "escalation",
+    )
+    .await?;
+    let status = owner
+        .child
+        .as_mut()
+        .unwrap()
+        .wait(Duration::from_secs(8))
+        .await?;
+    assert!(
+        status.success(),
+        "engine adapter escalation fixture failed: {status}"
+    );
+    let directory = Directory::open(owner.path(), Privacy::OwnerOnly, NameRetention::Movable)?;
+    let lock = directory.lock_file(std::ffi::OsStr::new("descendant.lock"))?;
+    lock.try_lock()?;
+    owner.descendants_stopped = true;
+    Ok(())
 }
 
 #[tokio::test]

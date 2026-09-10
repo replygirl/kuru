@@ -5,6 +5,8 @@
 //! the snapshot prepared before they start. Coverage deliberately does not opt
 //! in: its one workspace build supplies the actual instrumented executable.
 pub use crate::files::PrivateTemp as TempDir;
+#[cfg(windows)]
+pub mod windows;
 use crate::{OpenOptions, files};
 use anyhow::{Context, Result, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy, Publication, seal_private};

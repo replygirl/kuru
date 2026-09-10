@@ -47,6 +47,10 @@ links the C runtime statically; host build tools and procedural macros keep
 their normal host configuration. Shipping PE import checks inspect both Kuru
 and its embedded Dolt executable for external runtime DLL requirements.
 
+Repository text uses LF line endings on every platform, enforced by
+`.gitattributes`. This keeps shell scripts and cospec's generated-file checks
+consistent even when Git is configured with `core.autocrlf=true`.
+
 `kuru-platform` owns checked filesystem operations and Windows process/IPC
 mechanics; `kuru-archive` owns bounded ZIP decoding. Consumers keep their own
 payload policies and use those shared primitives. The PowerShell bootstrap

@@ -142,6 +142,12 @@ a successful build is not evidence of a successful deployment.
 Instrumented child fixtures must explicitly retain the runner's LLVM_PROFILE_FILE
 destination when clearing their environments, so their coverage is collected and
 profile files do not appear in source or private-state fixture directories.
+Cargo may hard-link its executable outputs. Treat explicitly selected build
+artifacts as read-only inputs: retain their identity, bound and verify the bytes
+being copied, and check the source name again. Keep private cache, installation
+and publication-destination checks strict; accepting a build input does not grant
+permission to modify its other links. Repository text must retain LF checkout
+semantics so native Windows shell and generated-file checks see identical bytes.
 Ordinary real-memory test tasks use the memory package's prepared supervisor
 snapshot: concurrent Cargo commands can replace their top-level executable
 aliases while another package's tests are running. Keep this preparation in the

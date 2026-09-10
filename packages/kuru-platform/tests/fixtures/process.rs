@@ -39,7 +39,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("missing fixture mode")?;
     match mode {
         "current-image" => {
-            let image = kuru_platform::windows::process::current_image()?;
+            eprintln!("current-image: acquiring initial guard");
+            let image = match kuru_platform::windows::process::current_image() {
+                Ok(image) => image,
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "stage":"initial_guard", "error":error.to_string(),
+                            "kind":format!("{:?}", error.kind()), "os_error":error.raw_os_error(),
+                        })
+                    );
+                    std::io::stdout().flush()?;
+                    return Err(error.into());
+                }
+            };
+            eprintln!("current-image: reading held identity");
             let identity = kuru_platform::fs::regular_file_info(image.file())?
                 .identity
                 .to_bytes();
@@ -51,9 +66,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut byte = [0];
             std::io::stdin().read_exact(&mut byte)?;
             drop(image);
+            eprintln!("current-image: initial guard released");
             println!("released");
             std::io::stdout().flush()?;
             std::io::stdin().read_exact(&mut byte)?;
+            eprintln!("current-image: checking stale guard");
             let result = kuru_platform::windows::process::current_image();
             println!(
                 "{}",
@@ -174,6 +191,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             channel.write_all(b"connected").await?;
             channel.flush().await?;
             tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        "rendezvous-partial-frame" => {
+            let mut channel = pipe::connect(&args[1], Duration::from_secs(5)).await?;
+            channel.write_all(b"{\"frame\":").await?;
+            channel.flush().await?;
+            println!("partial-frame-sent");
+            std::io::stdout().flush()?;
+            let mut byte = [0];
+            if channel.read(&mut byte).await? != 0 {
+                return Err("partial-frame peer received unexpected payload instead of EOF".into());
+            }
+            channel.close(Duration::from_secs(5)).await?;
+            println!("partial-frame-eof");
+            std::io::stdout().flush()?;
         }
         "duplex" => {
             let mut channel = pipe::connect(&args[1], Duration::from_secs(5)).await?;

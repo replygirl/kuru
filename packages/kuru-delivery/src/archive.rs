@@ -5,8 +5,8 @@ use anyhow::{Context, Result, ensure};
 use flate2::{Compression, GzBuilder, read::GzDecoder};
 use kuru_archive::zip::{self, Archive, Limits, MemberKind, MemberSpec, WriteMember};
 use kuru_platform::fs::{
-    Directory, NameRetention, Privacy, Publication, PublicationPhase, make_executable,
-    regular_file_info,
+    Directory, FileInfo, NameRetention, Privacy, Publication, PublicationPhase, make_executable,
+    regular_file_info, validate_component,
 };
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -15,7 +15,7 @@ use std::{
     collections::HashSet,
     ffi::OsStr,
     fs::{self, File},
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -148,6 +148,82 @@ fn bounded(reader: impl Read, limit: usize, description: &str) -> Result<Vec<u8>
     Ok(bytes)
 }
 
+// Cargo can hard-link its public executable name to a compiled artifact. Read
+// that source without changing it; installed files and publication destinations
+// continue to use Directory's stricter single-link policy.
+fn open_build_input(parent: &Directory, name: &OsStr) -> Result<File> {
+    validate_component(name)?;
+    let current = Directory::open(parent.path(), Privacy::Inherited, NameRetention::Movable)?;
+    ensure!(
+        current.identity() == parent.identity(),
+        "binary parent changed"
+    );
+    let path = parent.path().join(name);
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_file(),
+        "binary must be a regular file, not a symlink or directory"
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT also covers non-symlink reparse tags.
+        ensure!(
+            metadata.file_attributes() & 0x400 == 0,
+            "binary must not be a reparse point"
+        );
+    }
+    let input = File::open(path)?;
+    regular_file_info(&input)?;
+    #[cfg(unix)]
+    ensure!(
+        input.metadata()?.permissions().mode() & 0o111 != 0,
+        "binary must be an existing executable file"
+    );
+    Ok(input)
+}
+
+fn verify_build_snapshot(
+    parent: &Directory,
+    name: &OsStr,
+    input: &mut File,
+    before: FileInfo,
+    bytes: &[u8],
+) -> Result<()> {
+    let current = open_build_input(parent, name)?;
+    let after = regular_file_info(input)?;
+    let named = regular_file_info(&current)?;
+    ensure!(
+        before.identity == after.identity
+            && before.identity == named.identity
+            && before.len == after.len
+            && before.len == named.len
+            && before.len == bytes.len() as u64,
+        "binary changed while reading build input"
+    );
+    // Identity and length alone do not detect an in-place, same-size rebuild.
+    // Compare a second bounded read with the exact bytes about to be packaged.
+    input.rewind()?;
+    let mut buffer = [0; 8192];
+    for expected in bytes.chunks(buffer.len()) {
+        input.read_exact(&mut buffer[..expected.len()])?;
+        ensure!(
+            &buffer[..expected.len()] == expected,
+            "binary changed while reading build input"
+        );
+    }
+    ensure!(
+        input.read(&mut buffer[..1])? == 0,
+        "binary changed while reading build input"
+    );
+    let final_named = open_build_input(parent, name)?;
+    ensure!(
+        regular_file_info(&final_named)?.identity == before.identity,
+        "binary name changed while reading build input"
+    );
+    Ok(())
+}
+
 pub async fn install(
     base: &str,
     version: &str,
@@ -176,15 +252,11 @@ pub fn install_local(binary: &Path, destination: &Path, target: Option<&str>) ->
         NameRetention::Movable,
     )?;
     let name = binary.file_name().context("binary has no filename")?;
-    let mut source = parent.read(name)?;
-    #[cfg(unix)]
-    ensure!(
-        source.metadata()?.permissions().mode() & 0o111 != 0,
-        "local source is not executable"
-    );
+    let mut source = open_build_input(&parent, name)?;
+    let before = regular_file_info(&source)?;
     let bytes = bounded(&mut source, MAX_ARCHIVE_BYTES, "local executable")?;
     ensure!(!bytes.is_empty(), "local executable is empty");
-    parent.verify(name, &source)?;
+    verify_build_snapshot(&parent, name, &mut source, before, &bytes)?;
     install_binary(&bytes, destination, target)
 }
 
@@ -353,38 +425,27 @@ fn package_with_docs(
         NameRetention::Movable,
     )?;
     let input_name = binary.file_name().context("binary has no filename")?;
-    let mut input = parent
-        .read(input_name)
+    let mut input = open_build_input(&parent, input_name)
         .context("binary must be an existing executable file")?;
-    let metadata = input.metadata()?;
-    let identity = regular_file_info(&input)?.identity;
-    #[cfg(unix)]
-    ensure!(
-        metadata.permissions().mode() & 0o111 != 0,
-        "binary must be an existing executable file"
-    );
+    let before = regular_file_info(&input)?;
     let name = archive_name(version, target)?;
     let output = destination_directory(output)?;
     let archive = output.path().join(&name);
     let checksum = output.path().join(format!("{name}.sha256"));
     for path in [&archive, &checksum] {
-        match fs::symlink_metadata(path) {
+        match output.read(path.file_name().context("package output has no filename")?) {
             Ok(existing) => {
                 ensure!(
-                    existing.is_file() && !existing.file_type().is_symlink(),
-                    "package output must be a regular file, not a symlink or directory"
-                );
-                ensure!(
-                    regular_file_info(&File::open(path)?)?.identity != identity,
+                    regular_file_info(&existing)?.identity != before.identity,
                     "package output must not replace its input executable"
                 );
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("inspect package output"),
+            Err(error) => return Err(error).context("package output must be a regular file, not a symlink, reparse point, hardlink or directory"),
         }
     }
     let target = crate::targets::find(target)?;
-    let expanded_size = [metadata.len(), license.len() as u64, readme.len() as u64]
+    let expanded_size = [before.len, license.len() as u64, readme.len() as u64]
         .into_iter()
         .try_fold(1024u64, |total, size| {
             size.checked_add(511)
@@ -410,7 +471,7 @@ fn package_with_docs(
         ("LICENSE", license.to_vec(), 0o644),
         ("README.md", readme.to_vec(), 0o644),
     ];
-    parent.verify(input_name, &input)?;
+    verify_build_snapshot(&parent, input_name, &mut input, before, &contents[0].1)?;
     match target.format {
         ArchiveFormat::TarGz => {
             let gzip = GzBuilder::new().mtime(0).write(

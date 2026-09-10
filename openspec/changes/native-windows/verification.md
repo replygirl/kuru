@@ -128,3 +128,55 @@ has no Windows SDK; no dependency, TLS configuration or test contract was change
 to turn that limitation into a reported pass. Shipping PE import inspection,
 stock PowerShell bootstrap, loaded-image updates, ConPTY and actual mise-backend
 installation have authored native checks but no recorded native result yet.
+
+The first native consumer candidate, `939edcc`, ran in
+[CI 34527303037](https://github.com/replygirl/kuru/actions/runs/34527303037).
+The Windows primitive job passed 48 ordinary tests, then the current-image
+fixture exited before its initial acknowledgment. Coverage did not complete.
+The full Windows job failed before application tests: Windows checkout CRLF
+conversion broke ShellCheck and caused cospec's managed files to appear modified.
+Repository text now has an explicit LF checkout policy, and the image fixture
+reports the failing stage, OS error and child status while completing owned
+cleanup. The guard's behavior is unchanged; neither fix has native acceptance yet.
+
+Additional updater fixtures interrupt the real helper at prepared receipt,
+old-image move, candidate move, published receipt and cleanup boundaries, and
+separately exercise parent loss after acknowledgment. These tests reconcile
+recorded transaction files and exact native identities through the stock
+PowerShell recovery path. They remain unexecuted on Windows. Killing the parent
+before acknowledgment can leave its private, unrecorded candidate scratch
+directory: recovery has no recorded identity authorizing its deletion. These
+fixtures do not claim to clean that scratch directory or use pathname-pattern
+deletion to conceal it; ordinary completed-update cleanup remains required.
+
+The added native memory fixtures observe creator loss after partial readiness
+consumption and during an actual in-flight SQL transaction, normal Dolt close,
+forced engine-adapter cleanup after both compiled descendants acknowledge a
+console break, concurrent cold provisioning and lifecycle contention through an
+interrupted-directory move. They remain unexecuted on Windows. The separate
+post-move completion-error regression passed against actual Dolt on macOS
+(one test, 2.87 seconds); it exercises real identity reconciliation and staged
+recovery, without claiming a process kill at ready-marker publication. Memory
+all-target type checking and strict host Clippy passed.
+
+The platform's new partial-frame fixture checks the received prefix, bounded read
+cancellation, lifetime EOF, child/output closure and completed Tokio destruction.
+Windows-target strict Clippy passed in 4.14 seconds; native execution remains
+pending. This compile result also includes the improved image-failure diagnostics.
+
+The same `939edcc` CI run completed both macOS jobs successfully. The arm64 full
+check took 629.32 seconds and its source-install/offline-runtime checks passed;
+Intel macOS passed 70 memory cases and packaged offline-runtime verification.
+Both Linux jobs exposed Cargo's legitimate hard-linked build outputs being
+rejected by the packaging source reader. Packaging and local source installation
+now retain and verify read-only build snapshots while preserving strict output
+and installed-file checks. Regressions exercise a genuinely linked compiled
+fixture across all five archive targets, same-size mutation, source-name
+replacement and linked destination preservation.
+
+The corrected local full `mise run check` passed in 458.85 seconds on macOS
+arm64, measuring 14,078/14,491 covered lines (97.15%). Formatting, strict linting,
+type checking, documentation/cospec checks and ordinary plus instrumented suites
+passed. The log is `/tmp/kuru-native-portability-corrections-check.log`.
+Windows and Linux execution of these corrections remains pending; the current
+image change supplies diagnostics and does not claim to repair the guard failure.
