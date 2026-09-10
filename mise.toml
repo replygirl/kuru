@@ -9,6 +9,11 @@ lockfile = true
 HK_MISE = "1"
 HK_PKL_BACKEND = "pklr"
 
+[tool_alias]
+# Root task discovery must resolve the docs app's npm pin with the same backend.
+# Node/npm versions and installation remain owned by apps/kuru-docs.
+npm = "npm:npm"
+
 [tools]
 rust = "1.98.1"
 codex = "0.153.4"

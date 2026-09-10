@@ -2,12 +2,12 @@
 
 - [x] 1.1 Update the exact TOML dependency and lock entries; verify the official patch/MSRV evidence, Cargo resolution and existing configuration/delivery behavior tests without application source changes.
 - [x] 1.2 Update standalone cospec and tool provenance, regenerate integrations through its own command and retain the exact-bundle compatibility preload when required; verify actual standalone clear/blocked/error behavior, archive gates and managed-file drift.
-- [ ] 1.3 Pin current npm in the docs app through native mise ownership; verify selected npm/Node versions, clean locked dependency installation and actual docs build/lint/format/link checks, including native Windows selection in CI.
+- [ ] 1.3 Pin current npm in the docs app through native mise ownership; verify selected npm/Node versions, clean locked dependency installation and actual docs build/lint/format/link checks in the required documentation CI job, and fail explicitly if task activation selects another version.
 - [x] 1.4 Refresh contributor pin/compatibility documentation from observed official metadata and commands; verify ownership, no root language workspace and accurate separation of Codex's provider-bundle update.
 
 ## 2. Verify integration
 
-- [ ] 2.1 Run the normal full mise gate and required native CI with the refreshed pins; record actual results and at least 90% meaningful workspace line coverage, preserve release/Pages topology, then strictly validate and archive this maintenance record through cospec.
+- [ ] 2.1 Run the required granular mise/hk checks and native CI with the refreshed pins; record actual results and at least 90% meaningful workspace line coverage, preserve release/Pages topology, then strictly validate and archive this maintenance record through cospec.
 
 ## Observed checks
 
@@ -35,3 +35,17 @@ including docs build/link/format checks, strict lint, behavioral tests and
 14,304/14,731 covered workspace lines (97.10%). The full log is
 `/tmp/kuru-native-corrections-check.log`. Native Windows tool selection and
 required CI remain pending, so these local results do not complete those tasks.
+
+The user's subsequent `parallel-quality-gates` instruction moves static checks
+to Ubuntu and reserves the platform matrix for native application behavior.
+Accordingly, this maintenance task now requires exact npm/Node activation in
+the owning documentation job, rather than reinstating Windows documentation
+checks. Native Windows runtime acceptance remains required independently.
+
+The new d66780f docs job installed npm 12.0.2 but actually activated Node's bundled
+npm 11.19.1 under the root monorepo task runner. Its green build is not pin
+acceptance: the log reports an npm backend/lock mismatch before setup. The
+correction must preserve app-owned versions, resolve the canonical npm backend
+at monorepo scope and assert actual versions even when dependency installation
+is cached. Task 1.3 remains open; evidence is in
+`/tmp/kuru-windows-d66780f-docs.log`.

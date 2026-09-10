@@ -27,6 +27,12 @@ Installation, packaging, release orchestration and repository checks live in
 the Rust package `packages/kuru-delivery`. No Python or Bun is needed. The
 VitePress docs app owns its Node/npm pins, package.json and npm lockfile under
 `apps/kuru-docs`; its mise tasks invoke the installed tools directly.
+The root npm backend alias makes monorepo task discovery use that app's locked
+`npm:npm` backend. Versions remain app-owned. Documentation setup checks actual
+Node/npm versions against `mise current` even when `npm ci` is already cached;
+a runner's bundled npm must not silently replace the configured version.
+If an earlier local install used another backend for the same npm version,
+repair only that cache with `mise -C apps/kuru-docs install --force npm`.
 
 The delivery package activates Cocogitto and Communiqué only for its tests,
 combined coverage and release tasks. Its `setup` task preinstalls those tools

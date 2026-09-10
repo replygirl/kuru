@@ -68,6 +68,9 @@ exists for shared Rust dependency resolution and combined coverage. Other
 language manifests belong to their owning app/package only when necessary.
 VitePress's Node/npm dependencies are local to apps/kuru-docs. Do not introduce
 Python, Bun, or a root JavaScript/Python project for delivery helpers.
+Backend aliases needed by root task discovery may be registered in root mise
+configuration; keep their version pins and installation tasks in the owning
+app/package. The npm alias must resolve to the same backend as the docs lockfile.
 Scope tools needed only by particular tasks to those package tasks, as the
 delivery package does for release-note tooling. Installation, packaging and docs
 tasks must remain independent of the notes toolchain. Add new language tooling only

@@ -190,7 +190,7 @@ jobs:
       - name: Install app-owned documentation tools before task activation
         # With automatic installation disabled, setup's PATH must see the pins
         # before it starts; the runner's preinstalled Node/npm are not substitutes.
-        run: mise -C apps/kuru-docs install node npm
+        run: mise run //apps/kuru-docs:setup:tools
       - run: mise run docs:check
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
