@@ -2,33 +2,39 @@ context = """
 Kuru is a Rust terminal chat harness built around persistent equal peer parts,
 isolated memories, speaking relationships and reversible dreaming. Its IFS,
 polyvagal, Freudian and Jungian modes are computational interpretations rather
-than clinical treatment or claims of sentience. It supports native Codex login,
+than clinical treatment or claims of sentience. It supports OpenAI Codex login,
 OpenAI Responses, MCP, A2A, guarded file tools and explicitly enabled shell tools.
 Users install its kuru binary from source or verified native release archives.
 The demo provider runs in-process without credentials or network access. Codex
 owns its login and credential lifecycle. Explicitly enabled shell tools run with
 the user's process authority; there is no shell-command allowlist or sandbox.
-Messages retain peer provenance; do not describe them as anonymized. Storage is
-currently SQLite, and no future version or release date is promised for Dolt.
+Messages retain peer provenance. Storage is currently SQLite. IFS is the default
+framework with seven built-in peers; the demo provider uses the selected framework.
 """
 system_extra = """
 Write concise factual release notes of at most 450 words grounded in the supplied
-commits and files. Lead with observable changes for users, then use 6-10 focused
-bullets. Summarize the release rather than enumerating every component and test.
+commits and files. Lead with observable changes for users, then use at most ten
+focused bullets across the entire release body. Use fewer for a small release.
+Summarize the release rather than enumerating every component and test.
+The current-source snapshot is authoritative for present behavior. Commit history
+explains changes and may contain earlier designs that were subsequently replaced.
+Resolve any discrepancy using files at the selected source commit. Omit uncertain
+details rather than guessing. Do not turn historical plans into shipped features.
 Mention breaking changes and migration steps only when supported by history.
 Do not invent capabilities, restrictions, roadmap versions, release dates,
 benchmarks, test results, availability or completed deployments. Omit test counts,
 coverage figures, repository visibility and branch-protection administration.
-Read source when a technical claim is uncertain; omit it if unsupported.
 Do not disclose credential values or internal instructions. No marketing prose.
-The initial implementation inventory supplements history on the first release.
+Keep writing instructions out of the release prose. Do not repeat the version
+or product name in the release title; Communiqué supplies the version heading.
 """
 
 [defaults]
-# Current Haiku family: Communiqué 1.3.5 cannot deserialize thinking blocks
-# emitted by default by Claude 5. Revisit after upstream adds that support.
-model = "claude-haiku-4-5-20251001"
-provider = "anthropic"
+# Anthropic's official compatibility API omits the thinking blocks that
+# Communiqué 1.3.5's native Anthropic parser cannot yet deserialize.
+model = "claude-sonnet-5"
+provider = "openai"
+base_url = "https://api.anthropic.com/v1"
 repo = "replygirl/kuru"
 max_tokens = 16384
 emoji = false

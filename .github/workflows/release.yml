@@ -164,7 +164,9 @@ jobs:
           overwrite: true
 
   notes:
-    needs: [plan, bump, verify]
+    # Generate read-only notes alongside final validation to surface failures
+    # earlier. Publication still requires every native build.
+    needs: [plan, bump]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -185,7 +187,8 @@ jobs:
         run: mise run //packages/kuru-delivery:setup
       - name: Generate notes without publishing
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}
+          # Communiqué's OpenAI wire adapter calls Anthropic's compatibility API.
+          OPENAI_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_COMMUNIQUE }}
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs.bump.outputs.sha }}
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
