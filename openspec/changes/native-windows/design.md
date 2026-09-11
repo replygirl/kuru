@@ -414,6 +414,12 @@ use this real static-runtime PE; an instrumented development Kuru is not a
 shipping dependency fixture. Invalid PE input must still fail. The separate final
 shipping check retains actual Kuru, actual package-owned prefetch, nonempty
 ordinary/delay import parsing and the unchanged OS-DLL allowlist.
+The inspection fixture isolates user homes, temporary state and PATH, while
+retaining the narrowly required machine installation roots for real MSVC
+discovery. Unlike an installed-runtime test, this build-tool test deliberately
+uses the runner's MSVC installation. Preserve discovery's actual native exit and
+match count on failure; missing tooling fails the required test rather than
+selecting a substitute or skipping inspection.
 
 Add package-owned `support/install.ps1` with a thin conventional entrypoint,
 compatible with stock Windows PowerShell 5.1. Retain explicit version, target,

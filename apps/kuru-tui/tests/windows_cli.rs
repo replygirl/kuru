@@ -114,6 +114,14 @@ if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -n
         .expect("native MSVC acceptance requires ProgramFiles(x86)");
     let launch = |input: &str| {
         let mut child = command(root.path(), &powershell);
+        // This build-tool fixture uses the machine's real MSVC installation.
+        // Setup Configuration discovers its shared installation state under
+        // ProgramData; isolating user homes must not hide that machine root.
+        for key in ["ProgramData", "ALLUSERSPROFILE"] {
+            let value = std::env::var_os(key)
+                .unwrap_or_else(|| panic!("native MSVC acceptance requires {key}"));
+            child.env(key, value);
+        }
         child
             .env("OS", "Windows_NT")
             .env("ProgramFiles(x86)", &program_files)

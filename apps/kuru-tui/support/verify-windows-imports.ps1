@@ -12,7 +12,12 @@ $Binary = (Resolve-Path -LiteralPath $Binary).ProviderPath
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw 'MSVC Build Tools with vswhere are required for the shipping import check' }
 $tools = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe')
-if ($LASTEXITCODE -ne 0 -or $tools.Count -eq 0) { throw 'The native MSVC dumpbin tool is missing' }
+$discoveryExitCode = $LASTEXITCODE
+if ($discoveryExitCode -ne 0 -or $tools.Count -eq 0) {
+    $diagnostic = ($tools | Select-Object -First 12) -join [Environment]::NewLine
+    $diagnostic = $diagnostic.Substring(0, [Math]::Min(4096, $diagnostic.Length))
+    throw "The native MSVC dumpbin tool is missing (vswhere exit $discoveryExitCode; matches $($tools.Count)): $diagnostic"
+}
 $dumpbin = $tools[-1]
 
 # Provision from the verified embedded archive through its owning package.

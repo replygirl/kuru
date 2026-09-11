@@ -1050,3 +1050,53 @@ consumer cross-checking, and compiled-out Windows tests establish no native pass
 Evidence: `/tmp/kuru-pe-path-implementation.md`,
 `/tmp/kuru-pe-path-independent-review.md`, `/tmp/kuru-pe-path-format.log` and
 `/tmp/kuru-pe-path-final-validate.log`.
+
+## Hosted 243a79d result and inspection-fixture discovery
+
+[CI 34580970004](https://github.com/replygirl/kuru/actions/runs/34580970004)
+finished with 412 full-Windows cases passed, one failed and one intentionally
+ignored benchmark. Its actual merge checkout
+`683e89a46ceba397f30f127ac9e25da03879b87a` has tree
+`2c39665e351222b12241da28970183b82cab96c8`, identical to branch 243a79d.
+The sole failure was the new PE regression's first ordinary-path case: stock
+PowerShell reached the owning script, but real `vswhere` discovery returned a
+nonzero exit or no matching `dumpbin` path. The existing error did not distinguish
+those outcomes. It does not establish that MSVC was absent from the runner.
+Discovery failed before prefetch, inspection, alternate path forms, invalid-PE
+rejection or final file-identity assertions. The ProviderPath correction therefore
+still has no completed native acceptance.
+
+Both shell cases, actual instrumented full-application install/update with normal
+app/helper profiles, all five ConPTY cases, native mise fixture, 12 bootstrap
+cases, ten updater cases and retained-stage controls passed. The full suite's
+failure skipped full LCOV generation/upload and all later native source,
+offline-Cargo, selected shipping and final Kuru/Dolt PE checks. Windows primitives
+passed 55 cases at 2640/2903 lines (90.940406%). All static categories and four
+Unix jobs passed, including their actual selected shipping roundtrips. Ubuntu
+measured 14652/15086 lines (97.123161%); macOS arm64 measured 14663/15097
+(97.125257%). The aggregate failed; no native completion or archive is claimed.
+Evidence: `/tmp/kuru-windows-243a79d-results.md`, its completed full log and
+`/tmp/kuru-ci-243a79d-results.md`.
+
+Keep the fixture's private user directories and controlled PATH while preserving
+the machine-level installation discovery context required by the actual MSVC
+tools. Add the real discovery exit status and match count to failure diagnostics.
+This fixture adjustment must pass the same unmodified path, non-PE, prefetch and
+identity assertions in 16.1, followed by the separate actual shipping checks in
+16.2. No simulated tool, discovery fallback, skip or DLL-policy change can satisfy
+those rows; the specific environmental cause remains to be confirmed natively.
+
+The fixture now retains only `ProgramData` and `ALLUSERSPROFILE` in addition to
+its existing MSVC prerequisites. Microsoft's installation documentation locates
+instance state under ProgramData, and its known-folder contract identifies both
+machine-root variables; public vswhere code delegates the actual lookup to Setup
+Configuration COM. This supports the correction without proving which lookup
+failed in 243a79d. The owning script saves the real exit immediately and caps
+failure output at 12 lines and 4096 characters. Source review found no changes to
+user homes, PATH, product command environments, PE assertions or deadlines.
+Strict validation and actual apply both exited zero before source changes;
+formatting and independent review passed. Native rows 16.1 and 16.2 remain open.
+Evidence: `/tmp/kuru-vswhere-243-investigation.md`,
+`/tmp/kuru-pe-discovery-validate.log`, `/tmp/kuru-pe-discovery-apply.json`,
+`/tmp/kuru-pe-discovery-format.log` and
+`/tmp/kuru-pe-discovery-independent-review.md`.
