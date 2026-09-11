@@ -57,6 +57,19 @@ fn main() -> anyhow::Result<()> {
     serde_json::to_writer(&mut log, &arguments)?;
     writeln!(log)?;
     match arguments.as_slice() {
+        [action, task] if action == "run" && task == "//packages/kuru-memory:prefetch" => {
+            // The caller has already provisioned and verified the real bundled
+            // engine. Only the mise routing is substituted, never PE inspection.
+            let engine = PathBuf::from(
+                std::env::var_os("KURU_CLI_FIXTURE_ENGINE").expect("verified managed engine"),
+            );
+            anyhow::ensure!(
+                engine.is_file() && engine.canonicalize()? == engine,
+                "prefetch fixture requires the canonical managed executable"
+            );
+            log.flush()?;
+            println!("{}", engine.display());
+        }
         [action] if action == "login" || action == "logout" => {}
         [action, option]
             if action == "login" && (option == "status" || option == "--device-auth") => {}

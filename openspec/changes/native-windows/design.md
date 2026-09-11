@@ -403,6 +403,18 @@ CI inspects PE imports of both Kuru and the embedded Dolt executable and permits
 only operating-system DLL dependencies; a separately installed redistributable
 must not be needed to start the shipped application.
 
+Pass resolved filesystem `ProviderPath` values to native PE inspection tools,
+rather than PowerShell's provider-qualified `Path` representation. Preserve
+genuine extended Windows prefixes and literal-path resolution. A native regression
+uses actual managed Dolt PE bytes with ordinary, extended and provider-qualified
+input names, real stock PowerShell and real MSVC inspection. Its compiled mise
+fixture only records the exact owning prefetch call and returns the already
+verified engine path, avoiding recursive Cargo work. Both fixture image slots
+use this real static-runtime PE; an instrumented development Kuru is not a
+shipping dependency fixture. Invalid PE input must still fail. The separate final
+shipping check retains actual Kuru, actual package-owned prefetch, nonempty
+ordinary/delay import parsing and the unchanged OS-DLL allowlist.
+
 Add package-owned `support/install.ps1` with a thin conventional entrypoint,
 compatible with stock Windows PowerShell 5.1. Retain explicit version, target,
 release-base and install-dir options plus documented environment precedence.

@@ -992,3 +992,61 @@ Evidence: `/tmp/kuru-activation-563-{retention-test,move-tests,platform-tests}.l
 `/tmp/kuru-activation-563-{memory-lint,platform-windows-lint,format}.log`,
 `/tmp/kuru-activation-563-independent-review.md` and
 `/tmp/kuru-powershell-563-control-review.md`.
+
+## Hosted 6fb0a6b result and PE path follow-up
+
+[CI 34576347214](https://github.com/replygirl/kuru/actions/runs/34576347214)
+finished with 412 full-Windows tests passed, zero failed and one intentionally
+ignored benchmark, at 17928/19006 lines (94.328107%). The actual merge checkout
+`5d7bb559a693f32563d3ff29260667a5de7cb482` has tree
+`123c838b0b56dddda52634d5b32b80396a3285e5`, identical to branch 6fb0a6b.
+The actual incompatible-module negative control and subsequent Kuru hash and
+environment assertions passed, as did both source markers in the ordinary shell
+case. The real held-descendant activation control passed with preserved verified
+stage, identity, original error and stable lock. These controlled successes do
+not identify the causes of the earlier intermittent timeout or unexplained OS5.
+
+All five ConPTY cases, normal full-application update and distinct app/helper
+profiles, actual native mise fixture, 12 bootstrap and ten updater cases passed.
+Windows primitives passed 55 cases at 2640/2903 lines (90.940406%). Actual native
+source installation and all three offline Cargo controls passed: missing input
+rejected with OS2, same-size corruption rejected by its checksum, restored valid
+input built offline. The selected source-installed shipping executable measured
+53,709,824 bytes and its outer ZIP 44,159,587 bytes. Its actual packaged install
+and self-update each persisted chat from empty offline caches using Dolt 2.3.3.
+All seven static/quality/title jobs and all four Unix jobs passed; full Linux
+and macOS coverage remained above 97%, with actual shipping roundtrips on all
+four Unix targets. The local eight push hooks passed at 14662/15097 lines
+(97.118633%).
+
+The final native PE inspection passed Kuru's OS-only imports, then failed closed
+because no Dolt imports were parsed. `(Resolve-Path ...).Path` forwarded a
+`Microsoft.PowerShell.Core\FileSystem::` provider qualifier ahead of the genuine
+extended Windows engine path. Use `.ProviderPath` at both native-argument sites;
+do not strip extended prefixes, broaden the DLL allowlist or relax empty-output
+and native-exit checks. Actual `dumpbin` compatibility with the resulting native
+extended form remains unverified. The aggregate failed; native completion and
+archive are not claimed. Evidence: `/tmp/kuru-windows-6fb0a6b-results.md`,
+`/tmp/kuru-ci-6fb0a6b-results.md` and `/tmp/kuru-pe-path-6fb-investigation.md`.
+
+- [ ] 16.1 @regression (agent) Run the owning inspection script in stock Windows PowerShell against real verified Dolt PE bytes, forwarding ordinary and provider-qualified extended names to real MSVC tools -> both image inventories are nonempty and accepted, the exact owning prefetch call is recorded, file bytes/identities remain unchanged, and genuine non-PE input fails without a success inventory. Only prefetch command routing is substituted; no fake PE parser, native tool or DLL output.
+- [ ] 16.2 @integration (agent) Run the unchanged final native shipping task with actual source-installed Kuru and actual memory-owned prefetch -> both actual OS-only ordinary/delay DLL inventories pass, alongside full native coverage, source/offline Cargo/shipping checks and the aggregate. Local parsing or a fixture prefetch is not shipping provenance evidence.
+
+Independent host byte inspection extracted the pinned Windows Dolt member and
+verified its complete executable SHA-256 against the manifest. The existing Xcode
+LLVM inspector reported `ADVAPI32.dll`, `KERNEL32.dll` and `msvcrt.dll`, with an
+empty delay-import directory. This supports the pinned payload's inventory;
+it does not exercise PowerShell, native path forwarding or Windows `dumpbin`.
+Evidence: `/tmp/kuru-pe-path-dolt-llvm.txt`.
+
+The representation correction and native regression are implemented. The test
+uses three spellings of the same retained real PE, an actual non-PE control and
+exact prefetch-call observations; identities and streaming hashes are checked
+afterward. Its ASCII launcher explicitly selects UTF-8 for fixture path output,
+without changing product encoding. The final real shipping task is unchanged.
+Rust formatting, strict cospec validation and independent source review passed.
+Windows typing and execution remain pending; this host has no Windows SDK for
+consumer cross-checking, and compiled-out Windows tests establish no native pass.
+Evidence: `/tmp/kuru-pe-path-implementation.md`,
+`/tmp/kuru-pe-path-independent-review.md`, `/tmp/kuru-pe-path-format.log` and
+`/tmp/kuru-pe-path-final-validate.log`.

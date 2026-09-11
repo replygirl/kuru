@@ -38,6 +38,175 @@ fn success(command: &mut Command) {
     );
 }
 
+#[tokio::test]
+async fn pe_inspection_uses_native_paths_and_real_msvc_imports() {
+    use std::io::Read;
+
+    let root = kuru_memory::test_support::tempdir().unwrap();
+    let tools = root.path().join("tools");
+    let images = root.path().join("PE images 日本語");
+    fs::create_dir(&tools).unwrap();
+    fs::create_dir(&images).unwrap();
+    fs::copy(
+        env!("CARGO_BIN_EXE_kuru-cli-windows-fixture"),
+        tools.join("mise.exe"),
+    )
+    .unwrap();
+    let config = kuru_core::MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+    let engine =
+        kuru_memory::provision::provision(&config, &kuru_memory::test_support::cache_dir())
+            .await
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+    let evidence = |path: &Path| {
+        let mut file = File::open(path).unwrap();
+        let info = regular_file_info(&file).unwrap();
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let length = file.read(&mut buffer).unwrap();
+            if length == 0 {
+                break;
+            }
+            digest.update(&buffer[..length]);
+        }
+        (file, info, digest.finalize().to_vec())
+    };
+    let engine_before = evidence(&engine);
+    // Instrumented development Kuru may use a dynamic CRT. Both fixture slots
+    // instead inspect the actual verified static-runtime Dolt PE. Shipping CI
+    // separately inspects the source-installed Kuru and real owning prefetch.
+    let binary = images.join("copied engine.exe");
+    assert_eq!(fs::copy(&engine, &binary).unwrap(), engine_before.1.len);
+    let binary_before = evidence(&binary);
+    assert_eq!(binary_before.2, engine_before.2);
+    assert_ne!(binary_before.1.identity, engine_before.1.identity);
+    let invalid = images.join("not a PE.exe");
+    fs::write(&invalid, b"This is not a Portable Executable.\n").unwrap();
+    let invalid_before = evidence(&invalid);
+
+    let script = root.path().join("verify-windows-imports.ps1");
+    fs::write(
+        &script,
+        include_bytes!("../support/verify-windows-imports.ps1"),
+    )
+    .unwrap();
+    let launcher = root.path().join("inspect-pe.ps1");
+    fs::write(
+        &launcher,
+        r#"$ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'expected stock PowerShell 5.1' }
+# Native Rust fixture output and exact Unicode result assertions use UTF-8.
+# Keep this ASCII script independent of Windows PowerShell's source encoding.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+& $env:KURU_PE_SCRIPT -Binary $env:KURU_PE_INPUT
+"#,
+    )
+    .unwrap();
+    let powershell = kuru_platform::windows::process::system_directory()
+        .unwrap()
+        .join("WindowsPowerShell/v1.0/powershell.exe");
+    let program_files = std::env::var_os("ProgramFiles(x86)")
+        .expect("native MSVC acceptance requires ProgramFiles(x86)");
+    let launch = |input: &str| {
+        let mut child = command(root.path(), &powershell);
+        child
+            .env("OS", "Windows_NT")
+            .env("ProgramFiles(x86)", &program_files)
+            .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+            .env("KURU_CLI_FIXTURE_ENGINE", &engine)
+            .env("KURU_PE_SCRIPT", &script)
+            .env("KURU_PE_INPUT", input)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-OutputFormat",
+                "Text",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&launcher);
+        child.output().unwrap()
+    };
+    let extended = binary.canonicalize().unwrap();
+    let extended = extended.to_str().unwrap();
+    // Construct alternate spellings of this same retained fixture file only;
+    // production resolution preserves the genuine extended prefix unchanged.
+    let ordinary = match extended.strip_prefix(r"\\?\UNC\") {
+        Some(unc) => format!(r"\\{unc}"),
+        None => extended.strip_prefix(r"\\?\").unwrap().to_owned(),
+    };
+    let qualified = format!(r"Microsoft.PowerShell.Core\FileSystem::{extended}");
+    for input in [ordinary.as_str(), extended, qualified.as_str()] {
+        let output = launch(input);
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "input={input:?}: {diagnostic}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<_> = stdout.lines().collect();
+        assert_eq!(lines.len(), 2, "input={input:?}: {stdout:?}");
+        let mut inventories = Vec::new();
+        for (line, expected) in lines.into_iter().zip([&binary, &engine]) {
+            let (path, libraries) = line
+                .strip_prefix("OS-only PE imports: ")
+                .unwrap()
+                .rsplit_once(": ")
+                .unwrap();
+            assert!(!path.contains("FileSystem::"), "{line}");
+            assert_eq!(
+                Path::new(path).canonicalize().unwrap(),
+                expected.canonicalize().unwrap()
+            );
+            assert!(!libraries.is_empty(), "{line}");
+            assert!(
+                libraries
+                    .split(", ")
+                    .all(|library| library.ends_with(".dll"))
+            );
+            inventories.push(libraries);
+        }
+        assert_eq!(inventories[0], inventories[1]);
+    }
+    let output = launch(invalid.to_str().unwrap());
+    assert!(!output.status.success(), "non-PE input must fail");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("OS-only PE imports:"));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostic.contains("Cannot inspect PE imports")
+            || diagnostic.contains("No DLL imports were parsed"),
+        "non-PE input must reach actual inspection: {diagnostic}"
+    );
+    let calls: Vec<Vec<String>> = fs::read_to_string(root.path().join("actions.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        calls,
+        vec![vec!["run", "//packages/kuru-memory:prefetch"]; 4]
+    );
+    for (path, before) in [
+        (&engine, &engine_before),
+        (&binary, &binary_before),
+        (&invalid, &invalid_before),
+    ] {
+        let after = evidence(path);
+        assert_eq!(regular_file_info(&before.0).unwrap(), before.1);
+        assert_eq!(
+            after.1,
+            before.1,
+            "identity/size changed: {}",
+            path.display()
+        );
+        assert_eq!(after.2, before.2, "bytes changed: {}", path.display());
+    }
+}
+
 #[test]
 fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environment() {
     let root = tempfile::tempdir().unwrap();
