@@ -1,6 +1,56 @@
 //! Compiled acceptance fixture access to the actual private supervisor protocol.
 use super::*;
 
+/// The compiled creator owns the real lifetime endpoint but sends no Request.
+/// Its inherited output keeps the supervisor's completion observable after
+/// creator termination without reopening either process by numeric PID.
+pub(crate) async fn unconfigured(
+    supervisor: &Path,
+    directory: &Path,
+    observer: &mut pipe::Pipe,
+) -> Result<()> {
+    use kuru_platform::windows::process::{StandardStream, inherited_stdio};
+    let listener = pipe::PrivateListener::bind()?;
+    let mut command = NativeSpawnSpec::new(supervisor.to_owned(), directory.to_owned());
+    command.args = vec![
+        "--internal-dolt-supervisor".into(),
+        listener.address().to_owned(),
+        "--fixture-unconfigured".into(),
+    ];
+    command.environment = crate::test_support::windows::environment()?;
+    command.lifetime = Lifetime::TrustedSupervisor;
+    command.console = Console::PrivateHidden;
+    command.stdout = inherited_stdio(StandardStream::Output)?;
+    let mut owner = Owner {
+        child: Some(command.spawn().await?),
+        lifetime: None,
+        retained: None,
+    };
+    let result = async {
+        owner.lifetime = Some(
+            listener
+                .accept(owner.child.as_ref().unwrap(), Duration::from_secs(5))
+                .await?,
+        );
+        ensure!(
+            owner.child.as_mut().unwrap().try_wait()?.is_none(),
+            "unconfigured supervisor exited before creator acknowledgment"
+        );
+        observer.write_all(b"READY\n").await?;
+        observer.flush().await?;
+        let mut byte = [0];
+        timeout(Duration::from_secs(45), observer.read(&mut byte)).await??;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    // Every ordinary error/observer EOF closes the endpoint and awaits the
+    // existing owner cleanup. Forced creator loss supplies that EOF through OS
+    // handle closure instead; the supervisor's startup deadline remains intact.
+    let stopped = finish_owner(&mut owner).await;
+    result?;
+    stopped
+}
+
 pub(crate) async fn partial_readiness(
     options: ServerOptions,
     observer: &mut pipe::Pipe,

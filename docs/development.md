@@ -162,6 +162,7 @@ KURU_DOLT_BUNDLE_DIR=/absolute/path/to/build-inputs \
 
 KURU_DOLT_BUNDLE_DIR=/absolute/path/to/build-inputs \
 KURU_DOLT_BUNDLE_OFFLINE=true \
+CARGO_NET_OFFLINE=true \
   mise run //apps/kuru-tui:build:release -- --target x86_64-unknown-linux-gnu
 ```
 
@@ -187,6 +188,7 @@ For an offline Windows build, import the manifest's matching ZIP, then build:
 $env:KURU_DOLT_BUNDLE_DIR = 'C:\BuildInputs\kuru'
 mise run //packages/kuru-memory:bundle:prepare -- --target x86_64-pc-windows-msvc --archive C:\Downloads\dolt-windows-amd64.zip --offline
 $env:KURU_DOLT_BUNDLE_OFFLINE = 'true'
+$env:CARGO_NET_OFFLINE = 'true'
 mise run //apps/kuru-tui:build:release -- --target x86_64-pc-windows-msvc
 ```
 
@@ -195,6 +197,15 @@ unless `CARGO_TARGET_DIR` selects another target directory. For its native impor
 check, set `KURU_EMBEDDED_TEST_BINARY` to that absolute path and run
 `mise run //apps/kuru-tui:verify:windows-imports`. This maintainer check uses MSVC
 tools; the installed application does not.
+
+CI's source-install smoke disables both Cargo network access and missing-bundle
+downloads after preparing the dependencies. On Windows, the memory-owned
+`mise run //packages/kuru-memory:bundle:verify-native-build` task also invokes
+the actual Cargo build with isolated missing and same-size corrupt mirrors,
+requires the specific build-script rejection, then restores a valid offline
+build. Run it after source installation with `KURU_EMBEDDED_TEST_BINARY` pointing
+to the installed copy outside Cargo's output directory. It verifies that the
+installed executable and original prepared archive retain their hashes.
 
 ## Change workflow
 

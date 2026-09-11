@@ -11,6 +11,13 @@ pub(crate) struct Child {
     inner: Native,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    AlreadyExited,
+    Graceful,
+    Forced,
+}
+
 pub(crate) async fn spawn(
     binary: &Path,
     home: &Path,
@@ -123,9 +130,13 @@ impl Child {
         }
     }
 
-    pub(crate) async fn stop(&mut self, grace: Duration, kill_grace: Duration) -> Result<()> {
+    pub(crate) async fn stop(
+        &mut self,
+        grace: Duration,
+        kill_grace: Duration,
+    ) -> Result<StopOutcome> {
         if self.try_wait()?.is_some() {
-            return Ok(());
+            return Ok(StopOutcome::AlreadyExited);
         }
         #[cfg(unix)]
         {
@@ -153,16 +164,16 @@ impl Child {
                 .context(
                     "owned Dolt tree did not become quiescent after failed console interruption",
                 )??;
-            return Ok(());
+            return Ok(StopOutcome::Forced);
         }
         if let Ok(result) = tokio::time::timeout(grace, self.wait()).await {
             result?;
-            return Ok(());
+            return Ok(StopOutcome::Graceful);
         }
         self.kill()?;
         tokio::time::timeout(kill_grace, self.wait())
             .await
             .context("owned Dolt tree did not become quiescent after forced shutdown")??;
-        Ok(())
+        Ok(StopOutcome::Forced)
     }
 }

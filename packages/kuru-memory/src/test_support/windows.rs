@@ -101,6 +101,10 @@ pub async fn partial_readiness(
     crate::server::windows_fixture::partial_readiness(options, observer).await
 }
 
+pub async fn unconfigured(supervisor: &Path, directory: &Path, observer: &mut Pipe) -> Result<()> {
+    crate::server::windows_fixture::unconfigured(supervisor, directory, observer).await
+}
+
 struct EngineOwner {
     child: Option<crate::engine::Child>,
     directory: Option<Directory>,
@@ -165,9 +169,13 @@ pub async fn forced_engine_cleanup(root: &Path, fixture: &Path, observer: &mut P
         matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         "descendant did not retain its actual file lock"
     );
-    child
+    let outcome = child
         .stop(Duration::from_secs(2), Duration::from_secs(5))
         .await?;
+    ensure!(
+        outcome == crate::engine::StopOutcome::Forced,
+        "stubborn engine did not require forced cleanup: {outcome:?}"
+    );
     let status = child
         .try_wait()?
         .context("engine stop returned before Job quiescence")?;

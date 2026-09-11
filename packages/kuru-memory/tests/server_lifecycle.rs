@@ -172,6 +172,11 @@ async fn authenticated_readers_branch_pools_and_reopen_share_only_committed_stat
     writer.close().await?;
     assert!(writer.pool("main").await.is_err());
     assert!(!opts.directory.join("endpoint.json").exists());
+    let log = std::fs::read_to_string(opts.directory.join("server.log"))?;
+    assert!(
+        log.ends_with("\nKuru engine shutdown: Graceful\n"),
+        "real Dolt did not complete the graceful shutdown branch: {log}"
+    );
     let reopened_reader = open(read_options).await?;
     let pool = reopened_reader.pool("main").await?;
     assert_eq!(

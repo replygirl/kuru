@@ -917,6 +917,7 @@ pub mod test_support {
                 "none"
                     | "prepared"
                     | "old_moved_before_receipt"
+                    | "old_moved_before_receipt_resume"
                     | "candidate_moved_before_receipt"
                     | "candidate_published"
                     | "old_removed_before_complete"
@@ -963,6 +964,12 @@ pub mod test_support {
     /// The production parser still receives exactly its original JSON argument.
     pub async fn run_helper_observed(arguments: Vec<OsString>, checkpoint: &str) -> Result<()> {
         checked_checkpoint(checkpoint)?;
+        let resume = checkpoint == "old_moved_before_receipt_resume";
+        let checkpoint = if resume {
+            "old_moved_before_receipt"
+        } else {
+            checkpoint
+        };
         let checkpoint = checkpoint.to_owned();
         let mut observer = move |reached: &str, receipt: &Receipt| {
             if reached == checkpoint {
@@ -971,11 +978,15 @@ pub mod test_support {
                     serde_json::json!({"checkpoint":reached,"operation":receipt.operation,"phase":receipt.phase,"helper_pid":std::process::id()})
                 );
                 std::io::stdout().flush()?;
-                // The owner kills and reaps this Job after the exact marker.
-                // Input is retained to prevent EOF, never timing-polled.
+                // Existing interruption cases kill at this marker. The one
+                // resume fixture first acquires a real conflicting file handle
+                // and then allows the actual publication operation to continue.
                 let mut byte = [0];
                 std::io::stdin().read_exact(&mut byte)?;
-                anyhow::bail!("fixture checkpoint was resumed instead of terminated");
+                ensure!(
+                    resume && byte == [b'r'],
+                    "fixture checkpoint was resumed instead of terminated"
+                );
             }
             Ok(())
         };

@@ -78,6 +78,8 @@ jobs:
         if: inputs.install && runner.os != 'Windows'
         env:
           KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
+          CARGO_NET_OFFLINE: "true"
+          KURU_DOLT_BUNDLE_OFFLINE: "true"
         run: |
           mise run install
           "$KURU_INSTALL_DIR/kuru" --version
@@ -86,11 +88,18 @@ jobs:
         shell: pwsh
         env:
           KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
+          CARGO_NET_OFFLINE: "true"
+          KURU_DOLT_BUNDLE_OFFLINE: "true"
         run: |
           mise run install
           if ($LASTEXITCODE -ne 0) { throw 'Source installation failed' }
           & "$env:KURU_INSTALL_DIR/kuru.exe" --version
           if ($LASTEXITCODE -ne 0) { throw 'Installed Kuru failed' }
+      - name: Verify native offline Cargo input failures
+        if: inputs.install && runner.os == 'Windows'
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
+        run: mise run //packages/kuru-memory:bundle:verify-native-build
       - name: Verify installed offline runtime
         if: inputs.install
         env:

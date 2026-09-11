@@ -362,3 +362,43 @@ found no other ownership mismatch. The focused macOS A2A server test and scoped
 strict Clippy passed. Windows application test execution is still pending;
 compilation stopped before that suite ran. Evidence:
 `/tmp/kuru-native-server-path-fix.md` and `/tmp/kuru-windows-d66780f-full.log`.
+
+## Final acceptance boundary review
+
+Source-to-test maps are recorded in `/tmp/kuru-native-memory-acceptance-map.md`,
+`/tmp/kuru-native-delivery-acceptance-map.md` and
+`/tmp/kuru-native-cli-terminal-acceptance-map.md`. They distinguish assertions
+present in source from actual hosted execution. This review identified five
+specific boundaries that a green existing suite alone would not establish.
+
+The added memory fixture terminates a retained real creator before it sends any
+supervisor configuration. It requires the supervisor's actual UnexpectedEof
+completion and output closure, with no database or lease state. The engine now
+returns a crate-private shutdown outcome and appends it to the existing private
+log after cleanup; public lifecycle behavior and resource ordering are unchanged.
+The real-Dolt close fixture requires Graceful, and the stubborn compiled adapter
+requires Forced. The existing real-Dolt lifecycle scenario passed on macOS with
+the new Graceful assertion (one test, 3.07 seconds), alongside type checking and
+strict Clippy. The new Windows creator/stop assertions remain unexecuted there.
+Evidence: `/tmp/kuru-memory-lifecycle-final-evidence.md`.
+
+Stock PowerShell bootstrap regressions now exercise the actual compressed-file
+cap, aggregate expansion cap and declared member/output bounds with correctly
+checksummed physical ZIP records. A real loaded-image update fixture retains a
+candidate handle that denies DELETE sharing, proves OS32, then resumes the
+helper. It requires automatic restoration of the old object's identity/bytes
+before any recovery command. After the handle closes, recorded recovery must
+finish pending cleanup. Candidate execution and unrelated-file changes remain
+forbidden. Host type checking and strict Clippy passed; these Windows bodies
+still require native compilation and execution. Evidence:
+`/tmp/kuru-native-delivery-limits-rollback.md`.
+
+The existing native source-install step now disables Cargo network access and
+missing-bundle downloads after dependency preparation. Windows additionally
+runs the memory-owned `bundle:verify-native-build` task against actual Cargo,
+using isolated missing and same-size corrupted mirrors, then a valid offline
+build with the shipping target/profile. Specific build-script failure causes,
+original archive hashes and installed executable hashes are required; no nested
+Cargo test or extra static-analysis job was added. Source review, formatting,
+actionlint and cospec validation passed. Actual Windows invocation is pending;
+no local PowerShell interpreter was available for native execution.

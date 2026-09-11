@@ -1120,9 +1120,15 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         let _ = stderr.await;
     })
     .await;
-    let diagnostic = String::from_utf8_lossy(&log.lock().await)
+    let mut diagnostic = String::from_utf8_lossy(&log.lock().await)
         .replace(&identity.password, "[redacted]")
         .replace(&identity.reader_password, "[redacted]");
+    match &stopped {
+        Ok(outcome) => {
+            diagnostic.push_str(&format!("\nKuru engine shutdown: {outcome:?}\n"));
+        }
+        Err(_) => diagnostic.push_str("\nKuru engine shutdown: observed after cleanup error\n"),
+    }
     write_private(&request.directory.join("server.log"), diagnostic.as_bytes())?;
     if let Some(published) = read_record::<Endpoint>(&request.directory.join("endpoint.json"))?
         && published.instance == endpoint.instance
@@ -1342,7 +1348,7 @@ async fn initialize_database(
     Ok(())
 }
 
-async fn stop_child(child: &mut Child) -> Result<()> {
+async fn stop_child(child: &mut Child) -> Result<crate::engine::StopOutcome> {
     child.stop(CLOSE_GRACE, KILL_GRACE).await
 }
 

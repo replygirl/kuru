@@ -9,7 +9,7 @@ use kuru_platform::{
     fs::{Directory, NameRetention, Privacy},
     windows::{
         pipe::{Pipe, PrivateListener},
-        process::{Console, Lifetime, NativeChild, NativeSpawnSpec},
+        process::{Console, Lifetime, NativeChild, NativeSpawnSpec, Stdio},
     },
 };
 use std::{
@@ -126,6 +126,9 @@ async fn spawn_fixture(
     command.environment = environment()?;
     command.lifetime = lifetime;
     command.console = Console::PrivateHidden;
+    if mode == "unconfigured" {
+        command.stdout = Stdio::Pipe;
+    }
     owner.child = Some(command.spawn().await?);
     owner.channel = Some(
         listener
@@ -658,6 +661,11 @@ async fn normal_headless_dolt_close_reaps_the_supervisor_and_reopens_accepted_sq
     );
     let opts = options(owner.path(), binary);
     assert!(!opts.directory.join("endpoint.json").exists());
+    let log = std::fs::read_to_string(opts.directory.join("server.log"))?;
+    assert!(
+        log.ends_with("\nKuru engine shutdown: Graceful\n"),
+        "real Dolt did not complete the graceful shutdown branch: {log}"
+    );
     let reopened = Server::open(opts).await?;
     let pool = reopened.pool("main").await?;
     assert_eq!(
@@ -696,6 +704,50 @@ async fn actual_engine_adapter_escalates_after_observed_break_and_reaps_locked_d
     let directory = Directory::open(owner.path(), Privacy::OwnerOnly, NameRetention::Movable)?;
     let lock = directory.lock_file(std::ffi::OsStr::new("descendant.lock"))?;
     lock.try_lock()?;
+    owner.descendants_stopped = true;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_creator_loss_before_configuration_exits_without_database_or_lease() -> Result<()>
+{
+    let mut owner = Fixture::new()?;
+    fixture(
+        &mut owner,
+        Path::new(env!("CARGO_BIN_EXE_kuru-memory-parent-fixture")),
+        Lifetime::TrustedSupervisor,
+        "unconfigured",
+    )
+    .await?;
+    let child = owner.child.as_mut().unwrap();
+    let mut output = child
+        .take_stdout()
+        .context("unconfigured fixture output missing")?;
+    ensure!(
+        child.try_wait()?.is_none(),
+        "creator exited before the kill"
+    );
+    child.terminate()?;
+    assert!(!child.wait(Duration::from_secs(8)).await?.success());
+    owner
+        .channel
+        .as_mut()
+        .unwrap()
+        .close(Duration::from_secs(3))
+        .await?;
+    let mut completion = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        (&mut output).take(1024).read_to_end(&mut completion),
+    )
+    .await??;
+    assert_eq!(completion, b"SUPERVISOR-EOF\n");
+    output.close(Duration::from_secs(3)).await?;
+    assert_eq!(
+        std::fs::read_dir(owner.path())?.count(),
+        0,
+        "a supervisor without configuration created database or lease state"
+    );
     owner.descendants_stopped = true;
     Ok(())
 }

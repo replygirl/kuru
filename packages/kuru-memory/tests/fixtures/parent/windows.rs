@@ -3,6 +3,7 @@ use kuru_memory::{
     server::{Server, ServerOptions},
     test_support::windows::{
         environment, forced_engine_cleanup, partial_readiness, ready_marker, ready_marker_options,
+        unconfigured,
     },
 };
 use kuru_platform::{
@@ -19,7 +20,23 @@ pub async fn run() -> Result<()> {
     let arguments: Vec<_> = std::env::args_os().collect();
     match arguments.get(1).and_then(|value| value.to_str()) {
         Some("--internal-dolt-supervisor") => {
-            return kuru_memory::server::supervisor_entry().await;
+            let result = kuru_memory::server::supervisor_entry().await;
+            if arguments
+                .get(3)
+                .is_some_and(|value| value == "--fixture-unconfigured")
+            {
+                ensure!(
+                    result
+                        .as_ref()
+                        .err()
+                        .and_then(|error| error.downcast_ref::<std::io::Error>())
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof),
+                    "unconfigured supervisor did not observe creator EOF: {result:?}"
+                );
+                println!("SUPERVISOR-EOF");
+                std::io::stdout().flush()?;
+            }
+            return result;
         }
         Some("--stubborn-root" | "--stubborn-leaf") => {
             return tokio::time::timeout(Duration::from_secs(60), stubborn(&arguments)).await?;
@@ -33,6 +50,11 @@ pub async fn run() -> Result<()> {
     let root = PathBuf::from(&arguments[1]);
     let mode = arguments[4].to_str().context("fixture mode is not text")?;
     let mut parent = pipe::connect(&arguments[3], Duration::from_secs(5)).await?;
+    if mode == "unconfigured" {
+        unconfigured(&std::env::current_exe()?, &root, &mut parent).await?;
+        parent.close(Duration::from_secs(3)).await?;
+        return Ok(());
+    }
     if mode == "escalation" {
         forced_engine_cleanup(&root, &std::env::current_exe()?, &mut parent).await?;
         parent.close(Duration::from_secs(3)).await?;

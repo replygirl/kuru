@@ -457,6 +457,103 @@ async fn malformed_manifest_hash_and_zip_fail_before_changing_existing_native_id
 }
 
 #[tokio::test]
+async fn stock_ps51_enforces_archive_and_decoded_output_limits_before_publication() {
+    let fixture = Fixture::new();
+    let identity = regular_file_info(&fs::File::open(fixture.install.join("kuru.exe")).unwrap())
+        .unwrap()
+        .identity;
+    let control = fixture.root.path().join("bounded valid control");
+    success(
+        &fixture
+            .run(fixture.command().arg("-InstallDir").arg(&control))
+            .await,
+    );
+    fixture.installed(&control);
+
+    let name = archive_name(VERSION, TARGET).unwrap();
+    let archive = fixture.release.join(&name);
+    let valid = fs::read(&archive).unwrap();
+    // A real oversized local file exercises bounded Fetch/ReadBytes before
+    // hashing or allocating the full archive. No cap is lowered for the test.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&archive)
+        .unwrap()
+        .set_len(MAX_ARCHIVE_BYTES as u64 + 1)
+        .unwrap();
+    let result = fixture.run(&mut fixture.command()).await;
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("file exceeds size limit"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("Verifying Kuru release archive."));
+    fixture.unchanged();
+    assert_eq!(
+        regular_file_info(&fs::File::open(fixture.install.join("kuru.exe")).unwrap())
+            .unwrap()
+            .identity,
+        identity
+    );
+
+    let limit = u32::try_from(MAX_ARCHIVE_BYTES).unwrap();
+    for (sizes, diagnostic) in [
+        (
+            [Some(limit + 1), None, None],
+            "ZIP compression or member size is invalid",
+        ),
+        (
+            [Some(limit / 2), Some(limit / 2), Some(1)],
+            "expanded ZIP exceeds limit",
+        ),
+        (
+            [Some(1), None, None],
+            "DEFLATE output exceeds declared size",
+        ),
+    ] {
+        let mut bytes = valid.clone();
+        let end = bytes.len() - 22;
+        let mut central =
+            u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+        for size in sizes {
+            assert_eq!(&bytes[central..central + 4], b"PK\x01\x02");
+            let local =
+                u32::from_le_bytes(bytes[central + 42..central + 46].try_into().unwrap()) as usize;
+            if let Some(size) = size {
+                // Both physical records agree: rejection must reach the
+                // size/output policy rather than the metadata mismatch guard.
+                bytes[local + 22..local + 26].copy_from_slice(&size.to_le_bytes());
+                bytes[central + 24..central + 28].copy_from_slice(&size.to_le_bytes());
+            }
+            let name =
+                u16::from_le_bytes(bytes[central + 28..central + 30].try_into().unwrap()) as usize;
+            central += 46 + name;
+        }
+        fixture.replace_archive(&bytes);
+        let result = fixture.run(&mut fixture.command()).await;
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("Verifying Kuru release archive."),
+            "validation not reached: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(diagnostic),
+            "unexpected rejection: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fixture.unchanged();
+        assert_eq!(
+            regular_file_info(&fs::File::open(fixture.install.join("kuru.exe")).unwrap())
+                .unwrap()
+                .identity,
+            identity
+        );
+    }
+}
+
+#[tokio::test]
 async fn aliases_hardlinks_private_acl_and_busy_install_lease_fail_closed() {
     let fixture = Fixture::new();
     for path in [

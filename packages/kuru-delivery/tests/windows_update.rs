@@ -387,6 +387,124 @@ async fn killed_helper_after_prepared_receipt_recovers_original_identity() -> Re
 }
 
 #[tokio::test]
+async fn candidate_sharing_failure_restores_loaded_original_before_explicit_recovery() -> Result<()>
+{
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.directory.join("unrelated.txt"),
+        b"retain unrelated installation content",
+    )?;
+    let original_identity = file_identity(&fixture.current)?;
+    let mut spec = fixture.spawn();
+    spec.args[0] = "update-observed".into();
+    spec.args.push("old_moved_before_receipt_resume".into());
+    let mut child = spec.spawn().await?;
+    let mut input = child.take_stdin().context("fixture stdin")?;
+    let mut output = child.take_stdout().context("fixture stdout")?;
+    let errors = tokio::spawn(error_output(child.take_stderr().context("fixture stderr")?));
+    let mut blocker = None;
+    let result = async {
+        let marker = record(&mut output).await?;
+        ensure!(
+            marker["checkpoint"] == "old_moved_before_receipt" && marker["phase"] == "prepared",
+            "unexpected checkpoint {marker}"
+        );
+        ensure!(
+            marker["helper_pid"].as_u64().context("helper PID")? != u64::from(child.id()),
+            "checkpoint must originate in the actual helper"
+        );
+        let before = read_receipt(&fixture)?;
+        ensure!(
+            before["operation"] == marker["operation"],
+            "wrong persisted transaction"
+        );
+        ensure!(
+            !fixture.current.try_exists()?,
+            "old image was not moved before the conflict"
+        );
+        let candidate = fixture
+            .directory
+            .join(".kuru-update")
+            .join(before["candidate"].as_str().context("candidate name")?);
+        // Permit reads/writes, but deny DELETE sharing: the real second move
+        // fails while the helper can still validate all recovery bytes.
+        blocker = Some(
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(3)
+                .open(&candidate)?,
+        );
+        ensure!(
+            file_identity(&candidate)? == receipt_image(&before, "replacement")?,
+            "wrong candidate identity"
+        );
+        let probe = candidate.with_file_name("sharing-conflict-probe.exe");
+        let conflict =
+            fs::rename(&candidate, &probe).expect_err("retained native handle must deny the move");
+        ensure!(
+            conflict.raw_os_error() == Some(32),
+            "expected native sharing violation, got {conflict}"
+        );
+        ensure!(
+            !probe.try_exists()? && candidate.is_file(),
+            "failed probe changed candidate namespace"
+        );
+        input.write_all(b"r").await?;
+        input.flush().await?;
+        let status = child.wait(TIMEOUT).await?;
+        ensure!(
+            !status.success(),
+            "conflicting publication unexpectedly succeeded"
+        );
+
+        // This is the critical automatic rollback observation. No recovery
+        // command has run; the original loaded object's name/bytes are restored.
+        ensure!(
+            file_identity(&fixture.current)? == original_identity
+                && fs::read(&fixture.current)? == fixture.original,
+            "helper failed to restore original identity and bytes automatically"
+        );
+        let pending = read_receipt(&fixture)?;
+        ensure!(
+            pending["operation"] == before["operation"] && pending["phase"] == "old_moved",
+            "failed cleanup was not retained explicitly: {pending}"
+        );
+        ensure!(
+            candidate.is_file() && !fixture.marker.exists(),
+            "candidate was lost or executed"
+        );
+        ensure!(
+            fs::read(fixture.directory.join("unrelated.txt"))?
+                == b"retain unrelated installation content",
+            "unrelated bytes changed"
+        );
+        drop(blocker.take());
+        recover(&fixture)?;
+        reconciled(&fixture, &before, original_identity, false)
+    }
+    .await;
+    let cleanup = stop(&mut child, &mut input, &mut output).await;
+    drop(blocker);
+    let errors = tokio::time::timeout(TIMEOUT, errors).await;
+    if let Err(failure) = result.and(cleanup) {
+        let retained = fixture._root.keep();
+        anyhow::bail!(
+            "handled sharing conflict: {failure:#}; stderr={errors:?}; retained {}",
+            retained.display()
+        );
+    }
+    let bytes = errors.context("stderr task timed out")???;
+    ensure!(
+        String::from_utf8_lossy(&bytes).contains("publication failed; recovery receipt retained"),
+        "wrong failure cause: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn killed_helper_after_old_move_before_receipt_recovers_original_identity() -> Result<()> {
     interrupted("old_moved_before_receipt", "prepared", false).await
 }

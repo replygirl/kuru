@@ -38,6 +38,14 @@ run = "cargo test -p kuru-memory --all-targets --all-features --locked --no-fail
 description = "Prepare the actual upstream Windows ZIP for host-independent decoder tests"
 depends = [{ task = "bundle:prepare", args = ["--target", "x86_64-pc-windows-msvc"] }]
 
+[tasks."bundle:verify-native-build"]
+description = "Verify actual offline Windows Cargo rejection of missing/corrupt prepared inputs after source installation"
+env.CARGO_BUILD_TARGET = false
+env.CARGO_NET_OFFLINE = "true"
+env.KURU_DOLT_BUNDLE_OFFLINE = "true"
+env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
+run = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/verify-bundle-build.ps1"
+
 [tasks.typecheck]
 depends = ["bundle:prepare"]
 run = "cargo check -p kuru-memory --all-targets --all-features --locked"
