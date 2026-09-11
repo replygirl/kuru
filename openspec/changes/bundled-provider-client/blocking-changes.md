@@ -2,7 +2,7 @@
 
 ## Blocked by
 
-- [ ] `native-windows` — supplies the five-target application, private filesystem and owned process integration, native terminal/authentication lifecycle, Windows distribution and update contracts this client bundle must preserve.
+- [x] `native-windows` — supplies the five-target application, private filesystem and owned process integration, native terminal/authentication lifecycle, Windows distribution and update contracts this client bundle must preserve. *(archived 2026-09-11)*
 
 ## Soft-blocked by
 

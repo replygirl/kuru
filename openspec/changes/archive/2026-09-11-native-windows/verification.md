@@ -1,67 +1,74 @@
+Required candidate acceptance completed on September 11, 2026, at a1547ed.
+See **Final native acceptance: a1547ed** below for the complete successful graph,
+source identity, native coverage and actual shipping evidence. Earlier integration
+and failure sections are chronological history; their pending statements describe
+those earlier runs. Public-release installation and live provider authentication
+retain the separate boundaries recorded in the final section.
+
 ## 1. Native process ownership and supervisor handoff [critical]
 
-- [ ] 1.1 @integration (agent) Run compiled native fixture children and grandchildren while killing the owner at process creation/startup handshakes -> owned commands enter their Job atomically, no descendant escapes, and unrelated processes survive.
-- [ ] 1.2 @integration (agent) Launch concurrent children with distinct inherited handles and a root that exits before its grandchild -> private handles do not leak and quiescence waits for the actual final process and output closure.
-- [ ] 1.3 @regression (agent) Kill a real supervisor caller before configuration, during acknowledgment and during accepted SQL work -> startup is bounded, accepted work follows reconciliation, a second writer cannot overlap, and the supervisor releases the lease only after Dolt is quiescent.
-- [ ] 1.4 @integration (agent) Exercise graceful shutdown and forced escalation on the headless Windows runner -> Dolt closes normally where cooperative and its Job reaches verified zero active processes before any protected resource is released.
-- [ ] 1.5 @regression (agent) Separately terminate a retained creator process and an enclosing owned Job -> creator-only EOF permits supervisor cleanup, while whole-tree termination reaches verified zero active processes and subsequent reopen recovers committed state without claiming a graceful receipt or escape from enclosing authority.
+- [x] 1.1 @integration (agent) Run compiled native fixture children and grandchildren while killing the owner at process creation/startup handshakes -> owned commands enter their Job atomically, no descendant escapes, and unrelated processes survive.
+- [x] 1.2 @integration (agent) Launch concurrent children with distinct inherited handles and a root that exits before its grandchild -> private handles do not leak and quiescence waits for the actual final process and output closure.
+- [x] 1.3 @regression (agent) Kill a real supervisor caller before configuration, during acknowledgment and during accepted SQL work -> startup is bounded, accepted work follows reconciliation, a second writer cannot overlap, and the supervisor releases the lease only after Dolt is quiescent.
+- [x] 1.4 @integration (agent) Exercise graceful shutdown and forced escalation on the headless Windows runner -> Dolt closes normally where cooperative and its Job reaches verified zero active processes before any protected resource is released.
+- [x] 1.5 @regression (agent) Separately terminate a retained creator process and an enclosing owned Job -> creator-only EOF permits supervisor cleanup, while whole-tree termination reaches verified zero active processes and subsequent reopen recovers committed state without claiming a graceful receipt or escape from enclosing authority.
 
 ## 2. Private IPC cancellation and identity [critical]
 
-- [ ] 2.1 @integration (agent) Stall named-pipe connection, partial frame reads and blocked writes, then cancel and shut down Tokio -> every operation finishes within its bound without stranded blocking readers or leaked handles.
-- [ ] 2.2 @integration (agent) Present an existing pipe name, wrong connected process and concurrent unrelated child -> first-instance/ACL/peer checks reject impostors before private configuration transfer and lifetime EOF is not held open by leaked handles.
+- [x] 2.1 @integration (agent) Stall named-pipe connection, partial frame reads and blocked writes, then cancel and shut down Tokio -> every operation finishes within its bound without stranded blocking readers or leaked handles.
+- [x] 2.2 @integration (agent) Present an existing pipe name, wrong connected process and concurrent unrelated child -> first-instance/ACL/peer checks reject impostors before private configuration transfer and lifetime EOF is not held open by leaked handles.
 
 ## 3. Filesystem privacy, identity and durable transitions [critical]
 
-- [ ] 3.1 @integration (agent) Create native permissive/null/unsafe inherited ACL fixtures, junctions, other reparse points and hardlinks at protected roots/leaves -> private operations reject them without changing foreign data; legitimate Dolt descendants with inherited owner-only grants remain usable.
-- [ ] 3.2 @integration (agent) Attempt pathname substitution under a held lock and concurrent cache publication -> full handle identity prevents overlapping ownership; exactly one valid publication is retained.
-- [ ] 3.3 @regression (agent) Interrupt file/directory activation at recorded rename/marker boundaries on native NTFS, including an uncertain post-move result -> stable lifecycle locking and identity/receipt reconciliation preserve a valid state, including failure preservation and no-clobber behavior without assuming every error means no move occurred.
-- [ ] 3.4 @integration (agent) Contend on the external full-native-identity lifecycle lease across stage/active/interrupted directory moves, closing descendant data handles first -> the same physical store retains one lock key and exclusive ownership, a recreated directory has a distinct identity, and a missing/inside-tree Windows namespace fails before database startup.
-- [ ] 3.5 @integration (agent) Rename an unchanged existing file held read-only, including a loaded-image fixture, through the checked native move operation -> identity and bytes survive the same-volume move without requiring write access, conflicting names preserve recovery evidence, and newly written candidate publication still flushes its payload.
+- [x] 3.1 @integration (agent) Create native permissive/null/unsafe inherited ACL fixtures, junctions, other reparse points and hardlinks at protected roots/leaves -> private operations reject them without changing foreign data; legitimate Dolt descendants with inherited owner-only grants remain usable.
+- [x] 3.2 @integration (agent) Attempt pathname substitution under a held lock and concurrent cache publication -> full handle identity prevents overlapping ownership; exactly one valid publication is retained.
+- [x] 3.3 @regression (agent) Interrupt file/directory activation at recorded rename/marker boundaries on native NTFS, including an uncertain post-move result -> stable lifecycle locking and identity/receipt reconciliation preserve a valid state, including failure preservation and no-clobber behavior without assuming every error means no move occurred.
+- [x] 3.4 @integration (agent) Contend on the external full-native-identity lifecycle lease across stage/active/interrupted directory moves, closing descendant data handles first -> the same physical store retains one lock key and exclusive ownership, a recreated directory has a distinct identity, and a missing/inside-tree Windows namespace fails before database startup.
+- [x] 3.5 @integration (agent) Rename an unchanged existing file held read-only, including a loaded-image fixture, through the checked native move operation -> identity and bytes survive the same-volume move without requiring write access, conflicting names preserve recovery evidence, and newly written candidate publication still flushes its payload.
 
 ## 4. Real Dolt behavior on Windows [critical]
 
-- [ ] 4.1 @integration (agent) Run real storage/runtime suites with the embedded full Windows Dolt -> private histories, stable IDs, preferences, sessions, transaction rollback and close/reopen match the existing contract.
-- [ ] 4.2 @regression (agent) Migrate SQLite fixtures with committed WAL content, present/missing SHM, Unicode/spaced paths and source replacement attempts -> backup is lossless, held identities prevent substitution, original DB/WAL and accepted transactions are preserved while normal ephemeral SHM coordination is allowed, and interrupted activation recovers correctly.
-- [ ] 4.3 @regression (agent) Cancel or conflict a complete dream candidate, then exercise promotion, lost acknowledgment reconciliation and compensating undo after later chats/preferences -> no partial dream reaches live state and later writes survive undo.
+- [x] 4.1 @integration (agent) Run real storage/runtime suites with the embedded full Windows Dolt -> private histories, stable IDs, preferences, sessions, transaction rollback and close/reopen match the existing contract.
+- [x] 4.2 @regression (agent) Migrate SQLite fixtures with committed WAL content, present/missing SHM, Unicode/spaced paths and source replacement attempts -> backup is lossless, held identities prevent substitution, original DB/WAL and accepted transactions are preserved while normal ephemeral SHM coordination is allowed, and interrupted activation recovers correctly.
+- [x] 4.3 @regression (agent) Cancel or conflict a complete dream candidate, then exercise promotion, lost acknowledgment reconciliation and compensating undo after later chats/preferences -> no partial dream reaches live state and later writes survive undo.
 
 ## 5. Embedded bundle and ZIP validation [critical]
 
-- [ ] 5.1 @e2e (agent) Run only the actual packaged Windows executable with an empty cache, no external Dolt/compiler on PATH and memory configured offline -> version, persistent offline demo, license extraction, revision inspection and reopened conversation all succeed; inspect runtime provisioning for the absence of download paths and distinguish this from an OS egress firewall test.
-- [ ] 5.2 @integration (agent) Prepare the Windows bundle through the memory-owned mise task, then build from local verified inputs without network -> the executable contains the target payload, not the host payload; missing/corrupt input fails the build.
-- [ ] 5.3 @regression (agent) Feed duplicate physical ZIP records, inconsistent local/central metadata, links, encryption, extra members and compressed/expanded/final-output overflow fixtures -> validation rejects before executable probing or publication and preserves an existing cache/install.
-- [ ] 5.4 @integration (agent) Inspect actual shipping Kuru and embedded Dolt PE imports and build with explicit MSVC target/static CRT settings -> only OS DLLs are required and host proc macros/build scripts still compile normally.
+- [x] 5.1 @e2e (agent) Run only the actual packaged Windows executable with an empty cache, no external Dolt/compiler on PATH and memory configured offline -> version, persistent offline demo, license extraction, revision inspection and reopened conversation all succeed; inspect runtime provisioning for the absence of download paths and distinguish this from an OS egress firewall test.
+- [x] 5.2 @integration (agent) Prepare the Windows bundle through the memory-owned mise task, then build from local verified inputs without network -> the executable contains the target payload, not the host payload; missing/corrupt input fails the build.
+- [x] 5.3 @regression (agent) Feed duplicate physical ZIP records, inconsistent local/central metadata, links, encryption, extra members and compressed/expanded/final-output overflow fixtures -> validation rejects before executable probing or publication and preserves an existing cache/install.
+- [x] 5.4 @integration (agent) Inspect actual shipping Kuru and embedded Dolt PE imports and build with explicit MSVC target/static CRT settings -> only OS DLLs are required and host proc macros/build scripts still compile normally.
 
 ## 6. Native CLI, command and file authority [critical]
 
-- [ ] 6.1 @integration (agent) Exercise CLI config/data defaults with HOME absent, explicit overrides, drive/UNC classification and Unicode/spaced paths -> selected native paths and precedence match the documented commands.
-- [ ] 6.2 @integration (agent) Run compiled MCP/auth fixtures and supported command shims, configured cmd /c npx and deliberate single-source cmd forms with empty/quoted/metacharacter arguments, unusable preceding PATH entries and case-varied environment keys -> supported argv/environment and explicit interpreter intent are preserved, device authentication is bounded, and no unrequested shell command executes.
-- [ ] 6.3 @integration (agent) Run shell CRUD/cancellation fixtures under stock native PowerShell and file tools against junction/ADS/device/trailing-alias escapes -> authorized operations work with correct output/status and authority violations preserve external content.
-- [ ] 6.4 @eval (agent) Replay deterministic agent tool requests for ordinary shell/file work and Windows alias/metacharacter escapes through the actual native tool dispatcher -> authorized work succeeds, unauthorized side effects are absent and the model-facing result preserves the existing authority/error contract without live provider calls.
+- [x] 6.1 @integration (agent) Exercise CLI config/data defaults with HOME absent, explicit overrides, drive/UNC classification and Unicode/spaced paths -> selected native paths and precedence match the documented commands.
+- [x] 6.2 @integration (agent) Run compiled MCP/auth fixtures and supported command shims, configured cmd /c npx and deliberate single-source cmd forms with empty/quoted/metacharacter arguments, unusable preceding PATH entries and case-varied environment keys -> supported argv/environment and explicit interpreter intent are preserved, device authentication is bounded, and no unrequested shell command executes.
+- [x] 6.3 @integration (agent) Run shell CRUD/cancellation fixtures under stock native PowerShell and file tools against junction/ADS/device/trailing-alias escapes -> authorized operations work with correct output/status and authority violations preserve external content.
+- [x] 6.4 @eval (agent) Replay deterministic agent tool requests for ordinary shell/file work and Windows alias/metacharacter escapes through the actual native tool dispatcher -> authorized work succeeds, unauthorized side effects are absent and the model-facing result preserves the existing authority/error contract without live provider calls.
 
 ## 7. Actual Windows terminal behavior [critical]
 
-- [ ] 7.1 @e2e (agent) Run real ConPTY chat, selector, navigation, resize and cancellation scenarios -> rendered state and persistent choices match expected behavior without relying solely on a virtual buffer.
-- [ ] 7.2 @regression (agent) Send native focus-loss events and wait for a completed render frame -> no later animation bytes appear while unfocused; focus return resumes appropriate behavior.
-- [ ] 7.3 @integration (agent) Exit the TUI normally and exercise partial terminal initialization plus an error after entering terminal mode -> native console modes and owned processes are restored/closed through the shared session guard; Unix restoration assertions still execute on Unix.
+- [x] 7.1 @e2e (agent) Run real ConPTY chat, selector, navigation, resize and cancellation scenarios -> rendered state and persistent choices match expected behavior without relying solely on a virtual buffer.
+- [x] 7.2 @regression (agent) Send native focus-loss events and wait for a completed render frame -> no later animation bytes appear while unfocused; focus return resumes appropriate behavior.
+- [x] 7.3 @integration (agent) Exit the TUI normally and exercise partial terminal initialization plus an error after entering terminal mode -> native console modes and owned processes are restored/closed through the shared session guard; Unix restoration assertions still execute on Unix.
 
 ## 8. Compiler-free installation and loaded-image update [critical]
 
-- [ ] 8.1 @e2e (agent) Run package-owned PowerShell bootstrap in stock PowerShell 5.1 with actual locally packaged release bytes and an isolated destination -> no checkout/compiler/Bash/Dolt is needed and the resulting executable completes the persistent offline demo.
-- [ ] 8.2 @regression (agent) Exercise explicit flags/env precedence, latest-manifest version freezing, checksum failure, malformed archive, unsafe destination, output bounds and real cancellation -> rejected installs preserve exact old bytes and clean owned staging/producers.
-- [ ] 8.3 @e2e (agent) Run actual native mise GitHub selection/install/activation against simulated release metadata and genuine candidate ZIP bytes through documented URL replacements, with isolated config/data/cache/credentials and asserted requests -> the exact installed digest/version and persistent offline demo/reopen pass, corruption fails before activation, absent API digests use genuine SHA256SUMS, browser-to-API fallback stays inside the fixture, and no live fallback or user installation satisfies the test; actual published installation remains separately pending in docs/release.md.
-- [ ] 8.4 @regression (agent) Update the actual running Windows fixture executable and interrupt each recorded publication/helper boundary -> success publishes verified bytes, handled failure restores old bytes, recovery is deterministic, candidate code is never used as the validator/helper, and owned cleanup completes after old-image exit.
-- [ ] 8.5 @integration (agent) Run native source installation through the prepared app mise task into an explicit directory -> the resulting executable contains the correct embedded runtime and persists/reopens the offline demo.
-- [ ] 8.6 @regression (agent) Keep an old process alive, rename its loaded image and replace its original pathname with a byte-identical different file -> current-image preparation rejects the stale instance before copying or launching helper code, while a normal instance pins its actual source until the copy finishes.
+- [x] 8.1 @e2e (agent) Run package-owned PowerShell bootstrap in stock PowerShell 5.1 with actual locally packaged release bytes and an isolated destination -> no checkout/compiler/Bash/Dolt is needed and the resulting executable completes the persistent offline demo.
+- [x] 8.2 @regression (agent) Exercise explicit flags/env precedence, latest-manifest version freezing, checksum failure, malformed archive, unsafe destination, output bounds and real cancellation -> rejected installs preserve exact old bytes and clean owned staging/producers.
+- [x] 8.3 @e2e (agent) Run actual native mise GitHub selection/install/activation against simulated release metadata and genuine candidate ZIP bytes through documented URL replacements, with isolated config/data/cache/credentials and asserted requests -> the exact installed digest/version and persistent offline demo/reopen pass, corruption fails before activation, absent API digests use genuine SHA256SUMS, browser-to-API fallback stays inside the fixture, and no live fallback or user installation satisfies the test; actual published installation remains separately pending in docs/release.md.
+- [x] 8.4 @regression (agent) Update the actual running Windows fixture executable and interrupt each recorded publication/helper boundary -> success publishes verified bytes, handled failure restores old bytes, recovery is deterministic, candidate code is never used as the validator/helper, and owned cleanup completes after old-image exit.
+- [x] 8.5 @integration (agent) Run native source installation through the prepared app mise task into an explicit directory -> the resulting executable contains the correct embedded runtime and persists/reopens the offline demo.
+- [x] 8.6 @regression (agent) Keep an old process alive, rename its loaded image and replace its original pathname with a byte-identical different file -> current-image preparation rejects the stale instance before copying or launching helper code, while a normal instance pins its actual source until the copy finishes.
 
 ## 9. Required CI and release integration [critical]
 
-- [ ] 9.1 @integration (agent) Run required package test/coverage tasks on native windows-2025 and retain existing Unix jobs, with format/lint/typecheck running independently on Ubuntu per `parallel-quality-gates` -> all actual test counts and measured coverage are recorded, at least 90% workspace coverage remains enforced, and missing Windows prerequisites fail instead of skipping. Linux static analysis does not establish checking of Windows conditional branches; the native suite must compile and exercise them.
-- [ ] 9.2 @regression (agent) Exercise release planning/recovery/asset inventory fixtures with five targets -> one prepared version SHA is retained across reruns, invalid/missing Windows artifacts block publication and published assets remain immutable.
-- [ ] 9.3 @integration (agent) Validate the release workflow graph and actual native build artifact -> Windows uses the prepared version commit, packaged runtime smoke passes, and Pages remains inside the release workflow after successful publication.
-- [ ] 9.4 @manual (agent) Review README, guides and AGENTS against implemented native commands, package ownership and observed evidence -> mise/PowerShell precede source, embedded runtime needs no separate setup, update semantics are accurate and no unobserved hosted result is described as passed.
+- [x] 9.1 @integration (agent) Run required package test/coverage tasks on native windows-2025 and retain existing Unix jobs, with format/lint/typecheck running independently on Ubuntu per `parallel-quality-gates` -> all actual test counts and measured coverage are recorded, at least 90% workspace coverage remains enforced, and missing Windows prerequisites fail instead of skipping. Linux static analysis does not establish checking of Windows conditional branches; the native suite must compile and exercise them.
+- [x] 9.2 @regression (agent) Exercise release planning/recovery/asset inventory fixtures with five targets -> one prepared version SHA is retained across reruns, invalid/missing Windows artifacts block publication and published assets remain immutable.
+- [x] 9.3 @integration (agent) Validate the release workflow graph and actual native build artifact -> Windows uses the prepared version commit, packaged runtime smoke passes, and Pages remains inside the release workflow after successful publication.
+- [x] 9.4 @manual (agent) Review README, guides and AGENTS against implemented native commands, package ownership and observed evidence -> mise/PowerShell precede source, embedded runtime needs no separate setup, update semantics are accurate and no unobserved hosted result is described as passed.
 
-## Implementation evidence before native acceptance
+## Historical implementation evidence before native acceptance
 
 The candidate is still being integrated. No checkbox above is satisfied by a
 host-only compile or an authored Windows fixture. The archived foundation
@@ -673,7 +680,7 @@ and limitations: `/tmp/kuru-update-cost-invariants.md` and
 `/tmp/kuru-sha2-profile-audit.md`.
 
 - [x] 10.1 @integration (agent) Compare the existing and narrowly optimized SHA-2 dependency on identical bytes with unchanged consumer/instrumentation settings -> matched macOS arm64 artifacts hashed the same 64 MiB in median 270.508083 ms versus 27.439500 ms (15 observations each, three alternating pairs). All 45 measured digests, including supplementary runs, matched independent OpenSSL. No Windows or end-to-end update result is inferred.
-- [ ] 10.2 @integration (agent) Run unchanged native full-app updates, full native coverage and shipping checks -> verified publication is acknowledged within existing budgets, normal helper profiles retain the runner destination, and actual Windows acceptance passes before closing the change.
+- [x] 10.2 @integration (agent) Run unchanged native full-app updates, full native coverage and shipping checks -> verified publication is acknowledged within existing budgets, normal helper profiles retain the runner destination, and actual Windows acceptance passes before closing the change.
 
 The experiment used the pinned Rust 1.98.1 compiler and a frozen disposable Rust
 harness, with no additional manifest, workspace or dependency. The primary before
@@ -816,8 +823,8 @@ stock cmdlet through Kuru and verify its result plus unrelated environment
 preservation. This source exposure is not an observed failure of the passing
 87271ce shell cases.
 
-- [ ] 13.1 @integration (agent) Run the stock PowerShell mise tasks through the native hosted PowerShell 7 launcher after scoped module-path removal -> real source installation, missing/corrupt/valid offline Cargo controls, installed offline runtime and Kuru/Dolt PE inspection pass; checksums and exact old-byte preservation remain required.
-- [ ] 13.2 @regression (agent) Invoke Kuru's built-in Windows shell with an incompatible inherited module path in an isolated child -> actual stock cmdlet output and unrelated inherited values survive, while a direct unsanitized control demonstrates the unavailable command; configured command/MCP environment behavior stays unchanged.
+- [x] 13.1 @integration (agent) Run the stock PowerShell mise tasks through the native hosted PowerShell 7 launcher after scoped module-path removal -> real source installation, missing/corrupt/valid offline Cargo controls, installed offline runtime and Kuru/Dolt PE inspection pass; checksums and exact old-byte preservation remain required.
+- [x] 13.2 @regression (agent) Invoke Kuru's built-in Windows shell with an incompatible inherited module path in an isolated child -> actual stock cmdlet output and unrelated inherited values survive, while a direct unsanitized control demonstrates the unavailable command; configured command/MCP environment behavior stays unchanged.
 
 The completed log is `/tmp/kuru-windows-87271ce-full.log`; the failure appears
 at 05:52:59Z after successful release compilation and `kuru 0.1.0` execution.
@@ -910,8 +917,8 @@ remain required; markers distinguish observed source entry/completion but do
 not prove pipe delivery or identify an unobserved startup cause. Investigation:
 `/tmp/kuru-shell-662-investigation.md`.
 
-- [ ] 14.1 @regression (agent) Run the corrected native incompatible-manifest control and actual Kuru shell -> direct stock autoload fails for the named command/module; Kuru returns the independent SHA-256 and unrelated sentinel with unchanged file bytes/identity and no extra output.
-- [ ] 14.2 @integration (agent) Run the ordinary real CLI shell with private source-entry/completion markers and root-state diagnostics -> success requires exact output/status plus actual markers; any failure retains bounded independent observations without retries, extended deadlines or altered ownership. A passing intermittent case alone is not a causal repair claim.
+- [x] 14.1 @regression (agent) Run the corrected native incompatible-manifest control and actual Kuru shell -> direct stock autoload fails for the named command/module; Kuru returns the independent SHA-256 and unrelated sentinel with unchanged file bytes/identity and no extra output.
+- [x] 14.2 @integration (agent) Run the ordinary real CLI shell with private source-entry/completion markers and root-state diagnostics -> success requires exact output/status plus actual markers; any failure retains bounded independent observations without retries, extended deadlines or altered ownership. A passing intermittent case alone is not a causal repair claim.
 
 The corrected manifest, bounded source markers and retained-root observation are
 implemented. The focused host CLI case passed with exact parsed output/status
@@ -975,9 +982,9 @@ failure, and narrow retention of verified stages on activation error. No claim
 is made that those gaps caused the initial access denial. Review:
 `/tmp/kuru-dolt-activation-563-investigation.md`.
 
-- [ ] 15.1 @regression (agent) Hold a real descendant file open during native engine activation -> the actual move fails with its operation and original OS error retained; checked source identity, executable/license bytes, absent destination and the owned stable lock are preserved, and the verified private stage survives error return. Closing only the known fixture blocker permits a subsequent explicitly requested checked move of that same identity; product code does not retry.
-- [ ] 15.2 @regression (agent) Exercise actual post-move completion-error reconciliation and rejected activation on the host -> successful reconciliation retains exact identity; unresolved activation preserves the verified stage and both original/reconciliation diagnostics, while extraction/probe failure cleanup remains unchanged.
-- [ ] 15.3 @integration (agent) Run unchanged actual Windows cold-cache, packaged install/update and shipping acceptance -> each complete path passes; any recurrence records the precise failed operation and checked names without changed deadlines, retries or weakened guarantees. A pass does not establish the cause of the earlier OS5.
+- [x] 15.1 @regression (agent) Hold a real descendant file open during native engine activation -> the actual move fails with its operation and original OS error retained; checked source identity, executable/license bytes, absent destination and the owned stable lock are preserved, and the verified private stage survives error return. Closing only the known fixture blocker permits a subsequent explicitly requested checked move of that same identity; product code does not retry.
+- [x] 15.2 @regression (agent) Exercise actual post-move completion-error reconciliation and rejected activation on the host -> successful reconciliation retains exact identity; unresolved activation preserves the verified stage and both original/reconciliation diagnostics, while extraction/probe failure cleanup remains unchanged.
+- [x] 15.3 @integration (agent) Run unchanged actual Windows cold-cache, packaged install/update and shipping acceptance -> each complete path passes; any recurrence records the precise failed operation and checked names without changed deadlines, retries or weakened guarantees. A pass does not establish the cause of the earlier OS5.
 
 The operation labels, original typed-error preservation, checked name observations
 and activation-only stage retention are implemented. The host retained-stage
@@ -1029,8 +1036,8 @@ extended form remains unverified. The aggregate failed; native completion and
 archive are not claimed. Evidence: `/tmp/kuru-windows-6fb0a6b-results.md`,
 `/tmp/kuru-ci-6fb0a6b-results.md` and `/tmp/kuru-pe-path-6fb-investigation.md`.
 
-- [ ] 16.1 @regression (agent) Run the owning inspection script in stock Windows PowerShell against real verified Dolt PE bytes, forwarding ordinary and provider-qualified extended names to real MSVC tools -> both image inventories are nonempty and accepted, the exact owning prefetch call is recorded, file bytes/identities remain unchanged, and genuine non-PE input fails without a success inventory. Only prefetch command routing is substituted; no fake PE parser, native tool or DLL output.
-- [ ] 16.2 @integration (agent) Run the unchanged final native shipping task with actual source-installed Kuru and actual memory-owned prefetch -> both actual OS-only ordinary/delay DLL inventories pass, alongside full native coverage, source/offline Cargo/shipping checks and the aggregate. Local parsing or a fixture prefetch is not shipping provenance evidence.
+- [x] 16.1 @regression (agent) Run the owning inspection script in stock Windows PowerShell against real verified Dolt PE bytes, forwarding ordinary and provider-qualified extended names to real MSVC tools -> both image inventories are nonempty and accepted, the exact owning prefetch call is recorded, file bytes/identities remain unchanged, and genuine non-PE input fails without a success inventory. Only prefetch command routing is substituted; no fake PE parser, native tool or DLL output.
+- [x] 16.2 @integration (agent) Run the unchanged final native shipping task with actual source-installed Kuru and actual memory-owned prefetch -> both actual OS-only ordinary/delay DLL inventories pass, alongside full native coverage, source/offline Cargo/shipping checks and the aggregate. Local parsing or a fixture prefetch is not shipping provenance evidence.
 
 Independent host byte inspection extracted the pinned Windows Dolt member and
 verified its complete executable SHA-256 against the manifest. The existing Xcode
@@ -1181,3 +1188,116 @@ acceptance requirements. Actual restored-cache Windows success and a complete
 required graph remain outstanding. Evidence:
 `/tmp/kuru-windows-45a13b5-results.md`, `/tmp/kuru-ci-45a13b5-results.md`, and
 `/tmp/kuru-windows-bundle-cache-45a13b5-investigation.md`.
+
+## Final native acceptance: a1547ed
+
+[CI 34589999794](https://github.com/replygirl/kuru/actions/runs/34589999794)
+completed successfully at branch head
+`a1547edcde9f38aabfc16be11718b03e847681e4`. The completed Windows primitive/full
+and four Unix logs independently print the actual synthetic merge checkout
+`46f03cedbb167cca999786c8764d174e2901c916`. Its resolved complete tree,
+`13490e23c978a222465910807849dba4cbd50534`, matches the branch candidate.
+Full Windows job 103232853912 finished successfully at 11:08:25Z; required
+aggregate 103240993431 passed at 11:08:31Z. No required native phase was skipped.
+
+| Native job | Passed / failed / intentional exclusions | Raw covered / found lines | Coverage artifact |
+| --- | --- | --- | --- |
+| Full Windows, 103232853912 | 413 / 0 / 1 | 17928 / 19006 (94.328107%) | 10195965102 |
+| Windows primitives, 103232853377 | 55 / 0 / 0 | 2640 / 2903 (90.940406%) | 10195251376 |
+| Ubuntu, 103232853572 | 379 / 0 / 3 | 14652 / 15086 (97.123161%) | 10195335444 |
+| macOS ARM, 103232853774 | 380 / 0 / 3 | 14663 / 15097 (97.125257%) | 10195350021 |
+| Linux ARM, 103232853610 | 76 / 0 / 0 ordinary memory | Not an instrumented lane | Not applicable |
+| Intel macOS, 103232853477 | 77 / 0 / 0 ordinary memory | Not an instrumented lane | Not applicable |
+
+Each native application lane separately passed its actual selected shipping
+install/update case. The table's coverage totals were independently summed from
+downloaded raw LCOV, preserving both Windows 90% gates. The Windows primitive
+breakdown is 12 unit, 19 filesystem, six command, one current-image and 17 process
+cases. The only full-Windows exclusion is the opt-in frame benchmark; Unix also
+lists two subprocess entrypoints driven by their parent scenarios. Inapplicable
+zero-case binaries are not counted as native behavior.
+
+The Windows job actually restored the 876,767,551-byte Rust cache from fallback
+key `v0-rust-native-coverage-Windows_NT-x64-51494ef1-f9dcace3` (completed log
+406–416). Both subsequent prerequisites succeeded and printed the same verified
+archive under `D:\a\_temp\kuru-bundles` (455–458), outside restored target outputs.
+The early GITHUB_ENV export leaves leaf creation and private permission checks
+to the owning preparer. Source installation and shipping preparation printed the
+same mirror (1415 and 1549); the offline checker restored its temporary override.
+This is restored-cache execution, not a cache miss or permission repair. The
+earlier failure does not establish a specific old SID or restored archive bytes.
+Both full Unix jobs independently used their runner-temp mirror through initial
+preparation, source installation and shipping.
+
+Actual Windows source installation, unchanged-lock verification and all three
+offline Cargo controls passed: missing input failed at the owning verifier,
+same-size corruption failed integrity checking, and restored valid input built
+offline. Shipping explicitly selected the source-installed executable through
+KURU_EMBEDDED_TEST_BINARY. Direct installation and self-update each persisted
+and reopened chat with Dolt 2.3.3 from an independent empty offline engine cache.
+
+| Actual selected shipping target | Executable bytes | Archive bytes | Separate shipping case |
+| --- | --- | --- | --- |
+| Windows x64 | 53,709,824 | 44,159,587 | Passed, 63.49 s |
+| Linux x64 | 57,127,448 | 43,825,348 | Passed, 16.22 s |
+| macOS ARM | 52,353,392 | 40,739,672 | Passed, 18.35 s |
+| Linux ARM | 51,927,248 | 40,226,243 | Passed, 22.77 s |
+| macOS Intel | 55,986,176 | 43,303,648 | Passed, 31.88 s |
+
+The genuine stock-PowerShell/MSVC regression passed all three path forms,
+non-PE rejection, exact prefetch routing and unchanged byte/identity checks.
+The separate final shipping task used unsubstituted owning prefetch and real
+dumpbin on the selected Kuru and prepared Dolt. Its nonempty ordinary/delay
+import inspection accepted these OS DLL inventories (1606–1607): Kuru uses
+advapi32.dll, api-ms-win-core-synch-l1-2-0.dll, bcryptprimitives.dll, crypt32.dll,
+kernel32.dll, ntdll.dll, user32.dll and ws2_32.dll; Dolt uses advapi32.dll,
+kernel32.dll and msvcrt.dll. No DLL allowlist or static-CRT policy was relaxed.
+
+All five native ConPTY cases, compiled MCP/auth/shell fixtures, deterministic
+tool replay, loaded-image identity guard, actual native mise backend, 12 stock
+PowerShell bootstrap cases, ten updater cases and real memory/runtime suites
+passed. Normal full-application updates retained distinct nonempty application
+and helper coverage profiles. The creator/Job/IPC/lease, WAL import, graceful
+and forced shutdown, candidate isolation/reconciliation/undo and activation
+retention controls executed successfully. Both full Unix jobs passed all 17
+bootstrap cases, including real controlled timeouts, excess-output draining
+and rejection of a surviving child that closed its output. All deterministic
+immutable-download recovery cases passed through the actual preparation engine.
+
+All seven independent static categories, quality-gate 103233065796 and PR Title
+run 34589999643 passed. Documentation job 103232853724 actually observed Node
+26.8.2 and npm 12.0.2, then passed its locked setup, lint, format, build, content
+and link checks. Static/native lock checks passed without pin changes. The
+separate normal local eight-hook push passed 380 / 0 / 3 with 14663 / 15097
+covered lines (97.125257%); its instrumented suite took 211.77 s and coverage
+graph 213.43 s. Relevant prior independent source/interface reviews remain valid;
+final guide review confirms implemented native commands, apps/packages and mise
+ownership, embedded Dolt, accurate update semantics and unchanged Release/Pages
+ordering. These records and closure edits change no application interface.
+
+Windows archive preparation took 20.00 / 20.06 s, the single instrumented task
+1370.41 s and complete coverage graph 1390.59 s. Subsequent source installation
+took 129 s, offline Cargo controls 121 s, shipping task 82 s and final PE step
+12 s. Full Ubuntu and macOS coverage steps took 189 / 218 s, source installation
+62 / 94 s and shipping steps 25 / 31 s. These are actual runner/cache observations,
+not a controlled cross-platform benchmark. Coverage prepares only verified inputs
+before its instrumented suite; ordinary test snapshot ownership is preserved.
+
+Evidence is retained in `/tmp/kuru-windows-a1547ed-results.md`, its completed
+logs/counts and both raw LCOV artifacts; `/tmp/kuru-ci-a1547ed-results.md`, its
+four native logs and raw LCOV artifacts; and `/tmp/kuru-a1547ed-push.log`.
+The final closure mapping was independently reviewed in
+`/tmp/kuru-a1547ed-closure-guide.md`; root read the completed evidence before
+marking the remaining acceptance rows.
+
+These checks ran natively on windows-2025; they do not establish execution on
+every older Windows release. Genuine candidate bytes and the real mise backend
+use simulated release metadata. The public-endpoint check in docs/release.md
+awaits an authorized publication containing Windows assets. No Release/Pages
+workflow or live provider authentication was invoked. Default Codex bundling
+remains the separate bundled-provider-client change; compiled auth fixtures do
+not establish authenticated inference. Empty PATH/offline configuration is not
+an OS firewall test, recorded interruption boundaries are not every-instruction
+or power-loss simulation, and abrupt pre-ACK loss can retain unrecorded scratch.
+Later shell/activation/bootstrap passes do not identify earlier intermittent
+causes; a successful upstream download is not evidence that a retry occurred.

@@ -1,3 +1,6 @@
+Current acceptance is complete at a1547ed; see the final integration evidence
+below. Earlier pending-status paragraphs describe their historical runs.
+
 ## 1. Refresh owned pins
 
 - [x] 1.1 Update the exact TOML dependency and lock entries; verify the official patch/MSRV evidence, Cargo resolution and existing configuration/delivery behavior tests without application source changes.
@@ -7,7 +10,7 @@
 
 ## 2. Verify integration
 
-- [ ] 2.1 Run the required granular mise/hk checks and native CI with the refreshed pins; record actual results and at least 90% meaningful workspace line coverage, preserve release/Pages topology, then strictly validate and archive this maintenance record through cospec.
+- [x] 2.1 Run the required granular mise/hk checks and native CI with the refreshed pins; record actual results and at least 90% meaningful workspace line coverage, preserve release/Pages topology, then strictly validate and archive this maintenance record through cospec.
 
 ## Observed checks
 
@@ -58,3 +61,23 @@ fixtures also rejected stale cached npm and failing version probes. Version pins
 and tool installation remain app-owned; only the shared backend alias is
 registered at root. Task 1.3 is complete. Task 2.1 remains open until native
 application integration completes; static success alone does not satisfy it.
+
+## Final integration: a1547ed
+
+[CI 34589999794](https://github.com/replygirl/kuru/actions/runs/34589999794)
+passed every required job; aggregate 103240993431 succeeded at 11:08:31Z on
+September 11. Exact tested-source equivalence and shared graph details are in
+native-windows verification, "Final native acceptance: a1547ed".
+
+The owning docs job 103232853724 actually selected Node 26.8.2 and npm 12.0.2
+(completed log 405–406), then passed locked setup and lint/format/build/content
+and link checks. All seven static categories, managed checks, dependency-lock
+checks and normal eight concurrent hooks passed. The final native suite passed
+on every required runner above the unchanged 90% gates; all four Unix shipping
+lanes and Windows source/offline Cargo/shipping/PE phases passed on this candidate.
+
+Evidence:
+`/tmp/kuru-ci-a1547ed-results.md`, `/tmp/kuru-windows-a1547ed-results.md` and
+`/tmp/kuru-a1547ed-push.log`. The cospec provenance/preload evidence above remains
+valid; no new pin refresh or provider-bundle implementation is implied. Release
+and Pages ordering is unchanged, and no publication or live authentication ran.

@@ -2,7 +2,10 @@
 
 - [x] 1.1 Add and run a real HTTP 500-to-success regression against the unchanged downloader; retain its observed failure before implementation.
 - [x] 1.2 Add at most two delayed retries before body acceptance under the existing 120-second total budget; verify eligible/permanent/status/body/Retry-After and cancellation boundaries with actual local HTTP fixtures.
-- [ ] 1.3 Update owning developer guidance and run granular checks plus normal hooks/native CI; record actual results, strictly validate and archive the completed fix through cospec.
+- [x] 1.3 Update owning developer guidance and run granular checks plus normal hooks/native CI; record actual results, strictly validate and archive the completed fix through cospec.
+
+Final integration passed at a1547ed; see verification's final evidence. The
+following RED/GREEN and pending-status account is retained as historical evidence.
 
 The unmodified downloader failed the actual loopback HTTP 500-to-200 regression
 with Cargo exit 101: zero cases passed, one failed in 0.01 seconds after

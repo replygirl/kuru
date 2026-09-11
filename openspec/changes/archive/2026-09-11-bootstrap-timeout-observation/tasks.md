@@ -6,4 +6,7 @@
 
 ## 2. Complete integration
 
-- [ ] 2.1 Run normal concurrent hooks and required native integration, record exact results and the limits of historical-cause inference, then strictly validate and actually archive the completed change.
+- [x] 2.1 Run normal concurrent hooks and required native integration, record exact results and the limits of historical-cause inference, then strictly validate and actually archive the completed change.
+
+Final integration passed at a1547ed, including all 17 actual Unix bootstrap
+cases and the complete Windows/source/shipping graph; see verification evidence.

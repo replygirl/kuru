@@ -1,3 +1,7 @@
+Current acceptance is complete at a1547ed; see final integration below and
+native-windows verification, "Final native acceptance: a1547ed". Earlier failures
+and pending statements remain historical; no earlier stall cause is inferred.
+
 ## 1. Observable owned timeout [critical]
 
 - [x] 1.1 @regression (agent) Run the real controlled live-root and exited-root/retained-writer scenarios against the original capture behavior, then the corrected fixture -> original execution fails the required labeled partial-output/root-state assertions; corrected execution distinguishes both actual states, retains output and observes cleanup within its bound. Compiler failures and a plain non-reproducing host rerun are not RED/GREEN evidence.
@@ -6,9 +10,9 @@
 
 ## 2. Repository integration [critical]
 
-- [ ] 2.1 @integration (agent) Run granular format/lint/typecheck/tooling/docs/cospec checks and the normal concurrent hooks -> checks pass with the existing pins, one relevant instrumented suite and at least 90 percent meaningful line coverage.
-- [ ] 2.2 @integration (agent) Complete required native CI on the corrected candidate -> full Unix and Windows behavior/coverage, actual shipping/source checks and aggregate pass; any recurrence retains its concrete observation and no historical stall cause is inferred from a later pass.
-- [ ] 2.3 @manual (agent) Review the final fixture and owning records -> no installer, deadline, release/Pages topology, user credential or provider behavior changed; strictly validate and actually archive after all required evidence completes.
+- [x] 2.1 @integration (agent) Run granular format/lint/typecheck/tooling/docs/cospec checks and the normal concurrent hooks -> checks pass with the existing pins, one relevant instrumented suite and at least 90 percent meaningful line coverage.
+- [x] 2.2 @integration (agent) Complete required native CI on the corrected candidate -> full Unix and Windows behavior/coverage, actual shipping/source checks and aggregate pass; any recurrence retains its concrete observation and no historical stall cause is inferred from a later pass.
+- [x] 2.3 @manual (agent) Review the final fixture and owning records -> no installer, deadline, release/Pages topology, user credential or provider behavior changed; strictly validate and actually archive after all required evidence completes.
 
 ## Initial evidence
 
@@ -101,3 +105,30 @@ this change's full required-graph/archive row remains open. A passing ordinary
 host case does not establish the earlier stall's cause. Evidence:
 `/tmp/kuru-ci-45a13b5-results.md` and
 `/tmp/kuru-windows-45a13b5-results.md`.
+
+## Final integration: a1547ed
+
+[CI 34589999794](https://github.com/replygirl/kuru/actions/runs/34589999794)
+passed every required job; aggregate 103240993431 succeeded at 11:08:31Z on
+September 11. Ubuntu again passed all 17 bootstrap cases in 2.51 seconds and
+macOS ARM in 5.02 seconds. Both actual timeout/root-state controls, the excess
+output/nonzero-exit control, independently releasable surviving-child rejection
+and all original installer cases ran. The Unix-only helper is not counted as a
+Windows test; the full Windows suite separately passed its 90% coverage
+gate, source installation, offline Cargo controls, shipping and both PE checks.
+
+All seven static categories, docs/managed/lock checks and normal eight concurrent
+hooks passed. All required native source/shipping phases and the other two Unix
+lanes passed on this same candidate.
+Shared exact source, counts and graph evidence are in native-windows verification,
+"Final native acceptance: a1547ed".
+
+Final fixture/record review retains the original 30-second capture and five-second
+cleanup bounds, explicit ownership disarming, conservative uncertain retention,
+and the original no-surviving-child and old-byte assertions. No product installer,
+provider, credential, deadline or Release/Pages behavior changed. The original
+RED, first partial GREEN, natural-exit failure and corrected default-feature pass
+remain distinct evidence; no later host-selection pass explains the historical
+e7eb136 stall. Reports: `/tmp/kuru-ci-a1547ed-results.md`,
+`/tmp/kuru-windows-a1547ed-results.md`, `/tmp/kuru-a1547ed-push.log` and the retained
+independent `/tmp/kuru-bootstrap-observation-green-review.md`.
