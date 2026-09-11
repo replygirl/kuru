@@ -98,24 +98,29 @@ kuru --provider demo run "Help me think through a difficult design decision."
 kuru --provider demo
 ```
 
-The demo provider exercises the pool locally without credentials. For live
-OpenAI models, install the repository's pinned Codex version (`npm install -g
-@openai/codex@0.153.4`, or the pinned tool through `mise install` from a maintainer
-checkout), authenticate through its supported login flow,
-and start Kuru with the default `codex` provider. Model and reasoning-effort
-choices are discovered from your provider at runtime. API-key users can select
-the `responses` provider with `OPENAI_API_KEY` set in their environment.
+The demo provider exercises the pool locally without credentials. For ChatGPT
+subscription access, sign in with Kuru and use the default `codex` provider.
+Kuru handles browser or device authorization and sends requests directly to
+OpenAI; no Codex CLI, Node or npm installation is needed. Model and
+reasoning-effort choices are discovered from your provider at runtime.
 
 ```sh
 kuru login
+kuru auth
 kuru models
 kuru
 ```
 
-For API-key authentication, use an explicit model:
+Use `kuru login --no-browser` to open the printed sign-in URL yourself, or
+`kuru login --device` for device authorization. Credentials stay in Kuru's own
+private data directory; `kuru auth` prints redacted status and `kuru logout`
+clears Kuru's ChatGPT credentials. See [authentication configuration](docs/configuration.md#authentication).
+
+For API-key authentication, set `OPENAI_API_KEY` through your environment or
+secret manager and choose the `responses` provider with an explicit model:
 
 ```sh
-kuru --provider responses --model gpt-6-astra --effort low
+kuru --provider responses --model MODEL_ID
 ```
 
 Use `kuru --help` for current CLI flags and commands. Configuration can live at

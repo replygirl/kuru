@@ -16,7 +16,6 @@ npm = "npm:npm"
 
 [tools]
 rust = "1.98.1"
-codex = "0.153.4"
 "github:aligned-team/cospec" = "0.7.1"
 "aqua:jdx/hk" = "1.58.1"
 "aqua:tamasfe/taplo" = "0.10.0"

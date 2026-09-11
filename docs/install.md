@@ -3,6 +3,8 @@
 Kuru ships native executables for macOS and Linux on arm64 and x86-64, and Windows
 on x86-64. Binary installation requires no separately installed compiler, Dolt
 server or MSVC redistributable. Run it as `kuru` (`kuru.exe` on Windows).
+ChatGPT sign-in and OpenAI model requests are native to Kuru; no Codex CLI,
+Node or npm installation is needed for them.
 
 ## Install with mise
 
@@ -98,6 +100,28 @@ freezes latest to an explicit version, verifies the ZIP checksum and its exact
 three regular members, and installs only `kuru.exe`. It never runs the downloaded
 candidate to validate it. Reparse points, extra hardlinks, unsafe names and
 unexpected installation objects are refused.
+
+## Sign in after installation
+
+For ChatGPT subscription access with the default `codex` provider:
+
+```sh
+kuru login
+kuru auth
+kuru models
+kuru
+```
+
+Use `kuru login --no-browser` to open the printed URL yourself, or
+`kuru login --device` for device authorization. Kuru keeps credentials in its
+own private data directory and does not copy another application's auth store.
+`kuru auth` reports redacted local status; `kuru logout` clears Kuru's ChatGPT
+credentials.
+
+For API-key access, supply `OPENAI_API_KEY` through your environment or secret
+manager and run `kuru --provider responses --model MODEL_ID`. Provider selection
+stays explicit. See [authentication configuration](configuration.md#authentication)
+for storage overrides and migration from the removed `codex_command` setting.
 
 ## Supported platforms
 

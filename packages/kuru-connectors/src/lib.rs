@@ -2,7 +2,7 @@
 //! or persistent memory; the runtime supplies each actor's permitted context.
 
 mod a2a;
-mod codex;
+mod auth;
 mod http;
 mod mcp;
 #[cfg(windows)]
@@ -15,7 +15,7 @@ mod tools;
 mod test_support;
 
 pub use a2a::a2a_send;
-pub use codex::{AuthAction, CodexProvider, auth};
+pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
 pub use providers::{DemoProvider, Provider, ResponsesProvider, provider};
 pub use tools::ToolHost;
 

@@ -7,6 +7,13 @@ the initial SQLite API to asynchronous, versioned Dolt in `kuru-memory`; see
 [memory storage](memory.md). Historical interface sketches below are not current
 API documentation.
 
+The original Codex app-server/auth subprocess design below is also superseded.
+The September 11 architecture correction requires direct ChatGPT authentication
+(browser OAuth preferred, with device flow where useful) or `OPENAI_API_KEY` in
+Kuru's native connector layer. Kuru must not ship or require another harness.
+See the active `openai-authentication` correction; the historical prohibition on a
+native OAuth implementation below must not guide new work.
+
 Intent: Kuru is a Rust chat harness whose native unit of cognition is a pool of
 equal persistent parts. No LLM supervisor owns other actors. Frameworks define
 roles and tendencies; each part can message any peer, report modeled state,

@@ -45,26 +45,36 @@ dream_on_exit = true
 max_parts = 16
 allow_shell = false
 allow_write = false
-codex_command = "codex"
 api_base = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 ```
 
 ## Models and providers
 
-| Key             | Accepted value                                                       |
-| --------------- | -------------------------------------------------------------------- |
-| `mode`          | `ifs`, `polyvagal`, `freudian`, `jungian`                            |
-| `provider`      | `codex`, `responses`, `demo`                                         |
-| `model`         | Provider model ID; `auto` permits provider selection where supported |
-| `effort`        | Optional provider-advertised string                                  |
-| `codex_command` | Codex executable name or path                                        |
-| `api_base`      | Responses API base URL                                               |
-| `api_key_env`   | Environment variable containing the API key                          |
+| Key           | Accepted value                                                       |
+| ------------- | -------------------------------------------------------------------- |
+| `mode`        | `ifs`, `polyvagal`, `freudian`, `jungian`                            |
+| `provider`    | `codex`, `responses`, `demo`                                         |
+| `model`       | Provider model ID; `auto` permits provider selection where supported |
+| `effort`      | Optional provider-advertised string                                  |
+| `api_base`    | Responses API base URL                                               |
+| `api_key_env` | Environment variable containing the API key                          |
 
 Use `kuru models` to discover current capabilities. Kuru preserves newly advertised effort strings. The Responses catalog does not supply a default chat model, so that provider requires an explicit `model` or `--model`.
 
-An API key belongs in its environment variable, not the TOML file. See [authentication](/guide/authentication).
+The default `codex` provider uses Kuru's own ChatGPT login and direct subscription
+requests. The `responses` provider uses an API key; `api_base` and `api_key_env`
+apply only to that provider. Setting an API key does not change the selected
+provider, and ChatGPT credentials are never sent to the configurable API base.
+
+An API key belongs in its environment variable, not the TOML file. Kuru keeps
+ChatGPT credentials in the private `auth/openai` directory beneath its data
+directory. Use the same `--data-dir` or `KURU_DATA_DIR` for login and chat, and
+keep this state outside project tool roots. See [authentication](/guide/authentication).
+
+The former `codex_command` setting has been removed. Delete it from existing
+TOML, retain `provider = "codex"`, and run `kuru login` to establish Kuru's own
+session. No external Codex executable or credential-store import is needed.
 
 ## Budgets and dreaming
 

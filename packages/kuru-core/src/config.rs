@@ -151,7 +151,6 @@ pub struct Config {
     pub max_parts: usize,
     pub allow_shell: bool,
     pub allow_write: bool,
-    pub codex_command: String,
     pub api_base: String,
     pub api_key_env: String,
     pub mcp: BTreeMap<String, McpConfig>,
@@ -174,7 +173,6 @@ impl Default for Config {
             max_parts: 16,
             allow_shell: false,
             allow_write: false,
-            codex_command: "codex".into(),
             api_base: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             mcp: BTreeMap::new(),
@@ -263,6 +261,7 @@ impl Config {
             );
             let patch: toml::Value = toml::from_str(&source)
                 .with_context(|| format!("cannot parse configuration {}", path.display()))?;
+            reject_removed_settings(&patch)?;
             merge(&mut merged, patch);
             // Deserialize at every step so an invalid layer cannot be silently
             // masked by a later override. Defaults live in one place, Config.
@@ -278,10 +277,10 @@ impl Config {
                 total_bytes <= MAX_COMBINED_BYTES,
                 "combined configuration exceeds 1 MiB"
             );
-            Some(
-                toml::from_str::<toml::Value>(&source)
-                    .with_context(|| format!("cannot parse configuration {}", path.display()))?,
-            )
+            let patch = toml::from_str::<toml::Value>(&source)
+                .with_context(|| format!("cannot parse configuration {}", path.display()))?;
+            reject_removed_settings(&patch)?;
+            Some(patch)
         } else {
             None
         };
@@ -338,7 +337,6 @@ impl Config {
             Framework::builtin(self.mode).parts.len(),
             128,
         )?;
-        nonempty("codex_command", &self.codex_command, 4096)?;
         endpoint("api_base", &self.api_base)?;
         environment_name("api_key_env", &self.api_key_env)?;
         ensure!(
@@ -438,6 +436,14 @@ fn endpoint(label: &str, value: &str) -> Result<()> {
     ensure!(
         url.fragment().is_none(),
         "{label} must not contain a fragment"
+    );
+    Ok(())
+}
+
+fn reject_removed_settings(patch: &toml::Value) -> Result<()> {
+    ensure!(
+        patch.get("codex_command").is_none(),
+        "codex_command was removed: Kuru connects to OpenAI directly; remove this setting and use `kuru login`, or select the responses provider with OPENAI_API_KEY"
     );
     Ok(())
 }

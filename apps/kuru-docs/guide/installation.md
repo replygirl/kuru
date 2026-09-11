@@ -170,10 +170,10 @@ kuru update --source /path/to/kuru
 
 ## If the first launch fails
 
-| Symptom                                               | Next step                                                                                          |
-| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `kuru` is not found                                   | Activate mise or add the installation directory to `PATH`.                                         |
-| A new release is missing from mise's latest selection | Select its full version with `github:replygirl/kuru@VERSION`.                                      |
-| Codex cannot be started                               | Try `kuru --provider demo`, then install Codex as described in [authentication](./authentication). |
-| A release cannot be downloaded                        | Check the version and release directory against the available release assets.                      |
-| State directory is inside the workspace               | Set `--data-dir` to a private directory outside the project.                                       |
+| Symptom                                               | Next step                                                                               |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `kuru` is not found                                   | Activate mise or add the installation directory to `PATH`.                              |
+| A new release is missing from mise's latest selection | Select its full version with `github:replygirl/kuru@VERSION`.                           |
+| ChatGPT is not authenticated                          | Run `kuru login`, or use `kuru login --device`; see [authentication](./authentication). |
+| A release cannot be downloaded                        | Check the version and release directory against the available release assets.           |
+| State directory is inside the workspace               | Set `--data-dir` to a private directory outside the project.                            |

@@ -9,7 +9,7 @@ use std::{
     fs::{self, File},
     path::{Path, PathBuf},
     sync::{
-        Arc, Weak,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -367,21 +367,26 @@ impl Server {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                let _ = finish_owner(&mut owner).await;
-                return Err(error);
+                return Err(startup_failure(&mut owner, error).await);
             }
         };
         let (endpoint, owned) = match response {
             Response::Ready { endpoint, owned } => {
                 if !owned && !options.read_only {
-                    let _ = finish_owner(&mut owner).await;
-                    bail!("writable memory requires an owned supervisor lifetime");
+                    return Err(startup_failure(
+                        &mut owner,
+                        anyhow!("writable memory requires an owned supervisor lifetime"),
+                    )
+                    .await);
                 }
                 (endpoint, owned)
             }
             Response::Failed(message) => {
-                let _ = finish_owner(&mut owner).await;
-                bail!("memory server startup failed: {message}");
+                return Err(startup_failure(
+                    &mut owner,
+                    anyhow!("memory server startup failed: {message}"),
+                )
+                .await);
             }
         };
         let verified = async {
@@ -395,8 +400,11 @@ impl Server {
                 options.read_only,
                 1,
             )
-            .await?;
-            let result = verify_identity(&probe, &directory, &identity).await;
+            .await
+            .context("authenticate post-readiness memory connection")?;
+            let result = verify_identity(&probe, &directory, &identity)
+                .await
+                .context("verify post-readiness memory identity");
             probe.close().await;
             result?;
             Ok::<_, anyhow::Error>(identity)
@@ -405,8 +413,7 @@ impl Server {
         let identity = match verified {
             Ok(identity) => identity,
             Err(error) => {
-                let _ = finish_owner(&mut owner).await;
-                return Err(error);
+                return Err(startup_failure(&mut owner, error).await);
             }
         };
         let owner = if owned {
@@ -461,8 +468,11 @@ impl Server {
             self.0.read_only,
             4,
         )
-        .await?;
-        verify_identity(&pool, &self.0.directory, &self.0.identity).await?;
+        .await
+        .context("authenticate memory branch pool")?;
+        verify_identity(&pool, &self.0.directory, &self.0.identity)
+            .await
+            .context("verify memory branch pool identity")?;
         let pool = Arc::new(pool);
         pools.insert(branch.to_owned(), Arc::downgrade(&pool));
         Ok(pool)
@@ -543,6 +553,13 @@ async fn finish_owner(owner: &mut Owner) -> Result<()> {
         "memory supervisor exited unsuccessfully ({status})"
     );
     Ok(())
+}
+
+async fn startup_failure(owner: &mut Owner, error: anyhow::Error) -> anyhow::Error {
+    match finish_owner(owner).await {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!("memory startup cleanup also failed: {cleanup:#}")),
+    }
 }
 
 fn validate_branch(branch: &str) -> Result<()> {
@@ -771,6 +788,73 @@ fn valid_secret(secret: &str) -> bool {
     secret.len() == 64 && secret.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[derive(Clone)]
+struct ConnectionObservation(Arc<StdMutex<ConnectionProgress>>);
+
+struct ConnectionProgress {
+    phase: &'static str,
+    last_failure: Option<(&'static str, &'static str)>,
+}
+
+impl ConnectionObservation {
+    fn new() -> Self {
+        Self(Arc::new(StdMutex::new(ConnectionProgress {
+            phase: "after_connect not entered",
+            last_failure: None,
+        })))
+    }
+
+    fn phase(&self, phase: &'static str) {
+        if let Ok(mut progress) = self.0.lock() {
+            progress.phase = phase;
+        }
+    }
+
+    fn rejected(&self, error: &sqlx::Error) {
+        // SQLx discards callback errors while retrying acquisition. Keep only
+        // authored messages or static error classes, never SQL payloads or
+        // connection options. A later attempt may be in a different phase.
+        let Ok(mut progress) = self.0.lock() else {
+            return;
+        };
+        let cause = match error {
+            sqlx::Error::Protocol(message)
+                if message == "memory server data directory mismatch" =>
+            {
+                "memory server data directory mismatch"
+            }
+            sqlx::Error::Protocol(message)
+                if message == "memory SQL project/instance identity mismatch" =>
+            {
+                "memory SQL project/instance identity mismatch"
+            }
+            sqlx::Error::Protocol(_) if progress.phase == "checked data directory comparison" => {
+                "checked filesystem validation failed"
+            }
+            sqlx::Error::Protocol(_) => "SQL protocol failure",
+            sqlx::Error::Database(_) => "database rejected verification query",
+            sqlx::Error::Io(_) => "verification I/O failure",
+            sqlx::Error::RowNotFound => "verification row missing",
+            sqlx::Error::ColumnNotFound(_) => "verification column missing",
+            _ => "SQL verification failure",
+        };
+        progress.last_failure = Some((progress.phase, cause));
+    }
+
+    fn diagnostic(&self) -> String {
+        let Ok(progress) = self.0.lock() else {
+            return "connection observation unavailable".into();
+        };
+        let mut diagnostic = format!("connection phase: {}", progress.phase);
+        if let Some((phase, cause)) = progress.last_failure {
+            diagnostic.push_str(&format!(
+                "; last callback rejection during {phase}: {cause}"
+            ));
+        }
+        diagnostic
+    }
+}
+
 async fn connect_pool(
     identity: &Identity,
     endpoint: &Endpoint,
@@ -797,6 +881,8 @@ async fn connect_pool(
     let instance = identity.instance.clone();
     let project_scope = identity.project_scope.clone();
     let expected_directory = directory.join("data");
+    let observation = ConnectionObservation::new();
+    let callback_observation = observation.clone();
     MySqlPoolOptions::new()
         .max_connections(max)
         .min_connections(0)
@@ -806,35 +892,53 @@ async fn connect_pool(
             let instance = instance.clone();
             let project_scope = project_scope.clone();
             let expected_directory = expected_directory.clone();
+            let observation = callback_observation.clone();
             Box::pin(async move {
-                let datadir: String = sqlx::query_scalar("SELECT @@datadir")
-                    .fetch_one(&mut *connection)
+                let result = async {
+                    observation.phase("data directory query");
+                    let datadir: String = sqlx::query_scalar("SELECT @@datadir")
+                        .fetch_one(&mut *connection)
+                        .await?;
+                    observation.phase("checked data directory comparison");
+                    if !same_directory(Path::new(&datadir), &expected_directory)
+                        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
+                    {
+                        return Err(sqlx::Error::Protocol(
+                            "memory server data directory mismatch".into(),
+                        ));
+                    }
+                    observation.phase("SQL project/instance query");
+                    let row = sqlx::query(
+                        "SELECT instance_id, project_scope FROM kuru_instance WHERE singleton = 1",
+                    )
+                    .fetch_one(connection)
                     .await?;
-                if !same_directory(Path::new(&datadir), &expected_directory)
-                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
-                {
-                    return Err(sqlx::Error::Protocol(
-                        "memory server data directory mismatch".into(),
-                    ));
+                    observation.phase("SQL project/instance comparison");
+                    if row.try_get::<String, _>("instance_id")? != instance
+                        || row.try_get::<String, _>("project_scope")? != project_scope
+                    {
+                        return Err(sqlx::Error::Protocol(
+                            "memory SQL project/instance identity mismatch".into(),
+                        ));
+                    }
+                    observation.phase("authenticated identity callback complete");
+                    Ok(())
                 }
-                let row = sqlx::query(
-                    "SELECT instance_id, project_scope FROM kuru_instance WHERE singleton = 1",
-                )
-                .fetch_one(connection)
-                .await?;
-                if row.try_get::<String, _>("instance_id")? != instance
-                    || row.try_get::<String, _>("project_scope")? != project_scope
-                {
-                    return Err(sqlx::Error::Protocol(
-                        "memory SQL project/instance identity mismatch".into(),
-                    ));
+                .await;
+                if let Err(error) = &result {
+                    observation.rejected(error);
                 }
-                Ok(())
+                result
             })
         })
         .connect_with(options)
         .await
-        .context("connect to authenticated project memory")
+        .with_context(|| {
+            format!(
+                "connect to authenticated project memory; {}",
+                observation.diagnostic()
+            )
+        })
 }
 
 async fn verify_identity(pool: &MySqlPool, directory: &Path, identity: &Identity) -> Result<()> {
@@ -882,8 +986,12 @@ async fn live_endpoint(
         Ok(Ok(stream)) => drop(stream),
         _ => return Ok(None),
     }
-    let pool = connect_pool(identity, &endpoint, directory, "main", read_only, 1).await?;
-    let verified = verify_identity(&pool, directory, identity).await;
+    let pool = connect_pool(identity, &endpoint, directory, "main", read_only, 1)
+        .await
+        .context("authenticate published memory endpoint")?;
+    let verified = verify_identity(&pool, directory, identity)
+        .await
+        .context("verify published memory endpoint identity");
     pool.close().await;
     verified?;
     Ok(Some(endpoint))

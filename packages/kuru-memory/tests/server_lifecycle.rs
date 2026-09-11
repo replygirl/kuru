@@ -384,7 +384,8 @@ async fn wrong_credentials_directory_and_sql_identity_fail_without_server_takeov
     fs::copy(&endpoint_path, cloned.join("endpoint.json"))?;
     let mut wrong_directory = opts.clone();
     wrong_directory.directory = cloned.clone();
-    assert!(Server::open(wrong_directory).await.is_err());
+    let directory_result = Server::open(wrong_directory).await;
+    assert!(directory_result.is_err());
     assert!(
         !cloned.join("server.yaml").exists(),
         "foreign endpoint was adopted"
@@ -412,6 +413,63 @@ async fn wrong_credentials_directory_and_sql_identity_fail_without_server_takeov
     );
     drop(connection);
     server.close().await?;
+
+    // Observe diagnostic assertions only after restoring the authentic identity
+    // and closing the real server, including during the expected RED run.
+    let recorded: serde_json::Value = serde_json::from_slice(&identity)?;
+    let wrong_password = "0".repeat(64);
+    let secrets = [
+        recorded["password"].as_str().context("fixture password")?,
+        recorded["reader_password"]
+            .as_str()
+            .context("fixture reader password")?,
+        wrong_password.as_str(),
+    ];
+    let credentials_error = credentials_result.unwrap_err();
+    let directory_error = directory_result.unwrap_err();
+    let sql_identity_error = sql_identity_result.unwrap_err();
+    for error in [&credentials_error, &directory_error, &sql_identity_error] {
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.len() < 4096,
+            "connection diagnostic is unbounded"
+        );
+        for secret in secrets {
+            assert!(
+                !diagnostic.contains(secret),
+                "connection diagnostic exposed a fixture credential"
+            );
+        }
+        assert!(
+            !diagnostic.contains("foreign-sql-project"),
+            "connection diagnostic exposed the SQL identity payload"
+        );
+    }
+    for (error, phase, cause) in [
+        (
+            directory_error,
+            "checked data directory comparison",
+            "checked filesystem validation failed",
+        ),
+        (
+            sql_identity_error,
+            "SQL project/instance comparison",
+            "memory SQL project/instance identity mismatch",
+        ),
+    ] {
+        assert!(
+            matches!(
+                error.downcast_ref::<sqlx::Error>(),
+                Some(sqlx::Error::PoolTimedOut)
+            ),
+            "original SQLx pool timeout was lost: {error:#}"
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains(phase) && diagnostic.contains(cause),
+            "callback rejection lost its checked phase or cause: {diagnostic}"
+        );
+    }
     Ok(())
 }
 

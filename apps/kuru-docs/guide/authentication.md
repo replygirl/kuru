@@ -2,15 +2,17 @@
 
 Kuru has three inference providers. The peer pool, memories, and tool permissions belong to Kuru regardless of which provider you choose.
 
-| Provider    | Authentication                     | Use                                                             |
-| ----------- | ---------------------------------- | --------------------------------------------------------------- |
-| `codex`     | Supported Codex sign-in            | OpenAI inference through Codex app-server; the default provider |
-| `responses` | API key in an environment variable | Direct OpenAI Responses API access                              |
-| `demo`      | None                               | Deterministic offline exploration                               |
+| Provider    | Authentication                     | Use                                                        |
+| ----------- | ---------------------------------- | ---------------------------------------------------------- |
+| `codex`     | ChatGPT browser or device sign-in  | Direct ChatGPT subscription requests; the default provider |
+| `responses` | API key in an environment variable | Direct OpenAI Responses API access                         |
+| `demo`      | None                               | Deterministic offline exploration                          |
 
-## Sign in through Codex
+## Sign in with ChatGPT
 
-Have the `codex` executable available on your `PATH`. The repository's mise toolchain supplies its pinned supported version; `codex_command` can select another executable path.
+Kuru handles sign-in and sends model requests directly to OpenAI. Install Kuru,
+then sign in with your ChatGPT account; no Codex CLI, Node or npm installation
+is required.
 
 ```sh
 kuru login
@@ -19,7 +21,16 @@ kuru models
 kuru
 ```
 
-Kuru forwards login, status, and logout to Codex. Codex manages the credentials; Kuru does not copy authentication tokens. Follow [OpenAI's authentication instructions](https://learn.chatgpt.com/docs/auth?surface=app) for supported account and sign-in options.
+`kuru login` opens your browser and waits for the local authorization callback.
+To open the printed URL yourself, use:
+
+```sh
+kuru login --no-browser
+```
+
+Browser login uses the local callback port `1455`. If that port is occupied,
+Kuru reports the conflict; use device authorization instead. If launching the
+browser fails, the printed URL remains available for manual sign-in.
 
 For device authorization:
 
@@ -27,7 +38,20 @@ For device authorization:
 kuru login --device
 ```
 
-`kuru logout` signs out through Codex. If login fails, resolve the reported Codex error before retrying Kuru.
+Kuru stores its session in the private `auth/openai` directory beneath its data
+directory. If you choose `--data-dir` or `KURU_DATA_DIR`, use that same location
+for login and chat. Keep it outside the project tool root. Kuru does not read
+or copy credentials from another application's store.
+
+`kuru auth` prints redacted local status as JSON, without creating credentials
+or opening project memory. It is not a live access check. `kuru logout` clears
+Kuru's ChatGPT credentials; an API key supplied through the environment remains
+unchanged. Sessions refresh when needed. If login or refresh fails, follow the
+reported sign-in guidance; Kuru does not switch providers automatically.
+
+For existing configurations, remove `codex_command`; it no longer selects an
+external executable. Keep `provider = "codex"` and run `kuru login` to establish
+Kuru's own session.
 
 ## Discover models and effort
 
@@ -56,7 +80,10 @@ kuru --provider responses --model MODEL_ID
 
 This provider calls the [OpenAI Responses API](https://developers.openai.com/api/reference/resources/responses/). Its model catalog does not advertise a default chat model or reasoning effort capabilities, so select a suitable model explicitly. An empty effort list does not mean every effort is supported; provider validation errors remain authoritative.
 
-`api_key_env` changes the environment variable name, and `api_base` changes the API base URL. Put the variable name in configuration, never the key itself.
+For this provider, `api_key_env` changes the environment variable name, and
+`api_base` changes the API base URL. Put the variable name in configuration,
+never the key itself. ChatGPT credentials are not sent to this configurable
+endpoint, and setting an API key does not change the selected provider.
 
 ## Try the pool offline
 

@@ -28,6 +28,17 @@ when applying that standard. AGENTS.md is canonical; CLAUDE.md imports it with
 Keep provider and protocol knowledge behind connector interfaces. All crates
 inherit workspace dependencies; pin exact versions and update Cargo.lock in the
 same change. Preserve unknown model/effort capabilities returned by providers.
+Kuru owns the complete agent runtime. OpenAI integration must use native
+authentication and inference transports: ChatGPT browser OAuth (with device flow
+where useful), or `OPENAI_API_KEY`. Do not embed the Codex CLI/app-server, require
+another harness for login, or delegate Kuru's agent loop to another harness.
+The `codex` provider label selects direct ChatGPT subscription access; `responses`
+selects the explicit API-key route. Keep these routes separate across refresh,
+relogin and request failures. Bundled native runtime dependencies such as Dolt
+remain a separate portability requirement.
+Keep authentication corrections focused on login, credentials and direct provider
+requests. Runtime evaluations and peer-behavior changes are separate work; auth
+and transport still require complete functional verification.
 Do not concatenate unrelated private part histories into prompts. Retire parts
 by archiving and preserve reversibility and role coverage.
 Keep peers equal: cross-peer routing and relationship memory belong to the
@@ -240,10 +251,11 @@ When delegating work, give intent, goals, non-goals, constraints, owned files an
 observable acceptance criteria. Coordinate shared-workspace writes and integrate
 the results through the same cospec, review and verification flow.
 
-Never read, print, copy or commit provider credential stores. Codex owns its
-login lifecycle; API keys come from configured environment variables. Do not
-load local secret files to diagnose authentication. Tests use fake secrets and
-isolated stores. File operations remain under the tool root; shell is explicit
+Never inspect, print, copy or commit a user's provider credential stores while
+developing or diagnosing the application. Native login may manage only Kuru's
+own private authentication store; never import another harness's credentials.
+API keys come from configured environment variables. Tests use fake secrets and
+isolated stores; live login requires the user's participation. File operations remain under the tool root; shell is explicit
 process authority and must not be described as sandboxed. State directories
 are never tool roots. Avoid external messages, releases or remote publication
 unless explicitly requested.

@@ -94,9 +94,12 @@ toward the operational cost of a session.
 | Runtime envelopes | Extend peer actions and validate them before mutating state |
 | TUI/CLI | Expose options while keeping cognitive policy in the runtime |
 
-A provider only performs inference. Codex authentication and app-server are
-transports; Kuru owns actor context, memory and tools. General-purpose worker
-subtrees are outside the initial architecture. A2A ingress/egress provides the
+A provider only performs inference. The connector package owns native OpenAI
+authentication, Kuru's private token store and direct HTTP transports. The
+`codex` provider uses ChatGPT subscription access; `responses` uses an explicitly
+selected API-key route. Neither launches an external Codex harness. Kuru owns
+actor context, memory and tools. General-purpose worker subtrees are outside
+the initial architecture. A2A ingress/egress provides the
 path to external peers, with explicit configured endpoints rather than remote
 autodiscovery or implicit trust.
 

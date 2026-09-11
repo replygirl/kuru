@@ -176,7 +176,7 @@ impl Installation {
             .arg(&self.project)
             .arg("--data-dir")
             .arg(&self.data)
-            .args(["--provider", "demo", "--mode", "freudian", "--no-dream"]);
+            .args(["--mode", "freudian", "--no-dream"]);
         // Preserve only the coverage destination, never ambient provider state.
         if let Some(path) = std::env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", path);
@@ -188,7 +188,7 @@ impl Installation {
         command
     }
     async fn run(&self, args: &[&str]) -> Result<Value> {
-        let output = execute(self.command().args(args))
+        let output = execute(self.command().args(["--provider", "demo"]).args(args))
             .await
             .with_context(|| format!("execute installed command {args:?}"))?;
         ensure!(
@@ -198,6 +198,142 @@ impl Installation {
             String::from_utf8_lossy(&output.stderr)
         );
         serde_json::from_slice(&output.stdout).context("installed command did not return JSON")
+    }
+    async fn native_auth_status(&self) -> Result<()> {
+        let output = execute(self.command().arg("auth")).await?;
+        ensure!(
+            output.status.success(),
+            "installed native auth failed without PATH tools: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status: Value = serde_json::from_slice(&output.stdout)?;
+        ensure!(
+            status["authenticated"] == false && status["api_key_available"] == false,
+            "isolated installation has unexpected provider credentials"
+        );
+        ensure!(!self.data.exists(), "fresh auth inspection created data");
+        Ok(())
+    }
+
+    async fn api_key_access(&self) -> Result<()> {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::HeaderMap,
+            routing::{get, post},
+        };
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        #[derive(Default)]
+        struct Requests {
+            models: usize,
+            completions: usize,
+            valid: bool,
+        }
+        type Shared = Arc<Mutex<Requests>>;
+        fn authorized(headers: &HeaderMap) -> bool {
+            headers
+                .get("authorization")
+                .is_some_and(|value| value == "Bearer synthetic-installed-api-key")
+                && !headers.contains_key("chatgpt-account-id")
+        }
+        async fn models(State(state): State<Shared>, headers: HeaderMap) -> Json<Value> {
+            let mut requests = state.lock().await;
+            requests.models += 1;
+            requests.valid &= authorized(&headers);
+            Json(serde_json::json!({"data":[{"id":"fixture-openai-model"}]}))
+        }
+        async fn response(
+            State(state): State<Shared>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let mut requests = state.lock().await;
+            requests.completions += 1;
+            requests.valid &= authorized(&headers)
+                && body["model"] == "fixture-openai-model"
+                && body["store"] == false;
+            Json(
+                serde_json::json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Native OpenAI request completed."}]}],"usage":{"input_tokens":1,"output_tokens":1}}),
+            )
+        }
+        let state = Arc::new(Mutex::new(Requests {
+            valid: true,
+            ..Default::default()
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let router = Router::new()
+            .route("/models", get(models))
+            .route("/responses", post(response))
+            .with_state(state.clone());
+        struct Server(tokio::task::JoinHandle<()>);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        }));
+        let settings = self.config.join("api-fixture.toml");
+        fs::write(
+            &settings,
+            toml::to_string(&std::collections::BTreeMap::from([("api_base", &base)]))?,
+        )?;
+        for args in [
+            vec!["models"],
+            vec![
+                "--model",
+                "fixture-openai-model",
+                "run",
+                "Check the native OpenAI connection.",
+                "--json",
+            ],
+        ] {
+            let output = execute(
+                self.command()
+                    .env("OPENAI_API_KEY", "synthetic-installed-api-key")
+                    .arg("--config")
+                    .arg(&settings)
+                    .args(["--provider", "responses"])
+                    .args(&args),
+            )
+            .await?;
+            ensure!(
+                output.status.success(),
+                "installed API request failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = serde_json::from_slice(&output.stdout)?;
+            if args[0] == "models" {
+                ensure!(
+                    result[0]["id"] == "fixture-openai-model",
+                    "API model response was not returned"
+                );
+            } else {
+                ensure!(
+                    result["text"] == "Native OpenAI request completed.",
+                    "API completion was not returned"
+                );
+            }
+            ensure!(
+                !String::from_utf8_lossy(&output.stdout).contains("synthetic-installed-api-key")
+                    && !String::from_utf8_lossy(&output.stderr)
+                        .contains("synthetic-installed-api-key"),
+                "installed command exposed its API key"
+            );
+        }
+        let observed = state.lock().await;
+        ensure!(
+            observed.valid && observed.models >= 1 && observed.completions >= 1,
+            "installed API route did not send the expected authenticated requests"
+        );
+        ensure!(
+            !self.data.join("auth").exists(),
+            "API-key use created stored OAuth credentials"
+        );
+        Ok(())
     }
     async fn conversation(&self, marker: &str, asset: &Value, version: &str) -> Result<()> {
         ensure!(
@@ -460,6 +596,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         "installation must contain only Kuru and the Windows update coordination directory"
     );
     let first = Installation::new(root, "direct", &project, &installed)?;
+    first.native_auth_status().await?;
     let reported = execute(first.command().arg("--version"))
         .await
         .context("run the directly installed executable's version command")?;
@@ -476,6 +613,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         )
         .await
         .context("verify the direct installation's cold offline memory")?;
+    first.api_key_access().await?;
 
     let previous_identity = regular_file_info(&File::open(&installed)?)?.identity;
     let mut update = first.command();
@@ -504,6 +642,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         "self-update lost or changed the bundled executable"
     );
     let second = Installation::new(root, "updated", &project, &installed)?;
+    second.native_auth_status().await?;
     second
         .conversation(
             "Remember the offline self-update marker: indigo-942",
@@ -512,6 +651,7 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         )
         .await
         .context("verify the updated installation's cold offline memory")?;
+    second.api_key_access().await?;
     ensure!(
         fs::read_dir(&install_dir)?.count() == if cfg!(windows) { 2 } else { 1 },
         "self-update left a required companion executable"

@@ -340,11 +340,21 @@ The test runner uses two threads and limits
 simultaneous temporary servers. Do not replace these fixtures with SQLite or
 exclude memory modules from coverage.
 
-The demo provider allows offline process smoke tests. Protocol tests start
-local fake app-server, HTTP, MCP or A2A peers and exercise actual wire framing.
-Use temporary project roots and memory stores. Never inspect or copy the user's
-Codex credential file to construct test fixtures; supported auth status and
-model discovery commands are the intended read-only probes.
+The demo provider allows offline process smoke tests. Authentication and
+provider fixtures use local OAuth and HTTP peers with synthetic credentials,
+including callback validation, token refresh and Responses SSE framing. MCP
+and A2A fixtures exercise their own wire protocols. Use temporary project,
+auth and memory directories; never inspect or copy another application's
+credential store to construct a fixture.
+
+OpenAI authentication and requests belong to the Rust connector package.
+Running or building these providers does not require Codex CLI, app-server,
+Node or npm; the latter two remain docs-app tools. `kuru auth` is a redacted
+local status check and does not create credentials or project memory. Real
+browser/device sign-in requires user participation, and live model discovery
+or inference can refresh Kuru's own session. Record those checks separately
+from deterministic fixtures and never include tokens or authorization codes
+in verification output.
 
 Windows tests use native process Jobs, private pipes and ConPTY. The delivery
 fixtures run stock PowerShell and exercise loaded-image replacement and receipt

@@ -230,51 +230,6 @@ fn cli_configuration_errors_and_nonterminal_start_are_actionable() {
     assert!(text.contains("effort = \"medium\""));
 }
 
-#[cfg(unix)]
-#[test]
-fn supported_auth_commands_forward_to_native_codex_without_handling_tokens() {
-    use std::os::unix::fs::PermissionsExt;
-    let env = Sandbox::new();
-    let script = env.root.path().join("fake-codex");
-    let log = env.root.path().join("auth-actions");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AUTH_TEST_LOG\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let config = env.root.path().join("auth.toml");
-    std::fs::write(
-        &config,
-        format!("codex_command = {:?}\n", script.display().to_string()),
-    )
-    .unwrap();
-    for args in [
-        vec!["login"],
-        vec!["login", "--device"],
-        vec!["auth"],
-        vec!["logout"],
-    ] {
-        let output = env
-            .command()
-            .arg("--config")
-            .arg(&config)
-            .env("AUTH_TEST_LOG", &log)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    assert_eq!(
-        std::fs::read_to_string(log).unwrap(),
-        "login\nlogin --device-auth\nlogin status\nlogout\n"
-    );
-}
-
 #[test]
 fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
     let env = Sandbox::new();

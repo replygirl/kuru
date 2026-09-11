@@ -267,8 +267,10 @@ impl MemoryStore {
                     Uuid::new_v4()
                 ));
                 private_dir(&staging)?;
-                let server = Server::open(make_options(staging.clone(), false)).await?;
-                let pool = server.pool("main").await?;
+                let server = Server::open(make_options(staging.clone(), false))
+                    .await
+                    .context("open staged memory server")?;
+                let pool = server.pool("main").await.context("open staged main pool")?;
                 let initialized = async {
                     initialize(&pool).await?;
                     if let Some(legacy) = &legacy {
@@ -315,8 +317,10 @@ impl MemoryStore {
             drop(staging);
         }
         read_activation(&directory, &options.project_scope)?;
-        let server = Server::open(make_options(directory.clone(), options.read_only)).await?;
-        let pool = server.pool("main").await?;
+        let server = Server::open(make_options(directory.clone(), options.read_only))
+            .await
+            .context("open active memory server")?;
+        let pool = server.pool("main").await.context("open active main pool")?;
         validate_schema(&pool).await?;
         drop(lock);
         let shared = Arc::new(Shared {

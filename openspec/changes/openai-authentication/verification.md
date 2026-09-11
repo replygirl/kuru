@@ -1,0 +1,19 @@
+## 1. Complete native authentication [critical]
+
+- [x] 1.1 @regression (agent) run actual Kuru auth status with isolated homes and empty PATH before/after correction -> old installed preview exited 1 with missing Codex in /tmp/kuru-openai-auth-before.log; corrected native CLI passed four cases across explicit/XDG/native directories without creating data or exposing the synthetic API key, /tmp/kuru-native-auth-installed.log.
+- [x] 1.2 @integration (agent) exercise browser PKCE/callback/token exchange, device pacing and cancellation using real local HTTP -> 14 native auth cases passed within the 54-case connector suite, including exact PKCE/form exchange, invalid callbacks, busy ports, polling, expiry and cancellation, /tmp/kuru-native-auth-connectors.log.
+- [x] 1.3 @runtime (agent) exercise private files, concurrent token refresh, rejected rotation, relogin and logout -> actual private files and HTTP fixtures passed concurrent six-manager single rotation, missing-access rejection, destroyed caller runtime, fresh/existing browser and device logout fencing, unsafe records and changed locks; the 54-case connector suite passed in 4.78 seconds, /tmp/kuru-native-auth-connectors.log.
+- [ ] 1.4 @manual (human) complete native browser login and one Kuru conversation after the tested build is ready -> user-participating OpenAI access observed separately from fixture results without inspecting credential files.
+
+## 2. Working OpenAI requests [critical]
+
+- [x] 2.1 @integration (agent) drive direct subscription SSE and API-key JSON through local HTTP fixtures -> the 54-case connector suite passed exact routes/headers, future model/effort discovery, native tool continuation, bounded partial/error streams, single refresh and same-actor cancellation recovery. Actual macOS installed and updated binaries completed API catalog and conversation requests with synthetic Bearer credentials and empty PATH, /tmp/kuru-native-auth-installed.log.
+- [x] 2.2 @regression (agent) exercise existing provider/config selections and missing/rejected credentials -> 24 core tests and four native CLI regressions passed, including actionable removed codex_command; connector cases reject account/session changes and repeated 401 without billing fallback. Logs: /tmp/kuru-openai-correction-core-tests.log, /tmp/kuru-native-auth-connectors.log, /tmp/kuru-native-auth-installed.log.
+
+## 3. Finish the Dolt and portability PR [critical]
+
+- [ ] 3.1 @e2e (agent) run actual native installed/update acceptance and isolated auth/API checks on the five existing targets -> complete Kuru works without a separate harness and existing Dolt, archive and updater checks pass.
+- [ ] 3.2 @integration (agent) run granular mise/hk/native CI including the remaining Windows memory connection case -> recorded checks pass with at least 90% meaningful coverage; no repeated platform static categories or runtime evals added.
+- [x] 3.3 @manual (agent) review docs, pins and final diff -> docs build, format, lint and public links/anchors passed in /tmp/kuru-native-auth-docs.log; Rust Clippy passed in /tmp/kuru-native-auth-lint-final.log. Codex mise tool and all five lock entries are removed; direct crypto/URL dependencies reuse exact existing locked releases. Runtime and Release/Pages sources are unchanged. Windows browser dispatch uses the platform shell handoff; its native execution remains part of CI acceptance.
+
+Native Windows/Linux auth acceptance, final hooks/coverage and the user-participating live check remain pending; local fixture passes do not establish them.

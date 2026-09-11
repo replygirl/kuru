@@ -120,8 +120,6 @@ pub enum Step {
     Raw(&'static str),
     Repeat(usize),
     Sleep(u64),
-    Auth,
-    Exit(i32),
     Eof,
 }
 
@@ -162,8 +160,6 @@ impl StdioFixture {
                 Step::Raw(line) => format!("write {line}\n"),
                 Step::Repeat(count) => format!("repeat {count}\n"),
                 Step::Sleep(milliseconds) => format!("sleep {milliseconds}\n"),
-                Step::Auth => "auth\n".into(),
-                Step::Exit(code) => format!("exit {code}\n"),
                 Step::Eof => "eof\n".into(),
             })
             .collect();

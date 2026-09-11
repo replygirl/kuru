@@ -29,6 +29,7 @@ rusqlite = { version = "=0.40.2", features = ["bundled", "backup"] }
 sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "mysql"] }
 uuid = { version = "=1.26.1", features = ["v4", "v5", "serde"] }
 sha2 = "=0.11.0"
+getrandom = "=0.4.3"
 tokio = { version = "=1.53.1", features = ["full"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
 futures = "=0.3.34"

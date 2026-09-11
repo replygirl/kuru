@@ -51,7 +51,6 @@ also pins the native API bindings, strict ZIP codec and ConPTY test driver below
 | Tool | Stable pin |
 | --- | --- |
 | `rust` | `1.98.1` |
-| Codex (optional live-provider transport) | `0.153.4` |
 | `github:aligned-team/cospec` | `0.7.1` |
 | `aqua:jdx/hk` | `1.58.1` |
 | `aqua:tamasfe/taplo` | `0.10.0` |
@@ -105,8 +104,8 @@ Ratatui enables only its Crossterm 0.29 backend and layout cache. Disabling
 unused default widgets/backends removed the older optional termwiz/sha2 and
 pinned generic-array chain from the lockfile.
 
-Codex remains pinned at 0.153.4 for development and live provider verification.
-[0.154.0](https://github.com/openai/codex/releases/tag/rust-v0.154.0) is available;
-its update belongs to the bundled-provider change, which includes native archive,
-protocol and authentication acceptance. Offline demo and Responses operation do
-not require Codex.
+OpenAI authentication and model requests use Kuru's Rust connector package and
+the existing HTTP, cryptography and private-filesystem dependencies. Codex CLI
+and app-server are no longer runtime or development-tool prerequisites for
+these providers. No separate harness is installed or bundled. Node and npm
+remain scoped to the documentation app.

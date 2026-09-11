@@ -26,8 +26,8 @@ type ChildStdin = Pipe;
 #[cfg(windows)]
 type ChildStdout = Pipe;
 
-/// One serial JSON-RPC connection. Independent actors use independent Codex
-/// connections; MCP sessions serialize their own calls under a mutex.
+/// One serial JSON-RPC connection. MCP sessions serialize their own calls under
+/// a mutex and retain notifications until their session owner consumes them.
 pub(crate) struct Rpc {
     child: Child,
     #[cfg(unix)]
@@ -98,6 +98,7 @@ impl Rpc {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn read(&mut self) -> Result<Value> {
         if let Some(event) = self.events.pop_front() {
             return Ok(event);

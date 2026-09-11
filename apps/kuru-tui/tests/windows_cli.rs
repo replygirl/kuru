@@ -328,49 +328,6 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
 }
 
 #[test]
-fn all_authentication_actions_use_the_native_provider_command_without_token_access() {
-    let root = tempfile::tempdir().unwrap();
-    let tools = root.path().join("tools");
-    fs::create_dir(&tools).unwrap();
-    fs::copy(
-        env!("CARGO_BIN_EXE_kuru-cli-windows-fixture"),
-        tools.join("codex.exe"),
-    )
-    .unwrap();
-    let project = root.path().join("workspace");
-    fs::create_dir(&project).unwrap();
-    let binary = Path::new(env!("CARGO_BIN_EXE_kuru"));
-    for arguments in [
-        vec!["login"],
-        vec!["login", "--device"],
-        vec!["auth"],
-        vec!["logout"],
-    ] {
-        success(
-            command(root.path(), binary)
-                .arg("-C")
-                .arg(&project)
-                .args(arguments),
-        );
-    }
-    let actual: Vec<Vec<String>> = fs::read_to_string(root.path().join("actions.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(
-        actual,
-        [
-            vec!["login"],
-            vec!["login", "--device-auth"],
-            vec!["login", "status"],
-            vec!["logout"]
-        ]
-    );
-    assert!(!root.path().join("local/kuru/memory").exists());
-}
-
-#[test]
 fn source_update_builds_through_mise_and_publishes_after_the_trusted_build() {
     let root = tempfile::tempdir().unwrap();
     let tools = root.path().join("tools");

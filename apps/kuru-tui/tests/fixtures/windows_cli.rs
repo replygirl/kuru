@@ -70,9 +70,6 @@ fn main() -> anyhow::Result<()> {
             log.flush()?;
             println!("{}", engine.display());
         }
-        [action] if action == "login" || action == "logout" => {}
-        [action, option]
-            if action == "login" && (option == "status" || option == "--device-auth") => {}
         [directory, _, action, tool]
             if directory == "-C" && action == "install" && tool == "rust" => {}
         [directory, _, action, task, separator, target, triple]

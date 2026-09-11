@@ -42,10 +42,11 @@ Model, effort, and framework selections made here are [saved for the project](./
 | Command                      | Purpose                                                                                   |
 | ---------------------------- | ----------------------------------------------------------------------------------------- |
 | `kuru run "PROMPT"`          | Run a turn without the TUI; add `--json` for structured output                            |
-| `kuru login`                 | Start the supported Codex sign-in flow                                                    |
+| `kuru login`                 | Start browser sign-in for ChatGPT subscription access                                     |
+| `kuru login --no-browser`    | Print the browser sign-in URL for you to open                                             |
 | `kuru login --device`        | Use device authorization                                                                  |
-| `kuru auth`                  | Report authentication status without printing tokens                                      |
-| `kuru logout`                | Sign out through Codex                                                                    |
+| `kuru auth`                  | Print redacted local authentication status as JSON                                        |
+| `kuru logout`                | Clear Kuru's stored ChatGPT credentials                                                   |
 | `kuru models`                | Discover provider models and advertised efforts                                           |
 | `kuru config`                | Print merged configuration with MCP environment values redacted                           |
 | `kuru sessions`              | List saved sessions                                                                       |
@@ -59,6 +60,12 @@ Model, effort, and framework selections made here are [saved for the project](./
 | `kuru update`                | [Install an explicit release or source checkout](/guide/installation#update-deliberately) |
 
 Supply `--resume SESSION_ID` with `dream` or `undo-dream` when targeting a saved conversation.
+
+Authentication commands use Kuru's private store, without a Codex CLI or another
+application's tokens. `auth` does not create credentials or open project memory;
+it is not a live access check. `logout` leaves environment-supplied API keys
+unchanged. For API-key access, set `OPENAI_API_KEY` and select
+`--provider responses --model MODEL_ID`. See [authentication](/guide/authentication).
 
 ## Global options
 

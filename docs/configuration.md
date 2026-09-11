@@ -54,7 +54,6 @@ dream_on_exit = true
 max_parts = 16
 allow_shell = false
 allow_write = false
-codex_command = "codex"
 api_base = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 ```
@@ -76,6 +75,35 @@ embedding model from that catalog.
 `max_parts` must fit the built-in topology and cannot exceed 128.
 `dream_every = 0` disables periodic dreaming; explicit and session-end dreaming
 remain separate. Set `dream_on_exit = false` to disable exit dreaming.
+
+## Authentication
+
+The default `codex` provider uses ChatGPT subscription authentication and direct
+HTTP requests. Run `kuru login` for browser sign-in, `kuru login --no-browser`
+to open the printed URL yourself, or `kuru login --device` for device
+authorization. No Codex executable or app-server is required.
+
+Kuru keeps its credentials in the private `auth/openai` directory under the
+[data directory](#storage-and-authority). Use the same `--data-dir` or
+`KURU_DATA_DIR` selection for login and subsequent commands. The auth store
+must be outside the project tool root. Kuru never imports another application's
+credential store, and tokens do not belong in TOML or project files.
+
+`kuru auth` prints redacted local status without creating credentials or opening
+project memory. It does not prove that a live model request will succeed.
+`kuru logout` clears Kuru's stored ChatGPT credentials; it does not change an
+API key supplied by the environment. Kuru refreshes its own session when needed;
+if refresh fails or its outcome is uncertain, follow the error's sign-in guidance.
+
+The `responses` provider uses the API key from `api_key_env`, which defaults to
+`OPENAI_API_KEY`, and sends requests to `api_base`. These settings apply only
+to API-key requests. ChatGPT credentials use the fixed subscription service
+and are never sent to `api_base`. Provider selection is explicit: a failed
+ChatGPT login or request does not switch to API-key access.
+
+The former `codex_command` option has been removed. Delete it from existing
+configuration and run `kuru login` to establish Kuru's own session. Existing
+`provider = "codex"` selections remain valid.
 
 ## MCP servers
 

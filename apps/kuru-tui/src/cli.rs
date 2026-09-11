@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use kuru_connectors::{AuthAction, Provider, ToolHost, auth, provider};
+use kuru_connectors::{Provider, ToolHost, provider};
 use kuru_core::{Config, Mode, ModelInfo, ProjectPreferences, SelectionOverrides};
 use kuru_memory::{MemoryStore, OpenOptions as MemoryOptions};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
@@ -59,10 +59,13 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Sign in using the supported Codex OpenAI authentication flow.
+    /// Sign in to ChatGPT using native OpenAI authentication.
     Login {
         #[arg(long)]
         device: bool,
+        /// Print the browser URL without opening it automatically.
+        #[arg(long, conflicts_with = "device")]
+        no_browser: bool,
     },
     Logout,
     /// Show authentication status without displaying tokens.
@@ -251,6 +254,21 @@ pub async fn execute(cli: Cli) -> Result<()> {
         .await;
     }
     let (cwd, data, user) = paths(&cli)?;
+    if matches!(
+        cli.command,
+        Some(Command::Login { .. } | Command::Logout | Command::Auth)
+    ) {
+        let config = Config::load(user.as_deref(), &cwd, cli.config.as_deref())?;
+        return crate::authentication::run(
+            cli.command
+                .as_ref()
+                .expect("matched authentication command"),
+            &config,
+            &data,
+            &cwd,
+        )
+        .await;
+    }
     let scope = kuru_runtime::project_scope(&cwd)?;
     let memory_config = Config::load_memory(user.as_deref(), &cwd, cli.config.as_deref())?;
     let writer = matches!(
@@ -297,14 +315,6 @@ pub async fn execute(cli: Cli) -> Result<()> {
         };
         let mut config = effective_config(&cli, &cwd, user.as_deref(), &preferences)?;
         match &cli.command {
-            Some(Command::Login { device: true }) => {
-                return auth(&config.codex_command, AuthAction::DeviceLogin).await;
-            }
-            Some(Command::Login { device: false }) => {
-                return auth(&config.codex_command, AuthAction::Login).await;
-            }
-            Some(Command::Logout) => return auth(&config.codex_command, AuthAction::Logout).await,
-            Some(Command::Auth) => return auth(&config.codex_command, AuthAction::Status).await,
             Some(Command::Config) => {
                 let mut visible = config.clone();
                 for server in visible.mcp.values_mut() {
@@ -368,7 +378,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             }
             _ => {}
         }
-        let provider = provider(&config, &cwd)?;
+        let provider = provider(&config, &cwd, &data).await?;
         if matches!(cli.command, Some(Command::Models)) {
             println!(
                 "{}",
