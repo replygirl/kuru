@@ -211,6 +211,26 @@ runtime caches and no external developer tools. Preserve existing release SHA,
 checksums, strategy-only dispatch, recovery and final Pages topology. Do not add
 a second installer or a first-run dependency download as a size workaround.
 
+Existing installations cross the size-limit boundary through the same documented
+bootstrap or mise installation route. The published v0.1.0 Unix updater enforces
+128 MiB before installing a candidate; changing the new executable's constant
+cannot change that old validator. The current pre-bundle Windows helper has the
+same cap, but v0.1.0 did not publish a Windows executable. Document this version
+boundary and verify the real old-to-new installer path, including preservation of
+the old executable when its updater rejects an oversized candidate and retention
+of conversation data across reinstallation. Do not claim that a new-to-new update
+proves this transition. This uses the existing installer and does not require a
+bridge release or authorize a release dispatch. Retained published-source
+evidence: `/tmp/kuru-v0.1.0-archive.rs` and
+`/tmp/kuru-current-release-inventory.json`.
+
+The larger embedded image must also pass the actual Windows packaged and source
+update paths within the existing ten-second acknowledgment budget. Preserve
+independent hashes, file identities, durable receipts, cleanup and normal helper
+profile collection. The measured development SHA-2 optimization supports this
+work but does not predict the timing of the full Codex-bearing image; record
+that native result separately.
+
 ## Operational surface
 
 The client runs as a local owned subprocess; app-server uses the existing stdio
