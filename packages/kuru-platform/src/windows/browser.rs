@@ -20,7 +20,7 @@ pub async fn open_http_url(url: &str) -> io::Result<()> {
 }
 
 // Only the validated public boundary calls this in production. Native tests
-// also use an unregistered fixture scheme, without changing any associations.
+// also use an absent private executable, without changing any associations.
 async fn open_target(url: Vec<u16>) -> io::Result<()> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -167,16 +167,25 @@ fn handoff(url: &[u16]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
-        Foundation::{ERROR_NO_ASSOCIATION, RPC_E_CHANGED_MODE, S_FALSE, S_OK},
+        Foundation::{ERROR_FILE_NOT_FOUND, RPC_E_CHANGED_MODE, S_FALSE, S_OK},
         System::Com::COINIT_MULTITHREADED,
     };
 
-    fn unregistered_url() -> Vec<u16> {
-        format!("kuru-fixture-{}://handoff", uuid::Uuid::new_v4())
-            .encode_utf16()
+    fn missing_executable() -> (tempfile::TempDir, Vec<u16>) {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing.exe");
+        assert!(!missing.exists());
+        // Unknown URI schemes did not reliably fail in native Windows CI.
+        // A missing executable under an existing fixture directory exercises
+        // the documented file-not-found path without launching a handler.
+        let wide = missing
+            .as_os_str()
+            .encode_wide()
             .chain(std::iter::once(0))
-            .collect()
+            .collect();
+        (root, wide)
     }
 
     // Real COM calls must run on one fresh OS thread. A stuck native dispatch
@@ -211,16 +220,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregistered_desktop_dispatch_reports_the_actual_native_failure() {
-        let error = open_target(unregistered_url()).await.unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(ERROR_NO_ASSOCIATION as i32));
+    async fn missing_desktop_target_reports_the_actual_native_failure() {
+        let (_root, target) = missing_executable();
+        let error = open_target(target).await.unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_FILE_NOT_FOUND as i32));
     }
 
     #[tokio::test]
     async fn failed_desktop_dispatch_releases_its_sta_apartment() {
         on_fresh_thread(|| {
-            let error = handoff(&unregistered_url()).unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(ERROR_NO_ASSOCIATION as i32));
+            let (_root, target) = missing_executable();
+            let error = handoff(&target).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(ERROR_FILE_NOT_FOUND as i32));
             let (result, _release) = initialize_mta();
             // A leaked STA reference would make the actual mode change fail.
             assert_eq!(result, S_OK);
@@ -233,7 +244,8 @@ mod tests {
         on_fresh_thread(|| {
             let (initial, _first_release) = initialize_mta();
             assert_eq!(initial, S_OK);
-            let error = handoff(&unregistered_url()).unwrap_err();
+            let (_root, target) = missing_executable();
+            let error = handoff(&target).unwrap_err();
             assert_eq!(
                 error.to_string(),
                 format!("initialize browser COM apartment: HRESULT {RPC_E_CHANGED_MODE:#x}")
