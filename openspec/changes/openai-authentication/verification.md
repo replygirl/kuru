@@ -22,6 +22,9 @@ The user-participating live check and five-target native installed/update checks
 passed. CI 34612890798 recorded Windows workspace coverage of 19061/20227
 (94.235428%), platform coverage of 2904/3178 (91.378225%), Ubuntu coverage of
 15535/16058 (96.743056%) and macOS ARM coverage of 15546/16069 (96.745286%).
-Its shell test used observation callbacks. The later local plain-source shell
-correction requires its own native pass before final hooks/CI closure and archive;
-the existing successful run does not establish that later fixture's acceptance.
+Its shell test used observation callbacks. The original plain source then passed
+in CI 34617836357, Windows log line 605. That run's only failing case was delivery's
+immediate post-cleanup lock acquisition; all preceding owned cleanup and captured
+output assertions passed. The windows-command-lock-release test correction awaits
+native confirmation before final hooks/CI closure and archive. Windows workspace
+coverage and later shipping steps were skipped in that failed run.

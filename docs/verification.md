@@ -27,11 +27,14 @@ and COM cleanup. Source installation, missing/corrupt offline build-input contro
 installed offline conversations and self-update, and shipping Kuru/Dolt DLL
 inspection passed. Ubuntu and macOS ARM workspace coverage exceeded 96%.
 
-That run's shell case used temporary lookup observers. The later correction
-restores the original unobserved request and keeps Core tracing only after a
-failure. Its native confirmation remains pending; a wrapped-source pass does not
-establish the original cold command's behavior. The updater correction is archived
-with its actual native evidence; final PR closure awaits the plain shell check.
+That run's shell case used temporary lookup observers. The original unobserved
+request subsequently passed in [CI at 227dc82](https://github.com/replygirl/kuru/actions/runs/34617836357).
+Its only Windows failure was the delivery test's immediate lock reacquisition
+after successful owned cleanup; Windows permits deferred lock release. A bounded
+test-only observation corrects that assumption and awaits native confirmation.
+That failed run skipped Windows workspace coverage and later shipping steps;
+the earlier successful shipping evidence above remains separate. The updater
+and plain shell corrections are archived with their actual native evidence.
 
 ## Native delivery and public documentation (2026-09-09)
 
