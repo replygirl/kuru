@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, SlavePty};
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -12,16 +12,95 @@ pub const READY: Duration = Duration::from_secs(10);
 const TICK: Duration = Duration::from_millis(20);
 const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 
+pub fn composer_frame_ready(screen: &vt100::Screen, draft: &str) -> bool {
+    let cursor = screen.cursor_position();
+    // contents() joins autowrapped rows into logical lines. ConPTY emits those
+    // wraps while painting its grid, so cursor coordinates require real rows.
+    screen
+        .rows(0, screen.size().1)
+        .enumerate()
+        .any(|(row, line)| {
+            line.find(draft).is_some_and(|byte| {
+                let col: usize = line[..byte + draft.len()]
+                    .chars()
+                    .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+                    .sum();
+                cursor == (row as u16, col as u16) && !screen.hide_cursor()
+            })
+        })
+}
+
 pub struct Terminal {
     child: Box<dyn Child + Send + Sync>,
-    master: Option<Box<dyn MasterPty + Send>>,
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
-    reader: Option<JoinHandle<()>>,
+    console: Console,
     receive: mpsc::Receiver<std::io::Result<Vec<u8>>>,
     parser: vt100::Parser,
     pub output: Vec<u8>,
     directory: PathBuf,
     sequence: usize,
+}
+
+// Also guards construction errors before a Terminal/child exists. No remaining
+// console owner may reach a synchronous native destructor on the test thread.
+struct Console {
+    master: Option<Box<dyn MasterPty + Send>>,
+    slave: Option<Box<dyn SlavePty + Send>>,
+    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    reader: Option<JoinHandle<()>>,
+    closing: Vec<JoinHandle<()>>,
+    directory: PathBuf,
+}
+
+impl Console {
+    fn close(&mut self, timeout: Duration) -> Result<()> {
+        let writer = self.writer.take();
+        let master = self.master.take();
+        let slave = self.slave.take();
+        if writer.is_some() || master.is_some() || slave.is_some() {
+            // The output pump owns its reader and DSR writer independently.
+            // Keep it alive throughout ClosePseudoConsole, including on errors.
+            self.closing.push(std::thread::spawn(move || {
+                drop(writer);
+                drop(slave);
+                drop(master);
+            }));
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let reader_done = self.reader.as_ref().is_none_or(JoinHandle::is_finished);
+            let close_done = self.closing.iter().all(JoinHandle::is_finished);
+            if reader_done && close_done {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "ConPTY cleanup remains unproven at {}: reader_done={reader_done}, close_done={close_done}",
+                self.directory.display()
+            );
+            std::thread::sleep(TICK);
+        }
+        for closing in self.closing.drain(..) {
+            closing
+                .join()
+                .map_err(|_| anyhow::anyhow!("ConPTY close thread panicked"))?;
+        }
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("ConPTY reader thread panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Console {
+    fn drop(&mut self) {
+        if let Err(error) = self.close(Duration::from_secs(5)) {
+            // Workers retain the actual resources until native close completes.
+            // Dropping their JoinHandles neither blocks nor proves completion.
+            eprintln!("{error:#}");
+        }
+    }
 }
 
 impl Terminal {
@@ -34,6 +113,14 @@ impl Terminal {
             pixel_width: 0,
             pixel_height: 0,
         })?;
+        let mut console = Console {
+            master: Some(pair.master),
+            slave: Some(pair.slave),
+            writer: None,
+            reader: None,
+            closing: Vec::new(),
+            directory: directory.into(),
+        };
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_kuru-terminal-windows-fixture"));
         command.arg(directory);
         command.cwd(directory);
@@ -44,11 +131,13 @@ impl Terminal {
             }
         }
         command.env("TERM", "xterm-256color");
-        let mut input = pair.master.try_clone_reader()?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let master = console.master.as_ref().context("console master")?;
+        let mut input = master.try_clone_reader()?;
+        let writer = Arc::new(Mutex::new(master.take_writer()?));
+        console.writer = Some(writer.clone());
         let replies = writer.clone();
         let (send, receive) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
+        console.reader = Some(std::thread::spawn(move || {
             let mut total = 0usize;
             let mut tail = Vec::new();
             loop {
@@ -92,17 +181,19 @@ impl Terminal {
                     }
                 }
             }
-        });
+        }));
         // Every test in this binary holds its async SERIAL lock for the whole
         // scenario; no ordinary spawn overlaps this one ConPTY creation. The
         // output pump is already live for the inherited-cursor handshake.
-        let child = pair.slave.spawn_command(command)?;
-        drop(pair.slave);
+        let child = console
+            .slave
+            .as_ref()
+            .context("console slave")?
+            .spawn_command(command)?;
+        drop(console.slave.take());
         Ok(Self {
             child,
-            master: Some(pair.master),
-            writer: Some(writer),
-            reader: Some(reader),
+            console,
             receive,
             parser: vt100::Parser::new(rows, cols, 0),
             output: Vec::new(),
@@ -113,6 +204,20 @@ impl Terminal {
 
     pub fn screen(&self) -> String {
         self.parser.screen().contents()
+    }
+
+    /// Observe the real master destructor without replacing native ConPTY I/O.
+    pub fn wrap_master(
+        &mut self,
+        wrap: impl FnOnce(Box<dyn MasterPty + Send>) -> Box<dyn MasterPty + Send>,
+    ) -> Result<()> {
+        let master = self
+            .console
+            .master
+            .take()
+            .context("console already closed")?;
+        self.console.master = Some(wrap(master));
+        Ok(())
     }
 
     pub fn read_for(&mut self, duration: Duration) -> Result<()> {
@@ -172,6 +277,7 @@ impl Terminal {
 
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
         let mut writer = self
+            .console
             .writer
             .as_ref()
             .context("terminal input is closed")?
@@ -199,18 +305,17 @@ impl Terminal {
     }
 
     pub fn composer(&mut self, draft: &str) -> Result<()> {
-        self.wait("completed visible composer cursor", READY, |terminal| {
-            let screen = terminal.screen();
-            let cursor = terminal.parser.screen().cursor_position();
-            screen.lines().enumerate().any(|(row, line)| {
-                line.find(draft).is_some_and(|byte| {
-                    let col: usize = line[..byte + draft.len()]
-                        .chars()
-                        .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
-                        .sum();
-                    cursor == (row as u16, col as u16) && !terminal.parser.screen().hide_cursor()
-                })
-            })
+        self.wait(
+            &format!("completed visible composer cursor after {draft:?}"),
+            READY,
+            |terminal| composer_frame_ready(terminal.parser.screen(), draft),
+        )
+        .with_context(|| {
+            format!(
+                "native cursor {:?}, hidden={}",
+                self.parser.screen().cursor_position(),
+                self.parser.screen().hide_cursor()
+            )
         })
     }
 
@@ -226,7 +331,8 @@ impl Terminal {
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
-        self.master
+        self.console
+            .master
             .as_ref()
             .context("terminal closed")?
             .resize(PtySize {
@@ -273,36 +379,8 @@ impl Terminal {
     }
 
     fn close_output(&mut self, timeout: Duration) -> Result<()> {
-        let writer = self.writer.take();
-        let master = self.master.take();
-        let reader = self
-            .reader
-            .take()
-            .context("console reader already closed")?;
-        // ClosePseudoConsole can wait for output consumption. Keep the reader
-        // live while closing, and bound the observer's wait for both owners.
-        let closing = std::thread::spawn(move || {
-            drop(writer);
-            drop(master);
-        });
-        let deadline = Instant::now() + timeout;
-        while !reader.is_finished() || !closing.is_finished() {
-            self.read_for(TICK)?;
-            ensure!(
-                Instant::now() < deadline,
-                "ConPTY cleanup timed out: reader_done={}, close_done={}\n{}",
-                reader.is_finished(),
-                closing.is_finished(),
-                self.screen()
-            );
-        }
-        closing
-            .join()
-            .map_err(|_| anyhow::anyhow!("ConPTY close thread panicked"))?;
-        reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("ConPTY reader thread panicked"))?;
-        Ok(())
+        self.console.close(timeout)?;
+        self.read_for(TICK)
     }
 }
 
@@ -314,16 +392,12 @@ impl Drop for Terminal {
             while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 std::thread::sleep(TICK);
             }
-        }
-        self.writer.take();
-        self.master.take();
-        if let Some(reader) = self.reader.take() {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !reader.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(TICK);
-            }
-            if reader.is_finished() {
-                let _ = reader.join();
+            if self.child.try_wait().ok().flatten().is_none() {
+                eprintln!(
+                    "ConPTY child cleanup remains unproven at {}\n{}",
+                    self.directory.display(),
+                    self.screen()
+                );
             }
         }
     }

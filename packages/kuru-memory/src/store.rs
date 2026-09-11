@@ -26,7 +26,7 @@ use crate::{
 #[path = "store/recovery_tests.rs"]
 mod recovery_tests;
 
-const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTHOR: &str = "Kuru <memory@kuru.local>";
 
 #[derive(Clone, Debug)]

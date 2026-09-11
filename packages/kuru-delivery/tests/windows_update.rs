@@ -19,6 +19,55 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+#[tokio::test]
+async fn trusted_helper_stderr_preserves_eof_error_and_drains_past_prefix_limit() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    for bytes in [1024, 256 * 1024] {
+        let mut spec = NativeSpawnSpec::new(
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru-delivery-fixture")),
+            root.path().to_owned(),
+        );
+        spec.args = vec!["helper-stderr".into(), bytes.to_string().into()];
+        spec.stderr = Stdio::Pipe;
+        spec.stdout = Stdio::Pipe;
+        let mut child = spec.spawn().await?;
+        let mut output = child.take_stdout().context("native completion pipe")?;
+        let captured = tokio::time::timeout(
+            TIMEOUT,
+            kuru_delivery::update::test_support::capture_stderr(&mut child),
+        )
+        .await;
+        if captured.is_err() {
+            child.terminate()?;
+        }
+        let status = child.wait(TIMEOUT).await?;
+        let captured = captured.context("native stderr drain timed out")??;
+        let mut completion = Vec::new();
+        let read = tokio::time::timeout(
+            TIMEOUT,
+            (&mut output).take(128).read_to_end(&mut completion),
+        )
+        .await;
+        output.close(TIMEOUT).await?;
+        read.context("native completion read timed out")??;
+        ensure!(
+            completion == b"stderr fully written\n",
+            "stderr closed before the fixture finished its full write: {completion:?}"
+        );
+        ensure!(!status.success(), "fixture error unexpectedly succeeded");
+        ensure!(captured.starts_with("native helper diagnostic prefix\n"));
+        if bytes < 64 * 1024 {
+            ensure!(
+                captured.contains("native helper diagnostic final error"),
+                "missing EOF error: {captured}"
+            );
+        } else {
+            ensure!(captured.len() == 64 * 1024, "diagnostic prefix cap changed");
+        }
+    }
+    Ok(())
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     directory: PathBuf,

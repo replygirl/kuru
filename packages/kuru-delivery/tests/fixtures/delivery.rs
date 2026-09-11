@@ -38,6 +38,22 @@ async fn main() -> io::Result<()> {
                 .ok_or_else(|| io::Error::other("missing marker path"))?;
             std::fs::write(path, b"candidate executed")?;
         }
+        #[cfg(windows)]
+        Some("helper-stderr") => {
+            let count: usize = arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value <= 256 * 1024)
+                .ok_or_else(|| io::Error::other("invalid stderr fixture count"))?;
+            io::stderr().write_all(b"native helper diagnostic prefix\n")?;
+            for _ in 0..count.div_ceil(1024) {
+                io::stderr().write_all(&[b'x'; 1024])?;
+            }
+            io::stdout().write_all(b"stderr fully written\n")?;
+            io::stdout().flush()?;
+            return Err(io::Error::other("native helper diagnostic final error"));
+        }
         Some("check-hook-env") => {
             for (name, value) in [
                 ("GIT_SSH_COMMAND", "fixture-ssh"),

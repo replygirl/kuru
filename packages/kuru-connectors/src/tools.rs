@@ -428,7 +428,7 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
 #[cfg(windows)]
 async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String> {
     use base64::Engine;
-    use kuru_platform::windows::process::{NativeSpawnSpec, Stdio, system_directory};
+    use kuru_platform::windows::process::{Stdio, configured_command, system_directory};
     ensure!(!command.trim().is_empty(), "shell command is empty");
     // This is deliberately authorized PowerShell source, not command argv.
     // Stock Windows PowerShell accepts UTF-16LE source; its actual exit status
@@ -441,11 +441,7 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
         "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
     );
     let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut spec = NativeSpawnSpec::new(
-        system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe"),
-        root.to_path_buf(),
-    );
-    spec.args = [
+    let mut args: Vec<std::ffi::OsString> = [
         "-NoLogo",
         "-NoProfile",
         "-NonInteractive",
@@ -455,12 +451,20 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
     ]
     .map(Into::into)
     .into();
-    spec.args.push(
+    args.push(
         base64::engine::general_purpose::STANDARD
             .encode(bytes)
             .into(),
     );
-    spec.environment = std::env::vars_os().collect();
+    // Use the same identity-checked launch spelling as other configured native
+    // commands. PowerShell's .NET file APIs cannot use an introduced verbatim cwd.
+    let program = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
+    let mut spec = configured_command(
+        program.as_os_str(),
+        &args,
+        root,
+        std::env::vars_os().collect(),
+    )?;
     spec.stdout = Stdio::Pipe;
     spec.stderr = Stdio::Pipe;
     let mut child = spec

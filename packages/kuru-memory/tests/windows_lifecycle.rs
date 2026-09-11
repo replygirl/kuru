@@ -307,7 +307,11 @@ async fn marker_interruption(after_marker: bool, kill_creator: bool) -> Result<(
             );
             let mut bytes = vec![0; length];
             channel.read_exact(&mut bytes).await?;
-            Ok::<_, anyhow::Error>(serde_json::from_slice(&bytes)?)
+            let message: test_support::windows::ReadyMarkerMessage =
+                serde_json::from_slice(&bytes)?;
+            message
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("{mode} failed before its ready-marker observation"))
         })
         .await??;
     assert_eq!(observed.after_marker, after_marker);
@@ -498,6 +502,78 @@ async fn marker_observer_eof_awaits_cleanup_without_stranding_the_release_channe
     for after_marker in [false, true] {
         marker_interruption(after_marker, false).await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn marker_startup_failure_reports_its_actual_cause_and_releases_the_writer() -> Result<()> {
+    let mut owner = Fixture::new()?;
+    let binary = provision::provision(&Default::default(), &test_support::cache_dir()).await?;
+    let options = test_support::windows::ready_marker_options(
+        owner.path(),
+        binary.clone(),
+        env!("CARGO_BIN_EXE_kuru-memory-parent-fixture").into(),
+    );
+    marker_seed(&options)?;
+    let source = options.data_dir.join("memory.sqlite3");
+    let database = rusqlite::Connection::open(&source)?;
+    database.pragma_update(None, "user_version", 99)?;
+    database.close().map_err(|(_, error)| error)?;
+    let rejected = std::fs::read(&source)?;
+    spawn_fixture(
+        &mut owner,
+        &binary,
+        Lifetime::TrustedSupervisor,
+        "marker-before",
+    )
+    .await?;
+    let message: test_support::windows::ReadyMarkerMessage =
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let channel = owner.channel.as_mut().unwrap();
+            let length = channel.read_u32().await? as usize;
+            ensure!(
+                length > 0 && length <= 16 * 1024,
+                "invalid startup failure frame"
+            );
+            let mut bytes = vec![0; length];
+            channel.read_exact(&mut bytes).await?;
+            Ok::<_, anyhow::Error>(serde_json::from_slice(&bytes)?)
+        })
+        .await??;
+    let error = message.unwrap_err();
+    assert!(
+        error.contains("unsupported legacy memory schema version 99"),
+        "{error}"
+    );
+    assert!(
+        !owner
+            .child
+            .as_mut()
+            .unwrap()
+            .wait(Duration::from_secs(15))
+            .await?
+            .success()
+    );
+    owner
+        .channel
+        .as_mut()
+        .unwrap()
+        .close(Duration::from_secs(3))
+        .await?;
+    assert_eq!(std::fs::read(&source)?, rejected);
+    let database = rusqlite::Connection::open(&source)?;
+    database.pragma_update(None, "user_version", 1)?;
+    database.close().map_err(|(_, error)| error)?;
+    let recovered = kuru_memory::MemoryStore::open(options).await?;
+    assert_eq!(
+        recovered
+            .history(&format!("project/{}/transcript", "6".repeat(64)), 20)
+            .await?
+            .len(),
+        2
+    );
+    recovered.close().await?;
+    owner.descendants_stopped = true;
     Ok(())
 }
 

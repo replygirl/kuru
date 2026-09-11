@@ -402,3 +402,85 @@ original archive hashes and installed executable hashes are required; no nested
 Cargo test or extra static-analysis job was added. Source review, formatting,
 actionlint and cospec validation passed. Actual Windows invocation is pending;
 no local PowerShell interpreter was available for native execution.
+
+## Complete native run after 627edee
+
+CI run `34545817609` at `627edee5d10ff99f303d0e024c729e3124550b3a`
+completed with all seven static categories, all four Unix native jobs and the
+Windows primitives passing. The full Windows instrumented suite completed with
+363 passing cases, 21 failures and one intentionally ignored profiling case;
+ten targets failed. Its required aggregate failed, and subsequent Windows
+coverage publication, source installation, offline Cargo-input rejection,
+installed shipping-runtime and PE-import checks did not run. Compilation took
+7 minutes 13 seconds; the complete coverage/preparation step took 2,681.87
+seconds. Completion with failures is not evidence of a hung job.
+
+The actual Windows passes include all 54 platform cases, 29 connector units and
+five native connector cases, 31 memory units, ConPTY cancellation and independent
+console restoration, pre-configuration creator loss, both marker-kill scenarios,
+Graceful real-Dolt shutdown and Forced stubborn-adapter shutdown. Primitive
+coverage was 2,602/2,865 lines (90.8202%). Full Windows coverage and consumer
+acceptance remain open despite these component passes.
+
+Ubuntu workspace coverage was 14,299/14,725 lines (97.1070%) and macOS arm64 was
+14,314/14,736 (97.1363%); both source installation and installed offline-runtime
+checks passed. Linux arm64 and Intel macOS passed their real memory and packaged
+offline-runtime checks. Logs and LCOV artifacts are retained under
+`/tmp/kuru-windows-627edee-*`, including the full Windows log and failure index.
+
+The failures distinguish production defects from fixture defects: memory
+bootstrap/query failures, PowerShell/.NET working-directory spelling, updater
+handoff and recovery, mise command lookup, physical ConPTY cursor coordinates,
+and archive/ACL diagnostic and sharing assertions. Corrections are being
+validated separately. No native acceptance row is satisfied by their source
+changes or by a local host test; a new native run must demonstrate the resulting
+behavior.
+
+The common memory correction was demonstrated against actual Dolt on macOS:
+the unchanged six-second SQL query failed after 5.001108125 seconds with the
+old five-second listener timer, then passed in 7.66 seconds including startup
+and close. Dolt's result-iterator timer now derives from the greater of the
+configured startup limit and the existing 30-second query budget. Caller
+deadlines, write timeout, cancellation and shutdown are unchanged. Six existing
+timeout, cancellation, session-teardown and archive controls and strict host
+Clippy passed. Static bootstrap-phase diagnostics and bounded marker-fixture
+startup-result frames expose any remaining distinct failures. The native schema
+rejection/recovery and raw traversal-input regressions still require Windows.
+Evidence: `/tmp/kuru-native-memory-627-fixes.md`.
+
+The connector shell now uses the established checked Windows command adapter,
+which retains trusted PowerShell selection and permits an ordinary cwd spelling
+only after its exact canonical round-trip. The regression performs the real
+.NET file write in a spaced Unicode directory and checks its bytes as well as
+stdout, stderr and status. Independent source review passed; the new path has
+not run natively. Evidence: `/tmp/kuru-windows-shell-review.md`.
+
+ConPTY composer checks now use physical `Screen::rows`, since logical contents
+join autowrapped rows. An isolated probe of the old predicate failed and the
+corrected predicate passed, including partial, hidden and misplaced cursor
+controls. The fixture also gives normal and error teardown the same bounded
+console owner, with a native delayed-close regression. This separate cleanup
+gap is not established as a cause of the completed Windows 2025 failure.
+Formatting passed; actual new ConPTY execution remains pending. Evidence:
+`/tmp/kuru-conpty-cleanup-correction.md`.
+
+Delivery recovery preserves the validated receipt's helper launch spelling,
+with existing normalized ACL checks, full file identity, checksum and strict
+loaded-image validation intact. Its corruption fixture reads the retained
+source through a same-identity movable view beneath the pinned cache so its
+own handle does not prohibit the intended rename. Stock PowerShell diagnostic
+assertions retain the exact required words across output wrapping. The isolated
+mise environment now supplies conventional PATHEXT; a real missing-PATHEXT
+control precedes successful activation checks. Independent source review
+passed after correcting one remaining wrapped-diagnostic assertion.
+
+Application updater handoff is still unresolved. Phase-specific errors and a
+continuously drained, bounded helper stderr prefix now distinguish connection,
+request, publication and helper-exit outcomes. An observed exit drains buffered
+errors to EOF; an unobserved exit preserves the private candidate stage instead
+of deleting a possible live source. No updater timeout or identity/hash rule
+changed. A native compiled fixture checks output beyond the capture cap and
+final error retention. Integrated formatting, 102 delivery host tests and strict
+host lint passed; these Windows-only cases require the next native run.
+Evidence: `/tmp/kuru-native-delivery-627-fixes.md` and
+`/tmp/kuru-delivery-path-review.md`.

@@ -30,6 +30,12 @@ impl Stage {
         self.remove()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn keep(mut self) -> std::path::PathBuf {
+        let directory = self.directory.take().expect("owned stage has not finished");
+        directory.path().to_owned()
+    }
+
     fn remove(&mut self) -> Result<()> {
         let Some(held) = &self.directory else {
             return Ok(());

@@ -8,6 +8,43 @@ use std::{ffi::OsString, path::Path, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub use crate::store::marker_fixture::ReadyMarkerObservation;
+pub type ReadyMarkerMessage = std::result::Result<ReadyMarkerObservation, String>;
+
+async fn write_marker_message(observer: &mut Pipe, message: &ReadyMarkerMessage) -> Result<()> {
+    let bytes = serde_json::to_vec(message)?;
+    ensure!(
+        bytes.len() <= 16 * 1024,
+        "marker observation exceeds frame bound"
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        observer.write_u32(bytes.len().try_into()?).await?;
+        observer.write_all(&bytes).await?;
+        observer.flush().await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("marker observation transfer deadline exceeded")?
+}
+
+async fn report_marker_startup(
+    observer: &mut Pipe,
+    result: Result<crate::MemoryStore>,
+) -> Result<()> {
+    let error = match result {
+        Err(error) => error,
+        Ok(store) => match store.close().await {
+            Err(error) => error,
+            Ok(()) => {
+                anyhow::anyhow!("initialization completed without the requested marker observation")
+            }
+        },
+    };
+    // Preserve the actual initialization failure instead of an unexplained
+    // transport EOF. All startup/close cleanup above has already been awaited.
+    let bounded = format!("{error:#}").chars().take(2048).collect();
+    write_marker_message(observer, &Err(bounded)).await?;
+    Err(error)
+}
 
 pub fn ready_marker_options(
     root: &Path,
@@ -37,22 +74,15 @@ pub async fn ready_marker(
     tokio::pin!(opening);
     let observed = tokio::select! {
         result = &mut opening => {
-            let store = result?;
-            store.close().await?;
-            anyhow::bail!("initialization completed without the requested marker observation");
+            return report_marker_startup(observer, result).await;
         }
-        observed = observation => observed,
+        observed = observation => match observed {
+            Ok(observed) => observed,
+            Err(_) => return report_marker_startup(observer, opening.await).await,
+        },
     };
     let interaction = tokio::time::timeout(Duration::from_secs(40), async {
-        let observed = observed.context("initialization lost its marker observer")?;
-        let bytes = serde_json::to_vec(&observed)?;
-        ensure!(
-            bytes.len() <= 16 * 1024,
-            "marker observation exceeds frame bound"
-        );
-        observer.write_u32(bytes.len().try_into()?).await?;
-        observer.write_all(&bytes).await?;
-        observer.flush().await?;
+        write_marker_message(observer, &Ok(observed)).await?;
         let command = observer
             .read_u8()
             .await

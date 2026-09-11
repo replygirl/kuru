@@ -143,6 +143,8 @@ impl Fixture {
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
+                "-OutputFormat",
+                "Text",
                 "-EncodedCommand",
             ])
             .arg(base64::engine::general_purpose::STANDARD.encode(encoded))
@@ -238,6 +240,15 @@ fn assert_no_stage(path: &Path) {
             .to_string_lossy()
             .starts_with(".kuru-install-")
     }));
+}
+
+fn stderr_message(result: &Output) -> String {
+    // Stock PowerShell formats an exception to the host width. Preserve the
+    // actual message assertion across its CRLF/word wrapping.
+    String::from_utf8_lossy(&result.stderr)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn success(result: &Output) {
@@ -377,7 +388,7 @@ async fn malformed_manifest_hash_and_zip_fail_before_changing_existing_native_id
         let result = fixture.run(&mut fixture.command()).await;
         assert!(!result.status.success());
         assert!(
-            String::from_utf8_lossy(&result.stderr).contains(diagnostic),
+            stderr_message(&result).contains(diagnostic),
             "unexpected rejection: {}",
             String::from_utf8_lossy(&result.stderr)
         );
@@ -484,7 +495,7 @@ async fn stock_ps51_enforces_archive_and_decoded_output_limits_before_publicatio
     let result = fixture.run(&mut fixture.command()).await;
     assert!(!result.status.success());
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("file exceeds size limit"),
+        stderr_message(&result).contains("file exceeds size limit"),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
@@ -539,7 +550,7 @@ async fn stock_ps51_enforces_archive_and_decoded_output_limits_before_publicatio
             String::from_utf8_lossy(&result.stderr)
         );
         assert!(
-            String::from_utf8_lossy(&result.stderr).contains(diagnostic),
+            stderr_message(&result).contains(diagnostic),
             "unexpected rejection: {}",
             String::from_utf8_lossy(&result.stderr)
         );
@@ -573,7 +584,7 @@ async fn aliases_hardlinks_private_acl_and_busy_install_lease_fail_closed() {
     let result = fixture.run(&mut fixture.command()).await;
     assert!(!result.status.success());
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("hard-linked files are forbidden"),
+        stderr_message(&result).contains("hard-linked files are forbidden"),
         "hardlink validation was not reached: {}",
         String::from_utf8_lossy(&result.stderr)
     );
@@ -590,7 +601,7 @@ async fn aliases_hardlinks_private_acl_and_busy_install_lease_fail_closed() {
     lease.try_lock().unwrap();
     let result = fixture.run(&mut fixture.command()).await;
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("owns the installation"));
+    assert!(stderr_message(&result).contains("owns the installation"));
     fixture.unchanged();
     drop(lease);
     let result = fixture.run(&mut fixture.command()).await;
@@ -612,7 +623,9 @@ $acl.AddAccessRule($rule)
 "#)).await;
     assert!(!result.status.success());
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("private ACL grants another principal")
+        stderr_message(&result).contains("private ACL grants another principal"),
+        "weak ACL rejection: {}",
+        String::from_utf8_lossy(&result.stderr)
     );
     weak.unchanged();
     assert!(!weak.install.join(".kuru-update/receipt.json").exists());
@@ -659,9 +672,7 @@ async fn omitted_version_custom_base_has_a_deliberate_error_before_download_or_p
         .envs(fixture.environment());
     let result = fixture.run(&mut command).await;
     assert!(!result.status.success());
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("custom release base requires -Version")
-    );
+    assert!(stderr_message(&result).contains("custom release base requires -Version"));
     fixture.unchanged();
 }
 
@@ -834,10 +845,20 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
     .unwrap();
     let helper_name = helper.file_name().unwrap();
     let retained_name = OsStr::new("retained-original.exe");
-    let original = cache.read(helper_name).unwrap();
+    // Keep the private cache directory pinned, but allow its checked source
+    // file to move. Reading through the pinned view denies delete sharing and
+    // would make the fixture itself prevent the deliberate substitution.
+    let movable = Directory::open(
+        helper.parent().unwrap(),
+        Privacy::OwnerOnly,
+        NameRetention::Movable,
+    )
+    .unwrap();
+    assert_eq!(cache.identity(), movable.identity());
+    let original = movable.read(helper_name).unwrap();
     cache
         .rename_file(
-            &cache,
+            &movable,
             helper_name,
             &original,
             retained_name,
@@ -852,8 +873,9 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
     let result = fixture.run(fixture.command().arg("-Recover")).await;
     assert!(!result.status.success());
     assert!(
+        stderr_message(&result).contains("Trusted helper identity or checksum changed"),
+        "corrupt helper rejection: {}",
         String::from_utf8_lossy(&result.stderr)
-            .contains("Trusted helper identity or checksum changed")
     );
     assert!(!fixture.install.join("kuru.exe").exists());
     cache
@@ -861,7 +883,7 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
         .unwrap();
     cache
         .rename_file(
-            &cache,
+            &movable,
             retained_name,
             &original,
             helper_name,
@@ -869,6 +891,7 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
         )
         .unwrap();
     drop(original);
+    drop(movable);
     drop(cache);
     let result = fixture.run(fixture.command().arg("-Recover")).await;
     success(&result);

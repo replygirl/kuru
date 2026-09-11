@@ -82,6 +82,34 @@ async fn wait_removed(path: &Path) -> Result<()> {
 }
 
 #[tokio::test]
+async fn configured_startup_budget_is_not_preempted_by_a_shorter_query_timer() -> Result<()> {
+    let _permit = SERVERS.acquire().await?;
+    let root = tempfile::tempdir()?;
+    let writer = open(options(root.path(), engine().await?)).await?;
+    let pool = writer.pool("main").await?;
+    // Dolt uses the listener read timeout while executing a result iterator,
+    // including bootstrap DDL. A valid query inside our 20-second budget must
+    // not inherit an unrelated five-second server cancellation timer.
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        sqlx::query_scalar::<_, i64>("SELECT SLEEP(6)").fetch_one(pool.as_ref()),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    pool.close().await;
+    let stopped = writer.close().await;
+    stopped?;
+    assert_eq!(
+        result
+            .context("controlled query exceeded its outer ten-second bound")?
+            .with_context(|| format!("query failed after {elapsed:?}"))?,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn authenticated_readers_branch_pools_and_reopen_share_only_committed_state() -> Result<()> {
     let _permit = SERVERS.acquire().await?;
     let root = tempfile::tempdir()?;

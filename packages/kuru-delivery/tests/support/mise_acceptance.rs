@@ -308,6 +308,10 @@ impl Installation {
                 .to_owned(),
         ));
         env.push(("PATH".into(), system.into()));
+        // The real Windows resolver uses PATHEXT to expand `kuru` to
+        // `kuru.exe`. Keep conventional OS command lookup in this otherwise
+        // empty environment without importing user-defined extensions.
+        env.push(("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()));
         env.push(("MISE_CEILING_PATHS".into(), root.clone().into()));
         env.push(("MISE_TRUSTED_CONFIG_PATHS".into(), project.clone().into()));
         env.push(("MISE_YES".into(), "1".into()));
@@ -630,6 +634,23 @@ pub async fn run(binary: &Path) -> Result<()> {
                 archive::digest(&fs::read(&path)?) == expected,
                 "mise selected incorrect executable bytes"
             );
+            if index == 0 {
+                // Reproduce the isolated-environment failure independently of
+                // archive installation: the pinned resolver has no default
+                // executable extensions when PATHEXT is absent.
+                let mut missing_extensions = installed.command();
+                missing_extensions
+                    .env_remove("PATHEXT")
+                    .args(["exec", "--", "kuru", "--version"]);
+                let rejected = command::output(&mut missing_extensions, DEADLINE).await?;
+                ensure!(
+                    !rejected.status.success()
+                        && String::from_utf8_lossy(&rejected.stderr)
+                            .contains("cannot find binary path"),
+                    "missing-PATHEXT control did not reproduce native lookup rejection: {}",
+                    String::from_utf8_lossy(&rejected.stderr)
+                );
+            }
             ensure!(
                 installed
                     .success(&["exec", "--", "kuru", "--version"])

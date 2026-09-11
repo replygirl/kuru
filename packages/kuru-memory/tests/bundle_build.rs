@@ -153,10 +153,23 @@ fn prepared_inputs_reject_missing_truncated_corrupt_linked_and_mismatched_target
         assert!(verified_archive(&fifo, asset).is_err());
     }
     assert!(verified_archive(Path::new("relative.archive"), asset).is_err());
-    let traversal = directory
-        .join("..")
-        .join(directory.file_name().unwrap())
-        .join(path.file_name().unwrap());
+    // PathBuf::push normalizes `..` when its Windows base is verbatim (as
+    // canonicalize returns). Keep the actual hostile component in the input.
+    let mut traversal = directory.as_os_str().to_owned();
+    for component in [
+        std::ffi::OsStr::new(".."),
+        directory.file_name().unwrap(),
+        path.file_name().unwrap(),
+    ] {
+        traversal.push(std::path::MAIN_SEPARATOR_STR);
+        traversal.push(component);
+    }
+    let traversal = std::path::PathBuf::from(traversal);
+    assert!(
+        traversal
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    );
     assert!(verified_archive(&traversal, asset).is_err());
     asset.compressed_bytes = MAX_COMPRESSED + 1;
     assert!(verified_archive(&path, asset).is_err());

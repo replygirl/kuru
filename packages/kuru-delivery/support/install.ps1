@@ -94,6 +94,18 @@ public static class Native {
         foreach (string part in full.Substring(3).Split('\\')) Component(part);
         return full;
     }
+    public static string RecordedLaunchPath(string path) {
+        // Validate through the normal checked-path policy, but do not expand
+        // an already absolute receipt spelling from 8.3 to a long name. The
+        // loaded image section may retain the first launch's opened spelling;
+        // the trusted helper must perform its unchanged loaded-file check.
+        PathName(path);
+        if (path.StartsWith("\\\\?\\", StringComparison.Ordinal)) path = path.Substring(4);
+        path = path.Replace('/','\\');
+        Require(path.Length >= 3 && Char.IsLetter(path[0]) && path[1] == ':' && path[2] == '\\', "recorded helper requires an absolute drive path");
+        foreach (string part in path.Substring(3).Split('\\')) Component(part);
+        return path;
+    }
     public static void Component(string value) {
         Require(!String.IsNullOrEmpty(value) && value != "." && value != ".." && value.Length <= 255 && value.IndexOfAny(new char[]{'\\','/',':','\0','\r','\n','"','<','>','|','?','*'}) < 0 && !value.EndsWith(".") && !value.EndsWith(" "), "ambiguous Windows path component");
         foreach (char c in value) Require(c >= 32, "control character in path");
@@ -533,7 +545,7 @@ try {
     $lease = [Kuru.Bootstrap.Native]::Lock($state)
     $receipt = Read-KuruReceipt $state $parent
     if ($null -ne $receipt -and $receipt.phase -cnotin @('complete','rolled_back')) {
-        $helperPath = [Kuru.Bootstrap.Native]::PathName($receipt.helper)
+        $helperPath = [Kuru.Bootstrap.Native]::RecordedLaunchPath($receipt.helper)
         if ([IO.Path]::GetFileName($helperPath) -cne "x86_64-pc-windows-msvc-$($receipt.helper_image.sha256).exe" -or
             $receipt.helper_image.sha256 -cne $receipt.original.sha256 -or $receipt.helper_image.bytes -ne $receipt.original.bytes) { throw 'Receipt does not name a trusted original helper.' }
         $helperParent = [Kuru.Bootstrap.Native+DirectoryLease]::new([IO.Path]::GetDirectoryName($helperPath), $false, $true)

@@ -9,7 +9,7 @@ use kuru_platform::fs::{
 use kuru_platform::windows::{
     pipe::{self, Pipe, PrivateListener},
     process::{
-        Lifetime, NativeSpawnSpec, current_image, current_process_handle,
+        Lifetime, NativeSpawnSpec, Stdio, current_image, current_process_handle,
         duplicate_inherited_process_handle, wait_process_handle,
     },
 };
@@ -641,6 +641,60 @@ async fn receive<T: for<'de> Deserialize<'de>>(pipe: &mut Pipe) -> Result<T> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+// The trusted helper has no provider or user-auth environment. Retain a bounded
+// diagnostic prefix while continuously draining stderr, so an error can explain
+// a failed handoff without making the helper depend on an available console.
+async fn capture_helper_errors(
+    mut pipe: Pipe,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> Result<String> {
+    let mut prefix = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = &mut stop => break Ok(()),
+            read = pipe.read(&mut buffer) => match read {
+                Ok(0) => break Ok(()),
+                Ok(count) => {
+                    let keep = count.min(JSON_LIMIT.saturating_sub(prefix.len()));
+                    prefix.extend_from_slice(&buffer[..keep]);
+                }
+                Err(error) => break Err(error),
+            },
+        }
+    };
+    let closed = pipe.close(CLEANUP).await;
+    result.context("read trusted helper diagnostics")?;
+    closed.context("close trusted helper diagnostics")?;
+    Ok(String::from_utf8_lossy(&prefix).into_owned())
+}
+
+async fn helper_errors(
+    stop: tokio::sync::oneshot::Sender<()>,
+    mut task: tokio::task::JoinHandle<Result<String>>,
+    exited: bool,
+) -> String {
+    // After exit the final native pipe data can still be buffered. Drain it to
+    // EOF before stopping; otherwise stop could win select and hide the cause.
+    let completed = if exited {
+        tokio::time::timeout(CLEANUP, &mut task).await.ok()
+    } else {
+        None
+    };
+    let result = if let Some(result) = completed {
+        result
+    } else {
+        let _ = stop.send(());
+        task.await
+    };
+    match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => format!("diagnostic capture: {error:#}"),
+        Err(error) => format!("diagnostic task: {error}"),
+    }
+}
+
 pub async fn replace_running(
     base: &str,
     version: &str,
@@ -749,6 +803,7 @@ async fn replace_bytes_owned(
     };
     let mut spec = NativeSpawnSpec::new(helper.clone(), parent.path().to_owned());
     spec.lifetime = Lifetime::TrustedSupervisor;
+    spec.stderr = Stdio::Pipe;
     spec.args = vec![
         "--internal-update-helper".into(),
         serde_json::to_string(&start)?.into(),
@@ -756,12 +811,16 @@ async fn replace_bytes_owned(
     spec.inherited.push(parent_handle);
     configure(&mut spec)?;
     let mut child = spec.spawn().await?;
+    let errors = child.take_stderr().map(|pipe| {
+        let (stop, receive) = tokio::sync::oneshot::channel();
+        (stop, tokio::spawn(capture_helper_errors(pipe, receive)))
+    });
     // Snapshot the retained peer identity before constructing the handoff
     // future. NativeChild owns asynchronous pipe state and is Send, not Sync;
     // the listener's owned accept future must not capture a shared child borrow.
     let accept = listener.accept(&child, STARTUP);
     let operation = async {
-        let mut pipe = accept.await?;
+        let mut pipe = accept.await.context("accept trusted helper connection")?;
         send(
             &mut pipe,
             &Request {
@@ -775,8 +834,11 @@ async fn replace_bytes_owned(
                 candidate_image,
             },
         )
-        .await?;
-        let acknowledgment: Acknowledgment = receive(&mut pipe).await?;
+        .await
+        .context("send trusted helper update request")?;
+        let acknowledgment: Acknowledgment = receive(&mut pipe)
+            .await
+            .context("wait for verified update publication acknowledgment")?;
         ensure!(
             acknowledgment.installed == parent.path().join("kuru.exe"),
             "helper acknowledged an unexpected path"
@@ -795,16 +857,42 @@ async fn replace_bytes_owned(
     }
     .await;
     drop(helper_file);
-    if operation.is_err() {
+    let stopped = if operation.is_err() {
         // The trusted helper exits after its bounded request/reconciliation
         // budget. Do not terminate it in the middle of the two-rename gap.
-        let _ = child.wait(STARTUP + CLEANUP).await;
-    }
-    // A live helper keeps only its own durable copies, never this scratch stage.
-    let cleanup = stage.finish();
+        Some(child.wait(STARTUP + CLEANUP).await)
+    } else {
+        None
+    };
+    let diagnostics = if let Some((stop, task)) = errors {
+        helper_errors(stop, task, stopped.as_ref().is_some_and(Result::is_ok)).await
+    } else {
+        String::new()
+    };
+    // ACK proves the helper owns durable copies. On failure, only an observed
+    // process exit proves it has stopped using our scratch source.
+    let cleanup = if stopped.as_ref().is_some_and(Result::is_err) {
+        let retained = stage.keep();
+        Err(anyhow::anyhow!(
+            "trusted helper exit was not observed; candidate stage retained at {}",
+            retained.display()
+        ))
+    } else {
+        stage.finish()
+    };
     match operation {
-        Err(error) => Err(error)
-            .context("update handoff failed; rerun the installer to reconcile any pending receipt"),
+        Err(error) => {
+            let exit = match stopped.expect("failed handoff observes helper exit") {
+                Ok(status) => format!("helper exit: {status}"),
+                Err(error) => format!("helper exit unobserved: {error}"),
+            };
+            let cleanup = cleanup
+                .err()
+                .map_or_else(String::new, |error| format!("; {error:#}"));
+            Err(error).context(format!(
+                "update handoff failed; rerun the installer to reconcile any pending receipt; {exit}{cleanup}; helper stderr: {diagnostics}"
+            ))
+        }
         Ok(result) => {
             cleanup.context(
                 "new executable is installed; candidate staging cleanup needs attention",
@@ -853,7 +941,7 @@ async fn run_helper_observed(arguments: Vec<OsString>, observer: &mut Observer) 
     let directory = state(&parent)?;
     let _lease = lock(&directory)?;
     let _running = checked_helper(&request.helper, &request.helper_image)?;
-    let mut receipt = prepare(&directory, &request)?;
+    let mut receipt = prepare(&directory, &request).context("prepare durable update copies")?;
     observer("prepared", &receipt)?;
     if let Err(error) = publish(&directory, &mut receipt, observer) {
         let reconciliation = recover(&directory, &mut receipt);
@@ -873,8 +961,11 @@ async fn run_helper_observed(arguments: Vec<OsString>, observer: &mut Observer) 
             image: receipt.replacement.clone(),
         },
     )
-    .await?;
-    pipe.close(STARTUP).await?;
+    .await
+    .context("send acknowledgment after verified update publication")?;
+    pipe.close(STARTUP)
+        .await
+        .context("close acknowledged update channel")?;
     if wait_process_handle(&parent_handle, CLEANUP).await.is_err() {
         receipt.phase = Phase::CleanupPending;
         save(&directory, &receipt)?;
@@ -909,6 +1000,19 @@ fn checked_helper(
 #[cfg(feature = "tooling")]
 pub mod test_support {
     use super::*;
+
+    /// Exercise the production bounded prefix drain with actual native stderr.
+    pub async fn capture_stderr(
+        child: &mut kuru_platform::windows::process::NativeChild,
+    ) -> Result<String> {
+        let pipe = child.take_stderr().context("native stderr pipe")?;
+        let (stop, receive) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(capture_helper_errors(pipe, receive));
+        let exit = child.wait(STARTUP + CLEANUP).await;
+        let diagnostic = helper_errors(stop, task, exit.is_ok()).await;
+        exit.context("native diagnostic fixture exit")?;
+        Ok(diagnostic)
+    }
 
     fn checked_checkpoint(value: &str) -> Result<()> {
         ensure!(

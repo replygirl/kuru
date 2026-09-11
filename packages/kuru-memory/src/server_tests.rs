@@ -201,11 +201,18 @@ fn private_layout_and_branch_validation_are_strict() -> Result<()> {
     for valid in ["main", "dream_012345", "candidate-a"] {
         validate_branch(valid)?;
     }
-    let yaml = server_yaml(&root.path().join("space café \"quoted\""), 55000)?;
+    let yaml = server_yaml(
+        &root.path().join("space café \"quoted\""),
+        55000,
+        Duration::from_secs(20),
+    )?;
     assert!(yaml.contains("host: 127.0.0.1"));
     assert!(yaml.contains("event_scheduler: \"OFF\""));
     assert!(yaml.contains("\\\"quoted\\\""));
     assert!(!yaml.contains("password:"));
+    assert!(yaml.contains("read_timeout_millis: 30000"));
+    let longest = server_yaml(root.path(), 55000, Duration::from_secs(300))?;
+    assert!(longest.contains("read_timeout_millis: 300000"));
     Ok(())
 }
 

@@ -1060,7 +1060,11 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         instance: identity.instance.clone(),
         port,
     };
-    let yaml = server_yaml(&request.directory, port)?;
+    let yaml = server_yaml(
+        &request.directory,
+        port,
+        Duration::from_millis(request.timeout_millis),
+    )?;
     let config_path = request.directory.join("server.yaml");
     write_private(&config_path, yaml.as_bytes())?;
     let mut signals = ShutdownSignals::new()?;
@@ -1214,12 +1218,17 @@ impl ShutdownSignals {
     }
 }
 
-fn server_yaml(directory: &Path, port: u16) -> Result<String> {
+fn server_yaml(directory: &Path, port: u16, startup_timeout: Duration) -> Result<String> {
+    // Dolt also applies this listener value while its result iterator executes
+    // SQL, including CREATE DATABASE. Do not silently cancel work before our
+    // existing bootstrap/operation deadlines. Caller cancellation and owned
+    // shutdown still determine when resources can be released.
+    let read_timeout = startup_timeout.max(crate::store::QUERY_TIMEOUT).as_millis();
     // Dolt 2.3.3 does not derive @@datadir from data_dir. Initialize its
     // read-only SQL variable from the same canonical path for identity probes.
     let quoted = |name: &str| serde_json::to_string(&directory.join(name));
     Ok(format!(
-        "log_level: warning\nlog_format: text\nbehavior:\n  autocommit: true\n  dolt_transaction_commit: false\n  event_scheduler: \"OFF\"\n  auto_gc_behavior:\n    enable: false\nlistener:\n  host: 127.0.0.1\n  port: {port}\n  max_connections: 32\n  max_connections_timeout_millis: 1000\n  read_timeout_millis: 5000\n  write_timeout_millis: 5000\n  allow_cleartext_passwords: false\ndata_dir: {}\ncfg_dir: {}\nprivilege_file: {}\nbranch_control_file: {}\nsystem_variables:\n  datadir: {}\n  secure_file_priv: {}\n",
+        "log_level: warning\nlog_format: text\nbehavior:\n  autocommit: true\n  dolt_transaction_commit: false\n  event_scheduler: \"OFF\"\n  auto_gc_behavior:\n    enable: false\nlistener:\n  host: 127.0.0.1\n  port: {port}\n  max_connections: 32\n  max_connections_timeout_millis: 1000\n  read_timeout_millis: {read_timeout}\n  write_timeout_millis: 5000\n  allow_cleartext_passwords: false\ndata_dir: {}\ncfg_dir: {}\nprivilege_file: {}\nbranch_control_file: {}\nsystem_variables:\n  datadir: {}\n  secure_file_priv: {}\n",
         quoted("data")?,
         quoted("config")?,
         quoted("config/privileges.db")?,
@@ -1277,13 +1286,18 @@ async fn start_database(
         )
         .await
         {
+            let mut phase = "checking the bootstrap data directory";
             let initialized = timeout(
                 deadline.saturating_duration_since(Instant::now()),
-                initialize_database(&pool, directory, identity),
+                initialize_database(&pool, directory, identity, &mut phase),
             )
             .await;
             pool.close().await;
-            return initialized.context("Dolt database bootstrap deadline exceeded")?;
+            return initialized
+                .with_context(|| {
+                    format!("Dolt database bootstrap deadline exceeded while {phase}")
+                })?
+                .with_context(|| format!("Dolt database bootstrap failed while {phase}"));
         }
         sleep(Duration::from_millis(25)).await;
     }
@@ -1293,6 +1307,7 @@ async fn initialize_database(
     pool: &MySqlPool,
     directory: &Path,
     identity: &mut Identity,
+    phase: &mut &'static str,
 ) -> Result<()> {
     let datadir: String = sqlx::query_scalar("SELECT @@datadir")
         .fetch_one(pool)
@@ -1303,10 +1318,13 @@ async fn initialize_database(
         "Dolt bootstrap data directory mismatch"
     );
     if !identity.initialized {
+        *phase = "creating the project database";
         sqlx::query("CREATE DATABASE IF NOT EXISTS kuru")
             .execute(pool)
             .await?;
+        *phase = "creating the project identity table";
         sqlx::query("CREATE TABLE IF NOT EXISTS kuru.kuru_instance (singleton TINYINT PRIMARY KEY, instance_id VARCHAR(36) NOT NULL, project_scope TEXT NOT NULL)").execute(pool).await?;
+        *phase = "initializing the project identity";
         let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru.kuru_instance")
             .fetch_one(pool)
             .await?;
@@ -1323,14 +1341,17 @@ async fn initialize_database(
             "CREATE USER IF NOT EXISTS 'kuru_reader'@'localhost' IDENTIFIED BY '{}'",
             identity.reader_password
         );
+        *phase = "configuring the private reader account";
         sqlx::query(sqlx::AssertSqlSafe(credential_sql))
             .execute(pool)
             .await
             .map_err(|_| anyhow!("configuring private read-only memory account failed"))?;
+        *phase = "granting private reader access";
         sqlx::query("GRANT SELECT ON kuru.* TO 'kuru_reader'@'localhost'")
             .execute(pool)
             .await?;
     }
+    *phase = "verifying the project identity";
     let row = sqlx::query(
         "SELECT instance_id, project_scope FROM kuru.kuru_instance WHERE singleton = 1",
     )
@@ -1342,6 +1363,7 @@ async fn initialize_database(
         "Dolt bootstrap project identity mismatch"
     );
     if !identity.initialized {
+        *phase = "publishing the initialized identity";
         identity.initialized = true;
         write_record(&directory.join("identity.json"), identity)?;
     }

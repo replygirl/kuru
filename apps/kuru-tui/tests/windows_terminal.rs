@@ -26,6 +26,55 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 // Includes the actual memory shutdown grace/escalation and one pending commit.
 const EXIT: Duration = Duration::from_secs(30);
 
+#[test]
+fn composer_coordinates_use_physical_rows_after_conpty_autowrap() {
+    let mut parser = vt100::Parser::new(6, 20, 0);
+    // A full-width grid causes autowrap rather than explicit row separators.
+    parser.process("x".repeat(60).as_bytes());
+    parser.process(" › focus draft      footer\x1b[?25l".as_bytes());
+    assert!(parser.screen().row_wrapped(0));
+    assert!(
+        parser
+            .screen()
+            .contents()
+            .lines()
+            .next()
+            .unwrap()
+            .contains("focus draft")
+    );
+    assert!(!terminal::composer_frame_ready(
+        parser.screen(),
+        "focus draft"
+    ));
+
+    parser.process(b"\x1b[4;15");
+    assert!(!terminal::composer_frame_ready(
+        parser.screen(),
+        "focus draft"
+    ));
+    parser.process(b"H");
+    assert_eq!(parser.screen().cursor_position(), (3, 14));
+    assert!(!terminal::composer_frame_ready(
+        parser.screen(),
+        "focus draft"
+    ));
+    parser.process(b"\x1b[?25");
+    assert!(!terminal::composer_frame_ready(
+        parser.screen(),
+        "focus draft"
+    ));
+    parser.process(b"h");
+    assert!(terminal::composer_frame_ready(
+        parser.screen(),
+        "focus draft"
+    ));
+    parser.process(b"\x1b[5;1H");
+    assert!(!terminal::composer_frame_ready(
+        parser.screen(),
+        "focus draft"
+    ));
+}
+
 struct Sandbox {
     _temporary: tempfile::TempDir,
     root: PathBuf,
@@ -301,6 +350,106 @@ async fn native_console_modes_restore_after_partial_initialization_and_errors() 
         assert_eq!(report["status"], 1);
         assert_eq!(report["before"], report["after"]);
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_error_drop_returns_while_console_close_is_delayed() -> Result<()> {
+    use portable_pty::{MasterPty, PtySize};
+    use std::{
+        io::{Read, Write},
+        sync::mpsc,
+        thread::{self, ThreadId},
+        time::Instant,
+    };
+
+    struct GatedMaster {
+        inner: Option<Box<dyn MasterPty + Send>>,
+        entered: mpsc::Sender<ThreadId>,
+        release: mpsc::Receiver<()>,
+        closed: mpsc::Sender<bool>,
+    }
+    impl MasterPty for GatedMaster {
+        fn resize(&self, size: PtySize) -> Result<()> {
+            self.inner.as_ref().unwrap().resize(size)
+        }
+        fn get_size(&self) -> Result<PtySize> {
+            self.inner.as_ref().unwrap().get_size()
+        }
+        fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>> {
+            self.inner.as_ref().unwrap().try_clone_reader()
+        }
+        fn take_writer(&self) -> Result<Box<dyn Write + Send>> {
+            self.inner.as_ref().unwrap().take_writer()
+        }
+    }
+    impl Drop for GatedMaster {
+        fn drop(&mut self) {
+            let _ = self.entered.send(thread::current().id());
+            // Models delayed closure around a real native console. Channel EOF
+            // releases it even if an assertion fails; the fallback is bounded.
+            let released = self.release.recv_timeout(READY * 2).is_ok();
+            drop(self.inner.take());
+            let _ = self.closed.send(released);
+        }
+    }
+
+    let _serial = SERIAL.lock().await;
+    let sandbox = Sandbox::new()?;
+    let mut terminal = sandbox.start("drop-error", "partial-error", &[], true, "demo", &[])?;
+    let error = terminal
+        .text(&["marker-the-error-fixture-never-renders"], READY)
+        .unwrap_err();
+    ensure!(
+        error.to_string().contains("child exited"),
+        "expected the real console fixture's exit, got {error:#}"
+    );
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(sandbox.root.join("drop-error/report.json"))?)?;
+    assert_eq!(report["status"], 1);
+    assert_eq!(report["before"], report["after"]);
+
+    let (entered, entering) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let (closed, completion) = mpsc::channel();
+    terminal.wrap_master(|master| {
+        Box::new(GatedMaster {
+            inner: Some(master),
+            entered,
+            release: resume,
+            closed,
+        })
+    })?;
+    let (returned, returning) = mpsc::channel();
+    let dropping = thread::spawn(move || {
+        let caller = thread::current().id();
+        drop(terminal);
+        let _ = returned.send(caller);
+    });
+    // Capture all observations before asserting, so every failure releases the
+    // gate and permits owned native closure. Never join a still-running thread.
+    let close_thread = entering.recv_timeout(READY);
+    let bounded_return = returning.recv_timeout(READY);
+    let release_result = release.send(());
+    let actual_close = completion.recv_timeout(READY);
+    let deadline = Instant::now() + READY;
+    while !dropping.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    ensure!(
+        dropping.is_finished(),
+        "ConPTY drop observer remains active"
+    );
+    dropping
+        .join()
+        .map_err(|_| anyhow::anyhow!("ConPTY drop observer panicked"))?;
+    release_result.context("close gate exited without its release")?;
+    ensure!(actual_close?, "native close gate timed out before release");
+    let caller = bounded_return.context("Terminal::drop blocked on native console closure")?;
+    ensure!(
+        close_thread? != caller,
+        "native close ran on the dropping thread"
+    );
     Ok(())
 }
 

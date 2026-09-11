@@ -331,18 +331,24 @@ async fn file_alias_hardlink_and_reparse_guards_preserve_external_data() {
 #[tokio::test]
 async fn stock_powershell_unicode_and_terminating_errors_are_observed() {
     let root = tempfile::tempdir().unwrap();
+    let working = root.path().join("shell cwd café 東京");
+    std::fs::create_dir(&working).unwrap();
     let host = ToolHost::new(
-        root.path(),
+        &working,
         &Config {
             allow_shell: true,
             ..Default::default()
         },
     )
     .unwrap();
-    let result: Value = serde_json::from_str(&host.execute("shell", json!({"command":"Write-Progress -Activity 'native progress' -Status 'working' -PercentComplete 50; [Console]::Out.Write('日本語 🦀'); [Console]::Error.Write('échec'); exit 0"})).await.unwrap()).unwrap();
+    let result: Value = serde_json::from_str(&host.execute("shell", json!({"command":"Write-Progress -Activity 'native progress' -Status 'working' -PercentComplete 50; [IO.File]::WriteAllText([IO.Path]::Combine((Get-Location).Path,'shell-created.txt'),'日本語 🦀'); [Console]::Out.Write('日本語 🦀'); [Console]::Error.Write('échec'); exit 0"})).await.unwrap()).unwrap();
     assert_eq!(result["stdout"], "日本語 🦀");
     assert_eq!(result["stderr"], "échec");
     assert_eq!(result["success"], true);
+    assert_eq!(
+        std::fs::read_to_string(working.join("shell-created.txt")).unwrap(),
+        "日本語 🦀"
+    );
     let literal: Value = serde_json::from_str(&host.execute("shell", json!({"command":"[Console]::Error.Write('#< CLIXML <Objs>literal diagnostic</Objs>')"})).await.unwrap()).unwrap();
     assert_eq!(
         literal["stderr"],
