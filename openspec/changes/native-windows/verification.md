@@ -1100,3 +1100,48 @@ Evidence: `/tmp/kuru-vswhere-243-investigation.md`,
 `/tmp/kuru-pe-discovery-validate.log`, `/tmp/kuru-pe-discovery-apply.json`,
 `/tmp/kuru-pe-discovery-format.log` and
 `/tmp/kuru-pe-discovery-independent-review.md`.
+
+## Hosted e7eb136: Windows acceptance passed; Unix fixture follow-up
+
+[CI 34584264723](https://github.com/replygirl/kuru/actions/runs/34584264723)
+completed full Windows job 103214706180 successfully at 10:08:08Z on September 11.
+It passed 413 instrumented tests, with zero failures and one intentionally
+ignored benchmark, plus the separate ordinary shipping case. Full raw LCOV was
+17928/19006 lines (94.328107%); the separate 55-case primitive suite measured
+2640/2903 (90.940406%). Both completed native logs independently confirmed merge
+`96e2e2e36c773bba91f51bc3ac149471c8569eb4`, whose tree
+`3feabe66b775a192c8a7b335c563bb3345d0a032` equals candidate
+`e7eb136fc774639b0a4fbcd2e06d513533c683b4`.
+
+The actual stock-PowerShell/MSVC regression passed all three path forms,
+genuine non-PE rejection, exact prefetch routing, and unchanged byte/identity
+assertions. Source installation, all three missing/corrupt/valid offline Cargo
+controls, and the selected shipping executable's cold offline direct-install
+and self-update conversations passed. The real shipping executable was
+53,709,824 bytes and its ZIP 44,159,587 bytes. The final unsubstituted native PE
+checks also passed for both Kuru and the package-owned prepared Dolt executable,
+with nonempty inventories satisfying the unchanged OS-DLL policy. This is native
+acceptance of the two PE corrections; it does not identify the particular COM
+lookup that failed earlier, or establish published GitHub Release installation.
+
+All seven static categories and three other Unix jobs passed, including actual
+selected offline shipping roundtrips. Ubuntu passed 375 instrumented cases with
+three intentional exclusions and measured 14652/15086 lines (97.123161%). Linux
+ARM passed 76 ordinary memory cases and Intel macOS passed 77; each additionally
+passed its selected shipping case.
+
+macOS ARM failed only
+`host_detection_selects_each_supported_archive_and_rejects_unknown_hosts` with
+the old fixture's generic 30-second timeout. It passed 375 other cases with
+three intentional exclusions, then skipped full LCOV, source installation and
+shipping. Aggregate 103225613482 therefore failed at 10:08:17Z. No overall native
+completion or archive is claimed from this run. The separate
+`bootstrap-timeout-observation` fix retains labeled output/root/EOF evidence,
+preserves ordinary leak rejection and observes owned cleanup. Its actual failing
+controls and corrected 17-case default-feature pass are recorded in its own
+verification. The original hosted stall cause remains unknown, and the next
+candidate still requires the complete native graph.
+
+Evidence: `/tmp/kuru-windows-e7eb136-results.md`, its completed native logs and
+raw coverage artifacts; `/tmp/kuru-ci-e7eb136-results.md`; and the bootstrap
+fix's actual strict/apply/RED/GREEN/review records.

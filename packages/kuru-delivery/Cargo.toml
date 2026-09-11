@@ -52,5 +52,8 @@ rustix = { workspace = true, optional = true, features = ["fs", "process"] }
 [dev-dependencies]
 axum.workspace = true
 
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["process"] }
+
 [lints]
 workspace = true
