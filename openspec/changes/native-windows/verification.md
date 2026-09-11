@@ -1145,3 +1145,39 @@ candidate still requires the complete native graph.
 Evidence: `/tmp/kuru-windows-e7eb136-results.md`, its completed native logs and
 raw coverage artifacts; `/tmp/kuru-ci-e7eb136-results.md`; and the bootstrap
 fix's actual strict/apply/RED/GREEN/review records.
+
+## Hosted 45a13b5: Unix correction passed; restored Windows cache rejected
+
+[CI 34588322751](https://github.com/replygirl/kuru/actions/runs/34588322751)
+passed all seven static categories, quality, PR Title and all four Unix jobs.
+Each completed native log independently confirmed merge
+`86db892f0200aa1702828a449ec0ac52654fadbc`, tree
+`eb08351ae24dd3fe1ebec17bb34620b3d8f2be68`, equal to candidate
+`45a13b5dd5d271a6307bd33fb3c9d66eada82a70`.
+macOS ARM passed 380 instrumented cases with three intentional exclusions and
+14663/15097 covered lines (97.125257%); Ubuntu passed 379 with three exclusions
+and 14651/15086 lines (97.116532%). Both passed all 17 bootstrap cases, source
+installation and the actual selected shipping offline install/update. Linux
+ARM passed 76 ordinary memory cases plus shipping; Intel Mac passed 77 plus
+shipping. These new Unix passes exercise the observation controls and retain
+the earlier stall's unknown cause.
+
+Full Windows job 103227553568 failed at 10:17:33Z before any application test.
+Rust-cache restored the 876,767,551-byte archive containing the target directory,
+then both bundle-preparation prerequisites rejected their default private
+directory with `private object grants access to another principal`. No full
+suite, full LCOV, source installation, offline Cargo control, shipping or final
+PE result exists for this candidate. Separate Windows primitives passed 55 cases
+with 2640/2903 lines (90.940406%). Aggregate 103231074917 failed at 10:29:09Z.
+The previous candidate's complete Windows pass does not substitute for this run.
+
+The same cache key and byte count occur in the preceding successful uploader.
+Pinned Rust-cache cleanup can retain the empty bundle directory after removing
+its files; the actual rejected permission entry and whether any bundle bytes
+were restored were not recorded. `isolate-runner-bundle-cache` moves preparation
+outside the restored target tree through the existing absolute-directory override.
+It preserves private-object checks, package-owned preparation and all native
+acceptance requirements. Actual restored-cache Windows success and a complete
+required graph remain outstanding. Evidence:
+`/tmp/kuru-windows-45a13b5-results.md`, `/tmp/kuru-ci-45a13b5-results.md`, and
+`/tmp/kuru-windows-bundle-cache-45a13b5-investigation.md`.

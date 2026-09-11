@@ -77,3 +77,27 @@ assertions: `/tmp/kuru-bootstrap-observation-green-review.md`. Revised strict
 cospec validation also passed. Full hooks and the next required native graph
 remain pending; neither this local pass nor the fixture repair establishes the
 cause of the historical hosted stall.
+
+## Normal hooks and actual Unix integration
+
+Signed candidate 45a13b5 passed all eight concurrent pre-push checks: 380 tests,
+zero failed, three intentional exclusions, and 14663/15097 covered lines
+(97.125257%). The single instrumented suite took 213.06 seconds and its graph
+214.67 seconds. The actual bootstrap binary passed all 17 cases under coverage.
+Evidence: `/tmp/kuru-45a13b5-push.log` and the retained raw LCOV.
+
+CI 34588322751 independently passed all 17 bootstrap cases on macOS ARM
+(4.52 seconds) and Ubuntu (2.35 seconds), including both timeout observations,
+excess-output draining, surviving-child rejection and the original host-selection
+case. The full suites passed 380/0/3 and 379/0/3 respectively, each above 97%
+coverage, followed by source installation and selected shipping offline
+install/update. All static categories and the two other Unix shipping jobs passed.
+The tested merge 86db892 has the same complete tree as 45a13b5.
+
+Full Windows failed before tests at the restored private bundle-cache directory;
+the required aggregate failed. That separate CI-storage correction is tracked
+in isolate-runner-bundle-cache. The observed Unix controls are accepted, but
+this change's full required-graph/archive row remains open. A passing ordinary
+host case does not establish the earlier stall's cause. Evidence:
+`/tmp/kuru-ci-45a13b5-results.md` and
+`/tmp/kuru-windows-45a13b5-results.md`.

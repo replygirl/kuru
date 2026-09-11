@@ -162,6 +162,12 @@ directory for both preparation and compilation. Valid files are reverified and
 reused; corrupt or unsafe entries fail without replacement. This build cache is
 separate from the installed application's extracted `memory.cache_dir`.
 
+The cached native CI job selects `${{ runner.temp }}/kuru-bundles` for all its
+preparation and build steps. Private bundle directories must be created by the
+current runner; restoring them inside a Cargo target archive can change their
+permissions. Keep them outside shared build-output caches and retain the private
+directory checks when configuring native test runners.
+
 Choose a supported target explicitly when preparing or building for it:
 
 ```sh

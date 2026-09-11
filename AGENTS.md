@@ -59,6 +59,10 @@ the embedded bytes and must not download an engine. Keep build-input mirrors
 separate from runtime memory settings, route source builds through package-owned
 mise dependencies, and verify packaged cold offline conversations after install
 and update. See [bundled build inputs](docs/development.md#bundled-engine-build-inputs).
+Cached native test jobs keep private bundle preparation directories outside
+archived Cargo target caches. They select a runner-temporary mirror through
+the existing environment override so each runner creates its own permissions;
+do not weaken private-object validation to accept restored directory grants.
 
 Convention priority is: (1) the apps/ and packages/ monorepo structure,
 (2) mise's native monorepo task model, (3) Rust, (4) other tools. Each app or
