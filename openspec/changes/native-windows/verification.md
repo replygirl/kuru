@@ -505,3 +505,90 @@ acceptance and the unresolved app handoff remain pending; no retries, billing,
 Release or Pages actions were performed. Raw annotations and job metadata are
 recorded in `/tmp/kuru-windows-1943c4e-results.md` and
 `/tmp/kuru-ci-1943c4e-results.md`.
+
+## Hosted execution resumed at 1234096
+
+After the user changed repository visibility, the normal push passed all eight
+local hooks and [CI 34552780285](https://github.com/replygirl/kuru/actions/runs/34552780285)
+executed actual hosted jobs. This evidence-only commit retains the source from
+1943c4e. All seven static jobs, their required aggregate and the PR-title check
+passed. The previous account startup refusal did not recur.
+
+All four Unix application jobs passed. Ubuntu measured 14,318/14,746 lines
+(97.097518%) and macOS arm64 measured 14,329/14,757 (97.099682%); both passed
+source installation and installed cold offline install/update conversations.
+Linux arm64 passed 74 memory cases and Intel macOS passed 75, followed by their
+actual release-built packaged offline install/update checks. These results use
+the shipping executable selected by each native job, without publishing assets.
+The separate Windows primitive job passed 54 cases with 2,602/2,865 lines
+(90.820244%).
+
+The full Windows application job completed with 381 passing tests, eight
+failures and one intentionally ignored timing benchmark; seven test targets
+failed. Compilation took 3 minutes 35 seconds and the coverage/preparation task
+took 2,537.35 seconds. The final aggregate failed as required. All 62 memory
+cases and all ten delivery updater cases passed, including real recovery,
+Graceful/Forced teardown, marker interruption and bounded helper diagnostics.
+The remaining failures concern CLI shell timeout, full-app installed/source
+update, unexpected mise fixture traffic, ConPTY label capitalization, two
+bootstrap assertions and runtime cancellation-fixture setup.
+
+The source updater's new diagnostics identify a publication-acknowledgment
+timeout with unobserved helper exit and empty stderr. The candidate stage was
+retained. This does not establish a hashing bottleneck or resolve the failure.
+Windows combined LCOV, source installation, offline Cargo-input controls,
+installed shipping-runtime and PE-import checks did not run after the failed
+suite. Native consumer acceptance remains open. Exact sizes, timings, logs,
+failure locations and LCOV paths are recorded in
+`/tmp/kuru-ci-1234096-results.md` and
+`/tmp/kuru-windows-1234096-results.md`.
+
+The ConPTY correction changes only the fixture's reopened-screen expectation
+from `jungian` to the actual displayed `Jungian`. The retained native screen
+fails the old predicate and passes the corrected one. Its completed-frame,
+physical-cursor and quiescence requirements are unchanged.
+
+The runtime cancellation failure occurred before provider entry, while the
+turn persisted its transcript/input and read private history. The fixture now
+synchronizes on actual provider entry under the existing real-dream setup
+budget, then retains a separate two-second bound across abort, provider-drop
+acknowledgment and reacquisition of the real sole pool permit. A completed
+recovery turn remains required. Two focused real-Dolt host tests and strict
+runtime Clippy passed; no product deadline or actor behavior changed.
+
+The CLI shell's thirty-second timeout is still unresolved. Bounded captures now
+retain received bytes and actual EOF observations across cancellation, name
+output-read versus process-wait failures, and report the retained child's state
+and cleanup result. Both pipe closes are attempted and awaited. Three focused
+host capture/shell tests and strict connector Clippy passed; independent source
+review found no blocking defect. Execution and cleanup bounds, native shell
+selection and successful output/status semantics are unchanged. These source
+corrections and diagnostics require new Windows execution. Evidence:
+`/tmp/kuru-conpty-123-correction.md`, `/tmp/kuru-runtime-123-correction.md` and
+`/tmp/kuru-shell-123-correction.md`.
+
+Delivery's bootstrap fixtures now decode the actual stock PowerShell CLIXML
+Error records and remove the deliberately corrupt helper through the existing
+same-identity movable view. Warning/progress-only and empty Error envelopes
+cannot satisfy rejection assertions. A real pinned host mise probe reproduced
+the unexpected version-notification request; its exact URL now has a local
+fixture route, while all other unexpected traffic remains rejected. These are
+fixture corrections; native ACL, image, checksum and recovery rules are unchanged.
+
+The trusted updater now emits finite static phase names with elapsed time to
+its already drained stderr. The Windows command facade preserves bounded output,
+EOF observations and the original failure across failed process-tree waits and
+cleanup. A new native fixture requires an exited root's final error to survive
+its live descendant, then proves owned teardown releases the descendant's real
+file lease. The packaged app fixture labels each installation, conversation and
+update stage. Existing publication, capture and cleanup deadlines are unchanged;
+the actual ACK and shell timeout causes remain unresolved pending native output.
+
+All 105 host delivery tests, strict delivery Clippy and formatting passed. The
+first sandboxed test attempt was refused permission to bind existing loopback
+listeners; the same task passed with approved fixture binding. Independent
+review caught and resolved the CLIXML no-error false-positive path and found no
+remaining issue. These host results do not typecheck or execute Windows branches.
+Evidence: `/tmp/kuru-native-delivery-123-fixes.md`,
+`/tmp/kuru-mise-123-version-routing.log` and
+`/tmp/kuru-delivery-123-review.md`.

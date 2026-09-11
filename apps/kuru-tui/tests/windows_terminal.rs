@@ -324,7 +324,7 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
 
     let mut reopened = sandbox.start("reopened", "app", &[], true, "demo", &[])?;
     reopened.text(
-        &["demo", "jungian", "default", "enter send"],
+        &["demo", "Jungian", "default", "enter send"],
         sandbox.startup,
     )?;
     reopened.send(b"reduced draft")?;

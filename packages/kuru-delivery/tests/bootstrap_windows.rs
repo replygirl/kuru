@@ -30,6 +30,9 @@ const TARGET: &str = "x86_64-pc-windows-msvc";
 const VERSION: &str = "0.2.0";
 const TIMEOUT: Duration = Duration::from_secs(180);
 
+#[path = "support/powershell_diagnostic.rs"]
+mod powershell_diagnostic;
+
 struct Fixture {
     root: tempfile::TempDir,
     release: PathBuf,
@@ -243,12 +246,7 @@ fn assert_no_stage(path: &Path) {
 }
 
 fn stderr_message(result: &Output) -> String {
-    // Stock PowerShell formats an exception to the host width. Preserve the
-    // actual message assertion across its CRLF/word wrapping.
-    String::from_utf8_lossy(&result.stderr)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    powershell_diagnostic::message(&result.stderr)
 }
 
 fn success(result: &Output) {
@@ -879,7 +877,7 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
     );
     assert!(!fixture.install.join("kuru.exe").exists());
     cache
-        .remove_file(helper_name, cache.read(helper_name).unwrap())
+        .remove_file(helper_name, movable.read(helper_name).unwrap())
         .unwrap();
     cache
         .rename_file(

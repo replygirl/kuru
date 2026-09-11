@@ -39,6 +39,57 @@ async fn main() -> io::Result<()> {
             std::fs::write(path, b"candidate executed")?;
         }
         #[cfg(windows)]
+        Some("command-held-descendant") => {
+            let path = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing lock path"))?;
+            let lease = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)?;
+            lease.try_lock().map_err(io::Error::other)?;
+            io::stdout().write_all(b"R")?;
+            io::stdout().flush()?;
+            std::future::pending::<()>().await;
+            drop(lease);
+        }
+        #[cfg(windows)]
+        Some("command-output-before-tree-wait") => {
+            use kuru_platform::windows::process::{Lifetime, NativeSpawnSpec, Stdio};
+            use tokio::io::AsyncReadExt;
+            let path = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing lock path"))?;
+            let mut spec = NativeSpawnSpec::new(std::env::current_exe()?, std::env::current_dir()?);
+            spec.args = vec!["command-held-descendant".into(), path];
+            // Inherit the actual command owner's enclosing Job, but outlive this
+            // fixture root. Dropping its local child handle must not stop it.
+            spec.lifetime = Lifetime::TrustedSupervisor;
+            spec.stdout = Stdio::Pipe;
+            if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+                spec.environment.push(("LLVM_PROFILE_FILE".into(), profile));
+            }
+            let mut child = spec.spawn().await?;
+            let mut ready = child
+                .take_stdout()
+                .ok_or_else(|| io::Error::other("missing readiness pipe"))?;
+            let byte =
+                tokio::time::timeout(std::time::Duration::from_secs(5), ready.read_u8()).await??;
+            if byte != b'R' {
+                return Err(io::Error::other("descendant did not retain its lock"));
+            }
+            ready.close(std::time::Duration::from_secs(5)).await?;
+            io::stdout().write_all(b"native captured stdout prefix\n")?;
+            io::stdout().write_all(&vec![b'x'; 70 * 1024])?;
+            io::stdout().write_all(b"excluded stdout tail")?;
+            io::stdout().flush()?;
+            io::stderr().write_all(b"native fixture failure before tree wait\n")?;
+            io::stderr().flush()?;
+            return Err(io::Error::other("native root failed after both streams"));
+        }
+        #[cfg(windows)]
         Some("helper-stderr") => {
             let count: usize = arguments
                 .next()

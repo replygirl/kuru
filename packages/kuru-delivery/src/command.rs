@@ -142,7 +142,7 @@ mod windows {
         io,
         path::{Path, PathBuf},
         process::Output,
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tokio::io::AsyncReadExt;
 
@@ -235,52 +235,89 @@ mod windows {
             spec.stdout = Stdio::Pipe;
             spec.stderr = Stdio::Pipe;
             let mut child = spec.spawn().await?;
-            let stdout = child
+            let mut stdout = child
                 .take_stdout()
                 .ok_or_else(|| io::Error::other("missing native stdout"))?;
-            let stderr = child
+            let mut stderr = child
                 .take_stderr()
                 .ok_or_else(|| io::Error::other("missing native stderr"))?;
+            let started = Instant::now();
+            let mut stdout_bytes = Vec::new();
+            let mut stderr_bytes = Vec::new();
+            let mut stdout_eof = false;
+            let mut stderr_eof = false;
+            let mut phase = "read native stdout/stderr";
             let captured = tokio::time::timeout(timeout, async {
-                let (stdout, stderr) = tokio::try_join!(read(stdout), read(stderr))?;
-                let status = child.wait(Duration::from_secs(5)).await?;
-                Ok::<_, io::Error>(Output {
-                    status,
-                    stdout,
-                    stderr,
-                })
+                tokio::try_join!(
+                    read(&mut stdout, &mut stdout_bytes, &mut stdout_eof),
+                    read(&mut stderr, &mut stderr_bytes, &mut stderr_eof)
+                )?;
+                phase = "wait for native process tree quiescence";
+                child.wait(Duration::from_secs(5)).await
             })
             .await;
-            match captured {
-                Ok(Ok(output)) => Ok(output),
-                Ok(Err(error)) => {
-                    terminate(&mut child).await?;
-                    Err(error)
+            let error = match captured {
+                Ok(Ok(status)) => {
+                    return Ok(Output {
+                        status,
+                        stdout: stdout_bytes,
+                        stderr: stderr_bytes,
+                    });
                 }
-                Err(_) => {
-                    terminate(&mut child).await?;
-                    Err(io::Error::new(io::ErrorKind::TimedOut, "tool timed out"))
-                }
-            }
+                Ok(Err(error)) => error,
+                Err(_) => io::Error::new(io::ErrorKind::TimedOut, "tool timed out"),
+            };
+            // Keep partial/completed output outside the timed future, including
+            // a root's final failure when an enclosing Job still has a live
+            // trusted helper. Cleanup failure must not replace that first cause.
+            let elapsed = started.elapsed();
+            let cleanup = terminate(&mut child).await;
+            let (stdout_close, stderr_close) = tokio::join!(
+                stdout.close(Duration::from_secs(5)),
+                stderr.close(Duration::from_secs(5))
+            );
+            Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{phase} after {} ms: {error}; stdout_eof={stdout_eof} stderr_eof={stderr_eof}; \
+                 cleanup={cleanup:?} stdout_close={stdout_close:?} stderr_close={stderr_close:?}; \
+                 stdout prefix: {}; stderr prefix: {}",
+                    elapsed.as_millis(),
+                    prefix(&stdout_bytes),
+                    prefix(&stderr_bytes)
+                ),
+            ))
         }
     }
 
-    async fn read(mut pipe: kuru_platform::windows::pipe::Pipe) -> io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        (&mut pipe)
+    fn prefix(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&bytes[..bytes.len().min(64 * 1024)])
+    }
+
+    async fn read(
+        pipe: &mut kuru_platform::windows::pipe::Pipe,
+        bytes: &mut Vec<u8>,
+        eof: &mut bool,
+    ) -> io::Result<()> {
+        (&mut *pipe)
             .take(OUTPUT_LIMIT + 1)
-            .read_to_end(&mut bytes)
+            .read_to_end(bytes)
             .await?;
-        pipe.close(Duration::from_secs(5)).await?;
         if bytes.len() as u64 > OUTPUT_LIMIT {
             return Err(io::Error::other("tool output exceeds limit"));
         }
-        Ok(bytes)
+        *eof = true;
+        pipe.close(Duration::from_secs(5)).await
     }
 
     async fn terminate(child: &mut NativeChild) -> io::Result<()> {
-        child.terminate()?;
-        child.wait(Duration::from_secs(5)).await?;
-        Ok(())
+        let termination = child.terminate();
+        let reaped = child.wait(Duration::from_secs(5)).await;
+        match (termination, reaped) {
+            (Ok(()), Ok(_)) => Ok(()),
+            (termination, reaped) => Err(io::Error::other(format!(
+                "native cleanup: terminate={termination:?}; wait={reaped:?}"
+            ))),
+        }
     }
 }

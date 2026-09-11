@@ -667,6 +667,7 @@ async fn loaded_image_acknowledges_exact_new_bytes_while_old_process_is_still_al
     let original_identity = regular_file_info(&original_file).unwrap().identity;
     drop(original_file);
     let mut child = fixture.spawn().spawn().await.unwrap();
+    let errors = tokio::spawn(error_output(child.take_stderr().unwrap()));
     let mut input = child.take_stdin().unwrap();
     let mut output = child.take_stdout().unwrap();
     let ack: serde_json::Value = serde_json::from_str(&line(&mut output).await).unwrap();
@@ -708,6 +709,49 @@ async fn loaded_image_acknowledges_exact_new_bytes_while_old_process_is_still_al
     input.close(TIMEOUT).await.unwrap();
     assert!(child.wait(TIMEOUT).await.unwrap().success());
     output.close(TIMEOUT).await.unwrap();
+    let trace = tokio::time::timeout(TIMEOUT, errors)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let trace = String::from_utf8(trace).unwrap();
+    let mut records = trace.lines();
+    let mut previous = 0;
+    for phase in [
+        "started",
+        "receive_request",
+        "acquire_installation_lock",
+        "installation_lock_acquired",
+        "hash_loaded_helper",
+        "loaded_helper_verified",
+        "verify_original",
+        "copy_candidate",
+        "copy_rollback",
+        "prepared_receipt_saved",
+        "publish",
+        "old_moved_before_receipt",
+        "candidate_moved_before_receipt",
+        "send_verified_publication_acknowledgment",
+        "verified_publication_acknowledgment_sent",
+        "wait_parent_exit",
+    ] {
+        let prefix = format!("trusted update helper: phase={phase} elapsed_ms=");
+        let elapsed: u128 = records
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("missing ordered phase {phase}: {trace}"))
+            .parse()
+            .unwrap();
+        assert!(
+            elapsed >= previous,
+            "helper elapsed records moved backward: {trace}"
+        );
+        previous = elapsed;
+    }
+    assert!(
+        trace.contains("phase=complete elapsed_ms=")
+            || trace.contains("phase=parent_still_alive_cleanup_pending elapsed_ms="),
+        "helper did not report its actual bounded cleanup outcome: {trace}"
+    );
     // The cached current-version image is deliberately persistent. A fresh
     // public invocation runs the new image only after verified acknowledgment.
     assert!(helper.is_file());

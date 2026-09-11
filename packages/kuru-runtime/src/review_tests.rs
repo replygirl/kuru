@@ -832,33 +832,53 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         time::Duration,
     };
-    struct Guard(Arc<AtomicUsize>);
+    use tokio::sync::oneshot;
+
+    struct Guard {
+        active: Arc<AtomicUsize>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
     impl Drop for Guard {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
         }
     }
     struct Cancellable {
         stalled: AtomicBool,
         active: Arc<AtomicUsize>,
+        entered: Mutex<Option<oneshot::Sender<CompletionRequest>>>,
+        dropped: Mutex<Option<oneshot::Sender<()>>>,
     }
     #[async_trait]
     impl Provider for Cancellable {
         async fn models(&self) -> Result<Vec<ModelInfo>> {
             Ok(vec![])
         }
-        async fn complete(&self, _request: CompletionRequest) -> Result<Completion> {
+        async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
             self.active.fetch_add(1, Ordering::SeqCst);
-            let _guard = Guard(self.active.clone());
+            let _guard = Guard {
+                active: self.active.clone(),
+                dropped: self.dropped.lock().unwrap().take(),
+            };
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(request);
+            }
             if self.stalled.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
             Ok(reply("Recovered after cancellation"))
         }
     }
+    let (entered, request) = oneshot::channel();
+    let (dropped, cancellation) = oneshot::channel();
     let provider = Arc::new(Cancellable {
         stalled: AtomicBool::new(true),
         active: Arc::new(AtomicUsize::new(0)),
+        entered: Mutex::new(Some(entered)),
+        dropped: Mutex::new(Some(dropped)),
     });
     let (_dir, harness) = fixture(
         Config {
@@ -868,34 +888,67 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
         provider.clone(),
     )
     .await;
+    let permits = harness.permits.clone();
     let shared = Arc::new(tokio::sync::Mutex::new(harness));
     let running = shared.clone();
-    let task = tokio::spawn(async move { running.lock().await.run("Start a task").await });
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while provider.active.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
+    let mut task = tokio::spawn(async move { running.lock().await.run("Start a task").await });
+    // Entry follows real transcript/input commits and private-history reads.
+    // Use the real-dream fixture's 30s setup bound, not the cancellation bound.
+    let request = tokio::select! {
+        observed = tokio::time::timeout(Duration::from_secs(30), request) => {
+            match observed {
+                Ok(Ok(request)) => request,
+                error => {
+                    task.abort();
+                    let stopped = task.await;
+                    let cleanup = shared.lock().await.shutdown(false).await;
+                    panic!("provider entry after persisted setup failed: {error:?}; turn: {stopped:?}; cleanup: {cleanup:?}");
+                }
+            }
         }
+        ended = &mut task => {
+            let cleanup = shared.lock().await.shutdown(false).await;
+            panic!("turn ended before provider entry: {ended:?}; cleanup: {cleanup:?}");
+        }
+    };
+    assert!(
+        request
+            .messages
+            .iter()
+            .any(|message| message.role == "user" && message.content == "Start a task")
+    );
+    assert_eq!(provider.active.load(Ordering::SeqCst), 1);
+    assert!(
+        permits.try_acquire().is_err(),
+        "provider must hold the only permit"
+    );
+
+    // Only actual cancellation and permit release get the existing 2s bound.
+    // Acquiring the permit also excludes a still-active or leaked actor call.
+    let permit = tokio::time::timeout(Duration::from_secs(2), async {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        cancellation
+            .await
+            .expect("stalled provider must be dropped");
+        permits.acquire().await.expect("actor pool remains open")
     })
     .await
-    .unwrap();
-    task.abort();
-    assert!(task.await.unwrap_err().is_cancelled());
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while provider.active.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    .expect("cancellation must drop provider work and release the pool permit within 2s");
+    assert_eq!(provider.active.load(Ordering::SeqCst), 0);
+    drop(permit);
+
     provider.stalled.store(false, Ordering::SeqCst);
-    let output = tokio::time::timeout(Duration::from_secs(2), async {
+    // The recovery turn performs another full set of real Dolt operations.
+    let output = tokio::time::timeout(Duration::from_secs(30), async {
         shared.lock().await.run("Continue").await
     })
     .await
-    .unwrap()
+    .expect("persisted recovery turn must complete")
     .unwrap();
     assert_eq!(output.text, "Recovered after cancellation");
     assert_eq!(provider.active.load(Ordering::SeqCst), 0);
+    shared.lock().await.shutdown(false).await.unwrap();
 }
 
 #[cfg(unix)]

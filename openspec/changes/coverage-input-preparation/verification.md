@@ -12,6 +12,25 @@
   `/tmp/kuru-ci-1943c4e-results.md` and
   `/tmp/kuru-windows-1943c4e-results.md`. No retry or billing action was taken.
 
+  Hosted execution resumed at the evidence-only commit 1234096 in
+  [CI 34552780285](https://github.com/replygirl/kuru/actions/runs/34552780285).
+  Ubuntu and macOS arm64 passed their instrumented suites, source installation
+  and installed cold offline install/update checks. Their measured coverage was
+  14,318/14,746 (97.097518%) and 14,329/14,757 (97.099682%), respectively.
+  Input-only preparation took 6.79/7.98 seconds; their coverage task took
+  920.65/294.76 seconds and the complete coverage graph took 927.47/302.77
+  seconds. Ordinary memory prefetch did not run before instrumentation. These
+  are observations from different native runners, not a controlled performance
+  comparison. All static jobs and both other Unix shipping/memory jobs passed.
+  Full Windows subsequently completed with 381 passing cases, eight failures
+  and one ignored timing benchmark. Its coverage/preparation task took 2,537.35
+  seconds. All 62 memory cases passed, including cold provisioning and lifecycle
+  checks, but full-app update and other native consumer failures prevented
+  combined LCOV and later source/shipping installation checks. The required
+  aggregate correctly failed, so this acceptance row remains open. Evidence:
+  `/tmp/kuru-ci-1234096-results.md` and
+  `/tmp/kuru-windows-1234096-results.md`.
+
 ## 2. Workflow and instruction consistency
 
 - [x] 2.1 @integration (agent) Run relevant format, tooling, strict cospec/managed and docs checks and review the resulting diff -> the concurrent relevant gate passed in 4.63 seconds, including docs build/content/links. Independent diff review found only the declared prerequisite and documentation edits; native jobs, thresholds, scoped tools and publication order are intact. Evidence: `/tmp/kuru-coverage-input-static.log` and `/tmp/kuru-coverage-input-graph-review.md`.

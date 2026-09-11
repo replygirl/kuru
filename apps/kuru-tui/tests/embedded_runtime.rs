@@ -185,7 +185,9 @@ impl Installation {
         command
     }
     async fn run(&self, args: &[&str]) -> Result<Value> {
-        let output = execute(self.command().args(args)).await?;
+        let output = execute(self.command().args(args))
+            .await
+            .with_context(|| format!("execute installed command {args:?}"))?;
         ensure!(
             output.status.success(),
             "installed command {args:?} failed: {}\n{}",
@@ -392,7 +394,9 @@ async fn install_packaged(
     if let Some(value) = std::env::var_os("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", value);
     }
-    let output = execute(&mut command).await?;
+    let output = execute(&mut command)
+        .await
+        .context("execute stock PowerShell package installation")?;
     ensure!(
         output.status.success(),
         "stock PowerShell could not install the genuine packaged Kuru: {}\n{}",
@@ -440,7 +444,9 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         releases.join(format!("{name}.sha256")),
         releases.join("SHA256SUMS"),
     )?;
-    let installed = install_packaged(root, &releases, version, &install_dir, target).await?;
+    let installed = install_packaged(root, &releases, version, &install_dir, target)
+        .await
+        .context("install the genuine packaged executable")?;
     let original_digest = digest(&binary)?;
     ensure!(
         digest(&installed)? == original_digest,
@@ -451,7 +457,9 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         "installation must contain only Kuru and the Windows update coordination directory"
     );
     let first = Installation::new(root, "direct", &project, &installed)?;
-    let reported = execute(first.command().arg("--version")).await?;
+    let reported = execute(first.command().arg("--version"))
+        .await
+        .context("run the directly installed executable's version command")?;
     ensure!(
         reported.status.success()
             && String::from_utf8_lossy(&reported.stdout).trim() == format!("kuru {version}"),
@@ -463,7 +471,8 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
             asset,
             dolt_version,
         )
-        .await?;
+        .await
+        .context("verify the direct installation's cold offline memory")?;
 
     let previous_identity = regular_file_info(&File::open(&installed)?)?.identity;
     let output = execute(
@@ -472,7 +481,8 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
             .args(["update", "--version", version, "--release-base"])
             .arg(&releases),
     )
-    .await?;
+    .await
+    .context("run the installed executable's self-update")?;
     ensure!(
         output.status.success(),
         "native self-update failed: {}",
@@ -493,7 +503,8 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
             asset,
             dolt_version,
         )
-        .await?;
+        .await
+        .context("verify the updated installation's cold offline memory")?;
     ensure!(
         fs::read_dir(&install_dir)?.count() == if cfg!(windows) { 2 } else { 1 },
         "self-update left a required companion executable"

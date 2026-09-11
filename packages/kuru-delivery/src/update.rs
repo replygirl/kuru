@@ -20,7 +20,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::windows::io::AsRawHandle,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -33,7 +33,27 @@ const JSON_LIMIT: usize = 64 * 1024;
 
 // Ordinary callers supply a no-op. Maintainer fixtures observe completed
 // filesystem boundaries without choosing outcomes or changing receipt bytes.
-type Observer = dyn FnMut(&str, &Receipt) -> Result<()> + Send;
+type Observer<'a> = dyn FnMut(&str, &Receipt) -> Result<()> + Send + 'a;
+
+// A failed ACK can leave a correctly retained helper still doing work. Emit
+// finite, static phase names before and after that work, without paths, hashes,
+// credentials or a second control protocol. The existing bounded stderr owner
+// drains these records; diagnostics never change publication or timeout policy.
+struct HelperTrace(Instant);
+
+impl HelperTrace {
+    fn new() -> Self {
+        Self(Instant::now())
+    }
+
+    fn at(&self, phase: &str) {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "trusted update helper: phase={phase} elapsed_ms={}",
+            self.0.elapsed().as_millis()
+        );
+    }
+}
 
 #[derive(Debug)]
 pub struct UpdateOutcome {
@@ -335,7 +355,7 @@ fn cleanup(directory: &Directory, receipt: &mut Receipt) -> Result<()> {
 fn cleanup_observed(
     directory: &Directory,
     receipt: &mut Receipt,
-    observer: &mut Observer,
+    observer: &mut Observer<'_>,
 ) -> Result<()> {
     let parent = checked_parent(receipt)?;
     drop(verified(&parent, &receipt.installed, &receipt.replacement)?);
@@ -462,7 +482,8 @@ fn recover(directory: &Directory, receipt: &mut Receipt) -> Result<()> {
     rolled_back(directory, receipt)
 }
 
-fn prepare(directory: &Directory, request: &Request) -> Result<Receipt> {
+fn prepare(directory: &Directory, request: &Request, trace: &HelperTrace) -> Result<Receipt> {
+    trace.at("prepare_parent_and_previous_receipt");
     let parent = open(&request.parent, false)?;
     ensure!(
         parent.identity().to_bytes() == request.parent_identity && request.installed == "kuru.exe",
@@ -475,7 +496,9 @@ fn prepare(directory: &Directory, request: &Request) -> Result<Receipt> {
             "prior update cleanup is pending; retry after old Kuru processes exit"
         );
     }
+    trace.at("verify_original");
     let mut original = verified(&parent, &request.installed, &request.original)?;
+    trace.at("verify_recorded_helper");
     let helper_parent = open(
         request.helper.parent().context("helper has no parent")?,
         true,
@@ -489,6 +512,7 @@ fn prepare(directory: &Directory, request: &Request) -> Result<Receipt> {
             .context("invalid helper filename")?,
         &request.helper_image,
     )?);
+    trace.at("verify_candidate_source");
     let candidate_parent = open(
         request
             .candidate
@@ -505,8 +529,10 @@ fn prepare(directory: &Directory, request: &Request) -> Result<Receipt> {
     let operation = uuid::Uuid::new_v4().to_string();
     let candidate_name = format!("candidate-{operation}.exe");
     let backup_name = format!("backup-{operation}.exe");
+    trace.at("copy_candidate");
     let (replacement_file, replacement) =
         copy_new(directory, &candidate_name, &mut candidate, true)?;
+    trace.at("copy_rollback");
     let (backup_file, rollback) = match copy_new(directory, &backup_name, &mut original, true) {
         Ok(value) => value,
         Err(error) => {
@@ -533,6 +559,7 @@ fn prepare(directory: &Directory, request: &Request) -> Result<Receipt> {
         restored: None,
         phase: Phase::Prepared,
     };
+    trace.at("save_prepared_receipt");
     if let Err(error) = save(directory, &receipt) {
         // No rename of the installed image has happened yet. These retained
         // handles identify exactly the new files, including partial preparation.
@@ -541,10 +568,15 @@ fn prepare(directory: &Directory, request: &Request) -> Result<Receipt> {
         return Err(error);
     }
     drop((replacement_file, backup_file));
+    trace.at("prepared_receipt_saved");
     Ok(receipt)
 }
 
-fn publish(directory: &Directory, receipt: &mut Receipt, observer: &mut Observer) -> Result<()> {
+fn publish(
+    directory: &Directory,
+    receipt: &mut Receipt,
+    observer: &mut Observer<'_>,
+) -> Result<()> {
     move_original(directory, receipt, observer)?;
     publish_candidate(directory, receipt, observer)
 }
@@ -552,7 +584,7 @@ fn publish(directory: &Directory, receipt: &mut Receipt, observer: &mut Observer
 fn move_original(
     directory: &Directory,
     receipt: &mut Receipt,
-    observer: &mut Observer,
+    observer: &mut Observer<'_>,
 ) -> Result<()> {
     let parent = checked_parent(receipt)?;
     let original = verified(&parent, &receipt.installed, &receipt.original)?;
@@ -582,7 +614,7 @@ fn move_original(
 fn publish_candidate(
     directory: &Directory,
     receipt: &mut Receipt,
-    observer: &mut Observer,
+    observer: &mut Observer<'_>,
 ) -> Result<()> {
     let parent = checked_parent(receipt)?;
     let replacement = directory.read_write(OsStr::new(&receipt.candidate))?;
@@ -907,7 +939,9 @@ pub async fn run_helper(arguments: Vec<OsString>) -> Result<()> {
     run_helper_observed(arguments, &mut |_, _| Ok(())).await
 }
 
-async fn run_helper_observed(arguments: Vec<OsString>, observer: &mut Observer) -> Result<()> {
+async fn run_helper_observed(arguments: Vec<OsString>, observer: &mut Observer<'_>) -> Result<()> {
+    let trace = HelperTrace::new();
+    trace.at("started");
     ensure!(arguments.len() == 1, "invalid internal update invocation");
     let encoded = arguments[0]
         .to_str()
@@ -923,7 +957,7 @@ async fn run_helper_observed(arguments: Vec<OsString>, observer: &mut Observer) 
         let directory = state(&parent)?;
         let _lease = lock(&directory)?;
         let mut receipt = load(&directory)?.context("no pending update receipt")?;
-        let _running = checked_helper(&receipt.helper, &receipt.helper_image)?;
+        let _running = checked_helper(&receipt.helper, &receipt.helper_image, &trace)?;
         recover(&directory, &mut receipt)?;
         ensure!(
             receipt.phase != Phase::CleanupPending,
@@ -935,15 +969,27 @@ async fn run_helper_observed(arguments: Vec<OsString>, observer: &mut Observer) 
         start.parent_handle.context("missing parent handle")?,
         start.parent_pid.context("missing parent identity")?,
     )?;
+    trace.at("connect_parent");
     let mut pipe = pipe::connect(&start.pipe.context("missing helper channel")?, STARTUP).await?;
+    trace.at("receive_request");
     let request: Request = receive(&mut pipe).await?;
+    trace.at("open_installation_state");
     let parent = open(&request.parent, false)?;
     let directory = state(&parent)?;
+    trace.at("acquire_installation_lock");
     let _lease = lock(&directory)?;
-    let _running = checked_helper(&request.helper, &request.helper_image)?;
-    let mut receipt = prepare(&directory, &request).context("prepare durable update copies")?;
+    trace.at("installation_lock_acquired");
+    let _running = checked_helper(&request.helper, &request.helper_image, &trace)?;
+    let mut receipt =
+        prepare(&directory, &request, &trace).context("prepare durable update copies")?;
     observer("prepared", &receipt)?;
-    if let Err(error) = publish(&directory, &mut receipt, observer) {
+    trace.at("publish");
+    let published = publish(&directory, &mut receipt, &mut |phase, receipt| {
+        trace.at(phase);
+        observer(phase, receipt)
+    });
+    if let Err(error) = published {
+        trace.at("reconcile_publication_error");
         let reconciliation = recover(&directory, &mut receipt);
         if !matches!(
             receipt.phase,
@@ -954,6 +1000,7 @@ async fn run_helper_observed(arguments: Vec<OsString>, observer: &mut Observer) 
         }
     }
     observer("candidate_published", &receipt)?;
+    trace.at("send_verified_publication_acknowledgment");
     send(
         &mut pipe,
         &Acknowledgment {
@@ -963,23 +1010,33 @@ async fn run_helper_observed(arguments: Vec<OsString>, observer: &mut Observer) 
     )
     .await
     .context("send acknowledgment after verified update publication")?;
+    trace.at("verified_publication_acknowledgment_sent");
     pipe.close(STARTUP)
         .await
         .context("close acknowledged update channel")?;
+    trace.at("wait_parent_exit");
     if wait_process_handle(&parent_handle, CLEANUP).await.is_err() {
         receipt.phase = Phase::CleanupPending;
         save(&directory, &receipt)?;
+        trace.at("parent_still_alive_cleanup_pending");
         return Ok(());
     }
-    cleanup_observed(&directory, &mut receipt, observer)
+    trace.at("cleanup_after_parent_exit");
+    cleanup_observed(&directory, &mut receipt, observer)?;
+    trace.at("complete");
+    Ok(())
 }
 
 fn checked_helper(
     path: &Path,
     expected: &Image,
+    trace: &HelperTrace,
 ) -> Result<kuru_platform::windows::process::CurrentImage> {
+    trace.at("acquire_loaded_helper_guard");
     let mut running = current_image().context("verify the actual loaded recovery helper")?;
+    trace.at("hash_loaded_helper");
     let actual = image(running.file_mut())?;
+    trace.at("verify_loaded_helper_record");
     let directory = open(path.parent().context("helper has no parent")?, true)?;
     let name = path
         .file_name()
@@ -992,6 +1049,7 @@ fn checked_helper(
             && actual.bytes == expected.bytes,
         "recovery must run the recorded trusted helper image"
     );
+    trace.at("loaded_helper_verified");
     Ok(running)
 }
 
@@ -1143,6 +1201,7 @@ pub mod test_support {
                 candidate: source.path().join("candidate.exe"),
                 candidate_image,
             },
+            &HelperTrace::new(),
         )?;
         source.finish()?;
         drop((original_file, helper_file, input));
@@ -1196,7 +1255,7 @@ mod tests {
                 candidate: inputs.path().join("candidate.exe"),
                 candidate_image,
             };
-            let receipt = prepare(&state, &request).unwrap();
+            let receipt = prepare(&state, &request, &HelperTrace::new()).unwrap();
             Self {
                 _root: root,
                 parent,

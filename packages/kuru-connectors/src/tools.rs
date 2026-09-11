@@ -473,45 +473,146 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
         .context("cannot start Windows PowerShell")?;
     let mut stdout = child.take_stdout().context("missing shell stdout")?;
     let mut stderr = child.take_stderr().context("missing shell stderr")?;
+    let mut out = ShellCapture::default();
+    let mut err = ShellCapture::default();
+    let mut phase = "read shell output";
     let operation = async {
-        async fn read(reader: &mut kuru_platform::windows::pipe::Pipe) -> Result<Vec<u8>> {
-            let mut bytes = Vec::new();
-            reader
-                .take((MAX_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .await?;
-            ensure!(bytes.len() <= MAX_BYTES, "shell output exceeds 2 MiB limit");
-            Ok(bytes)
-        }
-        let (out, err) = tokio::try_join!(read(&mut stdout), read(&mut stderr))?;
+        tokio::try_join!(out.read(&mut stdout), err.read(&mut stderr))?;
+        phase = "wait for shell process tree";
         let status = child.wait(duration).await?;
-        Ok::<_, anyhow::Error>(json!({"exit_code":status.code(),"success":status.success(),"stdout":String::from_utf8_lossy(&out),"stderr":String::from_utf8_lossy(&err)}).to_string())
+        Ok::<_, anyhow::Error>(status)
     };
     let result = timeout(duration, operation)
         .await
-        .context("shell timed out; subprocess tree terminated")
+        .context("shell timed out")
         .and_then(|result| result);
-    if result.is_err() {
-        let _ = crate::process::stop(&mut child).await;
-    }
+    let result = match result {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            let observed = child.try_wait();
+            let stopped = match crate::process::stop(&mut child).await {
+                Ok(()) => "subprocess tree terminated".to_owned(),
+                Err(error) => format!("subprocess cleanup unconfirmed: {error:#}"),
+            };
+            let diagnostic = format!(
+                "{error:#}; {phase}; stdout {} bytes (EOF {}); stderr {} bytes (EOF {}); tree before cleanup: {observed:?}; {stopped}; stderr prefix: {}",
+                out.bytes.len(),
+                out.eof,
+                err.bytes.len(),
+                err.eof,
+                String::from_utf8_lossy(&err.bytes[..err.bytes.len().min(4096)]),
+            );
+            Err(error).context(diagnostic)
+        }
+    };
     let cleanup = async {
-        stdout.close(Duration::from_secs(5)).await?;
-        stderr.close(Duration::from_secs(5)).await?;
+        let (out, err) = tokio::join!(
+            stdout.close(Duration::from_secs(5)),
+            stderr.close(Duration::from_secs(5)),
+        );
+        out?;
+        err?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
     match result {
-        Ok(value) => {
+        Ok(status) => {
             cleanup?;
-            Ok(value)
+            Ok(json!({"exit_code":status.code(),"success":status.success(),"stdout":String::from_utf8_lossy(&out.bytes),"stderr":String::from_utf8_lossy(&err.bytes)}).to_string())
         }
-        Err(error) => Err(error),
+        Err(error) => match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error).context(format!("shell pipe cleanup failed: {cleanup:#}")),
+        },
+    }
+}
+
+// Keep accepted output outside the cancellable read future. A timeout must not
+// discard the bytes and EOF observations needed to distinguish a running shell
+// from a completed process whose output is still held by another process.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct ShellCapture {
+    bytes: Vec<u8>,
+    eof: bool,
+}
+
+#[cfg(any(windows, test))]
+impl ShellCapture {
+    async fn read(&mut self, reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<()> {
+        let mut buffer = [0; 8192];
+        loop {
+            let count = reader.read(&mut buffer).await?;
+            if count == 0 {
+                self.eof = true;
+                return Ok(());
+            }
+            let keep = count.min((MAX_BYTES + 1).saturating_sub(self.bytes.len()));
+            self.bytes.extend_from_slice(&buffer[..keep]);
+            ensure!(
+                self.bytes.len() <= MAX_BYTES,
+                "shell output exceeds 2 MiB limit"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_shell_capture_preserves_received_bytes_until_actual_eof() {
+        use tokio::io::AsyncWriteExt;
+        let (mut reader, mut writer) = tokio::io::duplex(1);
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            // The one-byte pipe cannot accept the suffix until the whole prefix
+            // has been read. Then retain the writer to withhold real EOF.
+            writer.write_all(b"accepted output!").await.unwrap();
+            sent.send(()).unwrap();
+            finishing.await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let mut capture = ShellCapture::default();
+        timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = capture.read(&mut reader) => panic!("writer still open: {result:?}"),
+                result = received => result.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(capture.bytes.starts_with(b"accepted output"));
+        assert!(!capture.eof);
+        finish.send(()).unwrap();
+        timeout(Duration::from_secs(2), capture.read(&mut reader))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(capture.bytes, b"accepted output!");
+        assert!(capture.eof);
+        producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_capture_rejects_overflow_without_retaining_unbounded_output() {
+        let bytes = vec![b'x'; MAX_BYTES + 16384];
+        let mut source = bytes.as_slice();
+        let mut capture = ShellCapture::default();
+        assert!(
+            capture
+                .read(&mut source)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+        assert_eq!(capture.bytes.len(), MAX_BYTES + 1);
+        assert!(!capture.eof);
+        assert!(!source.is_empty());
+    }
 
     #[tokio::test]
     async fn file_crud_is_contained_and_replaces_atomically() {

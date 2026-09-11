@@ -114,6 +114,13 @@ async fn serve(
     {
         rejected = Some("unexpected authentication header".to_owned());
         Vec::new()
+    } else if method == Method::GET && path == "/mise-version" && query.is_none() {
+        // `mise --version` also checks its own latest version outside CI. Our
+        // intentionally cleared environment has no CI flag or version cache.
+        // Keep that exact notification request local without disabling release
+        // provenance, changing backend behavior, or accepting arbitrary traffic.
+        content_type = "text/plain";
+        b"2026.9.4\n".to_vec()
     } else if method == Method::GET
         && path == "/api/repos/replygirl/kuru/releases"
         && matches!(query, None | Some("per_page=100"))
@@ -542,7 +549,8 @@ oauth_client_id=""
 'regex:^https://api\.github\.com/?$'='FIXTURE_BASE/api'
 'regex:^https://api\.github\.com/repos/replygirl/kuru(/|$)'='FIXTURE_BASE/api/repos/replygirl/kuru$1'
 'regex:^https://github\.com/replygirl/kuru/releases/download/'='FIXTURE_BASE/download/'
-'regex:^https?://.*'='FIXTURE_BASE/unexpected'
+'regex:^https://mise\.jdx\.dev/VERSION$'='FIXTURE_BASE/mise-version'
+'regex:^(https?://.*)'='FIXTURE_BASE/unexpected/$1'
 "#;
 
 pub async fn run(binary: &Path) -> Result<()> {
@@ -595,6 +603,16 @@ pub async fn run(binary: &Path) -> Result<()> {
                 .await?
                 .contains("2026.9.4"),
             "unexpected mise version"
+        );
+        ensure!(
+            server
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|request| request.method == Method::GET && request.path == "/mise-version"),
+            "the real mise version notification did not reach its isolated route"
         );
         if index == 0 {
             installed.isolation().await?;
