@@ -484,3 +484,24 @@ final error retention. Integrated formatting, 102 delivery host tests and strict
 host lint passed; these Windows-only cases require the next native run.
 Evidence: `/tmp/kuru-native-delivery-627-fixes.md` and
 `/tmp/kuru-delivery-path-review.md`.
+
+## Local cold gate and hosted startup block at 1943c4e
+
+The normal concurrent pre-push passed all eight hooks. Its initially absent
+private Dolt cache was populated by the instrumented fixtures, and actual cold
+startup, durable memory, installed offline update and runtime checks passed.
+Combined coverage was 14,328/14,757 lines (97.092905%); the instrumented suite
+took 260.25 seconds and coverage with input preparation took 261.90 seconds.
+Cargo artifacts were reused, so this is not a clean-build performance comparison.
+Evidence: `/tmp/kuru-627-corrections-push.log` and
+`/tmp/kuru-1943c4e-cold-coverage.lcov`.
+
+The resulting hosted CI `34551251564` and PR-title workflow `34551251314`
+failed before runner execution. All 15 CI jobs had zero executed steps and
+zero artifacts. GitHub's annotations report that recent account payments failed
+or the spending limit must be increased. No corrected Windows case, updater
+diagnostic, hosted coverage, source installation or shipping probe ran. Native
+acceptance and the unresolved app handoff remain pending; no retries, billing,
+Release or Pages actions were performed. Raw annotations and job metadata are
+recorded in `/tmp/kuru-windows-1943c4e-results.md` and
+`/tmp/kuru-ci-1943c4e-results.md`.
