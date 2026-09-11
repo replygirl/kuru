@@ -6,7 +6,7 @@ use kuru_platform::{
     fs::{Directory, NameRetention, Privacy, regular_file_info, require_private},
     windows::{
         pipe::Pipe,
-        process::{NativeChild, NativeSpawnSpec, Stdio, system_directory},
+        process::{NativeChild, NativeSpawnSpec, Stdio, system_directory, wait_process_handle},
     },
 };
 use std::{
@@ -167,12 +167,6 @@ async fn publication_wait_and_partial_frames_have_separate_bounded_native_deadli
                     "late frame extended total publication wait: {elapsed:?}"
                 );
             }
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        let cleanup = if result.is_err() {
-            stop(&mut child, &mut input, &mut output).await
-        } else {
             if matches!(
                 case,
                 "absent" | "partial-header" | "partial-body" | "late-header"
@@ -184,12 +178,22 @@ async fn publication_wait_and_partial_frames_have_separate_bounded_native_deadli
             let status = child.wait(TIMEOUT).await?;
             output.close(TIMEOUT).await?;
             ensure!(status.success(), "{case}: frame fixture failed: {status}");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let diagnostic_close = diagnostic.close(TIMEOUT).await;
+        let cleanup = if result.is_err() || diagnostic_close.is_err() {
+            stop(&mut child, &mut input, &mut output).await
+        } else {
             Ok(())
         };
-        diagnostic.close(TIMEOUT).await?;
+        let context = format!(
+            "native frame case {case}; owned cleanup={cleanup:?}; diagnostic close={diagnostic_close:?}"
+        );
         result
+            .and(diagnostic_close.map_err(anyhow::Error::from))
             .and(cleanup)
-            .with_context(|| format!("native frame case {case}"))?;
+            .context(context)?;
     }
     Ok(())
 }
@@ -426,13 +430,18 @@ fn reconciled(
 }
 
 async fn stop(child: &mut NativeChild, input: &mut Pipe, output: &mut Pipe) -> Result<()> {
-    child.terminate()?;
-    child
-        .wait(TIMEOUT)
-        .await
-        .context("fixture Job did not become quiescent")?;
-    input.close(TIMEOUT).await?;
-    output.close(TIMEOUT).await?;
+    // Observe every cleanup result even if an earlier operation fails. Keep
+    // the first error as the cause and retain the remaining cleanup evidence.
+    let termination = child.terminate();
+    let reaped = child.wait(TIMEOUT).await;
+    let (input_close, output_close) = tokio::join!(input.close(TIMEOUT), output.close(TIMEOUT));
+    let diagnostic = format!(
+        "fixture cleanup: terminate={termination:?}; wait={reaped:?}; input close={input_close:?}; output close={output_close:?}"
+    );
+    termination.context(diagnostic.clone())?;
+    reaped.context(diagnostic.clone())?;
+    input_close.context(diagnostic.clone())?;
+    output_close.context(diagnostic)?;
     Ok(())
 }
 
@@ -575,6 +584,7 @@ async fn publication_after_startup_budget_acknowledges_exact_image_while_parent_
         .context("slow publication fixture output")?;
     let errors = tokio::spawn(error_output(child.take_stderr().context("helper stderr")?));
     let result = async {
+        let parent = child.duplicate_process_handle()?;
         let marker = record(&mut output).await?;
         ensure!(
             marker["checkpoint"] == "prepared" && marker["phase"] == "prepared",
@@ -593,9 +603,10 @@ async fn publication_after_startup_budget_acknowledges_exact_image_while_parent_
         // parent has sent its request. Cross the old ten-second ACK allowance
         // before releasing actual publication; no production clock is changed.
         tokio::time::sleep(Duration::from_secs(11)).await;
+        let parent_state = wait_process_handle(&parent, Duration::ZERO).await;
         ensure!(
-            child.try_wait()?.is_none(),
-            "old parent exited before publication"
+            matches!(&parent_state, Err(error) if error.kind() == io::ErrorKind::TimedOut),
+            "old parent is not observably alive before publication: {parent_state:?}"
         );
         ensure!(
             read_receipt(&fixture)? == before,
@@ -614,9 +625,10 @@ async fn publication_after_startup_budget_acknowledges_exact_image_while_parent_
                 && acknowledgment["cleanup_pending"] == true,
             "invalid real publication acknowledgment: {acknowledgment}"
         );
+        let parent_state = wait_process_handle(&parent, Duration::ZERO).await;
         ensure!(
-            child.try_wait()?.is_none(),
-            "old parent exited before ACK inspection"
+            matches!(&parent_state, Err(error) if error.kind() == io::ErrorKind::TimedOut),
+            "old parent is not observably alive during ACK inspection: {parent_state:?}"
         );
         let receipt = read_receipt(&fixture)?;
         ensure!(
@@ -675,10 +687,11 @@ async fn publication_after_startup_budget_acknowledges_exact_image_while_parent_
         Ok(())
     };
     let errors = tokio::time::timeout(TIMEOUT, errors).await;
+    let cleanup_diagnostic = format!("{cleanup:?}");
     if let Err(failure) = result.and(cleanup) {
         let retained = fixture._root.keep();
         anyhow::bail!(
-            "slow verified publication: {failure:#}; stderr={errors:?}; retained {}",
+            "slow verified publication: {failure:#}; cleanup={cleanup_diagnostic}; stderr={errors:?}; retained {}",
             retained.display()
         );
     }
