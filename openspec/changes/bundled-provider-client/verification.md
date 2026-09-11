@@ -13,6 +13,8 @@
 - [ ] 2.3 @integration (agent) exercise exact-entry USTAR/GNU decoder and real filesystem publication with unexpected PAX/extension metadata, unsafe paths, duplicate/linked/device entries, truncation, excess sizes and notice/digest mismatches -> bounded failure preserves existing cache and never activates partial or aliased executables; no custom repack or general package extraction is introduced.
 - [ ] 2.4 @runtime (agent) cancel concurrent first-use extraction and retain a running client while another version is prepared on Unix and Windows -> private ownership, atomic activation, live-file lifetime and bounded process cleanup remain valid.
 - [ ] 2.5 @regression (agent) invoke default Dolt and explicit Codex preparation with both environment namespaces, CLI overrides, foreign CARGO_BUILD_TARGET and explicit host selection -> old Dolt defaults remain intact, kind/manifest mismatches reject, no unselected namespace changes behavior, and every helper executes natively while preparing the exact consumer target.
+- [ ] 2.6 @runtime (agent) observe real probe, RPC and authentication children at controlled startup/partial-reply barriers, then cancel their callers and separately destroy the initiating runtime -> owned files, temporary directories and staging leases remain until actual cleanup; errors and nonadvancing model pagination use the same path, caller waits remain bounded, and cancelled preparation cannot activate a cache entry.
+- [ ] 2.7 @regression (agent) exercise default auth/models/provider paths through native/XDG/explicit data-directory resolution and invalid workspace-contained roots -> one checked cache location serves every bundled route, while explicit external clients, other providers and config-only inspection leave the managed cache untouched.
 
 ## 3. Installed and updated complete executable [critical]
 
@@ -40,3 +42,15 @@ The completed upstream audit is preparation, not five-platform acceptance:
 were downloaded and hashed; only macOS arm64 was executed. Preserve the
 distinction between an unauthenticated native handshake, a mocked inference
 response and live login.
+
+Fresh official metadata on 2026-09-11 still selects 0.154.0 with the same source,
+five archive URLs/sizes/digests and notice identities; no payload was downloaded
+again. Source review identified the transient-resource lifetime needed by the
+bundle and fixed the stale description of the device-login route. The planning
+now names explicit data-root cache options and a Codex-local operation owner;
+no provider code or dependency changed. Evidence:
+`/tmp/kuru-codex-current-release-20260911.md` and
+`/tmp/kuru-codex-lifetime-design-review.md`. Strict validation passed with zero
+errors/warnings; actual apply returned 2 for the active native-windows blocker
+and no context files. Logs: `/tmp/kuru-provider-lifetime-validate.log` and
+`/tmp/kuru-provider-lifetime-apply.json`. Native acceptance remains required.

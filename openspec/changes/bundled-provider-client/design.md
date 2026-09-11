@@ -1,8 +1,8 @@
 ## Context
 
 The existing connector launches `config.codex_command`, whose default is
-`codex`, for app-server inference. TUI authentication has both connector-owned
-commands and a direct device-login launch; all must use one resolution policy.
+`codex`, for app-server inference. All four TUI authentication routes already
+delegate to the connector; keep that shared route under one resolution policy.
 `isolation_config` disables provider-native execution and optional capabilities,
 and the runtime owns structured tool proposals. The existing Dolt bundle already
 separates memory-owned target verification from a native delivery preparation
@@ -100,6 +100,23 @@ the user's selected authentication client. Keep the cache outside credential,
 memory and tool roots. Reject automatic PATH fallback because it recreates the
 install prerequisite and can make login and inference use different clients.
 
+Pass named client options from the CLI's existing resolved data root; the managed
+cache is `<data>/tools/codex`, alongside the Dolt cache and outside the memory
+namespace. Validate the data-root identity and exclusion from the project tool
+root before creating client cache children, including early auth and models
+commands. Keep existing `--data-dir`, native and XDG path precedence; connectors
+need no second HOME resolver or new user setting for this slice. Do not repurpose
+the provider factory's cwd argument as a cache path. Explicit external commands,
+other providers and configuration-only inspection never prepare a managed client.
+
+Resolution returns opaque ownership of checked cache-directory, executable and
+notice handles, not only a path. Version/target/content identity distinguishes
+immutable entries; new versions coexist without garbage collection or in-place
+repair. Invalid warm entries fail closed. Release the short installation lease
+after activation so it does not serialize independent peer connections. Held
+read handles retain identities and native names; they do not promise exclusion
+of another same-user writer.
+
 ### 3. Preserve the upstream executable and prove the selected payload
 
 Use the official per-executable gzip assets, keeping their bytes and signing
@@ -165,6 +182,28 @@ explicit environments. Kuru never reads or relocates auth files. Keep unknown
 models/efforts and the inference-only configuration intact; the bundle does not
 grant provider-native execution authority. Retain process-tree ownership and
 bounded pipe cleanup through the native Windows API once that prerequisite lands.
+
+Keep Codex-created process ownership separate from the caller's executor lifetime.
+A connector-local operation scope owns one models/completion/auth invocation,
+its selected client and any Kuru-created temporary directory. Create its child
+and reactor-bound pipes on its own executor, observe caller loss, and retain the
+resources through actual close/reap on success, error, timeout and cancellation.
+If bounded cleanup cannot establish completion, return the failure while the
+same owner continues observation with those resources retained. A plain guard
+field dropped immediately after requesting termination is insufficient. Inspect
+inner child-wait errors as well as timeout results. Keep this scope specific to
+Codex; do not introduce an MCP broker or a generic provider runtime. Existing
+safe platform APIs supply the needed native mechanics.
+
+Use the same ownership rule for the isolated version probe, following memory's
+owned-probe pattern. Extraction workers retain their stage/lease until writing
+ends, and only a still-active resolver may publish after receiving a successful
+probe result. Probe HOME/CODEX_HOME remain isolated; actual auth/inference retain
+the user's existing client-owned home selection. Native fixtures must observe
+resource retention and cleanup after destroying the initiating runtime. Unix
+group termination/root reaping is not a Windows Job active-count query; controlled
+descendant pipe/lock observations establish the intended cleanup without claiming
+a broader guarantee.
 
 ### 6. Delivery is measured as a complete installed product
 
