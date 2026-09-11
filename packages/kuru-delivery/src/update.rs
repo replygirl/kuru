@@ -28,6 +28,10 @@ const STATE: &str = ".kuru-update";
 const RECEIPT: &str = "receipt.json";
 const LOCK: &str = "install.lock";
 const STARTUP: Duration = Duration::from_secs(10);
+// The authenticated helper verifies and durably copies full embedded images
+// before acknowledging publication. That work has its own finite allowance;
+// connection establishment and a frame already in flight keep their short limit.
+const PUBLICATION: Duration = Duration::from_secs(120);
 const CLEANUP: Duration = Duration::from_secs(10);
 const JSON_LIMIT: usize = 64 * 1024;
 
@@ -658,19 +662,41 @@ async fn send<T: Serialize>(pipe: &mut Pipe, value: &T) -> Result<()> {
 }
 
 async fn receive<T: for<'de> Deserialize<'de>>(pipe: &mut Pipe) -> Result<T> {
-    let bytes = tokio::time::timeout(STARTUP, async {
-        let length = pipe.read_u32_le().await? as usize;
-        if length > JSON_LIMIT {
-            return Err(std::io::Error::other(
-                "update protocol message exceeds limit",
-            ));
-        }
-        let mut bytes = vec![0; length];
-        pipe.read_exact(&mut bytes).await?;
-        Ok::<_, std::io::Error>(bytes)
+    tokio::time::timeout(STARTUP, async {
+        let first = pipe.read_u8().await?;
+        receive_tail(pipe, first).await
     })
-    .await??;
+    .await?
+}
+
+async fn receive_tail<T: for<'de> Deserialize<'de>>(pipe: &mut Pipe, first: u8) -> Result<T> {
+    let mut header = [first, 0, 0, 0];
+    pipe.read_exact(&mut header[1..]).await?;
+    let length = u32::from_le_bytes(header) as usize;
+    ensure!(
+        length <= JSON_LIMIT,
+        "update protocol message exceeds limit"
+    );
+    let mut bytes = vec![0; length];
+    pipe.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+async fn receive_publication(
+    pipe: &mut Pipe,
+    publication: Duration,
+    frame: Duration,
+) -> Result<Acknowledgment> {
+    let publication_deadline = tokio::time::Instant::now() + publication;
+    let first = tokio::time::timeout_at(publication_deadline, pipe.read_u8())
+        .await
+        .context("publication acknowledgment did not begin within its budget")??;
+    // A partial header cannot buy another publication allowance, and even a
+    // late first byte cannot extend the total wait beyond the original budget.
+    let frame_deadline = publication_deadline.min(tokio::time::Instant::now() + frame);
+    tokio::time::timeout_at(frame_deadline, receive_tail(pipe, first))
+        .await
+        .context("publication acknowledgment frame did not complete within its budget")?
 }
 
 // The trusted helper has no provider or user-auth environment. Retain a bounded
@@ -872,7 +898,7 @@ async fn replace_bytes_owned(
         )
         .await
         .context("send trusted helper update request")?;
-        let acknowledgment: Acknowledgment = receive(&mut pipe)
+        let acknowledgment = receive_publication(&mut pipe, PUBLICATION, STARTUP)
             .await
             .context("wait for verified update publication acknowledgment")?;
         ensure!(
@@ -1063,6 +1089,16 @@ fn checked_helper(
 pub mod test_support {
     use super::*;
 
+    /// Exercise actual native IPC framing with bounded fixture-specific clocks.
+    pub async fn receive_publication_frame(
+        pipe: &mut Pipe,
+        publication: Duration,
+        frame: Duration,
+    ) -> Result<()> {
+        receive_publication(pipe, publication, frame).await?;
+        Ok(())
+    }
+
     /// Exercise the production bounded prefix drain with actual native stderr.
     pub async fn capture_stderr(
         child: &mut kuru_platform::windows::process::NativeChild,
@@ -1082,6 +1118,7 @@ pub mod test_support {
                 value,
                 "none"
                     | "prepared"
+                    | "prepared_resume"
                     | "old_moved_before_receipt"
                     | "old_moved_before_receipt_resume"
                     | "candidate_moved_before_receipt"
@@ -1128,11 +1165,10 @@ pub mod test_support {
     /// The production parser still receives exactly its original JSON argument.
     pub async fn run_helper_observed(arguments: Vec<OsString>, checkpoint: &str) -> Result<()> {
         checked_checkpoint(checkpoint)?;
-        let resume = checkpoint == "old_moved_before_receipt_resume";
-        let checkpoint = if resume {
-            "old_moved_before_receipt"
-        } else {
-            checkpoint
+        let (checkpoint, resume) = match checkpoint {
+            "prepared_resume" => ("prepared", true),
+            "old_moved_before_receipt_resume" => ("old_moved_before_receipt", true),
+            other => (other, false),
         };
         let checkpoint = checkpoint.to_owned();
         let mut observer = move |reached: &str, receipt: &Receipt| {
@@ -1142,9 +1178,9 @@ pub mod test_support {
                     serde_json::json!({"checkpoint":reached,"operation":receipt.operation,"phase":receipt.phase,"helper_pid":std::process::id()})
                 );
                 std::io::stdout().flush()?;
-                // Existing interruption cases kill at this marker. The one
-                // resume fixture first acquires a real conflicting file handle
-                // and then allows the actual publication operation to continue.
+                // Interruption cases kill at this marker. Resume controls hold
+                // either a real conflicting file handle or observed preparation
+                // beyond startup before allowing actual publication to continue.
                 let mut byte = [0];
                 std::io::stdin().read_exact(&mut byte)?;
                 ensure!(

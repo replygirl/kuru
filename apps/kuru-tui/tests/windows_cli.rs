@@ -217,6 +217,8 @@ if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -n
 
 #[test]
 fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environment() {
+    use std::io::Read;
+
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("workspace 日本語");
     let modules = root.path().join("incompatible modules");
@@ -245,11 +247,30 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     let identity = regular_file_info(&File::open(&input).unwrap())
         .unwrap()
         .identity;
+    // Keep each invocation's observations independent: the failing direct
+    // control must never supply evidence that Kuru's own shell entered source.
+    let control_progress = root.path().join("control-progress");
+    let kuru_progress = root.path().join("kuru-progress");
+    let read_progress = |path: &Path| -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        File::open(path)?.take(257).read_to_end(&mut bytes)?;
+        if bytes.len() > 256 {
+            return Err(std::io::Error::other(
+                "shell stage marker exceeds 256 bytes",
+            ));
+        }
+        String::from_utf8(bytes)
+            .map_err(|_| std::io::Error::other("shell stage marker is not UTF-8"))
+    };
     let sentinel = "retained & literal 日本語";
     let source = r#"$ErrorActionPreference = 'Stop'
+[IO.File]::WriteAllText($env:KURU_SHELL_PROGRESS, "entered`n")
 if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'expected stock PowerShell 5.1' }
+[IO.File]::AppendAllText($env:KURU_SHELL_PROGRESS, "version-checked`nhash-started`n")
 $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
+[IO.File]::AppendAllText($env:KURU_SHELL_PROGRESS, "hashed`n")
 [Console]::Write($hash + '|' + $env:KURU_SHELL_SENTINEL)
+[IO.File]::AppendAllText($env:KURU_SHELL_PROGRESS, "completed`n")
 "#;
     let child = |binary: &Path| {
         let mut child = command(root.path(), binary);
@@ -266,6 +287,7 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
         .unwrap()
         .join("WindowsPowerShell/v1.0/powershell.exe");
     let control = child(&powershell)
+        .env("KURU_SHELL_PROGRESS", &control_progress)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -275,14 +297,17 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
             "-Command",
             source,
         ])
-        .output()
-        .unwrap();
+        .output();
+    let control_stages = read_progress(&control_progress);
+    let control = control.unwrap_or_else(|error| {
+        panic!("stock PowerShell control failed: {error}; stages={control_stages:?}")
+    });
     let diagnostic = String::from_utf8_lossy(&control.stderr);
     let preview =
         |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
     assert!(
         !control.status.success(),
-        "unsanitized control must fail: status={} stdout={:?} stderr={:?}",
+        "unsanitized control must fail: status={} stdout={:?} stderr={:?} stages={control_stages:?}",
         control.status,
         preview(&control.stdout),
         preview(&control.stderr)
@@ -291,23 +316,36 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
         diagnostic.contains("Get-FileHash")
             && diagnostic.contains("CouldNotAutoloadMatchingModule")
             && diagnostic.contains("Microsoft.PowerShell.Utility"),
-        "control must reach the incompatible module's autoload failure: {:?}",
+        "control must reach the incompatible module's autoload failure: {:?}; stages={control_stages:?}",
         preview(&control.stderr)
     );
     assert!(control.stdout.is_empty());
+    assert_eq!(
+        control_stages.as_deref().ok(),
+        Some("entered\nversion-checked\nhash-started\n"),
+        "control must stop at the actual hash command: {control_stages:?}"
+    );
 
     let arguments = serde_json::json!({ "command": source }).to_string();
     let output = child(Path::new(env!("CARGO_BIN_EXE_kuru")))
+        .env("KURU_SHELL_PROGRESS", &kuru_progress)
         .arg("-C")
         .arg(&project)
         .args(["--allow-shell", "tool", "shell", "--args", &arguments])
-        .output()
-        .unwrap();
+        .output();
+    let kuru_stages = read_progress(&kuru_progress);
+    let output =
+        output.unwrap_or_else(|error| panic!("Kuru shell failed: {error}; stages={kuru_stages:?}"));
     assert!(
         output.status.success(),
-        "{}\n{}",
+        "{}\n{}\nstages={kuru_stages:?}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        kuru_stages.as_deref().ok(),
+        Some("entered\nversion-checked\nhash-started\nhashed\ncompleted\n"),
+        "Kuru must complete its own source sequence: {kuru_stages:?}"
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["exit_code"], 0);

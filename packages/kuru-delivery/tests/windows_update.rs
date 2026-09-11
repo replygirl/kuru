@@ -80,6 +80,120 @@ async fn trusted_helper_stderr_preserves_eof_error_and_drains_past_prefix_limit(
     Ok(())
 }
 
+#[tokio::test]
+async fn publication_wait_and_partial_frames_have_separate_bounded_native_deadlines() -> Result<()>
+{
+    use kuru_delivery::update::test_support::receive_publication_frame;
+
+    let root = tempfile::tempdir()?;
+    for (case, expected) in [
+        ("absent", "did not begin within its budget"),
+        ("partial-header", "frame did not complete within its budget"),
+        ("partial-body", "frame did not complete within its budget"),
+        ("late-header", "frame did not complete within its budget"),
+        ("oversized", "message exceeds limit"),
+        ("truncated-header", "unexpected EOF"),
+        ("truncated-body", "unexpected EOF"),
+        ("invalid-json", "expected value"),
+        ("invalid-ack", "missing field"),
+    ] {
+        let mut spec = NativeSpawnSpec::new(
+            PathBuf::from(env!("CARGO_BIN_EXE_kuru-delivery-fixture")),
+            root.path().to_owned(),
+        );
+        spec.args = vec!["update-frame".into(), case.into()];
+        spec.stdin = Stdio::Pipe;
+        spec.stdout = Stdio::Pipe;
+        spec.stderr = Stdio::Pipe;
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            spec.environment.push(("LLVM_PROFILE_FILE".into(), profile));
+        }
+        let mut child = spec.spawn().await?;
+        let mut input = child.take_stdin().context("frame fixture input")?;
+        let mut output = child.take_stdout().context("frame fixture output")?;
+        let mut diagnostic = child.take_stderr().context("frame fixture readiness")?;
+        let result = async {
+            let mut ready = [0; 6];
+            tokio::time::timeout(TIMEOUT, diagnostic.read_exact(&mut ready))
+                .await
+                .context("frame fixture did not become ready")??;
+            ensure!(ready == *b"ready\n", "invalid frame readiness marker");
+            let late = case == "late-header";
+            let publication = Duration::from_secs(3);
+            let frame = Duration::from_millis(if late { 3000 } else { 100 });
+            let started = std::time::Instant::now();
+            let receive = receive_publication_frame(&mut output, publication, frame);
+            let resumed = async {
+                if late {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    input.write_all(b"r").await?;
+                    input.flush().await?;
+                }
+                Ok::<_, io::Error>(())
+            };
+            let (received, resumed) = tokio::join!(receive, resumed);
+            resumed?;
+            let failure = received.err().context("invalid frame was accepted")?;
+            if case.starts_with("truncated-") {
+                ensure!(
+                    failure
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::UnexpectedEof),
+                    "{case}: expected {expected}, got {failure:#}"
+                );
+            } else {
+                ensure!(
+                    format!("{failure:#}").contains(expected),
+                    "{case}: wrong rejection: {failure:#}"
+                );
+            }
+            let elapsed = started.elapsed();
+            if case == "absent" {
+                ensure!(
+                    elapsed >= publication,
+                    "first-byte wait used the frame budget"
+                );
+            } else if case.starts_with("partial-") {
+                ensure!(
+                    elapsed < publication,
+                    "partial frame used publication budget"
+                );
+            } else if late {
+                // A late first byte must not add another full frame interval.
+                // A full second of scheduling margin still rejects an uncapped
+                // five-second wait (two seconds before a three-second frame).
+                ensure!(
+                    elapsed < Duration::from_secs(4),
+                    "late frame extended total publication wait: {elapsed:?}"
+                );
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let cleanup = if result.is_err() {
+            stop(&mut child, &mut input, &mut output).await
+        } else {
+            if matches!(
+                case,
+                "absent" | "partial-header" | "partial-body" | "late-header"
+            ) {
+                input.write_all(b"x").await?;
+                input.flush().await?;
+            }
+            input.close(TIMEOUT).await?;
+            let status = child.wait(TIMEOUT).await?;
+            output.close(TIMEOUT).await?;
+            ensure!(status.success(), "{case}: frame fixture failed: {status}");
+            Ok(())
+        };
+        diagnostic.close(TIMEOUT).await?;
+        result
+            .and(cleanup)
+            .with_context(|| format!("native frame case {case}"))?;
+    }
+    Ok(())
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     directory: PathBuf,
@@ -441,6 +555,143 @@ async fn interrupted(checkpoint: &str, phase: &str, new: bool) -> Result<()> {
 #[tokio::test]
 async fn killed_helper_after_prepared_receipt_recovers_original_identity() -> Result<()> {
     interrupted("prepared", "prepared", false).await
+}
+
+#[tokio::test]
+async fn publication_after_startup_budget_acknowledges_exact_image_while_parent_lives() -> Result<()>
+{
+    let fixture = Fixture::new();
+    let original_identity = file_identity(&fixture.current)?;
+    let source_identity = file_identity(&fixture.candidate)?;
+    let mut spec = fixture.spawn();
+    spec.args[0] = "update-observed-alive".into();
+    spec.args.push("prepared_resume".into());
+    let mut child = spec.spawn().await?;
+    let mut input = child
+        .take_stdin()
+        .context("slow publication fixture input")?;
+    let mut output = child
+        .take_stdout()
+        .context("slow publication fixture output")?;
+    let errors = tokio::spawn(error_output(child.take_stderr().context("helper stderr")?));
+    let result = async {
+        let marker = record(&mut output).await?;
+        ensure!(
+            marker["checkpoint"] == "prepared" && marker["phase"] == "prepared",
+            "unexpected helper checkpoint: {marker}"
+        );
+        ensure!(
+            marker["helper_pid"].as_u64().context("helper PID")? != u64::from(child.id()),
+            "checkpoint came from the parent instead of its trusted helper"
+        );
+        let before = read_receipt(&fixture)?;
+        ensure!(
+            before["operation"] == marker["operation"],
+            "wrong prepared transaction"
+        );
+        // The real helper is stopped at a completed durable boundary, after the
+        // parent has sent its request. Cross the old ten-second ACK allowance
+        // before releasing actual publication; no production clock is changed.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        ensure!(
+            child.try_wait()?.is_none(),
+            "old parent exited before publication"
+        );
+        ensure!(
+            read_receipt(&fixture)? == before,
+            "held preparation changed its receipt"
+        );
+        ensure!(
+            file_identity(&fixture.current)? == original_identity
+                && fs::read(&fixture.current)? == fixture.original,
+            "unpublished preparation changed the installed original"
+        );
+        input.write_all(b"r").await?;
+        input.flush().await?;
+        let acknowledgment = record(&mut output).await?;
+        ensure!(
+            acknowledgment["installed"] == fixture.current.to_string_lossy().as_ref()
+                && acknowledgment["cleanup_pending"] == true,
+            "invalid real publication acknowledgment: {acknowledgment}"
+        );
+        ensure!(
+            child.try_wait()?.is_none(),
+            "old parent exited before ACK inspection"
+        );
+        let receipt = read_receipt(&fixture)?;
+        ensure!(
+            receipt["operation"] == before["operation"]
+                && receipt["phase"] == "published"
+                && receipt["original"] == before["original"]
+                && receipt["replacement"] == before["replacement"],
+            "acknowledgment lost the prepared identities"
+        );
+        let replacement = receipt_image(&receipt, "replacement")?;
+        ensure!(
+            file_identity(&fixture.current)? == replacement
+                && replacement != original_identity
+                && fs::read(&fixture.current)? == fixture.replacement,
+            "ACK did not identify the exact installed candidate"
+        );
+        let displaced = fixture
+            .directory
+            .join(receipt["displaced"].as_str().context("displaced name")?);
+        ensure!(
+            file_identity(&displaced)? == original_identity
+                && fs::read(&displaced)? == fixture.original,
+            "displaced loaded original changed"
+        );
+        let backup = fixture
+            .directory
+            .join(".kuru-update")
+            .join(receipt["backup"].as_str().context("backup name")?);
+        ensure!(
+            file_identity(&backup)? == receipt_image(&receipt, "rollback")?
+                && file_identity(&backup)? != original_identity
+                && fs::read(&backup)? == fixture.original,
+            "independent rollback copy changed"
+        );
+        ensure!(
+            file_identity(&fixture.candidate)? == source_identity
+                && fs::read(&fixture.candidate)? == fixture.replacement
+                && !fixture.marker.exists(),
+            "source changed or candidate executed during update"
+        );
+        assert_private_receipt(&fixture);
+        input.write_all(b"x").await?;
+        input.flush().await?;
+        input.close(TIMEOUT).await?;
+        ensure!(
+            child.wait(TIMEOUT).await?.success(),
+            "acknowledged parent failed to exit"
+        );
+        output.close(TIMEOUT).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let cleanup = if result.is_err() {
+        stop(&mut child, &mut input, &mut output).await
+    } else {
+        Ok(())
+    };
+    let errors = tokio::time::timeout(TIMEOUT, errors).await;
+    if let Err(failure) = result.and(cleanup) {
+        let retained = fixture._root.keep();
+        anyhow::bail!(
+            "slow verified publication: {failure:#}; stderr={errors:?}; retained {}",
+            retained.display()
+        );
+    }
+    let errors = errors.context("slow publication stderr timed out")???;
+    let trace = trace_records(&errors)?;
+    ensure!(
+        trace.iter().any(
+            |record| record.phase == "verified_publication_acknowledgment_sent"
+                && record.elapsed_ms >= 11000
+        ),
+        "actual helper did not acknowledge after the old startup allowance: {trace:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test]

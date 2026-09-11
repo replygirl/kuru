@@ -90,6 +90,46 @@ async fn main() -> io::Result<()> {
             return Err(io::Error::other("native root failed after both streams"));
         }
         #[cfg(windows)]
+        Some("update-frame") => {
+            let case = arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| io::Error::other("missing update frame case"))?;
+            if arguments.next().is_some() {
+                return Err(io::Error::other("unexpected update frame argument"));
+            }
+            let (bytes, hold) = match case.as_str() {
+                "absent" | "late-header" => (Vec::new(), true),
+                "partial-header" => (vec![2], true),
+                "partial-body" => (vec![2, 0, 0, 0, b'{'], true),
+                "oversized" => (65537_u32.to_le_bytes().to_vec(), false),
+                "truncated-header" => (vec![2, 0], false),
+                "truncated-body" => (vec![2, 0, 0, 0, b'{'], false),
+                "invalid-json" => (vec![1, 0, 0, 0, b'?'], false),
+                "invalid-ack" => (vec![2, 0, 0, 0, b'{', b'}'], false),
+                other => return Err(io::Error::other(format!("unknown frame case {other}"))),
+            };
+            io::stdout().write_all(&bytes)?;
+            io::stdout().flush()?;
+            io::stderr().write_all(b"ready\n")?;
+            io::stderr().flush()?;
+            if case == "late-header" {
+                // Parent controls when the first byte arrives, after it has
+                // started the bounded production receiver on the actual pipe.
+                let mut byte = [0];
+                io::stdin().read_exact(&mut byte)?;
+                if byte != [b'r'] {
+                    return Err(io::Error::other("invalid frame resume byte"));
+                }
+                io::stdout().write_all(&[2])?;
+                io::stdout().flush()?;
+            }
+            if hold {
+                let mut byte = [0];
+                io::stdin().read_exact(&mut byte)?;
+            }
+        }
+        #[cfg(windows)]
         Some("helper-stderr") => {
             let count: usize = arguments
                 .next()
@@ -155,14 +195,16 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)?;
         }
         #[cfg(windows)]
-        Some(mode @ ("update" | "update-observed" | "update-parent-loss")) => {
+        Some(
+            mode @ ("update" | "update-observed" | "update-observed-alive" | "update-parent-loss"),
+        ) => {
             let candidate = arguments
                 .next()
                 .ok_or_else(|| io::Error::other("missing candidate"))?;
             let cache = arguments
                 .next()
                 .ok_or_else(|| io::Error::other("missing helper cache"))?;
-            let checkpoint = if mode == "update-observed" {
+            let checkpoint = if matches!(mode, "update-observed" | "update-observed-alive") {
                 arguments
                     .next()
                     .ok_or_else(|| io::Error::other("missing checkpoint"))?
@@ -186,7 +228,7 @@ async fn main() -> io::Result<()> {
                 serde_json::json!({"installed":result.installed,"cleanup_pending":result.cleanup_pending})
             );
             io::stdout().flush()?;
-            if mode != "update" {
+            if !matches!(mode, "update" | "update-observed-alive") {
                 println!(
                     "{}",
                     serde_json::json!({"parent_acknowledged":true,"parent_pid":std::process::id()})

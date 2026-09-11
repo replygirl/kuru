@@ -243,7 +243,10 @@ It requires no compiler or interpreter. Kuru does not install background updates
 
 On Windows, the current trusted executable performs replacement through a
 verified helper copy. It records publication before reporting success and waits
-for the old process to exit before cleanup. Close other old Kuru instances if
+for the old process to exit before cleanup. Publication has a two-minute
+acknowledgment deadline to allow for verified copies of the bundled executable;
+connection startup and individual protocol frames retain shorter deadlines.
+Close other old Kuru instances if
 cleanup remains pending. Rerunning the normal PowerShell installer reconciles
 the private receipt, including an interrupted update where `kuru.exe` is absent.
 It refuses an unknown replacement at that path. A verified helper cache entry is

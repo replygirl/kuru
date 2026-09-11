@@ -36,6 +36,8 @@ The `codex` provider label selects direct ChatGPT subscription access; `response
 selects the explicit API-key route. Keep these routes separate across refresh,
 relogin and request failures. Bundled native runtime dependencies such as Dolt
 remain a separate portability requirement.
+Browser sign-in hands its URL to the desktop through the platform boundary;
+the user's browser lifetime must not become an owned process tree that Kuru kills.
 Keep authentication corrections focused on login, credentials and direct provider
 requests. Runtime evaluations and peer-behavior changes are separate work; auth
 and transport still require complete functional verification.

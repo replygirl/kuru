@@ -17,4 +17,4 @@
 - [ ] 3.2 @integration (agent) run granular mise/hk/native CI including the remaining Windows memory connection case -> recorded checks pass with at least 90% meaningful coverage; no repeated platform static categories or runtime evals added.
 - [x] 3.3 @manual (agent) review docs, pins and final diff -> docs build, format, lint and public links/anchors passed in /tmp/kuru-native-auth-docs.log; Rust Clippy passed in /tmp/kuru-native-auth-lint-final.log. Codex mise tool and all five lock entries are removed; direct crypto/URL dependencies reuse exact existing locked releases. Runtime and Release/Pages sources are unchanged. Windows browser dispatch uses the platform shell handoff; its native execution remains part of CI acceptance.
 
-Native Windows/Linux auth acceptance, final hooks/coverage and the user-participating live check remain pending; local fixture passes do not establish them.
+The user-participating live check passed. Final native installed/update acceptance and hooks/coverage remain pending; local fixture passes do not establish them.
