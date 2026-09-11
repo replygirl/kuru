@@ -155,6 +155,16 @@ Windows write-through proves POSIX-equivalent power-loss durability.
 Directory activation, marker publication and recovery retain the stable
 lifecycle lock through the final durable transition.
 
+Publication errors identify their current operation (preflight, native move,
+destination reopen or identity verification) while retaining the original OS
+error and rejected/uncertain phase. On failed memory directory reconciliation,
+report checked source/destination observations against the retained full source
+identity; diagnostics do not authorize another move. Preserve an already
+verified engine stage on activation failure and report its private path rather
+than deleting the evidence through its temporary owner. Extraction and probe
+failures retain their existing cleanup behavior. The retained engine stage is
+reproducible runtime data, not a new database recovery receipt or automatic retry.
+
 Keep flushing newly written payloads in `publish_file`. Add a narrow checked
 rename operation for unchanged existing files, retaining the same identity,
 privacy, same-volume, write-through and uncertain-outcome checks without flushing

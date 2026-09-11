@@ -129,6 +129,159 @@ fn zip_extraction_owns_exact_payloads_and_never_publishes_unvalidated_bytes() {
     }
 }
 
+#[tokio::test]
+async fn rejected_activation_preserves_verified_stage_and_occupied_destination() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let identity = regular_file_info(&lock).unwrap().identity;
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_path = stage.path().to_owned();
+    let candidate = stage_path.join("runtime");
+    let bytes = zip();
+    with_asset(&bytes, |asset| extract(&bytes, &candidate, asset)).unwrap();
+    let source_identity = files::directory(&candidate).unwrap().identity();
+    let destination = cache.join("occupied");
+    private_directory(&destination).unwrap();
+    files::write(&destination.join("record"), b"unrelated occupant").unwrap();
+    let occupied_identity = files::directory(&destination).unwrap().identity();
+
+    let error = activate_staged(stage, &candidate, &destination).unwrap_err();
+    assert!(format!("{error:#}").contains("preserved private stage at"));
+    assert!(format!("{error:#}").contains(&stage_path.display().to_string()));
+    assert!(
+        stage_path.is_dir(),
+        "the consumed stage owner must retain evidence"
+    );
+    assert_eq!(
+        files::directory(&candidate).unwrap().identity(),
+        source_identity
+    );
+    assert_eq!(fs::read(candidate.join("dolt.exe")).unwrap(), EXE);
+    assert_eq!(fs::read(candidate.join("LICENSES")).unwrap(), NOTICES);
+    assert_eq!(
+        files::directory(&destination).unwrap().identity(),
+        occupied_identity
+    );
+    assert_eq!(
+        fs::read(destination.join("record")).unwrap(),
+        b"unrelated occupant"
+    );
+    let contender = open_regular(&cache.join(".install.lock")).unwrap();
+    assert_eq!(regular_file_info(&contender).unwrap().identity, identity);
+    assert!(matches!(
+        contender.try_lock(),
+        Err(TryLockError::WouldBlock)
+    ));
+    drop(lock);
+    contender.try_lock().unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn held_descendant_blocks_activation_without_losing_verified_stage_or_lock() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache café 東京");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock_identity = regular_file_info(&lock).unwrap().identity;
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_path = stage.path().to_owned();
+    let candidate = stage_path.join("runtime");
+    extract(EMBEDDED_ARCHIVE, &candidate, BUNDLED_ASSET).unwrap();
+    verify_version(
+        &candidate.join(BUNDLED_ASSET.executable_name),
+        &stage_path.join("probe"),
+    )
+    .await
+    .unwrap();
+    let source = files::directory(&candidate).unwrap();
+    let source_identity = source.identity();
+    // Even a delete-sharing data handle prevents moving its containing Windows
+    // directory. The real probe already exited before this known blocker opens.
+    let (_parent, blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    let destination = cache.join("active");
+    let error = activate_staged(stage, &candidate, &destination).unwrap_err();
+    let publication = error
+        .downcast_ref::<kuru_platform::fs::PublicationError>()
+        .unwrap();
+    assert_eq!(
+        publication.phase,
+        kuru_platform::fs::PublicationPhase::Uncertain
+    );
+    assert!(publication.error().raw_os_error().is_some());
+    assert!(publication.to_string().contains("during native-move"));
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("preserved private stage at"));
+    assert!(diagnostic.contains(&stage_path.display().to_string()));
+    assert!(diagnostic.contains("open publication destination"));
+    assert!(diagnostic.contains("source=same-identity"));
+    assert!(diagnostic.contains("destination=absent"));
+    assert!(stage_path.is_dir());
+    assert_eq!(
+        files::directory(&candidate).unwrap().identity(),
+        source_identity
+    );
+    assert!(!destination.exists());
+    for (name, size, digest, executable) in [
+        (
+            BUNDLED_ASSET.executable_name,
+            BUNDLED_ASSET.executable_bytes,
+            BUNDLED_ASSET.executable_sha256,
+            true,
+        ),
+        (
+            "LICENSES",
+            BUNDLED_ASSET.license_bytes,
+            BUNDLED_ASSET.license_sha256,
+            false,
+        ),
+    ] {
+        verify_payload(&candidate.join(name), size, digest, executable).unwrap();
+    }
+    let contender = open_regular(&cache.join(".install.lock")).unwrap();
+    assert_eq!(
+        regular_file_info(&contender).unwrap().identity,
+        lock_identity
+    );
+    assert!(matches!(
+        contender.try_lock(),
+        Err(TryLockError::WouldBlock)
+    ));
+
+    // Explicit fixture recovery after removing only its known blocker. There
+    // is no corresponding retry in provision or the activation helper.
+    drop(blocker);
+    activate(&candidate, &destination).unwrap();
+    assert_eq!(
+        files::directory(&destination).unwrap().identity(),
+        source_identity
+    );
+    assert!(!candidate.exists());
+    verify_payload(
+        &destination.join(BUNDLED_ASSET.executable_name),
+        BUNDLED_ASSET.executable_bytes,
+        BUNDLED_ASSET.executable_sha256,
+        true,
+    )
+    .unwrap();
+    verify_payload(
+        &destination.join("LICENSES"),
+        BUNDLED_ASSET.license_bytes,
+        BUNDLED_ASSET.license_sha256,
+        false,
+    )
+    .unwrap();
+    assert_eq!(regular_file_info(&lock).unwrap().identity, lock_identity);
+    assert!(matches!(
+        contender.try_lock(),
+        Err(TryLockError::WouldBlock)
+    ));
+    drop(lock);
+    contender.try_lock().unwrap();
+}
+
 #[test]
 fn physical_zip_mode_size_inventory_and_payload_pins_are_enforced_before_activation() {
     let root = crate::test_support::tempdir().unwrap();

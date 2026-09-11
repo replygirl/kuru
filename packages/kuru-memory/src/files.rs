@@ -1,6 +1,8 @@
 //! Memory-owned composition of the checked platform filesystem primitives.
 use anyhow::{Context, Result, ensure};
-use kuru_platform::fs::{Directory, NameRetention, Privacy, Publication, PublicationPhase};
+use kuru_platform::fs::{
+    Directory, FileIdentity, NameRetention, Privacy, Publication, PublicationPhase,
+};
 use std::{
     ffi::OsStr,
     fs::{self, File},
@@ -118,19 +120,43 @@ fn move_directory_with(
     match publish(&parent, source, name(destination)?) {
         Ok(moved) => Ok(moved),
         Err((PublicationPhase::Uncertain, error)) => {
-            let moved = directory(destination)
-                .with_context(|| format!("uncertain memory directory publication: {error}"))?;
-            ensure!(
-                moved.identity() == source.identity(),
-                "uncertain memory publication has an unrelated destination; preserve both paths"
-            );
-            ensure!(
-                matches!(fs::symlink_metadata(source.path()), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
-                "uncertain memory publication still has a source name; preserve both paths"
-            );
-            Ok(moved)
+            let reconcile = || -> Result<Directory> {
+                let moved = directory(destination).context("open publication destination")?;
+                ensure!(
+                    moved.identity() == source.identity(),
+                    "publication destination has an unrelated identity"
+                );
+                ensure!(
+                    matches!(fs::symlink_metadata(source.path()), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                    "publication source name is not absent"
+                );
+                Ok(moved)
+            };
+            reconcile().map_err(|secondary| {
+                // Preserve the original typed publication/OS error in the cause
+                // chain. These bounded fresh observations never authorize a retry.
+                error.context(format!(
+                    "memory directory reconciliation failed: {secondary:#}; held_source={:?}; source={}; destination={}; preserve both paths",
+                    source.identity(),
+                    observe_directory(source.path(), source.identity()),
+                    observe_directory(destination, source.identity()),
+                ))
+            })
         }
         Err((_, error)) => Err(error),
+    }
+}
+
+fn observe_directory(path: &Path, expected: FileIdentity) -> String {
+    match Directory::open(path, Privacy::OwnerOnly, NameRetention::Movable) {
+        Ok(directory) if directory.identity() == expected => "same-identity".into(),
+        Ok(directory) => format!("different-identity({:?})", directory.identity()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent".into(),
+        Err(error) => format!(
+            "query-error(kind={:?}, os={:?})",
+            error.kind(),
+            error.raw_os_error()
+        ),
     }
 }
 
@@ -182,5 +208,58 @@ impl PrivateTemp {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Preserve verified engine activation evidence; this does not create an
+    /// automatic database recovery action or retain any running process.
+    pub(crate) fn keep(self) -> PathBuf {
+        let _container_path = self._container.keep();
+        self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unresolved_real_move_reports_both_names_and_preserves_original_error() {
+        let root = PrivateTemp::new("memory-move-observation-", None).unwrap();
+        let source_path = root.path().join("source");
+        let source = Directory::ensure_private(&source_path).unwrap();
+        write(&source_path.join("record"), b"original committed bytes").unwrap();
+        let destination = root.path().join("active");
+        let identity = source.identity();
+        let error = move_directory_observed(&source, &destination, |moved| {
+            assert_eq!(moved.identity(), identity);
+            // Simulate a conflicting new occupant only after the actual native
+            // move. Reconciliation must preserve both objects and refuse success.
+            Directory::ensure_private(&source_path)?;
+            write(&source_path.join("record"), b"unrelated new occupant")?;
+            Err(std::io::Error::from_raw_os_error(5).into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(5)
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("publication source name is not absent"));
+        assert!(diagnostic.contains("source=different-identity("));
+        assert!(diagnostic.contains("destination=same-identity"));
+        assert!(diagnostic.contains("os error 5"));
+        assert_eq!(directory(&destination).unwrap().identity(), identity);
+        assert_ne!(directory(&source_path).unwrap().identity(), identity);
+        assert_eq!(
+            fs::read(destination.join("record")).unwrap(),
+            b"original committed bytes"
+        );
+        assert_eq!(
+            fs::read(source_path.join("record")).unwrap(),
+            b"unrelated new occupant"
+        );
     }
 }

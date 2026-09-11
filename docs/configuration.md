@@ -139,7 +139,9 @@ works offline without a separate engine installation. `offline` remains accepted
 for compatibility; bundled engine provisioning never uses HTTP, and this setting
 does not disable provider network calls. `dolt_binary` is an optional development
 override that must report the supported exact version. Corrupt existing caches
-fail without automatic repair. The startup timeout is 1–300 seconds. See
+fail without automatic repair. If activating a verified engine fails, the error
+reports the retained private staging directory for inspection; Kuru does not
+automatically retry that move. The startup timeout is 1–300 seconds. See
 [memory storage](memory.md) for migration, revision inspection and backups, or
 [development](development.md#bundled-engine-build-inputs) for build-input settings.
 

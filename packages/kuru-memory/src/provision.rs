@@ -100,8 +100,7 @@ async fn provision_with_extractor(
         (staging, _lock),
     )
     .await?;
-    activate(&candidate, &destination)?;
-    drop(staging);
+    activate_staged(staging, &candidate, &destination)?;
     Ok(destination.join(asset.executable_name))
 }
 
@@ -257,6 +256,19 @@ fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
     );
     #[cfg(unix)]
     File::open(destination)?.sync_all()?;
+    Ok(())
+}
+
+fn activate_staged(staging: PrivateTemp, candidate: &Path, destination: &Path) -> Result<()> {
+    if let Err(error) = activate(candidate, destination) {
+        let retained = staging.keep();
+        return Err(error).with_context(|| {
+            format!(
+                "verified Dolt activation failed; preserved private stage at {}",
+                retained.display()
+            )
+        });
+    }
     Ok(())
 }
 

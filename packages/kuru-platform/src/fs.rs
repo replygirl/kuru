@@ -76,6 +76,7 @@ pub struct PublicationError {
     pub phase: PublicationPhase,
     pub source_identity: Option<FileIdentity>,
     pub destination: PathBuf,
+    operation: &'static str,
     error: io::Error,
 }
 
@@ -89,8 +90,9 @@ impl std::fmt::Display for PublicationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:?} publication at {}: {}",
+            "{:?} publication during {} at {}: {}",
             self.phase,
+            self.operation,
             self.destination.display(),
             self.error
         )
@@ -500,10 +502,11 @@ impl Directory {
     ) -> Result<(), PublicationError> {
         let identity = checked_file(file).ok().map(|info| info.identity);
         let target = self.path().join(destination);
-        let failure = |phase, error| PublicationError {
+        let failure = |phase, operation, error| PublicationError {
             phase,
             source_identity: identity,
             destination: target.clone(),
+            operation,
             error,
         };
         let preflight = || -> io::Result<()> {
@@ -538,7 +541,7 @@ impl Directory {
             }
             Ok(())
         };
-        preflight().map_err(|error| failure(PublicationPhase::Rejected, error))?;
+        preflight().map_err(|error| failure(PublicationPhase::Rejected, "preflight", error))?;
         native::publish(
             &source.anchor().file,
             &source.path().join(name),
@@ -546,10 +549,11 @@ impl Directory {
             &target,
             policy,
         )
-        .map_err(|(phase, error)| failure(phase, error))?;
-        after_move().map_err(|error| failure(PublicationPhase::Uncertain, error))?;
+        .map_err(|(phase, error)| failure(phase, "native-move", error))?;
+        after_move()
+            .map_err(|error| failure(PublicationPhase::Uncertain, "postmove-completion", error))?;
         self.verify(destination, file)
-            .map_err(|error| failure(PublicationPhase::Uncertain, error))
+            .map_err(|error| failure(PublicationPhase::Uncertain, "identity-verification", error))
     }
 
     /// Move a stopped directory to an absent name. The caller retains `source`
@@ -562,10 +566,11 @@ impl Directory {
         destination: &OsStr,
     ) -> Result<Directory, PublicationError> {
         let target = self.path().join(destination);
-        let failure = |phase, error| PublicationError {
+        let failure = |phase, operation, error| PublicationError {
             phase,
             source_identity: Some(source.identity()),
             destination: target.clone(),
+            operation,
             error,
         };
         let preflight = || -> io::Result<()> {
@@ -594,7 +599,7 @@ impl Directory {
                 Err(error) => Err(error),
             }
         };
-        preflight().map_err(|error| failure(PublicationPhase::Rejected, error))?;
+        preflight().map_err(|error| failure(PublicationPhase::Rejected, "preflight", error))?;
         let parent = &source.anchors[source.anchors.len() - 2].file;
         native::publish(
             parent,
@@ -603,12 +608,13 @@ impl Directory {
             &target,
             Publication::New,
         )
-        .map_err(|(phase, error)| failure(phase, error))?;
+        .map_err(|(phase, error)| failure(phase, "native-move", error))?;
         let result = Self::open(&target, source.privacy, source.retention)
-            .map_err(|error| failure(PublicationPhase::Uncertain, error))?;
+            .map_err(|error| failure(PublicationPhase::Uncertain, "postmove-open", error))?;
         if result.identity() != source.identity() {
             return Err(failure(
                 PublicationPhase::Uncertain,
+                "identity-verification",
                 denied("published directory identity changed"),
             ));
         }
@@ -620,6 +626,50 @@ impl Directory {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn impossible_directory_move_preserves_native_error_and_source_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = Directory::ensure_private(&temporary.path().join("source")).unwrap();
+        source
+            .create_new(OsStr::new("record"))
+            .unwrap()
+            .write_all(b"retained")
+            .unwrap();
+        let child = Directory::ensure_private(&source.path().join("child")).unwrap();
+        // The preflight is valid, but the real OS cannot move an ancestor into
+        // its own descendant. No injected OS error replaces this operation.
+        let error = child
+            .move_new_directory(&source, OsStr::new("impossible"))
+            .unwrap_err();
+        assert_eq!(error.operation, "native-move");
+        assert_eq!(error.source_identity, Some(source.identity()));
+        assert!(error.error().raw_os_error().is_some());
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            error.error().raw_os_error()
+        );
+        #[cfg(unix)]
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        #[cfg(windows)]
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert!(error.to_string().contains("during native-move"));
+        assert_eq!(
+            Directory::open(source.path(), Privacy::OwnerOnly, NameRetention::Movable)
+                .unwrap()
+                .identity(),
+            source.identity()
+        );
+        assert_eq!(
+            std::fs::read(source.path().join("record")).unwrap(),
+            b"retained"
+        );
+        assert!(!child.path().join("impossible").exists());
+    }
 
     #[test]
     fn removal_reconciles_completion_failures_without_touching_new_occupants() {
@@ -666,6 +716,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert_eq!(error.operation, "postmove-completion");
         assert_eq!(error.source_identity, Some(identity));
         assert_eq!(
             regular_file_info(&directory.read(OsStr::new("published")).unwrap())

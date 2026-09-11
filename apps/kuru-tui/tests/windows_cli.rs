@@ -112,7 +112,6 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
     );
     assert!(
         diagnostic.contains("Get-FileHash")
-            && diagnostic.contains("CommandNotFoundException")
             && diagnostic.contains("CouldNotAutoloadMatchingModule")
             && diagnostic.contains("Microsoft.PowerShell.Utility"),
         "control must reach the incompatible module's autoload failure: {:?}",

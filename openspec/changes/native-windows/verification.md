@@ -923,3 +923,72 @@ Evidence: `/tmp/kuru-shell-observation-cli-test.log`,
 `/tmp/kuru-shell-observation-format.log`,
 `/tmp/kuru-shell-observation-final-validate.log` and
 `/tmp/kuru-shell-observation-independent-review.md`.
+
+## Hosted 563d321 result and native follow-up
+
+[CI 34572200638](https://github.com/replygirl/kuru/actions/runs/34572200638)
+finished with 400 full-Windows cases passed, two failed and one intentionally
+ignored benchmark. Its actual merge checkout
+`a453bf7e3b65f9fcf4d483a655a776774b7d7784` has tree
+`10559f0b22cb65f13b33e94a36800ea43a46a55d`, identical to branch 563d321.
+The ordinary CLI shell passed with both source markers and exact output/status;
+this does not establish a causal repair of its earlier intermittent timeout.
+All five ConPTY cases, source-entrypoint regressions, actual mise installation,
+12 bootstrap cases and ten updater cases passed. Windows primitives passed
+54 cases at 2602/2865 lines (90.820244%). Full Windows LCOV generation/upload,
+source installation, offline Cargo controls, installed shipping acceptance and
+PE inspection were skipped after the instrumented suite failed.
+
+The incompatible-module control did reach the intended stock PowerShell autoload
+failure: its diagnostic names `Get-FileHash`, `Microsoft.PowerShell.Utility` and
+`CouldNotAutoloadMatchingModule`. Its wrapper was
+`ParentContainsErrorRecordException`, so the additional assertion for
+`CommandNotFoundException` rejected the expected failure before Kuru ran.
+Correct that overly specific assertion by requiring the named command, module
+and fully qualified error ID, plus the existing nonzero status and empty stdout.
+Keep the real manifest and every positive Kuru hash, environment and identity
+assertion. Native execution of the positive path remains required by 14.1.
+
+The packaged full-application update passed its publication, normal app/helper
+profile, identity and digest assertions, then failed the updated executable's
+first cold conversation. Dolt directory activation reported uncertain
+publication with access denied (OS error 5), followed by file not found
+(OS error 2). The log does not identify a causal operation beyond that boundary;
+investigate retained handles and publication before proposing a repair. Do not
+add retries, weaken identity/durability, or increase existing deadlines.
+
+All static jobs and macOS arm64, Linux arm64 and Intel macOS application jobs
+passed, including actual shipping offline installation/update. macOS arm64
+measured 14473/14900 lines (97.134228%). Ubuntu failed before any tests on an
+upstream GitHub HTTP 500 while preparing the Windows Dolt fixture; the separate
+`bundle-download-recovery` change addresses that bounded build-input behavior.
+The aggregate failed; neither full native acceptance nor archive is claimed.
+Evidence: `/tmp/kuru-windows-563d321-full.log`,
+`/tmp/kuru-windows-563d321-results.md` and `/tmp/kuru-ci-563d321-results.md`.
+
+Source review found no normal-path Kuru descendant handle retained at activation.
+It did identify two observation gaps: native move and post-move reopen errors
+look identical, and the inner temporary stage is removed on activation failure
+before the test retains its outer fixture. Add static operation labels preserving
+the original OS error/phase, checked name/identity observations on reconciliation
+failure, and narrow retention of verified stages on activation error. No claim
+is made that those gaps caused the initial access denial. Review:
+`/tmp/kuru-dolt-activation-563-investigation.md`.
+
+- [ ] 15.1 @regression (agent) Hold a real descendant file open during native engine activation -> the actual move fails with its operation and original OS error retained; checked source identity, executable/license bytes, absent destination and the owned stable lock are preserved, and the verified private stage survives error return. Closing only the known fixture blocker permits a subsequent explicitly requested checked move of that same identity; product code does not retry.
+- [ ] 15.2 @regression (agent) Exercise actual post-move completion-error reconciliation and rejected activation on the host -> successful reconciliation retains exact identity; unresolved activation preserves the verified stage and both original/reconciliation diagnostics, while extraction/probe failure cleanup remains unchanged.
+- [ ] 15.3 @integration (agent) Run unchanged actual Windows cold-cache, packaged install/update and shipping acceptance -> each complete path passes; any recurrence records the precise failed operation and checked names without changed deadlines, retries or weakened guarantees. A pass does not establish the cause of the earlier OS5.
+
+The operation labels, original typed-error preservation, checked name observations
+and activation-only stage retention are implemented. The host retained-stage
+control passed in 0.05 seconds; four real memory move/recovery controls passed
+in 3.54 seconds, including actual Dolt completion reconciliation. Six platform
+move controls passed, including a real invalid native move and post-move error.
+Strict memory Clippy and Windows-target platform Clippy passed; the latter is
+type checking, not Windows execution. Rust formatting and independent review
+passed. The PowerShell wrapper assertion correction separately passed independent
+review. Full hook coverage and native controls remain pending.
+Evidence: `/tmp/kuru-activation-563-{retention-test,move-tests,platform-tests}.log`,
+`/tmp/kuru-activation-563-{memory-lint,platform-windows-lint,format}.log`,
+`/tmp/kuru-activation-563-independent-review.md` and
+`/tmp/kuru-powershell-563-control-review.md`.
