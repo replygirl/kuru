@@ -116,6 +116,15 @@ before they run, so concurrent Cargo builds cannot replace their executable.
 Coverage explicitly clears that snapshot opt-in and does not compile an unused
 ordinary supervisor first.
 
+Development and test builds optimize only the pinned SHA-2 0.11.0 dependency to
+keep repeated full-executable update verification responsive. Cargo requires
+this version-specific profile override in the workspace root. Workspace code,
+debug assertions, coverage instrumentation, CPU dispatch and release profiles
+retain their existing settings; every update verification and deadline remains
+in effect. The coverage tool instruments workspace crates by default, so this
+dependency retains the same instrumentation selection as other external crates.
+Update the profile selector alongside any SHA-2 version change.
+
 Coverage includes the application and all packages. Do not exclude hard-to-test
 runtime paths or add tautological assertions to inflate the score. Favor tests
 that observe peer routing, context isolation, persistence, bounded failure,

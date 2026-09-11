@@ -2,6 +2,9 @@
 //! and removes PATH tools; it does not install an OS egress firewall. Runtime
 //! download removal is also checked in the owning memory package/source review.
 
+#[path = "support/update_profiles.rs"]
+mod update_profiles;
+
 use anyhow::{Context, Result, ensure};
 use kuru_core::MemoryConfig;
 use kuru_delivery::{archive, command::Command};
@@ -475,9 +478,10 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         .context("verify the direct installation's cold offline memory")?;
 
     let previous_identity = regular_file_info(&File::open(&installed)?)?.identity;
+    let mut update = first.command();
+    let profiles = update_profiles::UpdateProfiles::observe(&mut update)?;
     let output = execute(
-        first
-            .command()
+        update
             .args(["update", "--version", version, "--release-base"])
             .arg(&releases),
     )
@@ -488,6 +492,9 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         "native self-update failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    if let Some(profiles) = profiles {
+        profiles.verify().await?;
+    }
     ensure!(
         regular_file_info(&File::open(&installed)?)?.identity != previous_identity,
         "self-update did not replace the installed executable"

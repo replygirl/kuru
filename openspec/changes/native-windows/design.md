@@ -513,6 +513,27 @@ working Windows instrumented task before calling the native quality gate
 complete. Measure task duration and bound real-process waits by observable
 handshakes, not arbitrary sleep-based retries.
 
+Full application update verification hashes the embedded executable repeatedly
+before acknowledging publication. Observed native debug timings put this work
+beyond the existing acknowledgment budget. Evaluate a version-specific Cargo
+development-profile override for the pinned SHA-2 dependency, inherited by tests,
+so its concrete compression loops are optimized while workspace code stays in
+its ordinary instrumented development/test profile. Cargo requires this shared
+profile declaration at the workspace root. Keep release settings, CPU dispatch,
+all identity/content checks, output limits and process deadlines unchanged.
+Compare identical preloaded bytes with the same compiler, instrumentation and
+consumer optimization before and after the override, verify the digest against
+an independent implementation, then require the unchanged actual Windows update
+cases, full LCOV and shipping checks. Host measurements support this experiment;
+they cannot establish native updater acceptance.
+
+The existing packaged update scenario also observes normal helper coverage
+emission. During its instrumented build, use an isolated filename prefix in the
+runner's existing profile directory for the update command alone. Require
+nonempty profiles from both distinct processes within the helper cleanup bound;
+retain those files for the ordinary coverage merge. An explicitly selected
+shipping binary is not instrumented and retains its separate runtime acceptance.
+
 Add the fifth native release build from the exact prepared version commit. Run
 its packaged executable with an empty engine cache, no external Dolt/compiler,
 and offline runtime access, then verify persistent demo/reopen. Publication

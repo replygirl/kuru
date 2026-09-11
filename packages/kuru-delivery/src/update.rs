@@ -836,6 +836,10 @@ async fn replace_bytes_owned(
     let mut spec = NativeSpawnSpec::new(helper.clone(), parent.path().to_owned());
     spec.lifetime = Lifetime::TrustedSupervisor;
     spec.stderr = Stdio::Pipe;
+    // Keep instrumented child output in the runner's explicit coverage directory.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        spec.environment.push(("LLVM_PROFILE_FILE".into(), profile));
+    }
     spec.args = vec![
         "--internal-update-helper".into(),
         serde_json::to_string(&start)?.into(),
@@ -1108,12 +1112,10 @@ pub mod test_support {
                 spec.stdin = inherited_stdio(StandardStream::Input)?;
                 spec.stdout = inherited_stdio(StandardStream::Output)?;
                 spec.stderr = inherited_stdio(StandardStream::Error)?;
-                // Instrumented helpers must retain their explicit profile
-                // destination; only fixture marker authority is also passed.
-                for key in ["LLVM_PROFILE_FILE", "KURU_EXECUTION_MARKER"] {
-                    if let Some(value) = std::env::var_os(key) {
-                        spec.environment.push((key.into(), value));
-                    }
+                // Only the fixture also forwards candidate-execution detection.
+                if let Some(marker) = std::env::var_os("KURU_EXECUTION_MARKER") {
+                    spec.environment
+                        .push(("KURU_EXECUTION_MARKER".into(), marker));
                 }
                 Ok(())
             })

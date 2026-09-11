@@ -617,3 +617,90 @@ Independent review checked every emitted phase and affected interruption/error
 path; it found no remaining issue. The source comparison is not native execution.
 Evidence: `/tmp/kuru-helper-trace-followup.md` and
 `/tmp/kuru-helper-trace-followup-review.md`.
+
+## Normal helper profiling destination
+
+While native `037d470` ran, a source audit found that ordinary app update helpers
+dropped the runner's `LLVM_PROFILE_FILE` at their second process hop. The observed
+delivery fixture forwarded it explicitly, so those passing fixtures did not cover
+this difference. The shared updater now forwards only that existing profiling
+destination; fixture-only execution-marker authority remains in its callback.
+No broader environment, profile naming, deadline or publication rule changed.
+
+A fresh native-windows apply returned clear and its context was read before the
+one-file correction. Independent source review, strict host delivery Clippy and
+formatting passed. Host conditional compilation does not execute or typecheck
+the Windows module; normal native helper execution and profile emission remain
+pending. This is a coverage-routing correction, not evidence about the ACK
+timeout's cause. Evidence: `/tmp/kuru-update-helper-context-audit.md` and
+`/tmp/kuru-update-profile-correction.md`.
+
+## Hosted 037d470: measured full-image verification cost
+
+[CI 34558398251](https://github.com/replygirl/kuru/actions/runs/34558398251)
+finished with all static checks, all four Unix application jobs and the separate
+Windows primitive gate passing. Ubuntu measured 14,380/14,809 lines (97.103113%)
+and macOS arm64 measured 14,392/14,820 (97.112011%); both source-installed shipping
+binaries passed cold offline install/update conversations. Linux arm64 passed
+74 memory cases and Intel macOS 75, plus their actual packaged offline checks.
+Windows primitives passed 54 cases with 2,602/2,865 lines (90.820244%).
+
+Full Windows completed with 396 passed, two failed and one intentionally ignored
+frame-cost measurement. All 62 memory, 44 runtime, 12 PowerShell bootstrap,
+ten updater and five ConPTY cases passed, as did real native mise acceptance and
+the prior CLI shell failure. The new strict trace and native descendant-output
+controls passed. Only the packaged self-update and source-update assertions failed.
+The required aggregate failed; full Windows LCOV, lock/source-install checks,
+offline Cargo-input controls, installed shipping runtime, PE imports and upload
+were skipped after the suite. The task took 2,332.38 seconds including 3 minutes
+36 seconds of compilation. Exact logs and complete counts are retained in
+`/tmp/kuru-windows-037d470-results.md` and `/tmp/kuru-ci-037d470-results.md`.
+
+Both failures now expose helper progress: installation locking completed in
+13/36 milliseconds, verification before copying in about 8.6/8.9 seconds,
+candidate/rollback preparation by about 21.5 seconds, and verified publication
+reached ACK send at 28.241/28.354 seconds. The parent had already reached its
+unchanged ten-second ACK deadline, so the helper exited with OS232 on its closed
+pipe. This locates the failure after actual publication rather than at startup
+or lock acquisition. These phases include reads and allocation, not just hashing.
+
+Source audit counted 15 full-image digests before ACK. Ordinary held file handles
+share writes and do not make content immutable, so removing later verifications
+would weaken mutation detection. Conservative overlap reductions alone would
+still leave most observed work. The planned narrow SHA-2 code-generation
+experiment preserves those independent checks and every timer. Source rationale
+and limitations: `/tmp/kuru-update-cost-invariants.md` and
+`/tmp/kuru-sha2-profile-audit.md`.
+
+- [x] 10.1 @integration (agent) Compare the existing and narrowly optimized SHA-2 dependency on identical bytes with unchanged consumer/instrumentation settings -> matched macOS arm64 artifacts hashed the same 64 MiB in median 270.508083 ms versus 27.439500 ms (15 observations each, three alternating pairs). All 45 measured digests, including supplementary runs, matched independent OpenSSL. No Windows or end-to-end update result is inferred.
+- [ ] 10.2 @integration (agent) Run unchanged native full-app updates, full native coverage and shipping checks -> verified publication is acknowledged within existing budgets, normal helper profiles retain the runner destination, and actual Windows acceptance passes before closing the change.
+
+The experiment used the pinned Rust 1.98.1 compiler and a frozen disposable Rust
+harness, with no additional manifest, workspace or dependency. The primary before
+and after SHA-2 artifacts had identical version, features and dependency
+fingerprints. The consumer retained opt-level zero, coverage instrumentation and
+line-table debug information. The dependency remained uninstrumented in both
+arms, matching cargo-llvm-cov 0.9.1's existing workspace selection. Cargo artifact
+JSON confirmed SHA-2 0.11.0 at opt-level three and delivery at zero, with debug
+assertions and overflow checks enabled; the separate SHA-2 0.10.9 was unchanged.
+Digest computation alone improved 9.858346 times; the measurement excludes IO,
+allocation and actual Windows execution. Evidence and exact data:
+`/tmp/kuru-sha2-cost-report.md` and `/tmp/kuru-sha2-build-artifacts.jsonl`.
+
+Independent source reviews found no profile, instrumentation, integrity or
+environment-isolation regression. The packaged update fixture now gives only the
+update command a unique profile prefix in the runner's existing merge directory,
+then requires nonempty files from both distinct processes within ten seconds.
+This directly observes the ordinary helper's second process hop; the files remain
+available to the normal LCOV merge. Explicit shipping-binary acceptance remains
+separate because that binary is not instrumented. Actual native execution of this
+observation is pending. Reviews: `/tmp/kuru-sha2-change-review.md`,
+`/tmp/kuru-sha2-wrapper-review.md` and `/tmp/kuru-native-windows-closure-review.md`.
+
+Strict host app Clippy passed, including the complete portable profile-observation
+module; only its execution is conditional on native Windows instrumentation.
+Attempted Windows-target app Clippy on macOS stopped in AWS-LC's C compilation
+because this host lacks Windows SDK headers, after the initially missing locked
+crates were fetched. This is not a Windows compile pass; the actual native CI
+remains required. Evidence: `/tmp/kuru-sha2-app-clippy.log` and
+`/tmp/kuru-sha2-windows-clippy-network.log`.
