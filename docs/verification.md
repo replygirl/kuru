@@ -16,25 +16,24 @@ concurrent refresh, private publication, logout fencing, actor tool continuation
 and missing-header regressions. Installed and updated macOS executables complete
 API-key model and conversation requests with an empty PATH, preserve bundled
 offline memory, and expose an HTTP 403 without echoing a credential supplied by
-the rejecting fixture. The complete local pre-push graph at ca8e38a passed
-405 tests and 96.739% workspace coverage, along with all seven static checks.
+the rejecting fixture. The complete local pre-push graph at db33c17 passed
+405 tests and 96.752% workspace coverage, along with all seven static checks.
 
-[CI at ca8e38a](https://github.com/replygirl/kuru/actions/runs/34612890798)
+[CI at db33c17](https://github.com/replygirl/kuru/actions/runs/34621868783)
 passed every static category and all five native application targets. Windows
-passed 443 tests with 94.235% workspace coverage; its separate platform suite
+passed 444 tests with 94.235% workspace coverage; its separate platform suite
 passed 60 tests with 91.378% coverage, including actual browser error propagation
 and COM cleanup. Source installation, missing/corrupt offline build-input controls,
 installed offline conversations and self-update, and shipping Kuru/Dolt DLL
 inspection passed. Ubuntu and macOS ARM workspace coverage exceeded 96%.
 
-That run's shell case used temporary lookup observers. The original unobserved
-request subsequently passed in [CI at 227dc82](https://github.com/replygirl/kuru/actions/runs/34617836357).
-Its only Windows failure was the delivery test's immediate lock reacquisition
-after successful owned cleanup; Windows permits deferred lock release. A bounded
-test-only observation corrects that assumption and awaits native confirmation.
-That failed run skipped Windows workspace coverage and later shipping steps;
-the earlier successful shipping evidence above remains separate. The updater
-and plain shell corrections are archived with their actual native evidence.
+The final Windows run passed the original unobserved shell request and both
+real-file lock controls: a retained lock must time out, and owned descendant
+cleanup must permit actual reacquisition within a bounded observation. Original
+process ownership, output and cleanup assertions remain intact. The OpenAI,
+updater, plain shell and lock-observation changes are archived with their actual
+native evidence. Historical observer-wrapped results and skipped steps from
+failed runs are not counted as acceptance of the final implementation.
 
 ## Native delivery and public documentation (2026-09-09)
 

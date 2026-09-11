@@ -15,16 +15,14 @@
 ## 3. Finish the Dolt and portability PR [critical]
 
 - [x] 3.1 @e2e (agent) run actual native installed/update acceptance and isolated auth/API checks on the five existing targets -> CI 34612890798 passed all five native targets at ca8e38a. Windows passed four native auth CLI cases, 51 connector unit cases and five native connector command cases, plus source installation, missing/corrupt offline build controls, actual installed offline conversations/self-update and shipping DLL inspection. All four Unix targets passed their installed/packaged offline conversations and updates. Windows log: /tmp/kuru-shell-lookup-ci-job-103307525914.log; per-target logs, exact checkout/tree identities and raw coverage: /tmp/kuru-shell-lookup-ci-report.md.
-- [ ] 3.2 @integration (agent) run granular mise/hk/native CI including the remaining Windows memory connection case -> recorded checks pass with at least 90% meaningful coverage; no repeated platform static categories or runtime evals added.
+- [x] 3.2 @integration (agent) run granular mise/hk/native CI including Windows memory, process, authentication and installed/update acceptance -> all eight normal hooks passed at db33c17 (405 tests, 15547/16069 covered lines, 96.751509%). CI 34621868783 passed all 15 jobs and all five native targets. Windows passed 444 tests with 19061/20227 covered lines (94.235428%); platform passed 60 tests with 2904/3178 (91.378225%). Original plain shell passed at Windows log line 605, both command lock controls at 1053–1054, source installation at 1463, offline Cargo missing/corrupt/valid controls at 1515/1540/1552, selected source-installed offline conversation/self-update at 1595 and OS-only Kuru/Dolt imports at 1637–1638. Actual logs, raw coverage and independently verified exact candidate/checkout trees: /tmp/kuru-command-lock-ci-report.md and /tmp/kuru-command-lock-ci-job-103337545621.log. No runtime evals or repeated static platform categories were added.
 - [x] 3.3 @manual (agent) review docs, pins and final diff -> docs build, format, lint and public links/anchors passed in /tmp/kuru-native-auth-docs.log; Rust Clippy passed in /tmp/kuru-native-auth-lint-final.log. Codex mise tool and all five lock entries are removed; direct crypto/URL dependencies reuse exact existing locked releases. Runtime and Release/Pages sources are unchanged. Windows browser dispatch uses the platform shell handoff; its native execution remains part of CI acceptance.
 
-The user-participating live check and five-target native installed/update checks
-passed. CI 34612890798 recorded Windows workspace coverage of 19061/20227
-(94.235428%), platform coverage of 2904/3178 (91.378225%), Ubuntu coverage of
-15535/16058 (96.743056%) and macOS ARM coverage of 15546/16069 (96.745286%).
-Its shell test used observation callbacks. The original plain source then passed
-in CI 34617836357, Windows log line 605. That run's only failing case was delivery's
-immediate post-cleanup lock acquisition; all preceding owned cleanup and captured
-output assertions passed. The windows-command-lock-release test correction awaits
-native confirmation before final hooks/CI closure and archive. Windows workspace
-coverage and later shipping steps were skipped in that failed run.
+The user-participating live check and final five-target native installed/update
+checks passed. Final CI 34621868783 recorded Windows workspace coverage of
+19061/20227 (94.235428%), platform coverage of 2904/3178 (91.378225%), Ubuntu
+coverage of 15535/16058 (96.743056%) and macOS ARM coverage of 15547/16069
+(96.751509%). It passed the original plain shell request and the real bounded
+lock-release controls. Earlier observer-wrapped results and skipped checks in
+failed runs are historical evidence only; this final native pass establishes
+closure of the tested correction.
