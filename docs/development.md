@@ -81,7 +81,7 @@ bridge before any downloaded application can be trusted.
 | `mise run build` | Locked debug workspace build |
 | `mise run build:release` | Optimized release build |
 | `mise run run -- --provider demo` | Interactive offline harness |
-| `mise run format:fix` | Rust and TOML formatting |
+| `mise run format:fix` | Rust, TOML and documentation formatting |
 | `mise run format:check` | Rust, TOML and documentation formatting |
 | `mise run lint` | All-target Clippy with warnings as errors |
 | `mise run typecheck` | Rust compilation checks for all targets/features on the host |

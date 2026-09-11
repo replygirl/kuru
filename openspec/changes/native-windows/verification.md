@@ -704,3 +704,36 @@ because this host lacks Windows SDK headers, after the initially missing locked
 crates were fetched. This is not a Windows compile pass; the actual native CI
 remains required. Evidence: `/tmp/kuru-sha2-app-clippy.log` and
 `/tmp/kuru-sha2-windows-clippy-network.log`.
+
+## Public Windows source entrypoint
+
+A manual docs/source review found that `scripts/install.ps1 -Source` invoked
+mise before disabling automatic task-tool installation and setup hooks. Its
+inner app-owned script applied those settings too late for first task activation;
+the native CI source smoke supplied them globally and could mask this path.
+The planned correction scopes both settings before the first invocation and
+restores the caller's environment even when the task fails. Existing native
+PowerShell/compiled-command fixtures will observe the actual entrypoint with
+absent and opposing settings. This is separate from the still-running c52fa62
+native update experiment; no passing execution is inferred for the correction.
+
+- [ ] 11.1 @regression (agent) Invoke the real source entrypoint under native PowerShell with absent and opposing mise settings and controlled success/failure of its compiled command fixture -> the first mise invocation observes explicit lean setup, argument/destination semantics remain correct, errors propagate and caller environment is restored.
+
+The same manual review found one small command-table error: `format:fix` also
+formats the documentation app. The development guide now states its complete
+write scope. No other incorrect command was found across README, canonical
+AGENTS, install/auth/config guides and release/CI ownership. Default Codex remains
+explicitly external until its separately gated bundle is implemented. Review:
+`/tmp/kuru-native-docs-c52fa62-review.md`. Final native and entrypoint acceptance
+remain pending; this documentation comparison does not substitute for them.
+
+The entrypoint correction and two native test cases are implemented. The tests
+exercise four success/failure and absent/opposing environment combinations, plus
+invalid source/release options before any mise call, using the real PowerShell
+entrypoint and a compiled invocation recorder. They do not claim an actual
+compiler installation or source build. Independent source review found no
+blocking issue; format, tooling and strict cospec checks passed in 1.33 seconds.
+Actual native execution remains pending on a subsequent candidate; c52fa62 does
+not contain this correction. Evidence: `/tmp/kuru-source-entry-apply.json`,
+`/tmp/kuru-source-entrypoint-independent-review.md` and
+`/tmp/kuru-source-entrypoint-static.log`.

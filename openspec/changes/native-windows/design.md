@@ -456,6 +456,14 @@ prepared app mise build task, including embedded target preparation, with no
 shadow language workspace. README order is mise, platform binary bootstrap,
 then source; guides describe ordinary available software.
 
+The public source entrypoint disables mise's automatic task-tool installation
+and repository setup hooks before its first mise invocation. The owning app
+task installs only its explicit Rust build toolchain and prepared inputs. Scope
+the entrypoint settings to the operation and restore the calling PowerShell
+environment on success and failure. Native entrypoint fixtures must begin with
+absent or opposing inherited settings; CI's global safeguards cannot stand in
+for this fresh-user path.
+
 Pre-merge mise acceptance runs the pinned native Windows mise executable and its
 actual `github:replygirl/kuru` backend against controlled release metadata and
 the candidate commit's genuine packaged ZIP. Use documented URL replacements

@@ -9,6 +9,29 @@ fn main() -> anyhow::Result<()> {
         path::PathBuf,
     };
     let arguments: Vec<_> = std::env::args().skip(1).collect();
+    if matches!(arguments.as_slice(), [directory, _, action, task]
+        if directory == "-C" && action == "run" && task == "//apps/kuru-tui:install")
+    {
+        // Observe the public PowerShell entrypoint before any real mise task
+        // activation. This fixture does not stand in for a native source build.
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::var_os("KURU_CLI_FIXTURE_SETUP_LOG").expect("isolated setup log"))?;
+        serde_json::to_writer(
+            &mut log,
+            &serde_json::json!({
+                "arguments": arguments,
+                "no_hooks": std::env::var("MISE_NO_HOOKS").ok(),
+                "auto_install": std::env::var("MISE_TASK_RUN_AUTO_INSTALL").ok(),
+                "install_dir": std::env::var("KURU_INSTALL_DIR").ok(),
+            }),
+        )?;
+        writeln!(log)?;
+        log.flush()?;
+        let status = std::env::var("KURU_CLI_FIXTURE_SETUP_EXIT")?.parse::<i32>()?;
+        std::process::exit(status);
+    }
     if arguments.first().is_some_and(|argument| argument == "-C") {
         for selector in [
             "GIT_DIR",
