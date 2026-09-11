@@ -29,7 +29,7 @@
 
 ## 5. Required CI, release and documentation
 
-- [ ] 5.1 Add package-owned native Windows format/lint/test/coverage tasks and required windows-2025/aggregate CI wiring; verify actual platform test counts and coverage, failure on missing required prerequisites and preservation of the workspace threshold and Unix gates.
+- [ ] 5.1 Add package-owned native Windows test/coverage tasks and required windows-2025/aggregate CI wiring, with static analysis in independent Ubuntu jobs as requested in `parallel-quality-gates`; verify actual platform test counts and coverage, failure on missing required prerequisites and preservation of the workspace threshold and Unix gates.
 - [ ] 5.2 Add the fifth release build from the prepared version SHA with packaged offline-runtime smoke; verify five-target planning/recovery fixtures, immutable asset checks and the unchanged strategy-only release graph with Pages after publication.
 - [ ] 5.3 Update README, guides and AGENTS for native directories, commands, embedded dependencies, Windows update behavior and package ownership; verify every documented command against the implemented interface and keep mise/PowerShell instructions before source.
 - [ ] 5.4 Complete cross-package native acceptance on the actual candidate commit and packaged Windows artifact; record observed CI, ConPTY, database, bootstrap, running-image update and native mise fixture results, distinguish simulated metadata, and retain the separately pending post-publication mise procedure in release documentation without treating unrun or skipped checks as passes.

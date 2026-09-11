@@ -2,7 +2,7 @@
 
 - [x] 1.1 Update the exact TOML dependency and lock entries; verify the official patch/MSRV evidence, Cargo resolution and existing configuration/delivery behavior tests without application source changes.
 - [x] 1.2 Update standalone cospec and tool provenance, regenerate integrations through its own command and retain the exact-bundle compatibility preload when required; verify actual standalone clear/blocked/error behavior, archive gates and managed-file drift.
-- [ ] 1.3 Pin current npm in the docs app through native mise ownership; verify selected npm/Node versions, clean locked dependency installation and actual docs build/lint/format/link checks in the required documentation CI job, and fail explicitly if task activation selects another version.
+- [x] 1.3 Pin current npm in the docs app through native mise ownership; verify selected npm/Node versions, clean locked dependency installation and actual docs build/lint/format/link checks in the required documentation CI job, and fail explicitly if task activation selects another version.
 - [x] 1.4 Refresh contributor pin/compatibility documentation from observed official metadata and commands; verify ownership, no root language workspace and accurate separation of Codex's provider-bundle update.
 
 ## 2. Verify integration
@@ -49,3 +49,12 @@ correction must preserve app-owned versions, resolve the canonical npm backend
 at monorepo scope and assert actual versions even when dependency installation
 is cached. Task 1.3 remains open; evidence is in
 `/tmp/kuru-windows-d66780f-docs.log`.
+
+The correction at eb6a04b passed actual hosted documentation CI in
+[run 34544299862](https://github.com/replygirl/kuru/actions/runs/34544299862).
+Its always-run check observed Node 26.8.2 and npm 12.0.2, then a clean npm ci and
+the full app validation passed without backend/lock warnings. Local isolated
+fixtures also rejected stale cached npm and failing version probes. Version pins
+and tool installation remain app-owned; only the shared backend alias is
+registered at root. Task 1.3 is complete. Task 2.1 remains open until native
+application integration completes; static success alone does not satisfy it.

@@ -56,7 +56,7 @@
 
 ## 9. Required CI and release integration [critical]
 
-- [ ] 9.1 @integration (agent) Run required package format/lint/test/coverage tasks on native windows-2025 and retain existing Unix jobs -> all actual test counts and measured coverage are recorded, at least 90% workspace coverage remains enforced, and missing Windows prerequisites fail instead of skipping.
+- [ ] 9.1 @integration (agent) Run required package test/coverage tasks on native windows-2025 and retain existing Unix jobs, with format/lint/typecheck running independently on Ubuntu per `parallel-quality-gates` -> all actual test counts and measured coverage are recorded, at least 90% workspace coverage remains enforced, and missing Windows prerequisites fail instead of skipping. Linux static analysis does not establish checking of Windows conditional branches; the native suite must compile and exercise them.
 - [ ] 9.2 @regression (agent) Exercise release planning/recovery/asset inventory fixtures with five targets -> one prepared version SHA is retained across reruns, invalid/missing Windows artifacts block publication and published assets remain immutable.
 - [ ] 9.3 @integration (agent) Validate the release workflow graph and actual native build artifact -> Windows uses the prepared version commit, packaged runtime smoke passes, and Pages remains inside the release workflow after successful publication.
 - [ ] 9.4 @manual (agent) Review README, guides and AGENTS against implemented native commands, package ownership and observed evidence -> mise/PowerShell precede source, embedded runtime needs no separate setup, update semantics are accurate and no unobserved hosted result is described as passed.
