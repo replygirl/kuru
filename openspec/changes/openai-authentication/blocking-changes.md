@@ -15,7 +15,8 @@ The user explicitly authorized complete direct
 OpenAI authentication as the remaining correction in the Dolt/portability PR.
 Archived provider-tools and parallel-quality-gates provide the existing transport
 and test graph. No new runtime evals or provider configuration redesign is needed.
-The independent `memory-connection-diagnostics` fix was archived after native
-memory acceptance passed. Final Windows acceptance still covers update
-acknowledgment, shell execution and browser handoff tests; those checks do not
-change the native OpenAI authentication scope.
+The independent `memory-connection-diagnostics` and `windows-update-acknowledgment`
+fixes were archived after native acceptance passed. Browser handoff controls and
+all five installed/update targets passed in CI 34612890798. Final closure still
+requires the original plain shell request after removing its diagnostic observers;
+that acceptance correction does not change the native OpenAI authentication scope.

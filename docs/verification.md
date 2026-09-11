@@ -16,16 +16,22 @@ concurrent refresh, private publication, logout fencing, actor tool continuation
 and missing-header regressions. Installed and updated macOS executables complete
 API-key model and conversation requests with an empty PATH, preserve bundled
 offline memory, and expose an HTTP 403 without echoing a credential supplied by
-the rejecting fixture. The first complete local pre-push graph passed 403 tests
-and 96.756% workspace coverage; subsequent inference corrections have their own
-focused checks and still require final hooks/native CI.
+the rejecting fixture. The complete local pre-push graph at ca8e38a passed
+405 tests and 96.739% workspace coverage, along with all seven static checks.
 
-[CI at 65f9896](https://github.com/replygirl/kuru/actions/runs/34602482369)
-passed all static categories and four Unix native application targets. Its
-Windows primitive assertions passed, but its separate coverage gate failed after
-adding browser dispatch. Actual native dispatch/COM cleanup controls have been
-added; their next hosted result is pending. This record does not count an earlier
-source revision or a build-only check as verification of those controls.
+[CI at ca8e38a](https://github.com/replygirl/kuru/actions/runs/34612890798)
+passed every static category and all five native application targets. Windows
+passed 443 tests with 94.235% workspace coverage; its separate platform suite
+passed 60 tests with 91.378% coverage, including actual browser error propagation
+and COM cleanup. Source installation, missing/corrupt offline build-input controls,
+installed offline conversations and self-update, and shipping Kuru/Dolt DLL
+inspection passed. Ubuntu and macOS ARM workspace coverage exceeded 96%.
+
+That run's shell case used temporary lookup observers. The later correction
+restores the original unobserved request and keeps Core tracing only after a
+failure. Its native confirmation remains pending; a wrapped-source pass does not
+establish the original cold command's behavior. The updater correction is archived
+with its actual native evidence; final PR closure awaits the plain shell check.
 
 ## Native delivery and public documentation (2026-09-09)
 

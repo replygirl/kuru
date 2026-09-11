@@ -101,10 +101,6 @@ fn shell_timeout_trace(
                 "KURU_SHELL_PROGRESS".into(),
                 progress.as_os_str().to_owned(),
             ),
-            (
-                "KURU_SHELL_LOOKUPS".into(),
-                root.join("trace-lookups").into_os_string(),
-            ),
         ]);
         // Match the product's UTF-8 prelude and sanitized environment. Core
         // Trace 1 prints script lines, not values. No redirection is used: 5>
@@ -399,8 +395,6 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     // control must never supply evidence that Kuru's own shell entered source.
     let control_progress = root.path().join("control-progress");
     let kuru_progress = root.path().join("kuru-progress");
-    let control_lookups = root.path().join("control-lookups");
-    let kuru_lookups = root.path().join("kuru-lookups");
     let trace_progress = root.path().join("trace-progress");
     let sentinel = "retained & literal 日本語";
     let original_source = r#"$ErrorActionPreference = 'Stop'
@@ -412,41 +406,6 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
 [Console]::Write($hash + '|' + $env:KURU_SHELL_SENTINEL)
 [IO.File]::AppendAllText($env:KURU_SHELL_PROGRESS, "completed`n")
 "#;
-    // PS 5.1 CommandInvocationIntrinsics exposes these observation callbacks.
-    // Never set Command, CommandScriptBlock, or StopSearch: discovery and the
-    // real Get-FileHash body retain their normal behavior. Callback exceptions
-    // can be swallowed by PowerShell, so the incompatible-module control below
-    // must independently prove its pre-lookup callback executed.
-    let observer = |phase: &str| {
-        format!(
-            r#"{{
-    param([string]$commandName, $eventArgs)
-    $name = $commandName.Substring($commandName.LastIndexOf('\') + 1)
-    $label = switch ($name) {{
-        'Get-FileHash' {{ 'get-file-hash' }}
-        'Resolve-Path' {{ 'resolve-path' }}
-        'Test-Path' {{ 'test-path' }}
-        'ForEach-Object' {{ 'foreach-object' }}
-        'GetStreamHash' {{ 'get-stream-hash' }}
-        'Import-Module' {{ 'import-module' }}
-        'Get-Module' {{ 'get-module' }}
-        'Set-StrictMode' {{ 'set-strict-mode' }}
-        'Export-ModuleMember' {{ 'export-module-member' }}
-    }}
-    if ($label) {{
-        $line = '{phase}-' + $label + "`n"
-        if ([IO.FileInfo]::new($env:KURU_SHELL_LOOKUPS).Length + $line.Length -le 4096) {{
-            [IO.File]::AppendAllText($env:KURU_SHELL_LOOKUPS, $line)
-        }}
-    }}
-}}"#
-        )
-    };
-    let source = format!(
-        "[IO.File]::WriteAllText($env:KURU_SHELL_LOOKUPS, '')\n$kuruPre = $ExecutionContext.InvokeCommand.PreCommandLookupAction\n$kuruPost = $ExecutionContext.InvokeCommand.PostCommandLookupAction\n$ExecutionContext.InvokeCommand.PreCommandLookupAction = {}\n$ExecutionContext.InvokeCommand.PostCommandLookupAction = {}\ntry {{\n{original_source}\n}} finally {{\n$ExecutionContext.InvokeCommand.PreCommandLookupAction = $kuruPre\n$ExecutionContext.InvokeCommand.PostCommandLookupAction = $kuruPost\n}}\n",
-        observer("pre"),
-        observer("post"),
-    );
     let child = |binary: &Path| {
         let mut child = command(root.path(), binary);
         child
@@ -463,7 +422,6 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
         .join("WindowsPowerShell/v1.0/powershell.exe");
     let control = child(&powershell)
         .env("KURU_SHELL_PROGRESS", &control_progress)
-        .env("KURU_SHELL_LOOKUPS", &control_lookups)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -471,20 +429,19 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
             "-OutputFormat",
             "Text",
             "-Command",
-            &source,
+            original_source,
         ])
         .output();
     let control_stages = shell_marker(&control_progress, 256);
-    let control_lookup_stages = shell_marker(&control_lookups, 4096);
     let control = control.unwrap_or_else(|error| {
-        panic!("stock PowerShell control failed: {error}; stages={control_stages:?}; lookups={control_lookup_stages:?}")
+        panic!("stock PowerShell control failed: {error}; stages={control_stages:?}")
     });
     let diagnostic = String::from_utf8_lossy(&control.stderr);
     let preview =
         |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
     assert!(
         !control.status.success(),
-        "unsanitized control must fail: status={} stdout={:?} stderr={:?} stages={control_stages:?} lookups={control_lookup_stages:?}",
+        "unsanitized control must fail: status={} stdout={:?} stderr={:?} stages={control_stages:?}",
         control.status,
         preview(&control.stdout),
         preview(&control.stderr)
@@ -493,7 +450,7 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
         diagnostic.contains("Get-FileHash")
             && diagnostic.contains("CouldNotAutoloadMatchingModule")
             && diagnostic.contains("Microsoft.PowerShell.Utility"),
-        "control must reach the incompatible module's autoload failure: {:?}; stages={control_stages:?}; lookups={control_lookup_stages:?}",
+        "control must reach the incompatible module's autoload failure: {:?}; stages={control_stages:?}",
         preview(&control.stderr)
     );
     assert!(control.stdout.is_empty());
@@ -502,26 +459,18 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
         Some("entered\nversion-checked\nhash-started\n"),
         "control must stop at the actual hash command: {control_stages:?}"
     );
-    assert!(
-        control_lookup_stages
-            .as_deref()
-            .is_ok_and(|stages| stages.lines().any(|stage| stage == "pre-get-file-hash")),
-        "negative control must validate the observer before module import fails: {control_lookup_stages:?}"
-    );
-
-    let arguments = serde_json::json!({ "command": source }).to_string();
+    // The first Kuru request must exercise the original source. Observation
+    // wrappers can alter discovery; a diagnostic retry cannot establish a pass.
+    let arguments = serde_json::json!({ "command": original_source }).to_string();
     let output = child(Path::new(env!("CARGO_BIN_EXE_kuru")))
         .env("KURU_SHELL_PROGRESS", &kuru_progress)
-        .env("KURU_SHELL_LOOKUPS", &kuru_lookups)
         .arg("-C")
         .arg(&project)
         .args(["--allow-shell", "tool", "shell", "--args", &arguments])
         .output();
     let kuru_stages = shell_marker(&kuru_progress, 256);
-    let kuru_lookup_stages = shell_marker(&kuru_lookups, 4096);
-    let output = output.unwrap_or_else(|error| {
-        panic!("Kuru shell failed: {error}; stages={kuru_stages:?}; lookups={kuru_lookup_stages:?}")
-    });
+    let output =
+        output.unwrap_or_else(|error| panic!("Kuru shell failed: {error}; stages={kuru_stages:?}"));
     let trace = if !output.status.success()
         && String::from_utf8_lossy(&output.stderr).contains("shell timed out")
     {
@@ -538,7 +487,7 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
     };
     assert!(
         output.status.success(),
-        "{}\n{}\nstages={kuru_stages:?}; lookups={kuru_lookup_stages:?}\n{trace}",
+        "{}\n{}\nstages={kuru_stages:?}\n{trace}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -546,14 +495,6 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
         kuru_stages.as_deref().ok(),
         Some("entered\nversion-checked\nhash-started\nhashed\ncompleted\n"),
         "Kuru must complete its own source sequence: {kuru_stages:?}"
-    );
-    assert!(
-        kuru_lookup_stages.as_deref().is_ok_and(|stages| {
-            ["pre-get-file-hash", "post-get-file-hash"]
-                .into_iter()
-                .all(|expected| stages.lines().any(|stage| stage == expected))
-        }),
-        "successful hashing must expose both command lookup boundaries: {kuru_lookup_stages:?}"
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["exit_code"], 0);

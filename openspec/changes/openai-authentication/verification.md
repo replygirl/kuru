@@ -4,7 +4,7 @@
 - [x] 1.2 @integration (agent) exercise browser PKCE/callback/token exchange, device pacing and cancellation using real local HTTP -> 14 native auth cases passed within the 54-case connector suite, including exact PKCE/form exchange, invalid callbacks, busy ports, polling, expiry and cancellation, /tmp/kuru-native-auth-connectors.log.
 - [x] 1.3 @runtime (agent) exercise private files, concurrent token refresh, rejected rotation, relogin and logout -> actual private files and HTTP fixtures passed concurrent six-manager single rotation, missing-access rejection, destroyed caller runtime, fresh/existing browser and device logout fencing, unsafe records and changed locks; the 54-case connector suite passed in 4.78 seconds, /tmp/kuru-native-auth-connectors.log.
 - [x] 1.4 @manual (human) complete native browser login and one Kuru conversation after the tested build is ready -> user completed actual browser sign-in on September 11. Native catalog returned eight models and effort settings. Initial inference failed on a missing Content-Type header; after the tested parser correction, the same Kuru login completed a GPT-6 Astra conversation and returned “Hello, it’s nice to meet you!” (3034 input / 52 output tokens, no error events). Actual logs: /tmp/kuru-native-auth-live-response-before.log and /tmp/kuru-native-auth-live-response-after.log. No credential files were inspected or copied; Kuru's native provider used its own user-created session.
-- [ ] 1.5 @integration (agent) exercise actual Windows desktop error propagation and COM apartment ownership using a missing private executable -> native failure retains the file-not-found error, releases the initialized STA and preserves an incompatible caller MTA. CI 34607501091 showed that the previous unregistered-URI control could succeed or lack a native error; Windows-target Clippy passed for the corrected control in /tmp/kuru-browser-missing-target-crosslint.log. Corrected native execution remains pending.
+- [x] 1.5 @integration (agent) exercise actual Windows desktop error propagation and COM apartment ownership using a missing private executable -> CI 34612890798, Windows primitive job 103307525625, passed all 60 tests, including native file-not-found propagation, released STA and preserved caller MTA. Raw platform coverage was 2904/3178 lines (91.378225%). The actual merge checkout's tree matches candidate ca8e38a; log: /tmp/kuru-shell-lookup-ci-job-103307525625.log. The corrected control replaces the unreliable unregistered-URI control observed in CI 34607501091. Windows-target Clippy also passed in /tmp/kuru-browser-missing-target-crosslint.log.
 
 ## 2. Working OpenAI requests [critical]
 
@@ -14,8 +14,14 @@
 
 ## 3. Finish the Dolt and portability PR [critical]
 
-- [ ] 3.1 @e2e (agent) run actual native installed/update acceptance and isolated auth/API checks on the five existing targets -> complete Kuru works without a separate harness and existing Dolt, archive and updater checks pass.
+- [x] 3.1 @e2e (agent) run actual native installed/update acceptance and isolated auth/API checks on the five existing targets -> CI 34612890798 passed all five native targets at ca8e38a. Windows passed four native auth CLI cases, 51 connector unit cases and five native connector command cases, plus source installation, missing/corrupt offline build controls, actual installed offline conversations/self-update and shipping DLL inspection. All four Unix targets passed their installed/packaged offline conversations and updates. Windows log: /tmp/kuru-shell-lookup-ci-job-103307525914.log; per-target logs, exact checkout/tree identities and raw coverage: /tmp/kuru-shell-lookup-ci-report.md.
 - [ ] 3.2 @integration (agent) run granular mise/hk/native CI including the remaining Windows memory connection case -> recorded checks pass with at least 90% meaningful coverage; no repeated platform static categories or runtime evals added.
 - [x] 3.3 @manual (agent) review docs, pins and final diff -> docs build, format, lint and public links/anchors passed in /tmp/kuru-native-auth-docs.log; Rust Clippy passed in /tmp/kuru-native-auth-lint-final.log. Codex mise tool and all five lock entries are removed; direct crypto/URL dependencies reuse exact existing locked releases. Runtime and Release/Pages sources are unchanged. Windows browser dispatch uses the platform shell handoff; its native execution remains part of CI acceptance.
 
-The user-participating live check passed. Final native installed/update acceptance and hooks/coverage remain pending; local fixture passes do not establish them.
+The user-participating live check and five-target native installed/update checks
+passed. CI 34612890798 recorded Windows workspace coverage of 19061/20227
+(94.235428%), platform coverage of 2904/3178 (91.378225%), Ubuntu coverage of
+15535/16058 (96.743056%) and macOS ARM coverage of 15546/16069 (96.745286%).
+Its shell test used observation callbacks. The later local plain-source shell
+correction requires its own native pass before final hooks/CI closure and archive;
+the existing successful run does not establish that later fixture's acceptance.
