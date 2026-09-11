@@ -19,6 +19,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+#[path = "support/update_trace.rs"]
+mod update_trace;
+
+fn trace_records(bytes: &[u8]) -> Result<Vec<update_trace::Record<'_>>> {
+    update_trace::parse(bytes).map_err(|cause| {
+        anyhow::anyhow!(
+            "unexpected helper stderr ({cause}): {}",
+            String::from_utf8_lossy(bytes)
+        )
+    })
+}
+
 #[tokio::test]
 async fn trusted_helper_stderr_preserves_eof_error_and_drains_past_prefix_limit() -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -422,11 +434,7 @@ async fn interrupted(checkpoint: &str, phase: &str, new: bool) -> Result<()> {
         );
     }
     let bytes = error.context("stderr task timed out")???;
-    ensure!(
-        bytes.is_empty(),
-        "unexpected helper stderr: {}",
-        String::from_utf8_lossy(&bytes)
-    );
+    trace_records(&bytes)?;
     Ok(())
 }
 
@@ -620,11 +628,7 @@ async fn post_ack_parent_loss_leaves_actual_helper_to_finish_owned_cleanup() -> 
         );
     }
     let bytes = error.context("stderr task timed out")???;
-    ensure!(
-        bytes.is_empty(),
-        "unexpected helper stderr: {}",
-        String::from_utf8_lossy(&bytes)
-    );
+    trace_records(&bytes)?;
     Ok(())
 }
 
@@ -714,8 +718,8 @@ async fn loaded_image_acknowledges_exact_new_bytes_while_old_process_is_still_al
         .unwrap()
         .unwrap()
         .unwrap();
-    let trace = String::from_utf8(trace).unwrap();
-    let mut records = trace.lines();
+    let trace = trace_records(&trace).unwrap();
+    let mut records = trace.iter();
     let mut previous = 0;
     for phase in [
         "started",
@@ -735,22 +739,22 @@ async fn loaded_image_acknowledges_exact_new_bytes_while_old_process_is_still_al
         "verified_publication_acknowledgment_sent",
         "wait_parent_exit",
     ] {
-        let prefix = format!("trusted update helper: phase={phase} elapsed_ms=");
-        let elapsed: u128 = records
-            .find_map(|line| line.strip_prefix(&prefix))
-            .unwrap_or_else(|| panic!("missing ordered phase {phase}: {trace}"))
-            .parse()
-            .unwrap();
+        let elapsed = records
+            .find(|record| record.phase == phase)
+            .unwrap_or_else(|| panic!("missing ordered phase {phase}: {trace:?}"))
+            .elapsed_ms;
         assert!(
             elapsed >= previous,
-            "helper elapsed records moved backward: {trace}"
+            "helper elapsed records moved backward: {trace:?}"
         );
         previous = elapsed;
     }
     assert!(
-        trace.contains("phase=complete elapsed_ms=")
-            || trace.contains("phase=parent_still_alive_cleanup_pending elapsed_ms="),
-        "helper did not report its actual bounded cleanup outcome: {trace}"
+        trace.iter().any(|record| matches!(
+            record.phase,
+            "complete" | "parent_still_alive_cleanup_pending"
+        )),
+        "helper did not report its actual bounded cleanup outcome: {trace:?}"
     );
     // The cached current-version image is deliberately persistent. A fresh
     // public invocation runs the new image only after verified acknowledgment.

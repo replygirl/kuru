@@ -592,3 +592,28 @@ remaining issue. These host results do not typecheck or execute Windows branches
 Evidence: `/tmp/kuru-native-delivery-123-fixes.md`,
 `/tmp/kuru-mise-123-version-routing.log` and
 `/tmp/kuru-delivery-123-review.md`.
+
+The normal push of `a552102f5e868c5e3e55d18a1c058835c97f6833` passed all eight
+concurrent local checks. Combined coverage was 14,392/14,820 lines (97.112011%);
+the suite took 263.68 seconds and coverage with preparation took 265.70 seconds.
+The hosted static jobs and PR-title check passed in
+[CI 34557801363](https://github.com/replygirl/kuru/actions/runs/34557801363).
+Native jobs were still running when the next fixture issue was found; no native
+acceptance is inferred. Local evidence: `/tmp/kuru-a552102-push.log` and
+`/tmp/kuru-a552102-coverage.lcov`.
+
+Further integration review found an effect missed by the first source review:
+interrupted-helper and post-ACK fixtures still required empty stderr despite the
+new static phase records. The loaded-image assertion also accepted unrelated
+lines while locating its expected phases. Their shared test-only parser now
+requires bounded, complete UTF-8 records with known phases and canonical,
+nondecreasing elapsed values; extra text remains an error. Actual failure and
+recovery assertions, identity checks, marker synchronization and deadlines stay
+in place. The original push completed before it could be stopped; no process or
+hosted workflow was manually cancelled.
+
+Three focused host parser controls, strict delivery Clippy and formatting passed.
+Independent review checked every emitted phase and affected interruption/error
+path; it found no remaining issue. The source comparison is not native execution.
+Evidence: `/tmp/kuru-helper-trace-followup.md` and
+`/tmp/kuru-helper-trace-followup-review.md`.
