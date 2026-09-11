@@ -1,8 +1,8 @@
 #![cfg(feature = "tooling")]
 
+use kuru_delivery::command::Command;
 use serde_json::Value;
 use std::{fs, path::Path, process::Output};
-use tokio::process::Command;
 
 async fn cospec(root: &Path, args: &[&str]) -> Output {
     tokio::time::timeout(

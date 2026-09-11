@@ -1,21 +1,30 @@
+#[cfg(windows)]
+use kuru_platform::windows::process::{Console, NativeChild as Child, NativeSpawnSpec, Stdio};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
 use std::{
     io::{BufRead, BufReader},
     process::{Child, Command, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
+#[path = "support/memory.rs"]
+mod memory;
+
 struct Server(Child);
 
 impl Drop for Server {
     fn drop(&mut self) {
+        #[cfg(unix)]
         if matches!(self.0.try_wait(), Ok(None)) {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+        #[cfg(windows)]
+        let _ = self.0.terminate();
     }
 }
 
@@ -25,36 +34,94 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
     let project = root.path().join("workspace");
     let data = root.path().join("data");
     std::fs::create_dir(&project)?;
-    let child = Command::new(env!("CARGO_BIN_EXE_kuru"))
-        .arg("-C")
-        .arg(&project)
-        .arg("--data-dir")
-        .arg(&data)
-        .args([
-            "--provider",
-            "demo",
-            "--mode",
-            "freudian",
-            "--no-dream",
-            "serve",
-            "--bind",
-            "127.0.0.1:0",
-        ])
-        .env("KURU_A2A_TOKEN", "integration-token-123456")
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut child = Server(child);
-    let stderr = child.0.stderr.take().context("server stderr missing")?;
-    let (sender, receiver) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
+    #[cfg(unix)]
+    let (mut child, line) = {
+        let child = Command::new(env!("CARGO_BIN_EXE_kuru"))
+            .arg("-C")
+            .arg(&project)
+            .arg("--data-dir")
+            .arg(&data)
+            .args([
+                "--provider",
+                "demo",
+                "--mode",
+                "freudian",
+                "--no-dream",
+                "serve",
+                "--bind",
+                "127.0.0.1:0",
+            ])
+            .env("KURU_A2A_TOKEN", "integration-token-123456")
+            .env("XDG_CONFIG_HOME", memory::configuration(root.path())?)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut child = Server(child);
+        let stderr = child.0.stderr.take().context("server stderr missing")?;
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stderr).read_line(&mut line).map(|_| line);
+            let _ = sender.send(result);
+        });
+        let line = receiver.recv_timeout(Duration::from_secs(10))??;
+        reader.join().expect("server readiness reader panicked");
+        (child, line)
+    };
+    #[cfg(windows)]
+    let (mut child, line) = {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut spec =
+            NativeSpawnSpec::new(env!("CARGO_BIN_EXE_kuru").into(), root.path().to_path_buf());
+        spec.args = vec![
+            "-C".into(),
+            project.as_os_str().into(),
+            "--data-dir".into(),
+            data.as_os_str().into(),
+        ];
+        spec.args.extend(
+            [
+                "--provider",
+                "demo",
+                "--mode",
+                "freudian",
+                "--no-dream",
+                "serve",
+                "--bind",
+                "127.0.0.1:0",
+            ]
+            .map(Into::into),
+        );
+        spec.environment = std::env::vars_os()
+            .filter(|(key, _)| {
+                !kuru_platform::windows::process::environment_key_eq(
+                    key,
+                    std::ffi::OsStr::new("XDG_CONFIG_HOME"),
+                ) && !kuru_platform::windows::process::environment_key_eq(
+                    key,
+                    std::ffi::OsStr::new("KURU_A2A_TOKEN"),
+                )
+            })
+            .collect();
+        spec.environment.extend([
+            (
+                "XDG_CONFIG_HOME".into(),
+                memory::configuration(root.path())?.into_os_string(),
+            ),
+            ("KURU_A2A_TOKEN".into(), "integration-token-123456".into()),
+        ]);
+        spec.console = Console::NewProcessGroup;
+        spec.stderr = Stdio::Pipe;
+        let mut child = Server(spec.spawn().await?);
+        let stderr = child.0.take_stderr().context("server stderr missing")?;
+        let mut reader = BufReader::new(stderr);
         let mut line = String::new();
-        let result = BufReader::new(stderr).read_line(&mut line).map(|_| line);
-        let _ = sender.send(result);
-    });
-    let line = receiver.recv_timeout(Duration::from_secs(10))??;
-    reader.join().expect("server readiness reader panicked");
+        tokio::time::timeout(Duration::from_secs(80), reader.read_line(&mut line)).await??;
+        // The server only publishes one readiness line. Retain no unobserved
+        // pipe operation after completing that frame.
+        reader.into_inner().close(Duration::from_secs(5)).await?;
+        (child, line)
+    };
     ensure!(line.contains("listening"), "{line}");
     let address = line
         .split_whitespace()
@@ -119,8 +186,8 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
         nix::unistd::Pid::from_raw(child.0.id().try_into()?),
         nix::sys::signal::Signal::SIGINT,
     )?;
-    #[cfg(not(unix))]
-    child.0.kill()?;
+    #[cfg(windows)]
+    child.0.interrupt()?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.0.try_wait()? {

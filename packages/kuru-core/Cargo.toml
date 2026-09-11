@@ -5,11 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Framework profiles, configuration, and isolated durable memory for Kuru"
+description = "Framework profiles, configuration, and shared contracts for Kuru"
 
 [dependencies]
 anyhow.workspace = true
-rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

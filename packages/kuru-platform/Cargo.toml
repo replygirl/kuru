@@ -1,0 +1,65 @@
+[package]
+name = "kuru-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Checked native filesystem, Windows process ownership and private IPC for Kuru"
+
+[features]
+default = []
+test-support = ["dep:serde_json"]
+
+[[bin]]
+name = "kuru-platform-process-fixture"
+path = "tests/fixtures/process.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "kuru-platform-fs-fixture"
+path = "tests/fixtures/filesystem.rs"
+required-features = ["test-support"]
+
+[dependencies]
+serde_json = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs", "process"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+tokio.workspace = true
+uuid.workspace = true
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Storage_FileSystem",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Console",
+  "Win32_System_Com",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_JobObjects",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_System_SystemServices",
+  "Win32_System_SystemInformation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# Consumer crates retain the workspace's forbid. Only the audited native Windows
+# implementation modules may override this crate's deny with a local allow.
+[lints.rust]
+unsafe_code = "deny"

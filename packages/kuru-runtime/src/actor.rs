@@ -2,14 +2,25 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use kuru_connectors::Provider;
-use kuru_core::{Completion, CompletionRequest, MemoryStore, Message, ToolSpec};
+use kuru_core::{Completion, CompletionRequest, Message, ToolSpec};
+use kuru_memory::MemoryStore;
 use serde_json::{Value, json};
 use tokio::{
     sync::{Semaphore, mpsc, oneshot},
     task::JoinHandle,
 };
 
+#[derive(Debug)]
+pub(crate) struct MemoryFailure(pub anyhow::Error);
+impl std::fmt::Display for MemoryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "actor memory operation failed: {:#}", self.0)
+    }
+}
+impl std::error::Error for MemoryFailure {}
+
 pub(crate) struct Work {
+    pub memory: MemoryStore,
     pub inputs: Vec<Message>,
     pub instructions: String,
     pub model: String,
@@ -25,23 +36,24 @@ pub(crate) struct Actor {
 }
 
 impl Actor {
-    pub fn spawn(
-        namespace: String,
-        memory: MemoryStore,
-        provider: Arc<dyn Provider>,
-        permits: Arc<Semaphore>,
-    ) -> Self {
+    pub fn spawn(namespace: String, provider: Arc<dyn Provider>, permits: Arc<Semaphore>) -> Self {
         let (tx, mut rx) = mpsc::channel::<Work>(16);
         let task = tokio::spawn(async move {
             while let Some(mut work) = rx.recv().await {
                 let run = async {
                     let _permit = permits.acquire().await.context("actor pool closed")?;
                     for input in &work.inputs {
-                        memory.append(&namespace, &input.role, &input.content)?;
+                        work.memory
+                            .append(&namespace, &input.role, &input.content)
+                            .await
+                            .map_err(MemoryFailure)?;
                     }
                     let mut instructions = work.instructions.clone();
                     let notes = bounded_history(
-                        memory.history(&format!("{namespace}/notes"), 16)?,
+                        work.memory
+                            .history(&format!("{namespace}/notes"), 16)
+                            .await
+                            .map_err(MemoryFailure)?,
                         0,
                         16 * 1024,
                     )?;
@@ -55,7 +67,10 @@ impl Actor {
                         actor: namespace.clone(),
                         instructions,
                         messages: bounded_history(
-                            memory.history(&namespace, work.history_limit)?,
+                            work.memory
+                                .history(&namespace, work.history_limit)
+                                .await
+                                .map_err(MemoryFailure)?,
                             work.inputs.len(),
                             112 * 1024,
                         )?,
@@ -91,11 +106,14 @@ impl Actor {
                             serde_json::json!({"text":completion.text,"calls":completion.calls})
                                 .to_string()
                         };
-                        memory.append(
-                            &namespace,
-                            "assistant",
-                            &truncate_text(&content, 128 * 1024),
-                        )?;
+                        work.memory
+                            .append(
+                                &namespace,
+                                "assistant",
+                                &truncate_text(&content, 128 * 1024),
+                            )
+                            .await
+                            .map_err(MemoryFailure)?;
                     }
                     Ok(completion)
                 };

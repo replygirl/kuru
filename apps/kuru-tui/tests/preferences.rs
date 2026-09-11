@@ -1,12 +1,17 @@
+use kuru_delivery::command::BlockingCommand as Command;
+use kuru_memory::MemoryStore;
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
     sync::Arc,
 };
 
 use kuru_connectors::DemoProvider;
-use kuru_core::{Config, MemoryStore, Mode};
+use kuru_core::{Config, Mode};
 use kuru_runtime::Harness;
+
+#[path = "support/memory.rs"]
+mod memory;
 
 struct Sandbox {
     root: tempfile::TempDir,
@@ -20,6 +25,7 @@ impl Sandbox {
         let project = root.path().join("project");
         let data = root.path().join("data");
         std::fs::create_dir(&project).unwrap();
+        memory::configuration(root.path()).unwrap();
         Self {
             root,
             project,
@@ -55,8 +61,13 @@ impl Sandbox {
         .unwrap()
     }
 
-    fn remember(&self) -> String {
-        let memory = MemoryStore::open(&self.data.join("memory.sqlite3")).unwrap();
+    async fn remember(&self) -> String {
+        let options = kuru_memory::test_support::open_options(
+            self.data.clone(),
+            kuru_runtime::project_scope(&self.project).unwrap(),
+        )
+        .unwrap();
+        let memory = MemoryStore::open(options).await.unwrap();
         let mut harness = Harness::new(
             Config {
                 provider: "demo".into(),
@@ -68,10 +79,12 @@ impl Sandbox {
             Arc::new(DemoProvider),
             None,
         )
+        .await
         .unwrap();
-        harness.set_mode(Mode::Jungian).unwrap();
+        harness.set_mode(Mode::Jungian).await.unwrap();
         harness
             .set_model("saved-model", Some("ultra".into()))
+            .await
             .unwrap();
         harness.session.id.clone()
     }
@@ -89,7 +102,7 @@ fn success(output: Output) -> String {
 #[tokio::test]
 async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_selections() {
     let sandbox = Sandbox::new();
-    let saved_session = sandbox.remember();
+    let saved_session = sandbox.remember().await;
     std::fs::create_dir(sandbox.project.join(".kuru")).unwrap();
     let shared = sandbox.project.join(".kuru/config.toml");
     let shared_contents = "mode='ifs'\nmodel='team-model'\neffort='low'\n";
@@ -197,26 +210,35 @@ async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_sel
     }
 }
 
-#[test]
-fn configuration_inspection_does_not_create_a_store_but_rejects_existing_tool_root_storage() {
+#[tokio::test]
+async fn configuration_inspection_does_not_create_a_store_but_rejects_existing_tool_root_storage() {
     let sandbox = Sandbox::new();
     assert_eq!(sandbox.config(&[]).mode, Mode::Ifs);
     assert!(!sandbox.data.exists());
     let nested = sandbox.project.join("state");
-    MemoryStore::open(&nested.join("memory.sqlite3")).unwrap();
+    kuru_platform::fs::Directory::ensure_private(&nested).unwrap();
+    std::fs::write(nested.join("memory.sqlite3"), b"existing legacy store").unwrap();
     let output = sandbox
         .command_for(&sandbox.project, &nested, "demo")
         .arg("config")
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("outside the tool workspace"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outside the tool workspace"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(nested.join("memory.sqlite3")).unwrap(),
+        b"existing legacy store"
+    );
 }
 
 #[tokio::test]
 async fn an_explicit_framework_override_is_validated_against_its_own_part_budget() {
     let sandbox = Sandbox::new();
-    sandbox.remember();
+    sandbox.remember().await;
     let local = sandbox.root.path().join("small-pool.toml");
     std::fs::write(&local, "max_parts=3\n").unwrap();
     let config = sandbox.config(&["--config", local.to_str().unwrap(), "--mode", "freudian"]);

@@ -13,45 +13,28 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  MISE_LOCKED: "1"
+  MISE_NO_HOOKS: "1"
+
 jobs:
-  check:
+  quality:
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: ${{ github.sha }}
+      artifact-prefix: ci
+
+  native-tests:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with:
-          experimental: true
-          version: 2026.9.3
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - run: mise run setup
-      - name: Tool lock drift
-        run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
-      - name: Cache Rust build dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-bin: false
-      - run: mise run check
-      - name: Source install smoke
-        env:
-          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
-        run: |
-          mise run install
-          "$KURU_INSTALL_DIR/kuru" --version
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-${{ matrix.os }}
-          path: target/coverage.lcov
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: matrix.os == 'ubuntu-24.04'
-        with:
-          name: documentation-preview
-          path: apps/kuru-docs/.vitepress/dist
-          include-hidden-files: true
+        os: [ubuntu-24.04, macos-14, windows-2025]
+    uses: ./.github/workflows/native-tests.yml
+    with:
+      ref: ${{ github.sha }}
+      os: ${{ matrix.os }}
+      install: true
+      artifact-prefix: ci
 
   native-build:
     strategy:
@@ -66,7 +49,7 @@ jobs:
     env:
       MISE_LOCKED: "1"
       MISE_TASK_RUN_AUTO_INSTALL: "false"
-      # Only omit mise's repository setup hook in these archive-only jobs.
+      # Native archive and memory tests need only the pinned Rust toolchain.
       MISE_NO_HOOKS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,7 +58,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.3
+          version: 2026.9.4
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -88,14 +71,60 @@ jobs:
           version=${version#kuru }
           mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$version"
           git diff --exit-code --name-only HEAD
+      - name: Verify native Dolt memory
+        run: mise run //packages/kuru-memory:test
+      - name: Verify packaged offline runtime
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru
+        run: mise run //apps/kuru-tui:test:embedded-runtime
+
+  native-platform:
+    name: Native platform primitives (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      MISE_LOCKED: "1"
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      MISE_NO_HOOKS: "1"
+      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust cargo:cargo-llvm-cov
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Set up platform Rust components
+        run: mise run //packages/kuru-platform:setup
+      - name: Cache platform Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: native-platform-windows
+      - name: Test native platform primitives and require 90% coverage
+        run: mise run //packages/kuru-platform:coverage
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock Cargo.lock
+      - name: Upload native platform coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-native-platform-windows
+          path: target/kuru-platform-coverage.lcov
+          if-no-files-found: error
 
   ci-gate:
     if: always()
-    needs: [check, native-build]
+    needs: [quality, native-tests, native-build, native-platform]
     runs-on: ubuntu-24.04
     steps:
-      - name: Require every platform check
+      - name: Require every static and native check
         env:
-          CHECK_RESULT: ${{ needs.check.result }}
-          NATIVE_BUILD_RESULT: ${{ needs.native-build.result }}
-        run: test "$CHECK_RESULT" = success && test "$NATIVE_BUILD_RESULT" = success
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$RESULTS"

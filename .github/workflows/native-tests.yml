@@ -1,0 +1,122 @@
+name: Native tests
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact source commit to validate
+        required: true
+        type: string
+      os:
+        type: string
+        default: ubuntu-24.04
+      install:
+        description: Also verify source installation and the shipping offline runtime
+        type: boolean
+        default: false
+      artifact-prefix:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  MISE_LOCKED: "1"
+  MISE_NO_HOOKS: "1"
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+jobs:
+  coverage:
+    name: Coverage and native behavior
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select private bundle build inputs
+        shell: bash
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        # Cargo's restored target/ cache must not supply these directory grants.
+        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Reserve space for bundled runtime coverage
+        if: inputs.os == 'ubuntu-24.04'
+        shell: bash
+        run: |
+          # This Rust/Node job does not use the hosted image's mobile or Swift SDKs.
+          # Keep Cargo outputs, coverage and the runner's own runtime intact.
+          df -h /
+          for sdk in /usr/local/lib/android /usr/share/swift; do
+            if [ -d "$sdk" ]; then
+              sudo du -sh "$sdk"
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+          df -h /
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          # Cospec is exercised by delivery's real standalone contract tests.
+          install_args: rust cargo:cargo-llvm-cov github:aligned-team/cospec
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Install coverage components
+        run: rustup component add llvm-tools-preview --toolchain 1.98.1
+      - name: Install package-owned test tools
+        run: mise run //packages/kuru-delivery:setup:test-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: native-coverage
+      - name: Run instrumented native tests and require 90% coverage
+        run: mise run coverage
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-attempt-${{ github.run_attempt }}
+          path: target/coverage.lcov
+          if-no-files-found: error
+      - name: Source install smoke
+        if: inputs.install && runner.os != 'Windows'
+        env:
+          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
+          CARGO_NET_OFFLINE: "true"
+          KURU_DOLT_BUNDLE_OFFLINE: "true"
+        run: |
+          mise run install
+          "$KURU_INSTALL_DIR/kuru" --version
+      - name: Native Windows source install smoke
+        if: inputs.install && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          KURU_INSTALL_DIR: ${{ runner.temp }}/kuru-bin
+          CARGO_NET_OFFLINE: "true"
+          KURU_DOLT_BUNDLE_OFFLINE: "true"
+        run: |
+          mise run install
+          if ($LASTEXITCODE -ne 0) { throw 'Source installation failed' }
+          & "$env:KURU_INSTALL_DIR/kuru.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Kuru failed' }
+      - name: Verify native offline Cargo input failures
+        if: inputs.install && runner.os == 'Windows'
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
+        run: mise run //packages/kuru-memory:bundle:verify-native-build
+      - name: Verify installed offline runtime
+        if: inputs.install
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: mise run //apps/kuru-tui:test:embedded-runtime
+      - name: Inspect native shipping DLL imports
+        if: inputs.install && runner.os == 'Windows'
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
+        run: mise run //apps/kuru-tui:verify:windows-imports

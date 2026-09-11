@@ -1,10 +1,17 @@
-use std::{fs::OpenOptions, process::Command};
+use kuru_delivery::command::BlockingCommand as Command;
+use kuru_platform::fs::Directory;
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[path = "support/memory.rs"]
+mod memory;
+
 fn arguments(project: &std::path::Path, data: &std::path::Path) -> Vec<String> {
+    let configuration = memory::configuration(data.parent().unwrap()).unwrap();
     vec![
+        "--config".into(),
+        configuration.join("kuru/config.toml").display().to_string(),
         "-C".into(),
         project.display().to_string(),
         "--data-dir".into(),
@@ -21,18 +28,15 @@ fn writer_lease_rejects_a_second_process_and_releases_on_close() {
     let project = root.path().join("project");
     let data = root.path().join("data");
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::create_dir_all(data.join("locks")).unwrap();
+    let directory = Directory::ensure_private(&data.join("locks")).unwrap();
     let project = project.canonicalize().unwrap();
     let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
     let hash = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let lease = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(data.join("locks").join(format!("{hash}.lock")))
+    let lease = directory
+        .lock_file(std::ffi::OsStr::new(&format!("{hash}.lock")))
         .unwrap();
     lease.try_lock().unwrap();
     let mut args = arguments(&project, &data);
@@ -43,6 +47,23 @@ fn writer_lease_rejects_a_second_process_and_releases_on_close() {
         .unwrap();
     assert!(!blocked.status.success());
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("active Kuru writer"));
+    // Even a read command needs the writer lease before importing a legacy file.
+    // An invalid marker proves the lease error precedes any attempt to parse it.
+    let legacy = data.join("memory.sqlite3");
+    std::fs::write(&legacy, b"legacy bytes must remain untouched").unwrap();
+    let blocked_migration = Command::new(env!("CARGO_BIN_EXE_kuru"))
+        .args(arguments(&project, &data))
+        .arg("sessions")
+        .output()
+        .unwrap();
+    assert!(!blocked_migration.status.success());
+    assert!(String::from_utf8_lossy(&blocked_migration.stderr).contains("active Kuru writer"));
+    assert_eq!(
+        std::fs::read(&legacy).unwrap(),
+        b"legacy bytes must remain untouched"
+    );
+    assert_eq!(std::fs::read_dir(&data).unwrap().count(), 2);
+    std::fs::remove_file(legacy).unwrap();
     drop(lease);
     let resumed = Command::new(env!("CARGO_BIN_EXE_kuru"))
         .args(&args)
@@ -127,9 +148,10 @@ fn symlink_lock_directory_cannot_redirect_project_locks() {
     let project = root.path().join("project");
     let data = root.path().join("data");
     let outside = root.path().join("outside");
-    for path in [&project, &data, &outside] {
+    for path in [&project, &outside] {
         std::fs::create_dir_all(path).unwrap();
     }
+    Directory::ensure_private(&data).unwrap();
     std::os::unix::fs::symlink(&outside, data.join("locks")).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_kuru"))
         .args(arguments(&project, &data))
@@ -137,6 +159,10 @@ fn symlink_lock_directory_cannot_redirect_project_locks() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("regular directory"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("regular directory"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
 }

@@ -175,9 +175,9 @@ pub async fn generate(
     if provider.omit_github_context {
         command.env_remove("GITHUB_TOKEN").env_remove("GH_TOKEN");
     }
-    let result = tokio::time::timeout(Duration::from_secs(600), command.output())
+    let result = crate::command::output(&mut command, Duration::from_secs(600))
         .await
-        .context("Communiqué timed out; no release was published")??;
+        .context("Communiqué execution failed; no release was published")?;
     ensure!(
         result.status.success(),
         "Communiqué failed ({}); no release was published",

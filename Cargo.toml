@@ -6,6 +6,9 @@ members = [
   "packages/kuru-connectors",
   "packages/kuru-runtime",
   "packages/kuru-delivery",
+  "packages/kuru-memory",
+  "packages/kuru-platform",
+  "packages/kuru-archive",
 ]
 
 [workspace.package]
@@ -21,10 +24,12 @@ base64 = "=0.23.1"
 async-trait = "=0.1.92"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
-toml = "=1.1.5"
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
-uuid = { version = "=1.26.0", features = ["v4", "v5", "serde"] }
+toml = "=1.1.6"
+rusqlite = { version = "=0.40.2", features = ["bundled", "backup"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "mysql"] }
+uuid = { version = "=1.26.1", features = ["v4", "v5", "serde"] }
 sha2 = "=0.11.0"
+getrandom = "=0.4.3"
 tokio = { version = "=1.53.1", features = ["full"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
 futures = "=0.3.34"
@@ -41,22 +46,34 @@ url = "=2.5.8"
 unicode-width = "=0.2.2"
 cap-std = "=4.0.3"
 cap-fs-ext = "=4.0.3"
-nix = { version = "=0.31.3", features = ["signal", "process", "term", "poll", "fs"] }
+nix = { version = "=0.31.3", features = ["signal", "process", "term", "poll", "fs", "user"] }
 rustix = { version = "=1.1.4", features = ["termios"] }
 vt100 = "=0.16.2"
 tar = "=0.4.46"
 flate2 = "=1.1.10"
 scraper = "=0.27.0"
 roxmltree = "=0.21.1"
+windows-sys = { version = "=0.61.2", default-features = false }
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
+crc32fast = "=1.5.1"
+portable-pty = "=0.9.0"
 kuru-core = { path = "packages/kuru-core" }
 kuru-connectors = { path = "packages/kuru-connectors" }
 kuru-runtime = { path = "packages/kuru-runtime" }
 kuru-delivery = { path = "packages/kuru-delivery" }
+kuru-memory = { path = "packages/kuru-memory" }
+kuru-platform = { path = "packages/kuru-platform" }
+kuru-archive = { path = "packages/kuru-archive" }
 
 [profile.release]
 lto = "thin"
 strip = true
 codegen-units = 1
+
+# Full-image update verification must also remain responsive in development.
+# Tests inherit this dependency-only optimization; workspace code stays at opt 0.
+[profile.dev.package."sha2:0.11.0"]
+opt-level = 3
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

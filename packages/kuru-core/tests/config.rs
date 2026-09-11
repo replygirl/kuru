@@ -140,13 +140,17 @@ fn bounded_regular_utf8_files_prevent_unlimited_or_malformed_instruction_loading
     assert!(format!("{:#}", Config::load(None, dir.path(), None).unwrap_err()).contains("256 KiB"));
     fs::remove_file(&config).unwrap();
     fs::create_dir(&config).unwrap();
-    assert!(
-        format!("{:#}", Config::load(None, dir.path(), None).unwrap_err()).contains("regular file")
-    );
+    let error = Config::load(None, dir.path(), None).unwrap_err();
+    assert!(format!("{error:#}").contains("regular file"), "{error:#}");
     write(dir.path().join("AGENTS.md"), [0xff]);
     assert!(load_instructions(dir.path()).is_err());
     write(dir.path().join("AGENTS.md"), "x".repeat(256 * 1024 + 1));
     assert!(load_instructions(dir.path()).is_err());
+    let instructions = dir.path().join("AGENTS.md");
+    fs::remove_file(&instructions).unwrap();
+    fs::create_dir(&instructions).unwrap();
+    let error = load_instructions(dir.path()).unwrap_err();
+    assert!(format!("{error:#}").contains("regular file"), "{error:#}");
 }
 
 #[test]

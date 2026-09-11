@@ -138,15 +138,18 @@ impl McpClient {
                 next_id: 0,
             })
         } else {
-            Transport::Stdio(Box::new(Rpc::spawn(
-                self.config
-                    .command
-                    .as_deref()
-                    .context("missing MCP command")?,
-                &self.config.args,
-                &self.config.env,
-                &self.root,
-            )?))
+            Transport::Stdio(Box::new(
+                Rpc::spawn(
+                    self.config
+                        .command
+                        .as_deref()
+                        .context("missing MCP command")?,
+                    &self.config.args,
+                    &self.config.env,
+                    &self.root,
+                )
+                .await?,
+            ))
         };
         let initialization = async {
             let result = transport.request("initialize", json!({"protocolVersion":VERSION,"capabilities":{},"clientInfo":{"name":"kuru","version":env!("CARGO_PKG_VERSION")}})).await?;
@@ -263,10 +266,7 @@ impl Transport {
     }
     async fn close(&mut self) -> Result<()> {
         match self {
-            Self::Stdio(rpc) => {
-                rpc.close().await;
-                Ok(())
-            }
+            Self::Stdio(rpc) => rpc.close().await,
             Self::Http(rpc) => {
                 if let Some(session) = rpc.session.take() {
                     let mut request = rpc

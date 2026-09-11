@@ -5,10 +5,18 @@ run = "cargo build -p kuru-connectors --all-features --locked"
 run = "cargo build -p kuru-connectors --release --all-features --locked"
 
 [tasks."test"]
-run = "cargo test -p kuru-connectors --all-targets --all-features --locked"
+env.RUST_TEST_THREADS = "2"
+run = "cargo test -p kuru-connectors --all-targets --all-features --locked --no-fail-fast"
 
 [tasks."typecheck"]
 run = "cargo check -p kuru-connectors --all-targets --all-features --locked"
 
 [tasks."lint"]
 run = "cargo clippy -p kuru-connectors --all-targets --all-features --locked -- -D warnings"
+
+[tasks."format:fixture:check"]
+description = "Check the shared native protocol fixture explicitly"
+run = "rustfmt --edition 2024 --check tests/fixtures/stdio_peer.rs"
+
+[tasks."format:fixture:fix"]
+run = "rustfmt --edition 2024 tests/fixtures/stdio_peer.rs"

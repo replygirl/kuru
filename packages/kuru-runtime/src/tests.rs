@@ -1,3 +1,4 @@
+use kuru_memory::MemoryStore;
 use std::{
     sync::{
         Arc, Mutex,
@@ -14,7 +15,7 @@ use axum::{
 };
 use kuru_connectors::Provider;
 use kuru_core::{
-    Completion, CompletionRequest, Config, MemoryStore, Mode, ModelInfo, RelationshipKind, ToolCall,
+    Completion, CompletionRequest, Config, Mode, ModelInfo, RelationshipKind, ToolCall,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -31,6 +32,8 @@ struct Fake {
     respond: Box<Responder>,
     active: AtomicUsize,
     peak: AtomicUsize,
+    first_pair: Option<tokio::sync::Barrier>,
+    started: AtomicUsize,
 }
 impl Fake {
     fn new(
@@ -41,6 +44,8 @@ impl Fake {
             respond: Box::new(respond),
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            first_pair: None,
+            started: AtomicUsize::new(0),
         })
     }
 }
@@ -52,7 +57,11 @@ impl Provider for Fake {
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        if let Some(barrier) = &self.first_pair
+            && self.started.fetch_add(1, Ordering::SeqCst) < 2
+        {
+            tokio::time::timeout(Duration::from_secs(10), barrier.wait()).await?;
+        }
         self.active.fetch_sub(1, Ordering::SeqCst);
         let reply = (self.respond)(&request);
         self.requests.lock().unwrap().push(request);
@@ -74,7 +83,7 @@ fn call(name: &str, args: Value) -> ToolCall {
         arguments: args,
     }
 }
-fn fixture(mode: Mode, fake: Arc<dyn Provider>) -> (TempDir, Harness) {
+async fn fixture(mode: Mode, fake: Arc<dyn Provider>) -> (TempDir, Harness) {
     let directory = tempfile::tempdir().unwrap();
     let config = Config {
         mode,
@@ -87,18 +96,22 @@ fn fixture(mode: Mode, fake: Arc<dyn Provider>) -> (TempDir, Harness) {
     let harness = Harness::new(
         config,
         directory.path(),
-        MemoryStore::in_memory().unwrap(),
+        MemoryStore::temporary().await.unwrap(),
         fake,
         None,
     )
+    .await
     .unwrap();
     (directory, harness)
 }
 
 #[tokio::test]
 async fn peers_are_concurrent_bounded_and_never_receive_each_others_private_context() {
-    let fake = Fake::new(|_| answer("A useful contribution"));
-    let (_dir, mut harness) = fixture(Mode::Ifs, fake.clone());
+    let mut fake = Fake::new(|_| answer("A useful contribution"));
+    // Real durable writes may take longer than a tiny simulated model response.
+    // Hold the first response until a second call proves actual pool overlap.
+    Arc::get_mut(&mut fake).unwrap().first_pair = Some(tokio::sync::Barrier::new(2));
+    let (_dir, mut harness) = fixture(Mode::Ifs, fake.clone()).await;
     let private_owner = harness.topology.parts[0].id.clone();
     harness
         .memory
@@ -107,11 +120,12 @@ async fn peers_are_concurrent_bounded_and_never_receive_each_others_private_cont
             "user",
             "PRIVATE-OWNER-SECRET",
         )
+        .await
         .unwrap();
     let result = harness.run("List tradeoffs").await.unwrap();
     assert!(!result.text.is_empty());
     assert_eq!(harness.session.turns, 1);
-    assert_eq!(harness.history().unwrap().len(), 2);
+    assert_eq!(harness.history().await.unwrap().len(), 2);
     assert!(fake.peak.load(Ordering::SeqCst) > 1);
     assert!(fake.peak.load(Ordering::SeqCst) <= harness.config.max_parallel);
     let requests = fake.requests.lock().unwrap();
@@ -144,7 +158,7 @@ async fn peer_messages_route_directly_with_a2a_provenance_and_tool_receipts() {
         }
         reply
     });
-    let (_dir, mut harness) = fixture(Mode::Freudian, fake.clone());
+    let (_dir, mut harness) = fixture(Mode::Freudian, fake.clone()).await;
     let sender = harness.topology.parts[0].id.clone();
     let recipient = harness.topology.parts[1].id.clone();
     *routes.lock().unwrap() = (sender.clone(), recipient.clone());
@@ -154,7 +168,7 @@ async fn peer_messages_route_directly_with_a2a_provenance_and_tool_receipts() {
     assert_eq!(rpc["method"], "SendMessage");
     assert_eq!(rpc["params"]["message"]["metadata"]["sender"], sender);
     assert_eq!(rpc["params"]["message"]["metadata"]["recipient"], recipient);
-    let requests = fake.requests.lock().unwrap();
+    let requests = fake.requests.lock().unwrap().clone();
     assert!(requests.iter().any(|r| {
         r.actor.ends_with(&recipient)
             && r.messages
@@ -164,6 +178,7 @@ async fn peer_messages_route_directly_with_a2a_provenance_and_tool_receipts() {
     assert!(
         harness
             .memory_for(&sender)
+            .await
             .unwrap()
             .iter()
             .any(|m| m.role == "tool" && m.content.contains("delivered"))
@@ -173,7 +188,7 @@ async fn peer_messages_route_directly_with_a2a_provenance_and_tool_receipts() {
 #[tokio::test]
 async fn relationships_preserve_their_own_history_without_access_to_part_notes() {
     let fake = Fake::new(|_| answer("Shared voice"));
-    let (_dir, mut harness) = fixture(Mode::Freudian, fake.clone());
+    let (_dir, mut harness) = fixture(Mode::Freudian, fake.clone()).await;
     let members = harness.topology.parts[..2]
         .iter()
         .map(|p| p.id.clone())
@@ -185,9 +200,11 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
             "note",
             "PART-ONLY-NOTE",
         )
+        .await
         .unwrap();
     let relation = harness
         .relate(RelationshipKind::Alliance, members.clone())
+        .await
         .unwrap();
     harness
         .memory
@@ -196,16 +213,18 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
             "user",
             "RELATION-ONLY-NOTE",
         )
+        .await
         .unwrap();
     let output = harness.run("Use the relationship").await.unwrap();
     assert_eq!(output.speaker, relation.id);
     assert_eq!(output.relationship.unwrap().members.len(), 2);
-    harness.focus(None).unwrap();
+    harness.focus(None).await.unwrap();
     let mut reversed = members;
     reversed.reverse();
     assert_eq!(
         harness
             .relate(RelationshipKind::Alliance, reversed)
+            .await
             .unwrap()
             .id,
         relation.id
@@ -213,6 +232,7 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
     assert!(
         harness
             .memory_for(&relation.id)
+            .await
             .unwrap()
             .iter()
             .any(|m| m.content.contains("RELATION-ONLY-NOTE"))
@@ -256,7 +276,7 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
         }
         reply
     });
-    let (dir, mut harness) = fixture(Mode::Freudian, fake.clone());
+    let (dir, mut harness) = fixture(Mode::Freudian, fake.clone()).await;
     std::fs::write(dir.path().join("sample.txt"), "unique-file-content").unwrap();
     let result = harness.run("Read sample.txt").await.unwrap();
     assert!(result.text.contains("unique-file-content"));
@@ -282,10 +302,13 @@ async fn invalid_tool_calls_are_visible_to_the_model_and_cannot_change_state() {
         }
         reply
     });
-    let (_dir, mut harness) = fixture(Mode::Freudian, fake);
+    let (_dir, mut harness) = fixture(Mode::Freudian, fake).await;
     harness.run("Try invalid proposals").await.unwrap();
     assert!(harness.topology.states.is_empty());
-    let history = harness.memory_for(&harness.topology.parts[0].id).unwrap();
+    let history = harness
+        .memory_for(&harness.topology.parts[0].id)
+        .await
+        .unwrap();
     assert!(
         history
             .iter()
@@ -310,7 +333,7 @@ async fn modeled_state_selects_a_peer_and_stores_private_notes() {
         }
         reply
     });
-    let (_dir, mut harness) = fixture(Mode::Freudian, fake.clone());
+    let (_dir, mut harness) = fixture(Mode::Freudian, fake.clone()).await;
     let id = harness.topology.parts[1].id.clone();
     *target.lock().unwrap() = id.clone();
     let output = harness.run("Choose a perspective").await.unwrap();
@@ -343,7 +366,7 @@ async fn cyclic_peers_stop_at_round_and_call_limits() {
         }
         reply
     });
-    let (_dir, mut harness) = fixture(Mode::Freudian, fake.clone());
+    let (_dir, mut harness) = fixture(Mode::Freudian, fake.clone()).await;
     *roster.lock().unwrap() = harness
         .topology
         .parts
@@ -363,7 +386,7 @@ async fn cyclic_peers_stop_at_round_and_call_limits() {
 
 #[tokio::test]
 async fn dreaming_adds_retires_and_undoes_without_losing_memories() {
-    let (_dir, mut harness) = fixture(Mode::Ifs, Fake::new(|_| answer("Summary")));
+    let (_dir, mut harness) = fixture(Mode::Ifs, Fake::new(|_| answer("Summary"))).await;
     let before = harness.topology.parts.iter().filter(|p| p.active).count();
     let role = harness
         .topology
@@ -384,6 +407,7 @@ async fn dreaming_adds_retires_and_undoes_without_losing_memories() {
     harness
         .memory
         .append(&harness.namespace(&retired), "user", "preserve me")
+        .await
         .unwrap();
     let report = harness
         .apply_dream(vec![
@@ -396,6 +420,7 @@ async fn dreaming_adds_retires_and_undoes_without_losing_memories() {
                 id: retired.clone(),
             },
         ])
+        .await
         .unwrap();
     assert_eq!(report.accepted.len(), 2);
     assert_eq!(
@@ -403,11 +428,12 @@ async fn dreaming_adds_retires_and_undoes_without_losing_memories() {
         before
     );
     assert!(!harness.actors.contains_key(&retired));
-    harness.undo_dream().unwrap();
+    harness.undo_dream().await.unwrap();
     assert!(harness.actors.contains_key(&retired));
     assert!(
         harness
             .memory_for(&retired)
+            .await
             .unwrap()
             .iter()
             .any(|m| m.content == "preserve me")
@@ -421,12 +447,12 @@ async fn dreaming_adds_retires_and_undoes_without_losing_memories() {
             .unwrap()
             .active
     );
-    assert!(harness.undo_dream().is_err());
+    assert!(harness.undo_dream().await.is_err());
 }
 
 #[tokio::test]
 async fn dreaming_rejects_last_role_removal_unknown_roles_names_and_capacity_overflow() {
-    let (_dir, mut harness) = fixture(Mode::Freudian, Fake::new(|_| answer("Summary")));
+    let (_dir, mut harness) = fixture(Mode::Freudian, Fake::new(|_| answer("Summary"))).await;
     harness.config.max_parts = harness.topology.parts.len();
     let part = harness.topology.parts[0].clone();
     let proposals = vec![
@@ -457,13 +483,14 @@ async fn dreaming_rejects_last_role_removal_unknown_roles_names_and_capacity_ove
             instruction: "x".into(),
         },
     ];
-    let report = harness.apply_dream(proposals).unwrap();
+    let report = harness.apply_dream(proposals).await.unwrap();
     assert_eq!(report.rejected.len(), 6);
     assert!(report.accepted.is_empty());
     assert_eq!(harness.topology.parts.len(), 3);
     assert!(
         harness
             .apply_dream(vec![DreamProposal::Retire { id: part.id }; 7])
+            .await
             .is_err()
     );
 }
@@ -477,7 +504,7 @@ async fn dreaming_uses_isolated_actor_histories_and_runs_periodically() {
             answer("response")
         }
     });
-    let (_dir, mut harness) = fixture(Mode::Polyvagal, fake.clone());
+    let (_dir, mut harness) = fixture(Mode::Polyvagal, fake.clone()).await;
     harness.config.dream_every = 1;
     let output = harness.run("one turn").await.unwrap();
     assert!(
@@ -491,6 +518,7 @@ async fn dreaming_uses_isolated_actor_histories_and_runs_periodically() {
             harness
                 .memory
                 .history(&format!("{}/notes", harness.namespace(&part.id)), 20)
+                .await
                 .unwrap()[0]
                 .content,
             "durable dream summary"
@@ -513,7 +541,7 @@ async fn dreaming_uses_isolated_actor_histories_and_runs_periodically() {
 #[tokio::test]
 async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() {
     let dir = tempfile::tempdir().unwrap();
-    let db = tempfile::tempdir().unwrap();
+    let db = kuru_memory::test_support::tempdir().unwrap();
     let fake = Fake::new(|_| answer("persisted answer"));
     let config = Config {
         provider: "demo".into(),
@@ -521,7 +549,12 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
         dream_every: 0,
         ..Config::default()
     };
-    let memory = MemoryStore::open(&db.path().join("store.sqlite")).unwrap();
+    let options = kuru_memory::test_support::open_options(
+        db.path().to_owned(),
+        crate::project_scope(dir.path()).unwrap(),
+    )
+    .unwrap();
+    let memory = MemoryStore::open(options).await.unwrap();
     let mut harness = Harness::new(
         config.clone(),
         dir.path(),
@@ -529,11 +562,12 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
         fake.clone(),
         None,
     )
+    .await
     .unwrap();
-    harness.set_mode(Mode::Jungian).unwrap();
+    harness.set_mode(Mode::Jungian).await.unwrap();
     harness.run("retain this session").await.unwrap();
     let id = harness.session.id.clone();
-    assert_eq!(harness.sessions().unwrap().len(), 1);
+    assert_eq!(harness.sessions().await.unwrap().len(), 1);
     drop(harness);
     let resumed = Harness::new(
         config.clone(),
@@ -542,10 +576,15 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
         fake.clone(),
         Some(&id),
     )
+    .await
     .unwrap();
     assert_eq!(resumed.config.mode, Mode::Jungian);
     assert_eq!(resumed.session.turns, 1);
-    assert!(resumed.history().unwrap()[0].content.contains("retain"));
+    assert!(
+        resumed.history().await.unwrap()[0]
+            .content
+            .contains("retain")
+    );
     let other = tempfile::tempdir().unwrap();
     assert!(
         Harness::new(
@@ -555,15 +594,18 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
             fake.clone(),
             Some(&id)
         )
+        .await
         .is_err()
     );
-    let another = Harness::new(config, other.path(), memory, fake, None).unwrap();
+    let another = Harness::new(config, other.path(), memory, fake, None)
+        .await
+        .unwrap();
     assert_ne!(resumed.scope, another.scope);
 }
 
 #[tokio::test]
 async fn manual_focus_and_relationship_validation_reject_invalid_topology() {
-    let (_dir, mut h) = fixture(Mode::Ifs, Fake::new(|_| answer("ok")));
+    let (_dir, mut h) = fixture(Mode::Ifs, Fake::new(|_| answer("ok"))).await;
     assert!(h.resolve("manager").is_err());
     assert!(h.resolve("missing").is_err());
     let ids = h.topology.parts[..4]
@@ -575,13 +617,13 @@ async fn manual_focus_and_relationship_validation_reject_invalid_topology() {
         RelationshipKind::Polarization,
         RelationshipKind::Alliance,
     ] {
-        let r = h.relate(kind, ids.clone()).unwrap();
+        let r = h.relate(kind, ids.clone()).await.unwrap();
         assert_eq!(h.resolve(&r.id).unwrap(), r.id);
-        assert!(h.relate(kind, vec![r.id, ids[0].clone()]).is_err());
+        assert!(h.relate(kind, vec![r.id, ids[0].clone()]).await.is_err());
     }
-    h.focus(Some(&ids[0])).unwrap();
+    h.focus(Some(&ids[0])).await.unwrap();
     assert_eq!(h.run("focused").await.unwrap().speaker, ids[0]);
-    h.focus(None).unwrap();
+    h.focus(None).await.unwrap();
     assert!(h.topology.focus.is_none());
     assert!(h.run("").await.is_err());
     assert!(h.run_for("hello", Some("absent")).await.is_err());
@@ -603,11 +645,11 @@ async fn manual_focus_and_relationship_validation_reject_invalid_topology() {
             note: "state".into(),
         },
     );
-    h.save().unwrap();
+    h.save().await.unwrap();
 }
 
-#[test]
-fn a2a_messages_round_trip_and_reject_empty_or_oversized_payloads() {
+#[tokio::test]
+async fn a2a_messages_round_trip_and_reject_empty_or_oversized_payloads() {
     let message = PeerMessage::new("a", "b", "c", "hello 世界").unwrap();
     let decoded: PeerMessage =
         serde_json::from_value(message.rpc()["params"]["message"].clone()).unwrap();
@@ -642,7 +684,7 @@ async fn rpc(app: axum::Router, body: Value, token: &str, version: &str) -> (u16
 
 #[tokio::test]
 async fn a2a_server_enforces_auth_validates_protocol_and_returns_peer_output() {
-    let (_dir, h) = fixture(Mode::Freudian, Fake::new(|_| answer("real A2A answer")));
+    let (_dir, h) = fixture(Mode::Freudian, Fake::new(|_| answer("real A2A answer"))).await;
     let shared = Arc::new(tokio::sync::Mutex::new(h));
     assert!(crate::server::router(shared.clone(), "http://localhost", "short").is_err());
     let app = crate::server::router(shared, "http://localhost", "test-token-123456").unwrap();

@@ -22,7 +22,7 @@ hero:
 kuru --provider demo
 ```
 
-The demo is deterministic and offline. To do real work, [connect an inference provider](/guide/authentication), then choose a model and effort beside the composer.
+The demo provider is deterministic and works offline. Kuru includes its verified native Dolt engine, so even the first conversation needs no separate engine installation or download. To do real work, [connect an inference provider](/guide/authentication), then choose a model and effort beside the composer.
 
 ## Different perspectives. Shared work.
 

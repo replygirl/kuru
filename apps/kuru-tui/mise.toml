@@ -1,20 +1,67 @@
+[vars]
+kuru_tui_build_target = "{{env.CARGO_BUILD_TARGET | default(value='host')}}"
+
 [tasks."build"]
-run = "cargo build -p kuru --all-features --locked"
+shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
+dir = "{{config_root}}/../.."
+usage = 'flag "--target <target>" default="{{vars.kuru_tui_build_target}}"'
+env.CARGO_BUILD_TARGET = false
+depends = [
+  { task = "//packages/kuru-memory:bundle:prepare", args = [
+    "--target",
+    "{{usage.target}}",
+  ] },
+]
+run = 'cargo build -p kuru --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru --all-features --locked --target {% if usage.target == "host" %}x86_64-pc-windows-msvc{% else %}"%usage_target%"{% endif %}'
 
 [tasks."build:release"]
-run = "cargo build -p kuru --release --all-features --locked"
+shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
+dir = "{{config_root}}/../.."
+usage = 'flag "--target <target>" default="{{vars.kuru_tui_build_target}}"'
+env.CARGO_BUILD_TARGET = false
+env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
+depends = [
+  { task = "//packages/kuru-memory:bundle:prepare", args = [
+    "--target",
+    "{{usage.target}}",
+  ] },
+]
+run = 'cargo build -p kuru --release --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru --release --all-features --locked --target {% if usage.target == "host" %}x86_64-pc-windows-msvc{% else %}"%usage_target%"{% endif %}'
 
 [tasks."test"]
-run = "cargo test -p kuru --all-targets --all-features --locked"
+env.RUST_TEST_THREADS = "2"
+env.KURU_TEST_SUPERVISOR_PREPARED = "1"
+depends = ["//packages/kuru-memory:prefetch"]
+run = "cargo test -p kuru --all-targets --all-features --locked --no-fail-fast"
 
 [tasks."typecheck"]
+depends = ["//packages/kuru-memory:bundle:prepare"]
 run = "cargo check -p kuru --all-targets --all-features --locked"
 
 [tasks."lint"]
+depends = ["//packages/kuru-memory:bundle:prepare"]
 run = "cargo clippy -p kuru --all-targets --all-features --locked -- -D warnings"
 
 [tasks.run]
+depends = ["//packages/kuru-memory:bundle:prepare"]
 run = "cargo run -p kuru --locked --"
 
 [tasks.install]
+# These owned scripts use stock PowerShell modules, not an inherited pwsh module path.
+env.PSModulePath = false
 run = "bash ../../scripts/install.sh --source"
+run_windows = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/install-source.ps1"
+
+[tasks."test:embedded-runtime"]
+description = "Verify packaged installation and update with fresh offline memory"
+depends = ["//packages/kuru-memory:bundle:prepare"]
+run = "cargo test -p kuru --test embedded_runtime --all-features --locked -- --nocapture"
+
+[tasks."verify:windows-imports"]
+description = "Inspect the shipping Windows executable and its embedded Dolt for external DLL requirements"
+env.PSModulePath = false
+run = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/verify-windows-imports.ps1"
+[env]
+RUST_TEST_THREADS = "2"

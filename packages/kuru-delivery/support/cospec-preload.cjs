@@ -1,4 +1,4 @@
-// Temporary compatibility fix for cospec 0.7.0's embedded OpenSpec bundle.
+// Temporary compatibility fix for cospec's affected embedded OpenSpec bundle.
 // Its vendor build combines bin/openspec.js (unconditional runCli()) with
 // dist/cli/index.js (runCli() when argv[1] equals import.meta.url). Bundling
 // collapses both module paths, so the extracted entry executes twice.

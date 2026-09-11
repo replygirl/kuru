@@ -55,7 +55,7 @@ history after it stops speaking. Nonmembers have no implicit access to that
 history. Being a member of a relationship does not merge the members' private
 memories.
 
-SQLite persists namespaces transactionally. Project identity derives from a
+Dolt persists namespaces in versioned transactions. Project identity derives from a
 canonical path hash; state lives in a user data location outside tool roots.
 Jungian collective memory is project-scoped in v1. A future explicit policy can
 add cross-project scope without treating all user projects as one memory.
@@ -67,6 +67,16 @@ The runtime validates proposed additions and retirements, enforces `max_parts`
 and preserves at least one active part for each role. Retired parts are archived;
 their memories are retained. Saved prior topology permits undo. Explicit,
 periodic and session-end triggers share the same validation path.
+
+Each dream runs on a candidate branch, including its actor histories, summaries,
+tool receipts and proposed topology. Promotion requires the recorded live base;
+an interruption before promotion or a stale candidate leaves active memory intact.
+An accepted promotion may finish after cancellation; the runtime reconciles its
+durable result before further work. Undo adds a new
+revision restoring membership while retaining later conversations and choices.
+`kuru-memory` owns branch-pinned SQL views, verified engine installation and the
+authenticated local sidecar. A lifetime supervisor reaps the sidecar on exit or
+writer crash. No database process becomes a cognitive supervisor.
 
 Dreaming is a consolidation and topology-update mechanism. It does not run an
 unbounded background loop or imply biological sleep. Its provider calls count
@@ -84,9 +94,12 @@ toward the operational cost of a session.
 | Runtime envelopes | Extend peer actions and validate them before mutating state |
 | TUI/CLI | Expose options while keeping cognitive policy in the runtime |
 
-A provider only performs inference. Codex authentication and app-server are
-transports; Kuru owns actor context, memory and tools. General-purpose worker
-subtrees are outside the initial architecture. A2A ingress/egress provides the
+A provider only performs inference. The connector package owns native OpenAI
+authentication, Kuru's private token store and direct HTTP transports. The
+`codex` provider uses ChatGPT subscription access; `responses` uses an explicitly
+selected API-key route. Neither launches an external Codex harness. Kuru owns
+actor context, memory and tools. General-purpose worker subtrees are outside
+the initial architecture. A2A ingress/egress provides the
 path to external peers, with explicit configured endpoints rather than remote
 autodiscovery or implicit trust.
 

@@ -1,6 +1,11 @@
 # Dependency audit
 
-Releases were checked on 2026-09-09 against the official crates.io sparse registry, npm registry, upstream GitHub releases and mise release metadata. Direct dependencies are exactly pinned; lockfiles resolve their compatible transitive dependencies. Rust dependencies use stable releases. The docs app follows cospec's VitePress 2 preview architecture and pins the latest available alpha explicitly.
+Releases were checked on 2026-09-10 against the official crates.io sparse registry, npm registry, upstream GitHub releases and mise release metadata. Direct dependencies are exactly pinned; lockfiles resolve their compatible transitive dependencies. Rust dependencies use stable releases. The docs app follows cospec's VitePress 2 preview architecture and pins the latest available alpha explicitly.
+
+The Dolt change checked SQLx 0.9.0, UUID 1.26.1 and full Dolt 2.3.3 on
+2026-09-10. The memory package's catalog records the measured native archive,
+executable and license digests for each cataloged target. The Windows change
+also pins the native API bindings, strict ZIP codec and ConPTY test driver below.
 
 ## Rust dependencies
 
@@ -10,9 +15,10 @@ Releases were checked on 2026-09-09 against the official crates.io sparse regist
 | `async-trait` | `0.1.92` | [sparse index](https://index.crates.io/as/yn/async-trait) |
 | `serde` | `1.0.229` | [sparse index](https://index.crates.io/se/rd/serde) |
 | `serde_json` | `1.0.151` | [sparse index](https://index.crates.io/se/rd/serde_json) |
-| `toml` | `1.1.5+spec-1.1.0` | [sparse index](https://index.crates.io/to/ml/toml) |
+| `toml` | `1.1.6+spec-1.1.0` | [sparse index](https://index.crates.io/to/ml/toml) |
 | `rusqlite` | `0.40.2` | [sparse index](https://index.crates.io/ru/sq/rusqlite) |
-| `uuid` | `1.26.0` | [sparse index](https://index.crates.io/uu/id/uuid) |
+| `uuid` | `1.26.1` | [sparse index](https://index.crates.io/uu/id/uuid) |
+| `sqlx` | `0.9.0` | [sparse index](https://index.crates.io/sq/lx/sqlx) |
 | `sha2` | `0.11.0` | [sparse index](https://index.crates.io/sh/a2/sha2) |
 | `tokio` | `1.53.1` | [sparse index](https://index.crates.io/to/ki/tokio) |
 | `reqwest` | `0.13.5` | [sparse index](https://index.crates.io/re/qw/reqwest) |
@@ -33,6 +39,10 @@ Releases were checked on 2026-09-09 against the official crates.io sparse regist
 | `vt100` | `0.16.2` | [sparse index](https://index.crates.io/vt/10/vt100) |
 | `tar` | `0.4.46` | [sparse index](https://index.crates.io/3/t/tar) |
 | `flate2` | `1.1.10` | [sparse index](https://index.crates.io/fl/at/flate2) |
+| `zip` | `8.6.0` | [sparse index](https://index.crates.io/3/z/zip) |
+| `crc32fast` | `1.5.1` | [sparse index](https://index.crates.io/cr/c3/crc32fast) |
+| `windows-sys` | `0.61.2` | [sparse index](https://index.crates.io/wi/nd/windows-sys) |
+| `portable-pty` (Windows terminal tests) | `0.9.0` | [sparse index](https://index.crates.io/po/rt/portable-pty) |
 | `scraper` | `0.27.0` | [sparse index](https://index.crates.io/sc/ra/scraper) |
 | `roxmltree` | `0.21.1` | [sparse index](https://index.crates.io/ro/xm/roxmltree) |
 
@@ -41,24 +51,32 @@ Releases were checked on 2026-09-09 against the official crates.io sparse regist
 | Tool | Stable pin |
 | --- | --- |
 | `rust` | `1.98.1` |
-| Codex (optional live-provider transport) | `0.153.4` |
-| `github:aligned-team/cospec` | `0.7.0` |
+| `github:aligned-team/cospec` | `0.7.1` |
 | `aqua:jdx/hk` | `1.58.1` |
 | `aqua:tamasfe/taplo` | `0.10.0` |
 | `aqua:koalaman/shellcheck` | `0.11.0` |
 | `aqua:rhysd/actionlint` | `1.7.12` |
 | `cargo:cargo-llvm-cov` | `0.9.1` |
 | Node (docs app only) | `26.8.2` |
-| npm (bundled with Node) | `11.19.1` |
+| npm (docs app only) | `12.0.2` |
 | VitePress (docs app) | `2.0.0-alpha.20` |
 | `vitepress-plugin-llms` (docs app) | `1.13.5` |
 | `oxfmt` (docs app) | `0.67.0` |
 | `oxlint` (docs app) | `1.82.0` |
 | Cocogitto (delivery package) | `7.0.0` |
 | Communiqué (delivery package) | `1.3.5` |
-| CI mise | `2026.9.3` |
+| CI mise | `2026.9.4` |
 
-Cospec is `0.7.0`, confirmed by both [GitHub releases](https://github.com/aligned-team/cospec/releases/tag/v0.7.0) and [npm](https://www.npmjs.com/package/@aligned-team/cospec). The mise latest endpoint returned an older release during the audit; it was not used to downgrade the verified newer release. Its standalone executable embeds its supported OpenSpec version. No project OpenSpec, Bun or Python dependency is required.
+Cospec is `0.7.1`, confirmed by its [GitHub release](https://github.com/aligned-team/cospec/releases/tag/v0.7.1). Its standalone executable embeds its supported OpenSpec version. No project OpenSpec, Bun or Python dependency is required. The task-scoped compatibility preload remains necessary; see [development](development.md).
+
+The docs app selects npm `12.0.2` separately because Node `26.8.2` bundles
+npm `11.19.1`. Its app-owned mise alias retains npm's PATH priority over Node's
+bundled copy, and the tool option pins the official tarball's SHA-512 digest.
+The npm backend does not supply per-platform archive URLs or attestations in
+mise.lock; its exact version and explicit checksum remain authoritative.
+[npm's declared Node range](https://registry.npmjs.org/npm/12.0.2) includes
+26.8.2. A clean locked installation selects these versions; dependency lifecycle
+scripts retain npm 12's default-deny policy, including optional `fsevents`.
 
 ## CI actions
 
@@ -76,7 +94,7 @@ The reqwest 0.13 upgrade changes its TLS feature name to `rustls`; the capabilit
 
 ## Upstream transitive constraints
 
-All direct pins are the latest stable releases. Cargo's full update resolves
+All direct Rust pins are the latest stable releases. Cargo's full update resolves
 transitives to the latest compatible releases. Latest Axum 0.8.9 pins
 `matchit = 0.8.4` exactly, preventing 0.8.6; a `cargo update --precise` probe
 confirmed this constraint. The lockfile retains the supported resolution rather
@@ -86,6 +104,8 @@ Ratatui enables only its Crossterm 0.29 backend and layout cache. Disabling
 unused default widgets/backends removed the older optional termwiz/sha2 and
 pinned generic-array chain from the lockfile.
 
-Codex 0.153.4 is the latest published npm release, verified via the official
-`@openai/codex` registry metadata. It is pinned for development and live provider
-verification; offline demo and Responses operation do not require Codex.
+OpenAI authentication and model requests use Kuru's Rust connector package and
+the existing HTTP, cryptography and private-filesystem dependencies. Codex CLI
+and app-server are no longer runtime or development-tool prerequisites for
+these providers. No separate harness is installed or bundled. Node and npm
+remain scoped to the documentation app.

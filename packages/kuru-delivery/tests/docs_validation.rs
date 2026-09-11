@@ -3,10 +3,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
+use kuru_delivery::command::BlockingCommand as Command;
 use kuru_delivery::docs;
+#[path = "support/files.rs"]
+mod files;
 
 struct Site {
     directory: tempfile::TempDir,
@@ -113,7 +115,7 @@ fn incorrect_base_and_encoded_traversal_are_rejected() {
 #[cfg(unix)]
 #[test]
 fn output_symlinks_cannot_publish_outside_files_or_directories() {
-    use std::os::unix::fs::symlink;
+    use files::symlink;
     let site = Site::new();
     let outside = site.directory.path().join("outside.html");
     fs::write(&outside, "outside").unwrap();
@@ -190,9 +192,17 @@ fn repository_only_pages_and_private_artifacts_fail() {
         ".codex/auth.json",
     ] {
         let path = site.write(name, "fixture only");
+        // Discovery joins native directory entries; these inputs use URL-style
+        // separators to describe the fixture on every host.
+        let relative: PathBuf = Path::new(name).components().collect();
+        let expected = format!(
+            "{}: repository-only or private artifact",
+            relative.display()
+        );
+        let errors = site.errors();
         assert!(
-            site.errors()
-                .contains(&format!("{name}: repository-only or private artifact"))
+            errors.contains(&expected),
+            "missing exact private-artifact rejection {expected:?} for {name:?}: {errors:?}"
         );
         fs::remove_file(path).unwrap();
     }
@@ -285,7 +295,7 @@ fn invalid_bases_bad_encoding_and_unreadable_html_fail_locally() {
 #[cfg(unix)]
 #[test]
 fn internal_symlinks_and_root_base_work_without_recursing_cycles() {
-    use std::os::unix::fs::symlink;
+    use files::symlink;
     let site = Site::new();
     site.write(
         "index.html",

@@ -1,9 +1,12 @@
+#![cfg(unix)]
+
 use std::{
     fs::{self, File},
     io::{self, Read},
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Output, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -11,13 +14,16 @@ use flate2::{Compression, write::GzEncoder};
 use kuru_delivery::archive::{TARGETS, archive_name, digest, package};
 use tokio::process::Command;
 
+#[path = "support/bootstrap_process.rs"]
+mod bootstrap_process;
+
 const LIMIT: u64 = 128 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const PREVIOUS: &[u8] = b"previous executable";
 const CANDIDATE: &[u8] = b"#!/bin/sh\nprintf executed > \"$KURU_EXECUTION_MARKER\"\n";
 
 struct Fixture {
-    root: tempfile::TempDir,
+    root: Arc<tempfile::TempDir>,
     release: PathBuf,
     destination: PathBuf,
     tools: PathBuf,
@@ -78,7 +84,7 @@ impl Fixture {
         )
         .unwrap();
         Self {
-            root,
+            root: Arc::new(root),
             release,
             destination,
             tools,
@@ -127,7 +133,7 @@ impl Fixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
-            .kill_on_drop(true);
+            .kill_on_drop(false);
         command
     }
 
@@ -138,14 +144,42 @@ impl Fixture {
     }
 
     async fn run(&self, mut command: Command) -> Output {
+        let environment = command.as_std().get_envs().collect::<Vec<_>>();
+        let value = |name: &str| {
+            environment
+                .iter()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| *value)
+        };
+        let case = format!(
+            "os={:?} arch={:?} target={} args={:?}",
+            value("FIXTURE_OS"),
+            value("FIXTURE_ARCH"),
+            self.target,
+            command.as_std().get_args().collect::<Vec<_>>(),
+        );
         let child = command.spawn().unwrap();
-        let mut group = ProcessGroup(Some(child.id().unwrap()));
-        let output = tokio::time::timeout(TIMEOUT, child.wait_with_output())
-            .await
-            .expect("bootstrap timed out; process group cleanup follows")
-            .unwrap();
-        group.assert_finished();
-        output
+        self.capture(child, TIMEOUT, &case).await
+    }
+
+    fn capture(
+        &self,
+        child: tokio::process::Child,
+        timeout: Duration,
+        case: &str,
+    ) -> impl std::future::Future<Output = Output> + Send + 'static {
+        let capture = bootstrap_process::capture(
+            child,
+            timeout,
+            case,
+            Arc::clone(&self.root),
+            &self.destination,
+        );
+        async move {
+            capture
+                .await
+                .unwrap_or_else(|diagnostic| panic!("{diagnostic}"))
+        }
     }
 
     fn unchanged(&self) {
@@ -254,25 +288,25 @@ fn executable(path: &Path, bytes: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-// Kill the entire fixture-owned group if a timeout or assertion interrupts a test.
-// kill_on_drop alone would leave the Bash installer’s download children behind.
-struct ProcessGroup(Option<u32>);
-
-impl ProcessGroup {
-    fn assert_finished(&mut self) {
-        let pid = self.0.unwrap();
-        assert!(
-            !signal("-0", &format!("-{pid}")),
-            "bootstrap left a live child in group {pid}"
-        );
-        self.0 = None;
-    }
-}
+// Startup handshakes precede capture, so no wait has consumed this root yet.
+// An interrupted handshake retains its private files until the failed fixture
+// process ends rather than treating a requested signal as observed cleanup.
+struct ProcessGroup(Option<u32>, Arc<tempfile::TempDir>);
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
-            signal("-KILL", &format!("-{pid}"));
+            use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+            let pid = Pid::from_raw(pid as i32).unwrap();
+            if waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )
+            .is_ok()
+            {
+                let _ = kill_process_group(pid, Signal::KILL);
+            }
+            std::mem::forget(Arc::clone(&self.1));
         }
     }
 }
@@ -432,6 +466,271 @@ async fn host_detection_selects_each_supported_archive_and_rejects_unknown_hosts
         .env("FIXTURE_OS", "FreeBSD");
     failure(&fixture.run(command).await, "unsupported platform");
     fixture.unchanged();
+}
+
+async fn timeout_control(exited_root: bool) {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    use std::os::fd::OwnedFd;
+    use tokio::io::AsyncReadExt;
+
+    const CONTROL_TIMEOUT: Duration = Duration::from_millis(250);
+    const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+    let fixture = Arc::new(Fixture::new(TARGETS[0], "0.2.0"));
+    // This separate channel proves the fixture's actual processes have closed
+    // their inherited resource, even when the original capture panics and
+    // discards both output readers. Bash -c does not parse its source from stdin.
+    let (observer, lifetime) = std::os::unix::net::UnixStream::pair().unwrap();
+    observer.set_nonblocking(true).unwrap();
+    let mut observer = tokio::net::UnixStream::from_std(observer).unwrap();
+    let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).unwrap();
+    let (case, script, root_observation) = if exited_root {
+        (
+            "control-exited-root",
+            r#"/bin/bash -c 'printf control-stdout; printf control-stderr >&2; printf "ready\n" >&0; IFS= read -r release' <&0 &
+exit 17
+"#,
+            "root=exited",
+        )
+    } else {
+        (
+            "control-live-root",
+            r#"printf control-stdout
+printf control-stderr >&2
+printf 'ready\n' >&0
+IFS= read -r release
+"#,
+            "root=running",
+        )
+    };
+    let mut command = Command::new("/bin/bash");
+    command
+        .args(["-c", script, "bootstrap-timeout-control"])
+        .current_dir(fixture.root.path())
+        .env_clear()
+        .stdin(Stdio::from(OwnedFd::from(lifetime)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(false);
+    let child = command.spawn().unwrap();
+    // Command retains its configured Stdio; only actual children may keep the
+    // peer alive while the independent observer checks for EOF.
+    drop(command);
+    let pid = Pid::from_raw(child.id().unwrap() as i32).unwrap();
+    let mut startup_group = ProcessGroup(Some(child.id().unwrap()), Arc::clone(&fixture.root));
+    let mut ready = [0; 6];
+    tokio::time::timeout(OBSERVATION_TIMEOUT, observer.read_exact(&mut ready))
+        .await
+        .expect("timeout control did not acknowledge startup")
+        .unwrap();
+    assert_eq!(&ready, b"ready\n");
+    let observation = || {
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        )
+        .unwrap()
+    };
+    if exited_root {
+        let status = tokio::time::timeout(OBSERVATION_TIMEOUT, async {
+            loop {
+                if let Some(status) = observation() {
+                    break status;
+                }
+                exits.recv().await.expect("child observation stream closed");
+            }
+        })
+        .await
+        .expect("control root did not exit before capture");
+        assert!(status.exited());
+        assert_eq!(status.exit_status(), Some(17));
+    } else {
+        assert!(observation().is_none(), "live control root already exited");
+    }
+    // Transfer the still-owned group to the capture implementation.
+    let capture = fixture.capture(child, CONTROL_TIMEOUT, case);
+    startup_group.0 = None;
+    let result = tokio::spawn(capture)
+        .await
+        .expect_err("the deliberately blocked control unexpectedly completed");
+    assert!(result.is_panic());
+    let panic = result.into_panic();
+    let diagnostic = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .expect("timeout panic must retain a textual diagnostic");
+
+    let mut unexpected = [0; 1];
+    let closed = tokio::time::timeout(OBSERVATION_TIMEOUT, observer.read(&mut unexpected)).await;
+    if !matches!(closed, Ok(Ok(0))) {
+        // An unproven control lifetime must not delete its private data.
+        std::mem::forget(fixture);
+        panic!("control lifetime channel did not reach EOF: {closed:?}; {diagnostic}");
+    }
+    fixture.unchanged();
+    let required = [
+        case,
+        root_observation,
+        "stdout_eof=false",
+        "stderr_eof=false",
+        "control-stdout",
+        "control-stderr",
+        "cleanup=observed",
+        "root_reaped=true",
+        "cleanup_stdout_eof=true",
+        "cleanup_stderr_eof=true",
+    ];
+    let missing = required
+        .into_iter()
+        .filter(|expected| !diagnostic.contains(expected))
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "missing timeout observations {missing:?}: {diagnostic}"
+    );
+    if exited_root {
+        assert!(diagnostic.contains("root_exit=17"), "{diagnostic}");
+    }
+}
+
+#[tokio::test]
+async fn timeout_observation_retains_live_root_partial_output_and_cleanup() {
+    timeout_control(false).await;
+}
+
+#[tokio::test]
+async fn timeout_observation_distinguishes_exited_root_with_a_retained_writer() {
+    timeout_control(true).await;
+}
+
+#[tokio::test]
+async fn bounded_capture_drains_past_its_retained_prefix_and_preserves_exit_status() {
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let mut command = Command::new("/bin/bash");
+    command
+        .args(["-c", "printf '%4194305s' ''; printf drained >&2; exit 17"])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(false);
+    let child = command.spawn().unwrap();
+    let output = fixture
+        .capture(child, TIMEOUT, "bounded stdout control")
+        .await;
+    assert_eq!(output.status.code(), Some(17));
+    assert_eq!(output.stdout.len(), 4 * 1024 * 1024);
+    assert!(output.stdout.iter().all(|byte| *byte == b' '));
+    assert_eq!(output.stderr, b"drained");
+    fixture.unchanged();
+}
+
+#[tokio::test]
+async fn natural_exit_rejects_a_live_descendant_that_closed_its_output() {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    use std::os::fd::OwnedFd;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let (observer, lifetime) = std::os::unix::net::UnixStream::pair().unwrap();
+    observer.set_nonblocking(true).unwrap();
+    let mut observer = tokio::net::UnixStream::from_std(observer).unwrap();
+    let mut exits = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).unwrap();
+    let mut command = Command::new("/bin/bash");
+    command
+        .args([
+            "-c",
+            r#"/bin/bash -c 'printf "ready\n" >&0; IFS= read -r release' <&0 >/dev/null 2>&1 &
+exit 0
+"#,
+        ])
+        .env_clear()
+        .stdin(Stdio::from(OwnedFd::from(lifetime)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(false);
+    let child = command.spawn().unwrap();
+    drop(command);
+    let pid = Pid::from_raw(child.id().unwrap() as i32).unwrap();
+    let mut startup_group = ProcessGroup(Some(child.id().unwrap()), Arc::clone(&fixture.root));
+    let mut ready = [0; 6];
+    tokio::time::timeout(OBSERVATION_TIMEOUT, observer.read_exact(&mut ready))
+        .await
+        .expect("output-closed descendant did not acknowledge startup")
+        .unwrap();
+    assert_eq!(&ready, b"ready\n");
+    let status = tokio::time::timeout(OBSERVATION_TIMEOUT, async {
+        loop {
+            if let Some(status) = waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )
+            .unwrap()
+            {
+                break status;
+            }
+            exits.recv().await.expect("child observation stream closed");
+        }
+    })
+    .await
+    .expect("control root did not exit before capture");
+    assert_eq!(status.exit_status(), Some(0));
+    let capture = fixture.capture(child, TIMEOUT, "output-closed descendant control");
+    startup_group.0 = None;
+    let result = tokio::spawn(capture).await;
+
+    let mut unexpected = [0; 1];
+    let still_open = matches!(observer.try_read(&mut unexpected), Err(error) if error.kind() == io::ErrorKind::WouldBlock);
+    // Cleanup uses this retained channel, never the reaped root's saved group.
+    // Perform it even if capture wrongly accepted or killed the descendant.
+    let released =
+        tokio::time::timeout(OBSERVATION_TIMEOUT, observer.write_all(b"release\n")).await;
+    let closed = tokio::time::timeout(OBSERVATION_TIMEOUT, observer.read(&mut unexpected)).await;
+    if !matches!(closed, Ok(Ok(0))) {
+        std::mem::forget(fixture);
+        panic!("controlled descendant did not close after release: {closed:?}");
+    }
+    fixture.unchanged();
+    // Only this control can establish the intentionally retained descendant's
+    // later exit by closing its exact release channel. Its private files may
+    // now be removed even though the generic owner correctly retained them.
+    fs::remove_dir_all(fixture.root.path()).unwrap();
+    assert!(
+        still_open,
+        "capture killed or lost the output-closed descendant"
+    );
+    assert!(
+        matches!(released, Ok(Ok(()))),
+        "control release failed: {released:?}"
+    );
+    let panic = result
+        .expect_err("capture accepted a live descendant")
+        .into_panic();
+    let diagnostic = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .expect("capture failure must retain a textual diagnostic");
+    for required in [
+        "output-closed descendant control",
+        "root=exited",
+        "root_exit=0",
+        "stdout_eof=true",
+        "stderr_eof=true",
+        "bootstrap left a surviving process group after natural exit",
+        "cleanup=unobserved",
+        "root_reaped=true",
+        "retained_private_path=",
+    ] {
+        assert!(
+            diagnostic.contains(required),
+            "missing {required:?}: {diagnostic}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -715,7 +1014,7 @@ async fn sigterm_during_download_reaps_both_children_and_preserves_the_previous_
         .env("FIXTURE_TRANSPORT", "block");
     let child = command.spawn().unwrap();
     let pid = child.id().unwrap();
-    let mut group = ProcessGroup(Some(pid));
+    let mut group = ProcessGroup(Some(pid), Arc::clone(&fixture.root));
     let producer = tokio::time::timeout(TIMEOUT, async {
         loop {
             if let Ok(value) = fs::read_to_string(fixture.path("producer-ready"))
@@ -730,10 +1029,13 @@ async fn sigterm_during_download_reaps_both_children_and_preserves_the_previous_
     .expect("fixture never acknowledged the blocked download");
     assert!(signal("-0", producer.trim()));
     assert!(signal("-TERM", &pid.to_string()));
-    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
-        .await
-        .expect("SIGTERM did not stop the installer promptly")
-        .unwrap();
+    let capture = fixture.capture(
+        child,
+        Duration::from_secs(5),
+        "SIGTERM during acknowledged download",
+    );
+    group.0 = None;
+    let output = capture.await;
     assert_eq!(
         output.status.code(),
         Some(143),
@@ -744,6 +1046,9 @@ async fn sigterm_during_download_reaps_both_children_and_preserves_the_previous_
         !signal("-0", producer.trim()),
         "download producer survived SIGTERM"
     );
-    group.assert_finished();
+    assert!(
+        !signal("-0", &format!("-{pid}")),
+        "bootstrap left a live child in group {pid}"
+    );
     fixture.unchanged();
 }

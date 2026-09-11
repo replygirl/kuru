@@ -37,14 +37,28 @@ Changing frameworks selects a different topology. It does not give the new pool 
 
 ## Local storage
 
-Kuru stores durable state in SQLite at:
+Kuru stores durable state in a separate Dolt database for each project:
 
 ```text
-$XDG_DATA_HOME/kuru/memory.sqlite3
+$XDG_DATA_HOME/kuru/memory/<canonical-project-hash>/
 ```
 
-If `XDG_DATA_HOME` is unset, the default is `~/.local/share/kuru/memory.sqlite3`. `--data-dir` or `KURU_DATA_DIR` chooses a separate directory. Keep it outside the tool workspace and restrict access as you would any chat history.
+If `XDG_DATA_HOME` is unset, the data directory is `~/.local/share/kuru` on macOS/Linux or `$env:LOCALAPPDATA\kuru` on Windows, with `$env:USERPROFILE\AppData\Local\kuru` as its Windows fallback. `--data-dir` or `KURU_DATA_DIR` chooses a separate directory. Keep it outside the tool workspace and restrict access as you would any chat history.
+
+Kuru includes its verified native Dolt engine and license notices in the executable. First memory use extracts them locally, including when offline; later runs verify and reuse the cache at `tools/dolt` inside the data directory. No separate engine installation or runtime download is needed. `memory.cache_dir` selects another extraction directory. Corrupt existing caches fail explicitly and remain preserved.
+
+The authenticated SQL sidecar runs only while its owning Kuru process needs it. Existing SQLite data is imported from a consistent snapshot; the original and snapshot remain preserved.
+
+Use `kuru memory status` to inspect the store and current revision, or `kuru memory history` to list committed changes. Dream candidates stay private until promotion. Undo adds a compensating revision and preserves later conversations.
 
 An operating-system writer lock prevents two Kuru processes from overwriting the same project's topology. Read-only session listing remains available.
+
+## Migration and backups
+
+Close older Kuru sessions before the first launch with Dolt. Kuru imports the current project's rows from `memory.sqlite3`, verifies them, and preserves the original plus a complete snapshot under `memory/legacy/`. Other projects are imported when opened. After migration, older Kuru versions write only to the old SQLite store, so avoid using them with the same data directory.
+
+An interrupted import can resume after validation. Partial imports are stopped and preserved under `memory/interrupted/`; a failed import never becomes the active store. Keep the original and snapshots until you have checked every project you want to retain.
+
+Revision history shares the database's disk. For a backup, close all Kuru processes using the data directory, let their database processes finish, then copy the entire data directory. Restore the copy into a separate location and open it with `--data-dir`. Keep the same canonical workspace path to retain the project identity. Do not copy a live `.dolt` directory or remove a held lockfile.
 
 See [sessions and dreaming](./sessions) for resuming a transcript and changing the pool's membership.

@@ -7,7 +7,7 @@ Kuru uses typed TOML. Run `kuru config` to inspect the effective configuration; 
 Later layers take precedence:
 
 1. Built-in defaults.
-2. User defaults at `$XDG_CONFIG_HOME/kuru/config.toml`, or `~/.config/kuru/config.toml`.
+2. User defaults at `$XDG_CONFIG_HOME/kuru/config.toml` when set; otherwise `~/.config/kuru/config.toml` on macOS/Linux or `$env:APPDATA\kuru\config.toml` on Windows.
 3. Ancestor `.kuru/config.toml` files, from outermost to nearest directory.
 4. Remembered interactive choices for the project.
 5. An explicit `--config PATH` file.
@@ -21,7 +21,7 @@ Ancestor `AGENTS.md` files provide project instructions, with nearer files takin
 
 <kbd>F2</kbd>, <kbd>F3</kbd>, <kbd>F4</kbd> and their matching slash commands save model, effort, and framework choices immediately. They apply to the canonical project directory and selected data store. A symlink to that directory shares the choices; a different directory has its own.
 
-Preferences live in SQLite, not edits to project configuration. A save failure is reported before the new choice becomes active.
+Preferences live in the private Dolt store. A save failure is reported before the new choice becomes active.
 
 Models and efforts are remembered together for each provider. Selecting a model uses its advertised default effort. Selecting `default` in the effort picker, or `/effort default`, clears an explicit effort.
 
@@ -45,26 +45,36 @@ dream_on_exit = true
 max_parts = 16
 allow_shell = false
 allow_write = false
-codex_command = "codex"
 api_base = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 ```
 
 ## Models and providers
 
-| Key             | Accepted value                                                       |
-| --------------- | -------------------------------------------------------------------- |
-| `mode`          | `ifs`, `polyvagal`, `freudian`, `jungian`                            |
-| `provider`      | `codex`, `responses`, `demo`                                         |
-| `model`         | Provider model ID; `auto` permits provider selection where supported |
-| `effort`        | Optional provider-advertised string                                  |
-| `codex_command` | Codex executable name or path                                        |
-| `api_base`      | Responses API base URL                                               |
-| `api_key_env`   | Environment variable containing the API key                          |
+| Key           | Accepted value                                                       |
+| ------------- | -------------------------------------------------------------------- |
+| `mode`        | `ifs`, `polyvagal`, `freudian`, `jungian`                            |
+| `provider`    | `codex`, `responses`, `demo`                                         |
+| `model`       | Provider model ID; `auto` permits provider selection where supported |
+| `effort`      | Optional provider-advertised string                                  |
+| `api_base`    | Responses API base URL                                               |
+| `api_key_env` | Environment variable containing the API key                          |
 
 Use `kuru models` to discover current capabilities. Kuru preserves newly advertised effort strings. The Responses catalog does not supply a default chat model, so that provider requires an explicit `model` or `--model`.
 
-An API key belongs in its environment variable, not the TOML file. See [authentication](/guide/authentication).
+The default `codex` provider uses Kuru's own ChatGPT login and direct subscription
+requests. The `responses` provider uses an API key; `api_base` and `api_key_env`
+apply only to that provider. Setting an API key does not change the selected
+provider, and ChatGPT credentials are never sent to the configurable API base.
+
+An API key belongs in its environment variable, not the TOML file. Kuru keeps
+ChatGPT credentials in the private `auth/openai` directory beneath its data
+directory. Use the same `--data-dir` or `KURU_DATA_DIR` for login and chat, and
+keep this state outside project tool roots. See [authentication](/guide/authentication).
+
+The former `codex_command` setting has been removed. Delete it from existing
+TOML, retain `provider = "codex"`, and run `kuru login` to establish Kuru's own
+session. No external Codex executable or credential-store import is needed.
 
 ## Budgets and dreaming
 
@@ -105,14 +115,30 @@ The example endpoints are placeholders. Choose trusted services and keep secrets
 
 ## Storage and environment
 
-| Variable or option            | Purpose                                               |
-| ----------------------------- | ----------------------------------------------------- |
-| `XDG_CONFIG_HOME`             | User configuration base directory                     |
-| `XDG_DATA_HOME`               | User data base directory                              |
-| `KURU_DATA_DIR`, `--data-dir` | Separate Kuru storage directory                       |
-| `KURU_REDUCED_MOTION=1`       | Static TUI ornament; operation indicators remain live |
-| `KURU_A2A_TOKEN`              | Default bearer-token variable for `serve`             |
-| `KURU_INSTALL_DIR`            | Destination for source installation                   |
-| `KURU_RELEASE_BASE`           | Version directory for the release installer           |
+| Variable or option            | Purpose                                                              |
+| ----------------------------- | -------------------------------------------------------------------- |
+| `XDG_CONFIG_HOME`             | User configuration base directory                                    |
+| `XDG_DATA_HOME`               | User data base directory                                             |
+| `APPDATA`, `LOCALAPPDATA`     | Windows configuration and data defaults when XDG overrides are unset |
+| `USERPROFILE`                 | Windows fallback for `AppData\Roaming` and `AppData\Local`           |
+| `KURU_DATA_DIR`, `--data-dir` | Separate Kuru storage directory                                      |
+| `KURU_REDUCED_MOTION=1`       | Static TUI ornament; operation indicators remain live                |
+| `KURU_A2A_TOKEN`              | Default bearer-token variable for `serve`                            |
+| `KURU_INSTALL_DIR`            | Destination for direct or source installation                        |
+| `KURU_RELEASE_BASE`           | Version directory for the release installer                          |
 
-The default database is `~/.local/share/kuru/memory.sqlite3` when no XDG data directory is set. Keep state outside tool roots. [Memory](../concepts/memory) describes project scope and access boundaries.
+When no XDG data directory is set, the default is `~/.local/share/kuru` on macOS/Linux or `$env:LOCALAPPDATA\kuru` on Windows. If Windows application-data variables are unset, `USERPROFILE` supplies `AppData\Roaming` for configuration and `AppData\Local` for data. Each project has a Dolt database under `memory/<project-hash>/`. Keep state outside tool roots. [Memory](../concepts/memory) describes project scope and access boundaries.
+
+Windows memory and engine caches require local volumes with persistent ACLs. UNC shares and device paths are not supported state locations.
+
+```toml
+[memory]
+offline = false
+startup_timeout_secs = 30
+# cache_dir = "/absolute/path/to/dolt-cache"
+# dolt_binary = "/absolute/path/to/dolt"
+```
+
+Kuru includes its pinned full-Dolt engine and licenses. First memory use extracts them locally into `tools/dolt` inside the data directory, or the configured `cache_dir`; an empty cache works offline. Existing caches are verified, and corrupt entries fail without automatic repair.
+
+`offline` remains accepted for compatibility; bundled engine provisioning never uses HTTP. `dolt_binary` is an optional development override and must report the supported exact version. The startup timeout is 1–300 seconds. Provider network access is independent of these memory settings.

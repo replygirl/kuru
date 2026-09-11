@@ -1,0 +1,45 @@
+## 1. Engine installation and lifecycle [critical]
+
+- [x] 1.1 @integration (agent) Provision the pinned native runtime in isolated paths and exercise valid offline cache, invalid hashes/entries/links and failed activation -> 14 provisioning tests passed, including actual host offline execution, complete fixture download/extract/activation, concurrent first use and cancellation cleanup.
+- [x] 1.2 @integration (agent) Open real authenticated Dolt, reject wrong credentials/identity, restart and attach readers -> eleven actual lifecycle tests passed, including wrong credential/datadir/instance refusal, SELECT-only table and version-procedure denial, restart and forty short-lived branch pools. Two ownership regressions failed before the fix and passed afterward: writers wait for cold inspections to release ownership, and an independent second writer cannot attach.
+- [x] 1.3 @integration (agent) Kill a writer parent and observe lifetime supervisor cleanup with bounded waits -> actual parent SIGKILL, supervisor SIGTERM with its parent pipe held open, cancelled startup retention and deferred fixture deletion passed; the same store reopened after reaping.
+
+## 2. Storage and migration [critical]
+
+- [x] 2.1 @integration (agent) Exercise Unicode/case/NUL values, message ordering, validation and failing multirow batches through real SQL -> real Dolt tests passed for exact values, concurrent peer ordering and a duplicate operation constraint failing after a row update without exposing partial data.
+- [x] 2.2 @integration (agent) Race candidate promotion and reconcile a committed operation after a lost acknowledgement -> six recovery tests passed, including real wire COMMIT and DOLT_MERGE reply drops, original-session teardown barriers, exactly-once recovery and divergent-history refusal; stale candidate integration also passed.
+- [x] 2.3 @integration (agent) Import a multi-project legacy fixture with WAL data and opaque JSON; interrupt activation and restore a stopped-store copy -> WAL/source bytes and all-project snapshot remained intact, rows compared exactly, empty scopes opened, completed staging reused its revision, incomplete staging was preserved, and backup restored live and candidate history. Active-owner recovery and replaced directory/lock regressions passed; activation retains its quiescence lease through rename.
+
+## 3. Runtime and CLI [critical]
+
+- [x] 3.1 @integration (agent) Dream using candidate actor histories/notes/report, cancel before promotion and test a stale base -> all 44 runtime tests passed, including held/cancelled whole-dream isolation, stale promotion retaining concurrent live writes, and existing partial model rejection behavior. Two accepted-publication regressions failed before reconciliation barriers and passed afterward for later cognitive calls and turn completion.
+- [x] 3.2 @integration (agent) Dream, chat, change preferences, undo and reopen -> actual Dolt regression passed for new undo revision, retained later transcript/preferences and archived new-part history.
+- [x] 3.3 @integration (agent) Exercise first launch, remembered mode/session restoration, memory status/history and fresh config/help/version/update -> all TUI tests passed, including real PTYs, CLI inspection, saved choices, writer leases and malformed legacy refusal; core configuration tests passed.
+- [x] 3.4 @eval (agent) Run scripted peer-provider scenarios for private history, candidate dreaming and rejected proposals against actual Dolt -> per-peer private markers remained isolated in captured prompts, cancelled candidate inputs stayed absent from live history, and existing peer/proposal scenarios passed in the 44-test runtime suite.
+
+## 4. Repository and delivery [critical]
+
+- [x] 4.1 @integration (agent) Run mise run check with real Dolt and updated documentation -> complete gate passed on 2026-09-10 in 307.67 seconds, including format, strict lint, all behavioral tests, docs build/link/anchor checks and cospec validation/managed drift. Actual coverage: 11,746 of 12,052 lines (97.4610 percent); no exclusions or threshold changes. Evidence: `/tmp/kuru-dolt-check-final-2.log` and generated `target/coverage.lcov`. The earlier instrumented failure-process fixture emitted a profiling file into its isolated data directory; using the native failure executable fixed the fixture while retaining strict directory validation.
+- [x] 4.2 @integration (agent) Observe hosted native matrix and aggregate checks on the implementation PR commit -> run `34491443433` passed at `e7b34ead53742a97751400a1a69502a60c559c7e`: Ubuntu x64 and macOS arm64 full checks/source install, Linux arm64 and macOS Intel native build/package/actual memory tests, and aggregate ci-gate. Required checks also gate the final archive commit before merge.
+- [x] 4.3 @manual (agent) Review AGENTS.md and install/config/memory docs against implemented behavior -> package ownership, versioned transactions, candidate isolation, preserved migration, owned cleanup and cospec/release rules match the foundation. The current runtime-download documentation accurately describes this implementation and is explicitly replaced by the pending embedding change before merge.
+
+### Hosted correction evidence
+
+Initial PR commit `8f291032286547e779b14a682281c11c71f7aa57` passed macOS arm64
+full checks/source install, macOS Intel native build/memory, and Linux arm64 native
+build/memory in run `34485929265`. Ubuntu x64 passed all 53 memory and 44 runtime
+tests, but two instrumented PTY tests exceeded their ten-second first-frame wait
+while ordinary and coverage suites overlapped. This was a failed hosted gate.
+
+The correction sequences ordinary tests before coverage and derives only cold
+first-frame waits from the configured database lifecycle bounds. Subsequent
+interaction waits remain ten seconds; assertions and production timeouts are
+unchanged. The exact terminal suite passed five tests (one subprocess entry
+intentionally ignored), strict TUI lint passed, and the full local gate passed in
+332.87 seconds with 11,746 of 12,052 lines covered (97.4610 percent).
+Evidence: `/tmp/kuru-dolt-hosted-diagnosis.md` and
+`/tmp/kuru-dolt-hosted-fix-check.log`. Corrected run `34491443433` subsequently
+completed successfully on all four native targets and ci-gate. Completed full
+job logs are `/tmp/kuru-dolt-ci-ubuntu-corrected.log` and
+`/tmp/kuru-dolt-ci-macos-arm.log`. This proves the Dolt foundation only; bundled
+offline startup and Windows application support retain their separate gates.

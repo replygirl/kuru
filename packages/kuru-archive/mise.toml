@@ -1,0 +1,22 @@
+[tasks.build]
+run = "cargo build -p kuru-archive --all-features --locked"
+
+[tasks."build:release"]
+run = "cargo build -p kuru-archive --release --all-features --locked"
+
+[tasks.test]
+run = "cargo test -p kuru-archive --all-targets --all-features --locked --no-fail-fast"
+
+[tasks.typecheck]
+run = "cargo check -p kuru-archive --all-targets --all-features --locked"
+
+[tasks.lint]
+run = "cargo clippy -p kuru-archive --all-targets --all-features --locked -- -D warnings"
+
+[tasks."deps:lock"]
+run = "cargo generate-lockfile"
+
+[tasks.coverage]
+description = "Require 90% meaningful archive codec line coverage"
+dir = "{{config_root}}/../.."
+run = "cargo llvm-cov -p kuru-archive --all-targets --all-features --locked --fail-under-lines 90 --lcov --output-path target/kuru-archive-coverage.lcov"

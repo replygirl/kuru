@@ -1,0 +1,52 @@
+[env]
+# Each filesystem fixture retains native ancestor handles and child processes.
+# Concurrency regressions create their own deliberate simultaneous operations.
+RUST_TEST_THREADS = "2"
+
+[tasks.setup]
+description = "Install only the pinned Rust components for platform package checks"
+run = "rustup component add rustfmt clippy llvm-tools-preview --toolchain 1.98.1"
+
+[tasks."deps:lock"]
+description = "Resolve exact workspace dependency changes for the platform boundary"
+run = "cargo generate-lockfile"
+
+[tasks."setup:windows"]
+description = "Install the pinned Windows standard library for cross-target type checking"
+run = "rustup target add x86_64-pc-windows-msvc --toolchain 1.98.1"
+
+[tasks."typecheck:windows"]
+description = "Type-check Windows code; native behavior remains a Windows CI requirement"
+run = "cargo check -p kuru-platform --target x86_64-pc-windows-msvc --all-targets --all-features --locked"
+
+[tasks."lint:windows"]
+description = "Check Windows-specific Rust diagnostics before native CI"
+run = "cargo clippy -p kuru-platform --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
+
+[tasks.build]
+run = "cargo build -p kuru-platform --all-features --locked"
+
+[tasks."build:release"]
+run = "cargo build -p kuru-platform --release --all-features --locked"
+
+[tasks.test]
+env.RUST_TEST_THREADS = "2"
+run = "cargo test -p kuru-platform --all-targets --all-features --locked --no-fail-fast"
+
+[tasks.typecheck]
+run = "cargo check -p kuru-platform --all-targets --all-features --locked"
+
+[tasks.lint]
+run = "cargo clippy -p kuru-platform --all-targets --all-features --locked -- -D warnings"
+
+[tasks."format:check"]
+run = "cargo fmt --package kuru-platform -- --check"
+
+[tasks.coverage]
+description = "Require 90% native platform package line coverage"
+dir = "{{config_root}}/../.."
+run = "cargo llvm-cov -p kuru-platform --all-targets --all-features --locked --no-fail-fast --fail-under-lines 90 --lcov --output-path target/kuru-platform-coverage.lcov"
+
+[tasks."check:native"]
+description = "Check platform primitives without building application or database consumers"
+depends = ["format:check", "lint", "typecheck", "coverage"]

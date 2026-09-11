@@ -10,8 +10,11 @@ combined input to 1 MiB.
 
 Use `kuru config` and `kuru --help` to inspect effective options and CLI overrides.
 `kuru config` redacts MCP environment values. User defaults are read from
-`$XDG_CONFIG_HOME/kuru/config.toml` or `~/.config/kuru/config.toml`; `--config`
-selects the final local layer. CLI flags take precedence over file values.
+`$XDG_CONFIG_HOME/kuru/config.toml` when set. Otherwise, Kuru uses
+`~/.config/kuru/config.toml` on macOS/Linux or
+`$env:APPDATA\kuru\config.toml` on Windows. Windows also falls back to
+`$env:USERPROFILE\AppData\Roaming` when `APPDATA` is unset. `--config` selects the
+final local layer. CLI flags take precedence over file values.
 Ancestor `AGENTS.md` files provide project instructions, ordered so local
 instructions have precedence. Kuru does not automatically follow arbitrary
 links in instruction files; repositories can put their applicable instructions
@@ -21,7 +24,7 @@ Mode, model and effort choices made in the terminal with F2/F3/F4 or the matchin
 slash commands are saved immediately. Relaunching from the same canonical directory
 and data store restores those choices in a new conversation. A symlink to that
 directory shares its choices; another directory has its own. Kuru keeps these
-preferences in its private SQLite store and does not edit project configuration.
+preferences in its private Dolt store and does not edit project configuration.
 Persistence failures are reported before a new choice becomes active.
 
 Models and efforts are remembered together for each provider. `/model` selects the
@@ -51,7 +54,6 @@ dream_on_exit = true
 max_parts = 16
 allow_shell = false
 allow_write = false
-codex_command = "codex"
 api_base = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 ```
@@ -73,6 +75,35 @@ embedding model from that catalog.
 `max_parts` must fit the built-in topology and cannot exceed 128.
 `dream_every = 0` disables periodic dreaming; explicit and session-end dreaming
 remain separate. Set `dream_on_exit = false` to disable exit dreaming.
+
+## Authentication
+
+The default `codex` provider uses ChatGPT subscription authentication and direct
+HTTP requests. Run `kuru login` for browser sign-in, `kuru login --no-browser`
+to open the printed URL yourself, or `kuru login --device` for device
+authorization. No Codex executable or app-server is required.
+
+Kuru keeps its credentials in the private `auth/openai` directory under the
+[data directory](#storage-and-authority). Use the same `--data-dir` or
+`KURU_DATA_DIR` selection for login and subsequent commands. The auth store
+must be outside the project tool root. Kuru never imports another application's
+credential store, and tokens do not belong in TOML or project files.
+
+`kuru auth` prints redacted local status without creating credentials or opening
+project memory. It does not prove that a live model request will succeed.
+`kuru logout` clears Kuru's stored ChatGPT credentials; it does not change an
+API key supplied by the environment. Kuru refreshes its own session when needed;
+if refresh fails or its outcome is uncertain, follow the error's sign-in guidance.
+
+The `responses` provider uses the API key from `api_key_env`, which defaults to
+`OPENAI_API_KEY`, and sends requests to `api_base`. These settings apply only
+to API-key requests. ChatGPT credentials use the fixed subscription service
+and are never sent to `api_base`. Provider selection is explicit: a failed
+ChatGPT login or request does not switch to API-key access.
+
+The former `codex_command` option has been removed. Delete it from existing
+configuration and run `kuru login` to establish Kuru's own session. Existing
+`provider = "codex"` selections remain valid.
 
 ## MCP servers
 
@@ -106,13 +137,41 @@ A2A subset and local ingress controls.
 
 ## Storage and authority
 
-Session and part histories are local durable data. The default store is
-`$XDG_DATA_HOME/kuru/memory.sqlite3` or `~/.local/share/kuru/memory.sqlite3`.
-`--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. An OS
+Session and part histories are local durable data. The default data directory is
+`$XDG_DATA_HOME/kuru` when set, otherwise `~/.local/share/kuru` on macOS/Linux or
+`$env:LOCALAPPDATA\kuru` on Windows. If `LOCALAPPDATA` is unset, Windows falls
+back to `$env:USERPROFILE\AppData\Local\kuru`. Each canonical project has a Dolt
+database under `memory/<project-hash>/`.
+`--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. On Windows,
+memory and engine caches require local volumes with persistent ACLs; UNC shares
+and device paths are not supported state locations. An OS
 writer lock prevents competing Kuru processes from overwriting the same
 project topology; session listing remains available without a writer lock. Restrict access to the user
 data directory as you would a chat transcript. They are not included in source
 control and should never be exposed as a tool root.
+
+Kuru includes its pinned full-Dolt engine and licenses in the executable. First
+memory use verifies and extracts them locally; later runs reuse the verified
+cache. These optional settings control the extracted runtime:
+
+```toml
+[memory]
+offline = false
+startup_timeout_secs = 30
+# cache_dir = "/absolute/path/to/dolt-cache"
+# dolt_binary = "/absolute/path/to/dolt"
+```
+
+The default engine cache is `tools/dolt` inside the data directory. A fresh cache
+works offline without a separate engine installation. `offline` remains accepted
+for compatibility; bundled engine provisioning never uses HTTP, and this setting
+does not disable provider network calls. `dolt_binary` is an optional development
+override that must report the supported exact version. Corrupt existing caches
+fail without automatic repair. If activating a verified engine fails, the error
+reports the retained private staging directory for inspection; Kuru does not
+automatically retry that move. The startup timeout is 1–300 seconds. See
+[memory storage](memory.md) for migration, revision inspection and backups, or
+[development](development.md#bundled-engine-build-inputs) for build-input settings.
 
 Writes and shell execution require opt-in through config or the corresponding
 CLI flags. Enabling shell permits subprocess activity with your account's

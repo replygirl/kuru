@@ -7,6 +7,20 @@ license.workspace = true
 repository.workspace = true
 description = "Inference and tool transports for Kuru's peer actor runtime"
 
+[features]
+default = []
+test-support = []
+
+[[bin]]
+name = "kuru-connectors-stdio-fixture"
+path = "tests/fixtures/stdio_peer.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "kuru-connectors-windows-peer"
+path = "tests/fixtures/windows_peer.rs"
+required-features = ["test-support"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -19,6 +33,11 @@ tempfile.workspace = true
 cap-std.workspace = true
 cap-fs-ext.workspace = true
 kuru-core.workspace = true
+kuru-platform.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+base64.workspace = true
+url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true

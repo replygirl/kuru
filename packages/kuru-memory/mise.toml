@@ -1,0 +1,71 @@
+[vars]
+# Capture the consumer target before the preparation task clears Cargo's target.
+kuru_memory_bundle_target = "{{env.CARGO_BUILD_TARGET | default(value='host')}}"
+
+[tasks."bundle:prepare"]
+description = "Prepare the verified engine archive embedded by the next build"
+dir = "{{config_root}}/../.."
+env.CARGO_BUILD_TARGET = false
+env.RUSTFLAGS = false
+env.CARGO_ENCODED_RUSTFLAGS = false
+env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = false
+env.KURU_DOLT_BUNDLE_TARGET = "{{vars.kuru_memory_bundle_target}}"
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- bundle prepare"
+
+[tasks.build]
+shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
+usage = 'flag "--target <target>" default="{{vars.kuru_memory_bundle_target}}"'
+env.CARGO_BUILD_TARGET = false
+depends = [{ task = "bundle:prepare", args = ["--target", "{{usage.target}}"] }]
+run = 'cargo build -p kuru-memory --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru-memory --all-features --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
+
+[tasks."build:release"]
+shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
+usage = 'flag "--target <target>" default="{{vars.kuru_memory_bundle_target}}"'
+env.CARGO_BUILD_TARGET = false
+depends = [{ task = "bundle:prepare", args = ["--target", "{{usage.target}}"] }]
+run = 'cargo build -p kuru-memory --release --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru-memory --release --all-features --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
+
+[tasks.test]
+env.RUST_TEST_THREADS = "2"
+env.KURU_TEST_SUPERVISOR_PREPARED = "1"
+depends = ["prefetch", "bundle:test-fixtures"]
+run = "cargo test -p kuru-memory --all-targets --all-features --locked --no-fail-fast"
+
+[tasks."bundle:test-fixtures"]
+description = "Prepare the actual upstream Windows ZIP for host-independent decoder tests"
+depends = [{ task = "bundle:prepare", args = ["--target", "x86_64-pc-windows-msvc"] }]
+
+[tasks."bundle:verify-native-build"]
+description = "Verify actual offline Windows Cargo rejection of missing/corrupt prepared inputs after source installation"
+# Let stock PowerShell reconstruct its module paths when mise was launched by pwsh.
+env.PSModulePath = false
+env.CARGO_BUILD_TARGET = false
+env.CARGO_NET_OFFLINE = "true"
+env.KURU_DOLT_BUNDLE_OFFLINE = "true"
+env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
+run = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/verify-bundle-build.ps1"
+
+[tasks.typecheck]
+depends = ["bundle:prepare"]
+run = "cargo check -p kuru-memory --all-targets --all-features --locked"
+
+[tasks.lint]
+depends = ["bundle:prepare"]
+run = "cargo clippy -p kuru-memory --all-targets --all-features --locked -- -D warnings"
+
+[tasks.prefetch]
+description = "Extract and verify the bundled full-Dolt runtime for local tests"
+depends = ["bundle:prepare"]
+run = "cargo run -p kuru-memory --locked -- prefetch"
+
+[tasks."deps:lock"]
+description = "Resolve exact workspace dependency changes"
+run = "cargo generate-lockfile"
+
+[tasks."deps:fetch"]
+run = "cargo fetch --locked"
+[env]
+RUST_TEST_THREADS = "2"

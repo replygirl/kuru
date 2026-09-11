@@ -95,19 +95,6 @@ fn run(executable: &Path) -> io::Result<()> {
                     argument.parse().expect("milliseconds"),
                 ));
             }
-            "auth" => {
-                let args: Vec<_> = std::env::args().skip(1).collect();
-                if !matches!(
-                    args.iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                    ["login"] | ["logout"] | ["login", "status"]
-                ) {
-                    return Err(io::Error::other("unexpected authentication arguments"));
-                }
-            }
-            "exit" => process::exit(argument.parse().expect("exit code")),
             other => {
                 return Err(io::Error::other(format!(
                     "unknown fixture operation {other}"

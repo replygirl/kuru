@@ -6,30 +6,27 @@ not own the actor pool.
 
 ## OpenAI authentication and models
 
-The `codex` provider uses Codex 0.153.4 (the current stable release verified on
-2026-09-09), pinned by mise for development, as an app-server over newline-delimited
-JSON-RPC. `kuru login` delegates to `codex login`; `kuru login --device` delegates
-to device authorization; `kuru auth` reports status; `kuru logout` delegates to
-logout. Kuru never copies OAuth tokens or implements a private login endpoint.
-Follow the supported [OpenAI authentication documentation](https://learn.chatgpt.com/docs/auth?surface=app)
-and [Codex authentication documentation](https://developers.openai.com/codex/auth).
+The default `codex` provider uses Kuru-owned ChatGPT authentication and direct
+HTTPS requests to the subscription service. It does not launch Codex CLI or
+app-server. `kuru login` starts browser OAuth with PKCE and a checked local
+callback; `kuru login --no-browser` leaves opening the URL to you, and
+`kuru login --device` uses device authorization. `kuru auth` prints redacted
+local status as JSON; `kuru logout` clears Kuru's stored credentials.
 
-Model discovery calls app-server `model/list`, preserving advertised effort
-values. Each completion uses an ephemeral isolated working directory and a
-read-only inference thread. Built-in shell, worker spawning, apps, plugins,
-memories and other execution features are disabled in the transport config;
-Kuru's completion schema carries proposed tool calls for the runtime to execute.
-New Codex versions can change this contract: keep the adapter and its protocol
-tests in step with supported versions, and report live-smoke evidence separately
-from deterministic mock tests.
+The private auth store is `auth/openai` beneath Kuru's data directory, outside
+the project tool root. Only Kuru's store participates in login and refresh;
+another application's tokens are never imported. Session revisions prevent a
+late login or refresh from overwriting logout or a newer sign-in. An uncertain
+refresh outcome requires sign-in again rather than replaying the token exchange.
 
-The 2026-09-09 live smoke used Codex 0.153.4 with existing supported
-authentication, discovered eight catalog models (including hidden review/reserve
-entries), preserved advertised `max` and `ultra` effort values, and received an
-`OK` completion from `gpt-6-astra` at `low` effort through the isolated structured
-output transport. This verifies that concrete transport path; catalog access
-remains account-specific. Reproduce with `mise exec -- cargo run --locked -p
-kuru-connectors --example codex_probe -- --infer` when authenticated.
+Subscription requests use the fixed ChatGPT backend with bearer and account
+headers. Kuru reads its model catalog, preserving advertised model IDs and
+reasoning efforts. Responses stream over SSE with `store` disabled; a truncated
+stream or missing successful completion is an error. Kuru supplies the messages
+and tool schemas and keeps all tool execution, peer behavior and memory in its
+own runtime. Subscription service compatibility and account access are separate
+from the public API-key interface; deterministic protocol fixtures do not prove
+live account access.
 
 The `responses` provider uses the [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses)
 and the configured API-key environment variable. It discovers model IDs from
@@ -38,6 +35,13 @@ passes configured reasoning effort. API model catalogs do not necessarily
 advertise effort capabilities; an empty effort list means no catalog restriction
 was supplied, not that every effort is guaranteed to work. The provider's error
 remains authoritative for unsupported model/effort combinations.
+
+`api_base` and `api_key_env` apply to the `responses` provider only. ChatGPT
+credentials never go to the configurable API endpoint, and authentication
+failures never select a different provider automatically. See
+[authentication configuration](configuration.md#authentication) for command and
+storage details. Live login and inference checks must be recorded separately
+from local fixtures, including checks of the former subprocess adapter.
 
 The `demo` provider is deterministic and requires no network or credentials.
 It is useful for installation, rendering and pool tests. A successful demo

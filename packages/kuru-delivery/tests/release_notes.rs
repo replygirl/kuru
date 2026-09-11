@@ -402,7 +402,7 @@ async fn real_release_cli_generates_notes_and_reports_invalid_sha() {
     let head = repo.commit("test: local notes endpoint").await;
     let result = tokio::time::timeout(
         TEST_TIMEOUT,
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
+        kuru_delivery::command::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
             .arg("--root")
             .arg(repo.path())
             .args(["notes", "--version", "0.1.0", "--sha", &head, "--output"])
@@ -428,7 +428,7 @@ async fn real_release_cli_generates_notes_and_reports_invalid_sha() {
     );
     let result = tokio::time::timeout(
         TEST_TIMEOUT,
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
+        kuru_delivery::command::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
             .arg("--root")
             .arg(repo.path())
             .args([

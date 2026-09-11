@@ -29,6 +29,8 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 | `/focus auto`        | Return to contextual speaker selection                           |
 | `/relate KIND ID,ID` | Activate protection, polarization, or alliance among 2–4 members |
 | `/memory NAME_OR_ID` | Inspect an identity's stored memory                              |
+| `/memory-status`     | Inspect the project's memory store and current revision          |
+| `/memory-history`    | List committed memory revisions                                  |
 | `/dream`             | Run bounded consolidation                                        |
 | `/undo-dream`        | Restore the previous accepted topology change                    |
 | `/quit`              | End the session                                                  |
@@ -40,13 +42,16 @@ Model, effort, and framework selections made here are [saved for the project](./
 | Command                      | Purpose                                                                                   |
 | ---------------------------- | ----------------------------------------------------------------------------------------- |
 | `kuru run "PROMPT"`          | Run a turn without the TUI; add `--json` for structured output                            |
-| `kuru login`                 | Start the supported Codex sign-in flow                                                    |
+| `kuru login`                 | Start browser sign-in for ChatGPT subscription access                                     |
+| `kuru login --no-browser`    | Print the browser sign-in URL for you to open                                             |
 | `kuru login --device`        | Use device authorization                                                                  |
-| `kuru auth`                  | Report authentication status without printing tokens                                      |
-| `kuru logout`                | Sign out through Codex                                                                    |
+| `kuru auth`                  | Print redacted local authentication status as JSON                                        |
+| `kuru logout`                | Clear Kuru's stored ChatGPT credentials                                                   |
 | `kuru models`                | Discover provider models and advertised efforts                                           |
 | `kuru config`                | Print merged configuration with MCP environment values redacted                           |
 | `kuru sessions`              | List saved sessions                                                                       |
+| `kuru memory status`         | Inspect the project store, branch and revision                                            |
+| `kuru memory history`        | List committed memory updates; use `--limit` to select 1–1000 entries                     |
 | `kuru dream`                 | Run explicit consolidation                                                                |
 | `kuru undo-dream`            | Restore the previous topology change                                                      |
 | `kuru tools`                 | Discover built-in and configured MCP tools                                                |
@@ -55,6 +60,12 @@ Model, effort, and framework selections made here are [saved for the project](./
 | `kuru update`                | [Install an explicit release or source checkout](/guide/installation#update-deliberately) |
 
 Supply `--resume SESSION_ID` with `dream` or `undo-dream` when targeting a saved conversation.
+
+Authentication commands use Kuru's private store, without a Codex CLI or another
+application's tokens. `auth` does not create credentials or open project memory;
+it is not a live access check. `logout` leaves environment-supplied API keys
+unchanged. For API-key access, set `OPENAI_API_KEY` and select
+`--provider responses --model MODEL_ID`. See [authentication](/guide/authentication).
 
 ## Global options
 

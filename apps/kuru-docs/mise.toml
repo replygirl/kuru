@@ -1,9 +1,11 @@
 [tools]
 node = "26.8.2"
+npm = { version = "12.0.2", checksum = "sha512:b885e890b9418fa1693544d05f53e64f9a73ec194837d4258b15fecdd692347b1dd2a517b1b0cbaf9d31cd8e92c3b70956bd2ecc72833a57b4b3098f5bfa7943" }
 
 [tasks.setup]
-description = "Install this app's pinned Node runtime and dependencies"
-run = ["mise install node", "npm ci --no-audit --no-fund"]
+description = "Install this app's pinned Node/npm tools and dependencies"
+depends = ["check:toolchain"]
+run = "npm ci --no-audit --no-fund"
 sources = ["package.json", "package-lock.json", "mise.toml"]
 outputs = [
   "node_modules/.package-lock.json",
@@ -11,32 +13,51 @@ outputs = [
   "node_modules/oxfmt/bin/oxfmt",
 ]
 
+[tasks."setup:tools"]
+description = "Install only the app-owned Node/npm pins"
+run = "mise install node npm"
+
+[tasks."check:toolchain"]
+description = "Require the exact selected Node/npm versions, including cached setup"
+depends = ["setup:tools"]
+run = "node .vitepress/check-toolchain.mjs"
+
 [tasks.dev]
 description = "Run the documentation server on loopback"
 depends = ["setup"]
 run = "node_modules/.bin/vitepress dev . --host 127.0.0.1"
+run_windows = "node node_modules/vitepress/bin/vitepress.js dev . --host 127.0.0.1"
 
 [tasks.build]
 description = "Build the public documentation site"
 depends = ["setup"]
 run = "node_modules/.bin/vitepress build ."
+run_windows = "node node_modules/vitepress/bin/vitepress.js build ."
 
 [tasks.preview]
 description = "Preview the built documentation site on loopback"
 run = "node_modules/.bin/vitepress preview . --host 127.0.0.1"
+run_windows = "node node_modules/vitepress/bin/vitepress.js preview . --host 127.0.0.1"
 
 [tasks.lint]
 depends = ["setup"]
-run = "node_modules/.bin/oxlint .vitepress/config.mts .vitepress/theme"
+run = "node_modules/.bin/oxlint .vitepress/config.mts .vitepress/theme .vitepress/check-toolchain.mjs"
+run_windows = "node node_modules/oxlint/bin/oxlint .vitepress/config.mts .vitepress/theme .vitepress/check-toolchain.mjs"
 
 [tasks."format:check"]
 depends = ["setup"]
 run = "node_modules/.bin/oxfmt --check ."
+run_windows = "node node_modules/oxfmt/bin/oxfmt --check ."
 
 [tasks."format:fix"]
 depends = ["setup"]
 run = "node_modules/.bin/oxfmt --write ."
+run_windows = "node node_modules/oxfmt/bin/oxfmt --write ."
 
 [tasks.check]
+description = "Validate documentation in one graph with shared dependency setup"
+depends = ["format:check", "lint", "check:content"]
+
+[tasks."check:content"]
 depends = ["build"]
 run = "mise run //packages/kuru-delivery:tool -- docs --root apps/kuru-docs/.vitepress/dist"

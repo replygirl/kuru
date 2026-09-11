@@ -1,0 +1,188 @@
+use super::*;
+use rustix::fs::{Mode, OFlags, RenameFlags, mkdirat, openat, renameat, renameat_with};
+use std::os::unix::fs::MetadataExt;
+
+pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
+    // macOS exposes these OS-owned aliases to tempfile and ordinary callers.
+    // Recognize only the exact system mapping, never arbitrary user symlinks.
+    #[cfg(target_os = "macos")]
+    for name in ["tmp", "var", "etc"] {
+        let alias = Path::new("/").join(name);
+        if let Ok(suffix) = path.strip_prefix(&alias) {
+            let metadata = std::fs::symlink_metadata(&alias)?;
+            let actual = Path::new("/private").join(name);
+            if metadata.file_type().is_symlink()
+                && metadata.uid() == 0
+                && Path::new("/").join(std::fs::read_link(&alias)?) == actual
+            {
+                return Ok(actual.join(suffix));
+            }
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(denied("expected a regular file or directory"));
+    }
+    let mut object = [0; 16];
+    object[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+    Ok(ObjectInfo {
+        file: FileInfo {
+            identity: FileIdentity {
+                volume: metadata.dev(),
+                object,
+            },
+            links: metadata.nlink(),
+            len: metadata.len(),
+        },
+        directory: metadata.is_dir(),
+    })
+}
+
+pub(super) fn require_private(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+        return Err(denied(
+            "private object must belong to the current user with no group or other permissions",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn private_chain(files: &[&File]) -> io::Result<()> {
+    require_private(
+        files
+            .last()
+            .ok_or_else(|| invalid("missing private root"))?,
+    )
+}
+
+pub(super) fn open_directory(
+    parent: Option<&File>,
+    path: &Path,
+    _: NameRetention,
+) -> io::Result<File> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = match parent {
+        Some(parent) => openat(
+            parent,
+            path.file_name()
+                .ok_or_else(|| invalid("missing directory name"))?,
+            flags,
+            Mode::empty(),
+        ),
+        None => openat(rustix::fs::CWD, path, flags, Mode::empty()),
+    }?;
+    Ok(File::from(fd))
+}
+
+pub(super) fn create_directory(parent: &File, path: &Path) -> io::Result<()> {
+    mkdirat(
+        parent,
+        path.file_name()
+            .ok_or_else(|| invalid("missing directory name"))?,
+        Mode::from_raw_mode(0o700),
+    )?;
+    Ok(())
+}
+
+pub(super) fn open_file(
+    parent: &File,
+    path: &Path,
+    mode: OpenMode,
+    privacy: Privacy,
+    _: NameRetention,
+) -> io::Result<File> {
+    let mut flags = OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    flags |= match mode {
+        OpenMode::Read => OFlags::RDONLY,
+        OpenMode::ReadWrite => OFlags::RDWR,
+        OpenMode::New => OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
+        OpenMode::Lock => OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
+    };
+    let permissions = if privacy == Privacy::OwnerOnly {
+        0o600
+    } else {
+        0o666
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("missing filename"))?;
+    let opened = openat(parent, name, flags, Mode::from_raw_mode(permissions));
+    let file = match opened {
+        Err(rustix::io::Errno::EXIST) if matches!(mode, OpenMode::Lock) => {
+            // Distinguish our exclusive creation from opening the stable object
+            // another owner created. Never recreate an object removed in between.
+            openat(
+                parent,
+                name,
+                flags & !(OFlags::CREATE | OFlags::EXCL),
+                Mode::empty(),
+            )?
+        }
+        result => result?,
+    };
+    Ok(File::from(file))
+}
+
+pub(super) fn seal_private(file: &File, executable: bool) -> io::Result<()> {
+    rustix::fs::fchmod(
+        file,
+        Mode::from_raw_mode(if executable { 0o500 } else { 0o400 }),
+    )?;
+    Ok(())
+}
+
+pub(super) fn make_executable(file: &File) -> io::Result<()> {
+    rustix::fs::fchmod(file, Mode::from_raw_mode(0o755))?;
+    Ok(())
+}
+
+pub(super) fn remove(
+    parent: &File,
+    path: &Path,
+    held: File,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    rustix::fs::unlinkat(
+        parent,
+        path.file_name().unwrap(),
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(|error| (PublicationPhase::Rejected, error.into()))?;
+    drop(held);
+    parent
+        .sync_all()
+        .map_err(|error| (PublicationPhase::Uncertain, error))
+}
+
+pub(super) fn publish(
+    source_parent: &File,
+    source: &Path,
+    destination_parent: &File,
+    destination: &Path,
+    policy: Publication,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    let moved = match policy {
+        Publication::New => renameat_with(
+            source_parent,
+            source.file_name().unwrap(),
+            destination_parent,
+            destination.file_name().unwrap(),
+            RenameFlags::NOREPLACE,
+        ),
+        Publication::ReplaceRegular => renameat(
+            source_parent,
+            source.file_name().unwrap(),
+            destination_parent,
+            destination.file_name().unwrap(),
+        ),
+    };
+    moved.map_err(|error| (PublicationPhase::Rejected, error.into()))?;
+    source_parent
+        .sync_all()
+        .and_then(|()| destination_parent.sync_all())
+        .map_err(|error| (PublicationPhase::Uncertain, error))
+}

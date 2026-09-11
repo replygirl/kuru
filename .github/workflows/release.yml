@@ -21,9 +21,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  source-quality:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: ${{ github.sha }}
+      artifact-prefix: validation-plan
+
+  source-tests:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/native-tests.yml
+    with:
+      ref: ${{ github.sha }}
+      artifact-prefix: validation-plan
+
   plan:
     if: github.ref == 'refs/heads/main'
+    needs: [source-quality, source-tests]
     runs-on: ubuntu-24.04
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      MISE_NO_HOOKS: "1"
     outputs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
@@ -38,7 +56,8 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.3
+          version: 2026.9.4
+          install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Check release prerequisites
@@ -50,8 +69,7 @@ jobs:
           test -n "$RELEASE_APP_ID" || { echo 'Missing RELEASE_APP_ID variable'; exit 1; }
           test -n "$RELEASE_APP_PRIVATE_KEY" || { echo 'Missing RELEASE_APP_PRIVATE_KEY secret'; exit 1; }
           test -n "$ANTHROPIC_API_KEY" || { echo 'Missing ANTHROPIC_API_KEY_COMMUNIQUE secret'; exit 1; }
-      - run: mise run setup
-      - run: mise run check
+      - run: mise run //packages/kuru-delivery:setup:test-tools
       - name: Select immutable release base and version
         id: plan
         env:
@@ -73,7 +91,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.3
+          version: 2026.9.4
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -101,24 +119,20 @@ jobs:
 
   verify:
     needs: bump
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.bump.outputs.sha }}
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with:
-          experimental: true
-          version: 2026.9.3
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - run: mise run setup
-      - run: mise run check
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: ${{ needs.bump.outputs.sha }}
+      artifact-prefix: validation-verify
+
+  verify-tests:
+    needs: bump
+    uses: ./.github/workflows/native-tests.yml
+    with:
+      ref: ${{ needs.bump.outputs.sha }}
+      artifact-prefix: validation-verify
 
   build:
-    needs: [plan, bump, verify]
+    needs: [plan, bump, verify, verify-tests]
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
       # Archive jobs do not write Git commits or need repository-hook setup.
@@ -135,6 +149,8 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -144,11 +160,12 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.3
+          version: 2026.9.4
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Build and package native executable
+        if: runner.os != 'Windows'
         env:
           RELEASE_TARGET: ${{ matrix.target }}
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
@@ -156,6 +173,29 @@ jobs:
           mise run //apps/kuru-tui:build:release -- --target "$RELEASE_TARGET"
           test "$("target/$RELEASE_TARGET/release/kuru" --version)" = "kuru $RELEASE_VERSION"
           mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
+      - name: Build and package native Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          mise run //apps/kuru-tui:build:release -- --target $env:RELEASE_TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          $binary = "target/$env:RELEASE_TARGET/release/kuru.exe"
+          $version = & $binary --version
+          if ($LASTEXITCODE -ne 0 -or $version -ne "kuru $env:RELEASE_VERSION") { throw 'Release version mismatch' }
+          mise run package -- --binary $binary --target $env:RELEASE_TARGET --version $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed' }
+      - name: Verify packaged offline runtime
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: mise run //apps/kuru-tui:test:embedded-runtime
+      - name: Inspect native shipping DLL imports
+        if: runner.os == 'Windows'
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru.exe
+        run: mise run //apps/kuru-tui:verify:windows-imports
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}
@@ -177,7 +217,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.3
+          version: 2026.9.4
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -215,7 +255,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.3
+          version: 2026.9.4
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -255,7 +295,7 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          version: 2026.9.3
+          version: 2026.9.4
           install_args: rust aqua:jdx/hk
         env:
           GITHUB_TOKEN: ${{ github.token }}

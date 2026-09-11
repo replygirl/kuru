@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -10,7 +11,19 @@ use kuru_core::{Completion, CompletionRequest, Config, Message, ModelInfo, ToolC
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::{CodexProvider, http};
+use crate::{
+    auth::{AuthManager, AuthRoute, RequestCredentials},
+    http,
+};
+
+mod sse;
+#[cfg(test)]
+mod subscription_tests;
+
+const SUBSCRIPTION_BASE: &str = "https://chatgpt.com/backend-api/codex";
+const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(600);
+// This describes the audited catalog wire contract, not Kuru's identity.
+const CATALOG_COMPATIBILITY: &str = "0.154.0";
 
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -18,10 +31,14 @@ pub trait Provider: Send + Sync {
     async fn complete(&self, request: CompletionRequest) -> Result<Completion>;
 }
 
-pub fn provider(config: &Config, _cwd: &Path) -> Result<Arc<dyn Provider>> {
+pub async fn provider(config: &Config, cwd: &Path, data_dir: &Path) -> Result<Arc<dyn Provider>> {
     match config.provider.as_str() {
         "demo" => Ok(Arc::new(DemoProvider)),
-        "codex" => Ok(Arc::new(CodexProvider::new(&config.codex_command))),
+        "codex" => {
+            let manager = AuthManager::new(data_dir.to_owned(), cwd.to_owned(), None)?;
+            let initial = manager.credentials(AuthRoute::Chatgpt).await?;
+            Ok(Arc::new(ResponsesProvider::subscription(manager, initial)?))
+        }
         "responses" => Ok(Arc::new(ResponsesProvider::new(
             &config.api_base,
             &config.api_key_env,
@@ -102,9 +119,17 @@ struct Pending {
 /// function-call protocol handshakes. Kuru remains the durable memory owner.
 pub struct ResponsesProvider {
     base: String,
-    key_env: String,
+    auth: Authentication,
     client: reqwest::Client,
     actors: Mutex<BTreeMap<String, Arc<Mutex<Option<Pending>>>>>,
+}
+
+enum Authentication {
+    Environment(String),
+    Subscription {
+        manager: AuthManager,
+        initial: RequestCredentials,
+    },
 }
 
 impl ResponsesProvider {
@@ -112,20 +137,75 @@ impl ResponsesProvider {
         http::endpoint(base)?;
         Ok(Self {
             base: base.trim_end_matches('/').into(),
-            key_env: key_env.into(),
+            auth: Authentication::Environment(key_env.into()),
             client: http::client()?,
             actors: Mutex::new(BTreeMap::new()),
         })
     }
 
-    fn authenticated(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
-        if self.key_env.is_empty() {
-            return Ok(builder);
+    fn subscription(manager: AuthManager, initial: RequestCredentials) -> Result<Self> {
+        ensure!(
+            initial.route() == AuthRoute::Chatgpt,
+            "subscription authentication required"
+        );
+        Ok(Self {
+            base: SUBSCRIPTION_BASE.into(),
+            auth: Authentication::Subscription { manager, initial },
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(SUBSCRIPTION_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            actors: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn is_subscription(&self) -> bool {
+        matches!(self.auth, Authentication::Subscription { .. })
+    }
+
+    async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        match &self.auth {
+            Authentication::Environment(key_env) => {
+                let builder = if key_env.is_empty() {
+                    builder
+                } else {
+                    let key = std::env::var(key_env).with_context(|| {
+                        format!("set {key_env} for Responses API authentication")
+                    })?;
+                    ensure!(!key.trim().is_empty(), "{key_env} is empty");
+                    builder.bearer_auth(key)
+                };
+                Ok(builder.send().await?)
+            }
+            Authentication::Subscription { manager, initial } => {
+                let credentials = manager.credentials(AuthRoute::Chatgpt).await?;
+                same_session(initial, &credentials)?;
+                let builder = builder
+                    .header(
+                        reqwest::header::USER_AGENT,
+                        concat!("Kuru/", env!("CARGO_PKG_VERSION")),
+                    )
+                    .header("originator", "kuru");
+                let first = subscription_headers(
+                    builder
+                        .try_clone()
+                        .context("subscription request is not replayable")?,
+                    &credentials,
+                )?
+                .send()
+                .await?;
+                if first.status() != reqwest::StatusCode::UNAUTHORIZED {
+                    return Ok(first);
+                }
+                // Only a rejected HTTP response, before reading any stream, can
+                // rotate and resend once. Never retry an uncertain partial turn.
+                drop(first);
+                let refreshed = manager.refresh_rejected(&credentials).await?;
+                same_session(initial, &refreshed)?;
+                Ok(subscription_headers(builder, &refreshed)?.send().await?)
+            }
         }
-        let key = std::env::var(&self.key_env)
-            .with_context(|| format!("set {} for Responses API authentication", self.key_env))?;
-        ensure!(!key.trim().is_empty(), "{} is empty", self.key_env);
-        Ok(builder.bearer_auth(key))
     }
 
     async fn actor(&self, name: &str) -> Result<Arc<Mutex<Option<Pending>>>> {
@@ -139,6 +219,32 @@ impl ResponsesProvider {
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone())
     }
+}
+
+fn same_session(initial: &RequestCredentials, current: &RequestCredentials) -> Result<()> {
+    ensure!(
+        current.route() == AuthRoute::Chatgpt
+            && initial.account_id() == current.account_id()
+            && initial.session_id() == current.session_id(),
+        "ChatGPT account or login session changed; start a new Kuru session"
+    );
+    Ok(())
+}
+
+fn subscription_headers(
+    builder: reqwest::RequestBuilder,
+    credentials: &RequestCredentials,
+) -> Result<reqwest::RequestBuilder> {
+    let account = credentials
+        .account_id()
+        .context("ChatGPT credentials lack account identity")?;
+    ensure!(
+        !account.is_empty(),
+        "ChatGPT credentials lack account identity"
+    );
+    Ok(builder
+        .bearer_auth(credentials.bearer())
+        .header("ChatGPT-Account-ID", account))
 }
 
 fn text_message(message: &Message) -> Value {
@@ -271,31 +377,91 @@ fn completion(value: &Value) -> Result<Completion> {
 #[async_trait]
 impl Provider for ResponsesProvider {
     async fn models(&self) -> Result<Vec<ModelInfo>> {
-        let value = http::json(
-            self.authenticated(self.client.get(format!("{}/models", self.base)))?
-                .send()
-                .await?,
-        )
-        .await?;
-        let data = value["data"]
-            .as_array()
-            .context("models response lacks data array")?;
-        data.iter()
-            .map(|model| {
-                let id = model["id"].as_str().context("model lacks ID")?;
-                // The public /models API does not advertise reasoning effort. Never
-                // infer a static effort catalog or filter away future model names.
-                Ok(ModelInfo {
-                    id: id.into(),
-                    name: id.into(),
-                    efforts: vec![],
-                    default_effort: None,
+        tokio::time::timeout(crate::IO_TIMEOUT, async {
+            let mut url = reqwest::Url::parse(&format!("{}/models", self.base))?;
+            if self.is_subscription() {
+                url.query_pairs_mut()
+                    .append_pair("client_version", CATALOG_COMPATIBILITY);
+            }
+            let builder = self.client.get(url).timeout(crate::IO_TIMEOUT);
+            let value = http::json(self.send(builder).await?).await?;
+            if self.is_subscription() {
+                return subscription_models(&value);
+            }
+            let data = value["data"]
+                .as_array()
+                .context("models response lacks data array")?;
+            data.iter()
+                .map(|model| {
+                    let id = model["id"].as_str().context("model lacks ID")?;
+                    // The public /models API does not advertise reasoning effort. Never
+                    // infer a static effort catalog or filter away future model names.
+                    Ok(ModelInfo {
+                        id: id.into(),
+                        name: id.into(),
+                        efforts: vec![],
+                        default_effort: None,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
+        .await
+        .context("model catalog exceeded 60-second total limit")?
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        if self.is_subscription() {
+            return tokio::time::timeout(SUBSCRIPTION_TIMEOUT, self.complete_request(request))
+                .await
+                .context("ChatGPT request exceeded 600-second total limit")?;
+        }
+        self.complete_request(request).await
+    }
+}
+
+fn subscription_models(value: &Value) -> Result<Vec<ModelInfo>> {
+    value["models"]
+        .as_array()
+        .context("ChatGPT models response lacks models array")?
+        .iter()
+        .map(|model| {
+            let id = model["slug"].as_str().context("ChatGPT model lacks slug")?;
+            ensure!(!id.is_empty(), "ChatGPT model has empty slug");
+            let efforts = match model.get("supported_reasoning_levels") {
+                None | Some(Value::Null) => vec![],
+                Some(value) => value
+                    .as_array()
+                    .context("invalid model reasoning levels")?
+                    .iter()
+                    .map(|level| {
+                        level["effort"]
+                            .as_str()
+                            .context("invalid reasoning effort")
+                            .map(str::to_owned)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            let default_effort = match model.get("default_reasoning_level") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .context("invalid default reasoning effort")?
+                        .to_owned(),
+                ),
+            };
+            Ok(ModelInfo {
+                id: id.into(),
+                name: model["display_name"].as_str().unwrap_or(id).into(),
+                efforts,
+                default_effort,
+            })
+        })
+        .collect()
+}
+
+impl ResponsesProvider {
+    async fn complete_request(&self, request: CompletionRequest) -> Result<Completion> {
         ensure!(
             request.model != "auto",
             "select an explicit model for the Responses provider"
@@ -307,20 +473,28 @@ impl Provider for ResponsesProvider {
         if let Some(effort) = request.effort {
             body["reasoning"] = json!({"effort":effort});
         }
+        if self.is_subscription() {
+            body["stream"] = json!(true);
+            body["tool_choice"] = json!("auto");
+            body["parallel_tool_calls"] = json!(true);
+        }
         ensure!(
             body.to_string().len() <= crate::MAX_BYTES,
             "Responses request exceeds 2 MiB transport limit; shorten actor context"
         );
-        let value = http::json(
-            self.authenticated(
-                self.client
-                    .post(format!("{}/responses", self.base))
-                    .json(&body),
-            )?
-            .send()
-            .await?,
-        )
-        .await?;
+        let mut builder = self
+            .client
+            .post(format!("{}/responses", self.base))
+            .json(&body);
+        if self.is_subscription() {
+            builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
+        }
+        let response = self.send(builder).await?;
+        let value = if self.is_subscription() {
+            sse::response(response, crate::IO_TIMEOUT).await?
+        } else {
+            http::json(response).await?
+        };
         let result = completion(&value)?;
         *pending = if result.calls.is_empty() {
             None
@@ -430,7 +604,9 @@ mod tests {
             provider: "demo".into(),
             ..Default::default()
         };
-        let demo = provider(&config, Path::new(".")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("uncreated-data");
+        let demo = provider(&config, Path::new("."), &data).await.unwrap();
         assert_eq!(demo.models().await.unwrap()[0].id, "demo");
         assert!(
             demo.complete(request())
@@ -442,26 +618,44 @@ mod tests {
         let mut empty = request();
         empty.messages.clear();
         assert!(demo.complete(empty).await.unwrap().text.contains("Ready"));
-        for name in ["codex", "responses"] {
-            assert!(
-                provider(
-                    &Config {
-                        provider: name.into(),
-                        ..Default::default()
-                    },
-                    Path::new(".")
-                )
-                .is_ok()
-            );
-        }
+        assert!(
+            provider(
+                &Config {
+                    provider: "responses".into(),
+                    ..Default::default()
+                },
+                Path::new("."),
+                &data
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            provider(
+                &Config {
+                    provider: "codex".into(),
+                    ..Default::default()
+                },
+                Path::new("."),
+                &data
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            !data.exists(),
+            "provider selection created authentication state"
+        );
         assert!(
             provider(
                 &Config {
                     provider: "unknown".into(),
                     ..Default::default()
                 },
-                Path::new(".")
+                Path::new("."),
+                &data,
             )
+            .await
             .is_err()
         );
         let api =

@@ -2,7 +2,6 @@ use std::{
     collections::BTreeMap,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 
@@ -13,8 +12,18 @@ use cap_std::{
     fs::{Dir, OpenOptions},
 };
 use kuru_core::{Config, ToolSpec};
+#[cfg(windows)]
+use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info, validate_component};
 use serde_json::{Value, json};
-use tokio::{io::AsyncReadExt, process::Command, time::timeout};
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use tokio::process::Command;
+use tokio::{io::AsyncReadExt, time::timeout};
+#[cfg(windows)]
+type PathGuard = Directory;
+#[cfg(unix)]
+type PathGuard = ();
 
 use crate::{MAX_BYTES, mcp::McpHosts};
 
@@ -23,6 +32,8 @@ use crate::{MAX_BYTES, mcp::McpHosts};
 pub struct ToolHost {
     root: PathBuf,
     directory: Dir,
+    #[cfg(windows)]
+    root_guard: Directory,
     allow_write: bool,
     allow_shell: bool,
     mcp: McpHosts,
@@ -31,11 +42,15 @@ pub struct ToolHost {
 impl ToolHost {
     pub fn new(root: &Path, config: &Config) -> Result<Self> {
         let root = root.canonicalize().context("tool root does not exist")?;
+        #[cfg(windows)]
+        let root_guard = Directory::open(&root, Privacy::Inherited, NameRetention::Pinned)?;
         let directory = Dir::open_ambient_dir(&root, ambient_authority())?;
         Ok(Self {
             mcp: McpHosts::new(&root, &config.mcp)?,
             root,
             directory,
+            #[cfg(windows)]
+            root_guard,
             allow_write: config.allow_write,
             allow_shell: config.allow_shell,
         })
@@ -84,7 +99,7 @@ impl ToolHost {
         ensure!(args.is_object(), "tool arguments must be an object");
         match name {
             "file_read" => {
-                let (directory, path) = self.path(string(&args, "path")?, false)?;
+                let (directory, path, _guard) = self.path(string(&args, "path")?, false)?;
                 let mut options = OpenOptions::new();
                 options.read(true).follow(FollowSymlinks::No);
                 #[cfg(unix)]
@@ -93,6 +108,15 @@ impl ToolHost {
                     options.custom_flags(nix::libc::O_NONBLOCK);
                 }
                 let file = directory.open_with(path, &options)?;
+                #[cfg(windows)]
+                let file = {
+                    let file = file.into_std();
+                    ensure!(
+                        regular_file_info(&file)?.links == 1,
+                        "hard-linked files are not readable through file tools"
+                    );
+                    file
+                };
                 ensure!(
                     file.metadata()?.is_file(),
                     "file_read requires a regular file"
@@ -117,7 +141,7 @@ impl ToolHost {
                     content.len() <= MAX_BYTES,
                     "file content exceeds 2 MiB limit"
                 );
-                let (directory, path) = self.path(string(&args, "path")?, true)?;
+                let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
                 let temporary = format!(".kuru-write-{}", uuid::Uuid::new_v4());
                 let mut options = OpenOptions::new();
                 options
@@ -142,7 +166,7 @@ impl ToolHost {
             }
             "file_delete" => {
                 ensure!(self.allow_write, "file deletion requires allow_write=true");
-                let (directory, path) = self.path(string(&args, "path")?, true)?;
+                let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
                 ensure!(
                     directory.symlink_metadata(&path)?.is_file(),
                     "file_delete requires a regular file"
@@ -156,7 +180,13 @@ impl ToolHost {
                     .map(|value| value.as_str().context("path must be a string"))
                     .transpose()?
                     .unwrap_or(".");
-                let (directory, path) = self.path(input_path, false)?;
+                let (directory, path, _guard) = self.path(input_path, false)?;
+                #[cfg(windows)]
+                let _listing_guard = Directory::open(
+                    &_guard.path().join(&path),
+                    Privacy::Inherited,
+                    NameRetention::Pinned,
+                )?;
                 let directory = directory.open_dir_nofollow(path)?;
                 let mut entries = BTreeMap::new();
                 for entry in directory.entries()? {
@@ -213,7 +243,7 @@ impl ToolHost {
         self.mcp.shutdown().await
     }
 
-    fn path(&self, value: &str, writing: bool) -> Result<(Dir, PathBuf)> {
+    fn path(&self, value: &str, writing: bool) -> Result<(Dir, PathBuf, PathGuard)> {
         let path = Path::new(value);
         ensure!(
             !value.is_empty() && !path.is_absolute(),
@@ -224,6 +254,8 @@ impl ToolHost {
             match component {
                 Component::CurDir => {}
                 Component::Normal(name) => {
+                    #[cfg(windows)]
+                    validate_component(name)?;
                     ensure!(
                         !protected_component(&name.to_string_lossy(), writing),
                         "protected instruction, config, credential, or memory path"
@@ -235,18 +267,63 @@ impl ToolHost {
         }
         let mut directory = self.directory.try_clone()?;
         let final_name = PathBuf::from(components.pop().unwrap_or(std::ffi::OsStr::new(".")));
+        #[cfg(windows)]
+        let guard = {
+            let parent = components
+                .iter()
+                .fold(self.root.clone(), |path, component| path.join(component));
+            let guard = Directory::open(&parent, Privacy::Inherited, NameRetention::Pinned)?;
+            ensure!(
+                guard.is_within(&self.root_guard)?,
+                "tool parent is outside the retained project root"
+            );
+            self.check_expanded_names(&parent, writing)?;
+            guard
+        };
+        #[cfg(unix)]
+        let guard = ();
         for component in components {
             directory = directory.open_dir_nofollow(component)?;
         }
         match directory.symlink_metadata(&final_name) {
-            Ok(metadata) => ensure!(
-                !metadata.is_symlink(),
-                "symlink paths are not permitted by file tools"
-            ),
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.is_symlink(),
+                    "symlink paths are not permitted by file tools"
+                );
+                #[cfg(windows)]
+                self.check_expanded_names(&guard.path().join(&final_name), writing)?;
+                #[cfg(windows)]
+                if metadata.is_file() {
+                    // All reparse types and hardlinks are checked from the native
+                    // handle, beyond cap-std's ordinary symlink classification.
+                    drop(guard.read(final_name.as_os_str())?);
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        Ok((directory, final_name))
+        Ok((directory, final_name, guard))
+    }
+
+    #[cfg(windows)]
+    fn check_expanded_names(&self, path: &Path, writing: bool) -> Result<()> {
+        // Confinement is already established by held native parent identities.
+        // Windows canonicalization expands DOS 8.3 names; inspect that spelling
+        // too so AUTH~1.JSO cannot alias an otherwise protected auth.json.
+        let expanded = path.canonicalize()?;
+        let relative = expanded
+            .strip_prefix(&self.root)
+            .context("expanded tool path is outside the project root")?;
+        for component in relative.components() {
+            if let Component::Normal(name) = component {
+                ensure!(
+                    !protected_component(&name.to_string_lossy(), writing),
+                    "protected instruction, config, credential, or memory path"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -295,8 +372,10 @@ fn spec(name: &str, description: &str, fields: &[&str], required: &[&str]) -> To
     }
 }
 
-struct ProcessGroup(Option<u32>);
+#[cfg(unix)]
+pub(crate) struct ProcessGroup(pub(crate) Option<u32>);
 
+#[cfg(unix)]
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -309,6 +388,7 @@ impl Drop for ProcessGroup {
     }
 }
 
+#[cfg(unix)]
 async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String> {
     ensure!(!command.trim().is_empty(), "shell command is empty");
     let mut process = Command::new("sh");
@@ -345,9 +425,207 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
         .context("shell timed out; process group terminated")?
 }
 
+#[cfg(windows)]
+async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String> {
+    use base64::Engine;
+    use kuru_platform::windows::process::{
+        Stdio, configured_command, environment_key_eq, system_directory, wait_process_handle,
+    };
+    ensure!(!command.trim().is_empty(), "shell command is empty");
+    // This is deliberately authorized PowerShell source, not command argv.
+    // Stock Windows PowerShell accepts UTF-16LE source; its actual exit status
+    // is returned without a suffix that could accidentally replace `$?`.
+    // Headless progress (including first-use module discovery) is not a text
+    // diagnostic: Windows PowerShell 5.1 serializes it onto redirected stderr.
+    // Disable only progress before any cmdlet runs; preserve warning/error and
+    // literal stderr bytes, including text which happens to resemble CLIXML.
+    let source = format!(
+        "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
+    );
+    let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut args: Vec<std::ffi::OsString> = [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-OutputFormat",
+        "Text",
+        "-EncodedCommand",
+    ]
+    .map(Into::into)
+    .into();
+    args.push(
+        base64::engine::general_purpose::STANDARD
+            .encode(bytes)
+            .into(),
+    );
+    // Use the same identity-checked launch spelling as other configured native
+    // commands. PowerShell's .NET file APIs cannot use an introduced verbatim cwd.
+    let program = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
+    // This owned stock-shell launch must reconstruct its own module paths: a
+    // PowerShell 7 parent can otherwise leave incompatible modules through Kuru.
+    // Generic configured commands retain their caller's deliberate environment.
+    let environment = std::env::vars_os()
+        .filter(|(key, _)| !environment_key_eq(key, std::ffi::OsStr::new("PSModulePath")))
+        .collect();
+    let mut spec = configured_command(program.as_os_str(), &args, root, environment)?;
+    spec.stdout = Stdio::Pipe;
+    spec.stderr = Stdio::Pipe;
+    let mut child = spec
+        .spawn()
+        .await
+        .context("cannot start Windows PowerShell")?;
+    let mut stdout = child.take_stdout().context("missing shell stdout")?;
+    let mut stderr = child.take_stderr().context("missing shell stderr")?;
+    let mut out = ShellCapture::default();
+    let mut err = ShellCapture::default();
+    let mut phase = "read shell output";
+    let operation = async {
+        tokio::try_join!(out.read(&mut stdout), err.read(&mut stderr))?;
+        phase = "wait for shell process tree";
+        let status = child.wait(duration).await?;
+        Ok::<_, anyhow::Error>(status)
+    };
+    let result = timeout(duration, operation)
+        .await
+        .context("shell timed out")
+        .and_then(|result| result);
+    let result = match result {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            // Query the retained root separately from whole-Job quiescence;
+            // observation failure must never prevent the existing cleanup.
+            let root_state = match child.duplicate_process_handle() {
+                Ok(process) => match wait_process_handle(&process, Duration::ZERO).await {
+                    Ok(()) => "exited",
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => "running",
+                    Err(_) => "query-error",
+                },
+                Err(_) => "query-error",
+            };
+            let observed = child.try_wait();
+            let stopped = match crate::process::stop(&mut child).await {
+                Ok(()) => "subprocess tree terminated".to_owned(),
+                Err(error) => format!("subprocess cleanup unconfirmed: {error:#}"),
+            };
+            let diagnostic = format!(
+                "{error:#}; {phase}; stdout {} bytes (EOF {}); stderr {} bytes (EOF {}); root before cleanup: {root_state}; tree before cleanup: {observed:?}; {stopped}; stderr prefix: {}",
+                out.bytes.len(),
+                out.eof,
+                err.bytes.len(),
+                err.eof,
+                String::from_utf8_lossy(&err.bytes[..err.bytes.len().min(4096)]),
+            );
+            Err(error).context(diagnostic)
+        }
+    };
+    let cleanup = async {
+        let (out, err) = tokio::join!(
+            stdout.close(Duration::from_secs(5)),
+            stderr.close(Duration::from_secs(5)),
+        );
+        out?;
+        err?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    match result {
+        Ok(status) => {
+            cleanup?;
+            Ok(json!({"exit_code":status.code(),"success":status.success(),"stdout":String::from_utf8_lossy(&out.bytes),"stderr":String::from_utf8_lossy(&err.bytes)}).to_string())
+        }
+        Err(error) => match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error).context(format!("shell pipe cleanup failed: {cleanup:#}")),
+        },
+    }
+}
+
+// Keep accepted output outside the cancellable read future. A timeout must not
+// discard the bytes and EOF observations needed to distinguish a running shell
+// from a completed process whose output is still held by another process.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct ShellCapture {
+    bytes: Vec<u8>,
+    eof: bool,
+}
+
+#[cfg(any(windows, test))]
+impl ShellCapture {
+    async fn read(&mut self, reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<()> {
+        let mut buffer = [0; 8192];
+        loop {
+            let count = reader.read(&mut buffer).await?;
+            if count == 0 {
+                self.eof = true;
+                return Ok(());
+            }
+            let keep = count.min((MAX_BYTES + 1).saturating_sub(self.bytes.len()));
+            self.bytes.extend_from_slice(&buffer[..keep]);
+            ensure!(
+                self.bytes.len() <= MAX_BYTES,
+                "shell output exceeds 2 MiB limit"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_shell_capture_preserves_received_bytes_until_actual_eof() {
+        use tokio::io::AsyncWriteExt;
+        let (mut reader, mut writer) = tokio::io::duplex(1);
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            // The one-byte pipe cannot accept the suffix until the whole prefix
+            // has been read. Then retain the writer to withhold real EOF.
+            writer.write_all(b"accepted output!").await.unwrap();
+            sent.send(()).unwrap();
+            finishing.await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let mut capture = ShellCapture::default();
+        timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = capture.read(&mut reader) => panic!("writer still open: {result:?}"),
+                result = received => result.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(capture.bytes.starts_with(b"accepted output"));
+        assert!(!capture.eof);
+        finish.send(()).unwrap();
+        timeout(Duration::from_secs(2), capture.read(&mut reader))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(capture.bytes, b"accepted output!");
+        assert!(capture.eof);
+        producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_capture_rejects_overflow_without_retaining_unbounded_output() {
+        let bytes = vec![b'x'; MAX_BYTES + 16384];
+        let mut source = bytes.as_slice();
+        let mut capture = ShellCapture::default();
+        assert!(
+            capture
+                .read(&mut source)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+        assert_eq!(capture.bytes.len(), MAX_BYTES + 1);
+        assert!(!capture.eof);
+        assert!(!source.is_empty());
+    }
 
     #[tokio::test]
     async fn file_crud_is_contained_and_replaces_atomically() {
@@ -562,6 +840,18 @@ mod tests {
 
     #[tokio::test]
     async fn shell_returns_status_bounds_output_and_terminates_on_timeout() {
+        #[cfg(unix)]
+        let (command, stall, flood) = (
+            "printf hello; printf problem >&2; exit 7",
+            "sleep 5",
+            "yes output",
+        );
+        #[cfg(windows)]
+        let (command, stall, flood) = (
+            "[Console]::Out.Write('hello'); [Console]::Error.Write('problem'); exit 7",
+            "Start-Sleep -Seconds 5",
+            "[Console]::Out.Write('x' * 2097153)",
+        );
         let root = tempfile::tempdir().unwrap();
         let host = ToolHost::new(
             root.path(),
@@ -580,10 +870,7 @@ mod tests {
         );
         let output: Value = serde_json::from_str(
             &host
-                .execute(
-                    "shell",
-                    json!({"command":"printf hello; printf problem >&2; exit 7"}),
-                )
+                .execute("shell", json!({"command":command}))
                 .await
                 .unwrap(),
         )
@@ -593,7 +880,7 @@ mod tests {
         assert_eq!(output["exit_code"], 7);
         assert_eq!(output["success"], false);
         assert!(
-            host.execute("shell", json!({"command":"sleep 5","timeout_ms":20}))
+            host.execute("shell", json!({"command":stall,"timeout_ms":20}))
                 .await
                 .unwrap_err()
                 .to_string()
@@ -608,7 +895,7 @@ mod tests {
         }
         assert!(host.execute("shell", json!({"command":""})).await.is_err());
         assert!(
-            host.execute("shell", json!({"command":"yes output"}))
+            host.execute("shell", json!({"command":flood}))
                 .await
                 .unwrap_err()
                 .to_string()

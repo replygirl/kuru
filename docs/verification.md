@@ -1,5 +1,40 @@
 # Verification record
 
+## Native OpenAI authentication (2026-09-11)
+
+Kuru completed a user-participating browser OAuth login, discovered eight
+account-visible models and their effort settings, and completed a direct
+GPT-6 Astra conversation using the resulting Kuru session. No development tool
+inspected or copied credential files. The initial live request exposed a missing
+Content-Type header; the parser now validates the bounded event stream when that
+header is absent, while rejecting malformed, incomplete and falsely typed bodies.
+CLI failures retain the provider's existing error instead of only the aggregate
+peer failure. This is functional authentication and transport verification.
+
+The connector suite passes 56 tests, including real HTTP browser/device flows,
+concurrent refresh, private publication, logout fencing, actor tool continuation
+and missing-header regressions. Installed and updated macOS executables complete
+API-key model and conversation requests with an empty PATH, preserve bundled
+offline memory, and expose an HTTP 403 without echoing a credential supplied by
+the rejecting fixture. The complete local pre-push graph at db33c17 passed
+405 tests and 96.752% workspace coverage, along with all seven static checks.
+
+[CI at db33c17](https://github.com/replygirl/kuru/actions/runs/34621868783)
+passed every static category and all five native application targets. Windows
+passed 444 tests with 94.235% workspace coverage; its separate platform suite
+passed 60 tests with 91.378% coverage, including actual browser error propagation
+and COM cleanup. Source installation, missing/corrupt offline build-input controls,
+installed offline conversations and self-update, and shipping Kuru/Dolt DLL
+inspection passed. Ubuntu and macOS ARM workspace coverage exceeded 96%.
+
+The final Windows run passed the original unobserved shell request and both
+real-file lock controls: a retained lock must time out, and owned descendant
+cleanup must permit actual reacquisition within a bounded observation. Original
+process ownership, output and cleanup assertions remain intact. The OpenAI,
+updater, plain shell and lock-observation changes are archived with their actual
+native evidence. Historical observer-wrapped results and skipped steps from
+failed runs are not counted as acceptance of the final implementation.
+
 ## Native delivery and public documentation (2026-09-09)
 
 The complete package-owned mise gate passes **209 Rust tests** and **97.51%

@@ -1,0 +1,46 @@
+[package]
+name = "kuru-memory"
+default-run = "kuru-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Private versioned Dolt memory and managed runtime for Kuru"
+
+[[bin]]
+name = "kuru-memory-parent-fixture"
+path = "tests/fixtures/parent.rs"
+
+[dependencies]
+anyhow.workspace = true
+flate2.workspace = true
+futures.workspace = true
+kuru-core.workspace = true
+kuru-platform.workspace = true
+kuru-archive.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+kuru-platform.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(unix)'.build-dependencies]
+nix.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[lints]
+workspace = true

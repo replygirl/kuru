@@ -1,5 +1,8 @@
 use super::*;
-use std::{os::unix::fs::symlink, process::Command};
+use crate::command::BlockingCommand as Command;
+#[path = "../../tests/support/files.rs"]
+mod files;
+use files::symlink;
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -55,12 +58,16 @@ impl Fixture {
     }
 
     fn valid(&self) -> Vec<u8> {
-        self.write(&[(
-            "kuru",
-            b"#!/bin/sh\necho kuru 0.1.0\n",
-            0o755,
-            tar::EntryType::Regular,
-        )])
+        self.write(&[
+            (
+                "kuru",
+                b"#!/bin/sh\necho kuru 0.1.0\n",
+                0o755,
+                tar::EntryType::Regular,
+            ),
+            ("LICENSE", b"license", 0o644, tar::EntryType::Regular),
+            ("README.md", b"readme", 0o644, tar::EntryType::Regular),
+        ])
     }
 
     async fn install(&self) -> Result<PathBuf> {
@@ -89,10 +96,24 @@ impl Fixture {
 #[tokio::test]
 async fn valid_release_replaces_executable_and_runs() {
     let fixture = Fixture::new();
-    fixture.valid();
+    let current = fs::read(std::env::current_exe().unwrap()).unwrap();
+    fixture.write(&[
+        ("kuru", &current, 0o755, tar::EntryType::Regular),
+        ("LICENSE", b"license", 0o644, tar::EntryType::Regular),
+        ("README.md", b"readme", 0o644, tar::EntryType::Regular),
+    ]);
     let path = fixture.install().await.unwrap();
-    assert_eq!(Command::new(path).output().unwrap().stdout, b"kuru 0.1.0\n");
-    assert_eq!(fs::read_dir(&fixture.destination).unwrap().count(), 1);
+    let result = Command::new(path).arg("--list").output().unwrap();
+    assert!(result.status.success());
+    assert!(
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("valid_release_replaces_executable_and_runs")
+    );
+    assert_eq!(
+        fs::read_dir(&fixture.destination).unwrap().count(),
+        1 + usize::from(cfg!(windows))
+    );
 }
 
 #[tokio::test]
@@ -270,8 +291,10 @@ fn versions_platforms_and_manifests_are_validated_before_installation() {
 async fn packager_roundtrip_is_reproducible_and_includes_documentation() {
     let fixture = Fixture::new();
     let binary = fixture._root.path().join("fixture-kuru");
-    fs::write(&binary, "#!/bin/sh\necho kuru 0.2.0\n").unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    files::executable(
+        &binary,
+        &fs::read(std::env::current_exe().unwrap()).unwrap(),
+    );
     let archive = package(&binary, TARGETS[0], "0.2.0", &fixture.releases).unwrap();
     let repeated = package(
         &binary,
@@ -297,9 +320,12 @@ async fn packager_roundtrip_is_reproducible_and_includes_documentation() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        Command::new(installed).output().unwrap().stdout,
-        b"kuru 0.2.0\n"
+    let result = Command::new(installed).arg("--list").output().unwrap();
+    assert!(result.status.success());
+    assert!(
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("packager_roundtrip_is_reproducible_and_includes_documentation")
     );
     let data = fs::read(archive).unwrap();
     let mut archive = tar::Archive::new(GzDecoder::new(data.as_slice()));
@@ -322,8 +348,15 @@ async fn packager_roundtrip_is_reproducible_and_includes_documentation() {
 fn packaging_requires_a_regular_executable_and_known_target() {
     let fixture = Fixture::new();
     let path = fixture.destination.join("kuru");
+    #[cfg(unix)]
     assert!(package(&path, TARGETS[0], "0.1.0", &fixture.releases).is_err());
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(windows)]
+    {
+        let directory = fixture.destination.join("not-an-executable");
+        fs::create_dir(&directory).unwrap();
+        assert!(package(&directory, TARGETS[4], "0.1.0", &fixture.releases).is_err());
+    }
+    make_executable(&File::open(&path).unwrap()).unwrap();
     assert!(package(&path, "unknown", "0.1.0", &fixture.releases).is_err());
     let link = fixture.destination.join("link");
     symlink(path, &link).unwrap();
@@ -340,12 +373,74 @@ fn packaging_requires_a_regular_executable_and_known_target() {
 }
 
 #[test]
+fn local_install_snapshots_linked_build_input_but_rejects_linked_destination() {
+    let fixture = Fixture::new();
+    let binary = fixture._root.path().join("compiled");
+    files::executable(&binary, b"trusted compiled bytes");
+    let alias = fixture._root.path().join("cargo alias");
+    fs::hard_link(&binary, &alias).unwrap();
+    let original = files::identity(&binary);
+    let target = crate::targets::host().unwrap();
+    let installed = install_local(&alias, &fixture.destination, Some(target.triple)).unwrap();
+    assert_eq!(fs::read(&installed).unwrap(), b"trusted compiled bytes");
+    let installed_info = regular_file_info(&File::open(&installed).unwrap()).unwrap();
+    assert_eq!(installed_info.links, 1);
+    assert_ne!(installed_info.identity, original);
+    let installed_alias = fixture._root.path().join("installed alias");
+    fs::hard_link(&installed, &installed_alias).unwrap();
+    let error = install_local(&alias, &fixture.destination, Some(target.triple)).unwrap_err();
+    assert!(format!("{error:#}").contains("hardlink"), "{error:#}");
+    assert_eq!(files::identity(&installed), installed_info.identity);
+    assert_eq!(files::identity(&installed_alias), installed_info.identity);
+    assert_eq!(
+        fs::read(&installed_alias).unwrap(),
+        b"trusted compiled bytes"
+    );
+    assert_eq!(files::identity(&binary), original);
+    assert_eq!(files::identity(&alias), original);
+    assert_eq!(
+        regular_file_info(&File::open(&binary).unwrap())
+            .unwrap()
+            .links,
+        2
+    );
+}
+
+#[test]
+fn build_snapshot_rejects_same_size_mutation_and_replaced_source_name() {
+    for replace_name in [false, true] {
+        let fixture = Fixture::new();
+        let source = fixture._root.path().join("compiled");
+        files::executable(&source, b"old compiled image");
+        let parent = Directory::open(
+            fixture._root.path(),
+            Privacy::Inherited,
+            NameRetention::Movable,
+        )
+        .unwrap();
+        let name = source.file_name().unwrap();
+        let mut input = open_build_input(&parent, name).unwrap();
+        let before = regular_file_info(&input).unwrap();
+        let bytes = bounded(&mut input, MAX_ARCHIVE_BYTES, "test input").unwrap();
+        if replace_name {
+            fs::rename(&source, fixture._root.path().join("retained original")).unwrap();
+        }
+        files::executable(&source, b"new compiled image");
+        assert_eq!(fs::metadata(&source).unwrap().len(), bytes.len() as u64);
+        assert_eq!(files::identity(&source) == before.identity, !replace_name);
+        let error = verify_build_snapshot(&parent, name, &mut input, before, &bytes).unwrap_err();
+        assert!(error.to_string().contains("changed"), "{error:#}");
+        assert_eq!(fs::read(&source).unwrap(), b"new compiled image");
+    }
+}
+
+#[test]
 fn packaging_rejects_hardlinked_outputs_without_modifying_the_input() {
     for checksum in [false, true] {
         let fixture = Fixture::new();
         let binary = fixture._root.path().join("input");
         fs::write(&binary, b"#!/bin/sh\necho input\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        make_executable(&File::open(&binary).unwrap()).unwrap();
         let name = archive_name("0.1.0", TARGETS[0]).unwrap();
         let output = fixture.releases.join(if checksum {
             format!("{name}.sha256")
@@ -354,10 +449,7 @@ fn packaging_rejects_hardlinked_outputs_without_modifying_the_input() {
         });
         fs::hard_link(&binary, &output).unwrap();
         let error = package(&binary, TARGETS[0], "0.1.0", &fixture.releases).unwrap_err();
-        assert!(
-            error.to_string().contains("must not replace its input"),
-            "{error}"
-        );
+        assert!(format!("{error:#}").contains("link"), "{error:#}");
         assert_eq!(fs::read(&binary).unwrap(), b"#!/bin/sh\necho input\n");
         assert_eq!(fs::read(output).unwrap(), fs::read(binary).unwrap());
         assert_eq!(fs::read_dir(&fixture.releases).unwrap().count(), 1);
@@ -369,7 +461,7 @@ fn packaging_failure_preserves_previous_artifacts_and_cleans_staging() {
     let fixture = Fixture::new();
     let binary = fixture._root.path().join("input");
     fs::write(&binary, b"#!/bin/sh\necho input\n").unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    make_executable(&File::open(&binary).unwrap()).unwrap();
     let archive = package(&binary, TARGETS[0], "0.1.0", &fixture.releases).unwrap();
     let checksum = fixture.releases.join(format!(
         "{}.sha256",
@@ -397,7 +489,7 @@ fn packaging_does_not_follow_archive_or_checksum_output_symlinks() {
         let fixture = Fixture::new();
         let binary = fixture._root.path().join("input");
         fs::write(&binary, b"#!/bin/sh\necho input\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        make_executable(&File::open(&binary).unwrap()).unwrap();
         let outside = fixture._root.path().join("outside");
         fs::write(&outside, b"outside preserved").unwrap();
         let name = archive_name("0.1.0", TARGETS[0]).unwrap();

@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use futures::future::join_all;
 use kuru_core::{Part, ToolSpec};
+use kuru_memory::Candidate;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::engine::{Harness, Topology, spec, user, validate_topology};
+use crate::engine::{Harness, PendingPublication, Topology, spec, user, validate_topology};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -29,6 +30,9 @@ pub struct DreamReport {
 
 impl Harness {
     pub async fn dream(&mut self) -> Result<DreamReport> {
+        self.reconcile().await?;
+        let candidate = self.memory.begin_candidate("dream").await?;
+        let memory = candidate.view();
         self.emit(
             "dream",
             "pool",
@@ -41,21 +45,24 @@ impl Harness {
             .filter(|p| p.active)
             .map(|p| p.id.clone())
             .collect::<Vec<_>>();
-        let replies = join_all(ids.iter().map(|id| self.ask(id,
+        let replies = join_all(ids.iter().map(|id| self.ask_in(&memory, id,
             vec![user("Review your own history. Write a concise durable memory summary of useful facts and unresolved concerns. You may suggest a new complementary member of an existing role or retire yourself if your role is redundantly covered. A suggestion is optional; do not manufacture changes. No other tools are available during dreaming.")],
             "dream: consolidate your own memory, optionally propose membership changes", vec![dream_tool()]))).await;
         let mut report = DreamReport::default();
         let mut proposals = vec![];
         for (id, reply) in ids.into_iter().zip(replies) {
             match reply {
+                Err(error) if error.is::<crate::actor::MemoryFailure>() => return Err(error),
                 Err(error) => report.rejected.push(format!("{id}: {error:#}")),
                 Ok(reply) => {
                     if !reply.text.trim().is_empty() {
-                        self.memory.append(
-                            &format!("{}/notes", self.namespace(&id)),
-                            "dream",
-                            &crate::actor::truncate_text(&reply.text, 8192),
-                        )?;
+                        memory
+                            .append(
+                                &format!("{}/notes", self.namespace(&id)),
+                                "dream",
+                                &crate::actor::truncate_text(&reply.text, 8192),
+                            )
+                            .await?;
                         report.summaries += 1;
                     }
                     for (index, call) in reply.calls.into_iter().enumerate() {
@@ -87,23 +94,21 @@ impl Harness {
                                 error
                             }
                         };
-                        self.memory.append(
-                            &self.namespace(&id),
-                            "tool",
-                            &json!({"call_id":call.id,"output":outcome}).to_string(),
-                        )?;
+                        memory
+                            .append(
+                                &self.namespace(&id),
+                                "tool",
+                                &json!({"call_id":call.id,"output":outcome}).to_string(),
+                            )
+                            .await?;
                     }
                 }
             }
         }
-        let changes = self.apply_dream(proposals)?;
+        let (topology, changes) = self.plan_dream(proposals)?;
         report.accepted = changes.accepted;
         report.rejected.extend(changes.rejected);
-        self.memory.append(
-            &format!("{}/{}/dream-log", self.scope, self.config.mode),
-            "dream",
-            &serde_json::to_string(&report)?,
-        )?;
+        self.finish_dream(&candidate, topology, &report).await?;
         self.emit(
             "dream",
             "pool",
@@ -117,15 +122,62 @@ impl Harness {
         Ok(report)
     }
 
-    pub fn apply_dream(&mut self, proposals: Vec<DreamProposal>) -> Result<DreamReport> {
+    pub async fn apply_dream(&mut self, proposals: Vec<DreamProposal>) -> Result<DreamReport> {
+        self.reconcile().await?;
+        let (topology, report) = self.plan_dream(proposals)?;
+        let candidate = self.memory.begin_candidate("dream").await?;
+        self.finish_dream(&candidate, topology, &report).await?;
+        Ok(report)
+    }
+
+    async fn finish_dream(
+        &mut self,
+        candidate: &Candidate,
+        topology: Topology,
+        report: &DreamReport,
+    ) -> Result<()> {
+        let memory = candidate.view();
+        let mut extra = vec![(
+            format!("{}/{}/last-dream", self.scope, self.config.mode),
+            json!({"id":Uuid::new_v4(), "base":candidate.base()}),
+        )];
+        if !report.accepted.is_empty() {
+            extra.push((
+                format!("{}/{}/dream-undo", self.scope, self.config.mode),
+                serde_json::to_value(&self.topology)?,
+            ));
+        }
+        let updates = self
+            .state_updates(&memory, &topology, &self.session, extra)
+            .await?;
+        memory.put_many(&updates).await?;
+        memory
+            .append(
+                &format!("{}/{}/dream-log", self.scope, self.config.mode),
+                "dream",
+                &serde_json::to_string(report)?,
+            )
+            .await?;
+        self.pending_publication = Some(PendingPublication {
+            config: self.config.clone(),
+            topology,
+            session: self.session.clone(),
+            updates,
+        });
+        candidate.promote().await?;
+        self.publish_pending();
+        Ok(())
+    }
+
+    fn plan_dream(&self, proposals: Vec<DreamProposal>) -> Result<(Topology, DreamReport)> {
         ensure!(
             proposals.len() <= self.config.max_parts * 2,
             "too many dream proposals"
         );
-        let before = self.topology.clone();
+        let mut topology = self.topology.clone();
         let mut report = DreamReport::default();
         for proposal in proposals {
-            let mut candidate = self.topology.clone();
+            let mut candidate = topology.clone();
             let validation = match &proposal {
                 DreamProposal::Add {
                     name,
@@ -175,31 +227,22 @@ impl Harness {
             .and_then(|()| validate_topology(&candidate, &self.config));
             match validation {
                 Ok(()) => {
-                    self.topology = candidate;
+                    topology = candidate;
                     report.accepted.push(proposal);
                 }
                 Err(error) => report.rejected.push(format!("{proposal:?}: {error}")),
             }
         }
-        if !report.accepted.is_empty() {
-            let undo = (
-                format!("{}/{}/dream-undo", self.scope, self.config.mode),
-                serde_json::to_value(&before)?,
-            );
-            if let Err(error) = self.save_with(vec![undo]) {
-                self.topology = before;
-                return Err(error);
-            }
-            self.sync_actors();
-        }
-        Ok(report)
+        Ok((topology, report))
     }
 
-    pub fn undo_dream(&mut self) -> Result<()> {
+    pub async fn undo_dream(&mut self) -> Result<()> {
+        self.reconcile().await?;
         let key = format!("{}/{}/dream-undo", self.scope, self.config.mode);
         let value = self
             .memory
-            .get(&key)?
+            .get(&key)
+            .await?
             .filter(|v| !v.is_null())
             .context("no dreaming change to undo")?;
         let previous: Topology = serde_json::from_value(value)?;
@@ -213,13 +256,13 @@ impl Harness {
                 restored.parts.push(archived);
             }
         }
-        let before = std::mem::replace(&mut self.topology, restored);
-        if let Err(error) = self.save_with(vec![(key, json!(null))]) {
-            self.topology = before;
-            return Err(error);
-        }
-        self.sync_actors();
-        Ok(())
+        self.persist_state(
+            self.config.clone(),
+            restored,
+            self.session.clone(),
+            vec![(key, json!(null))],
+        )
+        .await
     }
 }
 

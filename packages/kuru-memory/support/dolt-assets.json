@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "version": "2.3.3",
+  "upstream_commit": "79caf258c32e638868f17a803eb2c2779c0507ab",
+  "assets": [
+    {
+      "target": "aarch64-apple-darwin",
+      "stem": "dolt-darwin-arm64",
+      "format": "tar.gz",
+      "executable_name": "dolt",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-darwin-arm64.tar.gz",
+      "compressed_bytes": 41132675,
+      "archive_sha256": "55c11d34df78d7583f1130a1adef7763340f2aade33e68ccb0046854134ad08b",
+      "expanded_bytes": 120064000,
+      "executable_bytes": 118846882,
+      "executable_sha256": "84e8724957dd7b24202d5cbe0e5f6eba37f1f17e43f9094e92ba328b47413a6d",
+      "license_bytes": 1212811,
+      "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "stem": "dolt-darwin-amd64",
+      "format": "tar.gz",
+      "executable_name": "dolt",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-darwin-amd64.tar.gz",
+      "compressed_bytes": 43603373,
+      "archive_sha256": "e33f4fa00032054e38da78b31314f8e93fa9eb950c587ac5f29ba5c6402b3f2a",
+      "expanded_bytes": 127662080,
+      "executable_bytes": 126442936,
+      "executable_sha256": "cb37ed2489c15d62cd0a054c3c594337ca1b758a3866b63eef845490e58f0776",
+      "license_bytes": 1212811,
+      "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "stem": "dolt-linux-arm64",
+      "format": "tar.gz",
+      "executable_name": "dolt",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-linux-arm64.tar.gz",
+      "compressed_bytes": 40750254,
+      "archive_sha256": "850a880aece6587cb9251ea0f07eb51fcc0a37450471fd89e03ac2fba1fdaed3",
+      "expanded_bytes": 120033280,
+      "executable_bytes": 118817184,
+      "executable_sha256": "56c20166b6da38fd5b5189358443fd5e450ec634fdad3cc2ca239ecf959fb5f1",
+      "license_bytes": 1212811,
+      "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "stem": "dolt-linux-amd64",
+      "format": "tar.gz",
+      "executable_name": "dolt",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-linux-amd64.tar.gz",
+      "compressed_bytes": 43971030,
+      "archive_sha256": "4acd730a4c53991996854a72fbb1add102b0a583bd07411320efb65037a43d9d",
+      "expanded_bytes": 127897600,
+      "executable_bytes": 126673640,
+      "executable_sha256": "ec7c200f0c92516349c6e607635f6f8717e22abe31275ac326125d32356bc786",
+      "license_bytes": 1212811,
+      "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "stem": "dolt-windows-amd64",
+      "format": "zip",
+      "executable_name": "dolt.exe",
+      "url": "https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-windows-amd64.zip",
+      "compressed_bytes": 40038677,
+      "archive_sha256": "b8a113f7edf236124092de5b19f9b4904eac3c11a37d33379e2e3c2e0d1f6b0d",
+      "expanded_bytes": 130339211,
+      "executable_bytes": 129126400,
+      "executable_sha256": "195a2435c0cbb91769d590e866bad29a25d4c90a011a8f4ff2516f263e867301",
+      "license_bytes": 1212811,
+      "license_sha256": "2598089ca4e9c23a7a11b330952a37f51360f2db06dfdb7d699de1bca1371386"
+    }
+  ]
+}

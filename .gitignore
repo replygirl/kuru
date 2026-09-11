@@ -7,6 +7,7 @@ node_modules/
 *.db
 *.db-shm
 *.db-wal
+*.profraw
 .DS_Store
 apps/kuru-docs/.vitepress/cache/
 apps/kuru-docs/.vitepress/dist/

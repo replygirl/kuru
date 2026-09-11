@@ -1,6 +1,9 @@
 #![cfg(feature = "tooling")]
 
-use std::{fs, path::PathBuf, process::Command};
+use kuru_delivery::command::BlockingCommand as Command;
+use std::{fs, path::PathBuf};
+#[path = "support/files.rs"]
+mod files;
 
 use kuru_delivery::repo;
 
@@ -67,6 +70,10 @@ fn owned_packages_exact_pins_and_canonical_instructions_pass_real_cli() {
     repo.write(
         "scripts/check-commit.sh",
         "#!/usr/bin/env bash\nexec cog verify --file \"$1\"\n",
+    );
+    repo.write(
+        "scripts/install.ps1",
+        "& $PSScriptRoot/../packages/kuru-delivery/support/install.ps1 @args\n",
     );
     assert!(repo.errors().is_empty());
     let output = Command::new(env!("CARGO_BIN_EXE_kuru-delivery"))
@@ -241,6 +248,7 @@ fn root_language_projects_scripts_and_unneeded_interpreters_are_rejected() {
         repo.write(filename, "fixture");
     }
     repo.write("scripts/legacy.py", "fixture");
+    repo.write("scripts/unowned.ps1", "fixture");
     repo.replace(
         "mise.toml",
         "[tools]",
@@ -258,6 +266,11 @@ fn root_language_projects_scripts_and_unneeded_interpreters_are_rejected() {
         errors
             .iter()
             .any(|error| error.contains("helper implementation must belong"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("scripts/unowned.ps1"))
     );
     assert_eq!(
         errors
@@ -300,7 +313,7 @@ fn member_symlink_does_not_read_an_external_manifest() {
     let outside = tempfile::tempdir().unwrap();
     fs::write(outside.path().join("Cargo.toml"), "invalid external TOML {").unwrap();
     fs::remove_dir_all(repo.0.path().join("packages/kuru-core")).unwrap();
-    std::os::unix::fs::symlink(outside.path(), repo.0.path().join("packages/kuru-core")).unwrap();
+    files::symlink(outside.path(), repo.0.path().join("packages/kuru-core")).unwrap();
     assert!(
         repo.errors()
             .iter()

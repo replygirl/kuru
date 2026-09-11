@@ -1,8 +1,12 @@
 # Using Kuru
 
-Run `kuru --provider demo` for the offline terminal interface. Choose the
-`codex` provider after `kuru login`, or set `OPENAI_API_KEY` and select
-`--provider responses`. The selected model and effort are visible in the
+Run `kuru --provider demo` to explore the terminal without provider credentials.
+The executable includes the verified Dolt engine, so the first demo conversation
+works offline with an empty cache. See [memory storage](memory.md) for local
+extraction and storage details. Choose the
+default `codex` provider after Kuru's own ChatGPT sign-in with `kuru login`, or
+set `OPENAI_API_KEY` and select `--provider responses --model MODEL_ID`.
+The selected model and effort are visible in the
 composer beside their shortcuts; `kuru models` prints the provider's current catalog.
 
 ## Terminal controls
@@ -101,7 +105,13 @@ See [configuration](configuration.md) for persistent permissions and budgets.
 
 ## Authentication and service commands
 
-`login`, `login --device`, `auth` and `logout` use supported Codex commands.
+`login` starts browser sign-in for ChatGPT subscription access.
+`login --no-browser` prints the URL for you to open; `login --device` uses device
+authorization. `auth` prints redacted local authentication status as JSON, and
+`logout` clears Kuru's ChatGPT credentials. These commands manage Kuru's own
+private auth store without a Codex executable or another application's tokens.
+See [authentication configuration](configuration.md#authentication) for storage
+and API-key provider selection.
 `config` prints merged configuration, redacting MCP environment values.
 `serve` exposes the authenticated local A2A subset; see [protocols](protocols.md).
 `update` installs an explicit verified release or rebuilds a chosen source
