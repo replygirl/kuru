@@ -21,18 +21,18 @@ pub(super) async fn response(mut response: reqwest::Response, idle: Duration) ->
         response.content_length().unwrap_or(0) <= MAX_BYTES as u64,
         "Responses stream exceeds size limit"
     );
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    ensure!(
-        content_type
-            .split(';')
-            .next()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream")),
-        "ChatGPT response is not an event stream"
-    );
+    // The subscription endpoint can omit Content-Type. The bounded SSE
+    // records and successful terminal event remain mandatory in that case.
+    if let Some(header) = response.headers().get(reqwest::header::CONTENT_TYPE) {
+        let content_type = header.to_str().unwrap_or("");
+        ensure!(
+            content_type
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream")),
+            "ChatGPT response is not an event stream"
+        );
+    }
     let mut decoder = Decoder::default();
     loop {
         let chunk = tokio::time::timeout(idle, response.chunk())

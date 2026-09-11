@@ -501,3 +501,117 @@ async fn real_idle_stream_is_bounded_and_dropped() {
         .unwrap()
         .unwrap();
 }
+
+/// A real chunked HTTP response with deliberately controlled header presence.
+/// One-byte HTTP chunks exercise boundaries inside JSON strings and UTF-8.
+async fn raw_subscription_stream(
+    body: String,
+    content_type: Option<&str>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let content_type = content_type
+        .map(|value| format!("Content-Type: {value}\r\n"))
+        .unwrap_or_default();
+    let task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\n{content_type}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            for byte in body.bytes() {
+                // Invalid content can be rejected before the server finishes.
+                if socket.write_all(&[b'1', b'\r', b'\n', byte, b'\r', b'\n']).await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        }).await.expect("raw subscription fixture exceeded its bound");
+    });
+    (base, task)
+}
+
+#[tokio::test]
+async fn missing_content_type_accepts_fragmented_subscription_sse() {
+    let peer = Peer::new(vec![]).await;
+    let (mut provider, _manager, _directory) = subscription(&peer).await;
+    let body = stream(vec![
+        done(0, json!({"type":"message","content":[{"type":"output_text","text":"réponse"}]})),
+        done(1, json!({"type":"function_call","id":"item-one","call_id":"call-one","name":"file_read","arguments":"{\"path\":\"one.txt\"}"})),
+        completed(),
+    ]).body;
+    let (base, server) = raw_subscription_stream(body, None).await;
+    let _abort = AbortOnDrop(server.abort_handle());
+    provider.base = base;
+    let result = tokio::time::timeout(Duration::from_secs(5), provider.complete(request()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.text, "réponse");
+    assert_eq!((result.input_tokens, result.output_tokens), (8, 5));
+    assert_eq!(result.calls.len(), 1);
+    assert_eq!(result.calls[0].id, "call-one");
+    assert_eq!(result.calls[0].arguments, json!({"path":"one.txt"}));
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        peer.requests.lock().await.is_empty(),
+        "stream acceptance attempted refresh"
+    );
+}
+
+#[tokio::test]
+async fn missing_content_type_still_rejects_malformed_and_truncated_streams() {
+    let partial = stream(vec![
+        done(0, json!({"type":"reasoning","id":"partial-reasoning","encrypted_content":"unaccepted-opaque"})),
+        done(1, json!({"type":"function_call","id":"partial-item","call_id":"partial-call","name":"file_read","arguments":"{}"})),
+    ]).body;
+    for (body, content_type, expected) in [
+        (format!("{partial}data: not-json\n\n"), None, "JSON"),
+        (partial, None, "before response.completed"),
+        (
+            json!({"output":[],"status":"completed"}).to_string(),
+            None,
+            "before response.completed",
+        ),
+        (
+            message("valid SSE with wrong declared type").body,
+            Some("application/json"),
+            "event stream",
+        ),
+    ] {
+        let peer = Peer::new(vec![message("clean request")]).await;
+        let (mut provider, _manager, _directory) = subscription(&peer).await;
+        let (base, server) = raw_subscription_stream(body, content_type).await;
+        let _abort = AbortOnDrop(server.abort_handle());
+        provider.base = base;
+        let error = tokio::time::timeout(Duration::from_secs(5), provider.complete(request()))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            peer.requests.lock().await.is_empty(),
+            "invalid stream attempted a retry"
+        );
+        provider.base = peer.url.clone();
+        assert_eq!(
+            provider.complete(request()).await.unwrap().text,
+            "clean request"
+        );
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent.len(), 1);
+        let input = sent[0].body.to_string();
+        assert!(!input.contains("unaccepted-opaque"));
+        assert!(!input.contains("partial-call"));
+    }
+}

@@ -409,6 +409,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
         let mut harness = Harness::new(config, &cwd, memory, provider, cli.resume.as_deref()).await?;
         match cli.command {
             Some(Command::Run { prompt, json }) => {
+                let mut events = harness.subscribe();
                 let result = harness.run(&prompt).await;
                 let succeeded = result.is_ok();
                 if let Ok(result) = &result {
@@ -419,7 +420,19 @@ pub async fn execute(cli: Cli) -> Result<()> {
                     }
                 }
                 let cleanup = harness.shutdown(succeeded).await;
-                result?;
+                result.map_err(|error| {
+                    let mut failures = std::collections::BTreeSet::new();
+                    while let Ok(event) = events.try_recv() {
+                        if event.kind == "error" && failures.len() < 8 {
+                            failures.insert(event.detail.chars().take(512).collect::<String>());
+                        }
+                    }
+                    if failures.is_empty() {
+                        error
+                    } else {
+                        error.context(format!("provider errors: {}", failures.into_iter().collect::<Vec<_>>().join("; ")))
+                    }
+                })?;
                 cleanup?;
             }
 

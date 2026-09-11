@@ -219,7 +219,7 @@ impl Installation {
         use axum::{
             Json, Router,
             extract::State,
-            http::HeaderMap,
+            http::{HeaderMap, StatusCode},
             routing::{get, post},
         };
         use std::sync::Arc;
@@ -229,6 +229,7 @@ impl Installation {
             models: usize,
             completions: usize,
             valid: bool,
+            reject: bool,
         }
         type Shared = Arc<Mutex<Requests>>;
         fn authorized(headers: &HeaderMap) -> bool {
@@ -247,14 +248,23 @@ impl Installation {
             State(state): State<Shared>,
             headers: HeaderMap,
             Json(body): Json<Value>,
-        ) -> Json<Value> {
+        ) -> (StatusCode, Json<Value>) {
             let mut requests = state.lock().await;
             requests.completions += 1;
             requests.valid &= authorized(&headers)
                 && body["model"] == "fixture-openai-model"
                 && body["store"] == false;
-            Json(
-                serde_json::json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Native OpenAI request completed."}]}],"usage":{"input_tokens":1,"output_tokens":1}}),
+            if requests.reject {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error":{"message":"synthetic-installed-api-key"}})),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Native OpenAI request completed."}]}],"usage":{"input_tokens":1,"output_tokens":1}}),
+                ),
             )
         }
         let state = Arc::new(Mutex::new(Requests {
@@ -324,6 +334,36 @@ impl Installation {
                 "installed command exposed its API key"
             );
         }
+        state.lock().await.reject = true;
+        let rejected = execute(
+            self.command()
+                .env("OPENAI_API_KEY", "synthetic-installed-api-key")
+                .arg("--config")
+                .arg(&settings)
+                .args([
+                    "--provider",
+                    "responses",
+                    "--model",
+                    "fixture-openai-model",
+                    "run",
+                    "Check rejected OpenAI access.",
+                    "--json",
+                ]),
+        )
+        .await?;
+        ensure!(
+            !rejected.status.success(),
+            "rejected OpenAI request reported success"
+        );
+        let diagnostic = String::from_utf8_lossy(&rejected.stderr);
+        ensure!(
+            diagnostic.contains("provider errors: HTTP request failed: 403"),
+            "native CLI hid the OpenAI failure: {diagnostic}"
+        );
+        ensure!(
+            !diagnostic.contains("synthetic-installed-api-key"),
+            "native CLI echoed the rejected credential"
+        );
         let observed = state.lock().await;
         ensure!(
             observed.valid && observed.models >= 1 && observed.completions >= 1,

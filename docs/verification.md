@@ -1,5 +1,32 @@
 # Verification record
 
+## Native OpenAI authentication (2026-09-11)
+
+Kuru completed a user-participating browser OAuth login, discovered eight
+account-visible models and their effort settings, and completed a direct
+GPT-6 Astra conversation using the resulting Kuru session. No development tool
+inspected or copied credential files. The initial live request exposed a missing
+Content-Type header; the parser now validates the bounded event stream when that
+header is absent, while rejecting malformed, incomplete and falsely typed bodies.
+CLI failures retain the provider's existing error instead of only the aggregate
+peer failure. This is functional authentication and transport verification.
+
+The connector suite passes 56 tests, including real HTTP browser/device flows,
+concurrent refresh, private publication, logout fencing, actor tool continuation
+and missing-header regressions. Installed and updated macOS executables complete
+API-key model and conversation requests with an empty PATH, preserve bundled
+offline memory, and expose an HTTP 403 without echoing a credential supplied by
+the rejecting fixture. The first complete local pre-push graph passed 403 tests
+and 96.756% workspace coverage; subsequent inference corrections have their own
+focused checks and still require final hooks/native CI.
+
+[CI at 65f9896](https://github.com/replygirl/kuru/actions/runs/34602482369)
+passed all static categories and four Unix native application targets. Its
+Windows primitive assertions passed, but its separate coverage gate failed after
+adding browser dispatch. Actual native dispatch/COM cleanup controls have been
+added; their next hosted result is pending. This record does not count an earlier
+source revision or a build-only check as verification of those controls.
+
 ## Native delivery and public documentation (2026-09-09)
 
 The complete package-owned mise gate passes **209 Rust tests** and **97.51%
