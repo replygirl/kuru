@@ -737,3 +737,48 @@ Actual native execution remains pending on a subsequent candidate; c52fa62 does
 not contain this correction. Evidence: `/tmp/kuru-source-entry-apply.json`,
 `/tmp/kuru-source-entrypoint-independent-review.md` and
 `/tmp/kuru-source-entrypoint-static.log`.
+
+## Terminal redraw dispatch after c52fa62
+
+The completed native run passed both full-application updates but failed the
+focus-loss quiet-output assertion. Its log retained no appended bytes, so the
+failure does not identify their cause. Source inspection independently found
+that the Windows backend forwards key releases and the real loop marks every
+event dirty before the editor discards releases. This permits unchanged frames
+after the last character is visible. Correct this shared dispatch boundary and
+retain native byte/cursor diagnostics without changing its 450 ms quiet interval
+or 700 ms animation observations. Actual native acceptance is still required.
+
+- [x] 12.1 @regression (agent) Exercise the real dispatch boundary with focus loss, typed press/repeat and trailing releases, including command keys -> the focused host regression passed against the dispatcher used by the real loop, proving editing/command/release behavior and overdue focus/cadence handling; independent source review confirms other pending redraw causes are retained.
+- [ ] 12.2 @integration (agent) Run the actual native ConPTY scenario with bounded escaped late-output diagnostics -> the existing completed-composer, focus-loss quiescence, focus-return animation and later selector/persistence assertions pass without waiting for silence or weakening deadlines.
+
+The focused host regression passed in 1.11 seconds (22.07 seconds including
+prepared memory and compilation). Formatting and strict cospec validation passed.
+Both native quiet-output assertions now retain bounded escaped pre/post bytes,
+cursor visibility/position and screen diagnostics without altering the 450 ms
+observation or filtering any output. Independent review found no material defect;
+native execution and the separate frame-prefix synchronization risk remain open.
+Evidence: `/tmp/kuru-focus-dispatch-test.log`, `/tmp/kuru-focus-dispatch-apply.json`
+and `/tmp/kuru-focus-dispatch-final-review.md`.
+
+## Hosted c52fa62 result
+
+[CI 34562838599](https://github.com/replygirl/kuru/actions/runs/34562838599) passed
+all static jobs, four Unix application jobs and Windows primitives. The actual
+merge checkout was `c78539c8e2234ddc434c3a56da67a6e0a14f5e3c`; its source tree
+`36409b13d99ea1c708b57edc7df35efa7b195ee0` matches branch head `c52fa62`.
+Full Windows recorded 397 passed, one failed and one intentionally ignored case
+in 1549.48 seconds including compilation. Both normal full-app updates passed
+within unchanged deadlines and with all 15 verification digests retained. The
+packaged case observed profiles from the ordinary app/helper pair. Successful
+stderr was captured, so no exact successful ACK timestamp is available.
+
+Only the ConPTY focus-output assertion failed; its later selector/persistence
+assertions were not reached. The final gate failed, and full Windows LCOV,
+source installation, offline Cargo, shipping runtime and PE-import checks were
+skipped. The separately passing Windows primitive gate measured 2602/2865 lines
+(90.820244%); Ubuntu measured 14381/14809 (97.109866%) and macOS arm64
+14392/14820 (97.112011%). All four Unix jobs passed actual packaged offline
+install/update checks. The source-entrypoint correction was not in this tree.
+No release or Pages deployment occurred. Exact results and limitations:
+`/tmp/kuru-windows-c52fa62-results.md` and `/tmp/kuru-ci-c52fa62-results.md`.

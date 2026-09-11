@@ -348,6 +348,28 @@ impl View {
         }
     }
 
+    pub fn terminal_event(&mut self, event: TerminalEvent) -> (bool, Option<String>) {
+        let command = match event {
+            TerminalEvent::Key(key) if key.kind == KeyEventKind::Release => return (false, None),
+            TerminalEvent::Key(key) => self.key(key),
+            TerminalEvent::Paste(text) => {
+                self.paste(&text);
+                None
+            }
+            TerminalEvent::FocusGained => {
+                self.focused = true;
+                None
+            }
+            TerminalEvent::FocusLost => {
+                self.focused = false;
+                None
+            }
+            TerminalEvent::Resize(_, _) => None,
+            _ => return (false, None),
+        };
+        (true, command)
+    }
+
     pub fn key(&mut self, key: KeyEvent) -> Option<String> {
         if key.kind == KeyEventKind::Release {
             return None;
@@ -678,23 +700,8 @@ where
             Duration::from_millis(100)
         };
         if event::poll(wait)? {
-            dirty = true;
-            let command = match event::read()? {
-                TerminalEvent::Key(key) => view.key(key),
-                TerminalEvent::Paste(text) => {
-                    view.paste(&text);
-                    None
-                }
-                TerminalEvent::FocusGained => {
-                    view.focused = true;
-                    None
-                }
-                TerminalEvent::FocusLost => {
-                    view.focused = false;
-                    None
-                }
-                _ => None,
-            };
+            let (redraw, command) = view.terminal_event(event::read()?);
+            dirty |= redraw;
             if let Some(command) = command {
                 if command == "/cancel" {
                     if let Some(job) = job.take() {
@@ -889,6 +896,103 @@ mod tests {
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn terminal_dispatch_ignores_releases_without_losing_input_or_animation() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let (_dir, h, models) = fixture().await;
+        let mut view = View::new(&h, models).await.unwrap();
+        view.motion = true;
+        assert!(view.advance_animation(Duration::from_millis(250)));
+        let clock = (view.frame, view.clock_ms, view.last_frame_ms);
+        let release = |code, modifiers| {
+            TerminalEvent::Key(KeyEvent::new_with_kind(
+                code,
+                modifiers,
+                KeyEventKind::Release,
+            ))
+        };
+
+        for focused in [true, false] {
+            let event = if focused {
+                TerminalEvent::FocusGained
+            } else {
+                TerminalEvent::FocusLost
+            };
+            assert_eq!(view.terminal_event(event), (true, None));
+            assert_eq!(view.focused, focused);
+            for (kind, expected) in [(KeyEventKind::Press, "a"), (KeyEventKind::Repeat, "aa")] {
+                let event = TerminalEvent::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('a'),
+                    KeyModifiers::NONE,
+                    kind,
+                ));
+                assert_eq!(view.terminal_event(event), (true, None));
+                assert_eq!(view.input, expected);
+                assert_eq!(view.cursor, expected.len());
+                assert_eq!(
+                    view.terminal_event(release(KeyCode::Char('a'), KeyModifiers::NONE)),
+                    (false, None)
+                );
+                assert_eq!(view.input, expected);
+                assert_eq!(view.cursor, expected.len());
+            }
+            assert_eq!(
+                view.terminal_event(TerminalEvent::Key(key(KeyCode::Enter))),
+                (true, Some("aa".into()))
+            );
+            assert_eq!(
+                view.terminal_event(release(KeyCode::Enter, KeyModifiers::NONE)),
+                (false, None)
+            );
+            assert!(view.input.is_empty());
+            assert_eq!(view.cursor, 0);
+            assert_eq!(
+                view.terminal_event(TerminalEvent::Key(KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                ))),
+                (true, Some("/quit".into()))
+            );
+            assert_eq!(
+                view.terminal_event(release(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                (false, None)
+            );
+            assert_eq!(view.focused, focused);
+            assert_eq!((view.frame, view.clock_ms, view.last_frame_ms), clock);
+        }
+
+        assert_eq!(
+            view.terminal_event(TerminalEvent::Paste("猫\nx".into())),
+            (true, None)
+        );
+        assert_eq!(
+            view.terminal_event(TerminalEvent::Resize(80, 24)),
+            (true, None)
+        );
+        assert_eq!(
+            view.terminal_event(TerminalEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 2,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            })),
+            (false, None)
+        );
+        assert_eq!((view.input.as_str(), view.cursor), ("猫\nx", 5));
+        assert_eq!((view.frame, view.clock_ms, view.last_frame_ms), clock);
+        assert!(!view.focused);
+        assert!(!view.advance_animation(Duration::from_millis(500)));
+        assert_eq!(view.frame, clock.0);
+        assert_eq!(
+            view.terminal_event(TerminalEvent::FocusGained),
+            (true, None)
+        );
+        assert!(view.advance_animation(Duration::from_millis(501)));
+        assert!(!view.advance_animation(Duration::from_millis(750)));
+        assert!(view.advance_animation(Duration::from_millis(751)));
     }
 
     #[tokio::test]

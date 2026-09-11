@@ -319,6 +319,35 @@ impl Terminal {
         })
     }
 
+    /// Assert the entire observation interval, without first waiting for silence.
+    pub fn quiet(&mut self, description: &str, duration: Duration) -> Result<()> {
+        let settled = self.output.len();
+        let cursor = self.parser.screen().cursor_position();
+        let hidden = self.parser.screen().hide_cursor();
+        let before = self.screen();
+        self.read_for(duration)?;
+        let appended = &self.output[settled..];
+        ensure!(
+            appended.is_empty(),
+            "{description}: {} additional bytes over {duration:?}; \
+             preceding 512 bytes: {}; first 4096 new bytes: {}; \
+             cursor {cursor:?}/hidden={hidden} -> {:?}/hidden={}; \
+             screen changed={}; screen prefix: {}",
+            appended.len(),
+            self.output[settled.saturating_sub(512)..settled].escape_ascii(),
+            appended[..appended.len().min(4096)].escape_ascii(),
+            self.parser.screen().cursor_position(),
+            self.parser.screen().hide_cursor(),
+            before != self.screen(),
+            self.screen()
+                .chars()
+                .take(2048)
+                .collect::<String>()
+                .escape_debug(),
+        );
+        Ok(())
+    }
+
     pub fn command(&mut self, value: &str) -> Result<()> {
         self.text(&["enter send"], READY)?;
         self.send(value.as_bytes())?;

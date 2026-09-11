@@ -246,12 +246,10 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
     terminal.focus(false)?;
     terminal.send(b"focus draft")?;
     terminal.composer("focus draft")?;
-    let settled = terminal.output.len();
-    terminal.read_for(Duration::from_millis(450))?;
-    ensure!(
-        terminal.output.len() == settled,
-        "native focus loss continued drawing after its completed composer frame"
-    );
+    terminal.quiet(
+        "native focus loss continued drawing after its completed composer frame",
+        Duration::from_millis(450),
+    )?;
     terminal.focus(true)?;
     terminal.send(b"!")?;
     terminal.composer("focus draft!")?;
@@ -329,12 +327,10 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
     )?;
     reopened.send(b"reduced draft")?;
     reopened.composer("reduced draft")?;
-    let settled = reopened.output.len();
-    reopened.read_for(Duration::from_millis(450))?;
-    ensure!(
-        reopened.output.len() == settled,
-        "reduced-motion console continued drawing"
-    );
+    reopened.quiet(
+        "reduced-motion console continued drawing",
+        Duration::from_millis(450),
+    )?;
     reopened.send(b"\x03")?;
     assert_eq!(reopened.finish(EXIT)?["status"], 0);
     Ok(())

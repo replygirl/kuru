@@ -365,6 +365,17 @@ all necessary interop in the audited platform package and retain the consumer
 unsafe prohibition. Native tests must observe mode restoration from outside the
 application; renderer-only assertions cannot satisfy this contract.
 
+Terminal dispatch must distinguish events that can change the view from ignored
+events before requesting a frame. The pinned Windows input backend forwards key
+releases, while the editor intentionally ignores them. Share event dispatch and
+its redraw decision between the real loop and focused regression tests; ignore
+releases without clearing pending runtime or clock work. Preserve press/repeat,
+paste, resize and focus behavior. Native focus acceptance retains its completed
+composer observation and unchanged quiet interval. If late output remains, retain
+a bounded escaped byte sample and cursor/screen diagnostics; neither queued focus
+acknowledgment nor an unchanged parser snapshot proves a wire-level frame boundary.
+Do not substitute waiting for silence for the assertion of animation quiescence.
+
 Rejected: WSL/Git Bash as a runtime prerequisite, copying POSIX terminal bytes
 blindly, suppressing unsupported paths with `cfg`, or adding unrelated UI work.
 
