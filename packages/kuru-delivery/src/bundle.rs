@@ -22,6 +22,11 @@ const MAX_ARCHIVE: u64 = 64 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 128 * 1024 * 1024;
 const LOCK_NAME: &str = ".prepare.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[cfg(test)]
+#[path = "bundle/recovery_tests.rs"]
+mod recovery_tests;
 
 #[derive(Debug)]
 pub struct PrepareOptions {
@@ -207,6 +212,15 @@ async fn prepare_asset(
     asset: &Asset,
     client: Option<&reqwest::Client>,
 ) -> Result<PathBuf> {
+    prepare_asset_with_budget(options, asset, client, DOWNLOAD_TIMEOUT).await
+}
+
+async fn prepare_asset_with_budget(
+    options: &PrepareOptions,
+    asset: &Asset,
+    client: Option<&reqwest::Client>,
+    download_budget: Duration,
+) -> Result<PathBuf> {
     let directory =
         Directory::open(&options.bundle_dir, true, true).context("open bundle cache directory")?;
     let lock = directory
@@ -268,9 +282,15 @@ async fn prepare_asset(
     } else {
         let default_client = reqwest::Client::builder()
             .https_only(true)
-            .timeout(Duration::from_secs(120))
+            .timeout(DOWNLOAD_TIMEOUT)
             .build()?;
-        download(client.unwrap_or(&default_client), asset, &mut staging).await?;
+        download(
+            client.unwrap_or(&default_client),
+            asset,
+            &mut staging,
+            download_budget,
+        )
+        .await?;
     }
     seal_private(&staging, false)?;
     staging.sync_all()?;
@@ -298,28 +318,55 @@ async fn prepare_asset(
     Ok(destination)
 }
 
-async fn download(client: &reqwest::Client, asset: &Asset, output: &mut File) -> Result<()> {
-    let mut response = client.get(&asset.url).send().await?.error_for_status()?;
-    ensure!(
-        response
-            .content_length()
-            .is_none_or(|size| size == asset.compressed_bytes),
-        "bundle archive size mismatch"
-    );
-    let mut size = 0_u64;
-    let mut digest = Sha256::new();
-    while let Some(chunk) = response.chunk().await? {
-        size += chunk.len() as u64;
+async fn download(
+    client: &reqwest::Client,
+    asset: &Asset,
+    output: &mut File,
+    budget: Duration,
+) -> Result<()> {
+    tokio::time::timeout(budget, async {
+        let delays = [Duration::from_millis(250), Duration::from_secs(1)];
+        let mut attempt = 0;
+        let mut response = loop {
+            let response = client.get(&asset.url).send().await?;
+            if attempt < delays.len()
+                && matches!(response.status().as_u16(), 500 | 502 | 503 | 504)
+                && !response
+                    .headers()
+                    .contains_key(reqwest::header::RETRY_AFTER)
+            {
+                // No error-body bytes enter staging, and no response or worker
+                // survives cancellation during the bounded backoff.
+                drop(response);
+                tokio::time::sleep(delays[attempt]).await;
+                attempt += 1;
+                continue;
+            }
+            break response.error_for_status()?;
+        };
         ensure!(
-            size <= asset.compressed_bytes,
-            "bundle archive exceeds pinned size"
+            response
+                .content_length()
+                .is_none_or(|size| size == asset.compressed_bytes),
+            "bundle archive size mismatch"
         );
-        digest.update(&chunk);
-        // Synchronous bounded chunk writes have no worker that can outlive the
-        // staging file or lock when the surrounding download future is cancelled.
-        output.write_all(&chunk)?;
-    }
-    verify_digest(size, &digest.finalize(), asset)
+        let mut size = 0_u64;
+        let mut digest = Sha256::new();
+        while let Some(chunk) = response.chunk().await? {
+            size += chunk.len() as u64;
+            ensure!(
+                size <= asset.compressed_bytes,
+                "bundle archive exceeds pinned size"
+            );
+            digest.update(&chunk);
+            // Synchronous bounded chunk writes have no worker that can outlive
+            // staging or lock when the surrounding future is cancelled.
+            output.write_all(&chunk)?;
+        }
+        verify_digest(size, &digest.finalize(), asset)
+    })
+    .await
+    .context("bundle archive download timed out")?
 }
 
 fn verify_digest(size: u64, digest: &[u8], asset: &Asset) -> Result<()> {
@@ -473,7 +520,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn asset(bytes: &[u8]) -> Asset {
+    pub(super) fn asset(bytes: &[u8]) -> Asset {
         Asset {
             target: "test-target".into(),
             stem: "dolt-fixture".into(),
@@ -489,7 +536,7 @@ mod tests {
             license_sha256: "b".repeat(64),
         }
     }
-    fn options(path: &Path) -> PrepareOptions {
+    pub(super) fn options(path: &Path) -> PrepareOptions {
         PrepareOptions {
             manifest: path.join("unused-manifest"),
             target: "test-target".into(),
@@ -498,7 +545,7 @@ mod tests {
             offline: false,
         }
     }
-    fn assert_clean(path: &Path) {
+    pub(super) fn assert_clean(path: &Path) {
         let names: Vec<_> = fs::read_dir(path)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -510,6 +557,68 @@ mod tests {
             .open(path.join(LOCK_NAME))
             .unwrap();
         lock.try_lock().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_http_500_repeats_the_same_get_and_publishes_verified_bytes() {
+        let expected = b"verified immutable archive";
+        let root = tempfile::tempdir().unwrap();
+        let options = options(root.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut asset = asset(expected);
+        asset.url = format!(
+            "http://{}/immutable.archive",
+            listener.local_addr().unwrap()
+        );
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                for (status, body) in [
+                    (500, b"untrusted transient error body".as_slice()),
+                    (200, expected.as_slice()),
+                ] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.unwrap());
+                        assert!(request.len() < 8192);
+                    }
+                    observed.lock().unwrap().push(request);
+                    let mut response = format!(
+                        "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(body);
+                    let _ = socket.write_all(&response).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            prepare_asset(&options, &asset, Some(&client)),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        let published = result.unwrap().expect("recover the transient HTTP 500");
+        assert_eq!(fs::read(&published).unwrap(), expected);
+        assert_eq!(
+            published.file_name().unwrap(),
+            OsStr::new(&format!("{}.archive", asset.archive_sha256))
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert!(requests[0].starts_with(b"GET /immutable.archive HTTP/1.1\r\n"));
     }
 
     #[tokio::test]
