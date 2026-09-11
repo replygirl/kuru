@@ -11,7 +11,7 @@ description = "Install only the package's pinned behavioral fixture tools"
 run = "mise install aqua:cocogitto/cocogitto@{{vars.kuru_cocogitto_version}} github:jdx/communique@{{vars.kuru_communique_version}}"
 
 [tasks."coverage:workspace"]
-depends = ["//packages/kuru-memory:prefetch", "//packages/kuru-memory:bundle:test-fixtures"]
+depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]
 description = "Combine all package coverage with the delivery fixture toolchain"
 dir = "{{config_root}}/../.."
 tools."aqua:cocogitto/cocogitto" = "{{vars.kuru_cocogitto_version}}"

@@ -1,0 +1,9 @@
+## 1. Cold instrumented execution [critical]
+
+- [x] 1.1 @integration (agent) Resolve the actual pinned mise coverage and ordinary-test graphs -> twelve mise 2026.9.4 graph/info/dry-run queries passed. Coverage emits two delivery archive-preparation commands and one llvm-cov command, without an ordinary memory build/prefetch; its snapshot opt-in remains explicitly unset even when inherited as 1. Ordinary app/memory/runtime tests retain shared prefetch and snapshot=1. Windows-target dry-run was on macOS, not native execution. Evidence: `/tmp/kuru-coverage-input-graph-review.md` and `/tmp/kuru-coverage-input-graphs/`.
+- [ ] 1.2 @runtime (agent) Run the normal pre-push on macOS arm64 with a new private KURU_DOLT_CACHE -> the instrumented workspace performs real cold extraction/startup and durable SQL/reopen, all independent hooks pass, and measured line coverage remains at least 90% without an ordinary supervisor fallback.
+- [ ] 1.3 @runtime (agent) Run the actual GitHub-hosted Ubuntu, macOS and Windows native workflows on the changed task graph -> cold engine startup, native behavior, source installation and installed offline runtime pass, required aggregation stays enforced and observed preparation/total times are reported without claiming a controlled benchmark.
+
+## 2. Workflow and instruction consistency
+
+- [x] 2.1 @integration (agent) Run relevant format, tooling, strict cospec/managed and docs checks and review the resulting diff -> the concurrent relevant gate passed in 4.63 seconds, including docs build/content/links. Independent diff review found only the declared prerequisite and documentation edits; native jobs, thresholds, scoped tools and publication order are intact. Evidence: `/tmp/kuru-coverage-input-static.log` and `/tmp/kuru-coverage-input-graph-review.md`.

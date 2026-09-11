@@ -163,9 +163,11 @@ snapshot: concurrent Cargo commands can replace their top-level executable
 aliases while another package's tests are running. Keep this preparation in the
 owning mise task. Combined coverage must use its own instrumented supervisor,
 with the ordinary snapshot opt-in explicitly cleared; never substitute an
-uninstrumented executable to make a coverage run pass. Independent checks may
-overlap, but do not start competing coverage writers or duplicate live test
-suites. Preserve package-owned preparation and Cargo's artifact locking.
+uninstrumented executable to make a coverage run pass. Its prerequisites prepare
+only verified bundle inputs; the instrumented fixtures provision their engine
+cache, without first compiling or snapshotting an ordinary supervisor. Independent
+checks may overlap, but do not start competing coverage writers or duplicate live
+test suites. Preserve package-owned preparation and Cargo's artifact locking.
 
 Use conventional commits. Never bypass hk hooks. Do not commit directly to
 main; use a branch and review. Publishing and release tags are external actions

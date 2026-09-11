@@ -109,6 +109,13 @@ run already executes the behavioral tests, so neither CI nor hk first runs a
 duplicate ordinary suite. Keep only one coverage writer active per target
 directory, and preserve the instrumented child fixtures.
 
+Coverage prepares the verified engine archives and uses the supervisor from its
+single instrumented workspace build. Its fixtures initialize the engine cache
+when needed. Ordinary package tests still prepare a private supervisor snapshot
+before they run, so concurrent Cargo builds cannot replace their executable.
+Coverage explicitly clears that snapshot opt-in and does not compile an unused
+ordinary supervisor first.
+
 Coverage includes the application and all packages. Do not exclude hard-to-test
 runtime paths or add tautological assertions to inflate the score. Favor tests
 that observe peer routing, context isolation, persistence, bounded failure,

@@ -135,9 +135,10 @@ tool installation from extending lockfiles after source validation. The bump
 and publish jobs explicitly install locked Rust/hk and disable automatic task-tool
 installation. Native build jobs install only Rust and set `MISE_NO_HOOKS=1` to
 omit mise's repository-setup postinstall hook; hk 1.58.1 has no Intel macOS asset,
-and archive construction does not create Git commits. Git hooks and full
-validation retain hk. These native subcommands do not need the notes toolchain.
-Validation, notes and docs jobs retain their package setup, with frozen locks.
+and archive construction does not create Git commits. Local Git hooks and the
+release bump, publish, notes and docs jobs retain hk. Native archive subcommands
+do not need the notes toolchain. Reusable quality and native-test workflows skip
+hook setup and install only their scoped tools, with frozen locks.
 Version preparation checks for tracked setup changes before stamping, and
 the commit guard permits only Cargo.toml and Cargo.lock changes. An unexpected
 file is reported by name and must be fixed in source rather than reset or included
