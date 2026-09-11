@@ -863,3 +863,63 @@ Independent review found no remaining material issue after replacing the native
 test's unsupported whole-digest uppercase formatting with byte-wise formatting
 compatible with the pinned SHA-2 output type. The actual hash and assertions
 are unchanged. Review: `/tmp/kuru-powershell-correction-independent-review.md`.
+
+## Hosted 662ce90 and discriminating shell observations
+
+[CI 34569009783](https://github.com/replygirl/kuru/actions/runs/34569009783)
+finished with 400 full-Windows cases passed, two failed and one intentionally
+ignored benchmark. The actual merge checkout `e48b2af1e323bfdb12f2810cae7e012856ff3770`
+has tree `4945d9b468ec0c37e5dccc79343fe113b5973f71`, identical to branch 662ce90.
+All five ConPTY cases, both full-app updates with ordinary app/helper profiles,
+both source-entrypoint regressions, actual mise installation, 62 memory,
+44 runtime, 12 bootstrap and ten updater cases passed. Windows primitives
+passed 54 cases at 2602/2865 lines (90.820244%). All static and four Unix jobs
+passed; Ubuntu measured 14462/14889 lines (97.132111%) and macOS arm64
+14473/14900 (97.134228%). All four Unix packaged offline checks passed.
+
+The ordinary CLI shell again timed out at the unchanged 30-second deadline:
+neither capture contained bytes or EOF, whole-tree status was unavailable, and
+owned-tree termination succeeded. This does not distinguish a running root
+from a live descendant or establish whether the controlled source executed.
+The new module-path regression failed earlier in its own control: stock
+PowerShell successfully found the cmdlet despite the empty search directory.
+Its positive Kuru assertions were not reached. Full Windows coverage generation,
+source installation, offline Cargo, shipping-runtime and PE checks were skipped;
+the final aggregate failed. Exact evidence: `/tmp/kuru-windows-662ce90-results.md`
+and `/tmp/kuru-ci-662ce90-results.md`.
+
+Correct the module fixture with a discoverable manifest advertising the actual
+`Get-FileHash` command but requiring PowerShell 7. No fake cmdlet implementation
+or separately installed shell is involved. Microsoft's published engine source
+explicitly retains a system-directory fallback for 5.1 command discovery; an
+empty directory therefore cannot demonstrate incompatible module shadowing.
+Require the real autoload/import failure in the direct unsanitized control and
+retain the positive independent hash, Unicode sentinel, file identity and bytes.
+The source-supported fixture still requires actual native execution.
+Investigation: `/tmp/kuru-powershell-control-662-investigation.md`.
+
+The shell timeout has no demonstrated repair yet. On its existing error path,
+query the already-owned root through a wait/query-only duplicate with a zero
+timeout before the unchanged tree cleanup. Report root running/exited/query
+error independently of whole-tree state, without reopening a numeric PID or
+printing environment/arguments. In the existing real CLI fixture, place tiny
+private file markers around its original Console.Write, without replacing it,
+retrying it or changing its budget. Read only bounded fixture-owned marker
+contents after the child returns. Exact successful stdout, stderr and status
+remain required; markers distinguish observed source entry/completion but do
+not prove pipe delivery or identify an unobserved startup cause. Investigation:
+`/tmp/kuru-shell-662-investigation.md`.
+
+- [ ] 14.1 @regression (agent) Run the corrected native incompatible-manifest control and actual Kuru shell -> direct stock autoload fails for the named command/module; Kuru returns the independent SHA-256 and unrelated sentinel with unchanged file bytes/identity and no extra output.
+- [ ] 14.2 @integration (agent) Run the ordinary real CLI shell with private source-entry/completion markers and root-state diagnostics -> success requires exact output/status plus actual markers; any failure retains bounded independent observations without retries, extended deadlines or altered ownership. A passing intermittent case alone is not a causal repair claim.
+
+The corrected manifest, bounded source markers and retained-root observation are
+implemented. The focused host CLI case passed with exact parsed output/status
+assertions in 1.41 seconds (14.70 seconds including package-owned preparation
+and compilation). Formatting and strict cospec validation passed. Independent
+review found no blocking source issue and explicitly retains the scheduling
+limits of marker instrumentation; actual native typing/execution is pending.
+Evidence: `/tmp/kuru-shell-observation-cli-test.log`,
+`/tmp/kuru-shell-observation-format.log`,
+`/tmp/kuru-shell-observation-final-validate.log` and
+`/tmp/kuru-shell-observation-independent-review.md`.

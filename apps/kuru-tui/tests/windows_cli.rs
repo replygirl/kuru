@@ -46,6 +46,22 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     for directory in [&project, &modules, &root.path().join("tools")] {
         fs::create_dir(directory).unwrap();
     }
+    let incompatible = modules.join("Microsoft.PowerShell.Utility");
+    fs::create_dir(&incompatible).unwrap();
+    // Discovery reads these explicit exports before import checks the minimum
+    // engine version. No cmdlet, script module or DLL implements the command.
+    fs::write(
+        incompatible.join("Microsoft.PowerShell.Utility.psd1"),
+        r#"@{
+    ModuleVersion = '7.0.0.0'
+    PowerShellVersion = '7.0'
+    CmdletsToExport = @('Get-FileHash')
+    FunctionsToExport = @()
+    AliasesToExport = @()
+}
+"#,
+    )
+    .unwrap();
     let input = project.join("hash input 日本語.bin");
     let bytes = b"real stock PowerShell file hashing\0\xff\n";
     fs::write(&input, bytes).unwrap();
@@ -61,8 +77,8 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
     let child = |binary: &Path| {
         let mut child = command(root.path(), binary);
         child
-            // Without PSHOME in this inherited path, stock PowerShell retains
-            // it as-is. An empty lookup directory makes Get-FileHash unavailable.
+            // This incompatible manifest precedes the system-module fallback
+            // that lets stock 5.1 find commands through an empty module path.
             // Mixed casing exercises Windows environment-key comparison.
             .env("pSmOdUlEpAtH", &modules)
             .env("KURU_HASH_INPUT", &input)
@@ -85,10 +101,22 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
         .output()
         .unwrap();
     let diagnostic = String::from_utf8_lossy(&control.stderr);
-    assert!(!control.status.success(), "unsanitized control must fail");
+    let preview =
+        |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
     assert!(
-        diagnostic.contains("Get-FileHash") && diagnostic.contains("CommandNotFoundException"),
-        "control must reach the unavailable cmdlet: {diagnostic}"
+        !control.status.success(),
+        "unsanitized control must fail: status={} stdout={:?} stderr={:?}",
+        control.status,
+        preview(&control.stdout),
+        preview(&control.stderr)
+    );
+    assert!(
+        diagnostic.contains("Get-FileHash")
+            && diagnostic.contains("CommandNotFoundException")
+            && diagnostic.contains("CouldNotAutoloadMatchingModule")
+            && diagnostic.contains("Microsoft.PowerShell.Utility"),
+        "control must reach the incompatible module's autoload failure: {:?}",
+        preview(&control.stderr)
     );
     assert!(control.stdout.is_empty());
 

@@ -429,7 +429,7 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
 async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String> {
     use base64::Engine;
     use kuru_platform::windows::process::{
-        Stdio, configured_command, environment_key_eq, system_directory,
+        Stdio, configured_command, environment_key_eq, system_directory, wait_process_handle,
     };
     ensure!(!command.trim().is_empty(), "shell command is empty");
     // This is deliberately authorized PowerShell source, not command argv.
@@ -492,13 +492,23 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
     let result = match result {
         Ok(status) => Ok(status),
         Err(error) => {
+            // Query the retained root separately from whole-Job quiescence;
+            // observation failure must never prevent the existing cleanup.
+            let root_state = match child.duplicate_process_handle() {
+                Ok(process) => match wait_process_handle(&process, Duration::ZERO).await {
+                    Ok(()) => "exited",
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => "running",
+                    Err(_) => "query-error",
+                },
+                Err(_) => "query-error",
+            };
             let observed = child.try_wait();
             let stopped = match crate::process::stop(&mut child).await {
                 Ok(()) => "subprocess tree terminated".to_owned(),
                 Err(error) => format!("subprocess cleanup unconfirmed: {error:#}"),
             };
             let diagnostic = format!(
-                "{error:#}; {phase}; stdout {} bytes (EOF {}); stderr {} bytes (EOF {}); tree before cleanup: {observed:?}; {stopped}; stderr prefix: {}",
+                "{error:#}; {phase}; stdout {} bytes (EOF {}); stderr {} bytes (EOF {}); root before cleanup: {root_state}; tree before cleanup: {observed:?}; {stopped}; stderr prefix: {}",
                 out.bytes.len(),
                 out.eof,
                 err.bytes.len(),

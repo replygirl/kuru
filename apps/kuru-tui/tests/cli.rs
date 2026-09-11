@@ -97,7 +97,7 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
     let env = Sandbox::new();
     let tools: Value = serde_json::from_str(&env.success(&["tools"])).unwrap();
     let shell_args = if cfg!(windows) {
-        r#"{"command":"[Console]::Write('shell-ok')"}"#
+        r#"{"command":"[IO.File]::WriteAllText('shell-entered', 'entered'); [Console]::Write('shell-ok'); [IO.File]::WriteAllText('shell-completed', 'completed')"}"#
     } else {
         r#"{"command":"printf shell-ok"}"#
     };
@@ -140,10 +140,44 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
             .status
             .success()
     );
-    assert!(
-        env.success(&["--allow-shell", "tool", "shell", "--args", shell_args])
-            .contains("shell-ok")
+    // A denied request must not reach the controlled shell source.
+    #[cfg(windows)]
+    for name in ["shell-entered", "shell-completed"] {
+        assert!(!env.project.join(name).exists());
+    }
+    let output = env.run(&["--allow-shell", "tool", "shell", "--args", shell_args]);
+    // Observe only this fixture's bounded markers after the actual CLI returns.
+    // They distinguish source progress from captured pipe output, without a
+    // second shell invocation or changing the original Console.Write call.
+    #[cfg(windows)]
+    let markers = ["shell-entered", "shell-completed"].map(|name| {
+        use std::io::Read;
+        std::fs::File::open(env.project.join(name)).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(32).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+    });
+    let diagnostic = format!(
+        "status {}; stdout {:?}; stderr {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(4096)]),
+        String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(4096)]),
     );
+    #[cfg(windows)]
+    let diagnostic = format!("{diagnostic}; source entry/completion markers: {markers:?}");
+    assert!(output.status.success(), "{diagnostic}");
+    assert!(output.stderr.is_empty(), "{diagnostic}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["success"], true, "{diagnostic}");
+    assert_eq!(result["exit_code"], 0, "{diagnostic}");
+    assert_eq!(result["stdout"], "shell-ok", "{diagnostic}");
+    assert_eq!(result["stderr"], "", "{diagnostic}");
+    #[cfg(windows)]
+    {
+        assert_eq!(markers[0].as_deref().unwrap(), b"entered");
+        assert_eq!(markers[1].as_deref().unwrap(), b"completed");
+    }
     assert!(
         !env.run(&["tool", "file_read", "--args", "bad-json"])
             .status
