@@ -74,6 +74,11 @@ jobs:
         run: mise run coverage
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-attempt-${{ github.run_attempt }}
+          path: target/coverage.lcov
+          if-no-files-found: error
       - name: Source install smoke
         if: inputs.install && runner.os != 'Windows'
         env:
@@ -110,8 +115,3 @@ jobs:
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-bin/kuru.exe
         run: mise run //apps/kuru-tui:verify:windows-imports
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ inputs.artifact-prefix }}-coverage-${{ inputs.os }}-attempt-${{ github.run_attempt }}
-          path: target/coverage.lcov
-          if-no-files-found: error

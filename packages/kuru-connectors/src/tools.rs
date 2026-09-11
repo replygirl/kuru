@@ -428,7 +428,9 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
 #[cfg(windows)]
 async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String> {
     use base64::Engine;
-    use kuru_platform::windows::process::{Stdio, configured_command, system_directory};
+    use kuru_platform::windows::process::{
+        Stdio, configured_command, environment_key_eq, system_directory,
+    };
     ensure!(!command.trim().is_empty(), "shell command is empty");
     // This is deliberately authorized PowerShell source, not command argv.
     // Stock Windows PowerShell accepts UTF-16LE source; its actual exit status
@@ -459,12 +461,13 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
     // Use the same identity-checked launch spelling as other configured native
     // commands. PowerShell's .NET file APIs cannot use an introduced verbatim cwd.
     let program = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
-    let mut spec = configured_command(
-        program.as_os_str(),
-        &args,
-        root,
-        std::env::vars_os().collect(),
-    )?;
+    // This owned stock-shell launch must reconstruct its own module paths: a
+    // PowerShell 7 parent can otherwise leave incompatible modules through Kuru.
+    // Generic configured commands retain their caller's deliberate environment.
+    let environment = std::env::vars_os()
+        .filter(|(key, _)| !environment_key_eq(key, std::ffi::OsStr::new("PSModulePath")))
+        .collect();
+    let mut spec = configured_command(program.as_os_str(), &args, root, environment)?;
     spec.stdout = Stdio::Pipe;
     spec.stderr = Stdio::Pipe;
     let mut child = spec

@@ -717,7 +717,7 @@ PowerShell/compiled-command fixtures will observe the actual entrypoint with
 absent and opposing settings. This is separate from the still-running c52fa62
 native update experiment; no passing execution is inferred for the correction.
 
-- [ ] 11.1 @regression (agent) Invoke the real source entrypoint under native PowerShell with absent and opposing mise settings and controlled success/failure of its compiled command fixture -> the first mise invocation observes explicit lean setup, argument/destination semantics remain correct, errors propagate and caller environment is restored.
+- [x] 11.1 @regression (agent) Invoke the real source entrypoint under native PowerShell with absent and opposing mise settings and controlled success/failure of its compiled command fixture -> both native entrypoint cases passed on 87271ce, including all four environment/status combinations and invalid-option rejection; actual source compilation/installation passed separately in the same run.
 
 The same manual review found one small command-table error: `format:fix` also
 formats the documentation app. The development guide now states its complete
@@ -750,7 +750,7 @@ retain native byte/cursor diagnostics without changing its 450 ms quiet interval
 or 700 ms animation observations. Actual native acceptance is still required.
 
 - [x] 12.1 @regression (agent) Exercise the real dispatch boundary with focus loss, typed press/repeat and trailing releases, including command keys -> the focused host regression passed against the dispatcher used by the real loop, proving editing/command/release behavior and overdue focus/cadence handling; independent source review confirms other pending redraw causes are retained.
-- [ ] 12.2 @integration (agent) Run the actual native ConPTY scenario with bounded escaped late-output diagnostics -> the existing completed-composer, focus-loss quiescence, focus-return animation and later selector/persistence assertions pass without waiting for silence or weakening deadlines.
+- [x] 12.2 @integration (agent) Run the actual native ConPTY scenario with bounded escaped late-output diagnostics -> the entire combined ConPTY case passed on 87271ce, including unchanged focus-loss quiescence, resumed animation, later selectors/resize/persistence and reopened reduced-motion assertions; all five native terminal cases passed.
 
 The focused host regression passed in 1.11 seconds (22.07 seconds including
 prepared memory and compilation). Formatting and strict cospec validation passed.
@@ -782,3 +782,84 @@ skipped. The separately passing Windows primitive gate measured 2602/2865 lines
 install/update checks. The source-entrypoint correction was not in this tree.
 No release or Pages deployment occurred. Exact results and limitations:
 `/tmp/kuru-windows-c52fa62-results.md` and `/tmp/kuru-ci-c52fa62-results.md`.
+
+## Stock PowerShell task activation after 87271ce
+
+The native instrumented suite, coverage gate and actual source installation
+passed in CI 34565545466. The following offline Cargo-input check failed before
+its first hash: stock Windows PowerShell reported `Get-FileHash` unavailable.
+The job was launched by PowerShell 7 through mise. Microsoft's documented
+[cross-edition module-path behavior](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_psmodulepath?view=powershell-7.6#starting-windows-powershell-from-powershell-7)
+matches this launch chain and error: an intermediate executable preserves the
+PowerShell 7 module path that a directly launched 5.1 child would have removed.
+The log establishes the missing command; it did not print the inherited module
+path, so that causal link remains an inference pending the corrected native run.
+
+Remove only inherited `PSModulePath` in each package-owned mise task that
+explicitly selects stock Windows PowerShell: source installation, offline
+Cargo-input verification and shipping PE inspection. The child can reconstruct
+its own standard module paths. Preserve configured user shell/MCP environments,
+all archive/hash/identity assertions, target settings and runtime dependencies.
+No custom hash implementation or separately installed shell is needed.
+Upload the existing coverage artifact immediately after the successful coverage
+and lock checks, so a later shipping-check failure cannot discard that evidence.
+All installation/PE steps and the required aggregate still must pass.
+
+Independent review found the same concrete inheritance chain in the built-in
+Windows shell tool: it deliberately launches stock PowerShell while forwarding
+the complete Kuru environment. Apply the same single-key removal at that owned
+launch site, using native case-insensitive key comparison. Keep generic
+configured commands, explicit MCP/provider environments and unrelated inherited
+values intact. A native child-process regression must supply an incompatible
+module path without mutating the test runner environment, then execute a real
+stock cmdlet through Kuru and verify its result plus unrelated environment
+preservation. This source exposure is not an observed failure of the passing
+87271ce shell cases.
+
+- [ ] 13.1 @integration (agent) Run the stock PowerShell mise tasks through the native hosted PowerShell 7 launcher after scoped module-path removal -> real source installation, missing/corrupt/valid offline Cargo controls, installed offline runtime and Kuru/Dolt PE inspection pass; checksums and exact old-byte preservation remain required.
+- [ ] 13.2 @regression (agent) Invoke Kuru's built-in Windows shell with an incompatible inherited module path in an isolated child -> actual stock cmdlet output and unrelated inherited values survive, while a direct unsanitized control demonstrates the unavailable command; configured command/MCP environment behavior stays unchanged.
+
+The completed log is `/tmp/kuru-windows-87271ce-full.log`; the failure appears
+at 05:52:59Z after successful release compilation and `kuru 0.1.0` execution.
+The final CI aggregate failed. Shipping-runtime/PE verification and coverage
+artifact upload were skipped; this is not full native acceptance.
+
+The completed Windows report records 401 passed, zero failed and one intentionally
+ignored timing benchmark across 59 result rows. All 62 memory, 44 runtime,
+12 stock PowerShell bootstrap and ten updater cases passed. Both ordinary
+full-app updates passed with unchanged timeouts; the packaged test observed
+nonempty profiles from the distinct normal app/helper pair. The suite took
+1520.91 seconds and preparation/suite graph 1634.90 seconds. The successful
+coverage command enforced `--fail-under-lines 90`, but its exact full Windows
+percentage is unavailable because the later failure skipped artifact upload.
+The separate primitive gate passed 54 cases at 2602/2865 lines (90.820244%).
+
+All static jobs, PR Title and all four Unix application jobs passed. Ubuntu
+measured 14462/14889 lines (97.132111%) and macOS arm64 14472/14900 (97.127517%);
+both source installations and shipping offline install/update checks passed.
+Linux arm64 and Intel macOS passed 74/75 real memory cases and their actual
+release-built packaged checks. The actual checkout was merge commit
+`1acc447e6cddc920c453540a7113cfc79590aedf`, whose complete tree
+`143c2a180e94b028e33bab82e386605b05355bdc` matches branch 87271ce.
+Exact counts, artifact sizes, timings and limitations are retained in
+`/tmp/kuru-windows-87271ce-results.md` and `/tmp/kuru-ci-87271ce-results.md`.
+No release or Pages publication occurred.
+
+The scoped module-path corrections and native regression are implemented.
+The regression uses a real unsanitized stock PowerShell failure control, then
+requires Kuru to return a file's independently calculated SHA-256 and an unrelated
+Unicode environment value without changing file bytes or identity. Formatting,
+strict host connector Clippy, repository/workflow validation and strict cospec
+validation passed. The first sandboxed formatter attempt could not access the
+macOS system-configuration service; the approved normal check passed. Host
+checks do not typecheck or execute the Windows-only regression. Native
+verification 13.1 and 13.2 remain pending. Evidence:
+`/tmp/kuru-powershell-shell-correction.md`,
+`/tmp/kuru-powershell-correction-clippy.log`,
+`/tmp/kuru-powershell-task-tooling.log` and
+`/tmp/kuru-powershell-correction-final-validate.log`.
+
+Independent review found no remaining material issue after replacing the native
+test's unsupported whole-digest uppercase formatting with byte-wise formatting
+compatible with the pinned SHA-2 output type. The actual hash and assertions
+are unchanged. Review: `/tmp/kuru-powershell-correction-independent-review.md`.

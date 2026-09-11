@@ -40,6 +40,8 @@ depends = [{ task = "bundle:prepare", args = ["--target", "x86_64-pc-windows-msv
 
 [tasks."bundle:verify-native-build"]
 description = "Verify actual offline Windows Cargo rejection of missing/corrupt prepared inputs after source installation"
+# Let stock PowerShell reconstruct its module paths when mise was launched by pwsh.
+env.PSModulePath = false
 env.CARGO_BUILD_TARGET = false
 env.CARGO_NET_OFFLINE = "true"
 env.KURU_DOLT_BUNDLE_OFFLINE = "true"

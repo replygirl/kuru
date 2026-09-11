@@ -84,6 +84,11 @@ trusted or executed. Use only stock PowerShell/.NET facilities; add no separate
 compiler installation, language project or downloaded runtime. Native bootstrap
 tests must exercise that bridge. This exception does not relax Rust consumer
 unsafe-code rules or create an alternative application platform implementation.
+Owned launches that explicitly select stock Windows PowerShell must remove an
+inherited `PSModulePath` before startup, allowing that edition to reconstruct its
+standard module paths. A PowerShell 7 parent can otherwise break stock cmdlet
+autoloading through mise or Rust. Keep this policy at the owned launch sites;
+do not strip deliberate module settings from generic configured commands or MCPs.
 
 Portability and bundled runtime dependencies are product requirements. Installing
 Kuru must be sufficient to run it: ship required native runtime engines and their

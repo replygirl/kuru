@@ -2,6 +2,7 @@
 
 use kuru_delivery::command::BlockingCommand as Command;
 use kuru_platform::fs::regular_file_info;
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     path::Path,
@@ -34,6 +35,91 @@ fn success(command: &mut Command) {
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("workspace 日本語");
+    let modules = root.path().join("incompatible modules");
+    for directory in [&project, &modules, &root.path().join("tools")] {
+        fs::create_dir(directory).unwrap();
+    }
+    let input = project.join("hash input 日本語.bin");
+    let bytes = b"real stock PowerShell file hashing\0\xff\n";
+    fs::write(&input, bytes).unwrap();
+    let identity = regular_file_info(&File::open(&input).unwrap())
+        .unwrap()
+        .identity;
+    let sentinel = "retained & literal 日本語";
+    let source = r#"$ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'expected stock PowerShell 5.1' }
+$hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
+[Console]::Write($hash + '|' + $env:KURU_SHELL_SENTINEL)
+"#;
+    let child = |binary: &Path| {
+        let mut child = command(root.path(), binary);
+        child
+            // Without PSHOME in this inherited path, stock PowerShell retains
+            // it as-is. An empty lookup directory makes Get-FileHash unavailable.
+            // Mixed casing exercises Windows environment-key comparison.
+            .env("pSmOdUlEpAtH", &modules)
+            .env("KURU_HASH_INPUT", &input)
+            .env("KURU_SHELL_SENTINEL", sentinel);
+        child
+    };
+    let powershell = kuru_platform::windows::process::system_directory()
+        .unwrap()
+        .join("WindowsPowerShell/v1.0/powershell.exe");
+    let control = child(&powershell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-OutputFormat",
+            "Text",
+            "-Command",
+            source,
+        ])
+        .output()
+        .unwrap();
+    let diagnostic = String::from_utf8_lossy(&control.stderr);
+    assert!(!control.status.success(), "unsanitized control must fail");
+    assert!(
+        diagnostic.contains("Get-FileHash") && diagnostic.contains("CommandNotFoundException"),
+        "control must reach the unavailable cmdlet: {diagnostic}"
+    );
+    assert!(control.stdout.is_empty());
+
+    let arguments = serde_json::json!({ "command": source }).to_string();
+    let output = child(Path::new(env!("CARGO_BIN_EXE_kuru")))
+        .arg("-C")
+        .arg(&project)
+        .args(["--allow-shell", "tool", "shell", "--args", &arguments])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["success"], true);
+    let digest: String = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect();
+    assert_eq!(result["stdout"], format!("{digest}|{sentinel}"));
+    assert_eq!(result["stderr"], "");
+    assert_eq!(fs::read(&input).unwrap(), bytes);
+    assert_eq!(
+        regular_file_info(&File::open(&input).unwrap())
+            .unwrap()
+            .identity,
+        identity
     );
 }
 

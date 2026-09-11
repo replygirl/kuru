@@ -49,6 +49,8 @@ depends = ["//packages/kuru-memory:bundle:prepare"]
 run = "cargo run -p kuru --locked --"
 
 [tasks.install]
+# These owned scripts use stock PowerShell modules, not an inherited pwsh module path.
+env.PSModulePath = false
 run = "bash ../../scripts/install.sh --source"
 run_windows = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/install-source.ps1"
 
@@ -59,6 +61,7 @@ run = "cargo test -p kuru --test embedded_runtime --all-features --locked -- --n
 
 [tasks."verify:windows-imports"]
 description = "Inspect the shipping Windows executable and its embedded Dolt for external DLL requirements"
+env.PSModulePath = false
 run = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/verify-windows-imports.ps1"
 [env]
 RUST_TEST_THREADS = "2"
