@@ -261,11 +261,6 @@ async fn read_bounded_output(
         .take((OUTPUT_LIMIT + 1).saturating_sub(bytes.len()) as u64)
         .read_to_end(bytes)
         .await?;
-    let _ = label;
-    Ok(())
-}
-
-fn check_output_limit(bytes: &[u8], label: &str) -> std::io::Result<()> {
     if bytes.len() > OUTPUT_LIMIT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -284,13 +279,12 @@ async fn capture_native_output(
     timeout: Duration,
 ) -> Result<(), String> {
     let capture = tokio::time::timeout(timeout, async {
-        // Negative control: preserve the old post-join limit check ordering.
+        // Reject an overflowing stream immediately; waiting for the other EOF
+        // can deadlock against a child still writing to the overflowing pipe.
         tokio::try_join!(
             read_bounded_output(stdout, out, "stdout"),
             read_bounded_output(stderr, err, "stderr")
-        )?;
-        check_output_limit(out, "stdout")?;
-        check_output_limit(err, "stderr")
+        )
     })
     .await;
     let failure = match capture {
@@ -381,29 +375,31 @@ async fn stalled_capture_preserves_partial_output_and_reaps_before_returning() {
     let process = child.duplicate_process_handle().unwrap();
     let mut stdout = child.take_stdout().unwrap();
     let mut stderr = child.take_stderr().unwrap();
-    let mut out = vec![0; b"fixture stdout\n".len()];
-    let mut err = vec![0; b"fixture stderr\n".len()];
-    // Synchronize with real output so the short capture deadline cannot be
-    // satisfied by a failure to start the fixture in the first place.
+    let mut out = vec![0; 1];
+    let mut err = vec![0; 1];
+    // Synchronize with each stream, leaving the rest for capture to retain
+    // when its deadline cancels the readers.
     tokio::time::timeout(Duration::from_secs(10), async {
         tokio::try_join!(stdout.read_exact(&mut out), stderr.read_exact(&mut err))
     })
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(out, b"fixture stdout\n");
-    assert_eq!(err, b"fixture stderr\n");
+    assert_eq!(out, b"f");
+    assert_eq!(err, b"f");
     let error = capture_native_output(
         &mut child,
         &mut stdout,
         &mut stderr,
         &mut out,
         &mut err,
-        Duration::from_millis(50),
+        Duration::from_secs(1),
     )
     .await
     .unwrap_err();
     assert!(error.contains("capture timed out"), "{error}");
+    assert_eq!(out, b"fixture stdout\n");
+    assert_eq!(err, b"fixture stderr\n");
     assert!(
         error.contains("fixture stdout") && error.contains("fixture stderr"),
         "{error}"
