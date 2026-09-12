@@ -1,9 +1,10 @@
 #![cfg(all(windows, feature = "test-support"))]
 
+use kuru_platform::windows::pipe::Pipe;
 use kuru_platform::windows::process::{
-    NativeSpawnSpec, StandardStream, Stdio, configured_command, current_process_handle,
-    duplicate_inherited_process_handle, environment_key_eq, inherited_stdio, merge_environment,
-    resolve_executable, system_directory, wait_process_handle,
+    NativeChild, NativeSpawnSpec, StandardStream, Stdio, configured_command,
+    current_process_handle, duplicate_inherited_process_handle, environment_key_eq,
+    inherited_stdio, merge_environment, resolve_executable, system_directory, wait_process_handle,
 };
 use std::{
     ffi::{OsStr, OsString},
@@ -171,10 +172,6 @@ async fn command_resolution_and_representability_fail_before_execution() {
 
 #[tokio::test]
 async fn configured_stock_powershell_starts_like_direct_spawn_with_the_same_isolated_environment() {
-    compare_stock_powershell_launches(0).await;
-}
-
-async fn compare_stock_powershell_launches(attempt: usize) {
     let root = tempfile::tempdir().unwrap();
     let cwd = root.path().join("native shell 日本語");
     std::fs::create_dir(&cwd).unwrap();
@@ -219,35 +216,21 @@ async fn compare_stock_powershell_launches(attempt: usize) {
         let mut stderr = child.take_stderr().unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let capture = tokio::time::timeout(Duration::from_secs(30), async {
-            let mut limited_stdout = (&mut stdout).take(65537);
-            let mut limited_stderr = (&mut stderr).take(65537);
-            tokio::try_join!(
-                limited_stdout.read_to_end(&mut out),
-                limited_stderr.read_to_end(&mut err)
-            )
-        })
-        .await;
-        if !matches!(capture, Ok(Ok(_))) {
-            // Query the retained root separately: job quiescence also waits for
-            // descendants, which may retain output after PowerShell has exited.
-            let root = child.duplicate_process_handle().unwrap();
-            let root_exit = wait_process_handle(&root, Duration::ZERO).await;
-            let tree_exit = child.try_wait();
-            let progress = std::fs::read_to_string(&marker);
-            let termination = child.terminate();
-            let reaped = child.wait(Duration::from_secs(5)).await;
-            let closed = tokio::join!(
-                stdout.close(Duration::from_secs(5)),
-                stderr.close(Duration::from_secs(5))
-            );
+        capture_native_output(
+            &mut child,
+            &mut stdout,
+            &mut stderr,
+            &mut out,
+            &mut err,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_else(|error| {
             panic!(
-                "attempt {attempt}, {label}: capture={capture:?}; root_exit={root_exit:?}; tree_exit={tree_exit:?}; progress={progress:?}; stdout={}; stderr={}; termination={termination:?}; reaped={reaped:?}; closed={closed:?}",
-                String::from_utf8_lossy(&out),
-                String::from_utf8_lossy(&err)
-            );
-        }
-        assert!(out.len() <= 65536 && err.len() <= 65536);
+                "{label}: {error}; progress={:?}",
+                std::fs::read_to_string(&marker)
+            )
+        });
         stdout.close(Duration::from_secs(5)).await.unwrap();
         stderr.close(Duration::from_secs(5)).await.unwrap();
         let status = child.wait(Duration::from_secs(5)).await.unwrap();
@@ -265,6 +248,176 @@ async fn compare_stock_powershell_launches(attempt: usize) {
         assert_eq!(std::fs::read(&marker).unwrap(), b"reached", "{label}");
         std::fs::remove_file(&marker).unwrap();
     }
+}
+
+const OUTPUT_LIMIT: usize = 65536;
+
+async fn read_bounded_output(
+    stream: &mut Pipe,
+    bytes: &mut Vec<u8>,
+    label: &str,
+) -> std::io::Result<()> {
+    stream
+        .take((OUTPUT_LIMIT + 1).saturating_sub(bytes.len()) as u64)
+        .read_to_end(bytes)
+        .await?;
+    let _ = label;
+    Ok(())
+}
+
+fn check_output_limit(bytes: &[u8], label: &str) -> std::io::Result<()> {
+    if bytes.len() > OUTPUT_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} exceeded {OUTPUT_LIMIT} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+async fn capture_native_output(
+    child: &mut NativeChild,
+    stdout: &mut Pipe,
+    stderr: &mut Pipe,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let capture = tokio::time::timeout(timeout, async {
+        // Negative control: preserve the old post-join limit check ordering.
+        tokio::try_join!(
+            read_bounded_output(stdout, out, "stdout"),
+            read_bounded_output(stderr, err, "stderr")
+        )?;
+        check_output_limit(out, "stdout")?;
+        check_output_limit(err, "stderr")
+    })
+    .await;
+    let failure = match capture {
+        Ok(Ok(_)) => return Ok(()),
+        Ok(Err(error)) => format!("capture failed: {error}"),
+        Err(_) => "capture timed out".to_owned(),
+    };
+    // A live descendant can retain output after the root exits. Keep those
+    // states distinct, and never let a diagnostic error prevent cleanup.
+    let root_exit = match child.duplicate_process_handle() {
+        Ok(root) => wait_process_handle(&root, Duration::ZERO).await,
+        Err(error) => Err(error),
+    };
+    let tree_exit = child.try_wait();
+    let termination = child.terminate();
+    let reaped = child.wait(Duration::from_secs(5)).await;
+    let closed = tokio::join!(
+        stdout.close(Duration::from_secs(5)),
+        stderr.close(Duration::from_secs(5))
+    );
+    Err(format!(
+        "{failure}; root_exit={root_exit:?}; tree_exit={tree_exit:?}; stdout={}; stderr={}; termination={termination:?}; reaped={reaped:?}; closed={closed:?}",
+        String::from_utf8_lossy(out),
+        String::from_utf8_lossy(err)
+    ))
+}
+
+#[tokio::test]
+async fn overflowing_capture_rejects_each_stream_and_reaps_the_blocked_writer() {
+    for stream in ["stdout", "stderr"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = NativeSpawnSpec::new(
+            env!("CARGO_BIN_EXE_kuru-platform-process-fixture").into(),
+            root.path().into(),
+        );
+        spec.args = vec!["capture-flood".into(), stream.into()];
+        spec.environment = environment(root.path());
+        spec.stdout = Stdio::Pipe;
+        spec.stderr = Stdio::Pipe;
+        let mut child = spec.spawn().await.unwrap();
+        let process = child.duplicate_process_handle().unwrap();
+        let mut stdout = child.take_stdout().unwrap();
+        let mut stderr = child.take_stderr().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let error = capture_native_output(
+            &mut child,
+            &mut stdout,
+            &mut stderr,
+            &mut out,
+            &mut err,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains(&format!("{stream} exceeded {OUTPUT_LIMIT} bytes")),
+            "{error}"
+        );
+        let bytes = if stream == "stdout" { &out } else { &err };
+        assert_eq!(bytes.len(), OUTPUT_LIMIT + 1);
+        assert!(bytes.iter().all(|byte| *byte == b'x'));
+        wait_process_handle(&process, Duration::ZERO).await.unwrap();
+        assert!(child.try_wait().unwrap().is_some());
+        assert_eq!(
+            stdout.read(&mut [0]).await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            stderr.read(&mut [0]).await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+}
+
+#[tokio::test]
+async fn stalled_capture_preserves_partial_output_and_reaps_before_returning() {
+    let root = tempfile::tempdir().unwrap();
+    let mut spec = NativeSpawnSpec::new(
+        env!("CARGO_BIN_EXE_kuru-platform-process-fixture").into(),
+        root.path().into(),
+    );
+    spec.args = vec!["capture-stall".into()];
+    spec.environment = environment(root.path());
+    spec.stdout = Stdio::Pipe;
+    spec.stderr = Stdio::Pipe;
+    let mut child = spec.spawn().await.unwrap();
+    let process = child.duplicate_process_handle().unwrap();
+    let mut stdout = child.take_stdout().unwrap();
+    let mut stderr = child.take_stderr().unwrap();
+    let mut out = vec![0; b"fixture stdout\n".len()];
+    let mut err = vec![0; b"fixture stderr\n".len()];
+    // Synchronize with real output so the short capture deadline cannot be
+    // satisfied by a failure to start the fixture in the first place.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(stdout.read_exact(&mut out), stderr.read_exact(&mut err))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(out, b"fixture stdout\n");
+    assert_eq!(err, b"fixture stderr\n");
+    let error = capture_native_output(
+        &mut child,
+        &mut stdout,
+        &mut stderr,
+        &mut out,
+        &mut err,
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("capture timed out"), "{error}");
+    assert!(
+        error.contains("fixture stdout") && error.contains("fixture stderr"),
+        "{error}"
+    );
+    wait_process_handle(&process, Duration::ZERO).await.unwrap();
+    assert!(child.try_wait().unwrap().is_some());
+    assert_eq!(
+        stdout.read(&mut [0]).await.unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        stderr.read(&mut [0]).await.unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
 }
 
 #[test]

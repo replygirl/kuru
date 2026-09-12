@@ -1,28 +1,30 @@
 ## Why
 
-The Windows platform job in CI run 34630641990 timed out while draining the stock PowerShell regression's output. The same regression passed in the full Windows job at the identical released commit, and the failing assertion discarded the launch label, partial output and child state, so the available log does not identify the cause.
+The native PowerShell regression limits each captured stream to 64 KiB but waits for both readers to finish before checking the limit. If a child writes beyond one stream's limit and blocks before closing the other stream, capture reports a timeout instead of the output-limit failure. Timeout assertions also discard partial output and launch identity, while failure cleanup is left to drops.
+
+The original Windows timeout in CI run 34630641990 exposed these failure-handling gaps, but its underlying PowerShell stall remains unconfirmed. Repeated original and diagnostic scripts, including runs across 16 fresh Windows runners, passed; this change does not claim to correct that historical stall.
 
 ## What Changes
 
-Reproduce and identify the failing stage of the native PowerShell launch, then correct the established cause within the process boundary or its fixture. Preserve the regression's real PowerShell 5.1 and .NET initialization, its isolated environment, its existing deadlines, and its direct/configured launch comparison. Capture useful failure evidence and await owned child and pipe cleanup when the regression fails.
+Make the native regression's capture helper reject a stream as soon as its retained bytes exceed 64 KiB. Drain stdout and stderr concurrently within the existing deadline, preserve bounded partial output and the direct/configured launch label, and distinguish the retained root process state from owned job quiescence when capture fails. Await owned child and pipe cleanup before reporting the failure.
 
-Release scheduling, publication, provider authentication, runtime evaluations and unrelated Windows behavior remain outside this fix.
+Add deterministic native controls for a stalled child and a child that writes beyond a stream limit. Require the oversized writer to produce an output-limit error before the overall timeout and require both failure paths to reap the owned process.
+
+Keep the original PowerShell 5.1 script, actual .NET initialization, 30-second deadline, isolated environment, and single direct/configured comparison. Restore the normal single Windows platform CI job and ordinary artifact name after the temporary diagnostic matrix.
 
 ## Capabilities
 
 ### Modified Capabilities
 
-None. The existing native command execution contract remains correct.
+None. The existing command execution contract remains correct.
 
 ## Impact
 
-`packages/kuru-platform` owns the command boundary and native regression. A correction will be limited to that boundary and the fixture or package-owned verification needed to establish the cause; no dependencies or public API changes are planned.
-
-During diagnosis only, the existing Windows platform job runs on 16 fresh runners, each exercising the original single direct/configured comparison. This distinguishes fresh Windows instances from repeated processes sharing one instance. Restore the normal single platform job and artifact name before merge; no release workflow changes are involved.
+The correction belongs to the test capture helper in `packages/kuru-platform/tests/windows_commands.rs` and the native process fixture needed for its failure controls. No public API, production process boundary, dependency, model/provider, or release workflow changes are planned. The temporary diagnostic CI matrix and stress repetitions do not remain in the final change.
 
 ## Surfaces
 
 - [ ] interactive — no CLI or TUI changes
-- [x] deploy — temporary native CI reproduction matrix, removed before merge
-- [ ] integration — no provider or protocol changes
+- [ ] deploy — ordinary CI topology restored; no final topology change
+- [ ] integration — no provider or protocol contract changes
 - [ ] agent-behavior — no runtime behavior changes

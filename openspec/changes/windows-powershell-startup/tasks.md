@@ -1,11 +1,15 @@
-## 1. Establish the cause
+## 1. Correct native capture failure handling
 
-- [ ] 1.1 Capture the direct/configured launch label, script progress, partial output and retained process state on failure, with awaited owned cleanup, and reproduce the failure on native Windows.
-- [ ] 1.2 Identify the causal condition from native evidence and record it in the proposal; distinguish observations from hypotheses.
+- [ ] 1.1 Replace post-join stream-size assertions with bounded readers that return an output-limit error immediately after either stream exceeds 64 KiB while preserving bounded partial output.
+- [ ] 1.2 Preserve launch identity and separate retained root-process state from owned job quiescence on capture failure; await owned termination, process-tree exit, and pipe cleanup before reporting the original error.
 
-## 2. Correct and verify
+## 2. Prove the failure contracts
 
-- [ ] 2.1 Correct the established cause in the owning platform boundary or fixture without relaxing its execution contract, deadlines or coverage threshold.
-- [ ] 2.2 Verify a meaningful regression fails with the causal condition and passes with the correction on native Windows, including direct and configured PowerShell 5.1 launches and actual .NET initialization.
-- [ ] 2.3 Run the affected platform format/lint/type checks and native coverage, preserve the 90% gate, and record exact native CI evidence before archive.
-- [ ] 2.4 Remove the temporary native CI reproduction matrix and stress repetitions before merge, preserving the ordinary platform job and coverage artifact.
+- [ ] 2.1 Add a real oversized native writer regression that fails before the correction by reaching the overall timeout and passes afterward by reporting the output-limit error promptly and reaping the owned process.
+- [ ] 2.2 Add a real stalled-child control that reaches its capture timeout with known partial output, preserves that evidence, and proves owned process cleanup.
+- [ ] 2.3 Verify the unchanged stock PowerShell 5.1 script once through each direct and configured launch, including actual .NET initialization, exact output, script marker, and quiescent process tree within the existing 30-second capture budget.
+
+## 3. Restore and verify ordinary delivery
+
+- [ ] 3.1 Remove diagnostic stress repetitions and the temporary native CI matrix, restoring the normal Windows platform job and coverage artifact name.
+- [ ] 3.2 Run the affected format, Windows-target lint/type checks, native coverage with the 90% gate, and strict cospec validation; record actual results before archive.
