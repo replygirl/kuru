@@ -1,5 +1,3 @@
-#[cfg(test)]
-use kuru_memory::MemoryStore;
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal},
@@ -7,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use crossterm::{
     event::{self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -29,6 +27,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::cli::validate_effort;
 
 mod render;
+#[cfg(test)]
+mod runtime_tests;
 mod scene;
 pub use render::draw;
 
@@ -45,6 +45,26 @@ pub enum Picker {
 pub(crate) enum DispatchOutcome {
     Command(String),
     Turn(TurnOutput),
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeSnapshot {
+    pub turns: usize,
+    pub mode: String,
+    pub model: String,
+    pub effort: String,
+    pub parts: Vec<(String, String)>,
+    pub relationships: Vec<Relationship>,
+    pub focus: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InitialViewData {
+    pub transcript: Vec<(String, String)>,
+    pub session: String,
+    pub project: String,
+    pub motion: bool,
+    pub runtime: RuntimeSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -88,34 +108,25 @@ pub struct View {
 }
 
 impl View {
-    pub async fn new(harness: &Harness, models: Vec<ModelInfo>) -> Result<Self> {
-        let transcript: Vec<_> = harness
-            .history()
-            .await?
-            .into_iter()
-            .map(|m| (m.role, m.content))
-            .collect();
+    pub fn from_initial(initial: InitialViewData, models: Vec<ModelInfo>) -> Self {
+        let InitialViewData {
+            transcript,
+            session,
+            project,
+            motion,
+            runtime,
+        } = initial;
         let show_scene = transcript.is_empty();
-        Ok(Self {
+        Self {
             completion_metadata: BTreeMap::new(),
             transcript,
             input: String::new(),
             cursor: 0,
-            mode: harness.config.mode.to_string(),
-            model: harness.config.model.clone(),
-            effort: harness
-                .config
-                .effort
-                .clone()
-                .unwrap_or_else(|| "default".into()),
-            session: harness.session.id.clone(),
-            parts: harness
-                .topology
-                .parts
-                .iter()
-                .filter(|p| p.active)
-                .map(|p| (p.id.clone(), format!("{} · {}", p.name, p.role)))
-                .collect(),
+            mode: runtime.mode,
+            model: runtime.model,
+            effort: runtime.effort,
+            session,
+            parts: runtime.parts,
             activity: vec![],
             busy: false,
             status: "Ready · /help for commands".into(),
@@ -125,19 +136,14 @@ impl View {
             models,
             scroll: 0,
             frame: 0,
-            motion: !reduced_motion(std::env::var("KURU_REDUCED_MOTION").ok().as_deref()),
+            motion,
             part_activity: BTreeMap::new(),
-            relationships: live_relationships(harness),
-            focus: harness.topology.focus.as_ref().map(|f| f.id.clone()),
+            relationships: runtime.relationships,
+            focus: runtime.focus,
             speaker_id: String::new(),
             routes: vec![],
-            project: harness
-                .cwd()
-                .file_name()
-                .unwrap_or(harness.cwd().as_os_str())
-                .to_string_lossy()
-                .into_owned(),
-            turns: harness.session.turns,
+            project,
+            turns: runtime.turns,
             focused: true,
             show_scene,
             query: String::new(),
@@ -148,7 +154,7 @@ impl View {
             operation_start: None,
             notice_until: 0,
             completion_locked: false,
-        })
+        }
     }
 
     /// Ambient frames are slower than busy indicators; all motion uses this
@@ -188,24 +194,14 @@ impl View {
         self.operation_ms = 0;
     }
 
-    fn refresh(&mut self, harness: &Harness) {
-        self.turns = harness.session.turns;
-        self.mode = harness.config.mode.to_string();
-        self.model = harness.config.model.clone();
-        self.effort = harness
-            .config
-            .effort
-            .clone()
-            .unwrap_or_else(|| "default".into());
-        self.parts = harness
-            .topology
-            .parts
-            .iter()
-            .filter(|p| p.active)
-            .map(|p| (p.id.clone(), format!("{} · {}", p.name, p.role)))
-            .collect();
-        self.relationships = live_relationships(harness);
-        self.focus = harness.topology.focus.as_ref().map(|f| f.id.clone());
+    pub fn apply_runtime(&mut self, runtime: RuntimeSnapshot) {
+        self.turns = runtime.turns;
+        self.mode = runtime.mode;
+        self.model = runtime.model;
+        self.effort = runtime.effort;
+        self.parts = runtime.parts;
+        self.relationships = runtime.relationships;
+        self.focus = runtime.focus;
         self.part_activity
             .retain(|id, _| self.parts.iter().any(|(part, _)| part == id));
         self.routes.retain(|(from, to)| {
@@ -361,7 +357,7 @@ impl View {
         }
     }
 
-    fn complete_turn(&mut self, output: TurnOutput) {
+    pub fn complete_turn(&mut self, output: TurnOutput) {
         let speaker = output
             .relationship
             .as_ref()
@@ -548,6 +544,56 @@ fn reduced_motion(value: Option<&str>) -> bool {
     value.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
+/// Read the initial TUI presentation from the runtime at the adapter boundary.
+/// `View` itself remains a synchronous owned value.
+pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> {
+    let transcript = harness
+        .history()
+        .await?
+        .into_iter()
+        .map(|message| (message.role, message.content))
+        .collect();
+    Ok(InitialViewData {
+        transcript,
+        session: harness.session.id.clone(),
+        project: harness
+            .cwd()
+            .file_name()
+            .unwrap_or(harness.cwd().as_os_str())
+            .to_string_lossy()
+            .into_owned(),
+        motion: !reduced_motion(std::env::var("KURU_REDUCED_MOTION").ok().as_deref()),
+        runtime: project_runtime_snapshot(harness),
+    })
+}
+
+/// Project mutable runtime state without letting the renderer access a Harness.
+pub fn project_runtime_snapshot(harness: &Harness) -> RuntimeSnapshot {
+    RuntimeSnapshot {
+        turns: harness.session.turns,
+        mode: harness.config.mode.to_string(),
+        model: harness.config.model.clone(),
+        effort: harness
+            .config
+            .effort
+            .clone()
+            .unwrap_or_else(|| "default".into()),
+        parts: harness
+            .topology
+            .parts
+            .iter()
+            .filter(|part| part.active)
+            .map(|part| (part.id.clone(), format!("{} · {}", part.name, part.role)))
+            .collect(),
+        relationships: live_relationships(harness),
+        focus: harness
+            .topology
+            .focus
+            .as_ref()
+            .map(|focus| focus.id.clone()),
+    }
+}
+
 fn live_relationships(harness: &Harness) -> Vec<Relationship> {
     harness
         .topology
@@ -683,7 +729,8 @@ async fn run_loop<B: Backend>(
 where
     B::Error: Send + Sync + 'static,
 {
-    let mut view = View::new(&harness, models).await?;
+    let initial = project_initial_view(&harness).await?;
+    let mut view = View::from_initial(initial, models);
     let mut events = harness.subscribe();
     let harness = Arc::new(Mutex::new(harness));
     let (tx, mut rx) = mpsc::channel::<(u64, Result<DispatchOutcome>)>(8);
@@ -742,8 +789,11 @@ where
                     view.completion_locked = true;
                 }
             }
-            let h = harness.lock().await;
-            view.refresh(&h);
+            let snapshot = {
+                let h = harness.lock().await;
+                project_runtime_snapshot(&h)
+            };
+            view.apply_runtime(snapshot);
             view.settle();
         }
         dirty |= view.advance_animation(started.elapsed());
@@ -774,7 +824,11 @@ where
                     quit_pending = false;
                     view.busy = false;
                     view.settle();
-                    view.refresh(&*harness.lock().await);
+                    let snapshot = {
+                        let h = harness.lock().await;
+                        project_runtime_snapshot(&h)
+                    };
+                    view.apply_runtime(snapshot);
                     view.notice = None;
                     view.status = "Cancelled · turn interrupted".into();
                     view.completion_locked = true;
@@ -910,59 +964,55 @@ pub(crate) async fn dispatch(
     };
     Ok(DispatchOutcome::Command(feedback))
 }
-
-use anyhow::Context;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuru_connectors::DemoProvider;
-    use kuru_core::Config;
+    use kuru_core::{Framework, RelationshipKind};
     use ratatui::backend::TestBackend;
 
-    async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
-        let dir = tempfile::tempdir().unwrap();
-        let config = Config {
-            provider: "demo".into(),
+    fn runtime_snapshot() -> RuntimeSnapshot {
+        let framework = Framework::builtin(Mode::Ifs);
+        RuntimeSnapshot {
+            turns: 2,
+            mode: "ifs".into(),
             model: "demo".into(),
-            dream_every: 0,
-            dream_on_exit: false,
-            ..Config::default()
-        };
-        let h = Harness::new(
-            config,
-            dir.path(),
-            MemoryStore::temporary().await.unwrap(),
-            Arc::new(DemoProvider),
-            None,
+            effort: "default".into(),
+            parts: framework
+                .parts
+                .into_iter()
+                .map(|part| (part.id, format!("{} · {}", part.name, part.role)))
+                .collect(),
+            relationships: vec![],
+            focus: None,
+        }
+    }
+
+    fn fixture() -> View {
+        View::from_initial(
+            InitialViewData {
+                transcript: vec![],
+                session: "plain-session".into(),
+                project: "plain-project".into(),
+                motion: true,
+                runtime: runtime_snapshot(),
+            },
+            vec![ModelInfo {
+                id: "demo".into(),
+                name: "Demo".into(),
+                efforts: vec!["low".into(), "high".into()],
+                default_effort: Some("low".into()),
+            }],
         )
-        .await
-        .unwrap();
-        let models = vec![ModelInfo {
-            id: "demo".into(),
-            name: "Demo".into(),
-            efforts: vec!["low".into(), "high".into()],
-            default_effort: Some("low".into()),
-        }];
-        (dir, h, models)
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn command_text(outcome: DispatchOutcome) -> String {
-        match outcome {
-            DispatchOutcome::Command(text) => text,
-            DispatchOutcome::Turn(_) => panic!("expected command feedback"),
-        }
-    }
-
-    #[tokio::test]
-    async fn terminal_dispatch_ignores_releases_without_losing_input_or_animation() {
+    #[test]
+    fn terminal_dispatch_ignores_releases_without_losing_input_or_animation() {
         use crossterm::event::{MouseEvent, MouseEventKind};
 
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+        let mut view = fixture();
         view.motion = true;
         assert!(view.advance_animation(Duration::from_millis(250)));
         let clock = (view.frame, view.clock_ms, view.last_frame_ms);
@@ -1054,10 +1104,9 @@ mod tests {
         assert!(view.advance_animation(Duration::from_millis(751)));
     }
 
-    #[tokio::test]
-    async fn ambient_clock_ignores_editing_and_preserves_busy_focus_and_static_behavior() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn ambient_clock_ignores_editing_and_preserves_busy_focus_and_static_behavior() {
+        let mut view = fixture();
         view.motion = true;
         assert!(!view.advance_animation(Duration::from_millis(249)));
         assert!(view.advance_animation(Duration::from_millis(250)));
@@ -1098,12 +1147,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn activity_summarizes_routing_without_disclosing_peer_contents_or_state_notes() {
-        let (_dir, mut h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
-        let from = h.topology.parts[0].id.clone();
-        let to = h.topology.parts[1].id.clone();
+    #[test]
+    fn activity_summarizes_routing_without_disclosing_peer_contents_or_state_notes() {
+        let mut view = fixture();
+        let from = view.parts[0].0.clone();
+        let to = view.parts[1].0.clone();
         let envelope =
             kuru_runtime::PeerMessage::new(&from, &to, "session", "PRIVATE MESSAGE").unwrap();
         for _ in 0..8 {
@@ -1120,13 +1168,8 @@ mod tests {
             actor: to.clone(),
             detail: "{\"activation\":0.9,\"note\":\"PRIVATE NOTE\"}".into(),
         });
-        let relation = h
-            .relate(
-                kuru_core::RelationshipKind::Alliance,
-                vec![from.clone(), to.clone()],
-            )
-            .await
-            .unwrap();
+        let relation =
+            Relationship::new(RelationshipKind::Alliance, vec![from.clone(), to.clone()]).unwrap();
         view.event(Event {
             kind: "relationship".into(),
             actor: from.clone(),
@@ -1142,7 +1185,7 @@ mod tests {
         assert_eq!(view.speaker_id, relation.id);
         let activity = view.activity.join("\n");
         assert!(!activity.contains("PRIVATE"));
-        assert!(activity.contains(&h.topology.parts[1].name));
+        assert!(activity.contains(view.parts[1].1.split_once(" · ").unwrap().0));
         view.event(Event {
             kind: "peer".into(),
             actor: to.clone(),
@@ -1156,17 +1199,17 @@ mod tests {
         });
         view.settle();
         assert_eq!(view.part_activity[&to], "idle");
-        h.topology.parts[0].active = false;
-        view.refresh(&h);
+        let mut next = runtime_snapshot();
+        next.parts.retain(|(id, _)| id != &from);
+        view.apply_runtime(next);
         assert!(view.relationships.is_empty());
         assert!(view.routes.is_empty());
         assert!(!view.parts.iter().any(|(id, _)| id == &from));
     }
 
-    #[tokio::test]
-    async fn response_activity_never_becomes_transcript_content() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn response_activity_never_becomes_transcript_content() {
+        let mut view = fixture();
         view.event(Event {
             kind: "response".into(),
             actor: "misleading-speaker".into(),
@@ -1182,20 +1225,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn completed_turn_keeps_returned_facts_when_activity_arrives_late() {
-        let (_dir, mut h, models) = fixture().await;
-        let members = h.topology.parts[..2]
+    #[test]
+    fn completed_turn_keeps_returned_facts_when_activity_arrives_late() {
+        let mut view = fixture();
+        let members = view.parts[..2]
             .iter()
-            .map(|part| part.id.clone())
+            .map(|part| part.0.clone())
             .collect::<Vec<_>>();
-        let relation = h
-            .relate(kuru_core::RelationshipKind::Alliance, members)
-            .await
-            .unwrap();
-        let mut view = View::new(&h, models).await.unwrap();
+        let relation = Relationship::new(RelationshipKind::Alliance, members).unwrap();
         view.complete_turn(TurnOutput {
-            session: h.session.id.clone(),
+            session: view.session.clone(),
             speaker: relation.id.clone(),
             text: "AUTHORITATIVE_RESPONSE".into(),
             relationship: Some(relation.clone()),
@@ -1245,13 +1284,12 @@ mod tests {
         assert_eq!(view.status, "Complete · limited result");
     }
 
-    #[tokio::test]
-    async fn completion_metadata_stays_with_its_answer_at_wide_and_narrow_sizes() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn completion_metadata_stays_with_its_answer_at_wide_and_narrow_sizes() {
+        let mut view = fixture();
         view.complete_turn(TurnOutput {
-            session: h.session.id.clone(),
-            speaker: h.topology.parts[0].id.clone(),
+            session: view.session.clone(),
+            speaker: view.parts[0].0.clone(),
             text: "COMPLETION_TEXT".into(),
             relationship: None,
             input_tokens: 8,
@@ -1284,10 +1322,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn unicode_editor_supports_midline_editing_navigation_newlines_and_send() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn unicode_editor_supports_midline_editing_navigation_newlines_and_send() {
+        let mut view = fixture();
         for c in "a猫🌿".chars() {
             view.key(key(KeyCode::Char(c)));
         }
@@ -1337,10 +1374,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn pickers_select_models_efforts_modes_and_handle_empty_catalogs() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn pickers_select_models_efforts_modes_and_handle_empty_catalogs() {
+        let mut view = fixture();
         for (function, expected) in [
             (2, "/model demo"),
             (3, "/effort low"),
@@ -1365,10 +1401,9 @@ mod tests {
         assert_eq!(view.key(key(KeyCode::Enter)).unwrap(), "/effort default");
     }
 
-    #[tokio::test]
-    async fn picker_search_and_paste_preserve_drafts_and_busy_settings_are_explained() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn picker_search_and_paste_preserve_drafts_and_busy_settings_are_explained() {
+        let mut view = fixture();
         view.paste("An unsent 猫 draft");
         let draft = view.input.clone();
         view.key(key(KeyCode::F(4)));
@@ -1392,10 +1427,9 @@ mod tests {
         assert_eq!(view.input, draft);
     }
 
-    #[tokio::test]
-    async fn rendering_handles_small_terminals_long_chats_activity_and_popups() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn rendering_handles_small_terminals_long_chats_activity_and_popups() {
+        let mut view = fixture();
         for size in [(120, 35), (60, 20), (10, 5), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
             terminal.draw(|f| draw(f, &view)).unwrap();
@@ -1414,7 +1448,7 @@ mod tests {
         }
         assert_eq!(view.activity.len(), 100);
         view.complete_turn(TurnOutput {
-            session: h.session.id.clone(),
+            session: view.session.clone(),
             speaker: "speaker".into(),
             text: "Completed task".into(),
             relationship: None,
@@ -1450,89 +1484,64 @@ mod tests {
         assert!(text.contains("Enter selects"));
     }
 
-    #[tokio::test]
-    async fn slash_commands_change_real_runtime_state_and_validate_errors() {
-        let (_dir, mut h, models) = fixture().await;
-        assert!(
-            command_text(dispatch(&mut h, &models, "/parts").await.unwrap()).contains("manager")
+    #[test]
+    fn applying_runtime_snapshot_preserves_initial_editor_and_completion_state() {
+        let initial_runtime = runtime_snapshot();
+        let original_parts = initial_runtime.parts.clone();
+        let mut view = View::from_initial(
+            InitialViewData {
+                transcript: vec![("user".into(), "initial transcript".into())],
+                session: "initial-session".into(),
+                project: "initial-project".into(),
+                motion: true,
+                runtime: initial_runtime,
+            },
+            vec![],
         );
-        dispatch(&mut h, &models, "/mode freudian").await.unwrap();
-        assert_eq!(h.config.mode, Mode::Freudian);
-        dispatch(&mut h, &models, "/model demo").await.unwrap();
-        assert_eq!(h.config.effort.as_deref(), Some("low"));
-        dispatch(&mut h, &models, "/effort high").await.unwrap();
-        assert_eq!(h.config.effort.as_deref(), Some("high"));
-        assert!(
-            dispatch(&mut h, &models, "/effort impossible")
-                .await
-                .is_err()
+        view.input = "editor draft".into();
+        view.cursor = view.input.len();
+        view.complete_turn(TurnOutput {
+            session: "initial-session".into(),
+            speaker: original_parts[0].0.clone(),
+            text: "typed completion".into(),
+            relationship: None,
+            input_tokens: 3,
+            output_tokens: 5,
+            limited: false,
+            events: vec![],
+        });
+        let next_framework = Framework::builtin(Mode::Freudian);
+        view.apply_runtime(RuntimeSnapshot {
+            turns: 9,
+            mode: "freudian".into(),
+            model: "next-model".into(),
+            effort: "high".into(),
+            parts: next_framework
+                .parts
+                .into_iter()
+                .map(|part| (part.id, format!("{} · {}", part.name, part.role)))
+                .collect(),
+            relationships: vec![],
+            focus: None,
+        });
+        assert_eq!(
+            view.transcript[0],
+            ("user".into(), "initial transcript".into())
         );
-        dispatch(&mut h, &models, "/effort default").await.unwrap();
-        assert!(h.config.effort.is_none());
-        let ids = h.topology.parts[..2]
-            .iter()
-            .map(|p| p.id.clone())
-            .collect::<Vec<_>>();
-        dispatch(&mut h, &models, &format!("/focus {}", ids[0]))
-            .await
-            .unwrap();
-        assert!(h.topology.focus.is_some());
-        dispatch(&mut h, &models, "/focus auto").await.unwrap();
-        assert!(h.topology.focus.is_none());
-        dispatch(
-            &mut h,
-            &models,
-            &format!("/relate alliance {},{}", ids[0], ids[1]),
-        )
-        .await
-        .unwrap();
-        assert_eq!(h.topology.relationships.len(), 1);
-        assert!(matches!(
-            dispatch(&mut h, &models, "hello").await.unwrap(),
-            DispatchOutcome::Turn(_)
-        ));
-        assert!(
-            command_text(
-                dispatch(&mut h, &models, &format!("/memory {}", ids[0]))
-                    .await
-                    .unwrap()
-            )
-            .contains("hello")
+        assert_eq!(view.transcript[1].1, "typed completion");
+        assert_eq!(view.session, "initial-session");
+        assert_eq!(view.project, "initial-project");
+        assert!(view.motion);
+        assert_eq!(view.input, "editor draft");
+        assert_eq!(view.cursor, "editor draft".len());
+        assert_eq!(
+            view.completion_metadata[&1],
+            "3 input tokens · 5 output tokens"
         );
-        assert!(
-            command_text(dispatch(&mut h, &models, "/dream").await.unwrap()).contains("summaries")
-        );
-        h.apply_dream(vec![kuru_runtime::DreamProposal::Add {
-            name: "Extra".into(),
-            role: h.topology.parts[0].role.clone(),
-            instruction: "Complement".into(),
-        }])
-        .await
-        .unwrap();
-        dispatch(&mut h, &models, "/undo-dream").await.unwrap();
-        let status: serde_json::Value = serde_json::from_str(&command_text(
-            dispatch(&mut h, &models, "/memory-status").await.unwrap(),
-        ))
-        .unwrap();
-        assert_eq!(status["engine"], "dolt");
-        let revisions: serde_json::Value = serde_json::from_str(&command_text(
-            dispatch(&mut h, &models, "/memory-history").await.unwrap(),
-        ))
-        .unwrap();
-        assert!(
-            revisions
-                .as_array()
-                .is_some_and(|revisions| !revisions.is_empty())
-        );
-        for bad in [
-            "/unknown",
-            "/relate",
-            "/mode unknown",
-            "/model",
-            "/effort",
-            "/memory missing",
-        ] {
-            assert!(dispatch(&mut h, &models, bad).await.is_err(), "{bad}");
-        }
+        assert_eq!(view.mode, "freudian");
+        assert_eq!(view.model, "next-model");
+        assert_eq!(view.effort, "high");
+        assert_eq!(view.turns, 9);
+        assert_ne!(view.parts, original_parts);
     }
 }

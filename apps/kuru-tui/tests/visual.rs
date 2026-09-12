@@ -1,11 +1,9 @@
-use kuru_memory::MemoryStore;
-use std::{collections::BTreeSet, fmt::Write as _, sync::Arc};
+use std::{collections::BTreeSet, fmt::Write as _};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use kuru::ui::{View, draw};
-use kuru_connectors::DemoProvider;
-use kuru_core::{Config, Mode, ModelInfo, RelationshipKind};
-use kuru_runtime::{Event, Harness, PeerMessage};
+use kuru::ui::{InitialViewData, RuntimeSnapshot, View, draw};
+use kuru_core::{Framework, Mode, ModelInfo};
+use kuru_runtime::{Event, PeerMessage};
 use ratatui::{
     Terminal,
     backend::TestBackend,
@@ -14,26 +12,28 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-async fn fixture(mode: Mode) -> (tempfile::TempDir, Harness, View) {
-    let project = tempfile::tempdir().unwrap();
-    let harness = Harness::new(
-        Config {
-            provider: "demo".into(),
-            model: "demo".into(),
-            mode,
-            dream_every: 0,
-            dream_on_exit: false,
-            ..Config::default()
+fn fixture(mode: Mode) -> View {
+    let framework = Framework::builtin(mode);
+    View::from_initial(
+        InitialViewData {
+            transcript: vec![],
+            session: "plain-session".into(),
+            project: "plain-project".into(),
+            motion: true,
+            runtime: RuntimeSnapshot {
+                turns: 0,
+                mode: mode.to_string(),
+                model: "demo".into(),
+                effort: "default".into(),
+                parts: framework
+                    .parts
+                    .into_iter()
+                    .map(|part| (part.id, format!("{} · {}", part.name, part.role)))
+                    .collect(),
+                relationships: vec![],
+                focus: None,
+            },
         },
-        project.path(),
-        MemoryStore::temporary().await.unwrap(),
-        Arc::new(DemoProvider),
-        None,
-    )
-    .await
-    .unwrap();
-    let view = View::new(
-        &harness,
         vec![ModelInfo {
             id: "demo".into(),
             name: "Offline demo".into(),
@@ -41,9 +41,6 @@ async fn fixture(mode: Mode) -> (tempfile::TempDir, Harness, View) {
             default_effort: Some("low".into()),
         }],
     )
-    .await
-    .unwrap();
-    (project, harness, view)
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -145,10 +142,10 @@ fn html(buffer: &Buffer) -> String {
     output
 }
 
-#[tokio::test]
-async fn welcome_shows_actual_framework_members_and_color_at_wide_and_compact_sizes() {
+#[test]
+fn welcome_shows_actual_framework_members_and_color_at_wide_and_compact_sizes() {
     for mode in [Mode::Ifs, Mode::Polyvagal, Mode::Freudian, Mode::Jungian] {
-        let (_project, harness, mut view) = fixture(mode).await;
+        let mut view = fixture(mode);
         view.motion = false;
         let (wide, _) = render(&view, 140, 50, &format!("welcome-{mode}"));
         let screen = text(&wide);
@@ -156,8 +153,9 @@ async fn welcome_shows_actual_framework_members_and_color_at_wide_and_compact_si
             assert!(screen.contains(label), "missing {label}:\n{screen}");
         }
         assert!(screen.to_ascii_lowercase().contains(&mode.to_string()));
-        for part in &harness.topology.parts {
-            assert!(screen.contains(&part.name), "missing {}", part.name);
+        for (_, label) in &view.parts {
+            let name = label.split_once(" · ").unwrap().0;
+            assert!(screen.contains(name), "missing {name}");
         }
         let accents = wide
             .content
@@ -180,113 +178,33 @@ async fn welcome_shows_actual_framework_members_and_color_at_wide_and_compact_si
     }
 }
 
-#[tokio::test]
-async fn real_turn_events_keep_speaking_group_members_and_peer_routes_visible() {
-    let (_project, mut harness, _) = fixture(Mode::Freudian).await;
-    let members = harness.topology.parts[..2]
-        .iter()
-        .map(|part| part.id.clone())
-        .collect::<Vec<_>>();
-    let relation = harness
-        .relate(RelationshipKind::Alliance, members.clone())
-        .await
-        .unwrap();
-    let names = harness.topology.parts[..2]
-        .iter()
-        .map(|part| part.name.clone())
-        .collect::<Vec<_>>();
-    let member_names = relation
-        .members
-        .iter()
-        .map(|id| {
-            harness
-                .topology
-                .parts
-                .iter()
-                .find(|part| &part.id == id)
-                .unwrap()
-                .name
-                .as_str()
-        })
-        .collect::<Vec<_>>()
-        .join(" + ");
-    let mut view = View::new(&harness, vec![]).await.unwrap();
-    view.motion = false;
-    view.transcript
-        .push(("user".into(), "Shared design".into()));
-    let outcome = harness.run("Shared design").await.unwrap();
-    assert_eq!(outcome.speaker, relation.id);
-    let returned_text = outcome.text.clone();
-    for event in outcome.events {
-        view.event(event);
-    }
-    // Activity is deliberately separate from the completed result. The real
-    // terminal loop supplies `TurnOutput` through its completion channel.
-    view.speaker_id = outcome.speaker;
-    view.speaker = format!("{} · {member_names}", relation.kind);
-    view.transcript
-        .push((view.speaker.clone(), returned_text.clone()));
-    let route = PeerMessage::new(
-        &members[0],
-        &members[1],
-        &harness.session.id,
-        "PRIVATE_PEER_TEXT_MUST_STAY_INTERNAL",
-    )
-    .unwrap();
-    view.event(Event {
-        kind: "peer".into(),
-        actor: members[0].clone(),
-        detail: route.rpc().to_string(),
-    });
-    let (buffer, _) = render(&view, 120, 45, "conversation-alliance");
-    let screen = text(&buffer);
-    for label in [
-        "Shared design",
-        "alliance",
-        "Relationships",
-        "Peer exchange",
-    ] {
-        assert!(screen.contains(label), "missing {label}:\n{screen}");
-    }
-    assert!(screen.contains(&member_names));
-    assert!(screen.contains(&format!("{} → {}", names[0], names[1])));
-    assert!(!screen.contains("PRIVATE_PEER_TEXT_MUST_STAY_INTERNAL"));
-    assert_eq!(view.speaker_id, relation.id);
-    assert_eq!(
-        view.routes.last(),
-        Some(&(members[0].clone(), members[1].clone()))
-    );
-    assert_eq!(view.transcript.last().unwrap().1, returned_text);
-    assert!(view.part_activity.values().any(|value| value == "idle"));
-}
-
-#[tokio::test]
-async fn motion_changes_decoration_without_changing_text_and_respects_static_override() {
-    let (_project, harness, mut view) = fixture(Mode::Ifs).await;
+#[test]
+fn motion_changes_decoration_without_changing_text_and_respects_static_override() {
+    let mut view = fixture(Mode::Ifs);
     view.busy = true;
     view.transcript
         .push(("user".into(), "Keep this content readable".into()));
     view.input = "Draft remains editable".into();
     view.cursor = view.input.len();
     view.motion = true;
-    let members = &harness.topology.parts[..2];
-    for part in members {
+    let members = view.parts[..2].to_vec();
+    for (id, _) in &members {
         view.event(Event {
             kind: "active".into(),
-            actor: part.id.clone(),
+            actor: id.clone(),
             detail: "peer round 1".into(),
         });
     }
     let route = PeerMessage::new(
-        &members[0].id,
-        &members[1].id,
+        &members[0].0,
+        &members[1].0,
         &view.session,
         "Check the draft",
     )
     .unwrap();
     view.event(Event {
         kind: "peer".into(),
-        actor: members[0].id.clone(),
+        actor: members[0].0.clone(),
         detail: route.rpc().to_string(),
     });
     let (first, cursor) = render(&view, 120, 45, "busy-frame-zero");
@@ -302,12 +220,9 @@ async fn motion_changes_decoration_without_changing_text_and_respects_static_ove
         let screen = text(buffer);
         assert!(screen.contains("Keep this content readable"));
         assert!(screen.contains("Draft remains editable"));
-        for part in &harness.topology.parts {
-            assert!(
-                screen.contains(&part.name),
-                "graph legend lost {}",
-                part.name
-            );
+        for (_, label) in &view.parts {
+            let name = label.split_once(" · ").unwrap().0;
+            assert!(screen.contains(name), "graph legend lost {name}",);
         }
     }
     view.motion = false;
@@ -323,9 +238,9 @@ async fn motion_changes_decoration_without_changing_text_and_respects_static_ove
     assert_eq!(view.input, "Draft remains editable!");
 }
 
-#[tokio::test]
-async fn long_model_catalog_scrolls_selection_into_view_and_preserves_draft() {
-    let (_project, _harness, mut view) = fixture(Mode::Freudian).await;
+#[test]
+fn long_model_catalog_scrolls_selection_into_view_and_preserves_draft() {
+    let mut view = fixture(Mode::Freudian);
     view.input = "An unsent draft".into();
     view.cursor = view.input.len();
     view.models = (0..30)
@@ -363,9 +278,9 @@ async fn long_model_catalog_scrolls_selection_into_view_and_preserves_draft() {
     );
 }
 
-#[tokio::test]
-async fn unicode_editor_and_cursor_survive_resize_even_below_supported_layout_size() {
-    let (_project, _harness, mut view) = fixture(Mode::Jungian).await;
+#[test]
+fn unicode_editor_and_cursor_survive_resize_even_below_supported_layout_size() {
+    let mut view = fixture(Mode::Jungian);
     for ch in "long draft 猫 🌿 ".repeat(6).chars() {
         view.key(key(KeyCode::Char(ch)));
     }
@@ -393,9 +308,9 @@ async fn unicode_editor_and_cursor_survive_resize_even_below_supported_layout_si
     assert_eq!(view.key(key(KeyCode::Enter)).unwrap(), draft);
 }
 
-#[tokio::test]
-async fn rich_answer_preserves_prose_code_and_list_content_when_terminal_wraps() {
-    let (_project, _harness, mut view) = fixture(Mode::Ifs).await;
+#[test]
+fn rich_answer_preserves_prose_code_and_list_content_when_terminal_wraps() {
+    let mut view = fixture(Mode::Ifs);
     view.motion = false;
     view.transcript = vec![
         ("user".into(), "Show me the next step".into()),
@@ -437,9 +352,9 @@ async fn rich_answer_preserves_prose_code_and_list_content_when_terminal_wraps()
     }
 }
 
-#[tokio::test]
-async fn composer_combines_values_with_hints_and_status_prioritizes_errors() {
-    let (_project, _harness, mut view) = fixture(Mode::Freudian).await;
+#[test]
+fn composer_combines_values_with_hints_and_status_prioritizes_errors() {
+    let mut view = fixture(Mode::Freudian);
     view.model = "gpt-current-long-model-name".into();
     view.effort = "high".into();
     view.motion = false;
@@ -495,9 +410,9 @@ async fn composer_combines_values_with_hints_and_status_prioritizes_errors() {
     assert!(text(&buffer).contains("Reality · ego"));
 }
 
-#[tokio::test]
-async fn mode_picker_previews_selection_and_filtering_never_changes_the_live_pool() {
-    let (_project, _harness, mut view) = fixture(Mode::Ifs).await;
+#[test]
+fn mode_picker_previews_selection_and_filtering_never_changes_the_live_pool() {
+    let mut view = fixture(Mode::Ifs);
     view.key(key(KeyCode::F(4)));
     let original = view.parts.clone();
     for mode in ["ifs", "polyvagal", "freudian", "jungian"] {
@@ -527,9 +442,9 @@ async fn mode_picker_previews_selection_and_filtering_never_changes_the_live_poo
     );
 }
 
-#[tokio::test]
-async fn ambient_time_preserves_labels_draft_caret_and_static_override() {
-    let (_project, harness, mut view) = fixture(Mode::Jungian).await;
+#[test]
+fn ambient_time_preserves_labels_draft_caret_and_static_override() {
+    let mut view = fixture(Mode::Jungian);
     view.motion = true;
     let (first, _) = render(&view, 140, 50, "ambient-zero");
     view.advance_animation(std::time::Duration::from_secs(12));
@@ -543,8 +458,9 @@ async fn ambient_time_preserves_labels_draft_caret_and_static_override() {
     let (later_frame, after) = render(&view, 140, 50, "ambient-draft-later");
     assert_ne!(typed, later_frame);
     assert_eq!(cursor, after);
-    for part in &harness.topology.parts {
-        let locate = |buffer: &Buffer| text(buffer).find(&part.name).unwrap();
+    for (_, label) in &view.parts {
+        let name = label.split_once(" · ").unwrap().0;
+        let locate = |buffer: &Buffer| text(buffer).find(name).unwrap();
         assert_eq!(locate(&typed), locate(&later_frame));
     }
     assert!(text(&later_frame).contains("A thought"));
@@ -557,10 +473,10 @@ async fn ambient_time_preserves_labels_draft_caret_and_static_override() {
 
 // Explicit profiling fixture, excluded from normal assertions because timings
 // depend on the machine. Exercises actual cells, not a separate scene mockup.
-#[tokio::test]
+#[test]
 #[ignore = "run explicitly with --ignored --nocapture to measure frame cost"]
-async fn frame_cost_profile() {
-    let (_project, _harness, mut view) = fixture(Mode::Ifs).await;
+fn frame_cost_profile() {
+    let mut view = fixture(Mode::Ifs);
     let mut terminal = Terminal::new(TestBackend::new(140, 50)).unwrap();
     for state in ["welcome", "long conversation", "picker"] {
         if state == "long conversation" {
@@ -589,10 +505,10 @@ async fn frame_cost_profile() {
     }
 }
 
-#[tokio::test]
-async fn quiet_typing_leaves_portrait_and_composer_decoration_untouched() {
+#[test]
+fn quiet_typing_leaves_portrait_and_composer_decoration_untouched() {
     for mode in Mode::ALL {
-        let (_project, _harness, mut view) = fixture(mode).await;
+        let mut view = fixture(mode);
         view.motion = true;
         let (baseline, _) = render(&view, 140, 50, &format!("quiet-before-{mode}"));
         // Rows 0..45 include the complete scene and composer separator; the
@@ -618,10 +534,10 @@ async fn quiet_typing_leaves_portrait_and_composer_decoration_untouched() {
     }
 }
 
-#[tokio::test]
-async fn quiet_ambient_keeps_every_glyph_fixed_and_changes_color_gradually() {
+#[test]
+fn quiet_ambient_keeps_every_glyph_fixed_and_changes_color_gradually() {
     for mode in Mode::ALL {
-        let (_project, _harness, mut view) = fixture(mode).await;
+        let mut view = fixture(mode);
         view.motion = true;
         let (baseline, _) = render(&view, 140, 50, &format!("quiet-ambient-zero-{mode}"));
         let mut colored = false;
