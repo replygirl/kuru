@@ -171,6 +171,12 @@ async fn command_resolution_and_representability_fail_before_execution() {
 
 #[tokio::test]
 async fn configured_stock_powershell_starts_like_direct_spawn_with_the_same_isolated_environment() {
+    for attempt in 0..32 {
+        compare_stock_powershell_launches(attempt).await;
+    }
+}
+
+async fn compare_stock_powershell_launches(attempt: usize) {
     let root = tempfile::tempdir().unwrap();
     let cwd = root.path().join("native shell 日本語");
     std::fs::create_dir(&cwd).unwrap();
@@ -238,7 +244,7 @@ async fn configured_stock_powershell_starts_like_direct_spawn_with_the_same_isol
                 stderr.close(Duration::from_secs(5))
             );
             panic!(
-                "{label}: capture={capture:?}; root_exit={root_exit:?}; tree_exit={tree_exit:?}; progress={progress:?}; stdout={}; stderr={}; termination={termination:?}; reaped={reaped:?}; closed={closed:?}",
+                "attempt {attempt}, {label}: capture={capture:?}; root_exit={root_exit:?}; tree_exit={tree_exit:?}; progress={progress:?}; stdout={}; stderr={}; termination={termination:?}; reaped={reaped:?}; closed={closed:?}",
                 String::from_utf8_lossy(&out),
                 String::from_utf8_lossy(&err)
             );
