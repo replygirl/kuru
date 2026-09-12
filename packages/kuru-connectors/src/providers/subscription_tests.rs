@@ -299,6 +299,48 @@ async fn repeated_401_and_partial_stream_errors_do_not_retry_or_leak_tokens() {
 }
 
 #[tokio::test]
+async fn native_failed_events_and_initial_statuses_use_fixed_diagnostics() {
+    let mut initial = Reply::json(
+        json!({"error":{"message":"native-status-secret","code":"model_not_found","type":"insufficient_quota"}}),
+    );
+    initial.status = StatusCode::TOO_MANY_REQUESTS;
+    let peer = Peer::new(vec![
+        stream(vec![json!({"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"native-known-secret"}}})]),
+        stream(vec![json!({"type":"response.failed","response":{"error":{"code":"future-native-code","type":"future-native-type","message":"native-unknown-secret"}}})]),
+        initial,
+    ])
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    for expected in [
+        "ChatGPT service is overloaded",
+        "ChatGPT completion stream failed before completion",
+        "ChatGPT completion is rate limited (HTTP 429)",
+    ] {
+        let error = provider.complete(request()).await.unwrap_err();
+        let display = format!("{error:#}");
+        let debug = format!("{error:?}");
+        assert!(display.contains(expected), "{display}");
+        for secret in [
+            "native-status-secret",
+            "native-known-secret",
+            "native-unknown-secret",
+            "future-native-code",
+            "future-native-type",
+        ] {
+            assert!(
+                !display.contains(secret) && !debug.contains(secret),
+                "native value escaped: {display} / {debug}"
+            );
+        }
+    }
+    assert_eq!(
+        peer.requests.lock().await.len(),
+        3,
+        "failed streams were replayed"
+    );
+}
+
+#[tokio::test]
 async fn replacement_login_rejects_old_provider_before_sending_pending_context() {
     for account in ["account-one", "different-account"] {
         let peer = Peer::new(vec![stream(vec![
@@ -345,8 +387,8 @@ async fn malformed_incomplete_and_oversized_subscription_responses_are_errors() 
     .await;
     let (provider, _manager, _directory) = subscription(&peer).await;
     for expected in [
-        "JSON",
-        "incomplete",
+        "invalid protocol",
+        "stream failed before completion",
         "before response.completed",
         "limit",
         "event stream",
@@ -492,9 +534,13 @@ async fn real_idle_stream_is_bounded_and_dropped() {
     });
     let _abort = AbortOnDrop(server.abort_handle());
     let response = http::client().unwrap().get(url).send().await.unwrap();
-    let error = sse::response(response, Duration::from_millis(100))
-        .await
-        .unwrap_err();
+    let error = sse::response(
+        response,
+        Duration::from_millis(100),
+        diagnostics::Operation::ChatgptCompletion,
+    )
+    .await
+    .unwrap_err();
     assert!(error.to_string().contains("idle timeout"));
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
@@ -607,7 +653,11 @@ async fn missing_content_type_still_rejects_malformed_and_truncated_streams() {
         done(1, json!({"type":"function_call","id":"partial-item","call_id":"partial-call","name":"file_read","arguments":"{}"})),
     ]).body;
     for (body, content_type, expected) in [
-        (format!("{partial}data: not-json\n\n"), None, "JSON"),
+        (
+            format!("{partial}data: not-json\n\n"),
+            None,
+            "invalid protocol",
+        ),
         (partial, None, "before response.completed"),
         (
             json!({"output":[],"status":"completed"}).to_string(),

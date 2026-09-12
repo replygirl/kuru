@@ -16,6 +16,7 @@ use crate::{
     http,
 };
 
+mod diagnostics;
 mod sse;
 #[cfg(test)]
 mod subscription_tests;
@@ -135,11 +136,11 @@ enum Authentication {
 
 impl ResponsesProvider {
     pub fn new(base: &str, key_env: &str) -> Result<Self> {
-        http::endpoint(base)?;
+        http::endpoint(base).map_err(|_| diagnostics::invalid_endpoint())?;
         Ok(Self {
             base: base.trim_end_matches('/').into(),
             auth: Authentication::Environment(key_env.into()),
-            client: http::client()?,
+            client: http::client().map_err(|_| diagnostics::client())?,
             completion_timeout: COMPLETION_TIMEOUT,
             actors: Mutex::new(BTreeMap::new()),
         })
@@ -157,7 +158,8 @@ impl ResponsesProvider {
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(COMPLETION_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+                .build()
+                .map_err(|_| diagnostics::client())?,
             completion_timeout: COMPLETION_TIMEOUT,
             actors: Mutex::new(BTreeMap::new()),
         })
@@ -167,19 +169,32 @@ impl ResponsesProvider {
         matches!(self.auth, Authentication::Subscription { .. })
     }
 
-    async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    fn operation(&self, catalog: bool) -> diagnostics::Operation {
+        match (self.is_subscription(), catalog) {
+            (false, false) => diagnostics::Operation::ResponsesCompletion,
+            (false, true) => diagnostics::Operation::ResponsesCatalog,
+            (true, false) => diagnostics::Operation::ChatgptCompletion,
+            (true, true) => diagnostics::Operation::ChatgptCatalog,
+        }
+    }
+
+    async fn send(
+        &self,
+        builder: reqwest::RequestBuilder,
+        operation: diagnostics::Operation,
+    ) -> Result<reqwest::Response> {
         match &self.auth {
             Authentication::Environment(key_env) => {
                 let builder = if key_env.is_empty() {
                     builder
                 } else {
-                    let key = std::env::var(key_env).with_context(|| {
-                        format!("set {key_env} for Responses API authentication")
-                    })?;
-                    ensure!(!key.trim().is_empty(), "{key_env} is empty");
+                    let key = environment_value(environment_key(key_env)?)?;
                     builder.bearer_auth(key)
                 };
-                Ok(builder.send().await?)
+                builder
+                    .send()
+                    .await
+                    .map_err(|error| diagnostics::transport(operation, error))
             }
             Authentication::Subscription { manager, initial } => {
                 let credentials = manager.credentials(AuthRoute::Chatgpt).await?;
@@ -197,7 +212,8 @@ impl ResponsesProvider {
                     &credentials,
                 )?
                 .send()
-                .await?;
+                .await
+                .map_err(|error| diagnostics::transport(operation, error))?;
                 if first.status() != reqwest::StatusCode::UNAUTHORIZED {
                     return Ok(first);
                 }
@@ -206,7 +222,10 @@ impl ResponsesProvider {
                 drop(first);
                 let refreshed = manager.refresh_rejected(&credentials).await?;
                 same_session(initial, &refreshed)?;
-                Ok(subscription_headers(builder, &refreshed)?.send().await?)
+                subscription_headers(builder, &refreshed)?
+                    .send()
+                    .await
+                    .map_err(|error| diagnostics::transport(operation, error))
             }
         }
     }
@@ -221,6 +240,29 @@ impl ResponsesProvider {
             .entry(name.into())
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone())
+    }
+}
+
+fn environment_key(name: &str) -> Result<String> {
+    std::env::var(name).map_err(environment_error)
+}
+
+fn environment_value(key: String) -> Result<String> {
+    ensure!(
+        !key.trim().is_empty(),
+        "Responses API authentication environment variable is empty"
+    );
+    Ok(key)
+}
+
+fn environment_error(error: std::env::VarError) -> anyhow::Error {
+    match error {
+        std::env::VarError::NotPresent => {
+            anyhow::Error::msg("Responses API authentication environment variable is not set")
+        }
+        std::env::VarError::NotUnicode(_) => anyhow::Error::msg(
+            "Responses API authentication environment variable is not valid Unicode",
+        ),
     }
 }
 
@@ -316,19 +358,8 @@ fn input_items(messages: &[Message], pending: Option<&Pending>) -> Result<Vec<Va
     Ok(input)
 }
 
-fn completion(value: &Value) -> Result<Completion> {
-    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
-        bail!(
-            "Responses API error: {}",
-            error["message"].as_str().unwrap_or("request failed")
-        );
-    }
-    if let Some(status) = value["status"].as_str() {
-        ensure!(
-            status == "completed",
-            "Responses API returned {status}; response was not completed"
-        );
-    }
+fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Completion> {
+    diagnostics::envelope(value, operation)?;
     let output = value["output"]
         .as_array()
         .context("Responses response lacks output array")?;
@@ -359,7 +390,7 @@ fn completion(value: &Value) -> Result<Completion> {
                         .as_str()
                         .context("function call lacks arguments")?,
                 )
-                .context("invalid function arguments JSON")?;
+                .map_err(|_| diagnostics::function_arguments(operation))?;
                 calls.push(ToolCall {
                     id: id.into(),
                     name: name.into(),
@@ -381,13 +412,15 @@ fn completion(value: &Value) -> Result<Completion> {
 impl Provider for ResponsesProvider {
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         tokio::time::timeout(crate::IO_TIMEOUT, async {
-            let mut url = reqwest::Url::parse(&format!("{}/models", self.base))?;
+            let operation = self.operation(true);
+            let mut url = reqwest::Url::parse(&format!("{}/models", self.base))
+                .map_err(|_| diagnostics::invalid_endpoint())?;
             if self.is_subscription() {
                 url.query_pairs_mut()
                     .append_pair("client_version", CATALOG_COMPATIBILITY);
             }
             let builder = self.client.get(url).timeout(crate::IO_TIMEOUT);
-            let value = http::json(self.send(builder).await?).await?;
+            let value = diagnostics::json(self.send(builder, operation).await?, operation).await?;
             if self.is_subscription() {
                 return subscription_models(&value);
             }
@@ -490,13 +523,14 @@ impl ResponsesProvider {
         if self.is_subscription() {
             builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
         }
-        let response = self.send(builder).await?;
+        let operation = self.operation(false);
+        let response = self.send(builder, operation).await?;
         let value = if self.is_subscription() {
-            sse::response(response, crate::IO_TIMEOUT).await?
+            sse::response(response, crate::IO_TIMEOUT, operation).await?
         } else {
-            http::json(response).await?
+            diagnostics::json(response, operation).await?
         };
-        let result = completion(&value)?;
+        let result = completion(&value, operation)?;
         *pending = if result.calls.is_empty() {
             None
         } else {
@@ -619,7 +653,7 @@ mod tests {
             .unwrap_err();
         let diagnostic = format!("{error:#}");
         assert!(
-            diagnostic.contains("operation timed out")
+            diagnostic.contains("transport timed out")
                 || diagnostic.contains("Responses request exceeded 600-second total limit"),
             "{diagnostic}"
         );
@@ -764,7 +798,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("set KURU_")
+                .contains("authentication environment variable is not set")
         );
         let mut auto = request();
         auto.model = "auto".into();
@@ -788,7 +822,10 @@ mod tests {
             json!({"output":[{"type":"function_call","call_id":"a","name":"x","arguments":"not-json"}]}),
             json!({"output":[{"type":"function_call","call_id":"a","name":"x","arguments":"{}"},{"type":"function_call","call_id":"a","name":"x","arguments":"{}"}]}),
         ] {
-            assert!(completion(&value).is_err(), "{value}");
+            assert!(
+                completion(&value, diagnostics::Operation::ResponsesCompletion).is_err(),
+                "{value}"
+            );
         }
         let pending = Pending {
             input: vec![],
@@ -814,6 +851,319 @@ mod tests {
         assert_eq!(
             input_items(&malformed, Some(&pending)).unwrap()[0]["role"],
             "user"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_envelopes_do_not_render_remote_values() {
+        let peer = HttpFixture::new(vec![
+            json!({"error":{"message":"http-200-message-secret","code":"unknown-code","type":"unknown-type"}}),
+            json!({"status":"unexpected-status-secret","output":[]}),
+        ]
+        .into_iter()
+        .map(Reply::json)
+        .collect())
+        .await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        for _ in 0..2 {
+            let error = provider.complete(request()).await.unwrap_err();
+            let display = format!("{error:#}");
+            let debug = format!("{error:?}");
+            for secret in [
+                "http-200-message-secret",
+                "unknown-code",
+                "unknown-type",
+                "unexpected-status-secret",
+            ] {
+                assert!(
+                    !display.contains(secret) && !debug.contains(secret),
+                    "remote value escaped: {display} / {debug}"
+                );
+            }
+        }
+        assert_eq!(peer.requests.lock().await.len(), 2);
+    }
+
+    #[test]
+    fn provider_parser_and_environment_errors_do_not_retain_values() {
+        let value = json!({"output":[{"type":"function_call","call_id":"call","name":"tool","arguments":"{arguments-secret"}]});
+        let error = completion(&value, diagnostics::Operation::ResponsesCompletion).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Responses completion contained invalid function arguments"
+        );
+        assert!(!format!("{error:#}").contains("arguments-secret"));
+        assert!(!format!("{error:?}").contains("arguments-secret"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let error = environment_error(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from_vec(b"environment-value-secret\xff".to_vec()),
+            ));
+            assert_eq!(
+                error.to_string(),
+                "Responses API authentication environment variable is not valid Unicode"
+            );
+            assert!(!format!("{error:#}").contains("environment-value-secret"));
+            assert!(!format!("{error:?}").contains("environment-value-secret"));
+
+            let error = environment_key("configured-name-secret\0").unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Responses API authentication environment variable is not set"
+            );
+            assert!(!format!("{error:#}").contains("configured-name-secret"));
+            assert!(!format!("{error:?}").contains("configured-name-secret"));
+        }
+
+        let error = environment_value(" \t".into()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Responses API authentication environment variable is empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_http_diagnostics_are_finite_and_redacted() {
+        let mut model =
+            Reply::json(json!({"error":{"message":"model-body-secret","code":"model_not_found"}}));
+        model.status = reqwest::StatusCode::BAD_REQUEST;
+        let mut quota = Reply::json(
+            json!({"error":{"message":"billing-body-secret","type":"insufficient_quota"}}),
+        );
+        quota.status = reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let mut oversized = Reply::json(
+            json!({"error":{"message":"oversized-body-secret","padding":"x".repeat(9 * 1024)}}),
+        );
+        oversized.status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
+        let peer = HttpFixture::new(vec![model, quota, oversized]).await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        for expected in [
+            "selected model is unavailable or access is denied (HTTP 400)",
+            "quota or billing limit (HTTP 429)",
+            "service failed (HTTP 500)",
+        ] {
+            let error = provider.complete(request()).await.unwrap_err();
+            let display = format!("{error:#}");
+            let debug = format!("{error:?}");
+            assert!(display.contains(expected), "{display}");
+            for secret in [
+                "model-body-secret",
+                "billing-body-secret",
+                "oversized-body-secret",
+            ] {
+                assert!(
+                    !display.contains(secret) && !debug.contains(secret),
+                    "remote body escaped: {display} / {debug}"
+                );
+            }
+        }
+        assert_eq!(peer.requests.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn response_catalog_diagnostics_use_the_catalog_operation_and_redact_bodies() {
+        let mut reply = Reply::json(
+            json!({"error":{"message":"catalog-body-secret","code":"model_not_found"}}),
+        );
+        reply.status = reqwest::StatusCode::NOT_FOUND;
+        let peer = HttpFixture::new(vec![reply]).await;
+        let error = ResponsesProvider::new(&peer.url, "")
+            .unwrap()
+            .models()
+            .await
+            .unwrap_err();
+        let display = format!("{error:#}");
+        let debug = format!("{error:?}");
+        assert!(
+            display.contains(
+                "Responses model catalog selected model is unavailable or access is denied (HTTP 404)"
+            ),
+            "{display}"
+        );
+        assert!(
+            !display.contains("catalog-body-secret") && !debug.contains("catalog-body-secret"),
+            "catalog body escaped: {display} / {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_error_body_falls_back_without_quota_classification() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            let body = json!({"error":{"type":"insufficient_quota","message":"chunked-quota-secret","padding":"x".repeat(9 * 1024)}}).to_string();
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket
+                .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        });
+        let error = ResponsesProvider::new(&url, "")
+            .unwrap()
+            .complete(request())
+            .await
+            .unwrap_err();
+        let display = format!("{error:#}");
+        let debug = format!("{error:?}");
+        assert!(display.contains("rate limited (HTTP 429)"), "{display}");
+        assert!(
+            !display.contains("quota or billing")
+                && !display.contains("chunked-quota-secret")
+                && !debug.contains("chunked-quota-secret"),
+            "chunked diagnostic body escaped or was classified: {display} / {debug}"
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_error_body_uses_status_fallback_inside_operation_budget() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\n{\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let provider = ResponsesProvider::new(&url, "").unwrap();
+        let started = std::time::Instant::now();
+        let error = provider.complete(request()).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "diagnostic body read exceeded its bounded fallback"
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("rate limited (HTTP 429)"),
+            "{diagnostic}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn dribbling_error_body_uses_one_total_diagnostic_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for _ in 0..4 {
+                if socket.write_all(b"1\r\n{\r\n").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = ResponsesProvider::new(&url, "")
+            .unwrap()
+            .complete(request())
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(2600),
+            "diagnostic deadline restarted after a body chunk"
+        );
+        assert!(
+            format!("{error:#}").contains("rate limited (HTTP 429)"),
+            "{error:#}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn enclosing_completion_deadline_preempts_diagnostic_body_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\n{\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let mut provider = ResponsesProvider::new(&url, "").unwrap();
+        provider.completion_timeout = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let error = provider.complete(request()).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "diagnostic reader extended the enclosing completion budget"
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("Responses request exceeded 600-second total limit")
+                || diagnostic.contains("rate limited (HTTP 429)"),
+            "{diagnostic}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn provider_transport_errors_do_not_retain_endpoint_queries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/?configured-query-secret=untrusted",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+        let error = ResponsesProvider::new(&endpoint, "")
+            .unwrap()
+            .complete(request())
+            .await
+            .unwrap_err();
+        let display = format!("{error:#}");
+        let debug = format!("{error:?}");
+        assert!(display.contains("transport connection failed"), "{display}");
+        assert!(
+            !display.contains("configured-query-secret")
+                && !debug.contains("configured-query-secret"),
+            "endpoint query escaped: {display} / {debug}"
         );
     }
 

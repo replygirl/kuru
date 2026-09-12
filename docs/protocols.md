@@ -33,14 +33,22 @@ and the configured API-key environment variable. It discovers model IDs from
 `/models`, submits messages and function tool schemas to `/responses`, and
 passes configured reasoning effort. API model catalogs do not necessarily
 advertise effort capabilities; an empty effort list means no catalog restriction
-was supplied, not that every effort is guaranteed to work. The provider's error
-remains authoritative for unsupported model/effort combinations.
+was supplied, not that every effort is guaranteed to work. Provider failures use
+fixed status and supported-code categories; Kuru does not retain or render remote
+error messages, unknown codes, parser excerpts, or endpoint queries.
 
 Responses completions have a 600-second total operation budget while model
 catalog requests remain bounded to 60 seconds. SSE keeps at most 2 MiB of its
 completed response; ignored deltas and framing use separate finite wire and
 parser limits. A truncated, oversized, or failed stream is an error and is not
 replayed after partial output.
+
+For provider failures, Kuru reads at most 8 KiB of a failed HTTP body for up to
+two seconds, within the existing catalog or completion budget. Known API
+statuses and supported provider codes can produce a fixed diagnostic such as a
+model-access, quota, rate-limit, or service failure; unknown response details
+fall back to a fixed status or stream failure. A transport classification never
+authorizes a replay.
 
 `api_base` and `api_key_env` apply to the `responses` provider only. ChatGPT
 credentials never go to the configurable API endpoint, and authentication

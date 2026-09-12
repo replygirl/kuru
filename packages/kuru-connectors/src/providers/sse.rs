@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 
 use crate::MAX_BYTES;
 
+use super::diagnostics::{self, Operation};
+
 // The retained result remains Kuru's 2 MiB protocol limit. SSE transport can
 // contain independently discarded deltas and framing, but never grows without
 // a bounded wire, event, or line budget.
@@ -18,12 +20,12 @@ const MAX_SSE_WIRE_BYTES: usize = MAX_BYTES * 32;
 const MAX_SSE_EVENT_BYTES: usize = MAX_BYTES * 2;
 const MAX_SSE_LINE_BYTES: usize = MAX_SSE_EVENT_BYTES;
 
-pub(super) async fn response(mut response: reqwest::Response, idle: Duration) -> Result<Value> {
-    ensure!(
-        response.status().is_success(),
-        "HTTP request failed: {}",
-        response.status()
-    );
+pub(super) async fn response(
+    response: reqwest::Response,
+    idle: Duration,
+    operation: Operation,
+) -> Result<Value> {
+    let mut response = diagnostics::successful(response, operation).await?;
     ensure!(
         response.content_length().unwrap_or(0) <= MAX_SSE_WIRE_BYTES as u64,
         "Responses stream exceeds wire size limit"
@@ -44,7 +46,8 @@ pub(super) async fn response(mut response: reqwest::Response, idle: Duration) ->
     loop {
         let chunk = tokio::time::timeout(idle, response.chunk())
             .await
-            .context("Responses stream exceeded idle timeout")??;
+            .context("Responses stream exceeded idle timeout")?
+            .map_err(|error| diagnostics::transport(operation, error))?;
         let Some(chunk) = chunk else {
             bail!("Responses stream closed before response.completed");
         };
@@ -101,7 +104,7 @@ impl Decoder {
 
     fn end_line(&mut self) -> Result<Option<Value>> {
         let line = std::mem::take(&mut self.line);
-        let line = std::str::from_utf8(&line).context("Responses event contains invalid UTF-8")?;
+        let line = std::str::from_utf8(&line).map_err(|_| diagnostics::stream_protocol())?;
         let line = if self.started {
             line
         } else {
@@ -114,7 +117,7 @@ impl Decoder {
             }
             let data = std::mem::take(&mut self.data);
             let event: Value =
-                serde_json::from_str(&data).context("invalid Responses event JSON")?;
+                serde_json::from_str(&data).map_err(|_| diagnostics::stream_protocol())?;
             return self.event(event);
         }
         if let Some(value) = line.strip_prefix("data:") {
@@ -166,7 +169,7 @@ impl Decoder {
                     "duplicate completed output index"
                 );
                 let item_bytes = serde_json::to_vec(item)
-                    .context("completed output cannot be measured")?
+                    .map_err(|_| diagnostics::stream_protocol())?
                     .len();
                 let separator_bytes = if self.items.is_empty() { 2 } else { 1 };
                 let retained = self
@@ -226,7 +229,7 @@ impl Decoder {
                 }
                 response["status"] = json!("completed");
                 let response_bytes = serde_json::to_vec(&response)
-                    .context("completed response cannot be measured")?
+                    .map_err(|_| diagnostics::stream_protocol())?
                     .len();
                 ensure!(
                     response_bytes <= MAX_BYTES,
@@ -236,9 +239,8 @@ impl Decoder {
             }
             // Do not echo remote messages: they can contain tokens or actor
             // context. The event classification is sufficient for this error.
-            "response.failed" => bail!("Responses stream reported response.failed"),
-            "response.incomplete" => bail!("Responses stream reported response.incomplete"),
-            "error" => bail!("Responses stream reported an error"),
+            "response.failed" => return Err(diagnostics::stream_event(&event)),
+            "response.incomplete" | "error" => return Err(diagnostics::stream_failed()),
             _ => {}
         }
         Ok(None)
@@ -362,5 +364,15 @@ mod tests {
                 .to_string()
                 .contains("event line")
         );
+
+        let error = Decoder::default()
+            .push(b"data: {\"parser-secret\":\n\n")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ChatGPT completion stream contained invalid protocol data"
+        );
+        assert!(!format!("{error:#}").contains("parser-secret"));
+        assert!(!format!("{error:?}").contains("parser-secret"));
     }
 }

@@ -96,6 +96,12 @@ requests. The `responses` provider uses an API key; `api_base` and `api_key_env`
 apply only to that provider. Setting an API key does not change the selected
 provider, and ChatGPT credentials are never sent to the configurable API base.
 
+Provider diagnostics use fixed status and supported-code categories. Kuru does
+not show remote error messages, unknown codes, raw parser input, or configured
+endpoint queries. Failed provider bodies are read only up to 8 KiB and two
+seconds within the existing request budget; a failed or partial stream is not
+replayed.
+
 An API key belongs in its environment variable, not the TOML file. Kuru keeps
 ChatGPT credentials in the private `auth/openai` directory beneath its data
 directory. Use the same `--data-dir` or `KURU_DATA_DIR` for login and chat, and
