@@ -52,6 +52,15 @@ fn run(executable: &Path) -> io::Result<()> {
             std::env::current_exe()
         ),
     )?;
+    fs::write(
+        directory.join(format!("{}.environment", process::id())),
+        format!(
+            "inherited={}\noverride={}\n",
+            std::env::var_os("KURU_MCP_INHERITED_SENTINEL").is_some(),
+            std::env::var_os("KURU_MCP_CONFIGURED_SENTINEL")
+                .is_some_and(|value| value == "configured")
+        ),
+    )?;
     let plan_path = executable.with_extension("plan");
     let plan = fs::read_to_string(&plan_path).map_err(|error| {
         io::Error::new(

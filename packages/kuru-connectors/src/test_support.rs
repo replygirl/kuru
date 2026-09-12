@@ -9,10 +9,34 @@ use axum::{
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
+    io,
     path::PathBuf,
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
-use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    sync::Mutex,
+};
+
+/// Retain a bounded diagnostic prefix while continuing to drain an owned test
+/// child pipe. A fixture failure must not let a noisy child grow test memory or
+/// keep its parent waiting on a full pipe.
+pub async fn drain_bounded(
+    reader: &mut (impl AsyncRead + Unpin),
+    retained: &mut Vec<u8>,
+) -> io::Result<bool> {
+    let mut buffer = [0; 8192];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(truncated);
+        }
+        let keep = count.min(crate::MAX_BYTES.saturating_sub(retained.len()));
+        retained.extend_from_slice(&buffer[..keep]);
+        truncated |= keep != count;
+    }
+}
 
 #[derive(Clone)]
 pub struct Recorded {
@@ -190,6 +214,19 @@ impl StdioFixture {
                     .map(|line| serde_json::from_str(line).unwrap())
                     .collect()
             })
+            .collect()
+    }
+
+    pub fn environment_observations(&self) -> Vec<String> {
+        let mut paths: Vec<_> = std::fs::read_dir(self.directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|value| value == "environment"))
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| std::fs::read_to_string(path).unwrap())
             .collect()
     }
 

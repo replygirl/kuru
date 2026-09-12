@@ -271,6 +271,123 @@ async fn rejected_subscription_rotates_once_without_changing_account_or_route() 
 }
 
 #[tokio::test]
+async fn rejected_503_then_401_shares_one_finite_rotation_budget() {
+    let mut unavailable = Reply::json(json!({"error":{"message":"subscription-transient-secret"}}));
+    unavailable.status = StatusCode::SERVICE_UNAVAILABLE;
+    let rotated = crate::auth::test_future_jwt("account-one");
+    let peer = Peer::new(vec![
+        unavailable,
+        unauthorized(),
+        Reply::json(
+            json!({"access_token":rotated,"refresh_token":"rotated-refresh","expires_in":3600}),
+        ),
+        message("bounded rotation"),
+        message("later operation"),
+    ])
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    assert_eq!(
+        provider.complete(request()).await.unwrap().text,
+        "bounded rotation"
+    );
+    assert_eq!(
+        provider.complete(request()).await.unwrap().text,
+        "later operation"
+    );
+    let sent = peer.requests.lock().await;
+    assert_eq!(sent.len(), 5);
+    assert_eq!(sent[0].uri.path(), "/responses");
+    assert_eq!(sent[1].uri.path(), "/responses");
+    assert_eq!(sent[2].uri.path(), "/oauth/token");
+    assert_eq!(sent[3].uri.path(), "/responses");
+    assert_eq!(sent[4].uri.path(), "/responses");
+    assert_eq!(sent[0].body, sent[1].body);
+    assert_eq!(sent[1].body, sent[3].body);
+    assert_eq!(
+        sent[0].headers["authorization"],
+        "Bearer subscription-access"
+    );
+    assert_eq!(
+        sent[1].headers["authorization"],
+        "Bearer subscription-access"
+    );
+    assert_eq!(
+        sent[3].headers["authorization"],
+        format!("Bearer {rotated}")
+    );
+    assert_eq!(
+        sent[4].headers["authorization"],
+        format!("Bearer {rotated}")
+    );
+}
+
+#[tokio::test]
+async fn subscription_completion_and_catalog_retry_explicit_rejections() {
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let mut rejected = Reply::json(json!({"error":{"message":"native-retry-secret"}}));
+        rejected.status = status;
+        let peer = Peer::new(vec![rejected, message("retried")]).await;
+        let (provider, _manager, _directory) = subscription(&peer).await;
+        assert_eq!(provider.complete(request()).await.unwrap().text, "retried");
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent.len(), 2, "completion status {status}");
+        assert_eq!(sent[0].body, sent[1].body);
+        assert_eq!(
+            sent[0].headers["authorization"],
+            sent[1].headers["authorization"]
+        );
+
+        let mut rejected = Reply::json(json!({"error":{"message":"native-retry-secret"}}));
+        rejected.status = status;
+        let peer = Peer::new(vec![
+            rejected,
+            Reply::json(json!({"models":[{"slug":"future-model"}]})),
+        ])
+        .await;
+        let (provider, _manager, _directory) = subscription(&peer).await;
+        assert_eq!(provider.models().await.unwrap()[0].id, "future-model");
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent.len(), 2, "catalog status {status}");
+        assert_eq!(sent[0].method, Method::GET);
+        assert_eq!(sent[1].method, Method::GET);
+        assert_eq!(
+            sent[0].headers["authorization"],
+            sent[1].headers["authorization"]
+        );
+    }
+
+    let peer = Peer::new(
+        (0..3)
+            .map(|_| {
+                let mut reply = Reply::json(json!({
+                    "error": {
+                        "type": "insufficient_quota",
+                        "code": "project_spend_limit_exceeded",
+                        "message": "subscription-secret"
+                    }
+                }));
+                reply.status = StatusCode::TOO_MANY_REQUESTS;
+                reply
+            })
+            .collect(),
+    )
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    let error = provider.complete(request()).await.err().unwrap();
+    assert_eq!(peer.requests.lock().await.len(), 3);
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("retry budget exhausted"),
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains("billing") && !diagnostic.contains("subscription-secret"));
+}
+
+#[tokio::test]
 async fn repeated_401_and_partial_stream_errors_do_not_retry_or_leak_tokens() {
     let peer = Peer::new(vec![
         unauthorized(),
@@ -303,7 +420,7 @@ async fn native_failed_events_and_initial_statuses_use_fixed_diagnostics() {
     let mut initial = Reply::json(
         json!({"error":{"message":"native-status-secret","code":"model_not_found","type":"insufficient_quota"}}),
     );
-    initial.status = StatusCode::TOO_MANY_REQUESTS;
+    initial.status = StatusCode::FORBIDDEN;
     let peer = Peer::new(vec![
         stream(vec![json!({"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"native-known-secret"}}})]),
         stream(vec![json!({"type":"response.failed","response":{"error":{"code":"future-native-code","type":"future-native-type","message":"native-unknown-secret"}}})]),
@@ -314,7 +431,7 @@ async fn native_failed_events_and_initial_statuses_use_fixed_diagnostics() {
     for expected in [
         "ChatGPT service is overloaded",
         "ChatGPT completion stream failed before completion",
-        "ChatGPT completion is rate limited (HTTP 429)",
+        "ChatGPT completion access was denied (HTTP 403)",
     ] {
         let error = provider.complete(request()).await.unwrap_err();
         let display = format!("{error:#}");

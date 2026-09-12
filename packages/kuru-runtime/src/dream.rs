@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use futures::future::join_all;
-use kuru_core::{Config, Mode, Part, ToolSpec};
+use kuru_core::{Config, Mode, Part, ToolSpec, canonical_peer_instruction};
 use kuru_memory::{Candidate, MemoryStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -186,11 +186,7 @@ impl Harness {
                     role,
                     instruction,
                 } => {
-                    if name.trim().is_empty()
-                        || name.len() > 128
-                        || instruction.trim().is_empty()
-                        || instruction.len() > 8192
-                    {
+                    if name.trim().is_empty() || name.len() > 128 {
                         Err(anyhow::anyhow!(
                             "new part requires a short name and 1–8192 byte instruction"
                         ))
@@ -205,14 +201,15 @@ impl Harness {
                     {
                         Err(anyhow::anyhow!("active part name already exists"))
                     } else {
-                        candidate.parts.push(Part {
-                            id: Uuid::new_v4().to_string(),
-                            name: name.clone(),
-                            role: role.clone(),
-                            instruction: instruction.clone(),
-                            active: true,
-                        });
-                        Ok(())
+                        canonical_peer_instruction(instruction).map(|instruction| {
+                            candidate.parts.push(Part {
+                                id: Uuid::new_v4().to_string(),
+                                name: name.clone(),
+                                role: role.clone(),
+                                instruction,
+                                active: true,
+                            });
+                        })
                     }
                 }
                 DreamProposal::Retire { id } => {

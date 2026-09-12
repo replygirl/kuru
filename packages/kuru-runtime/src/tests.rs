@@ -16,6 +16,7 @@ use axum::{
 use kuru_connectors::{Provider, ToolHost};
 use kuru_core::{
     Completion, CompletionRequest, Config, Mode, ModelInfo, RelationshipKind, ToolCall,
+    canonical_peer_instruction,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -449,6 +450,35 @@ async fn dreaming_adds_retires_and_undoes_without_losing_memories() {
             .active
     );
     assert!(harness.undo_dream().await.is_err());
+}
+
+#[tokio::test]
+async fn dream_additions_persist_the_equal_peer_preamble() {
+    let (_dir, mut harness) = fixture(Mode::Freudian, Fake::new(|_| answer("Summary"))).await;
+    let role = harness.topology.parts[0].role.clone();
+    let tendency = "Compare practical alternatives without supervising the pool";
+
+    let report = harness
+        .apply_dream(vec![DreamProposal::Add {
+            name: "Alternative".into(),
+            role,
+            instruction: tendency.into(),
+        }])
+        .await
+        .unwrap();
+
+    assert_eq!(report.accepted.len(), 1);
+    let added = harness
+        .topology
+        .parts
+        .iter()
+        .find(|part| part.name == "Alternative")
+        .unwrap();
+    assert_eq!(
+        added.instruction,
+        canonical_peer_instruction(tendency).unwrap(),
+        "dream additions must persist the same equal-peer preamble as builtins"
+    );
 }
 
 #[tokio::test]

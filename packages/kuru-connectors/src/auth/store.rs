@@ -13,7 +13,7 @@ use std::{
 const RECORD: &str = "credentials.json";
 const LOCK: &str = "credentials.lock";
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Session {
     pub access_token: String,
@@ -53,7 +53,7 @@ impl Session {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Record {
     schema_version: u32,
@@ -73,6 +73,17 @@ impl Record {
 pub(super) struct Store {
     path: PathBuf,
     tool_root: PathBuf,
+    #[cfg(test)]
+    faults: std::sync::Arc<std::sync::Mutex<TestFaults>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestFaults {
+    write_target: Option<usize>,
+    writes: usize,
+    read_target: Option<usize>,
+    reads: usize,
 }
 impl Store {
     pub fn new(data: PathBuf, tool_root: PathBuf) -> Result<Self> {
@@ -88,6 +99,8 @@ impl Store {
         Ok(Self {
             path: data.join("auth").join("openai"),
             tool_root,
+            #[cfg(test)]
+            faults: Default::default(),
         })
     }
 
@@ -169,21 +182,51 @@ impl Store {
         directory
             .verify(OsStr::new(LOCK), &lock)
             .context("authentication lease identity changed")?;
-        Ok(Some(Lease { directory, lock }))
+        Ok(Some(Lease {
+            directory,
+            lock,
+            #[cfg(test)]
+            faults: self.faults.clone(),
+        }))
     }
 
     #[cfg(test)]
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+
+    #[cfg(test)]
+    pub fn fail_after_publish_on_write(&self, target: usize) {
+        let mut faults = self.faults.lock().unwrap();
+        faults.write_target = Some(target);
+        faults.writes = 0;
+    }
+
+    #[cfg(test)]
+    pub fn fail_on_read(&self, target: usize) {
+        let mut faults = self.faults.lock().unwrap();
+        faults.read_target = Some(target);
+        faults.reads = 0;
+    }
 }
 
 pub(super) struct Lease {
     directory: Directory,
     lock: File,
+    #[cfg(test)]
+    faults: std::sync::Arc<std::sync::Mutex<TestFaults>>,
 }
 impl Lease {
     pub fn read(&self) -> Result<Option<Record>> {
+        #[cfg(test)]
+        {
+            let mut faults = self.faults.lock().unwrap();
+            faults.reads += 1;
+            if faults.read_target == Some(faults.reads) {
+                faults.read_target = None;
+                anyhow::bail!("synthetic authentication read failure")
+            }
+        }
         self.directory.verify(OsStr::new(LOCK), &self.lock)?;
         read_record(&self.directory)
     }
@@ -212,6 +255,15 @@ impl Lease {
             .context(
                 "publish private authentication record; uncertain candidates remain private",
             )?;
+        #[cfg(test)]
+        {
+            let mut faults = self.faults.lock().unwrap();
+            faults.writes += 1;
+            if faults.write_target == Some(faults.writes) {
+                faults.write_target = None;
+                anyhow::bail!("synthetic authentication publication reply loss")
+            }
+        }
         Ok(())
     }
 }

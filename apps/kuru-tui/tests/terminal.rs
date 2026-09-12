@@ -164,6 +164,49 @@ fn terminal_fixture_process() -> Result<()> {
             input.read_exact(&mut acknowledgment)?;
             crossterm::terminal::disable_raw_mode()?;
         }
+        "error-unwind" => {
+            let report = std::path::PathBuf::from(std::env::var("KURU_TERMINAL_ERROR_REPORT")?);
+            let mut session = kuru::ui::TerminalSession::enter(&mut std::io::stdout())?;
+            // The parent waits for this completed frame before sending the
+            // key below. The fixture owns one real EventStream until that
+            // input is observed, then drops it before restoration.
+            std::io::stdout().write_all(b"\x1b[2J\x1b[HEVENTSTREAM_READY\x1b[?25h\x1b[1;18H")?;
+            std::io::stdout().flush()?;
+            let observed = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()?
+                .block_on(async {
+                    use futures::StreamExt as _;
+
+                    let mut input = crossterm::event::EventStream::new();
+                    let event = tokio::time::timeout(Duration::from_secs(5), input.next())
+                        .await
+                        .context("timed out waiting for native EventStream input")?;
+                    match event {
+                        Some(Ok(crossterm::event::Event::Key(key)))
+                            if key.code == crossterm::event::KeyCode::Char('x') =>
+                        {
+                            Ok(())
+                        }
+                        Some(Ok(event)) => {
+                            anyhow::bail!("unexpected native EventStream event: {event:?}")
+                        }
+                        Some(Err(error)) => Err(error.into()),
+                        None => anyhow::bail!("native EventStream closed before the test key"),
+                    }
+                });
+            let original = match &observed {
+                Ok(()) => anyhow::anyhow!("injected native terminal input failure"),
+                Err(error) => anyhow::anyhow!("{error:#}"),
+            };
+            // Mirror `ui::run`: restoration is explicit after a loop error,
+            // before the original error is returned to the caller.
+            let restore = session.restore();
+            std::fs::write(
+                report,
+                format!("event: {observed:?}\noriginal: {original:#}\nrestore: {restore:?}"),
+            )?;
+        }
         other => anyhow::bail!("unknown fixture mode {other}"),
     }
     Ok(())
@@ -180,6 +223,21 @@ fn fixture(mode: &str) -> Result<Terminal> {
             "--test-threads=1",
         ])
         .env("KURU_TERMINAL_FIXTURE", mode);
+    Terminal::spawn(command, 35, 120)
+}
+
+fn error_unwind_fixture(report: &std::path::Path) -> Result<Terminal> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--exact",
+            "terminal_fixture_process",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("KURU_TERMINAL_FIXTURE", "error-unwind")
+        .env("KURU_TERMINAL_ERROR_REPORT", report);
     Terminal::spawn(command, 35, 120)
 }
 
@@ -256,6 +314,24 @@ fn terminal_driver_waits_for_complete_frames_before_checking_quiescence() -> Res
     );
     terminal.send(b"q")?;
     terminal.wait_exit(EXIT_TIMEOUT)
+}
+
+#[test]
+fn real_pty_error_unwind_restores_terminal_and_reports_the_original_error() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let report = directory.path().join("error.txt");
+    let mut terminal = error_unwind_fixture(&report)?;
+    terminal.wait_composer_frame(&["EVENTSTREAM_READY"], READY_TIMEOUT)?;
+    terminal.send(b"x")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    let report = std::fs::read_to_string(report)?;
+    assert!(report.contains("event: Ok(())"), "{report}");
+    assert!(
+        report.contains("injected native terminal input failure"),
+        "{report}"
+    );
+    assert!(report.contains("restore: Ok(())"), "{report}");
+    terminal.assert_restored()
 }
 
 fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {

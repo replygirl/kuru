@@ -75,6 +75,30 @@ pub(super) async fn successful(response: Response, operation: Operation) -> Resu
     }
 }
 
+pub(super) struct Rejected {
+    pub error: Error,
+    pub retryable: bool,
+}
+
+pub(super) async fn rejected(mut response: Response, operation: Operation) -> Rejected {
+    let status = response.status();
+    let body = diagnostic_body(&mut response).await;
+    let retryable = match status {
+        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => true,
+        StatusCode::TOO_MANY_REQUESTS => {
+            !matches!(
+                operation,
+                Operation::ResponsesCompletion | Operation::ResponsesCatalog
+            ) || !is_responses_quota(body.as_ref())
+        }
+        _ => false,
+    };
+    Rejected {
+        error: Error::msg(status_message(operation, status, body.as_ref())),
+        retryable,
+    }
+}
+
 pub(super) async fn json(response: Response, operation: Operation) -> Result<Value> {
     let mut response = successful(response, operation).await?;
     ensure!(
@@ -165,9 +189,6 @@ fn status_message(operation: Operation, status: StatusCode, body: Option<&Value>
     let code = body
         .and_then(|body| body.pointer("/error/code"))
         .and_then(Value::as_str);
-    let kind = body
-        .and_then(|body| body.pointer("/error/type"))
-        .and_then(Value::as_str);
     let status = status.as_u16();
     let responses = matches!(
         operation,
@@ -178,19 +199,7 @@ fn status_message(operation: Operation, status: StatusCode, body: Option<&Value>
             "{operation} selected model is unavailable or access is denied (HTTP {status})"
         );
     }
-    if responses
-        && status == 429
-        && (kind == Some("insufficient_quota")
-            || matches!(
-                code,
-                Some(
-                    "credit_balance_exhausted"
-                        | "organization_usage_limit_exceeded"
-                        | "organization_spend_limit_exceeded"
-                        | "project_spend_limit_exceeded"
-                )
-            ))
-    {
+    if responses && status == 429 && is_responses_quota(body) {
         return format!("{operation} is blocked by an API quota or billing limit (HTTP 429)");
     }
     match status {
@@ -206,15 +215,38 @@ fn status_message(operation: Operation, status: StatusCode, body: Option<&Value>
 
 async fn failed(mut response: Response, operation: Operation) -> Error {
     let status = response.status();
-    let body = if response.content_length().unwrap_or(0) <= DIAGNOSTIC_BYTES as u64 {
-        match tokio::time::timeout(DIAGNOSTIC_TIMEOUT, read_diagnostic(&mut response)).await {
+    let body = diagnostic_body(&mut response).await;
+    Error::msg(status_message(operation, status, body.as_ref()))
+}
+
+fn is_responses_quota(body: Option<&Value>) -> bool {
+    let code = body
+        .and_then(|body| body.pointer("/error/code"))
+        .and_then(Value::as_str);
+    let kind = body
+        .and_then(|body| body.pointer("/error/type"))
+        .and_then(Value::as_str);
+    kind == Some("insufficient_quota")
+        || matches!(
+            code,
+            Some(
+                "credit_balance_exhausted"
+                    | "organization_usage_limit_exceeded"
+                    | "organization_spend_limit_exceeded"
+                    | "project_spend_limit_exceeded"
+            )
+        )
+}
+
+async fn diagnostic_body(response: &mut Response) -> Option<Value> {
+    if response.content_length().unwrap_or(0) <= DIAGNOSTIC_BYTES as u64 {
+        match tokio::time::timeout(DIAGNOSTIC_TIMEOUT, read_diagnostic(response)).await {
             Ok(Ok(Some(bytes))) => serde_json::from_slice(&bytes).ok(),
             Ok(Ok(None) | Err(_)) | Err(_) => None,
         }
     } else {
         None
-    };
-    Error::msg(status_message(operation, status, body.as_ref()))
+    }
 }
 
 async fn read_diagnostic(

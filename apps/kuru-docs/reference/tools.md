@@ -38,6 +38,16 @@ The built-in file tools enforce containment through capability-relative filesyst
 
 Shell execution requires `--allow-shell` or `allow_shell = true`. It runs with your process permissions, including possible network access and access beyond the project. It is not a sandbox.
 
+The built-in shell receives a finite compatibility subset of inherited variables
+for command discovery, home/profile, temporary paths, locale, time, and standard
+XDG locations. Provider/authentication variables, proxy configuration, agent
+sockets, arbitrary `KURU_*` variables, and shell-startup controls are omitted.
+Windows derives its stock system-shell paths and omits inherited `PSModulePath`,
+allowing stock PowerShell to reconstruct its standard module paths. This
+reduces accidental environment disclosure; it does not restrict filesystem,
+process, or network authority. Configured stdio MCP servers retain their own
+inherited environment and configured overrides.
+
 Commands use `sh` on macOS/Linux and stock Windows PowerShell on Windows. The default timeout is 30 seconds. `timeout_ms` accepts 1–120000 milliseconds. Standard output and standard error are each bounded to 2 MiB. Timeout or cancellation terminates the owned Unix process group or Windows Job, including descendants.
 
 ## Third-party tools

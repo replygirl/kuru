@@ -43,12 +43,33 @@ completed response; ignored deltas and framing use separate finite wire and
 parser limits. A truncated, oversized, or failed stream is an error and is not
 replayed after partial output.
 
+Within that same deadline, Kuru may retry an explicitly rejected provider
+response only for HTTP 429, 500, or 503, with at most three provider sends and
+two delays. One operation makes at most four application HTTP sends in total,
+including at most one subscription credential rotation. Fallback delays use
+equal jitter in the ranges 250–500 milliseconds and then 500–1000 milliseconds. One
+`Retry-After` delta-seconds or canonical IMF-fixdate value may raise the delay,
+but never past 30 seconds for one delay, 60 seconds in aggregate, or the
+operation deadline. A valid value that does not fit those bounds prevents a
+retry instead of being clamped. API quota and billing responses remain terminal.
+
 For provider failures, Kuru reads at most 8 KiB of a failed HTTP body for up to
 two seconds, within the existing catalog or completion budget. Known API
 statuses and supported provider codes can produce a fixed diagnostic such as a
 model-access, quota, rate-limit, or service failure; unknown response details
-fall back to a fixed status or stream failure. A transport classification never
-authorizes a replay.
+fall back to a fixed status or stream failure. After a response or stream is
+accepted, malformed, partial, idle, canceled, disconnected, and decoding
+outcomes are terminal and are never replayed. Ambiguous transport failures are
+also never replayed.
+
+Credential refresh remains under Kuru's private credential lease. A refresh
+POST may repeat once only when the pinned native HTTP/1 transport reports its
+audited connection-acquisition failure before the token request was dispatched;
+a timeout can be part of that audited class, but timeout status alone does not
+establish it. Proxy CONNECT, response, or other send failure also does not.
+Possibly dispatched refreshes are reconciled against the exact durable
+credential generation or pending record rather than replayed. Kuru does not
+claim that the remote provider implements request idempotency.
 
 `api_base` and `api_key_env` apply to the `responses` provider only. ChatGPT
 credentials never go to the configurable API endpoint, and authentication
@@ -84,6 +105,17 @@ process groups are terminated on timeout or cancellation.
 The shell uses your process authority, not a sandbox. Configured MCP servers
 also bring their own permissions; the built-in file/shell switches do not impose
 a sandbox on third-party tools.
+
+The built-in shell receives a finite compatibility subset of inherited
+environment variables for command discovery, home/profile, temporary paths,
+locale, time and standard XDG locations. It does not inherit provider or
+authentication variables, proxy configuration, agent sockets, arbitrary
+`KURU_*` values, or shell-startup controls. Windows additionally derives its
+stock system-shell paths and omits inherited `PSModulePath`, allowing stock
+PowerShell to reconstruct its standard module paths. This reduces accidental
+variable disclosure; it does not contain the shell's filesystem, process, or
+network authority. Configured stdio MCP servers keep their own inherited
+environment and explicit configuration overrides.
 
 ## MCP
 

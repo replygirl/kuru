@@ -215,19 +215,28 @@ mod bounded_unix {
         }
     }
 
-    async fn wait_for_group_gone(pid: Pid) -> io::Result<()> {
+    async fn wait_for_group_gone_with(
+        mut observe: impl FnMut() -> Result<(), Errno>,
+    ) -> io::Result<()> {
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
         loop {
-            match test_kill_process_group(pid) {
+            let permission_pending = match observe() {
                 Err(Errno::SRCH) => return Ok(()),
-                Ok(()) => {}
+                Ok(()) => false,
+                Err(Errno::PERM) => true,
                 Err(error) => {
                     return Err(io::Error::other(format!(
                         "post-cleanup process-group query: {error}"
                     )));
                 }
-            }
+            };
             if Instant::now() >= deadline {
+                if permission_pending {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "post-cleanup process-group permission persisted through cleanup deadline: EPERM",
+                    ));
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "owned process group survived cleanup",
@@ -235,6 +244,10 @@ mod bounded_unix {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    async fn wait_for_group_gone(pid: Pid) -> io::Result<()> {
+        wait_for_group_gone_with(|| test_kill_process_group(pid)).await
     }
 
     async fn stop_and_reap(child: &mut Child, pid: Pid) -> String {
@@ -390,6 +403,67 @@ mod bounded_unix {
             Err(io::Error::other(
                 "owned root was still running after both output pipes closed",
             ))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::VecDeque;
+
+        #[tokio::test]
+        async fn permission_then_absence_waits_for_observed_group_absence() {
+            let mut observed = VecDeque::from([Err(Errno::PERM), Err(Errno::SRCH)]);
+            wait_for_group_gone_with(|| observed.pop_front().expect("observer call"))
+                .await
+                .unwrap();
+            assert!(observed.is_empty(), "observer must wait for ESRCH");
+        }
+
+        #[tokio::test]
+        async fn persistent_permission_remains_a_bounded_error() {
+            let started = Instant::now();
+            let mut observed = 0usize;
+            let error = wait_for_group_gone_with(|| {
+                observed += 1;
+                Err(Errno::PERM)
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(
+                error
+                    .to_string()
+                    .contains("permission persisted through cleanup deadline: EPERM"),
+                "{error}"
+            );
+            assert!(started.elapsed() >= CLEANUP_TIMEOUT);
+            assert!(
+                started.elapsed() < CLEANUP_TIMEOUT + Duration::from_secs(1),
+                "permission observation exceeded its fixed cleanup deadline"
+            );
+            assert!(observed > 1, "permission must be observed more than once");
+        }
+
+        #[tokio::test]
+        async fn existing_group_then_absence_preserves_success() {
+            let mut observed = VecDeque::from([Ok(()), Err(Errno::SRCH)]);
+            wait_for_group_gone_with(|| observed.pop_front().expect("observer call"))
+                .await
+                .unwrap();
+            assert!(observed.is_empty());
+        }
+
+        #[tokio::test]
+        async fn unexpected_group_observation_preserves_failure() {
+            let error = wait_for_group_gone_with(|| Err(Errno::INVAL))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("post-cleanup process-group query: Invalid argument"),
+                "{error}"
+            );
         }
     }
 }

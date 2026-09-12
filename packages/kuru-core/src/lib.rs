@@ -13,5 +13,7 @@ pub use config::{
     ProjectPreferences, ResponsesRouteConfig, SafeClaimDisplay, SafeManifest, SafeSource,
     SelectionOverrides, load_instructions,
 };
-pub use framework::{Framework, Mode, Part, Relationship, RelationshipKind};
+pub use framework::{
+    Framework, Mode, Part, Relationship, RelationshipKind, canonical_peer_instruction,
+};
 pub use types::{Completion, CompletionRequest, Message, ModelInfo, ToolCall, ToolSpec};

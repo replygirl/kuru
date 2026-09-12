@@ -102,6 +102,26 @@ endpoint queries. Failed provider bodies are read only up to 8 KiB and two
 seconds within the existing request budget; a failed or partial stream is not
 replayed.
 
+Kuru may retry only an explicit HTTP 429, 500, or 503 rejection before accepting
+a response, with at most three provider sends, two delays, and four total
+application sends when a subscription credential rotation is included. Missing
+or invalid `Retry-After` values use equal jitter in the ranges 250–500
+milliseconds and then 500–1000 milliseconds; a valid delta-seconds or canonical
+HTTP date can raise a delay, but never beyond 30 seconds per delay, 60 seconds
+total, or the operation deadline. A valid value that cannot fit those bounds
+prevents a retry instead of being clamped. API
+quota/billing failures, ambiguous transport results, and every failure after a
+response or stream is accepted remain terminal and are not replayed.
+
+Subscription credential rotation is limited to one logical rotation per
+operation. A token refresh may repeat once only after the pinned native HTTP/1
+transport proves the first POST was not dispatched. That audited
+connection-acquisition class can itself report a timeout, but a timeout or proxy
+CONNECT observation alone proves nothing about dispatch. Responses and other
+possibly dispatched results are reconciled against Kuru's private credential
+record without replay. These bounds do not promise remote
+request idempotency and do not add retry behavior to MCP or A2A transports.
+
 An API key belongs in its environment variable, not the TOML file. Kuru keeps
 ChatGPT credentials in the private `auth/openai` directory beneath its data
 directory. Use the same `--data-dir` or `KURU_DATA_DIR` for login and chat, and
