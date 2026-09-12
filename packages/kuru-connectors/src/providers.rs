@@ -21,7 +21,7 @@ mod sse;
 mod subscription_tests;
 
 const SUBSCRIPTION_BASE: &str = "https://chatgpt.com/backend-api/codex";
-const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(600);
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
 // This describes the audited catalog wire contract, not Kuru's identity.
 const CATALOG_COMPATIBILITY: &str = "0.154.0";
 
@@ -121,6 +121,7 @@ pub struct ResponsesProvider {
     base: String,
     auth: Authentication,
     client: reqwest::Client,
+    completion_timeout: Duration,
     actors: Mutex<BTreeMap<String, Arc<Mutex<Option<Pending>>>>>,
 }
 
@@ -139,6 +140,7 @@ impl ResponsesProvider {
             base: base.trim_end_matches('/').into(),
             auth: Authentication::Environment(key_env.into()),
             client: http::client()?,
+            completion_timeout: COMPLETION_TIMEOUT,
             actors: Mutex::new(BTreeMap::new()),
         })
     }
@@ -153,9 +155,10 @@ impl ResponsesProvider {
             auth: Authentication::Subscription { manager, initial },
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(SUBSCRIPTION_TIMEOUT)
+                .timeout(COMPLETION_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            completion_timeout: COMPLETION_TIMEOUT,
             actors: Mutex::new(BTreeMap::new()),
         })
     }
@@ -410,12 +413,9 @@ impl Provider for ResponsesProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
-        if self.is_subscription() {
-            return tokio::time::timeout(SUBSCRIPTION_TIMEOUT, self.complete_request(request))
-                .await
-                .context("ChatGPT request exceeded 600-second total limit")?;
-        }
-        self.complete_request(request).await
+        tokio::time::timeout(self.completion_timeout, self.complete_request(request))
+            .await
+            .context("Responses request exceeded 600-second total limit")?
     }
 }
 
@@ -485,6 +485,7 @@ impl ResponsesProvider {
         let mut builder = self
             .client
             .post(format!("{}/responses", self.base))
+            .timeout(self.completion_timeout)
             .json(&body);
         if self.is_subscription() {
             builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
@@ -596,6 +597,104 @@ mod tests {
             .unwrap();
         assert_eq!(models[0].id, "future-2099");
         assert!(models[0].efforts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_key_completion_uses_its_operation_deadline() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let mut provider = ResponsesProvider::new(&url, "").unwrap();
+        provider.completion_timeout = Duration::from_millis(80);
+        let error = tokio::time::timeout(Duration::from_secs(1), provider.complete(request()))
+            .await
+            .unwrap()
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("operation timed out")
+                || diagnostic.contains("Responses request exceeded 600-second total limit"),
+            "{diagnostic}"
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_key_completion_overrides_shorter_generic_client_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 81\r\nConnection: close\r\n\r\n{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"text\":\"later\"}]}]}",
+                )
+                .await
+                .unwrap();
+        });
+        let mut provider = ResponsesProvider::new(&url, "").unwrap();
+        provider.client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_millis(80))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        provider.completion_timeout = Duration::from_secs(2);
+        let completion = tokio::time::timeout(Duration::from_secs(3), provider.complete(request()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completion.text, "later");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_key_catalog_keeps_its_separate_http_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"future-model\"}]}",
+                )
+                .await
+                .unwrap();
+        });
+        let mut provider = ResponsesProvider::new(&url, "").unwrap();
+        provider.completion_timeout = Duration::from_millis(80);
+        let models = tokio::time::timeout(Duration::from_secs(1), provider.models())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(models[0].id, "future-model");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

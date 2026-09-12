@@ -36,6 +36,12 @@ advertise effort capabilities; an empty effort list means no catalog restriction
 was supplied, not that every effort is guaranteed to work. The provider's error
 remains authoritative for unsupported model/effort combinations.
 
+Responses completions have a 600-second total operation budget while model
+catalog requests remain bounded to 60 seconds. SSE keeps at most 2 MiB of its
+completed response; ignored deltas and framing use separate finite wire and
+parser limits. A truncated, oversized, or failed stream is an error and is not
+replayed after partial output.
+
 `api_base` and `api_key_env` apply to the `responses` provider only. ChatGPT
 credentials never go to the configurable API endpoint, and authentication
 failures never select a different provider automatically. See

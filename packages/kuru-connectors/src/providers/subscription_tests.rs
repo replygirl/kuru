@@ -331,7 +331,7 @@ async fn malformed_incomplete_and_oversized_subscription_responses_are_errors() 
     let mut malformed = stream(vec![]);
     malformed.body = "data: not-json\n\n".into();
     let mut oversized = stream(vec![]);
-    oversized.body = "x".repeat(crate::MAX_BYTES + 1);
+    oversized.body = "x".repeat(crate::MAX_BYTES * 32 + 1);
     let peer = Peer::new(vec![
         malformed,
         stream(vec![json!({"type":"response.incomplete"})]),
@@ -508,7 +508,16 @@ async fn raw_subscription_stream(
     body: String,
     content_type: Option<&str>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    raw_subscription_stream_with_chunks(body, content_type, 1).await
+}
+
+async fn raw_subscription_stream_with_chunks(
+    body: String,
+    content_type: Option<&str>,
+    chunk_bytes: usize,
+) -> (String, tokio::task::JoinHandle<()>) {
     use tokio::io::AsyncWriteExt;
+    assert_ne!(chunk_bytes, 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let content_type = content_type
@@ -522,9 +531,15 @@ async fn raw_subscription_stream(
                 "HTTP/1.1 200 OK\r\n{content_type}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
             );
             socket.write_all(headers.as_bytes()).await.unwrap();
-            for byte in body.bytes() {
+            for bytes in body.as_bytes().chunks(chunk_bytes) {
                 // Invalid content can be rejected before the server finishes.
-                if socket.write_all(&[b'1', b'\r', b'\n', byte, b'\r', b'\n']).await.is_err() {
+                if socket
+                    .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                    .await
+                    .is_err()
+                    || socket.write_all(bytes).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
                     return;
                 }
             }
@@ -532,6 +547,26 @@ async fn raw_subscription_stream(
         }).await.expect("raw subscription fixture exceeded its bound");
     });
     (base, task)
+}
+
+#[tokio::test]
+async fn fragmented_discarded_subscription_sse_does_not_exhaust_retained_output_budget() {
+    let peer = Peer::new(vec![]).await;
+    let (mut provider, _manager, _directory) = subscription(&peer).await;
+    let discarded = ": ignored framing\n".repeat(crate::MAX_BYTES / 17 + 1);
+    let body = format!("{discarded}\n{}", message("small completion").body);
+    let (base, server) = raw_subscription_stream_with_chunks(body, None, 1024).await;
+    let _abort = AbortOnDrop(server.abort_handle());
+    provider.base = base;
+    let result = tokio::time::timeout(Duration::from_secs(5), provider.complete(request()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.text, "small completion");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
