@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use crate::unix_shell::ShellRegistry;
 use anyhow::{Context, Result, bail, ensure};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
@@ -18,10 +20,11 @@ use kuru_platform::fs::{Directory, NameRetention, Privacy};
 #[cfg(windows)]
 use kuru_platform::fs::{regular_file_info, validate_component};
 use serde_json::{Value, json};
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use std::process::Stdio;
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use tokio::process::Command;
+#[cfg(any(windows, test))]
 use tokio::{io::AsyncReadExt, time::timeout};
 #[cfg(windows)]
 type PathGuard = Directory;
@@ -171,6 +174,8 @@ pub struct ToolHost {
     allow_write: bool,
     allow_shell: bool,
     mcp: McpHosts,
+    #[cfg(unix)]
+    shells: ShellRegistry,
 }
 
 impl ToolHost {
@@ -198,6 +203,8 @@ impl ToolHost {
             root_guard,
             allow_write: config.allow_write,
             allow_shell: config.allow_shell,
+            #[cfg(unix)]
+            shells: ShellRegistry::new(),
         })
     }
 
@@ -384,8 +391,9 @@ impl ToolHost {
                     "timeout_ms must be 1..120000"
                 );
                 shell(
-                    self.root_guard.as_ref(),
-                    &self.root,
+                    self.shells(),
+                    self.root_guard.clone(),
+                    self.root.clone(),
                     string(&args, "command")?,
                     Duration::from_millis(duration),
                 )
@@ -396,7 +404,30 @@ impl ToolHost {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let (shell, mcp) = tokio::join!(self.shells.shutdown(), self.mcp.shutdown());
+            match (shell, mcp) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(shell), Ok(())) => Err(shell),
+                (Ok(()), Err(mcp)) => Err(mcp),
+                (Err(shell), Err(mcp)) => {
+                    Err(shell).context(format!("MCP shutdown also failed: {mcp:#}"))
+                }
+            }
+        }
+        #[cfg(not(unix))]
         self.mcp.shutdown().await
+    }
+
+    #[cfg(unix)]
+    fn shells(&self) -> &ShellRegistry {
+        &self.shells
+    }
+
+    #[cfg(all(unix, test))]
+    fn test_shells(&self) -> &ShellRegistry {
+        &self.shells
     }
 
     fn path(&self, value: &str, writing: bool) -> Result<(Dir, PathBuf, PathGuard)> {
@@ -529,65 +560,18 @@ fn spec(name: &str, description: &str, fields: &[&str], required: &[&str]) -> To
 }
 
 #[cfg(unix)]
-pub(crate) struct ProcessGroup(pub(crate) Option<u32>);
-
-#[cfg(unix)]
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0 {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-    }
-}
-
-#[cfg(unix)]
 async fn shell(
-    root_guard: &Directory,
-    root: &Path,
+    registry: &ShellRegistry,
+    root_guard: Arc<Directory>,
+    root: PathBuf,
     command: &str,
     duration: Duration,
 ) -> Result<String> {
-    ensure!(!command.trim().is_empty(), "shell command is empty");
-    let environment = unix_shell_environment(std::env::vars_os());
-    let mut process = Command::new("sh");
-    process
-        .arg("-c")
-        .arg(command)
-        .env_clear()
-        .envs(environment)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    process.process_group(0);
-    root_guard.revalidate()?;
-    let mut child = process.spawn().context("cannot start shell")?;
-    let _group = ProcessGroup(child.id());
-    let stdout = child.stdout.take().context("missing shell stdout")?;
-    let stderr = child.stderr.take().context("missing shell stderr")?;
-    let operation = async {
-        let read = async |reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>| -> Result<Vec<u8>> {
-            let mut bytes = Vec::new();
-            reader
-                .take((MAX_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .await?;
-            ensure!(bytes.len() <= MAX_BYTES, "shell output exceeds 2 MiB limit");
-            Ok(bytes)
-        };
-        let (out, err) = tokio::try_join!(read(Box::new(stdout)), read(Box::new(stderr)))?;
-        let status = child.wait().await?;
-        Ok::<_, anyhow::Error>(json!({"exit_code":status.code(),"success":status.success(),"stdout":String::from_utf8_lossy(&out),"stderr":String::from_utf8_lossy(&err)}).to_string())
-    };
-    timeout(duration, operation)
+    registry
+        .execute(root_guard, root, command.into(), duration, || {
+            unix_shell_environment(std::env::vars_os())
+        })
         .await
-        .context("shell timed out; process group terminated")?
 }
 
 #[cfg(windows)]
@@ -744,6 +728,10 @@ impl ShellCapture {
 mod tests {
     use super::*;
     use crate::test_support::drain_bounded;
+    #[cfg(unix)]
+    use crate::test_support::{StdioFixture, Step};
+    #[cfg(unix)]
+    use kuru_core::McpConfig;
 
     #[tokio::test]
     async fn cancelled_shell_capture_preserves_received_bytes_until_actual_eof() {
@@ -1012,16 +1000,18 @@ mod tests {
     #[tokio::test]
     async fn shell_returns_status_bounds_output_and_terminates_on_timeout() {
         #[cfg(unix)]
-        let (command, stall, flood) = (
+        let (command, stall, flood, stderr_flood) = (
             "printf hello; printf problem >&2; exit 7",
             "sleep 5",
             "yes output",
+            "yes problem >&2",
         );
         #[cfg(windows)]
-        let (command, stall, flood) = (
+        let (command, stall, flood, stderr_flood) = (
             "[Console]::Out.Write('hello'); [Console]::Error.Write('problem'); exit 7",
             "Start-Sleep -Seconds 5",
             "[Console]::Out.Write('x' * 2097153)",
+            "[Console]::Error.Write('x' * 2097153)",
         );
         let root = tempfile::tempdir().unwrap();
         let host = ToolHost::new(
@@ -1072,6 +1062,279 @@ mod tests {
                 .to_string()
                 .contains("limit")
         );
+        assert!(
+            host.execute("shell", json!({"command":stderr_flood}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_shell_requires_both_eof_and_root_exit_then_reaps_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                allow_shell: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let output: Value = serde_json::from_str(
+            &host
+                .execute("shell", json!({"command":"exec 1>&- 2>&-; sleep 0.15"}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(output["exit_code"], 0);
+        assert_eq!(output["stdout"], "");
+        assert_eq!(output["stderr"], "");
+
+        let output: Value = serde_json::from_str(
+            &host
+                .execute(
+                    "shell",
+                    json!({"command":"sleep 5 </dev/null >/dev/null 2>/dev/null & exit 7"}),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output["exit_code"], 7);
+        assert_eq!(output["success"], false);
+        host.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_shell_caller_loss_keeps_registered_owner_for_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("caller-ready");
+        let host = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    allow_shell: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let call = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.execute(
+                    "shell",
+                    json!({"command":": > caller-ready; exec sleep 5", "timeout_ms":120_000}),
+                )
+                .await
+            }
+        });
+        timeout(Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell caller did not reach readiness");
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(6), host.shutdown())
+            .await
+            .expect("registered shell owner did not finish bounded shutdown")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_shutdown_cancels_starting_and_active_shells_and_closes_mcp() {
+        let peer = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})),
+            Step::Eof,
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let active_ready = root.path().join("active-ready");
+        let host = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    allow_shell: true,
+                    mcp: [(
+                        "fixture".into(),
+                        McpConfig {
+                            command: Some(peer.command().into()),
+                            args: vec![],
+                            url: None,
+                            env: BTreeMap::new(),
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(
+            host.specs()
+                .await
+                .unwrap()
+                .iter()
+                .any(|spec| spec.name == "shell")
+        );
+        let starting_gate = host.test_shells().test_arm_start_gate();
+        let starting = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.execute(
+                    "shell",
+                    json!({"command":": > started-after-shutdown", "timeout_ms":120_000}),
+                )
+                .await
+            }
+        });
+        timeout(Duration::from_secs(1), async {
+            while host.test_shells().test_owner_count() != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("starting shell was not registered");
+        timeout(Duration::from_secs(1), async {
+            while !starting_gate.entered() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("starting shell did not reach its controlled gate");
+        let active = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.execute(
+                    "shell",
+                    json!({"command":": > active-ready; exec sleep 5", "timeout_ms":120_000}),
+                )
+                .await
+            }
+        });
+        let active_ready_result = timeout(Duration::from_secs(2), async {
+            while !active_ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if active_ready_result.is_err() {
+            let active_result = timeout(Duration::from_millis(100), active).await;
+            starting_gate.release();
+            let _ = host.shutdown().await;
+            panic!("active shell did not reach readiness: {active_result:?}");
+        }
+        let shutdown = tokio::spawn({
+            let host = host.clone();
+            async move { host.shutdown().await }
+        });
+        timeout(Duration::from_secs(1), async {
+            while !host.test_shells().test_is_closing() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown did not close shell registration");
+        let rejected = host
+            .execute("shell", json!({"command":": > launched-after-shutdown"}))
+            .await
+            .unwrap_err();
+        assert!(rejected.to_string().contains("shutting down"));
+        starting_gate.release();
+        timeout(Duration::from_secs(6), shutdown)
+            .await
+            .expect("combined shell/MCP shutdown did not finish")
+            .unwrap()
+            .unwrap();
+        assert!(
+            starting
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert!(
+            active
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        peer.assert_completed(1);
+        assert!(!root.path().join("started-after-shutdown").exists());
+        assert!(!root.path().join("launched-after-shutdown").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_outlives_a_destroyed_parent_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("worker-ready");
+        let host = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    allow_shell: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let root = root.path().to_path_buf();
+            runtime.block_on(async {
+                let _call = tokio::spawn({
+                    let host = host.clone();
+                    async move {
+                        host.execute(
+                            "shell",
+                            json!({"command":": > worker-ready; exec sleep 5", "timeout_ms":120_000}),
+                        )
+                        .await
+                    }
+                });
+                timeout(Duration::from_secs(2), async {
+                    while !root.join("worker-ready").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("shell worker did not reach readiness before runtime destruction");
+            });
+        }
+        assert!(ready.exists());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            timeout(Duration::from_secs(6), host.shutdown())
+                .await
+                .expect("retained worker did not finish after parent runtime destruction")
+                .unwrap();
+        });
     }
 
     #[cfg(unix)]

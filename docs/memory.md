@@ -8,12 +8,20 @@ generated local credentials and runs only while its owning Kuru process needs it
 ```sh
 kuru memory status
 kuru memory history
+kuru memory notes ID --limit 100
 ```
 
 Status identifies the current project store, branch and revision. History lists
 committed memory updates. These commands do not expose database credentials.
 `/memory-status` and `/memory-history` provide revision inspection in the TUI.
-`/memory NAME_OR_ID` continues to inspect an identity's conversation.
+`/memory NAME_OR_ID` continues to inspect an identity's conversation. `/notes
+NAME_OR_ID` reads that identity's separate durable notes. Both use the selected
+mode; an exact retained part or relationship ID can be inspected after it is
+inactive, while names and roles resolve only among active identities. Notes are
+the newest requested messages in chronological order, with `requested_limit`
+and `truncated` in the result. `kuru memory notes ID --limit N` accepts N from
+1 through 1000 and defaults to 100. It reads an existing current Dolt store and
+does not import legacy SQLite data or create memory for a fresh project.
 
 ## Runtime and offline use
 

@@ -14,7 +14,7 @@ use kuru_core::{
 };
 use kuru_memory::{MemoryStore, OpenOptions as MemoryOptions};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
-use kuru_runtime::Harness;
+use kuru_runtime::{Harness, read_notes};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -147,6 +147,12 @@ pub enum MemoryCommand {
     /// List recent committed memory revisions.
     History {
         #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Read one peer or relationship's durable notes without starting a conversation.
+    Notes {
+        identity: String,
+        #[arg(long, default_value_t = 100)]
         limit: usize,
     },
 }
@@ -386,6 +392,15 @@ pub async fn execute(cli: Cli) -> Result<()> {
         )
     );
     let exists = MemoryStore::exists(&data, &scope)?;
+    let notes_only = matches!(
+        cli.command,
+        Some(Command::Memory {
+            command: MemoryCommand::Notes { .. }
+        })
+    );
+    if notes_only && !exists {
+        bail!("this project has no memory yet; start a conversation first");
+    }
     let legacy_path = data.join("memory.sqlite3");
     let legacy = match std::fs::symlink_metadata(&legacy_path) {
         Ok(_) => true,
@@ -448,6 +463,14 @@ pub async fn execute(cli: Cli) -> Result<()> {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&memory.revisions(*limit).await?)?
+                        );
+                    }
+                    MemoryCommand::Notes { identity, limit } => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &read_notes(memory, &cwd, config.mode, identity, *limit).await?
+                            )?
                         );
                     }
                 }

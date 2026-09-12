@@ -11,6 +11,8 @@ mod providers;
 mod retry;
 mod rpc;
 mod tools;
+#[cfg(unix)]
+mod unix_shell;
 
 #[cfg(test)]
 mod test_support;

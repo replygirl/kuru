@@ -70,6 +70,16 @@ pub struct TurnOutput {
     pub events: Vec<Event>,
 }
 
+/// A bounded, current-mode projection of one identity's durable notes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesView {
+    pub mode: Mode,
+    pub identity: String,
+    pub notes: Vec<Message>,
+    pub requested_limit: usize,
+    pub truncated: bool,
+}
+
 pub struct Harness {
     pub config: Config,
     pub topology: Topology,
@@ -210,20 +220,11 @@ impl Harness {
         self.memory.history(&self.transcript_key(), 500).await
     }
     pub async fn memory_for(&self, identity: &str) -> Result<Vec<Message>> {
-        // Human inspection may address archived identities by exact ID; peer
-        // routing still uses resolve(), which deliberately requires activity.
-        let id = if self.topology.parts.iter().any(|part| part.id == identity)
-            || self
-                .topology
-                .relationships
-                .iter()
-                .any(|relation| relation.id == identity)
-        {
-            identity.to_owned()
-        } else {
-            self.resolve(identity)?
-        };
+        let id = resolve_human_identity(&self.topology, identity)?;
         self.memory.history(&self.namespace(&id), 100).await
+    }
+    pub async fn notes_for(&self, identity: &str, limit: usize) -> Result<NotesView> {
+        read_notes(&self.memory, &self.cwd, self.config.mode, identity, limit).await
     }
     pub async fn sessions(&self) -> Result<Vec<Session>> {
         Ok(self
@@ -494,30 +495,7 @@ impl Harness {
     }
 
     pub fn resolve(&self, identity: &str) -> Result<String> {
-        if self.topology.relationships.iter().any(|r| {
-            r.id == identity
-                && r.members
-                    .iter()
-                    .all(|id| self.topology.parts.iter().any(|p| p.active && &p.id == id))
-        }) {
-            return Ok(identity.into());
-        }
-        let matches = self
-            .topology
-            .parts
-            .iter()
-            .filter(|p| {
-                p.active
-                    && (p.id == identity
-                        || p.name.eq_ignore_ascii_case(identity)
-                        || p.role.eq_ignore_ascii_case(identity))
-            })
-            .collect::<Vec<_>>();
-        ensure!(
-            matches.len() == 1,
-            "identity '{identity}' is unknown or ambiguous; use a part ID or unique name"
-        );
-        Ok(matches[0].id.clone())
+        resolve_active_identity(&self.topology, identity)
     }
 
     pub async fn focus(&mut self, identity: Option<&str>) -> Result<()> {
@@ -1118,6 +1096,94 @@ fn is_cognitive(name: &str) -> bool {
         "peer_send" | "relate" | "state_report" | "remember" | "a2a_send"
     )
 }
+
+/// Read durable notes without constructing a harness or any provider machinery.
+pub async fn read_notes(
+    memory: &MemoryStore,
+    cwd: &Path,
+    mode: Mode,
+    identity: &str,
+    limit: usize,
+) -> Result<NotesView> {
+    ensure!(
+        (1..=1000).contains(&limit),
+        "notes limit must be between 1 and 1000"
+    );
+    ensure!(
+        memory.status().await?.branch == "main",
+        "notes inspection requires the live memory branch"
+    );
+    let scope = project_scope(cwd)?;
+    let topology: Topology = memory
+        .get(&format!("{scope}/{mode}/topology"))
+        .await?
+        .context("no persisted topology exists for the selected mode")
+        .and_then(|value| {
+            serde_json::from_value(value).context("invalid persisted topology for selected mode")
+        })?;
+    let identity = resolve_human_identity(&topology, identity)?;
+    let mut notes = memory
+        .history(
+            &format!("{scope}/{mode}/identity/{identity}/notes"),
+            limit + 1,
+        )
+        .await?;
+    let truncated = notes.len() > limit;
+    if truncated {
+        notes.remove(0);
+    }
+    Ok(NotesView {
+        mode,
+        identity,
+        notes,
+        requested_limit: limit,
+        truncated,
+    })
+}
+
+fn resolve_human_identity(topology: &Topology, identity: &str) -> Result<String> {
+    // Exact retained IDs remain inspectable even after their part or relationship
+    // is inactive; ordinary routing remains deliberately active-only.
+    if topology.parts.iter().any(|part| part.id == identity)
+        || topology
+            .relationships
+            .iter()
+            .any(|relationship| relationship.id == identity)
+    {
+        return Ok(identity.to_owned());
+    }
+    resolve_active_identity(topology, identity)
+}
+
+fn resolve_active_identity(topology: &Topology, identity: &str) -> Result<String> {
+    if topology.relationships.iter().any(|relationship| {
+        relationship.id == identity
+            && relationship.members.iter().all(|id| {
+                topology
+                    .parts
+                    .iter()
+                    .any(|part| part.active && &part.id == id)
+            })
+    }) {
+        return Ok(identity.to_owned());
+    }
+    let matches = topology
+        .parts
+        .iter()
+        .filter(|part| {
+            part.active
+                && (part.id == identity
+                    || part.name.eq_ignore_ascii_case(identity)
+                    || part.role.eq_ignore_ascii_case(identity))
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "identity '{identity}' is unknown or ambiguous; use a part ID or unique name"
+    );
+    Ok(matches[0].id.clone())
+}
+
 pub(crate) async fn read_topology(
     memory: &MemoryStore,
     scope: &str,

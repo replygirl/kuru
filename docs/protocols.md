@@ -99,8 +99,19 @@ provide containment beyond string-prefix checks. Sensitive directories such as
 files are protected. Instruction files may be read but are protected from
 mutation. Files and protocol/output payloads have 2 MiB bounds. Shell execution
 defaults to a 30-second timeout; an optional `timeout_ms` argument accepts
-1–120000 milliseconds. Stdout and stderr are each bounded to 2 MiB. Unix
-process groups are terminated on timeout or cancellation.
+1–120000 milliseconds. Stdout and stderr are each bounded to 2 MiB. On Unix,
+a registered owner retains the standard root, its fresh process group,
+both pipes, and the checked workspace capability through cleanup. It signals the
+remaining original group before reaping that root, then confirms group absence
+before reporting normal completion. A timeout, cancellation, pipe/output
+failure, or shutdown keeps its primary error; if bounded confirmation remains
+unavailable, Kuru reports that state while the owner remains retained for later
+observation. Selected execution/startup timeouts may be followed by one
+five-second cleanup-confirmation allowance; a delayed startup caller returns at
+that deadline plus the allowance, and host shutdown shares one five-second
+window across registered shells. This does not control processes that leave the
+original group.
+Windows retains its existing Job-based cleanup.
 
 The shell uses your process authority, not a sandbox. Configured MCP servers
 also bring their own permissions; the built-in file/shell switches do not impose

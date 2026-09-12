@@ -14,7 +14,12 @@ The runtime schedules those calls and enforces limits on rounds, tools, and conc
 
 Joining a relationship does not merge the members' private memories. One part's private history is not silently concatenated into another part's prompt.
 
-You can inspect identities with `/parts` and their stored history with `/memory NAME_OR_ID`. The human user can inspect private memory; the separation governs what the actors receive.
+You can inspect identities with `/parts` and their stored conversation history
+with `/memory NAME_OR_ID`. `/notes NAME_OR_ID` and `kuru memory notes ID` read
+the separate durable notes namespace. The notes view returns chronological newest
+notes plus its requested limit and `truncated` flag, so it does not imply a full
+export. The human user can inspect private memory; the separation governs what
+the actors receive.
 
 ## Relationships
 
@@ -49,7 +54,13 @@ Kuru includes its verified native Dolt engine and license notices in the executa
 
 The authenticated SQL sidecar runs only while its owning Kuru process needs it. Existing SQLite data is imported from a consistent snapshot; the original and snapshot remain preserved.
 
-Use `kuru memory status` to inspect the store and current revision, or `kuru memory history` to list committed changes. Dream candidates stay private until promotion. Undo adds a compensating revision and preserves later conversations.
+Use `kuru memory status` to inspect the store and current revision, `kuru memory
+history` to list committed changes, or `kuru memory notes ID --limit N` to read
+one identity's current-mode notes from an existing live store. Exact retained
+part and relationship IDs remain readable after inactivity; names and roles use
+active identity resolution. Notes limits are 1–1000, defaulting to 100. Dream
+candidates stay private until promotion. Undo adds a compensating revision and
+preserves later conversations.
 
 An operating-system writer lock prevents two Kuru processes from overwriting the same project's topology. Read-only session listing remains available.
 
