@@ -171,9 +171,7 @@ async fn command_resolution_and_representability_fail_before_execution() {
 
 #[tokio::test]
 async fn configured_stock_powershell_starts_like_direct_spawn_with_the_same_isolated_environment() {
-    for attempt in 0..32 {
-        compare_stock_powershell_launches(attempt).await;
-    }
+    compare_stock_powershell_launches(0).await;
 }
 
 async fn compare_stock_powershell_launches(attempt: usize) {

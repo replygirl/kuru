@@ -79,7 +79,11 @@ jobs:
         run: mise run //apps/kuru-tui:test:embedded-runtime
 
   native-platform:
-    name: Native platform primitives (Windows)
+    name: Native platform primitives (Windows, probe ${{ matrix.probe }})
+    strategy:
+      fail-fast: false
+      matrix:
+        probe: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     runs-on: windows-2025
     timeout-minutes: 30
     env:
@@ -115,7 +119,7 @@ jobs:
       - name: Upload native platform coverage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-native-platform-windows
+          name: coverage-native-platform-windows-${{ matrix.probe }}
           path: target/kuru-platform-coverage.lcov
           if-no-files-found: error
 

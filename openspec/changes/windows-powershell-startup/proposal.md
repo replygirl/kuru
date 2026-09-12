@@ -18,9 +18,11 @@ None. The existing native command execution contract remains correct.
 
 `packages/kuru-platform` owns the command boundary and native regression. A correction will be limited to that boundary and the fixture or package-owned verification needed to establish the cause; no dependencies or public API changes are planned.
 
+During diagnosis only, the existing Windows platform job runs on 16 fresh runners, each exercising the original single direct/configured comparison. This distinguishes fresh Windows instances from repeated processes sharing one instance. Restore the normal single platform job and artifact name before merge; no release workflow changes are involved.
+
 ## Surfaces
 
 - [ ] interactive — no CLI or TUI changes
-- [ ] deploy — no workflow or publication changes
+- [x] deploy — temporary native CI reproduction matrix, removed before merge
 - [ ] integration — no provider or protocol changes
 - [ ] agent-behavior — no runtime behavior changes
