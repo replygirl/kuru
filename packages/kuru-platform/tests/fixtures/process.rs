@@ -117,6 +117,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::io::stdout().flush()?;
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
+        "capture-stall" => {
+            println!("fixture stdout");
+            eprintln!("fixture stderr");
+            std::io::stdout().flush()?;
+            std::io::stderr().flush()?;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        "capture-flood" => {
+            let bytes = vec![b'x'; 1024 * 1024];
+            match args.get(1).and_then(|arg| arg.to_str()) {
+                Some("stdout") => std::io::stdout().write_all(&bytes)?,
+                Some("stderr") => std::io::stderr().write_all(&bytes)?,
+                _ => return Err("missing capture-flood stream".into()),
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
         "leaf" => {
             let lock = File::options()
                 .read(true)
