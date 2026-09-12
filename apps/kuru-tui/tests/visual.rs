@@ -216,9 +216,16 @@ async fn real_turn_events_keep_speaking_group_members_and_peer_routes_visible() 
         .push(("user".into(), "Shared design".into()));
     let outcome = harness.run("Shared design").await.unwrap();
     assert_eq!(outcome.speaker, relation.id);
+    let returned_text = outcome.text.clone();
     for event in outcome.events {
         view.event(event);
     }
+    // Activity is deliberately separate from the completed result. The real
+    // terminal loop supplies `TurnOutput` through its completion channel.
+    view.speaker_id = outcome.speaker;
+    view.speaker = format!("{} · {member_names}", relation.kind);
+    view.transcript
+        .push((view.speaker.clone(), returned_text.clone()));
     let route = PeerMessage::new(
         &members[0],
         &members[1],
@@ -249,7 +256,7 @@ async fn real_turn_events_keep_speaking_group_members_and_peer_routes_visible() 
         view.routes.last(),
         Some(&(members[0].clone(), members[1].clone()))
     );
-    assert_eq!(view.transcript.last().unwrap().1, outcome.text);
+    assert_eq!(view.transcript.last().unwrap().1, returned_text);
     assert!(view.part_activity.values().any(|value| value == "idle"));
 }
 

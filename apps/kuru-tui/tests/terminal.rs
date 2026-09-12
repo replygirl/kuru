@@ -337,7 +337,7 @@ async fn complete(State(mut state): State<ProviderState>, Json(_): Json<Value>) 
         "status":"completed", "output":[{"type":"message", "content":[{
             "type":"output_text", "text": if delayed { "LATE_RESPONSE_MUST_STAY_ABSENT" }
             else { "FRESH_RESPONSE_MARKER" }
-        }]}]
+        }]}], "usage":{"input_tokens":8,"output_tokens":5}
     }))
 }
 
@@ -394,7 +394,24 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     terminal.wait_text(&["Cancelled", "Next thought", "enter send"], &[])?;
     release.send(true)?;
     terminal.send(b"\r")?;
-    terminal.wait_text(&["FRESH_RESPONSE_MARKER"], &[])?;
+    terminal.wait_text(
+        &[
+            "FRESH_RESPONSE_MARKER",
+            "32 input tokens",
+            "20 output tokens",
+        ],
+        &[],
+    )?;
+    terminal.resize(35, 65)?;
+    terminal.wait_text(
+        &[
+            "FRESH_RESPONSE_MARKER",
+            "32 input tokens",
+            "20 output tokens",
+            "enter send",
+        ],
+        &[],
+    )?;
     assert!(!String::from_utf8_lossy(&terminal.output).contains("LATE_RESPONSE_MUST_STAY_ABSENT"));
     terminal.wait_idle()?;
     terminal.send(b"/quit\r")?;

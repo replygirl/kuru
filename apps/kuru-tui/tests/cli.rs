@@ -71,6 +71,22 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
             "--json",
         ]))
         .unwrap();
+        assert_eq!(result.as_object().unwrap().len(), 8);
+        for field in [
+            "session",
+            "speaker",
+            "text",
+            "relationship",
+            "input_tokens",
+            "output_tokens",
+            "limited",
+            "events",
+        ] {
+            assert!(
+                result.get(field).is_some(),
+                "missing TurnOutput field {field}"
+            );
+        }
         assert!(result["text"].as_str().unwrap().contains("demo"));
         let session = result["session"].as_str().unwrap();
         let resumed: Value =

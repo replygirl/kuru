@@ -14,7 +14,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use kuru_core::{Mode, ModelInfo, Relationship};
-use kuru_runtime::{Event, Harness};
+use kuru_runtime::{Event, Harness, TurnOutput};
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
@@ -41,9 +41,16 @@ pub enum Picker {
     Modes,
 }
 
+#[derive(Debug)]
+pub(crate) enum DispatchOutcome {
+    Command(String),
+    Turn(TurnOutput),
+}
+
 #[derive(Debug, Clone)]
 pub struct View {
     pub transcript: Vec<(String, String)>,
+    completion_metadata: BTreeMap<usize, String>,
     pub input: String,
     pub cursor: usize,
     pub mode: String,
@@ -77,6 +84,7 @@ pub struct View {
     last_frame_ms: u64,
     operation_start: Option<u64>,
     notice_until: u64,
+    completion_locked: bool,
 }
 
 impl View {
@@ -89,6 +97,7 @@ impl View {
             .collect();
         let show_scene = transcript.is_empty();
         Ok(Self {
+            completion_metadata: BTreeMap::new(),
             transcript,
             input: String::new(),
             cursor: 0,
@@ -138,6 +147,7 @@ impl View {
             last_frame_ms: 0,
             operation_start: None,
             notice_until: 0,
+            completion_locked: false,
         })
     }
 
@@ -172,6 +182,7 @@ impl View {
 
     fn begin_operation(&mut self) {
         self.busy = true;
+        self.completion_locked = false;
         self.notice = None;
         self.operation_start = Some(self.clock_ms);
         self.operation_ms = 0;
@@ -317,7 +328,7 @@ impl View {
         } else if event.kind == "state" {
             detail = "modeled state updated".into();
         }
-        if event.kind == "speaker" {
+        if event.kind == "speaker" && !self.completion_locked {
             self.speaker_id = event.actor.clone();
             self.speaker = self
                 .parts
@@ -333,19 +344,64 @@ impl View {
                 });
         }
         if event.kind == "response" {
-            self.transcript.push((self.speaker.clone(), event.detail));
-        } else {
-            self.status = format!("{} · {}", event.kind, self.actor_name(&event.actor));
-            let detail: String = detail
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(140)
-                .collect();
-            self.activity.push(format!("{} · {}", self.status, detail));
-            if self.activity.len() > 100 {
-                self.activity.remove(0);
-            }
+            detail = "response activity".into();
         }
+        let activity_status = format!("{} · {}", event.kind, self.actor_name(&event.actor));
+        if !self.completion_locked {
+            self.status = activity_status.clone();
+        }
+        let detail: String = detail
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(140)
+            .collect();
+        self.activity.push(format!("{activity_status} · {detail}"));
+        if self.activity.len() > 100 {
+            self.activity.remove(0);
+        }
+    }
+
+    fn complete_turn(&mut self, output: TurnOutput) {
+        let speaker = output
+            .relationship
+            .as_ref()
+            .map(|relationship| {
+                let members = relationship
+                    .members
+                    .iter()
+                    .map(|id| self.actor_name(id))
+                    .collect::<Vec<_>>();
+                if members.is_empty() {
+                    relationship.kind.to_string()
+                } else {
+                    format!("{} · {}", relationship.kind, members.join(" + "))
+                }
+            })
+            .unwrap_or_else(|| self.actor_name(&output.speaker));
+        self.speaker_id = output.speaker;
+        self.speaker = speaker.clone();
+        let index = self.transcript.len();
+        self.transcript.push((speaker, output.text));
+        let limited = if output.limited {
+            " · limited result"
+        } else {
+            ""
+        };
+        self.completion_metadata.insert(
+            index,
+            format!(
+                "{} input tokens · {} output tokens{limited}",
+                output.input_tokens, output.output_tokens
+            ),
+        );
+        self.show_scene = false;
+        self.status = if output.limited {
+            "Complete · limited result"
+        } else {
+            "Complete"
+        }
+        .into();
+        self.completion_locked = true;
     }
 
     pub fn terminal_event(&mut self, event: TerminalEvent) -> (bool, Option<String>) {
@@ -630,7 +686,7 @@ where
     let mut view = View::new(&harness, models).await?;
     let mut events = harness.subscribe();
     let harness = Arc::new(Mutex::new(harness));
-    let (tx, mut rx) = mpsc::channel::<(u64, Result<String>)>(8);
+    let (tx, mut rx) = mpsc::channel::<(u64, Result<DispatchOutcome>)>(8);
     let mut job: Option<JoinHandle<()>> = None;
     let mut quit_pending = false;
     let mut generation = 0u64;
@@ -665,7 +721,7 @@ where
                 return Ok(());
             }
             match message {
-                Ok(text) => {
+                Ok(DispatchOutcome::Command(text)) => {
                     if text.starts_with("Mode:")
                         || text.starts_with("Model:")
                         || text.starts_with("Effort:")
@@ -676,11 +732,14 @@ where
                         view.show_scene = false;
                     }
                     view.status = "Complete".into();
+                    view.completion_locked = true;
                 }
+                Ok(DispatchOutcome::Turn(output)) => view.complete_turn(output),
                 Err(error) => {
                     view.transcript.push(("error".into(), format!("{error:#}")));
                     view.show_scene = false;
                     view.status = "Failed · details in conversation".into();
+                    view.completion_locked = true;
                 }
             }
             let h = harness.lock().await;
@@ -717,7 +776,8 @@ where
                     view.settle();
                     view.refresh(&*harness.lock().await);
                     view.notice = None;
-                    view.status = "Cancelled".into();
+                    view.status = "Cancelled · turn interrupted".into();
+                    view.completion_locked = true;
                 } else if command == "/quit" {
                     if let Some(job) = job.take() {
                         job.abort();
@@ -737,7 +797,7 @@ where
                             .await
                             .shutdown(true)
                             .await
-                            .map(|()| String::new());
+                            .map(|()| DispatchOutcome::Command(String::new()));
                         let _ = tx.send((generation, result)).await;
                     }));
                 } else if command == "/help" {
@@ -785,19 +845,19 @@ where
     }
 }
 
-pub async fn dispatch(
+pub(crate) async fn dispatch(
     harness: &mut Harness,
     models: &[ModelInfo],
     command: &str,
-) -> Result<String> {
+) -> Result<DispatchOutcome> {
     harness.reconcile().await?;
     let (name, args) = command.split_once(' ').unwrap_or((command, ""));
     let args = args.trim();
-    match name {
-        "/parts" => Ok(serde_json::to_string_pretty(&harness.topology)?),
+    let feedback = match name {
+        "/parts" => serde_json::to_string_pretty(&harness.topology)?,
         "/mode" => {
             harness.set_mode(args.parse::<Mode>()?).await?;
-            Ok(format!("Mode: {args}"))
+            format!("Mode: {args}")
         }
         "/model" => {
             ensure!(!args.is_empty(), "model ID required");
@@ -806,7 +866,7 @@ pub async fn dispatch(
                 .find(|m| m.id == args)
                 .and_then(|m| m.default_effort.clone());
             harness.set_model(args, effort).await?;
-            Ok(format!("Model: {args}"))
+            format!("Model: {args}")
         }
         "/effort" => {
             let effort = if args == "default" {
@@ -817,13 +877,13 @@ pub async fn dispatch(
             };
             validate_effort(models, &harness.config.model, effort)?;
             harness.set_effort(effort.map(str::to_owned)).await?;
-            Ok(format!("Effort: {args}"))
+            format!("Effort: {args}")
         }
         "/focus" => {
             harness
                 .focus(if args == "auto" { None } else { Some(args) })
                 .await?;
-            Ok(format!("Speaking focus: {args}"))
+            format!("Speaking focus: {args}")
         }
         "/relate" => {
             let (kind, members) = args
@@ -835,28 +895,20 @@ pub async fn dispatch(
                     members.split(',').map(|m| m.trim().to_owned()).collect(),
                 )
                 .await?;
-            Ok(format!("Activated {} · {}", relation.kind, relation.id))
+            format!("Activated {} · {}", relation.kind, relation.id)
         }
-        "/memory" => Ok(serde_json::to_string_pretty(
-            &harness.memory_for(args).await?,
-        )?),
-        "/memory-status" => Ok(serde_json::to_string_pretty(
-            &harness.memory_status().await?,
-        )?),
-        "/memory-history" => Ok(serde_json::to_string_pretty(
-            &harness.memory_revisions(20).await?,
-        )?),
-        "/dream" => Ok(serde_json::to_string_pretty(&harness.dream().await?)?),
+        "/memory" => serde_json::to_string_pretty(&harness.memory_for(args).await?)?,
+        "/memory-status" => serde_json::to_string_pretty(&harness.memory_status().await?)?,
+        "/memory-history" => serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?,
+        "/dream" => serde_json::to_string_pretty(&harness.dream().await?)?,
         "/undo-dream" => {
             harness.undo_dream().await?;
-            Ok("Previous membership restored.".into())
+            "Previous membership restored.".into()
         }
         _ if command.starts_with('/') => anyhow::bail!("unknown command; use /help"),
-        _ => {
-            harness.run(command).await?;
-            Ok(String::new())
-        }
-    }
+        _ => return Ok(DispatchOutcome::Turn(harness.run(command).await?)),
+    };
+    Ok(DispatchOutcome::Command(feedback))
 }
 
 use anyhow::Context;
@@ -896,6 +948,13 @@ mod tests {
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn command_text(outcome: DispatchOutcome) -> String {
+        match outcome {
+            DispatchOutcome::Command(text) => text,
+            DispatchOutcome::Turn(_) => panic!("expected command feedback"),
+        }
     }
 
     #[tokio::test]
@@ -1105,6 +1164,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_activity_never_becomes_transcript_content() {
+        let (_dir, h, models) = fixture().await;
+        let mut view = View::new(&h, models).await.unwrap();
+        view.event(Event {
+            kind: "response".into(),
+            actor: "misleading-speaker".into(),
+            detail: "BROADCAST_RESPONSE_MUST_NOT_BE_A_FINAL_ANSWER".into(),
+        });
+
+        assert!(view.transcript.is_empty());
+        assert!(
+            !view
+                .activity
+                .join("\n")
+                .contains("BROADCAST_RESPONSE_MUST_NOT_BE_A_FINAL_ANSWER")
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_turn_keeps_returned_facts_when_activity_arrives_late() {
+        let (_dir, mut h, models) = fixture().await;
+        let members = h.topology.parts[..2]
+            .iter()
+            .map(|part| part.id.clone())
+            .collect::<Vec<_>>();
+        let relation = h
+            .relate(kuru_core::RelationshipKind::Alliance, members)
+            .await
+            .unwrap();
+        let mut view = View::new(&h, models).await.unwrap();
+        view.complete_turn(TurnOutput {
+            session: h.session.id.clone(),
+            speaker: relation.id.clone(),
+            text: "AUTHORITATIVE_RESPONSE".into(),
+            relationship: Some(relation.clone()),
+            input_tokens: 13,
+            output_tokens: 29,
+            limited: true,
+            events: vec![],
+        });
+        view.event(Event {
+            kind: "speaker".into(),
+            actor: "misleading-speaker".into(),
+            detail: "misleading speaker".into(),
+        });
+        view.event(Event {
+            kind: "response".into(),
+            actor: "misleading-speaker".into(),
+            detail: "DUPLICATE_RESPONSE_MUST_STAY_ACTIVITY".into(),
+        });
+
+        assert_eq!(view.speaker_id, relation.id);
+        assert!(view.speaker.starts_with("alliance · "));
+        assert_eq!(
+            view.transcript
+                .iter()
+                .filter(|(_, text)| text == "AUTHORITATIVE_RESPONSE")
+                .count(),
+            1
+        );
+        assert_eq!(
+            view.completion_metadata,
+            BTreeMap::from([(
+                0,
+                "13 input tokens · 29 output tokens · limited result".into()
+            )])
+        );
+        assert!(
+            !view
+                .transcript
+                .iter()
+                .any(|(_, text)| text == "DUPLICATE_RESPONSE_MUST_STAY_ACTIVITY")
+        );
+        assert!(
+            view.activity
+                .last()
+                .is_some_and(|activity| activity.starts_with("response · "))
+        );
+        assert_eq!(view.status, "Complete · limited result");
+    }
+
+    #[tokio::test]
+    async fn completion_metadata_stays_with_its_answer_at_wide_and_narrow_sizes() {
+        let (_dir, h, models) = fixture().await;
+        let mut view = View::new(&h, models).await.unwrap();
+        view.complete_turn(TurnOutput {
+            session: h.session.id.clone(),
+            speaker: h.topology.parts[0].id.clone(),
+            text: "COMPLETION_TEXT".into(),
+            relationship: None,
+            input_tokens: 8,
+            output_tokens: 5,
+            limited: true,
+            events: vec![],
+        });
+
+        for size in [(120, 35), (60, 20)] {
+            let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+            terminal.draw(|frame| draw(frame, &view)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            for expected in [
+                "COMPLETION_TEXT",
+                "8 input tokens",
+                "5 output tokens",
+                "limited result",
+            ] {
+                assert!(
+                    screen.contains(expected),
+                    "{size:?} omitted {expected}:\n{screen}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn unicode_editor_supports_midline_editing_navigation_newlines_and_send() {
         let (_dir, h, models) = fixture().await;
         let mut view = View::new(&h, models).await.unwrap();
@@ -1233,10 +1413,15 @@ mod tests {
             });
         }
         assert_eq!(view.activity.len(), 100);
-        view.event(Event {
-            kind: "response".into(),
-            actor: "speaker".into(),
-            detail: "Completed task".into(),
+        view.complete_turn(TurnOutput {
+            session: h.session.id.clone(),
+            speaker: "speaker".into(),
+            text: "Completed task".into(),
+            relationship: None,
+            input_tokens: 8,
+            output_tokens: 5,
+            limited: true,
+            events: vec![],
         });
         assert_eq!(view.transcript.last().unwrap().1, "Completed task");
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
@@ -1250,6 +1435,8 @@ mod tests {
         assert!(text.contains("KURU"));
         assert!(text.contains("PARTS /"));
         assert!(text.contains("Completed task"));
+        assert!(text.contains("8 input tokens"));
+        assert!(text.contains("limited result"));
         view.picker = Some(Picker::Models);
         terminal.draw(|f| draw(f, &view)).unwrap();
         let text = terminal
@@ -1267,10 +1454,7 @@ mod tests {
     async fn slash_commands_change_real_runtime_state_and_validate_errors() {
         let (_dir, mut h, models) = fixture().await;
         assert!(
-            dispatch(&mut h, &models, "/parts")
-                .await
-                .unwrap()
-                .contains("manager")
+            command_text(dispatch(&mut h, &models, "/parts").await.unwrap()).contains("manager")
         );
         dispatch(&mut h, &models, "/mode freudian").await.unwrap();
         assert_eq!(h.config.mode, Mode::Freudian);
@@ -1303,18 +1487,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(h.topology.relationships.len(), 1);
-        dispatch(&mut h, &models, "hello").await.unwrap();
+        assert!(matches!(
+            dispatch(&mut h, &models, "hello").await.unwrap(),
+            DispatchOutcome::Turn(_)
+        ));
         assert!(
-            dispatch(&mut h, &models, &format!("/memory {}", ids[0]))
-                .await
-                .unwrap()
-                .contains("hello")
+            command_text(
+                dispatch(&mut h, &models, &format!("/memory {}", ids[0]))
+                    .await
+                    .unwrap()
+            )
+            .contains("hello")
         );
         assert!(
-            dispatch(&mut h, &models, "/dream")
-                .await
-                .unwrap()
-                .contains("summaries")
+            command_text(dispatch(&mut h, &models, "/dream").await.unwrap()).contains("summaries")
         );
         h.apply_dream(vec![kuru_runtime::DreamProposal::Add {
             name: "Extra".into(),
@@ -1324,13 +1510,15 @@ mod tests {
         .await
         .unwrap();
         dispatch(&mut h, &models, "/undo-dream").await.unwrap();
-        let status: serde_json::Value =
-            serde_json::from_str(&dispatch(&mut h, &models, "/memory-status").await.unwrap())
-                .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(&mut h, &models, "/memory-status").await.unwrap(),
+        ))
+        .unwrap();
         assert_eq!(status["engine"], "dolt");
-        let revisions: serde_json::Value =
-            serde_json::from_str(&dispatch(&mut h, &models, "/memory-history").await.unwrap())
-                .unwrap();
+        let revisions: serde_json::Value = serde_json::from_str(&command_text(
+            dispatch(&mut h, &models, "/memory-history").await.unwrap(),
+        ))
+        .unwrap();
         assert!(
             revisions
                 .as_array()
