@@ -192,7 +192,7 @@ async fn configured_stock_powershell_starts_like_direct_spawn_with_the_same_isol
         env.push(("LLVM_PROFILE_FILE".into(), profile));
     }
     let args: Vec<OsString> = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-        "$ErrorActionPreference='Stop'; if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'requires 5.1' }; $null=[Net.ServicePointManager]::SecurityProtocol; [IO.File]::WriteAllText($env:KURU_PROBE,'reached'); [Console]::WriteLine('ready:5.1')"]
+        "$ErrorActionPreference='Stop'; [IO.File]::WriteAllText($env:KURU_PROBE,'entered'); if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'requires 5.1' }; [IO.File]::WriteAllText($env:KURU_PROBE,'framework-started'); $null=[Net.ServicePointManager]::SecurityProtocol; [IO.File]::WriteAllText($env:KURU_PROBE,'reached'); [Console]::WriteLine('ready:5.1')"]
         .map(Into::into).into();
     let mut direct = NativeSpawnSpec::new(shell.clone(), cwd.clone());
     direct.args = args.clone();
@@ -215,7 +215,7 @@ async fn configured_stock_powershell_starts_like_direct_spawn_with_the_same_isol
         let mut stderr = child.take_stderr().unwrap();
         let mut out = Vec::new();
         let mut err = Vec::new();
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let capture = tokio::time::timeout(Duration::from_secs(30), async {
             let mut limited_stdout = (&mut stdout).take(65537);
             let mut limited_stderr = (&mut stderr).take(65537);
             tokio::try_join!(
@@ -223,9 +223,26 @@ async fn configured_stock_powershell_starts_like_direct_spawn_with_the_same_isol
                 limited_stderr.read_to_end(&mut err)
             )
         })
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
+        if !matches!(capture, Ok(Ok(_))) {
+            // Query the retained root separately: job quiescence also waits for
+            // descendants, which may retain output after PowerShell has exited.
+            let root = child.duplicate_process_handle().unwrap();
+            let root_exit = wait_process_handle(&root, Duration::ZERO).await;
+            let tree_exit = child.try_wait();
+            let progress = std::fs::read_to_string(&marker);
+            let termination = child.terminate();
+            let reaped = child.wait(Duration::from_secs(5)).await;
+            let closed = tokio::join!(
+                stdout.close(Duration::from_secs(5)),
+                stderr.close(Duration::from_secs(5))
+            );
+            panic!(
+                "{label}: capture={capture:?}; root_exit={root_exit:?}; tree_exit={tree_exit:?}; progress={progress:?}; stdout={}; stderr={}; termination={termination:?}; reaped={reaped:?}; closed={closed:?}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err)
+            );
+        }
         assert!(out.len() <= 65536 && err.len() <= 65536);
         stdout.close(Duration::from_secs(5)).await.unwrap();
         stderr.close(Duration::from_secs(5)).await.unwrap();
