@@ -30,6 +30,7 @@ const OUTPUT_LIMIT: u64 = 4096;
 /// first use. An explicit development binary still passes the exact version
 /// guard; managed entries also pass their immutable payload checksums.
 pub async fn provision(config: &MemoryConfig, default_cache: &Path) -> Result<PathBuf> {
+    config.validate()?;
     if let Some(binary) = &config.dolt_binary {
         checked_regular(binary, true)?;
         let binary = binary

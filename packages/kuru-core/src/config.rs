@@ -129,6 +129,10 @@ impl MemoryConfig {
                         && !path.as_os_str().as_encoded_bytes().contains(&0),
                     "memory.{label} must be a nonempty path without NUL characters"
                 );
+                ensure!(
+                    path.is_absolute(),
+                    "memory.{label} must be an absolute path"
+                );
             }
         }
         Ok(())
@@ -580,18 +584,37 @@ mod memory_tests {
                 .is_err()
             );
         }
+        for path in ["dolt", "./dolt", "../dolt"] {
+            assert!(
+                MemoryConfig {
+                    dolt_binary: Some(path.into()),
+                    ..MemoryConfig::default()
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                MemoryConfig {
+                    cache_dir: Some(path.into()),
+                    ..MemoryConfig::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
         assert!(toml::from_str::<MemoryConfig>("unknown_option = true").is_err());
         assert!(toml::from_str::<MemoryConfig>("offline = 'yes'").is_err());
-        let config: MemoryConfig = toml::from_str(
-            "offline = true\ncache_dir = '/private/cache'\ndolt_binary = '/opt/dolt'\n",
-        )
-        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let config = MemoryConfig {
+            offline: true,
+            cache_dir: Some(directory.path().join("cache-not-created")),
+            dolt_binary: Some(directory.path().join("dolt-not-created")),
+            ..MemoryConfig::default()
+        };
         config.validate().unwrap();
         assert!(config.offline);
-        assert_eq!(
-            config.cache_dir.as_deref(),
-            Some(Path::new("/private/cache"))
-        );
+        assert!(!config.cache_dir.as_ref().unwrap().exists());
+        assert!(!config.dolt_binary.as_ref().unwrap().exists());
     }
 
     #[test]
@@ -599,10 +622,14 @@ mod memory_tests {
         let directory = tempfile::tempdir().unwrap();
         let user = directory.path().join("user.toml");
         let project = directory.path().join("project");
+        let shared_cache = directory.path().join("shared-cache");
         std::fs::create_dir_all(project.join(".kuru")).unwrap();
         std::fs::write(
             &user,
-            "max_parts = 3\n[memory]\ncache_dir = '/shared/cache'\nstartup_timeout_secs = 12\n",
+            format!(
+                "max_parts = 3\n[memory]\ncache_dir = {}\nstartup_timeout_secs = 12\n",
+                toml::Value::String(shared_cache.to_string_lossy().into_owned())
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -613,10 +640,7 @@ mod memory_tests {
         let memory = Config::load_memory(Some(&user), &project, None).unwrap();
         assert!(memory.offline);
         assert_eq!(memory.startup_timeout_secs, 12);
-        assert_eq!(
-            memory.cache_dir.as_deref(),
-            Some(Path::new("/shared/cache"))
-        );
+        assert_eq!(memory.cache_dir.as_deref(), Some(shared_cache.as_path()));
         // IFS needs more than three parts, but the stored Freudian choice is valid.
         assert!(Config::load(Some(&user), &project, None).is_err());
         let config = Config::load_with_preferences(

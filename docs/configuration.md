@@ -142,13 +142,14 @@ Session and part histories are local durable data. The default data directory is
 `$env:LOCALAPPDATA\kuru` on Windows. If `LOCALAPPDATA` is unset, Windows falls
 back to `$env:USERPROFILE\AppData\Local\kuru`. Each canonical project has a Dolt
 database under `memory/<project-hash>/`.
-`--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. On Windows,
-memory and engine caches require local volumes with persistent ACLs; UNC shares
-and device paths are not supported state locations. An OS
-writer lock prevents competing Kuru processes from overwriting the same
-project topology; session listing remains available without a writer lock. Restrict access to the user
-data directory as you would a chat transcript. They are not included in source
-control and should never be exposed as a tool root.
+`--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. Either may
+be relative; Kuru resolves relative values from the invocation directory. On
+Windows, memory and engine caches require local volumes with persistent ACLs;
+UNC shares and device paths are not supported state locations. An OS writer lock
+prevents competing Kuru processes from overwriting the same project topology;
+session listing remains available without a writer lock. Restrict access to the
+user data directory as you would a chat transcript. They are not included in
+source control and should never be exposed as a tool root.
 
 Kuru includes its pinned full-Dolt engine and licenses in the executable. First
 memory use verifies and extracts them locally; later runs reuse the verified
@@ -165,12 +166,14 @@ startup_timeout_secs = 30
 The default engine cache is `tools/dolt` inside the data directory. A fresh cache
 works offline without a separate engine installation. `offline` remains accepted
 for compatibility; bundled engine provisioning never uses HTTP, and this setting
-does not disable provider network calls. `dolt_binary` is an optional development
-override that must report the supported exact version. Corrupt existing caches
-fail without automatic repair. If activating a verified engine fails, the error
-reports the retained private staging directory for inspection; Kuru does not
-automatically retry that move. The startup timeout is 1–300 seconds. See
-[memory storage](memory.md) for migration, revision inspection and backups, or
+does not disable provider network calls. `cache_dir` and `dolt_binary` must be
+absolute native paths; Kuru does not resolve either relative to a configuration
+file. `dolt_binary` is an optional development override that must report the
+supported exact version. Corrupt existing caches fail without automatic repair.
+If activating a verified engine fails, the error reports the retained private
+staging directory for inspection; Kuru does not automatically retry that move.
+The startup timeout is 1–300 seconds. See [memory storage](memory.md) for
+migration, revision inspection and backups, or
 [development](development.md#bundled-engine-build-inputs) for build-input settings.
 
 Writes and shell execution require opt-in through config or the corresponding

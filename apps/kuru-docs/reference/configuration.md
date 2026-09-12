@@ -127,7 +127,7 @@ The example endpoints are placeholders. Choose trusted services and keep secrets
 | `KURU_INSTALL_DIR`            | Destination for direct or source installation                        |
 | `KURU_RELEASE_BASE`           | Version directory for the release installer                          |
 
-When no XDG data directory is set, the default is `~/.local/share/kuru` on macOS/Linux or `$env:LOCALAPPDATA\kuru` on Windows. If Windows application-data variables are unset, `USERPROFILE` supplies `AppData\Roaming` for configuration and `AppData\Local` for data. Each project has a Dolt database under `memory/<project-hash>/`. Keep state outside tool roots. [Memory](../concepts/memory) describes project scope and access boundaries.
+When no XDG data directory is set, the default is `~/.local/share/kuru` on macOS/Linux or `$env:LOCALAPPDATA\kuru` on Windows. If Windows application-data variables are unset, `USERPROFILE` supplies `AppData\Roaming` for configuration and `AppData\Local` for data. Each project has a Dolt database under `memory/<project-hash>/`. `--data-dir` and `KURU_DATA_DIR` may be relative and resolve from the invocation directory. Keep state outside tool roots. [Memory](../concepts/memory) describes project scope and access boundaries.
 
 Windows memory and engine caches require local volumes with persistent ACLs. UNC shares and device paths are not supported state locations.
 
@@ -141,4 +141,4 @@ startup_timeout_secs = 30
 
 Kuru includes its pinned full-Dolt engine and licenses. First memory use extracts them locally into `tools/dolt` inside the data directory, or the configured `cache_dir`; an empty cache works offline. Existing caches are verified, and corrupt entries fail without automatic repair.
 
-`offline` remains accepted for compatibility; bundled engine provisioning never uses HTTP. `dolt_binary` is an optional development override and must report the supported exact version. The startup timeout is 1–300 seconds. Provider network access is independent of these memory settings.
+`offline` remains accepted for compatibility; bundled engine provisioning never uses HTTP. `cache_dir` and `dolt_binary` must be absolute native paths and are not resolved relative to a configuration file. `dolt_binary` is an optional development override and must report the supported exact version. The startup timeout is 1–300 seconds. Provider network access is independent of these memory settings.
