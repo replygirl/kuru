@@ -125,6 +125,275 @@ pub async fn output(
     command.output_with_timeout(timeout).await
 }
 
+/// Run a bounded maintainer subprocess while draining both pipes and reaping its
+/// owned Unix process group.
+///
+/// Delivery's advisory scanner uses this instead of Tokio's unbounded command
+/// output collection. It is deliberately separate from [`output`], whose
+/// established callers retain their existing command semantics.
+#[cfg(feature = "tooling")]
+pub async fn bounded_output(
+    command: &mut Command,
+    timeout: std::time::Duration,
+    limit: usize,
+) -> std::io::Result<std::process::Output> {
+    #[cfg(unix)]
+    return bounded_unix::output(command, timeout, limit).await;
+    #[cfg(windows)]
+    command
+        .output_with_limit_and_timeout(timeout, limit as u64)
+        .await
+}
+
+#[cfg(all(unix, feature = "tooling"))]
+mod bounded_unix {
+    use rustix::{
+        io::Errno,
+        process::{
+            Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
+        },
+    };
+    use std::{io, process::Stdio, time::Duration};
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt},
+        process::{Child, ChildStderr, ChildStdout},
+        time::{Instant, MissedTickBehavior},
+    };
+
+    const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct Capture<R> {
+        reader: Option<R>,
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+
+    impl<R: AsyncRead + Unpin> Capture<R> {
+        fn new(reader: R, limit: usize) -> Self {
+            Self {
+                reader: Some(reader),
+                bytes: Vec::new(),
+                limit,
+            }
+        }
+
+        fn eof(&self) -> bool {
+            self.reader.is_none()
+        }
+
+        async fn read(&mut self) -> io::Result<()> {
+            let mut chunk = [0; 8192];
+            let length = self
+                .reader
+                .as_mut()
+                .expect("capture is only read while active")
+                .read(&mut chunk)
+                .await?;
+            if length == 0 {
+                self.reader = None;
+                return Ok(());
+            }
+            let retained = length.min(self.limit.saturating_sub(self.bytes.len()));
+            self.bytes.extend_from_slice(&chunk[..retained]);
+            if retained != length {
+                return Err(io::Error::other("tool output exceeds limit"));
+            }
+            Ok(())
+        }
+    }
+
+    fn root_exited(pid: Pid) -> io::Result<bool> {
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(None) => Ok(false),
+            Ok(Some(_)) => Ok(true),
+            Err(error) => Err(io::Error::other(format!(
+                "lost owned process identity before cleanup: {error}"
+            ))),
+        }
+    }
+
+    async fn wait_for_group_gone(pid: Pid) -> io::Result<()> {
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        loop {
+            match test_kill_process_group(pid) {
+                Err(Errno::SRCH) => return Ok(()),
+                Ok(()) => {}
+                Err(error) => {
+                    return Err(io::Error::other(format!(
+                        "post-cleanup process-group query: {error}"
+                    )));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "owned process group survived cleanup",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn stop_and_reap(child: &mut Child, pid: Pid) -> String {
+        let mut issues = Vec::new();
+        match root_exited(pid) {
+            Ok(_) => match kill_process_group(pid, Signal::KILL) {
+                Ok(()) | Err(Errno::SRCH) => {}
+                Err(error) => issues.push(format!("owned process-group termination: {error}")),
+            },
+            Err(error) => issues.push(error.to_string()),
+        }
+        match tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => issues.push(format!("root reap: {error}")),
+            Err(_) => issues.push("root reap timed out".to_owned()),
+        }
+        if let Err(error) = wait_for_group_gone(pid).await {
+            issues.push(error.to_string());
+        }
+        if issues.is_empty() {
+            "owned process group stopped and root reaped".to_owned()
+        } else {
+            format!("cleanup issues: {issues:?}")
+        }
+    }
+
+    async fn finish_and_reap(child: &mut Child, pid: Pid) -> io::Result<std::process::ExitStatus> {
+        ensure_root_exited(pid)?;
+        let mut issues = Vec::new();
+        // The root is still an unreaped waitid anchor here. Terminate any
+        // helper that inherited its fresh group before that identity can be
+        // reused, even when the root itself reported success and both pipes
+        // were already closed.
+        let termination = match kill_process_group(pid, Signal::KILL) {
+            Ok(()) | Err(Errno::SRCH) => None,
+            Err(error) => Some(error),
+        };
+        let status = match tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                return Err(io::Error::other(format!(
+                    "root reap after natural exit: {error}"
+                )));
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "root reap timed out",
+                ));
+            }
+        };
+        match wait_for_group_gone(pid).await {
+            Ok(()) => {
+                // macOS can reject signalling a group whose only member is an
+                // already-exited root. Successful post-reap absence proves no
+                // helper survived; it does not treat EPERM as ownership proof.
+            }
+            Err(error) => {
+                if let Some(termination) = termination {
+                    issues.push(format!("owned process-group termination: {termination}"));
+                }
+                issues.push(error.to_string());
+            }
+        }
+        if issues.is_empty() {
+            Ok(status)
+        } else {
+            Err(io::Error::other(format!(
+                "natural process-group cleanup issues: {issues:?}"
+            )))
+        }
+    }
+
+    async fn capture_until(
+        pid: Pid,
+        stdout: &mut Capture<ChildStdout>,
+        stderr: &mut Capture<ChildStderr>,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        // Pipes can close before a command performs its final exit. Keep the
+        // root as an unreaped waitid anchor, but poll that state until it exits
+        // instead of waiting until the overall deadline with both readers idle.
+        let mut observation = tokio::time::interval(Duration::from_millis(10));
+        observation.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            if root_exited(pid)? && stdout.eof() && stderr.eof() {
+                return Ok(());
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "tool timed out"));
+                }
+                result = stdout.read(), if !stdout.eof() => result?,
+                result = stderr.read(), if !stderr.eof() => result?,
+                _ = observation.tick() => {}
+            }
+        }
+    }
+
+    pub(super) async fn output(
+        command: &mut super::Command,
+        timeout: Duration,
+        limit: usize,
+    ) -> io::Result<std::process::Output> {
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(false);
+        let mut child = command.spawn()?;
+        let pid = Pid::from_raw(
+            child
+                .id()
+                .ok_or_else(|| io::Error::other("owned tool did not expose a process ID"))?
+                .try_into()
+                .map_err(|_| io::Error::other("owned tool process ID did not fit native range"))?,
+        )
+        .ok_or_else(|| io::Error::other("owned tool process ID was invalid"))?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let cleanup = stop_and_reap(&mut child, pid).await;
+                return Err(io::Error::other(format!("missing tool stdout; {cleanup}")));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let cleanup = stop_and_reap(&mut child, pid).await;
+                return Err(io::Error::other(format!("missing tool stderr; {cleanup}")));
+            }
+        };
+        let mut stdout = Capture::new(stdout, limit);
+        let mut stderr = Capture::new(stderr, limit);
+        if let Err(error) =
+            capture_until(pid, &mut stdout, &mut stderr, Instant::now() + timeout).await
+        {
+            let cleanup = stop_and_reap(&mut child, pid).await;
+            return Err(io::Error::new(error.kind(), format!("{error}; {cleanup}")));
+        }
+        let status = finish_and_reap(&mut child, pid).await?;
+        Ok(std::process::Output {
+            status,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        })
+    }
+
+    fn ensure_root_exited(pid: Pid) -> io::Result<()> {
+        if root_exited(pid)? {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "owned root was still running after both output pipes closed",
+            ))
+        }
+    }
+}
+
 #[cfg(windows)]
 pub use windows::Command;
 #[cfg(windows)]
@@ -146,7 +415,7 @@ mod windows {
     };
     use tokio::io::AsyncReadExt;
 
-    const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
+    pub(super) const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 
     pub struct Command {
         pub(super) program: OsString,
@@ -220,6 +489,18 @@ mod windows {
             &mut self,
             timeout: Duration,
         ) -> io::Result<Output> {
+            self.output_with_limit_and_timeout(timeout, OUTPUT_LIMIT)
+                .await
+        }
+
+        pub(super) async fn output_with_limit_and_timeout(
+            &mut self,
+            timeout: Duration,
+            limit: u64,
+        ) -> io::Result<Output> {
+            if limit > OUTPUT_LIMIT {
+                return Err(io::Error::other("requested output limit is too large"));
+            }
             let cwd = self.directory.clone().unwrap_or(std::env::current_dir()?);
             let cwd = if cwd.is_absolute() {
                 cwd
@@ -249,8 +530,8 @@ mod windows {
             let mut phase = "read native stdout/stderr";
             let captured = tokio::time::timeout(timeout, async {
                 tokio::try_join!(
-                    read(&mut stdout, &mut stdout_bytes, &mut stdout_eof),
-                    read(&mut stderr, &mut stderr_bytes, &mut stderr_eof)
+                    read(&mut stdout, &mut stdout_bytes, &mut stdout_eof, limit),
+                    read(&mut stderr, &mut stderr_bytes, &mut stderr_eof, limit)
                 )?;
                 phase = "wait for native process tree quiescence";
                 child.wait(Duration::from_secs(5)).await
@@ -298,12 +579,10 @@ mod windows {
         pipe: &mut kuru_platform::windows::pipe::Pipe,
         bytes: &mut Vec<u8>,
         eof: &mut bool,
+        limit: u64,
     ) -> io::Result<()> {
-        (&mut *pipe)
-            .take(OUTPUT_LIMIT + 1)
-            .read_to_end(bytes)
-            .await?;
-        if bytes.len() as u64 > OUTPUT_LIMIT {
+        (&mut *pipe).take(limit + 1).read_to_end(bytes).await?;
+        if bytes.len() as u64 > limit {
             return Err(io::Error::other("tool output exceeds limit"));
         }
         *eof = true;

@@ -32,6 +32,15 @@ checksum = "sha256:074f68f05d270da5c0d69d3e234ec362bec4c6e3189c21d1c948d03860365
 url = "https://github.com/cocogitto/cocogitto/releases/download/7.0.0/cocogitto-7.0.0-x86_64-pc-windows-msvc.tar.gz"
 url_api = "https://api.github.com/repos/cocogitto/cocogitto/releases/assets/366659399"
 
+[[tools."cargo:cargo-audit"]]
+version = "0.22.2"
+backend = "cargo:cargo-audit"
+specifiers = ["0.22.2"]
+
+[tools."cargo:cargo-audit".options]
+default-features = "false"
+locked = "true"
+
 [[tools."github:jdx/communique"]]
 version = "1.3.5"
 backend = "github:jdx/communique"

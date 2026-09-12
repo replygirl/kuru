@@ -1,5 +1,7 @@
 //! Native archive installation and package-owned delivery tooling.
 
+#[cfg(feature = "tooling")]
+pub mod advisory;
 pub mod archive;
 #[cfg(feature = "tooling")]
 pub mod bundle;

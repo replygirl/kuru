@@ -201,9 +201,37 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Install delivery-owned advisory scanner
+        run: mise run //packages/kuru-delivery:setup:advisories
+      - name: Refresh and scan the isolated RustSec advisory database
+        env:
+          KURU_ADVISORY_DB: ${{ runner.temp }}/kuru-rustsec-advisory-db
+        run: |
+          mise run //packages/kuru-delivery:audit:advisories:refresh
+          mise run //packages/kuru-delivery:audit:advisories
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
+
   quality-gate:
     if: always()
-    needs: [format, lint, typecheck, tooling, cospec, cospec-managed, docs]
+    needs: [format, lint, typecheck, tooling, cospec, cospec-managed, docs, advisories]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every quality check

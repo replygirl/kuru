@@ -1,4 +1,5 @@
 [vars]
+kuru_cargo_audit_version = "0.22.2"
 kuru_cocogitto_version = "7.0.0"
 kuru_communique_version = "1.3.5"
 
@@ -9,6 +10,23 @@ run = "mise install --include-task-tools"
 [tasks."setup:test-tools"]
 description = "Install only the package's pinned behavioral fixture tools"
 run = "mise install aqua:cocogitto/cocogitto@{{vars.kuru_cocogitto_version}} github:jdx/communique@{{vars.kuru_communique_version}}"
+
+[tasks."setup:advisories"]
+description = "Install only the pinned cargo-audit scanner used by advisory tasks"
+run = "mise install --locked \"cargo:cargo-audit[default-features=false,locked=true]@{{vars.kuru_cargo_audit_version}}\""
+
+[tasks."audit:advisories:refresh"]
+description = "Explicitly refresh the isolated public RustSec advisory database"
+dir = "{{config_root}}"
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit refresh --database \"$KURU_ADVISORY_DB\""
+run_windows = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit refresh --database \"$env:KURU_ADVISORY_DB\""
+
+[tasks."audit:advisories"]
+description = "Scan the root Cargo.lock against an already-refreshed RustSec database"
+dir = "{{config_root}}"
+tools."cargo:cargo-audit" = { version = "{{vars.kuru_cargo_audit_version}}", locked = true, default-features = false }
+run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit scan --database \"$KURU_ADVISORY_DB\" --audit-bin \"$(command -v cargo-audit)\""
+run_windows = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- audit scan --database \"$env:KURU_ADVISORY_DB\" --audit-bin \"$((Get-Command cargo-audit).Source)\""
 
 [tasks."coverage:workspace"]
 depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]

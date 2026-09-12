@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use kuru_delivery::{archive, bundle, docs, repo};
+use kuru_delivery::{advisory, archive, bundle, docs, repo};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -12,6 +12,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Refresh or scan the isolated public RustSec advisory database.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     /// Prepare verified local build inputs without compiling their consumer.
     Bundle {
         #[command(subcommand)]
@@ -63,6 +68,22 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum AuditCommand {
+    /// Explicitly create or refresh the public advisory database checkout.
+    Refresh {
+        #[arg(long, env = "KURU_ADVISORY_DB")]
+        database: PathBuf,
+    },
+    /// Scan the root lockfile without fetching advisory data.
+    Scan {
+        #[arg(long, env = "KURU_ADVISORY_DB")]
+        database: PathBuf,
+        #[arg(long)]
+        audit_bin: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum BundleCommand {
     Prepare {
         #[arg(long, default_value = "packages/kuru-memory/support/dolt-assets.json")]
@@ -81,6 +102,20 @@ enum BundleCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Audit {
+            command: AuditCommand::Refresh { database },
+        } => {
+            advisory::refresh(&database).await?;
+        }
+        Command::Audit {
+            command:
+                AuditCommand::Scan {
+                    database,
+                    audit_bin,
+                },
+        } => {
+            advisory::scan(&database, &audit_bin).await?;
+        }
         Command::Bundle {
             command:
                 BundleCommand::Prepare {

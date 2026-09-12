@@ -11,6 +11,66 @@ async fn main() -> io::Result<()> {
         std::fs::write(marker, b"candidate executed")?;
     }
     let mut arguments = std::env::args_os().skip(1);
+    if let Some(marker) = std::env::var_os("KURU_AUDIT_CAPTURE") {
+        let values: Vec<_> = arguments
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        std::fs::write(
+            marker,
+            serde_json::to_vec(&values).map_err(io::Error::other)?,
+        )?;
+        if let Some(marker) = std::env::var_os("KURU_AUDIT_CAPTURE_ENV") {
+            let current_directory = std::env::current_dir()?;
+            let cargo_home = std::env::var_os("CARGO_HOME")
+                .map(|value| value.to_string_lossy().into_owned())
+                .ok_or_else(|| io::Error::other("audit fixture did not receive CARGO_HOME"))?;
+            std::fs::write(
+                marker,
+                serde_json::to_vec(&serde_json::json!({
+                    "current_directory": current_directory.to_string_lossy(),
+                    "cargo_home": cargo_home,
+                }))
+                .map_err(io::Error::other)?,
+            )?;
+        }
+        if std::env::var_os("KURU_AUDIT_ADVANCE_HEAD").is_some() {
+            let database = values
+                .windows(2)
+                .find(|arguments| arguments[0] == "--db")
+                .map(|arguments| std::path::PathBuf::from(&arguments[1]))
+                .ok_or_else(|| io::Error::other("audit fixture did not receive --db"))?;
+            let mut command = kuru_delivery::command::rooted(&database, "git");
+            command.args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "controlled scanner changed advisory HEAD",
+            ]);
+            let output = kuru_delivery::command::bounded_output(
+                &mut command,
+                std::time::Duration::from_secs(10),
+                64 * 1024,
+            )
+            .await?;
+            if !output.status.success() {
+                return Err(io::Error::other(
+                    "controlled scanner could not advance advisory HEAD",
+                ));
+            }
+        }
+        if std::env::var_os("KURU_AUDIT_FAIL").is_some() {
+            io::stderr().write_all(b"controlled scanner failure\n")?;
+            io::stderr().flush()?;
+            return Err(io::Error::other("controlled scanner failure"));
+        }
+        return Ok(());
+    }
     match arguments
         .next()
         .and_then(|value| value.into_string().ok())
@@ -37,6 +97,95 @@ async fn main() -> io::Result<()> {
                 .next()
                 .ok_or_else(|| io::Error::other("missing marker path"))?;
             std::fs::write(path, b"candidate executed")?;
+        }
+        #[cfg(unix)]
+        Some("bounded-overflow") => {
+            let stream = arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| io::Error::other("missing overflow stream"))?;
+            let bytes = vec![b'x'; 8192];
+            match stream.as_str() {
+                "stdout" => {
+                    io::stdout().write_all(&bytes)?;
+                    io::stdout().flush()?;
+                }
+                "stderr" => {
+                    io::stderr().write_all(&bytes)?;
+                    io::stderr().flush()?;
+                }
+                _ => return Err(io::Error::other("unknown overflow stream")),
+            }
+            std::future::pending::<()>().await;
+        }
+        #[cfg(unix)]
+        Some("bounded-held-output") => {
+            io::stdout().write_all(b"descendant retained inherited output\n")?;
+            io::stdout().flush()?;
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+        #[cfg(unix)]
+        Some("bounded-timeout-descendant") => {
+            let marker = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing process-group marker"))?;
+            let group = rustix::process::getpgrp().as_raw_nonzero().get();
+            std::fs::write(marker, format!("{} {group}", std::process::id()))?;
+            std::process::Command::new(std::env::current_exe()?)
+                .arg("bounded-held-output")
+                // The real Git helper inherits both captured pipes. This
+                // descendant deliberately does the same after the root exits.
+                .spawn()?;
+            io::stdout().write_all(b"root exited with descendant holding output\n")?;
+            io::stdout().flush()?;
+        }
+        #[cfg(unix)]
+        Some("bounded-close-output-before-exit") => {
+            use std::os::unix::process::CommandExt;
+            // Replace this fixture root in place so it retains the helper's
+            // process-group identity while closing both inherited pipes before
+            // its delayed, ordinary exit.
+            let error = std::process::Command::new("/bin/sh")
+                .args(["-c", "exec 1>&-; exec 2>&-; exec /bin/sleep 0.1"])
+                .exec();
+            return Err(error);
+        }
+        #[cfg(unix)]
+        Some("bounded-silent-descendant") => {
+            let ready = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing silent descendant readiness marker"))?;
+            std::fs::write(ready, b"ready")?;
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+        #[cfg(unix)]
+        Some("bounded-silent-descendant-root") => {
+            let group = rustix::process::getpgrp().as_raw_nonzero().get();
+            let root = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing silent descendant root marker"))?;
+            let ready = arguments
+                .next()
+                .ok_or_else(|| io::Error::other("missing silent descendant readiness marker"))?;
+            std::fs::write(root, format!("{} {group}", std::process::id()))?;
+            std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "bounded-silent-descendant",
+                    ready.to_str().unwrap_or_default(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            for _ in 0..500 {
+                if matches!(std::fs::read(&ready), Ok(bytes) if bytes == b"ready") {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "silent descendant did not become ready",
+            ));
         }
         #[cfg(windows)]
         Some("command-held-descendant") => {
