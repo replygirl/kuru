@@ -198,7 +198,7 @@ async fn compare_stock_powershell_launches(attempt: usize) {
         env.push(("LLVM_PROFILE_FILE".into(), profile));
     }
     let args: Vec<OsString> = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-        "$ErrorActionPreference='Stop'; [IO.File]::WriteAllText($env:KURU_PROBE,'entered'); if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'requires 5.1' }; [IO.File]::WriteAllText($env:KURU_PROBE,'framework-started'); $null=[Net.ServicePointManager]::SecurityProtocol; [IO.File]::WriteAllText($env:KURU_PROBE,'reached'); [Console]::WriteLine('ready:5.1')"]
+        "$ErrorActionPreference='Stop'; if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'requires 5.1' }; $null=[Net.ServicePointManager]::SecurityProtocol; [IO.File]::WriteAllText($env:KURU_PROBE,'reached'); [Console]::WriteLine('ready:5.1')"]
         .map(Into::into).into();
     let mut direct = NativeSpawnSpec::new(shell.clone(), cwd.clone());
     direct.args = args.clone();
