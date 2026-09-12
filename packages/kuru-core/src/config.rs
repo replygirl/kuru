@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{Framework, Mode};
@@ -48,6 +49,238 @@ pub struct SelectionOverrides<'a> {
     pub provider: Option<&'a str>,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
+}
+
+/// All invocation inputs captured before workspace authority is reviewed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InvocationOverrides {
+    pub mode: Option<Mode>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub allow_write: bool,
+    pub allow_shell: bool,
+    pub no_dream: bool,
+}
+
+impl From<SelectionOverrides<'_>> for InvocationOverrides {
+    fn from(value: SelectionOverrides<'_>) -> Self {
+        Self {
+            mode: value.mode,
+            provider: value.provider.map(str::to_owned),
+            model: value.model.map(str::to_owned),
+            effort: value.effort.map(str::to_owned),
+            ..Self::default()
+        }
+    }
+}
+
+/// Authority effects whose effective value has an automatic ancestor origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AuthorityClaimCategory {
+    WorkspaceWrite,
+    Shell,
+    McpStdio,
+    McpHttp,
+    MemoryDoltBinary,
+    MemoryCacheDir,
+    ResponsesRoute,
+    ExternalAgent,
+}
+
+impl AuthorityClaimCategory {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::WorkspaceWrite => "workspace write",
+            Self::Shell => "shell",
+            Self::McpStdio => "stdio MCP",
+            Self::McpHttp => "HTTP MCP",
+            Self::MemoryDoltBinary => "memory executable",
+            Self::MemoryCacheDir => "memory cache",
+            Self::ResponsesRoute => "Responses route",
+            Self::ExternalAgent => "external agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ManifestDigest([u8; 32]);
+
+impl ManifestDigest {
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ManifestDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClaimDigest([u8; 32]);
+
+impl ClaimDigest {
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ClaimDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SafeSource(String);
+
+impl SafeSource {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SafeSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeClaimDisplay(String);
+
+impl SafeClaimDisplay {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SafeClaimDisplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// The active Responses route after workspace preflight. Its values are not
+/// redacted because only the approved caller may read the named environment.
+pub struct ResponsesRouteConfig {
+    api_base: String,
+    api_key_env: String,
+}
+
+impl ResponsesRouteConfig {
+    pub fn api_base(&self) -> &str {
+        &self.api_base
+    }
+    pub fn api_key_env(&self) -> &str {
+        &self.api_key_env
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityClaim {
+    category: AuthorityClaimCategory,
+    digest: ClaimDigest,
+    source: SafeSource,
+    sources: Vec<SafeSource>,
+    source_digests: Vec<[u8; 32]>,
+    display: SafeClaimDisplay,
+}
+
+impl AuthorityClaim {
+    pub const fn category(&self) -> AuthorityClaimCategory {
+        self.category
+    }
+    pub const fn digest(&self) -> ClaimDigest {
+        self.digest
+    }
+    pub fn source(&self) -> &SafeSource {
+        &self.source
+    }
+    pub fn sources(&self) -> &[SafeSource] {
+        &self.sources
+    }
+    pub fn display(&self) -> &SafeClaimDisplay {
+        &self.display
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityManifest {
+    schema_version: u16,
+    digest: ManifestDigest,
+    claims: Vec<AuthorityClaim>,
+    sources: Vec<SafeSource>,
+}
+
+impl AuthorityManifest {
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+    pub const fn full_digest(&self) -> ManifestDigest {
+        self.digest
+    }
+    pub fn claims(&self) -> &[AuthorityClaim] {
+        &self.claims
+    }
+    pub fn sources(&self) -> &[SafeSource] {
+        &self.sources
+    }
+    pub fn filtered(&self, categories: &BTreeSet<AuthorityClaimCategory>) -> SafeManifest {
+        let claims: Vec<_> = self
+            .claims
+            .iter()
+            .filter(|claim| categories.contains(&claim.category))
+            .cloned()
+            .collect();
+        SafeManifest::new(self.schema_version, claims)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeManifest {
+    schema_version: u16,
+    digest: ManifestDigest,
+    claims: Vec<AuthorityClaim>,
+    sources: Vec<SafeSource>,
+}
+
+impl SafeManifest {
+    fn new(schema_version: u16, claims: Vec<AuthorityClaim>) -> Self {
+        let sources = claims
+            .iter()
+            .flat_map(|claim| claim.sources.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let digest = manifest_digest(schema_version, &claims);
+        Self {
+            schema_version,
+            digest,
+            claims,
+            sources,
+        }
+    }
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+    pub const fn digest(&self) -> ManifestDigest {
+        self.digest
+    }
+    pub fn claims(&self) -> &[AuthorityClaim] {
+        &self.claims
+    }
+    pub fn sources(&self) -> &[SafeSource] {
+        &self.sources
+    }
 }
 
 impl ProjectPreferences {
@@ -186,6 +419,218 @@ impl Default for Config {
     }
 }
 
+/// A single parsed configuration view used for workspace review and activation.
+/// Its fields are private so callers cannot add authority after review.
+#[derive(Debug, Clone)]
+pub struct ConfigSnapshot {
+    workspace: PathBuf,
+    merged: toml::Value,
+    origins: BTreeMap<String, LayerOrigin>,
+    local: Option<toml::Value>,
+    local_origins: BTreeMap<String, LayerOrigin>,
+    overrides: InvocationOverrides,
+    manifest: AuthorityManifest,
+    memory: MemoryConfig,
+}
+
+#[derive(Debug, Clone)]
+struct LayerOrigin {
+    source: SafeSource,
+    source_digest: [u8; 32],
+    automatic: bool,
+}
+
+impl ConfigSnapshot {
+    pub fn parse(
+        user: Option<&Path>,
+        workspace: &Path,
+        local: Option<&Path>,
+        overrides: InvocationOverrides,
+    ) -> Result<Self> {
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|_| config_error("read", workspace))?;
+        if !workspace.is_dir() {
+            return Err(config_error("read", &workspace));
+        }
+        let mut merged =
+            toml::Value::try_from(Config::default()).expect("default config serializes");
+        let mut origins = BTreeMap::new();
+        let mut total_bytes: usize = 0;
+        let mut layers = Vec::new();
+        if let Some(path) = user {
+            layers.push((path.to_path_buf(), true, false));
+        }
+        for directory in
+            ancestor_directories(&workspace).map_err(|_| config_error("read", &workspace))?
+        {
+            layers.push((directory.join(".kuru/config.toml"), false, true));
+        }
+        for (path, required, automatic) in layers {
+            let Some(source) = read_config_bounded(&path, required)? else {
+                continue;
+            };
+            total_bytes = total_bytes
+                .checked_add(source.len())
+                .ok_or_else(|| config_error("read", &path))?;
+            if total_bytes > MAX_COMBINED_BYTES {
+                return Err(config_error("read", &path));
+            }
+            let patch: toml::Value = toml::from_str(&source)
+                .map_err(|error| config_parse_error(&path, &source, &error))?;
+            reject_removed_settings(&patch).map_err(|_| config_error("validation", &path))?;
+            merge_with_origins(
+                &mut merged,
+                &mut origins,
+                patch,
+                layer_origin(&path, automatic),
+            );
+            let _: Config = merged
+                .clone()
+                .try_into()
+                .map_err(|_| config_error("type", &path))?;
+        }
+        let (local, local_origins) = if let Some(path) = local {
+            let source =
+                read_config_bounded(path, true)?.ok_or_else(|| config_error("read", path))?;
+            total_bytes = total_bytes
+                .checked_add(source.len())
+                .ok_or_else(|| config_error("read", path))?;
+            if total_bytes > MAX_COMBINED_BYTES {
+                return Err(config_error("read", path));
+            }
+            let patch: toml::Value = toml::from_str(&source)
+                .map_err(|error| config_parse_error(path, &source, &error))?;
+            reject_removed_settings(&patch).map_err(|_| config_error("validation", path))?;
+            let mut checked = merged.clone();
+            merge(&mut checked, patch.clone());
+            let _: Config = checked.try_into().map_err(|_| config_error("type", path))?;
+            let mut local_origins = BTreeMap::new();
+            record_origins(&patch, "", layer_origin(path, false), &mut local_origins);
+            (Some(patch), local_origins)
+        } else {
+            (None, BTreeMap::new())
+        };
+        let provisional = Self {
+            workspace,
+            merged,
+            origins,
+            local,
+            local_origins,
+            overrides,
+            manifest: empty_manifest(),
+            memory: MemoryConfig::default(),
+        };
+        let (value, value_origins) =
+            provisional.value_with_preferences(&ProjectPreferences::default())?;
+        let config: Config = value
+            .clone()
+            .try_into()
+            .map_err(|_| config_error("type", provisional.workspace()))?;
+        config
+            .memory
+            .validate()
+            .map_err(|_| config_error("validation", provisional.workspace()))?;
+        let manifest = derive_manifest(&config, &value_origins)?;
+        Ok(Self {
+            memory: config.memory.clone(),
+            manifest,
+            ..provisional
+        })
+    }
+
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+    pub fn memory_config(&self) -> &MemoryConfig {
+        &self.memory
+    }
+    pub fn manifest(&self) -> &AuthorityManifest {
+        &self.manifest
+    }
+
+    /// Return an active Responses route without loading saved preferences or memory.
+    pub fn responses_route(&self) -> Result<Option<ResponsesRouteConfig>> {
+        let (value, _) = self.value_with_preferences(&ProjectPreferences::default())?;
+        let config: Config = value
+            .try_into()
+            .map_err(|_| config_error("type", self.workspace()))?;
+        Ok(
+            (config.provider == "responses").then_some(ResponsesRouteConfig {
+                api_base: config.api_base,
+                api_key_env: config.api_key_env,
+            }),
+        )
+    }
+
+    /// Parseable effective TOML before saved project preferences are loaded.
+    pub fn snapshot_toml(&self) -> Result<String> {
+        let (mut value, _) = self.value_with_preferences(&ProjectPreferences::default())?;
+        if let Some(mcp) = value.get_mut("mcp").and_then(toml::Value::as_table_mut) {
+            for server in mcp.iter_mut().map(|(_, server)| server) {
+                if let Some(environment) = server.get_mut("env").and_then(toml::Value::as_table_mut)
+                {
+                    for value in environment.iter_mut().map(|(_, value)| value) {
+                        *value = "[redacted]".into();
+                    }
+                }
+            }
+        }
+        toml::to_string_pretty(&value).map_err(|_| config_error("type", self.workspace()))
+    }
+
+    pub fn finalize(&self, preferences: &ProjectPreferences) -> Result<Config> {
+        let (value, _) = self.value_with_preferences(preferences)?;
+        let config: Config = value
+            .try_into()
+            .map_err(|_| config_error("type", self.workspace()))?;
+        config
+            .validate()
+            .map_err(|_| config_error("validation", self.workspace()))?;
+        Ok(config)
+    }
+
+    fn value_with_preferences(
+        &self,
+        preferences: &ProjectPreferences,
+    ) -> Result<(toml::Value, BTreeMap<String, LayerOrigin>)> {
+        let mut value = self.merged.clone();
+        let mut origins = self.origins.clone();
+        let provider = self
+            .overrides
+            .provider
+            .as_deref()
+            .or_else(|| self.local.as_ref()?.get("provider")?.as_str())
+            .or_else(|| value.get("provider")?.as_str())
+            .ok_or_else(|| config_error("type", self.workspace()))?
+            .to_owned();
+        let explicit_model = self
+            .overrides
+            .model
+            .as_deref()
+            .or_else(|| self.local.as_ref()?.get("model")?.as_str())
+            .map(str::to_owned);
+        preferences
+            .overlay(&mut value, &provider, explicit_model.as_deref())
+            .map_err(|_| config_error("validation", self.workspace()))?;
+        if let Some(local) = &self.local {
+            merge_with_origins(
+                &mut value,
+                &mut origins,
+                local.clone(),
+                LayerOrigin {
+                    source: SafeSource("explicit configuration".into()),
+                    source_digest: source_digest(b"explicit configuration"),
+                    automatic: false,
+                },
+            );
+            origins.extend(self.local_origins.clone());
+        }
+        apply_overrides(&mut value, &mut origins, &self.overrides);
+        Ok((value, origins))
+    }
+}
+
 impl Config {
     /// Merge user, outer-to-inner project, then explicit local TOML.
     ///
@@ -193,13 +638,8 @@ impl Config {
     /// path must exist. Maps merge recursively and arrays replace. Each layer is
     /// checked for unknown keys and field types; semantic checks run after merging.
     pub fn load(user: Option<&Path>, project: &Path, local: Option<&Path>) -> Result<Self> {
-        Self::load_with_preferences(
-            user,
-            project,
-            local,
-            &ProjectPreferences::default(),
-            SelectionOverrides::default(),
-        )
+        ConfigSnapshot::parse(user, project, local, InvocationOverrides::default())
+            .and_then(|snapshot| snapshot.finalize(&ProjectPreferences::default()))
     }
 
     /// Remembered interactive choices override ordinary file defaults. An
@@ -213,9 +653,7 @@ impl Config {
         preferences: &ProjectPreferences,
         overrides: SelectionOverrides<'_>,
     ) -> Result<Self> {
-        let config = Self::load_unvalidated(user, project, local, preferences, overrides)?;
-        config.validate()?;
-        Ok(config)
+        ConfigSnapshot::parse(user, project, local, overrides.into())?.finalize(preferences)
     }
 
     /// Storage bootstrap is independent of choices stored inside that storage.
@@ -224,102 +662,11 @@ impl Config {
         project: &Path,
         local: Option<&Path>,
     ) -> Result<MemoryConfig> {
-        let config = Self::load_unvalidated(
-            user,
-            project,
-            local,
-            &ProjectPreferences::default(),
-            SelectionOverrides::default(),
-        )?;
-        config.memory.validate()?;
-        Ok(config.memory)
-    }
-
-    fn load_unvalidated(
-        user: Option<&Path>,
-        project: &Path,
-        local: Option<&Path>,
-        preferences: &ProjectPreferences,
-        overrides: SelectionOverrides<'_>,
-    ) -> Result<Self> {
-        let ancestors = ancestor_directories(project)?;
-        let mut layers = Vec::new();
-        if let Some(path) = user {
-            layers.push((path.to_path_buf(), true));
-        }
-        layers.extend(
-            ancestors
-                .into_iter()
-                .map(|path| (path.join(".kuru/config.toml"), false)),
-        );
-        let mut merged = toml::Value::try_from(Self::default())?;
-        let mut total_bytes = 0;
-        for (path, required) in layers {
-            let Some(source) = read_bounded(&path, required)? else {
-                continue;
-            };
-            total_bytes += source.len();
-            ensure!(
-                total_bytes <= MAX_COMBINED_BYTES,
-                "combined configuration exceeds 1 MiB"
-            );
-            let patch: toml::Value = toml::from_str(&source)
-                .with_context(|| format!("cannot parse configuration {}", path.display()))?;
-            reject_removed_settings(&patch)?;
-            merge(&mut merged, patch);
-            // Deserialize at every step so an invalid layer cannot be silently
-            // masked by a later override. Defaults live in one place, Config.
-            let _: Self = merged
-                .clone()
-                .try_into()
-                .with_context(|| format!("invalid configuration in {}", path.display()))?;
-        }
-        let local_patch = if let Some(path) = local {
-            let source = read_bounded(path, true)?.context("explicit configuration is missing")?;
-            total_bytes += source.len();
-            ensure!(
-                total_bytes <= MAX_COMBINED_BYTES,
-                "combined configuration exceeds 1 MiB"
-            );
-            let patch = toml::from_str::<toml::Value>(&source)
-                .with_context(|| format!("cannot parse configuration {}", path.display()))?;
-            reject_removed_settings(&patch)?;
-            Some(patch)
-        } else {
-            None
-        };
-        let provider = overrides
-            .provider
-            .or_else(|| local_patch.as_ref()?.get("provider")?.as_str())
-            .or_else(|| merged.get("provider")?.as_str())
-            .context("provider must be a string")?
-            .to_owned();
-        let explicit_model = overrides
-            .model
-            .or_else(|| local_patch.as_ref()?.get("model")?.as_str());
-        preferences.overlay(&mut merged, &provider, explicit_model)?;
-        if let Some(patch) = local_patch {
-            merge(&mut merged, patch);
-        }
-        let mut config: Self = merged.try_into().with_context(|| {
-            local.map_or_else(
-                || "invalid effective configuration".into(),
-                |path| format!("invalid configuration in {}", path.display()),
-            )
-        })?;
-        if let Some(mode) = overrides.mode {
-            config.mode = mode;
-        }
-        if let Some(provider) = overrides.provider {
-            config.provider = provider.into();
-        }
-        if let Some(model) = overrides.model {
-            config.model = model.into();
-        }
-        if let Some(effort) = overrides.effort {
-            config.effort = Some(effort.into());
-        }
-        Ok(config)
+        Ok(
+            ConfigSnapshot::parse(user, project, local, InvocationOverrides::default())?
+                .memory_config()
+                .clone(),
+        )
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -466,6 +813,350 @@ fn merge(base: &mut toml::Value, patch: toml::Value) {
         }
         (base, patch) => *base = patch,
     }
+}
+
+fn config_error(category: &str, path: &Path) -> anyhow::Error {
+    anyhow::anyhow!("configuration {category} error in {}", safe_source(path))
+}
+
+fn config_parse_error(path: &Path, source: &str, error: &toml::de::Error) -> anyhow::Error {
+    let position = error
+        .span()
+        .map(|span| {
+            let prefix = &source[..span.start.min(source.len())];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let column = prefix
+                .rsplit_once('\n')
+                .map_or(prefix.chars().count() + 1, |(_, tail)| {
+                    tail.chars().count() + 1
+                });
+            format!(" at line {line}, column {column}")
+        })
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "configuration parse error in {}{position}",
+        safe_source(path)
+    )
+}
+
+fn safe_source(path: &Path) -> SafeSource {
+    let text = path.as_os_str().to_string_lossy();
+    let escaped = text
+        .chars()
+        .flat_map(char::escape_default)
+        .take(160)
+        .collect::<String>();
+    SafeSource(if escaped.is_empty() {
+        "configuration source".into()
+    } else {
+        escaped
+    })
+}
+
+fn source_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"kuru.workspace-trust.source\0");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    hash.finalize().into()
+}
+
+fn layer_origin(path: &Path, automatic: bool) -> LayerOrigin {
+    LayerOrigin {
+        source: safe_source(path),
+        source_digest: source_digest(path.as_os_str().as_encoded_bytes()),
+        automatic,
+    }
+}
+
+fn read_config_bounded(path: &Path, required: bool) -> Result<Option<String>> {
+    read_bounded(path, required).map_err(|_| config_error("read", path))
+}
+
+fn merge_with_origins(
+    base: &mut toml::Value,
+    origins: &mut BTreeMap<String, LayerOrigin>,
+    patch: toml::Value,
+    origin: LayerOrigin,
+) {
+    merge(base, patch.clone());
+    record_origins(&patch, "", origin, origins);
+}
+
+fn record_origins(
+    value: &toml::Value,
+    prefix: &str,
+    origin: LayerOrigin,
+    origins: &mut BTreeMap<String, LayerOrigin>,
+) {
+    if let toml::Value::Table(table) = value {
+        for (key, value) in table {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            record_origins(value, &path, origin.clone(), origins);
+        }
+    } else {
+        origins.insert(prefix.into(), origin);
+    }
+}
+
+fn apply_overrides(
+    value: &mut toml::Value,
+    origins: &mut BTreeMap<String, LayerOrigin>,
+    overrides: &InvocationOverrides,
+) {
+    let table = value
+        .as_table_mut()
+        .expect("configuration default is a table");
+    let cli = || LayerOrigin {
+        source: SafeSource("command line".into()),
+        source_digest: source_digest(b"command line"),
+        automatic: false,
+    };
+    if let Some(mode) = overrides.mode {
+        table.insert(
+            "mode".into(),
+            toml::Value::try_from(mode).expect("mode serializes"),
+        );
+        origins.insert("mode".into(), cli());
+    }
+    if let Some(provider) = &overrides.provider {
+        table.insert("provider".into(), provider.clone().into());
+        origins.insert("provider".into(), cli());
+    }
+    if let Some(model) = &overrides.model {
+        table.insert("model".into(), model.clone().into());
+        origins.insert("model".into(), cli());
+    }
+    if let Some(effort) = &overrides.effort {
+        table.insert("effort".into(), effort.clone().into());
+        origins.insert("effort".into(), cli());
+    }
+    if overrides.allow_write {
+        table.insert("allow_write".into(), true.into());
+        origins.insert("allow_write".into(), cli());
+    }
+    if overrides.allow_shell {
+        table.insert("allow_shell".into(), true.into());
+        origins.insert("allow_shell".into(), cli());
+    }
+    if overrides.no_dream {
+        table.insert("dream_every".into(), 0.into());
+        table.insert("dream_on_exit".into(), false.into());
+    }
+}
+
+fn empty_manifest() -> AuthorityManifest {
+    SafeManifest::new(1, Vec::new()).into_manifest()
+}
+
+impl SafeManifest {
+    fn into_manifest(self) -> AuthorityManifest {
+        AuthorityManifest {
+            schema_version: self.schema_version,
+            digest: self.digest,
+            claims: self.claims,
+            sources: self.sources,
+        }
+    }
+}
+
+fn manifest_digest(schema_version: u16, claims: &[AuthorityClaim]) -> ManifestDigest {
+    let mut hash = Sha256::new();
+    hash.update(b"kuru.workspace-trust.manifest\0");
+    hash.update(schema_version.to_be_bytes());
+    for claim in claims {
+        hash.update((claim.category as u8).to_be_bytes());
+        hash.update(claim.digest.0);
+        for source_digest in &claim.source_digests {
+            hash.update(source_digest);
+        }
+    }
+    ManifestDigest(hash.finalize().into())
+}
+
+fn claim_digest(category: AuthorityClaimCategory, value: impl Serialize) -> Result<ClaimDigest> {
+    // All claim values are concrete, serde-serializable configuration types.
+    // JSON preserves BTreeMap order and represents root scalars and tuples.
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|_| anyhow::anyhow!("canonical authority encoding failed"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"kuru.workspace-trust.claim\0");
+    hash.update((category as u8).to_be_bytes());
+    hash.update((encoded.len() as u64).to_be_bytes());
+    hash.update(encoded);
+    Ok(ClaimDigest(hash.finalize().into()))
+}
+
+fn automatic_origins<'a>(
+    origins: &'a BTreeMap<String, LayerOrigin>,
+    path: &str,
+) -> Vec<&'a LayerOrigin> {
+    let prefix = format!("{path}.");
+    origins
+        .iter()
+        .filter_map(|(key, origin)| {
+            ((key == path || key.starts_with(&prefix)) && origin.automatic).then_some(origin)
+        })
+        .collect()
+}
+
+fn push_claim(
+    claims: &mut Vec<AuthorityClaim>,
+    category: AuthorityClaimCategory,
+    value: impl Serialize,
+    origins: &[&LayerOrigin],
+    display: impl Into<String>,
+) -> Result<()> {
+    let sources = origins
+        .iter()
+        .map(|origin| origin.source.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let source_digests = origins
+        .iter()
+        .map(|origin| origin.source_digest)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let source = sources
+        .first()
+        .expect("claim has an automatic source")
+        .clone();
+    claims.push(AuthorityClaim {
+        category,
+        digest: claim_digest(category, value)?,
+        source,
+        sources,
+        source_digests,
+        display: SafeClaimDisplay(display.into()),
+    });
+    Ok(())
+}
+
+fn derive_manifest(
+    config: &Config,
+    origins: &BTreeMap<String, LayerOrigin>,
+) -> Result<AuthorityManifest> {
+    let mut claims = Vec::new();
+    let write_origins = automatic_origins(origins, "allow_write");
+    if config.allow_write && !write_origins.is_empty() {
+        push_claim(
+            &mut claims,
+            AuthorityClaimCategory::WorkspaceWrite,
+            config.allow_write,
+            &write_origins,
+            "workspace write enabled",
+        )?;
+    }
+    let shell_origins = automatic_origins(origins, "allow_shell");
+    if config.allow_shell && !shell_origins.is_empty() {
+        push_claim(
+            &mut claims,
+            AuthorityClaimCategory::Shell,
+            config.allow_shell,
+            &shell_origins,
+            "shell enabled",
+        )?;
+    }
+    let binary_origins = automatic_origins(origins, "memory.dolt_binary");
+    if config.memory.dolt_binary.is_some() && !binary_origins.is_empty() {
+        push_claim(
+            &mut claims,
+            AuthorityClaimCategory::MemoryDoltBinary,
+            &config.memory.dolt_binary,
+            &binary_origins,
+            "configured memory executable",
+        )?;
+    }
+    let cache_origins = automatic_origins(origins, "memory.cache_dir");
+    if config.memory.cache_dir.is_some() && !cache_origins.is_empty() {
+        push_claim(
+            &mut claims,
+            AuthorityClaimCategory::MemoryCacheDir,
+            &config.memory.cache_dir,
+            &cache_origins,
+            "configured memory cache",
+        )?;
+    }
+    if config.provider == "responses" {
+        let response_origins = ["provider", "api_base", "api_key_env"]
+            .into_iter()
+            .flat_map(|path| automatic_origins(origins, path))
+            .collect::<Vec<_>>();
+        if !response_origins.is_empty() {
+            push_claim(
+                &mut claims,
+                AuthorityClaimCategory::ResponsesRoute,
+                (&config.provider, &config.api_base, &config.api_key_env),
+                &response_origins,
+                "Responses credential route",
+            )?;
+        }
+    }
+    for (name, mcp) in &config.mcp {
+        let path = format!("mcp.{name}");
+        let mcp_origins = automatic_origins(origins, &path);
+        if !mcp_origins.is_empty() {
+            let category = if mcp.command.is_some() {
+                AuthorityClaimCategory::McpStdio
+            } else {
+                AuthorityClaimCategory::McpHttp
+            };
+            let display_name = safe_text(name, 64);
+            if mcp.command.is_some() {
+                push_claim(
+                    &mut claims,
+                    category,
+                    (name, &mcp.command, &mcp.args, &mcp.env),
+                    &mcp_origins,
+                    format!("{display_name}: configured executable"),
+                )?;
+            } else {
+                push_claim(
+                    &mut claims,
+                    category,
+                    (name, &mcp.url),
+                    &mcp_origins,
+                    format!("{display_name}: HTTP endpoint"),
+                )?;
+            }
+        }
+    }
+    for (name, url) in &config.external_agents {
+        let agent_origins = automatic_origins(origins, &format!("external_agents.{name}"));
+        if !agent_origins.is_empty() {
+            push_claim(
+                &mut claims,
+                AuthorityClaimCategory::ExternalAgent,
+                (name, url),
+                &agent_origins,
+                format!("{}: external agent", safe_text(name, 64)),
+            )?;
+        }
+    }
+    claims.sort_by_key(|claim| (claim.category, claim.digest));
+    let mut manifest = SafeManifest::new(1, claims).into_manifest();
+    manifest.sources = manifest
+        .claims
+        .iter()
+        .flat_map(|claim| claim.sources.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(manifest)
+}
+
+fn safe_text(value: &str, max: usize) -> String {
+    value
+        .chars()
+        .flat_map(char::escape_default)
+        .take(max)
+        .collect()
 }
 
 fn ancestor_directories(project: &Path) -> Result<Vec<PathBuf>> {

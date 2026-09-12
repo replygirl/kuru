@@ -1,6 +1,6 @@
 # Configuration
 
-Kuru uses typed TOML. Run `kuru config` to inspect the effective configuration; MCP environment values are redacted in its output. Unknown keys, unsupported providers, invalid types, and invalid bounds produce an error rather than being silently ignored.
+Kuru uses typed TOML. Run `kuru config` to inspect configured values and CLI overrides. MCP environment values are redacted, and saved project mode, model, and effort preferences are omitted so this command never opens or provisions memory. The stderr notice identifies that omission. Unknown keys, unsupported providers, invalid types, and invalid bounds produce an error rather than being silently ignored.
 
 ## Precedence
 
@@ -16,6 +16,35 @@ Later layers take precedence:
 Tables merge recursively; arrays replace earlier arrays. Each configuration file is limited to 256 KiB, and combined input to 1 MiB.
 
 Ancestor `AGENTS.md` files provide project instructions, with nearer files taking precedence. Put applicable instructions in `AGENTS.md` itself; linked files are not automatically followed.
+
+## Workspace trust
+
+Kuru reviews effective process, mutation, executable, credential-route, and endpoint authority supplied by automatic ancestor `.kuru/config.toml` files before activation. The trust subject is the exact canonical `-C` directory and its current native identity; approval does not cover a parent, child, or replacement directory. User defaults, explicit `--config`, and CLI flags are deliberate inputs and authorize their own effective values.
+
+```sh
+kuru -C /path/to/project trust status
+kuru -C /path/to/project trust approve
+kuru -C /path/to/project trust approve --yes
+kuru -C /path/to/project trust revoke
+kuru -C /path/to/project --trust-workspace-once tools
+```
+
+Persistent approval always covers the complete current authority manifest. Any automatic authority value added, removed, or changed invalidates that record globally; ordinary mode, model, effort, budget, dreaming, offline-memory, and timeout changes do not. A command may use the applicable subset of a matching complete record. Stored claim digests are audit data, not separate grants.
+
+`--trust-workspace-once` approves only the invoking command's applicable subset and writes nothing. `trust status` and an absent `trust revoke` create no trust state. Noninteractive commands fail promptly unless a complete stored approval matches or the one-time flag was supplied. Before the terminal UI enters its alternate screen, it offers continue once, approve the complete configuration, or cancel.
+
+| Commands                                           | Automatic ancestor authority checked before activation                                                                                 |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `login`, `logout`, `config`, `trust ...`, `update` | None. Login/logout use fixed ChatGPT authentication; config omits saved preferences; revoke works even if current config is malformed. |
+| `auth`                                             | Active Responses route. Under another provider the API-key route is reported as not checked.                                           |
+| `sessions`, `memory ...`, `undo-dream`             | Configured memory executable and cache paths                                                                                           |
+| `models`                                           | Configured memory paths used for saved selections and the active Responses route                                                       |
+| `tool`, `tools`                                    | Configured memory paths used for saved selections, write/shell grants, and stdio/HTTP MCP configuration                                |
+| `run`, `dream`, `serve`, terminal UI               | All applicable memory, provider, write, shell, MCP, and external-agent claims                                                          |
+
+Review text and configuration diagnostics are bounded and escaped. They do not print MCP arguments or environment values, URL queries, credential values, or raw parser excerpts. Private approval records under `<data-dir>/trust/workspaces` contain root/manifest identities and digests, not configuration values, and remain outside Dolt and workspace tools.
+
+Workspace trust is authorization, not confinement. Approved shell and stdio MCP children keep your process authority. Kuru revalidates the retained workspace before a pathname-based child launch, but Unix cannot atomically bind that check to the later child cwd selection. Workspace trust is not an OS sandbox.
 
 ## Remembered choices
 

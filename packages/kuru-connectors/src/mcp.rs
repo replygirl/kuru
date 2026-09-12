@@ -1,11 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::path::Path;
+
 use anyhow::{Context, Result, bail, ensure};
 use kuru_core::{McpConfig, ToolSpec};
+use kuru_platform::fs::Directory;
+#[cfg(test)]
+use kuru_platform::fs::{NameRetention, Privacy};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 
@@ -20,7 +26,23 @@ pub(crate) struct McpHosts {
 }
 
 impl McpHosts {
+    #[cfg(test)]
     pub fn new(root: &Path, configs: &BTreeMap<String, McpConfig>) -> Result<Self> {
+        let root = root.canonicalize().context("MCP root does not exist")?;
+        let root = Arc::new(Directory::open(
+            &root,
+            Privacy::Inherited,
+            NameRetention::Pinned,
+        )?);
+        Self::with_retained_root(root, configs)
+    }
+
+    pub(crate) fn with_retained_root(
+        root_guard: Arc<Directory>,
+        configs: &BTreeMap<String, McpConfig>,
+    ) -> Result<Self> {
+        root_guard.revalidate()?;
+        let root = root_guard.path().to_path_buf();
         let mut clients = BTreeMap::new();
         for (name, config) in configs {
             ensure!(
@@ -34,7 +56,8 @@ impl McpHosts {
                 name.clone(),
                 Arc::new(McpClient {
                     config: config.clone(),
-                    root: root.into(),
+                    root: root.clone(),
+                    root_guard: root_guard.clone(),
                     transport: Mutex::new(None),
                 }),
             );
@@ -124,6 +147,7 @@ impl McpHosts {
 struct McpClient {
     config: McpConfig,
     root: PathBuf,
+    root_guard: Arc<Directory>,
     transport: Mutex<Option<Transport>>,
 }
 
@@ -138,6 +162,7 @@ impl McpClient {
                 next_id: 0,
             })
         } else {
+            self.root_guard.revalidate()?;
             Transport::Stdio(Box::new(
                 Rpc::spawn(
                     self.config
@@ -522,6 +547,34 @@ mod tests {
         assert_eq!(requests[4]["params"]["name"], "counter");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_root_replacement_blocks_stdio_discovery_before_child_spawn() {
+        let script = StdioFixture::new([Step::Read, Step::Eof]);
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let retained =
+            Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Pinned).unwrap());
+        let config = [(
+            "stdio".into(),
+            McpConfig {
+                command: Some(script.command().into()),
+                args: vec![],
+                url: None,
+                env: BTreeMap::new(),
+            },
+        )]
+        .into();
+        let hosts = McpHosts::with_retained_root(retained, &config).unwrap();
+        std::fs::rename(&root, parent.path().join("replaced")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let error = hosts.specs().await.unwrap_err();
+        assert!(format!("{error:#}").contains("identity changed"));
+        assert!(script.conversations().is_empty());
+    }
+
     #[tokio::test]
     async fn discovery_rejects_incompatible_version_duplicates_and_stalled_pagination() {
         for (reply, expected) in [
@@ -536,9 +589,15 @@ mod tests {
             (json!({}), "protocolVersion"),
         ] {
             let peer = HttpFixture::new(vec![Reply::rpc(reply)]).await;
+            let workspace = tempfile::tempdir().unwrap();
+            let root = Arc::new(
+                Directory::open(workspace.path(), Privacy::Inherited, NameRetention::Pinned)
+                    .unwrap(),
+            );
             let client = McpClient {
                 config: http_config(&peer.url).remove("test").unwrap(),
-                root: PathBuf::from("."),
+                root: root.path().to_path_buf(),
+                root_guard: root,
                 transport: Mutex::new(None),
             };
             assert!(

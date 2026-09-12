@@ -13,7 +13,7 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use kuru_connectors::Provider;
+use kuru_connectors::{Provider, ToolHost};
 use kuru_core::{
     Completion, CompletionRequest, Config, Mode, ModelInfo, RelationshipKind, ToolCall,
 };
@@ -23,7 +23,8 @@ use tower::ServiceExt;
 
 use crate::{
     DreamProposal, Harness, PeerMessage,
-    engine::{StateReport, validate_topology},
+    engine::{StateReport, read_topology, validate_topology},
+    undo_dream,
 };
 
 type Responder = dyn Fn(&CompletionRequest) -> Completion + Send + Sync;
@@ -448,6 +449,90 @@ async fn dreaming_adds_retires_and_undoes_without_losing_memories() {
             .active
     );
     assert!(harness.undo_dream().await.is_err());
+}
+
+#[tokio::test]
+async fn provider_free_undo_preserves_sessions_and_archives_added_identities() {
+    let (_directory, mut harness) = fixture(Mode::Ifs, Fake::new(|_| answer("Summary"))).await;
+    let config = harness.config.clone();
+    let scope = harness.scope.clone();
+    let memory = harness.memory.clone();
+    let session = harness.session.id.clone();
+    let role = harness.topology.parts[0].role.clone();
+    harness
+        .apply_dream(vec![DreamProposal::Add {
+            name: "Later observer".into(),
+            role,
+            instruction: "Preserve the later identity".into(),
+        }])
+        .await
+        .unwrap();
+    let added = harness.resolve("Later observer").unwrap();
+    memory
+        .append(
+            &format!("{scope}/{}/identity/{added}", config.mode),
+            "user",
+            "later private conversation",
+        )
+        .await
+        .unwrap();
+    let sessions = memory.get(&format!("{scope}/sessions")).await.unwrap();
+    harness.shutdown(false).await.unwrap();
+    drop(harness);
+
+    undo_dream(&config, &scope, &memory, Some(&session))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        memory.get(&format!("{scope}/sessions")).await.unwrap(),
+        sessions
+    );
+    assert!(
+        memory
+            .history(&format!("{scope}/{}/identity/{added}", config.mode), 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.content == "later private conversation")
+    );
+    let topology = read_topology(&memory, &scope, config.mode).await.unwrap();
+    assert!(
+        !topology
+            .parts
+            .iter()
+            .find(|part| part.id == added)
+            .unwrap()
+            .active
+    );
+}
+
+#[tokio::test]
+async fn injected_host_must_match_the_canonical_workspace() {
+    let workspace = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let config = Config {
+        provider: "demo".into(),
+        model: "demo".into(),
+        dream_every: 0,
+        ..Config::default()
+    };
+    let host = ToolHost::new(other.path(), &config).unwrap();
+    let result = Harness::with_tool_host(
+        config,
+        workspace.path(),
+        MemoryStore::temporary().await.unwrap(),
+        Fake::new(|_| answer("unused")),
+        None,
+        host,
+    )
+    .await;
+    let error = result.err().expect("mismatched host must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the canonical workspace")
+    );
 }
 
 #[tokio::test]

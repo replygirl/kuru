@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, ensure};
 use futures::future::join_all;
-use kuru_core::{Part, ToolSpec};
-use kuru_memory::Candidate;
+use kuru_core::{Config, Mode, Part, ToolSpec};
+use kuru_memory::{Candidate, MemoryStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::engine::{Harness, PendingPublication, Topology, spec, user, validate_topology};
+use crate::engine::{
+    Harness, PendingPublication, Session, Topology, read_topology, spec, user, validate_topology,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -238,32 +240,114 @@ impl Harness {
 
     pub async fn undo_dream(&mut self) -> Result<()> {
         self.reconcile().await?;
-        let key = format!("{}/{}/dream-undo", self.scope, self.config.mode);
-        let value = self
-            .memory
-            .get(&key)
-            .await?
-            .filter(|v| !v.is_null())
-            .context("no dreaming change to undo")?;
-        let previous: Topology = serde_json::from_value(value)?;
-        validate_topology(&previous, &self.config)?;
-        // Keep newly created identities archived so their memories remain inspectable.
-        let mut restored = previous;
-        for part in &self.topology.parts {
-            if !restored.parts.iter().any(|p| p.id == part.id) {
-                let mut archived = part.clone();
-                archived.active = false;
-                restored.parts.push(archived);
-            }
-        }
+        let undo = prepare_undo_dream(
+            &self.config,
+            &self.scope,
+            &self.memory,
+            Some(&self.session.id),
+        )
+        .await?;
         self.persist_state(
             self.config.clone(),
-            restored,
+            undo.topology,
             self.session.clone(),
-            vec![(key, json!(null))],
+            vec![(undo.key, json!(null))],
         )
         .await
     }
+}
+
+/// Undo the latest dream membership change without starting a provider, tool
+/// host, actor, or harness. A resumed session selects its saved mode; otherwise
+/// the finalized configuration selects the mode.
+pub async fn undo_dream(
+    config: &Config,
+    scope: &str,
+    memory: &MemoryStore,
+    resume: Option<&str>,
+) -> Result<()> {
+    let undo = prepare_undo_dream(config, scope, memory, resume).await?;
+    memory
+        .put_many(&[
+            (
+                format!("{scope}/{}/topology", undo.mode),
+                serde_json::to_value(&undo.topology)?,
+            ),
+            (undo.key, json!(null)),
+        ])
+        .await?;
+    memory.reconcile().await?;
+    Ok(())
+}
+
+struct UndoDream {
+    mode: Mode,
+    topology: Topology,
+    key: String,
+}
+
+async fn prepare_undo_dream(
+    config: &Config,
+    scope: &str,
+    memory: &MemoryStore,
+    resume: Option<&str>,
+) -> Result<UndoDream> {
+    config.validate()?;
+    memory.reconcile().await?;
+    let mode = resume_mode(config, scope, memory, resume).await?;
+    let mut config = config.clone();
+    config.mode = mode;
+    config.validate()?;
+    let current = read_topology(memory, scope, mode).await?;
+    let key = format!("{scope}/{mode}/dream-undo");
+    let value = memory
+        .get(&key)
+        .await?
+        .filter(|value| !value.is_null())
+        .context("no dreaming change to undo")?;
+    let previous: Topology = serde_json::from_value(value)?;
+    validate_topology(&previous, &config)?;
+    let restored = restore_topology(previous, &current);
+    validate_topology(&restored, &config)?;
+    Ok(UndoDream {
+        mode,
+        topology: restored,
+        key,
+    })
+}
+
+async fn resume_mode(
+    config: &Config,
+    scope: &str,
+    memory: &MemoryStore,
+    resume: Option<&str>,
+) -> Result<Mode> {
+    let Some(resume) = resume else {
+        return Ok(config.mode);
+    };
+    let session: Session = serde_json::from_value(
+        memory
+            .get(&format!("{scope}/session/{resume}"))
+            .await?
+            .context("session not found in this project")?,
+    )?;
+    Ok(session.mode)
+}
+
+fn restore_topology(mut previous: Topology, current: &Topology) -> Topology {
+    // Keep newly created identities archived so their memories remain inspectable.
+    for part in &current.parts {
+        if !previous
+            .parts
+            .iter()
+            .any(|previous_part| previous_part.id == part.id)
+        {
+            let mut archived = part.clone();
+            archived.active = false;
+            previous.parts.push(archived);
+        }
+    }
+    previous
 }
 
 fn dream_tool() -> ToolSpec {

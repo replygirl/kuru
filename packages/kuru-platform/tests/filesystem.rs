@@ -485,6 +485,7 @@ fn directory_substitution_invalidates_previously_held_authority() {
         .write_all(b"replacement")
         .unwrap();
     assert_ne!(replacement.identity(), directory.identity());
+    assert!(directory.revalidate().is_err());
     assert!(directory.read(OsStr::new("record")).is_err());
     assert!(directory.verify(OsStr::new("record"), &file).is_err());
     assert_eq!(

@@ -10,7 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -19,7 +19,7 @@ use axum::{
     extract::State,
     routing::{get, post},
 };
-use kuru_core::{Config, Mode};
+use kuru_core::{Config, Mode, SelectionOverrides};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{
@@ -87,6 +87,29 @@ impl Sandbox {
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(toml::from_str(&String::from_utf8(output.stdout)?)?)
+    }
+
+    async fn preferences(&self) -> Result<kuru_core::ProjectPreferences> {
+        let mut options = memory_options(self)?;
+        options.read_only = true;
+        let memory = MemoryStore::open(options).await?;
+        let preferences = kuru_runtime::Harness::load_preferences(&memory, &self.project).await?;
+        memory.close().await?;
+        Ok(preferences)
+    }
+
+    async fn effective_config(&self) -> Result<Config> {
+        let preferences = self.preferences().await?;
+        Config::load_with_preferences(
+            Some(&self.root.path().join("config/kuru/config.toml")),
+            &self.project,
+            None,
+            &preferences,
+            SelectionOverrides {
+                provider: Some("demo"),
+                ..SelectionOverrides::default()
+            },
+        )
     }
 
     fn sessions(&self) -> Result<Vec<kuru_runtime::Session>> {
@@ -601,22 +624,29 @@ async fn preferences_session(
             terminal.wait_text(&["Esc back"], &[])?;
             terminal.close_picker(&selection.keys[3..])?;
         }
-        terminal.wait(
-            "selection persisted and rendered",
-            READY_TIMEOUT,
-            |terminal| {
-                let actual = sandbox.config()?;
-                let screen = terminal.screen();
-                Ok(actual.mode == selection.mode
-                    && actual.model == selection.model
-                    && actual.effort.as_deref() == selection.effort
-                    && screen.contains("enter send")
-                    && (!reject
-                        || "invalid saved session index"
-                            .split_whitespace()
-                            .all(|word| screen.contains(word))))
-            },
-        )?;
+        terminal.wait("selection rendered", READY_TIMEOUT, |terminal| {
+            let screen = terminal.screen();
+            Ok(screen.contains("enter send")
+                && (!reject
+                    || "invalid saved session index"
+                        .split_whitespace()
+                        .all(|word| screen.contains(word))))
+        })?;
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            let actual = sandbox.effective_config().await?;
+            if actual.mode == selection.mode
+                && actual.model == selection.model
+                && actual.effort.as_deref() == selection.effort
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "selection was rendered but its saved preference did not match"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     if let Some(fault) = rejected_index {
         fault.restore().await?;
@@ -657,7 +687,7 @@ async fn terminal_selections_survive_restarts_picker_changes_and_failed_database
         false,
     )
     .await?;
-    assert_eq!(sandbox.config()?.mode, Mode::Jungian);
+    assert_eq!(sandbox.effective_config().await?.mode, Mode::Jungian);
     preferences_session(
         &sandbox,
         &["persistent-demo", "jungian", "high"],
@@ -691,9 +721,13 @@ async fn terminal_selections_survive_restarts_picker_changes_and_failed_database
     )
     .await?;
     preferences_session(&sandbox, &["demo", "freudian", "default"], &[], false).await?;
-    let current = sandbox.config()?;
+    let current = sandbox.effective_config().await?;
     assert_eq!(
-        (current.mode, current.model.as_str(), current.effort),
+        (
+            current.mode,
+            current.model.as_str(),
+            current.effort.as_deref()
+        ),
         (Mode::Freudian, "demo", None)
     );
     preferences_session(
@@ -708,7 +742,7 @@ async fn terminal_selections_survive_restarts_picker_changes_and_failed_database
         true,
     )
     .await?;
-    assert_eq!(sandbox.config()?.mode, Mode::Freudian);
+    assert_eq!(sandbox.effective_config().await?.mode, Mode::Freudian);
     let sessions = sandbox.sessions()?;
     assert_eq!(sessions.len(), 4);
     assert!(sessions.iter().all(|session| session.turns == 0));

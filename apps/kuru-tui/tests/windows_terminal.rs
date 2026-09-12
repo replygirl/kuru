@@ -337,6 +337,91 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_trust_refusal_and_persistent_choice_precede_the_alternate_screen()
+-> Result<()> {
+    let _serial = SERIAL.lock().await;
+
+    let sandbox = Sandbox::new()?;
+    std::fs::create_dir(sandbox.root.join(".kuru"))?;
+    std::fs::write(
+        sandbox.root.join(".kuru/config.toml"),
+        "allow_shell = true\nprovider = 'responses'\nmodel = 'fixture-model'\napi_key_env = 'KURU_ABSENT_CONPTY_KEY'\n",
+    )?;
+    let mut terminal = sandbox.start("trust-refusal", "app", &[], true, "responses", &[])?;
+    terminal.text(
+        &["Continue once", "Approve this complete configuration"],
+        READY,
+    )?;
+    ensure!(
+        !sandbox.data.exists(),
+        "trust refusal created memory before a choice"
+    );
+    terminal.send(b"3\r")?;
+    let error = terminal
+        .wait("trust refusal exits before the TUI", READY, |_| false)
+        .unwrap_err();
+    ensure!(error.to_string().contains("child exited"), "{error:#}");
+    ensure!(
+        !terminal
+            .output
+            .windows(8)
+            .any(|bytes| bytes == b"\x1b[?1049h"),
+        "trust refusal entered the alternate screen"
+    );
+    ensure!(
+        !sandbox.data.exists(),
+        "trust refusal created memory after the declined choice"
+    );
+
+    let sandbox = Sandbox::new()?;
+    std::fs::create_dir(sandbox.root.join(".kuru"))?;
+    std::fs::write(
+        sandbox.root.join(".kuru/config.toml"),
+        "allow_shell = true\nprovider = 'responses'\nmodel = 'fixture-model'\napi_key_env = 'KURU_ABSENT_CONPTY_KEY'\n",
+    )?;
+    let mut terminal = sandbox.start("trust-persistent", "app", &[], true, "responses", &[])?;
+    terminal.text(
+        &["Continue once", "Approve this complete configuration"],
+        READY,
+    )?;
+    terminal.send(b"2\r")?;
+    let error = terminal
+        .wait(
+            "missing responses route exits before the TUI",
+            READY,
+            |_| false,
+        )
+        .unwrap_err();
+    ensure!(error.to_string().contains("child exited"), "{error:#}");
+    ensure!(
+        !terminal
+            .output
+            .windows(8)
+            .any(|bytes| bytes == b"\x1b[?1049h"),
+        "persistent trust choice entered the alternate screen"
+    );
+
+    let status = BlockingCommand::new(env!("CARGO_BIN_EXE_kuru"))
+        .args(sandbox.args("responses"))
+        .arg("trust")
+        .arg("status")
+        .env_clear()
+        .envs(&sandbox.environment)
+        .output()?;
+    ensure!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    ensure!(
+        String::from_utf8_lossy(&status.stdout).contains("Status: approved"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_console_modes_restore_after_partial_initialization_and_errors() -> Result<()> {
     let _serial = SERIAL.lock().await;
     let sandbox = Sandbox::new()?;

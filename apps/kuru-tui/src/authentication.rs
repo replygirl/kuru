@@ -4,23 +4,28 @@
 use std::time::Duration;
 use std::{future::Future, path::Path};
 
+use crate::cli::Command;
 #[cfg(unix)]
 use anyhow::ensure;
 use anyhow::{Context, Result, bail};
 use kuru_connectors::{AuthManager, AuthStatus};
-use kuru_core::Config;
 
-use crate::cli::Command;
-
-pub(crate) async fn run(command: &Command, config: &Config, data: &Path, cwd: &Path) -> Result<()> {
-    let api_key = if config.api_key_env.is_empty() {
-        None
-    } else {
-        match std::env::var(&config.api_key_env) {
+pub(crate) async fn run(
+    command: &Command,
+    responses_api_key_env: Option<&str>,
+    data: &Path,
+    cwd: &Path,
+) -> Result<()> {
+    let api_key = if let Some(name) = responses_api_key_env {
+        match std::env::var(name) {
             Ok(value) => Some(value),
             Err(std::env::VarError::NotPresent) => None,
-            Err(_) => bail!("{} must contain valid text", config.api_key_env),
+            Err(_) => {
+                bail!("configured Responses API-key environment variable must contain valid text")
+            }
         }
+    } else {
+        None
     };
     let auth = AuthManager::new(data.to_owned(), cwd.to_owned(), api_key)?;
     match command {
@@ -122,7 +127,7 @@ mod tests {
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !marker.exists() {
+            while std::fs::read_to_string(&marker).ok().as_deref() != Some("desktop") {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })

@@ -381,3 +381,31 @@ async fn stock_powershell_unicode_and_terminating_errors_are_observed() {
             .contains("native failure")
     );
 }
+
+#[tokio::test]
+async fn retained_pinned_workspace_denies_replacement_and_keeps_shell_cwd() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let host = ToolHost::new(
+        &workspace,
+        &Config {
+            allow_shell: true,
+            ..Config::default()
+        },
+    )
+    .unwrap();
+
+    assert!(std::fs::rename(&workspace, parent.path().join("retired")).is_err());
+    host.execute(
+        "shell",
+        json!({"command":"[IO.File]::WriteAllText([IO.Path]::Combine((Get-Location).Path,'retained-root.txt'), 'kept')"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("retained-root.txt")).unwrap(),
+        "kept"
+    );
+    host.shutdown().await.unwrap();
+}

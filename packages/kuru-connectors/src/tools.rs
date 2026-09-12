@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,8 +13,9 @@ use cap_std::{
     fs::{Dir, OpenOptions},
 };
 use kuru_core::{Config, ToolSpec};
+use kuru_platform::fs::{Directory, NameRetention, Privacy};
 #[cfg(windows)]
-use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info, validate_component};
+use kuru_platform::fs::{regular_file_info, validate_component};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::process::Stdio;
@@ -32,8 +34,7 @@ use crate::{MAX_BYTES, mcp::McpHosts};
 pub struct ToolHost {
     root: PathBuf,
     directory: Dir,
-    #[cfg(windows)]
-    root_guard: Directory,
+    root_guard: Arc<Directory>,
     allow_write: bool,
     allow_shell: bool,
     mcp: McpHosts,
@@ -42,18 +43,39 @@ pub struct ToolHost {
 impl ToolHost {
     pub fn new(root: &Path, config: &Config) -> Result<Self> {
         let root = root.canonicalize().context("tool root does not exist")?;
-        #[cfg(windows)]
-        let root_guard = Directory::open(&root, Privacy::Inherited, NameRetention::Pinned)?;
+        let root_guard = Arc::new(Directory::open(
+            &root,
+            Privacy::Inherited,
+            NameRetention::Pinned,
+        )?);
+        Self::with_retained_root(root_guard, config)
+    }
+
+    /// Construct a host from the workspace capability retained before
+    /// configuration review. Configured process launches keep this exact guard.
+    pub fn with_retained_root(root_guard: Arc<Directory>, config: &Config) -> Result<Self> {
+        root_guard.revalidate()?;
+        let root = root_guard.path().to_path_buf();
         let directory = Dir::open_ambient_dir(&root, ambient_authority())?;
+        root_guard.revalidate()?;
         Ok(Self {
-            mcp: McpHosts::new(&root, &config.mcp)?,
+            mcp: McpHosts::with_retained_root(root_guard.clone(), &config.mcp)?,
             root,
             directory,
-            #[cfg(windows)]
             root_guard,
             allow_write: config.allow_write,
             allow_shell: config.allow_shell,
         })
+    }
+
+    /// Verify the held workspace identity without reopening a replacement.
+    pub fn revalidate_root(&self) -> Result<()> {
+        Ok(self.root_guard.revalidate()?)
+    }
+
+    /// Canonical pathname paired with the retained root capability.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub async fn specs(&self) -> Result<Vec<ToolSpec>> {
@@ -229,6 +251,7 @@ impl ToolHost {
                     "timeout_ms must be 1..120000"
                 );
                 shell(
+                    self.root_guard.as_ref(),
                     &self.root,
                     string(&args, "command")?,
                     Duration::from_millis(duration),
@@ -389,7 +412,12 @@ impl Drop for ProcessGroup {
 }
 
 #[cfg(unix)]
-async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String> {
+async fn shell(
+    root_guard: &Directory,
+    root: &Path,
+    command: &str,
+    duration: Duration,
+) -> Result<String> {
     ensure!(!command.trim().is_empty(), "shell command is empty");
     let mut process = Command::new("sh");
     process
@@ -402,6 +430,7 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
         .kill_on_drop(true);
     #[cfg(unix)]
     process.process_group(0);
+    root_guard.revalidate()?;
     let mut child = process.spawn().context("cannot start shell")?;
     let _group = ProcessGroup(child.id());
     let stdout = child.stdout.take().context("missing shell stdout")?;
@@ -426,7 +455,12 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
 }
 
 #[cfg(windows)]
-async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String> {
+async fn shell(
+    root_guard: &Directory,
+    root: &Path,
+    command: &str,
+    duration: Duration,
+) -> Result<String> {
     use base64::Engine;
     use kuru_platform::windows::process::{
         Stdio, configured_command, environment_key_eq, system_directory, wait_process_handle,
@@ -470,6 +504,7 @@ async fn shell(root: &Path, command: &str, duration: Duration) -> Result<String>
     let mut spec = configured_command(program.as_os_str(), &args, root, environment)?;
     spec.stdout = Stdio::Pipe;
     spec.stderr = Stdio::Pipe;
+    root_guard.revalidate()?;
     let mut child = spec
         .spawn()
         .await
@@ -901,5 +936,41 @@ mod tests {
                 .to_string()
                 .contains("limit")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_root_replacement_blocks_shell_and_keeps_file_capability() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("held.txt"), "held object").unwrap();
+        let retained =
+            Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Pinned).unwrap());
+        let host = ToolHost::with_retained_root(
+            retained,
+            &Config {
+                allow_shell: true,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        std::fs::rename(&root, parent.path().join("replaced")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        assert_eq!(
+            host.execute("file_read", json!({"path":"held.txt"}))
+                .await
+                .unwrap(),
+            "held object"
+        );
+        assert!(
+            host.execute("shell", json!({"command":"printf started > launched"}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("identity changed")
+        );
+        assert!(!root.join("launched").exists());
     }
 }

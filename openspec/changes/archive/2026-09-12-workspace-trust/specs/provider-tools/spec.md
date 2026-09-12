@@ -1,11 +1,4 @@
-# provider-tools Specification
-
-## Purpose
-Connect peer actors to supported inference and authentication transports,
-workspace tools, MCP servers and A2A peers through extensible interfaces with
-explicit authority, bounded execution and protected private state.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Supported OpenAI transport
 
@@ -41,16 +34,6 @@ API-key environment variable.
 - **THEN** login and logout still use their fixed ChatGPT route, while an
   active Responses status check requires approval; none reads the selected
   API-key environment value before its applicable preflight permits it.
-
-### Requirement: Provider-neutral inference boundary
-
-The application SHALL own peer context and tool execution independently of the
-provider. Native OpenAI requests MUST use Kuru's existing supplied context and
-function tools without executing another harness or importing its agent policy.
-
-#### Scenario: Tool proposal
-- **WHEN** a provider returns a tool request
-- **THEN** the runtime validates and executes it through Kuru's configured tool host.
 
 ### Requirement: Explicit bounded tools
 

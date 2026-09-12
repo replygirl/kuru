@@ -196,6 +196,13 @@ impl Terminal {
         Ok(())
     }
 
+    #[allow(dead_code)] // Used by trust.rs; each integration test compiles this support module alone.
+    pub fn interrupt(&mut self) -> Result<()> {
+        let pid = Pid::from_raw(self.child.id().try_into()?);
+        kill(pid, Signal::SIGINT)?;
+        Ok(())
+    }
+
     pub fn command(&mut self, text: &str, picker: Option<&str>) -> Result<()> {
         self.wait_idle()?;
         self.send(text.as_bytes())?;

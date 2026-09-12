@@ -105,6 +105,7 @@ fn status_reports_only_api_key_presence_and_never_exposes_the_key() {
     let env = Environment::new();
     let output = env
         .command()
+        .args(["--provider", "responses"])
         .env("OPENAI_API_KEY", "synthetic-key-do-not-print")
         .arg("auth")
         .output()
@@ -119,6 +120,25 @@ fn status_reports_only_api_key_presence_and_never_exposes_the_key() {
     assert_eq!(status["authenticated"], false);
     for bytes in [&output.stdout, &output.stderr] {
         assert!(!String::from_utf8_lossy(bytes).contains("synthetic-key-do-not-print"));
+    }
+    assert!(!env.native_data().exists());
+
+    let inactive = env
+        .command()
+        .env("OPENAI_API_KEY", "inactive-key-do-not-print")
+        .arg("auth")
+        .output()
+        .unwrap();
+    assert!(inactive.status.success());
+    let status: Value = serde_json::from_slice(&inactive.stdout).unwrap();
+    assert_eq!(status["api_key_available"], false);
+    assert!(
+        String::from_utf8_lossy(&inactive.stderr).contains("was not checked"),
+        "{}",
+        String::from_utf8_lossy(&inactive.stderr)
+    );
+    for bytes in [&inactive.stdout, &inactive.stderr] {
+        assert!(!String::from_utf8_lossy(bytes).contains("inactive-key-do-not-print"));
     }
     assert!(!env.native_data().exists());
 }
@@ -148,9 +168,10 @@ fn authentication_rejects_workspace_state_and_removed_external_command_settings(
     assert!(!output.status.success());
     let diagnostic = String::from_utf8_lossy(&output.stderr);
     assert!(
-        diagnostic.contains("codex_command was removed"),
+        diagnostic.contains("configuration validation error"),
         "{diagnostic}"
     );
+    assert!(!diagnostic.contains("untrusted-external-command"));
     assert!(!env.native_data().exists());
 }
 

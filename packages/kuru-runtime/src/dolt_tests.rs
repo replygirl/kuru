@@ -12,7 +12,7 @@ use kuru_memory::MemoryStore;
 use serde_json::json;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::{DreamProposal, Harness, engine::PendingPublication};
+use crate::{DreamProposal, Harness, Topology, engine::PendingPublication};
 
 fn config() -> Config {
     Config {
@@ -314,6 +314,108 @@ async fn undo_is_a_new_revision_that_preserves_later_chats_preferences_and_archi
     );
     assert!(harness.resolve(&added).is_err());
     assert!(harness.undo_dream().await.is_err());
+    harness.shutdown(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_live_undo_reconciles_before_a_later_save() {
+    let project = tempfile::tempdir().unwrap();
+    let memory = MemoryStore::temporary().await.unwrap();
+    let mut harness = Harness::new(
+        config(),
+        project.path(),
+        memory.clone(),
+        Arc::new(DemoProvider),
+        None,
+    )
+    .await
+    .unwrap();
+    let role = harness.topology.parts[0].role.clone();
+    harness
+        .apply_dream(vec![DreamProposal::Add {
+            name: "Interrupted undo identity".into(),
+            role,
+            instruction: "Remain archived after the undo".into(),
+        }])
+        .await
+        .unwrap();
+    let added = harness.resolve("Interrupted undo identity").unwrap();
+    memory
+        .append(
+            &harness.namespace(&added),
+            "user",
+            "later conversation survives",
+        )
+        .await
+        .unwrap();
+    let harness = Arc::new(Mutex::new(harness));
+    let (written, release) = {
+        let mut harness = harness.lock().await;
+        harness.pause_after_next_memory_write()
+    };
+    let running = tokio::spawn({
+        let harness = harness.clone();
+        async move { harness.lock().await.undo_dream().await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), written)
+        .await
+        .unwrap()
+        .unwrap();
+    // The actual live undo has made its SQL write, but cancellation prevents
+    // `persist_state` from publishing that topology in the harness.
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    drop(release);
+
+    let mut harness = harness.lock().await;
+    assert!(harness.pending_publication.is_some());
+    assert!(
+        harness
+            .topology
+            .parts
+            .iter()
+            .find(|part| part.id == added)
+            .unwrap()
+            .active
+    );
+    harness.reconcile().await.unwrap();
+    assert!(
+        !harness
+            .topology
+            .parts
+            .iter()
+            .find(|part| part.id == added)
+            .unwrap()
+            .active
+    );
+    harness.set_effort(Some("high".into())).await.unwrap();
+    let durable: Topology = serde_json::from_value(
+        memory
+            .get(&format!(
+                "{}/{}/topology",
+                harness.scope, harness.config.mode
+            ))
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !durable
+            .parts
+            .iter()
+            .find(|part| part.id == added)
+            .unwrap()
+            .active
+    );
+    assert!(
+        memory
+            .history(&harness.namespace(&added), 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.content == "later conversation survives")
+    );
     harness.shutdown(false).await.unwrap();
 }
 
