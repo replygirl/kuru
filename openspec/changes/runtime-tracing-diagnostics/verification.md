@@ -5,8 +5,8 @@
 
 ## 2. Bounded private diagnostic ring [critical]
 
-- [~] 2.1 @e2e (agent) run a runtime-owning CLI command until fixed byte/count rotation -> defer: focused `diagnostics::tests` proves fixed four-slot rotation, restart-oldest selection, late-write disarm, and checked replacement refusal, but no real CLI run has yet forced all byte/count rotations.
-- [~] 2.2 @integration (agent) force diagnostic setup and write failure through the app boundary -> defer: checked ring replacement failure disarms the writer and CLI cleanup preserves successful command output, but a direct app-boundary setup/write-failure injection remains unrun.
+- [x] 2.1 @e2e (agent) run a runtime-owning CLI command until fixed byte/count rotation -> observed: `/private/tmp/kuru-tracing-cli-ring-rotation-final.log` exits 0. A real debug CLI child uses the existing `max_tool_calls=768` configuration to receive one bounded unknown-tool batch through the fake Responses provider, completes the turn, and leaves exactly one scope with all four nonempty trace files at or below 64 KiB. Focused layer tests separately prove restart-oldest selection, replacement refusal, and late-write disarm.
+- [x] 2.2 @integration (agent) force diagnostic setup and write failure through the app boundary -> observed: `/private/tmp/kuru-tracing-diagnostic-setup-refusal.log` exits 0 for an unsafe private diagnostics-path refusal before provider work; `/private/tmp/kuru-tracing-diagnostic-write-failure.log` exits 0 after replacing the held trace name while a fake provider is gated, with the completed JSON turn authoritative and only a bounded stderr cleanup notice.
 
 ## 3. Presentation and native evidence
 

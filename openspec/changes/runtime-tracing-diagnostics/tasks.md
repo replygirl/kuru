@@ -5,8 +5,8 @@
 
 ## 2. Application diagnostics
 
-- [x] 2.1 Add a real-CLI-only fixed target subscriber and checked private per-project byte/count JSONL ring under the existing writer lease, with focused rotation, replacement refusal, restart retention, and finish-disarm checks. App-boundary setup/write-failure evidence remains tracked in verification 2.2.
-- [x] 2.2 Add `--debug` operational detail without `RUST_LOG` or changed application output. Observed normal/debug CLI comparison and real-PTY cancellation preserve output, while focused rotated-layer checks exclude fake secrets.
+- [x] 2.1 Add a real-CLI-only fixed target subscriber and checked private per-project byte/count JSONL ring under the existing writer lease, with focused rotation, replacement refusal, restart retention, and finish-disarm checks.
+- [x] 2.2 Add `--debug` operational detail without `RUST_LOG` or changed application output. Observed normal/debug CLI comparison and real-PTY cancellation preserve output, focused rotated-layer checks exclude fake secrets, and real CLI setup/write failures remain bounded without displacing completed output.
 
 ## 3. Documentation and evidence
 
@@ -18,4 +18,7 @@
 - `/private/tmp/kuru-tracing-cli-provider-tool-test-final5.log`: exit 0. A real CLI child compares normal and `--debug` JSON turns except for generated session identity, drives fake-provider retry, actor work, owned external shell success, and checks no fake provider/API sentinel in diagnostics.
 - `/private/tmp/kuru-tracing-cli-failing-shell-test-final2.log`: exit 0. A real normal-mode CLI child receives a failing owned shell receipt with the complete redaction marker and no raw command or sentinel in continuation or diagnostics.
 - `/private/tmp/kuru-tracing-pty-cancellation-test-final.log`: exit 0. Existing native PTY fixture runs the actual debug binary, cancels in-flight provider work, observes a cancelled actor record and span close, preserves the draft, accepts the next turn, and restores the terminal.
+- `/private/tmp/kuru-tracing-diagnostic-setup-refusal.log`: exit 0. An unsafe private diagnostics path fails through the real CLI before provider work and leaves machine stdout empty.
+- `/private/tmp/kuru-tracing-diagnostic-write-failure.log`: exit 0. Replacing the held trace pathname while a fake provider is gated disarms diagnostics; after release the completed CLI turn remains authoritative and stderr has only the bounded incomplete-diagnostics notice.
+- `/private/tmp/kuru-tracing-cli-ring-rotation-final.log`: exit 0. A real debug CLI child drives the existing 768-call tool limit through the fake Responses provider and verifies every fixed 64 KiB ring slot is nonempty and byte-bounded beneath one canonical project scope.
 - Native Windows and coordinated coverage are not run in this change worktree.

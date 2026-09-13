@@ -21,9 +21,9 @@ use axum::{
 use kuru_delivery::command::{Command, bounded_output};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, oneshot},
+    sync::{Mutex, Notify, oneshot},
     task::JoinHandle,
-    time::timeout,
+    time::{Instant, sleep, timeout},
 };
 
 #[path = "support/memory.rs"]
@@ -35,6 +35,9 @@ const CAPTURE_LIMIT: usize = 128 * 1024;
 const SHELL_MARKER: &str = "SHELL_TURN_RECEIPT";
 const FINAL_TEXT: &str = "SHELL_TURN_FINAL_TEXT";
 const PROVIDER_SECRET: &str = "sk-proj-tracing-provider-secret-0123456789";
+const ROTATION_TOOL_CALLS: usize = 768;
+const DIAGNOSTIC_FILE_BYTES: u64 = 64 * 1024;
+const DIAGNOSTIC_FILE_COUNT: usize = 4;
 
 struct Sandbox {
     root: tempfile::TempDir,
@@ -45,6 +48,10 @@ struct Sandbox {
 
 impl Sandbox {
     fn new(provider_url: &str) -> Result<Self> {
+        Self::with_config(provider_url, "")
+    }
+
+    fn with_config(provider_url: &str, extra_config: &str) -> Result<Self> {
         let root = tempfile::tempdir()?;
         let project = root.path().join("project");
         let data = root.path().join("data");
@@ -53,7 +60,9 @@ impl Sandbox {
         let provider_config = root.path().join("fixture-responses.toml");
         std::fs::write(
             &provider_config,
-            format!("api_base = {provider_url:?}\napi_key_env = 'KURU_SHELL_TURN_FIXTURE_KEY'\n"),
+            format!(
+                "api_base = {provider_url:?}\napi_key_env = 'KURU_SHELL_TURN_FIXTURE_KEY'\n{extra_config}"
+            ),
         )?;
         Ok(Self {
             root,
@@ -97,16 +106,57 @@ impl Sandbox {
     }
 }
 
-#[derive(Default)]
+struct Gate {
+    started: AtomicUsize,
+    released: AtomicUsize,
+    release: Notify,
+}
+
+impl Gate {
+    fn new() -> Self {
+        Self {
+            started: AtomicUsize::new(0),
+            released: AtomicUsize::new(0),
+            release: Notify::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        while self.released.load(Ordering::Acquire) == 0 {
+            let notified = self.release.notified();
+            if self.released.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(1, Ordering::Release);
+        self.release.notify_waiters();
+    }
+}
+
 struct ProviderState {
     requests: Mutex<Vec<Value>>,
     completion_attempts: AtomicUsize,
     failing_shell: bool,
+    rotation_tool_calls: usize,
+    rotation_issued: AtomicUsize,
+    gate: Option<Arc<Gate>>,
 }
 
 async fn complete(State(state): State<Arc<ProviderState>>, Json(request): Json<Value>) -> Response {
     let attempt = state.completion_attempts.fetch_add(1, Ordering::SeqCst);
     state.requests.lock().await.push(request.clone());
+    if let Some(gate) = &state.gate
+        && gate
+            .started
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        gate.wait().await;
+    }
     if attempt == 0 {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -124,6 +174,22 @@ async fn complete(State(state): State<Arc<ProviderState>>, Json(request): Json<V
     });
     let output = if is_continuation {
         json!([{"type":"message","content":[{"type":"output_text","text":FINAL_TEXT}]}])
+    } else if state.rotation_tool_calls > 0
+        && state
+            .rotation_issued
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        json!(
+            (0..state.rotation_tool_calls)
+                .map(|index| json!({
+                    "type":"function_call",
+                    "call_id":format!("ring-rotation-{index}"),
+                    "name":"fixture_unknown_tool",
+                    "arguments":"{}",
+                }))
+                .collect::<Vec<_>>()
+        )
     } else if shell_is_available {
         json!([{
             "type":"function_call",
@@ -157,14 +223,34 @@ struct Server {
 
 impl Server {
     async fn start() -> Result<Self> {
-        Self::start_with_shell_failure(false).await
+        Self::start_with(false, 0, None).await
     }
 
     async fn start_with_shell_failure(failing_shell: bool) -> Result<Self> {
+        Self::start_with(failing_shell, 0, None).await
+    }
+
+    async fn start_gated() -> Result<(Self, Arc<Gate>)> {
+        let gate = Arc::new(Gate::new());
+        Ok((Self::start_with(false, 0, Some(gate.clone())).await?, gate))
+    }
+
+    async fn start_with_rotation() -> Result<Self> {
+        Self::start_with(false, ROTATION_TOOL_CALLS, None).await
+    }
+
+    async fn start_with(
+        failing_shell: bool,
+        rotation_tool_calls: usize,
+        gate: Option<Arc<Gate>>,
+    ) -> Result<Self> {
         let state = Arc::new(ProviderState {
             requests: Mutex::new(vec![]),
             completion_attempts: AtomicUsize::new(0),
             failing_shell,
+            rotation_tool_calls,
+            rotation_issued: AtomicUsize::new(0),
+            gate,
         });
         let app = Router::new()
             .route(
@@ -224,12 +310,11 @@ struct CliRun {
     sandbox: Sandbox,
 }
 
-async fn run_cli(provider_url: String, debug: bool) -> Result<CliRun> {
+async fn run_sandbox(sandbox: Sandbox, debug: bool) -> Result<CliRun> {
     tokio::task::spawn_blocking(move || {
         // If this test future is cancelled, Tokio leaves the started blocking
         // worker running. It retains the complete sandbox through bounded
         // helper completion, including any reported cleanup failure.
-        let sandbox = Sandbox::new(&provider_url)?;
         let mut command = sandbox.command(debug);
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -241,6 +326,10 @@ async fn run_cli(provider_url: String, debug: bool) -> Result<CliRun> {
     })
     .await
     .context("retained CLI fixture worker panicked")?
+}
+
+async fn run_cli(provider_url: String, debug: bool) -> Result<CliRun> {
+    run_sandbox(Sandbox::new(&provider_url)?, debug).await
 }
 
 fn diagnostics(run: &CliRun) -> Result<String> {
@@ -447,4 +536,166 @@ async fn normal_cli_trace_redacts_a_failing_owned_shell_receipt() -> Result<()> 
     let shutdown = server.shutdown().await;
     result?;
     shutdown
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_cli_rotates_the_fixed_private_diagnostic_ring() -> Result<()> {
+    let server = Server::start_with_rotation()
+        .await
+        .context("start rotating fake Responses server")?;
+    let result = async {
+        let sandbox = Sandbox::with_config(
+            &server.url,
+            &format!("max_tool_calls = {ROTATION_TOOL_CALLS}\n"),
+        )
+        .context("prepare bounded tool-call CLI sandbox")?;
+        let run = run_sandbox(sandbox, true)
+            .await
+            .context("run bounded rotation CLI")?;
+        ensure!(
+            run.output.status.success(),
+            "rotation fixture kuru run failed with {}; stdout {:?}; stderr {:?}",
+            run.output.status,
+            String::from_utf8_lossy(&run.output.stdout),
+            String::from_utf8_lossy(&run.output.stderr),
+        );
+        let turn: Value = serde_json::from_slice(&run.output.stdout)
+            .context("parse rotation fixture kuru run JSON")?;
+        ensure!(
+            turn["text"].as_str().is_some_and(|text| !text.is_empty())
+                && !turn["limited"].as_bool().unwrap_or(true),
+            "rotation fixture did not finish an ordinary unbounded turn: {turn}"
+        );
+        ensure!(
+            server.state.rotation_issued.load(Ordering::Acquire) == 1,
+            "the fake provider did not issue the bounded rotation tool batch"
+        );
+
+        let root = run.sandbox.data.join("diagnostics");
+        let scopes = std::fs::read_dir(&root)
+            .context("read private diagnostics root after rotation")?
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        ensure!(
+            scopes.len() == 1,
+            "diagnostics created {} per-project directories instead of one: {scopes:?}",
+            scopes.len()
+        );
+        for index in 0..DIAGNOSTIC_FILE_COUNT {
+            let trace = scopes[0].join(format!("trace-{index}.jsonl"));
+            let metadata = std::fs::metadata(&trace)
+                .with_context(|| format!("read rotated diagnostic slot {}", trace.display()))?;
+            ensure!(
+                metadata.len() > 0 && metadata.len() <= DIAGNOSTIC_FILE_BYTES,
+                "rotated diagnostic slot {} has {} bytes, outside the fixed bound",
+                trace.display(),
+                metadata.len()
+            );
+        }
+        let logs = diagnostics(&run)?;
+        ensure!(logs.contains("\"status\":\"error\""));
+        ensure!(
+            !logs.contains(PROVIDER_SECRET),
+            "provider sentinel leaked to rotated diagnostics: {logs}"
+        );
+        Ok(())
+    }
+    .await;
+    let shutdown = server.shutdown().await;
+    result?;
+    shutdown
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn debug_setup_refusal_is_bounded_before_provider_work() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let sandbox = Sandbox::new("http://127.0.0.1:9/v1")?;
+    std::fs::create_dir(&sandbox.data)?;
+    std::fs::set_permissions(&sandbox.data, std::fs::Permissions::from_mode(0o700))?;
+    let replacement = sandbox.root.path().join("outside-diagnostics");
+    std::fs::create_dir(&replacement)?;
+    symlink(&replacement, sandbox.data.join("diagnostics"))?;
+
+    let run = run_sandbox(sandbox, true).await?;
+    ensure!(
+        !run.output.status.success(),
+        "unsafe diagnostics path unexpectedly opened"
+    );
+    ensure!(
+        run.output.stdout.is_empty(),
+        "setup failure wrote machine stdout"
+    );
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    ensure!(
+        stderr.contains("cannot create the private project diagnostics directory"),
+        "unexpected setup refusal: {stderr}"
+    );
+    ensure!(!stderr.contains(PROVIDER_SECRET));
+    Ok(())
+}
+
+async fn trace_file(data: &std::path::Path) -> Result<PathBuf> {
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        if let Ok(scopes) = std::fs::read_dir(data.join("diagnostics")) {
+            for scope in scopes.flatten() {
+                let trace = scope.path().join("trace-0.jsonl");
+                if trace.exists() {
+                    return Ok(trace);
+                }
+            }
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for diagnostic trace file"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostic_write_failure_keeps_a_completed_cli_turn_authoritative() -> Result<()> {
+    let (server, gate) = Server::start_gated().await?;
+    let sandbox = Sandbox::new(&server.url)?;
+    let data = sandbox.data.clone();
+    let mut worker = tokio::spawn(run_sandbox(sandbox, true));
+    let observation = async {
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        while gate.started.load(Ordering::Acquire) == 0 {
+            ensure!(
+                Instant::now() < deadline,
+                "timed out waiting for fake provider gate"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        let trace = trace_file(&data).await?;
+        let replacement = data.join("trace-replacement");
+        std::fs::write(&replacement, b"replacement")?;
+        std::fs::remove_file(&trace)?;
+        std::fs::hard_link(&replacement, &trace)?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    gate.release();
+    let run = timeout(CLI_TIMEOUT, &mut worker)
+        .await
+        .context("bounded CLI worker did not finish after diagnostic replacement")?
+        .context("retained CLI worker panicked")??;
+    let shutdown = server.shutdown().await;
+    observation?;
+    shutdown?;
+    ensure!(
+        run.output.status.success(),
+        "diagnostic write failure displaced CLI success: stdout {:?}; stderr {:?}",
+        String::from_utf8_lossy(&run.output.stdout),
+        String::from_utf8_lossy(&run.output.stderr),
+    );
+    let turn: Value = serde_json::from_slice(&run.output.stdout)?;
+    ensure!(turn["text"] == FINAL_TEXT);
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    ensure!(stderr.contains("diagnostic cleanup failed; diagnostics may be incomplete"));
+    ensure!(!stderr.contains(PROVIDER_SECRET));
+    Ok(())
 }
