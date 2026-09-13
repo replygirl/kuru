@@ -6,8 +6,8 @@ None.
 
 ## Soft-blocked by
 
-- [x] `tool-result-redaction` — supplies the already-implemented streaming recognizable-secret scanner and typed ToolHost projection, while its native Windows evidence remains pending *(archived 2026-09-13)*
-- [x] `owned-unix-shell-lifecycle` — supplies the already-implemented retained Unix process-group owner, while native Linux and complete compatibility evidence remain pending *(archived 2026-09-13)*
+- [x] `tool-result-redaction` — supplies the already-implemented streaming recognizable-secret scanner and typed ToolHost projection *(archived 2026-09-13)*
+- [x] `owned-unix-shell-lifecycle` — supplies the already-implemented retained Unix process-group owner *(archived 2026-09-13)*
 
 ## Siblings
 

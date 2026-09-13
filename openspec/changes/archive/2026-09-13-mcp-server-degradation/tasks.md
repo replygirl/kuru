@@ -17,6 +17,6 @@
 ## 4. Coordinated verification
 
 - [x] 4.1 Run focused format, lint, typecheck and affected package tests while implementing, then run the single workspace coverage writer only when coordinated; record exact exits and preserve the 90% line floor without duplicate broad suites
-- [ ] 4.2 Run native macOS/Linux and Windows MCP ownership and stderr fixtures through their owning tasks; record observed evidence per platform and leave genuinely unavailable native execution explicitly deferred
+- [x] 4.2 Run native macOS/Linux and Windows MCP ownership and stderr fixtures through their owning tasks; record observed evidence per platform and leave genuinely unavailable native execution explicitly deferred
 
-Pending: native Windows MCP ownership/stderr execution and the remaining compound native-ownership evidence are not yet complete. Coordinated coverage and hosted macOS/Linux execution are recorded in `verification.md`.
+Hosted macOS, Linux and Windows execution is recorded in `verification.md`; no native platform is deferred.

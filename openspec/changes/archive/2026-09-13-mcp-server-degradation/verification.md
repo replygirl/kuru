@@ -16,8 +16,8 @@
 
 - [x] 3.1 @unit (agent) exercise Unix one-shot stdin/stdout/stderr extraction plus the existing signal-before-reap state transitions -> pipe access never exposes or transfers numeric process authority
 - [x] 3.2 @integration (agent) emit a stderr flood containing fake credentials across scanner/read/tail boundaries, invalid UTF-8 and controls -> capture drains continuously and the bounded human tail is projected and escaped before exposure
-- [ ] 3.3 @integration (agent) exercise timeout, natural root exit, caller loss and parent-runtime loss with a same-group descendant retaining stderr on native macOS and Linux -> worker confirms ordered cleanup or honestly retains the owner without a post-reap signal
-- [ ] 3.4 @integration (agent) run equivalent caller/runtime-loss, stderr-flood and descendant-held-pipe fixtures with the Windows Job owner -> Job/tree and pipes become quiescent without inferring parity from Unix
+- [x] 3.3 @integration (agent) exercise timeout, natural root exit, caller loss and parent-runtime loss with a same-group descendant retaining stderr on native macOS and Linux -> worker confirms ordered cleanup or honestly retains the owner without a post-reap signal
+- [x] 3.4 @integration (agent) run equivalent caller/runtime-loss, stderr-flood and descendant-held-pipe fixtures with the Windows Job owner -> Job/tree and pipes become quiescent without inferring parity from Unix
 
 ## 4. Shutdown and presentation [critical]
 
@@ -28,7 +28,7 @@
 ## 5. Quality and documentation
 
 - [x] 5.1 @unit (agent) exercise Scanner with a cleared reusable output buffer and long cumulative input -> destination capacity stays bounded by the current chunk while cumulative overflow/growth checks remain effective
-- [ ] 5.2 @integration (agent) run focused platform, connector, runtime and TUI tests plus format, lint, typecheck and documentation checks; run workspace coverage once when coordinated -> all executed gates pass, the 90% floor remains intact, and unrun native evidence is explicitly deferred
+- [x] 5.2 @integration (agent) run focused platform, connector, runtime and TUI tests plus format, lint, typecheck and documentation checks; run workspace coverage once when coordinated -> all executed gates pass, the 90% floor remains intact, and unrun native evidence is explicitly deferred
 - [x] 5.3 @integration (agent) build and inspect curated tools/protocol documentation -> public text matches alias degradation, explicit recovery, no replay, human-only stderr and finite-detector/process limits without publishing private notes
 
 ## Observed evidence
@@ -40,10 +40,10 @@
 - Runtime isolation: `review_tests::unavailable_mcp_status_stays_out_of_provider_input_and_memory` exited 0 against actual durable Dolt, then closed and reopened that store. One failed and one healthy MCP alias produced fixed event metadata and only usable tools in captured provider requests; fake command, environment secret and HTTP endpoint were absent from provider requests and both live and reopened memory.
 - Direct CLI: `direct_tools_keeps_stdout_json_and_reports_filtered_failed_stdio` exited 0. Real `kuru tools` and `kuru tool file_list` processes preserved JSON stdout and emitted fixed status plus a recognizable-secret-filtered, terminal-escaped diagnostic on human stderr. Real plain and JSON runs preserved their stdout shapes; JSON used the existing fixed MCP event, and neither run exposed the diagnostic, command or fake secret.
 - Documentation: `mise run docs:check` exited 0 with pinned Node 26.8.2/npm 12.0.2, oxfmt, oxlint, VitePress build, and delivery content/link inspection.
-- Exact-base push gate: all eight normal hook categories exited 0 at `4de6b2a19ea24e458867d765916d697120ed3a47`; combined LCOV covered 27,740 of 29,085 lines (95.3756%). This predates the three proof-only tests above, so their combined coverage remains pending.
+- Exact-base push gate: all eight normal hook categories exited 0 at `4de6b2a19ea24e458867d765916d697120ed3a47`; combined LCOV covered 27,740 of 29,085 lines (95.3756%). At that local checkpoint this predated the three proof-only tests above, so their combined coverage had not yet run.
 - Strict cospec validation and the acknowledged apply gate exited 0 with only the declared `tool-result-redaction` and `owned-unix-shell-lifecycle` soft blockers.
 
-Pending: native Windows ownership/stderr execution and the unchecked compound rows above whose complete multi-surface fixture composition has not yet run. Coordinated coverage and hosted macOS/Linux execution are observed; cross-compilation is not recorded as native evidence.
+Historical checkpoint: native Windows ownership/stderr execution and the unchecked compound rows above had not yet completed at that point. The later successful hosted run `34757216251` closes that gap with actual Windows execution; cross-compilation is not used as native evidence.
 
 - Exact-base hook: `b8c186f` completed all eight normal hook categories; the
   authoritative LCOV total was 27,966/29,315 (95.3983%).
@@ -58,4 +58,6 @@ Pending: native Windows ownership/stderr execution and the unchecked compound ro
 
 - Hosted CI `34743613521` observed hosted Linux fully green and instrumented
   macOS green for the b8 base. The exact base hook remains the authoritative
-  27,966/29,315 (95.3983%) LCOV evidence; native Windows remains pending.
+  27,966/29,315 (95.3983%) LCOV evidence for that historical head.
+- Hosted CI `34757216251` completed successfully at exact head `7be6b46f8521c7784f4a0471054286de5fc3d2b9` on Linux, macOS and Windows. Linux and macOS each ran the real same-group descendant timeout, natural-exit, caller-loss and parent-runtime-loss fixtures: the connector suites passed 152 tests, including `worker_retains_cleanup_after_parent_runtime_loss`, bounded terminal-safe stderr and the retained Unix owner scenarios. Windows passed all 128 connector library tests plus six native command cases, including bounded stderr, parent-runtime cleanup retention, post-spawn owner retention, repeated cleanup, configured MCP `.cmd`/`npx` dispatch and owned descendant shutdown. The same Windows job passed the runtime isolation case, source installation, offline-input rejection and acceptance, installed cold offline runtime and PE-import inspection. No stack overflow occurred in the MCP suite or installed binary. Complete logs are `/private/tmp/kuru-pr15-linux-ci34757216251.log`, `/private/tmp/kuru-pr15-macos-ci34757216251.log` and `/private/tmp/kuru-pr15-windows-ci34757216251.log`.
+- The normal pre-push hook at `7be6b46f8521c7784f4a0471054286de5fc3d2b9` passed all eight categories; combined LCOV covered 28,002 of 29,350 lines (95.4072%). The final archived descendant head still requires its own normal hook and exact hosted CI before merge.

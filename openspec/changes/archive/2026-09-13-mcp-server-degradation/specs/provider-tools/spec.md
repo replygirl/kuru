@@ -9,7 +9,7 @@ Initialization, every catalog page, tool calls, close, and alias-state publicati
 #### Scenario: One failed alias does not abort the turn
 
 - **WHEN** catalog discovery visits one unavailable server and one healthy server in either configured order
-- **THEN** the provider receives built-in and healthy-server tools, receives none from the failed alias, and the runtime records fixed unavailable metadata for that alias outside the prompt and memory
+- **THEN** the provider receives built-in and healthy-server tools, receives none from the failed alias, and the runtime records fixed unavailable metadata for that alias outside provider prompts, conversation messages, and authored notes
 
 #### Scenario: Invalid partial catalog is not published
 
