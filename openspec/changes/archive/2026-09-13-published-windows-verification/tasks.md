@@ -1,6 +1,6 @@
 ## 1. Isolated published verifier
 
-- [ ] 1.1 Extract the existing native mise environment construction into one delivery-owned helper and verify the candidate-install fixture retains isolated roots, no ambient credentials or proxies, and its current behavior.
+- [x] 1.1 Extract the existing native mise environment construction into one delivery-owned helper and verify the candidate-install fixture retains isolated roots, no ambient credentials or proxies, and its current behavior.
 - [x] 1.2 Add the tooling-only `verify-published-windows` subcommand and bounded public GitHub release/tag/download validation and verify exact identity, inventory, checksum, archive, and selected executable mismatch cases.
 - [x] 1.3 Implement ordinary isolated mise selection, activation, location and execution using the resolved absolute mise path and verify command plans contain `github:replygirl/kuru@VERSION` without endpoint replacements.
 - [x] 1.4 Exercise the installed Kuru version, demo conversation/resume and memory status/history/sessions against cold offline data and engine caches, then verify extracted Dolt and licenses against the checked-out manifest.
@@ -14,4 +14,4 @@
 
 ## 3. Acceptance and delivery
 
-- [ ] 3.1 Run focused delivery formatting, lint, typecheck, tests, workflow checks, and docs checks and record exact observed results in the verification ledger.
+- [x] 3.1 Run focused delivery formatting, lint, typecheck, tests, workflow checks, and docs checks and record exact observed results in the verification ledger.

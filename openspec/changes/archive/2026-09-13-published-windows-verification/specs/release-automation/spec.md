@@ -13,7 +13,7 @@ changing the release, tag, assets, or selected commit.
 
 #### Scenario: Published Windows verification fails
 - **WHEN** any required published-release observation fails or cleanup is not confirmed
-- **THEN** the verification job and dependent documentation jobs fail without modifying the published release
+- **THEN** the verification job fails and the dependent documentation jobs do not run, without modifying the published release
 
 #### Scenario: Published release run resumes
 - **WHEN** a maintainer reruns the verification job after publication already succeeded
