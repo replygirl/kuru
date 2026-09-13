@@ -20,6 +20,6 @@
 ## 4. Documentation and coordinated verification
 
 - [x] 4.1 Document turn IDs, retry/uncertainty, interrupted-prompt retention, cancellation, answer/dream event boundaries, and shutdown limits in owning runtime, usage, protocol, and curated docs; verify the built site and content checks
-- [ ] 4.2 After the archived checkpoint parent lands, modify its `Asynchronous terminal event scheduling` requirement in the existing chat-harness delta so normal cancellation signals and settles while abnormal cleanup signals when a token is retained and otherwise aborts; strict-validate the integrated delta before archive or merge
+- [x] 4.2 After the archived checkpoint parent lands, modify its `Asynchronous terminal event scheduling` requirement in the existing chat-harness delta so normal cancellation signals and settles while abnormal cleanup signals when a token is retained and otherwise aborts; strict-validate the integrated delta before archive or merge
 - [ ] 4.3 Run the focused memory, connector, runtime, TUI, format, lint, typecheck, and docs checks, then the single coordinated workspace coverage task; record exact exits and retain the 90 percent floor
 - [ ] 4.4 Run native macOS/Linux and Windows real-Dolt, process-owner, A2A, and PTY cancellation fixtures; record platform-specific evidence and defer only genuinely unavailable native runs
