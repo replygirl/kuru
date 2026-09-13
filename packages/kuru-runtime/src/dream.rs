@@ -7,7 +7,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::engine::{
-    Harness, PendingPublication, Session, Topology, read_topology, spec, user, validate_topology,
+    CancellationToken, Harness, PendingPublication, Session, Topology, read_topology, spec,
+    turn_was_cancelled, user, validate_topology,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,8 +33,20 @@ pub struct DreamReport {
 
 impl Harness {
     pub async fn dream(&mut self) -> Result<DreamReport> {
+        let cancellation = CancellationToken::new();
+        self.dream_controlled(&cancellation).await
+    }
+
+    /// Run dreaming while observing an explicit foreground cancellation signal.
+    pub async fn dream_controlled(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<DreamReport> {
+        cancellation.check()?;
         self.reconcile().await?;
+        cancellation.check()?;
         let candidate = self.memory.begin_candidate("dream").await?;
+        cancellation.check()?;
         let memory = candidate.view();
         self.emit(
             "dream",
@@ -47,17 +60,19 @@ impl Harness {
             .filter(|p| p.active)
             .map(|p| p.id.clone())
             .collect::<Vec<_>>();
-        let replies = join_all(ids.iter().map(|id| self.ask_in(&memory, id,
+        let replies = join_all(ids.iter().map(|id| self.ask_in_controlled(&memory, id,
             vec![user("Review your own history. Write a concise durable memory summary of useful facts and unresolved concerns. You may suggest a new complementary member of an existing role or retire yourself if your role is redundantly covered. A suggestion is optional; do not manufacture changes. No other tools are available during dreaming.")],
-            "dream: consolidate your own memory, optionally propose membership changes", vec![dream_tool()]))).await;
+            "dream: consolidate your own memory, optionally propose membership changes", vec![dream_tool()], cancellation))).await;
         let mut report = DreamReport::default();
         let mut proposals = vec![];
         for (id, reply) in ids.into_iter().zip(replies) {
             match reply {
                 Err(error) if error.is::<crate::actor::MemoryFailure>() => return Err(error),
+                Err(error) if turn_was_cancelled(&error) => return Err(error),
                 Err(error) => report.rejected.push(format!("{id}: {error:#}")),
                 Ok(reply) => {
                     if !reply.text.trim().is_empty() {
+                        cancellation.check()?;
                         memory
                             .append(
                                 &format!("{}/notes", self.namespace(&id)),
@@ -65,6 +80,7 @@ impl Harness {
                                 &crate::actor::truncate_text(&reply.text, 8192),
                             )
                             .await?;
+                        cancellation.check()?;
                         report.summaries += 1;
                     }
                     for (index, call) in reply.calls.into_iter().enumerate() {
@@ -96,6 +112,7 @@ impl Harness {
                                 error
                             }
                         };
+                        cancellation.check()?;
                         memory
                             .append(
                                 &self.namespace(&id),
@@ -103,6 +120,7 @@ impl Harness {
                                 &json!({"call_id":call.id,"output":outcome}).to_string(),
                             )
                             .await?;
+                        cancellation.check()?;
                     }
                 }
             }
@@ -110,7 +128,8 @@ impl Harness {
         let (topology, changes) = self.plan_dream(proposals)?;
         report.accepted = changes.accepted;
         report.rejected.extend(changes.rejected);
-        self.finish_dream(&candidate, topology, &report).await?;
+        self.finish_dream(&candidate, topology, &report, cancellation)
+            .await?;
         self.emit(
             "dream",
             "pool",
@@ -128,7 +147,9 @@ impl Harness {
         self.reconcile().await?;
         let (topology, report) = self.plan_dream(proposals)?;
         let candidate = self.memory.begin_candidate("dream").await?;
-        self.finish_dream(&candidate, topology, &report).await?;
+        let cancellation = CancellationToken::new();
+        self.finish_dream(&candidate, topology, &report, &cancellation)
+            .await?;
         Ok(report)
     }
 
@@ -137,7 +158,9 @@ impl Harness {
         candidate: &Candidate,
         topology: Topology,
         report: &DreamReport,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
+        cancellation.check()?;
         let memory = candidate.view();
         let mut extra = vec![(
             format!("{}/{}/last-dream", self.scope, self.config.mode),
@@ -152,7 +175,9 @@ impl Harness {
         let updates = self
             .state_updates(&memory, &topology, &self.session, extra)
             .await?;
+        cancellation.check()?;
         memory.put_many(&updates).await?;
+        cancellation.check()?;
         memory
             .append(
                 &format!("{}/{}/dream-log", self.scope, self.config.mode),
@@ -160,6 +185,7 @@ impl Harness {
                 &serde_json::to_string(report)?,
             )
             .await?;
+        cancellation.check()?;
         self.pending_publication = Some(PendingPublication {
             config: self.config.clone(),
             topology,

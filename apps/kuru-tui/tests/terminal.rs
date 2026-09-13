@@ -640,6 +640,11 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     assert!(
         history
             .iter()
+            .any(|message| message.role == "user" && message.content == "Slow request")
+    );
+    assert!(
+        history
+            .iter()
             .any(|message| message.role == "user" && message.content == "Next thought")
     );
     assert!(

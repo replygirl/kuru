@@ -39,6 +39,12 @@ Use `/parts` to find unambiguous identities; roles containing multiple members
 need a unique name or ID. The human user can inspect private memories; parts
 receive only the memory available to their own identity.
 
+Cancelling active work signals the runtime and waits for the operation to settle.
+The submitted prompt remains in the conversation. If the answer checkpoint won
+the race, Kuru displays that answer; otherwise it reports the turn as interrupted
+and accepts the next command. A cancelled external call may already have reached
+its peer, so Kuru does not replay that turn automatically.
+
 `/notes` returns the selected identity's newest 100 durable notes with the
 selected mode, canonical identity, requested limit, and `truncated` metadata.
 It does not show that identity's conversation; use `/memory` for that history.
@@ -87,6 +93,11 @@ JSON output includes `session`, `speaker`, `text`, `relationship`, token counts,
 constrained the turn. Session listing does not create a new session. Reusing a
 session restores its transcript; peer and relationship histories also persist
 across sessions within their project and framework scope.
+
+The returned event trace freezes with the response. Periodic dreaming runs as
+later maintenance, so its activity or failure cannot remove a completed answer.
+Exit dreaming has a finite deadline; Kuru still attempts actor and tool cleanup
+when the 30-second deadline or the dream itself fails.
 
 `kuru memory notes ID` reads an existing project's selected-mode durable notes
 without starting a conversation, provider, or tool. It returns the same bounded

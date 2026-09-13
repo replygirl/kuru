@@ -10,6 +10,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::engine::CancellationToken;
+
 #[derive(Debug)]
 pub(crate) struct MemoryFailure(pub anyhow::Error);
 impl std::fmt::Display for MemoryFailure {
@@ -27,6 +29,7 @@ pub(crate) struct Work {
     pub effort: Option<String>,
     pub tools: Vec<ToolSpec>,
     pub history_limit: usize,
+    pub cancellation: CancellationToken,
     pub reply: oneshot::Sender<Result<Completion>>,
 }
 
@@ -41,19 +44,30 @@ impl Actor {
         let task = tokio::spawn(async move {
             while let Some(mut work) = rx.recv().await {
                 let run = async {
-                    let _permit = permits.acquire().await.context("actor pool closed")?;
+                    work.cancellation.check()?;
+                    let _permit = work
+                        .cancellation
+                        .wait(async { permits.acquire().await.context("actor pool closed") })
+                        .await?;
                     for input in &work.inputs {
+                        work.cancellation.check()?;
                         work.memory
                             .append(&namespace, &input.role, &input.content)
                             .await
                             .map_err(MemoryFailure)?;
+                        work.cancellation.check()?;
                     }
                     let mut instructions = work.instructions.clone();
                     let notes = bounded_history(
-                        work.memory
-                            .history(&format!("{namespace}/notes"), 16)
-                            .await
-                            .map_err(MemoryFailure)?,
+                        work.cancellation
+                            .wait(async {
+                                work.memory
+                                    .history(&format!("{namespace}/notes"), 16)
+                                    .await
+                                    .map_err(MemoryFailure)
+                                    .map_err(Into::into)
+                            })
+                            .await?,
                         0,
                         16 * 1024,
                     )?;
@@ -67,10 +81,15 @@ impl Actor {
                         actor: namespace.clone(),
                         instructions,
                         messages: bounded_history(
-                            work.memory
-                                .history(&namespace, work.history_limit)
-                                .await
-                                .map_err(MemoryFailure)?,
+                            work.cancellation
+                                .wait(async {
+                                    work.memory
+                                        .history(&namespace, work.history_limit)
+                                        .await
+                                        .map_err(MemoryFailure)
+                                        .map_err(Into::into)
+                                })
+                                .await?,
                             work.inputs.len(),
                             112 * 1024,
                         )?,
@@ -78,10 +97,17 @@ impl Actor {
                         effort: work.effort.clone(),
                         tools: work.tools.clone(),
                     };
-                    let completion =
-                        tokio::time::timeout(Duration::from_secs(180), provider.complete(request))
+                    let completion = work
+                        .cancellation
+                        .wait(async {
+                            tokio::time::timeout(
+                                Duration::from_secs(180),
+                                provider.complete(request),
+                            )
                             .await
-                            .context("model call exceeded 180 seconds")??;
+                            .context("model call exceeded 180 seconds")?
+                        })
+                        .await?;
                     ensure!(
                         completion.calls.len() <= 1024,
                         "provider returned more than 1024 calls in one batch"
@@ -100,6 +126,7 @@ impl Actor {
                         "provider call identifiers exceed the bounded replay budget"
                     );
                     if !completion.text.is_empty() || !completion.calls.is_empty() {
+                        work.cancellation.check()?;
                         let content = if completion.calls.is_empty() {
                             completion.text.clone()
                         } else {
@@ -114,6 +141,7 @@ impl Actor {
                             )
                             .await
                             .map_err(MemoryFailure)?;
+                        work.cancellation.check()?;
                     }
                     Ok(completion)
                 };

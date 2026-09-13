@@ -201,6 +201,15 @@ a message or a task; terminal task text is extracted from status messages and
 artifacts. The adapter sends `A2A-Version: 1.0`. Protocol errors, malformed
 responses, response-size excess and timeouts become observable call errors.
 
+For inbound messages, `messageId` is the durable turn ID within the current
+project session. Repeating the same ID and exact request returns the stored answer
+without another model or tool call. Reusing it with changed text or target fails,
+and an interrupted request that may have dispatched external work must use a new
+ID. The same ID remains independent in another session. IDs contain 1–256 bytes.
+Ingress allows a turn up to 10 minutes. On timeout it signals cancellation and
+allows up to 35 more seconds for accepted memory work and the answer race to
+settle; that allowance does not prove cleanup of an owned subprocess.
+
 Internal actors use typed peer envelopes and Tokio mailboxes. They do not issue
 loopback HTTP calls to each other. A2A at the external boundary preserves peer
 message intent and provides a future federation path without imposing a tree of

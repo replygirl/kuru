@@ -12,9 +12,12 @@ use kuru_core::{
 };
 use kuru_memory::MemoryStore;
 use serde_json::json;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 
-use crate::{DreamProposal, Harness, Topology, engine::PendingPublication};
+use crate::{
+    CancellationToken, DreamProposal, Harness, Topology,
+    engine::{PendingPublication, turn_was_cancelled},
+};
 
 fn config() -> Config {
     Config {
@@ -29,6 +32,66 @@ fn config() -> Config {
 
 struct HeldDream {
     started: mpsc::UnboundedSender<CompletionRequest>,
+}
+
+struct HeldPeriodicDream {
+    calls: std::sync::atomic::AtomicUsize,
+    started: Notify,
+}
+
+struct StalePeriodicDream {
+    live: MemoryStore,
+    calls: std::sync::atomic::AtomicUsize,
+    wrote: AtomicBool,
+}
+
+#[async_trait]
+impl Provider for StalePeriodicDream {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.instructions.contains("Phase: dream") {
+            if !self.wrote.swap(true, Ordering::SeqCst) {
+                self.live
+                    .append("post-answer-live", "user", "force stale dream")
+                    .await?;
+            }
+            Ok(Completion {
+                text: "candidate summary".into(),
+                ..Completion::default()
+            })
+        } else {
+            Ok(Completion {
+                text: "answer before failed maintenance".into(),
+                ..Completion::default()
+            })
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for HeldPeriodicDream {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if request.instructions.contains("Phase: dream") {
+            self.started.notify_waiters();
+            std::future::pending().await
+        } else {
+            Ok(Completion {
+                text: "answer before maintenance".into(),
+                input_tokens: 4,
+                output_tokens: 2,
+                ..Completion::default()
+            })
+        }
+    }
 }
 #[async_trait]
 impl Provider for HeldDream {
@@ -49,7 +112,7 @@ impl Provider for HeldDream {
 }
 
 #[tokio::test]
-async fn cancellation_discards_the_whole_dream_and_each_peer_sees_only_its_history() {
+async fn explicit_cancellation_keeps_live_dream_state_and_private_histories_isolated() {
     let project = tempfile::tempdir().unwrap();
     let memory = MemoryStore::temporary().await.unwrap();
     let (started, mut requests) = mpsc::unbounded_channel();
@@ -81,9 +144,11 @@ async fn cancellation_discards_the_whole_dream_and_each_peer_sees_only_its_histo
     let before_revision = memory.revision().await.unwrap();
     let before_topology = serde_json::to_value(&harness.topology).unwrap();
     let harness = Arc::new(Mutex::new(harness));
+    let cancellation = CancellationToken::new();
     let running = tokio::spawn({
         let harness = harness.clone();
-        async move { harness.lock().await.dream().await }
+        let cancellation = cancellation.clone();
+        async move { harness.lock().await.dream_controlled(&cancellation).await }
     });
     for _ in &identities {
         let request = tokio::time::timeout(Duration::from_secs(30), requests.recv())
@@ -107,8 +172,8 @@ async fn cancellation_discards_the_whole_dream_and_each_peer_sees_only_its_histo
     for namespace in &namespaces {
         assert_eq!(memory.history(namespace, 100).await.unwrap().len(), 1);
     }
-    running.abort();
-    assert!(running.await.unwrap_err().is_cancelled());
+    cancellation.cancel();
+    assert!(turn_was_cancelled(&running.await.unwrap().unwrap_err()));
     let mut harness = harness.lock().await;
     harness.reconcile().await.unwrap();
     assert_eq!(
@@ -128,6 +193,138 @@ async fn cancellation_discards_the_whole_dream_and_each_peer_sees_only_its_histo
     let output = harness.run("Continue after cancellation").await.unwrap();
     assert_eq!(output.text, "A later conversation still works");
     harness.shutdown(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn periodic_dream_cancellation_preserves_the_exact_completed_output() {
+    let project = tempfile::tempdir().unwrap();
+    let memory = MemoryStore::temporary().await.unwrap();
+    let provider = Arc::new(HeldPeriodicDream {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        started: Notify::new(),
+    });
+    let harness = Harness::new(
+        Config {
+            dream_every: 1,
+            ..config()
+        },
+        project.path(),
+        memory.clone(),
+        provider.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let target = harness.topology.parts[0].id.clone();
+    let mut events = harness.subscribe();
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let dream_started = provider.started.notified();
+    tokio::pin!(dream_started);
+    let task = tokio::spawn(async move {
+        let mut harness = harness;
+        let output = harness
+            .run_controlled(
+                "finish before dreaming",
+                Some(&target),
+                "periodic-boundary",
+                &task_cancellation,
+            )
+            .await;
+        (harness, output, target)
+    });
+    tokio::time::timeout(Duration::from_secs(30), dream_started)
+        .await
+        .unwrap();
+    cancellation.cancel();
+    let (mut harness, output, target) = task.await.unwrap();
+    let output = output.unwrap();
+    assert!(matches!(output.events.last(), Some(event) if event.kind == "response"));
+    assert!(!output.events.iter().any(|event| event.kind == "dream"));
+    let calls = provider.calls.load(Ordering::SeqCst);
+    let retry = harness
+        .run_controlled(
+            "finish before dreaming",
+            Some(&target),
+            "periodic-boundary",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&retry).unwrap(),
+        serde_json::to_vec(&output).unwrap()
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+    let mut kinds = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        kinds.push(event.kind);
+    }
+    assert!(kinds.iter().any(|kind| kind == "response"));
+    assert!(kinds.iter().any(|kind| kind == "dream"));
+    assert_eq!(harness.history().await.unwrap().len(), 2);
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
+    let project = tempfile::tempdir().unwrap();
+    let memory = MemoryStore::temporary().await.unwrap();
+    let provider = Arc::new(StalePeriodicDream {
+        live: memory.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        wrote: AtomicBool::new(false),
+    });
+    let mut harness = Harness::new(
+        Config {
+            dream_every: 1,
+            ..config()
+        },
+        project.path(),
+        memory.clone(),
+        provider.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let target = harness.topology.parts[0].id.clone();
+    let mut events = harness.subscribe();
+    let output = harness
+        .run_controlled(
+            "finish despite stale dream",
+            Some(&target),
+            "failed-periodic-boundary",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(output.events.last(), Some(event) if event.kind == "response"));
+    assert!(!output.events.iter().any(|event| event.kind == "dream"));
+    let calls = provider.calls.load(Ordering::SeqCst);
+    let retry = harness
+        .run_controlled(
+            "finish despite stale dream",
+            Some(&target),
+            "failed-periodic-boundary",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&retry).unwrap(),
+        serde_json::to_vec(&output).unwrap()
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+    let mut observed_failure = false;
+    while let Ok(event) = events.try_recv() {
+        observed_failure |=
+            event.kind == "error" && event.actor == "dream" && event.detail.contains("stale");
+    }
+    assert!(observed_failure);
+    assert_eq!(harness.history().await.unwrap().len(), 2);
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
 }
 
 struct ConcurrentWriter {

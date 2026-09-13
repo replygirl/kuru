@@ -604,18 +604,44 @@ impl MemoryStore {
         self.put_many(&[(key.into(), value.clone())]).await
     }
     pub async fn put_many(&self, values: &[(String, Value)]) -> Result<()> {
-        let mut keys = BTreeSet::new();
-        let mut encoded = Vec::with_capacity(values.len());
-        for (key, value) in values {
-            identifier("state key", key, 1024)?;
-            ensure!(keys.insert(key), "duplicate state key in atomic update");
-            encoded.push((key.clone(), serde_json::to_string(value)?));
-        }
+        let encoded = encode_state(values)?;
         if encoded.is_empty() {
             return Ok(());
         }
         self.mutate("state", Mutation::State(encoded)).await
     }
+
+    /// Append messages to one namespace and update state in the same durable
+    /// receipt-bearing transaction. This is the narrow turn-checkpoint seam;
+    /// callers do not receive general SQL or cross-namespace authority.
+    pub async fn checkpoint(
+        &self,
+        namespace: &str,
+        messages: &[Message],
+        values: &[(String, Value)],
+    ) -> Result<()> {
+        identifier("namespace", namespace, 1024)?;
+        let mut encoded_messages = Vec::with_capacity(messages.len());
+        for message in messages {
+            identifier("role", &message.role, 128)?;
+            encoded_messages.push((message.role.clone(), message.content.clone()));
+        }
+        let encoded_state = encode_state(values)?;
+        ensure!(
+            !encoded_messages.is_empty() || !encoded_state.is_empty(),
+            "memory checkpoint must contain a message or state value"
+        );
+        self.mutate(
+            "checkpoint",
+            Mutation::Checkpoint {
+                namespace: namespace.into(),
+                messages: encoded_messages,
+                values: encoded_state,
+            },
+        )
+        .await
+    }
+
     pub async fn get(&self, key: &str) -> Result<Option<Value>> {
         self.readable()?;
         identifier("state key", key, 1024)?;
@@ -847,6 +873,11 @@ enum Mutation {
         content: String,
     },
     State(Vec<(String, String)>),
+    Checkpoint {
+        namespace: String,
+        messages: Vec<(String, String)>,
+        values: Vec<(String, String)>,
+    },
     Clear(String),
     ForgetNote {
         namespace: String,
@@ -875,6 +906,23 @@ async fn apply(
                 .await?;
         }
         Mutation::State(values) => {
+            for (key, value) in values {
+                sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)").bind(key.as_bytes()).bind(value).execute(&mut *transaction).await?;
+            }
+        }
+        Mutation::Checkpoint {
+            namespace,
+            messages,
+            values,
+        } => {
+            for (role, content) in messages {
+                sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
+                    .bind(namespace.as_bytes())
+                    .bind(role.as_bytes())
+                    .bind(content)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
             for (key, value) in values {
                 sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)").bind(key.as_bytes()).bind(value).execute(&mut *transaction).await?;
             }
@@ -913,6 +961,18 @@ async fn apply(
     transaction.commit().await?;
     Ok(())
 }
+
+fn encode_state(values: &[(String, Value)]) -> Result<Vec<(String, String)>> {
+    let mut keys = BTreeSet::new();
+    let mut encoded = Vec::with_capacity(values.len());
+    for (key, value) in values {
+        identifier("state key", key, 1024)?;
+        ensure!(keys.insert(key), "duplicate state key in atomic update");
+        encoded.push((key.clone(), serde_json::to_string(value)?));
+    }
+    Ok(encoded)
+}
+
 async fn owned_connection(pool: &MySqlPool) -> Result<(MySqlConnection, u64)> {
     let mut connection = pool.acquire().await?.detach();
     let id = tokio::time::timeout(
@@ -2314,7 +2374,11 @@ mod tests {
             &mut connection,
             &operation,
             "receipt",
-            Mutation::State(vec![("two".into(), "2".into())]),
+            Mutation::Checkpoint {
+                namespace: "turn".into(),
+                messages: vec![("assistant".into(), "answer".into())],
+                values: vec![("two".into(), "2".into())],
+            },
         )
         .await
         .unwrap();
@@ -2325,7 +2389,11 @@ mod tests {
                 &mut connection,
                 &operation,
                 "duplicate",
-                Mutation::State(vec![("one".into(), "10".into())])
+                Mutation::Checkpoint {
+                    namespace: "turn".into(),
+                    messages: vec![("assistant".into(), "duplicate".into())],
+                    values: vec![("one".into(), "10".into())],
+                }
             )
             .await
             .is_err()
@@ -2335,6 +2403,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.get("one").await.unwrap(), Some(json!(1)));
+        assert_eq!(
+            store.history("turn", 10).await.unwrap(),
+            [Message {
+                role: "assistant".into(),
+                content: "answer".into(),
+            }]
+        );
         assert_eq!(store.revision().await.unwrap(), before);
         assert!(operation_exists(&store.pool, &operation).await.unwrap());
         assert!(
@@ -2360,6 +2435,47 @@ mod tests {
             receipt: Receipt::Operation(Uuid::new_v4().to_string()),
         });
         assert_eq!(store.reconcile().await.unwrap(), Some(false));
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_validates_one_namespace_and_atomic_state_inputs() {
+        let store = MemoryStore::temporary().await.unwrap();
+        let before = store.revision().await.unwrap();
+        for result in [
+            store
+                .checkpoint(
+                    "",
+                    &[Message {
+                        role: "user".into(),
+                        content: "prompt".into(),
+                    }],
+                    &[],
+                )
+                .await,
+            store
+                .checkpoint(
+                    "turn",
+                    &[Message {
+                        role: "".into(),
+                        content: "prompt".into(),
+                    }],
+                    &[],
+                )
+                .await,
+            store.checkpoint("turn", &[], &[]).await,
+            store
+                .checkpoint(
+                    "turn",
+                    &[],
+                    &[("same".into(), json!(1)), ("same".into(), json!(2))],
+                )
+                .await,
+        ] {
+            assert!(result.is_err());
+        }
+        assert_eq!(store.revision().await.unwrap(), before);
+        assert!(store.history("turn", 10).await.unwrap().is_empty());
         store.close().await.unwrap();
     }
 

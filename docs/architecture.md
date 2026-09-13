@@ -60,6 +60,13 @@ canonical path hash; state lives in a user data location outside tool roots.
 Jungian collective memory is project-scoped in v1. A future explicit policy can
 add cross-project scope without treating all user projects as one memory.
 
+Each admitted turn writes one user transcript row together with a session-scoped
+journal entry. Before actor work, the runtime records that external dispatch is
+possible. A completed answer, its assistant row and the matching session and
+topology state commit together. This makes exact completed retries safe and leaves
+interrupted prompts visible without claiming that an ambiguous external call did
+or did not happen.
+
 ## Dreaming
 
 Dreaming solicits bounded proposals from parts using their isolated context.
@@ -106,7 +113,9 @@ autodiscovery or implicit trust.
 ## Bounds and permissions
 
 Concurrency, peer rounds and tool-call budgets bound cyclic conversation.
-Cancellation terminates pending work. File read/list operations are available
+Cancellation is an explicit signal through actor, provider, tool, A2A and dream
+waits. Accepted memory writes still settle or reconcile, and shell or MCP owners
+keep responsibility for their process cleanup. File read/list operations are available
 within the root; mutations require write opt-in. Shell execution requires a
 separate opt-in and is ordinary process authority. A working directory is not
 a security sandbox. MCP servers and configured external endpoints are trusted

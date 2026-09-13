@@ -15,7 +15,7 @@ use futures::{Stream, stream};
 use kuru_connectors::{DemoProvider, Provider};
 use kuru_core::{Completion, CompletionRequest, Config, Mode, ModelInfo};
 use kuru_memory::MemoryStore;
-use kuru_runtime::{Harness, TurnOutput};
+use kuru_runtime::{CancellationToken, Harness, TurnOutput};
 use ratatui::{
     Terminal,
     backend::{Backend, ClearType, TestBackend, WindowSize},
@@ -29,8 +29,8 @@ use tokio::{
 
 use super::{
     ACTIVITY_DRAIN_CAP, CompletionState, DispatchOutcome, Scheduler, TerminalEvent, View, Wake,
-    WakeAvailability, apply_completion, dispatch, next_wake, project_initial_view,
-    project_runtime_snapshot, run_loop_with_stream,
+    WakeAvailability, apply_completion, cancel_operation, dispatch, next_wake,
+    project_initial_view, project_runtime_snapshot, run_loop_with_stream,
 };
 
 async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
@@ -585,6 +585,63 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
         "a stale completion must not clear the live job"
     );
     job.take().unwrap().abort();
+}
+
+#[tokio::test]
+async fn cancellation_consumes_an_answer_that_won_the_completion_race() {
+    let (_directory, harness, _) = fixture().await;
+    let mut events = harness.subscribe();
+    let harness = Arc::new(tokio::sync::Mutex::new(harness));
+    let initial = {
+        let harness = harness.lock().await;
+        project_initial_view(&harness).await.unwrap()
+    };
+    let mut view = View::from_initial(initial, vec![]);
+    view.begin_operation();
+    let output = TurnOutput {
+        session: view.session.clone(),
+        speaker: view.parts[0].0.clone(),
+        text: "answer won cancellation".into(),
+        relationship: None,
+        input_tokens: 5,
+        output_tokens: 3,
+        limited: false,
+        events: vec![],
+    };
+    let (tx, mut completions) = mpsc::channel(1);
+    let token = CancellationToken::new();
+    let worker_token = token.clone();
+    let mut job = Some(tokio::spawn(async move {
+        while !worker_token.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+        tx.send((7, Ok(DispatchOutcome::Turn(output))))
+            .await
+            .unwrap();
+    }));
+    let mut cancellation = Some(token);
+    let mut generation = 7;
+    let mut quit_pending = false;
+    assert!(
+        !cancel_operation(
+            &mut completions,
+            &mut events,
+            &mut view,
+            &harness,
+            &mut job,
+            &mut cancellation,
+            &mut generation,
+            &mut quit_pending,
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(view.status, "Complete");
+    assert_eq!(view.transcript.last().unwrap().1, "answer won cancellation");
+    assert!(job.is_none());
+    assert!(cancellation.is_none());
+    assert_eq!(generation, 8);
+    harness.lock().await.shutdown(false).await.unwrap();
 }
 
 #[tokio::test]
