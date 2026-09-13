@@ -2,21 +2,23 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('Shard', 'Collect')]
     [string]$Mode,
-    [Parameter(Mandatory = $true)]
-    [string]$TargetDir,
-    [Parameter(Mandatory = $true)]
-    [string]$ExpectedSource,
-    [Parameter(Mandatory = $true)]
-    [string]$RunAttempt,
-    [string]$Shard,
-    [string]$Packages,
-    [string]$OutputDir,
-    [string]$Inputs,
-    [string]$OutputPath
+    [string]$TargetDir = $env:KURU_COVERAGE_TARGET,
+    [string]$ExpectedSource = $env:KURU_COVERAGE_SOURCE,
+    [string]$RunAttempt = $env:KURU_COVERAGE_ATTEMPT,
+    [string]$Shard = $env:KURU_COVERAGE_SHARD,
+    [string]$Packages = $env:KURU_COVERAGE_PACKAGES,
+    [string]$OutputDir = $env:KURU_COVERAGE_OUTPUT,
+    [string]$Inputs = $env:KURU_COVERAGE_INPUTS,
+    [string]$OutputPath = $env:KURU_COVERAGE_REPORT
 )
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
+if ([string]::IsNullOrWhiteSpace($TargetDir) -or
+    [string]::IsNullOrWhiteSpace($ExpectedSource) -or
+    [string]::IsNullOrWhiteSpace($RunAttempt)) {
+    throw 'Coverage target, expected source and run attempt are required'
+}
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
 Set-Location $root
 

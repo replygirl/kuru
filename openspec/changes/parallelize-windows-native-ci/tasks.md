@@ -19,7 +19,7 @@
 
 ## 3. Verification
 
-- [ ] 3.1 Run focused helper, workflow, formatting, lint and strict cospec checks
+- [x] 3.1 Run focused helper, workflow, formatting, lint and strict cospec checks
   and record observed local evidence
 - [ ] 3.2 Run the exact pull-request head on native CI, record per-shard and
   aggregate timings plus every per-OS coverage/install result, and preserve any

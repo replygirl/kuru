@@ -58,7 +58,7 @@ tools."cargo:cargo-llvm-cov" = "0.9.1"
 tools."aqua:cocogitto/cocogitto" = "{{vars.kuru_cocogitto_version}}"
 tools."github:jdx/communique" = "{{vars.kuru_communique_version}}"
 run = "echo 'coverage:windows:shard requires native Windows' >&2; exit 1"
-run_windows = "& packages/kuru-delivery/support/windows-coverage.ps1 -Mode Shard -TargetDir $env:KURU_COVERAGE_TARGET -ExpectedSource $env:KURU_COVERAGE_SOURCE -RunAttempt $env:KURU_COVERAGE_ATTEMPT -Shard $env:KURU_COVERAGE_SHARD -Packages $env:KURU_COVERAGE_PACKAGES -OutputDir $env:KURU_COVERAGE_OUTPUT"
+run_windows = "pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File packages/kuru-delivery/support/windows-coverage.ps1 -Mode Shard"
 
 [tasks."coverage:windows:shard".env]
 RUST_TEST_THREADS = "2"
@@ -70,7 +70,7 @@ description = "Validate Windows coverage shard receipts and enforce one workspac
 dir = "{{config_root}}/../.."
 tools."cargo:cargo-llvm-cov" = "0.9.1"
 run = "echo 'coverage:windows:collect requires native Windows' >&2; exit 1"
-run_windows = "& packages/kuru-delivery/support/windows-coverage.ps1 -Mode Collect -TargetDir $env:KURU_COVERAGE_TARGET -ExpectedSource $env:KURU_COVERAGE_SOURCE -RunAttempt $env:KURU_COVERAGE_ATTEMPT -Inputs $env:KURU_COVERAGE_INPUTS -OutputPath $env:KURU_COVERAGE_REPORT"
+run_windows = "pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File packages/kuru-delivery/support/windows-coverage.ps1 -Mode Collect"
 
 [tasks."coverage:windows:collect".env]
 KURU_TEST_SUPERVISOR_PREPARED = false

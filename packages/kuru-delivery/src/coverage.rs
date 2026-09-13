@@ -1970,25 +1970,16 @@ mod tests {
 
     #[tokio::test]
     async fn modified_tracked_source_cannot_claim_head_identity() {
-        use std::process::Command as StdCommand;
-
-        fn git(root: &Path, args: &[&str]) -> std::process::Output {
-            let mut command = StdCommand::new("git");
-            command
-                .args(["-c", "commit.gpgSign=false"])
-                .args(args)
-                .current_dir(root);
-            for variable in [
-                "GIT_DIR",
-                "GIT_WORK_TREE",
-                "GIT_INDEX_FILE",
-                "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                "GIT_COMMON_DIR",
-            ] {
-                command.env_remove(variable);
-            }
-            command.output().unwrap()
+        async fn git(root: &Path, args: &[&str]) -> std::process::Output {
+            let mut command = crate::command::rooted(root, "git");
+            command.args(["-c", "commit.gpgSign=false"]).args(args);
+            crate::command::bounded_output(
+                &mut command,
+                std::time::Duration::from_secs(30),
+                64 * 1024,
+            )
+            .await
+            .unwrap()
         }
 
         let temp = TempDir::new().unwrap();
@@ -1998,13 +1989,18 @@ mod tests {
             &["config", "user.name", "Coverage fixture"][..],
             &["config", "user.email", "fixture@example.invalid"][..],
         ] {
-            assert!(git(root, args).status.success());
+            assert!(git(root, args).await.status.success());
         }
         fs::write(root.join("Cargo.lock"), "version = 4\n").unwrap();
         fs::write(root.join("source.rs"), "const VALUE: u8 = 1;\n").unwrap();
-        assert!(git(root, &["add", "."]).status.success());
-        assert!(git(root, &["commit", "-m", "fixture"]).status.success());
-        let head = String::from_utf8(git(root, &["rev-parse", "HEAD"]).stdout).unwrap();
+        assert!(git(root, &["add", "."]).await.status.success());
+        assert!(
+            git(root, &["commit", "-m", "fixture"])
+                .await
+                .status
+                .success()
+        );
+        let head = String::from_utf8(git(root, &["rev-parse", "HEAD"]).await.stdout).unwrap();
         fs::write(root.join("source.rs"), "const VALUE: u8 = 2;\n").unwrap();
         let error = identity(root, head.trim(), Path::new("missing-llvm-cov"))
             .await
