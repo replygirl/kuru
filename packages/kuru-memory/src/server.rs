@@ -776,6 +776,26 @@ impl LifecycleLease {
         self.verify()
     }
 
+    /// Remove the stopped, still-verified store tree while retaining the
+    /// lifecycle lock and its parent authority through native cleanup. This
+    /// consumes the lease: an uncertain removal leaves its separately recorded
+    /// quarantine identity for a later explicit reconciliation attempt.
+    pub(crate) fn remove_tree(self) -> Result<()> {
+        self.verify()?;
+        let Self {
+            directory,
+            lock_directory,
+            lock_name,
+            lock,
+        } = self;
+        // Keep the lifecycle authority live until the checked tree primitive
+        // has consumed the root. On Windows the lifecycle root is external;
+        // on Unix this is an in-tree lock whose held descriptor remains valid
+        // across unlink until this scope exits.
+        let _retained_lifecycle = (lock_directory, lock_name, lock);
+        directory.remove_tree().map_err(anyhow::Error::from)
+    }
+
     #[cfg(test)]
     pub(crate) fn move_to_observed(
         &mut self,

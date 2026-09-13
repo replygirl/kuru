@@ -10,6 +10,7 @@ kuru memory status
 kuru memory history
 kuru memory notes ID --limit 100
 kuru memory forget ID --note SEQUENCE
+kuru memory purge --yes
 kuru memory export --format json --output committed-memory.json
 ```
 
@@ -31,6 +32,18 @@ notes written by dreaming. `kuru memory forget ID --note SEQUENCE` removes that
 one row from the selected identity's active notes namespace and records a new
 Dolt revision. It does not remove conversations, other notes, or older revisions;
 it is not secure erasure and does not provide a history-recovery command.
+
+`kuru memory purge --yes` is the explicit destructive control for one canonical
+project. It removes that project's managed current Dolt store, revision history,
+and recognised managed recovery trees, then prevents that project from being
+automatically re-imported from a shared legacy SQLite source. It refuses an
+active owner and never kills it. It retains original/shared legacy SQLite inputs
+and migration snapshots, user exports and backups, other projects, engine cache,
+and stable lock files. After memory removal, it removes that project's bounded
+diagnostics ring. If an earlier purge records an incomplete operation, rerun the
+same `kuru memory purge --yes` command: it removes only the recorded remaining
+identities. It is not secure erasure and does not rewrite copies outside Kuru's
+managed project store.
 
 `kuru memory export` writes every application message and state record from one
 captured, committed `main` revision. It uses JSON by default; `--format markdown`

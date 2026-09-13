@@ -636,10 +636,12 @@ struct StoppedStage {
 mod export;
 pub(crate) mod marker_fixture;
 mod migrations;
+pub(crate) mod purge;
 pub use export::{ActiveExportSnapshot, ExportCursor, ExportPage, ExportProvenance, StorageRecord};
 
 impl MemoryStore {
     pub fn exists(data_dir: &Path, project_scope: &str) -> Result<bool> {
+        purge::ensure_open_allowed(data_dir, project_scope)?;
         let path = project_directory(data_dir, project_scope)?;
         match fs::symlink_metadata(&path) {
             Ok(metadata) => ensure!(
@@ -703,6 +705,7 @@ impl MemoryStore {
             .await?,
         );
         lock_directory.verify(name, lock.as_ref().expect("startup lock"))?;
+        purge::ensure_open_allowed(&options.data_dir, &options.project_scope)?;
         let binary = provision::provision_observed(
             &options.config,
             &options.data_dir.join("tools/dolt"),
@@ -737,7 +740,11 @@ impl MemoryStore {
             let data = options.data_dir.clone();
             let scope = options.project_scope.clone();
             let legacy =
-                tokio::task::spawn_blocking(move || migration::prepare(&data, &scope)).await??;
+                if Self::legacy_import_suppressed(&options.data_dir, &options.project_scope)? {
+                    None
+                } else {
+                    tokio::task::spawn_blocking(move || migration::prepare(&data, &scope)).await??
+                };
             let recovered = recover_staging(
                 &directory,
                 &options.project_scope,

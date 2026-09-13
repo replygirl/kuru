@@ -58,6 +58,31 @@ pub(crate) fn install(
     Ok(Some(DiagnosticsGuard(ring)))
 }
 
+/// Remove the bounded ring for one already-confirmed project purge. The CLI
+/// holds that project's writer lease; this does not initialize diagnostics or
+/// create a directory when no ring was ever written.
+pub(crate) fn purge(data: &std::path::Path, scope: &str) -> Result<()> {
+    let hash = scope
+        .strip_prefix("project/")
+        .context("invalid project diagnostic scope")?;
+    ensure!(
+        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid project diagnostic scope"
+    );
+    let path = data.join("diagnostics").join(hash);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Directory::open(
+            &path,
+            kuru_platform::fs::Privacy::OwnerOnly,
+            kuru_platform::fs::NameRetention::Movable,
+        )?
+        .remove_tree()
+        .map_err(anyhow::Error::from),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 struct Ring {
     state: Mutex<State>,
     failure: Mutex<Option<String>>,

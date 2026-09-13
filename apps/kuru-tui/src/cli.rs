@@ -183,6 +183,18 @@ pub enum MemoryCommand {
         #[arg(long)]
         note: i64,
     },
+    /// Explicitly remove this project's managed Dolt memory and history.
+    ///
+    /// Original/shared legacy SQLite inputs and migration snapshots, exports,
+    /// backups, other projects, engine cache, and stable locks remain. The
+    /// selected project's diagnostics ring is removed after its memory. If a
+    /// prior purge stopped after recording its intent, rerun this command to
+    /// remove only its recorded remaining identities.
+    Purge {
+        /// Confirm removal of this project's local current memory and all managed revisions.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 pub fn paths(cli: &Cli) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
@@ -576,7 +588,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 | Command::UndoDream
                 | Command::Serve { .. }
                 | Command::Memory {
-                    command: MemoryCommand::Forget { .. }
+                    command: MemoryCommand::Forget { .. } | MemoryCommand::Purge { .. }
                 }
         )
     );
@@ -586,7 +598,25 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             Command::Run { .. } | Command::Dream | Command::UndoDream | Command::Serve { .. }
         )
     );
-    let exists = MemoryStore::exists(&data, &scope)?;
+    let purge = matches!(
+        cli.command,
+        Some(Command::Memory {
+            command: MemoryCommand::Purge { .. }
+        })
+    );
+    if let Some(Command::Memory {
+        command: MemoryCommand::Purge { yes: false },
+    }) = &cli.command
+    {
+        bail!(
+            "memory purge removes this project's local Dolt history and current memory; rerun with --yes after reviewing the retained-history boundary"
+        );
+    }
+    let exists = if purge {
+        false
+    } else {
+        MemoryStore::exists(&data, &scope)?
+    };
     let memory_control = matches!(
         cli.command,
         Some(Command::Memory {
@@ -617,6 +647,15 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     } else {
         None
     };
+    if purge {
+        let mut options = MemoryOptions::new(data.clone(), scope.clone());
+        options.config = memory_config;
+        let outcome = MemoryStore::purge(options).await?;
+        crate::diagnostics::purge(&data, &scope)
+            .context("project memory was removed but project diagnostics cleanup failed")?;
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+        return Ok(());
+    }
     let mut diagnostics = if install_diagnostics && runtime_owner {
         crate::diagnostics::install(&data, &scope, cli.debug)?
     } else {
@@ -706,6 +745,9 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                                 &forget_note(memory, &cwd, config.mode, identity, *note).await?
                             )?
                         );
+                    }
+                    MemoryCommand::Purge { .. } => {
+                        unreachable!("purge returned before opening memory")
                     }
                 }
                 return Ok(());

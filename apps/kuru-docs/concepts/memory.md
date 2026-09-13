@@ -73,6 +73,17 @@ notes row and commits that change as a new revision. It does not alter a
 conversation, other notes, or earlier revisions. This is active-memory control,
 not secure erasure, and Kuru does not expose a history-recovery command.
 
+Use `kuru memory purge --yes` only when you intend to remove one project's
+managed local Dolt memory and revision history. It also removes recognised
+managed recovery copies and suppresses that project's automatic legacy SQLite
+re-import. It retains original/shared legacy SQLite inputs and migration
+snapshots, exports and backups, other projects, engine cache, and lock objects.
+It refuses a live owner, never kills another process, and does not promise secure
+erasure or rewrite copies outside the managed project store. After memory is
+gone, it removes that project's bounded diagnostics ring. An incomplete purge is
+resumed only by rerunning the same explicit command against its recorded
+identities.
+
 `kuru memory export` reads every application message and state row from one
 captured committed `main` revision. The JSON default and Markdown option preserve
 the same rows and a manifest with revision, schema and row counts. Previous

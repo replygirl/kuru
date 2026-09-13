@@ -121,6 +121,58 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
 }
 
 #[test]
+fn cli_requires_explicit_project_purge_confirmation_and_removes_its_diagnostics_ring() {
+    let env = Sandbox::new();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let hash = scope.strip_prefix("project/").unwrap();
+    env.success(&["--debug", "run", "create managed project memory"]);
+    let ring = env.data.join("diagnostics").join(hash);
+    assert!(ring.is_dir(), "debug run did not create the project ring");
+
+    let mut help_command = env.command_for("responses");
+    let help = help_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "purge", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--yes"));
+    assert!(help.contains("history"));
+    assert!(help.contains("legacy SQLite"));
+    assert!(help.contains("exports"));
+    assert!(help.contains("diagnostics"));
+    assert!(help.contains("recorded remaining identities"));
+    let mut refusal_command = env.command_for("responses");
+    let refusal = refusal_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "purge"])
+        .output()
+        .unwrap();
+    assert!(!refusal.status.success());
+    assert!(refusal.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&refusal.stderr).contains("--yes"));
+    assert!(ring.is_dir(), "refusal changed the diagnostics ring");
+
+    let mut purge_command = env.command_for("responses");
+    let output = purge_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "purge", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["project"], scope);
+    assert_eq!(result["legacy_import_suppressed"], true);
+    assert!(!ring.exists());
+}
+
+#[test]
 fn cli_file_crud_and_shell_require_real_capabilities() {
     const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
     const ORDINARY_CONTROL: &str = "ordinary-control-remains-exact";

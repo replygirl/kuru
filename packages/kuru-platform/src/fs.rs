@@ -441,6 +441,102 @@ impl Directory {
         self.remove_file_then(name, file, || Ok(()))
     }
 
+    /// Remove this checked directory and every checked descendant. This
+    /// consumes the held root so native Windows deletion can complete. The
+    /// caller owns inventory and retry policy; a possible partial deletion is
+    /// reported as uncertain and never authorizes selecting a new pathname.
+    pub fn remove_tree(self) -> Result<(), RemovalError> {
+        let identity = self.identity();
+        let path = self.path().to_path_buf();
+        if self.anchors.len() < 2 {
+            return Err(RemovalError {
+                phase: PublicationPhase::Rejected,
+                identity: Some(identity),
+                path,
+                error: invalid("cannot remove a filesystem root"),
+            });
+        }
+        let name = path.file_name().ok_or_else(|| RemovalError {
+            phase: PublicationPhase::Rejected,
+            identity: Some(identity),
+            path: path.clone(),
+            error: invalid("missing directory name"),
+        })?;
+        component(name).map_err(|error| RemovalError {
+            phase: PublicationPhase::Rejected,
+            identity: Some(identity),
+            path: path.clone(),
+            error,
+        })?;
+        if self.privacy != Privacy::OwnerOnly {
+            return Err(RemovalError {
+                phase: PublicationPhase::Rejected,
+                identity: Some(identity),
+                path,
+                error: denied("checked tree removal requires an owner-private root"),
+            });
+        }
+        if self.retention != NameRetention::Movable {
+            return Err(RemovalError {
+                phase: PublicationPhase::Rejected,
+                identity: Some(identity),
+                path,
+                error: denied("checked tree removal requires a movable root handle"),
+            });
+        }
+        self.revalidate().map_err(|error| RemovalError {
+            phase: PublicationPhase::Rejected,
+            identity: Some(identity),
+            path: path.clone(),
+            error,
+        })?;
+        let retention = self.retention;
+        let mut anchors = self.anchors;
+        let root = anchors.pop().expect("root count checked");
+        let parent = anchors
+            .last()
+            .expect("root count checked")
+            .file
+            .try_clone()
+            .map_err(|error| RemovalError {
+                phase: PublicationPhase::Rejected,
+                identity: Some(identity),
+                path: path.clone(),
+                error,
+            })?;
+        let ancestor_paths: Vec<_> = anchors
+            .iter()
+            .map(|anchor| (anchor.path.as_path(), anchor.identity))
+            .collect();
+        native::remove_tree(&parent, &ancestor_paths, &path, name, root.file, identity).map_err(
+            |(phase, error)| RemovalError {
+                phase,
+                identity: Some(identity),
+                path: path.clone(),
+                error,
+            },
+        )?;
+        Self::revalidate_ancestors(&anchors, retention).map_err(|error| RemovalError {
+            phase: PublicationPhase::Uncertain,
+            identity: Some(identity),
+            path,
+            error,
+        })
+    }
+
+    fn revalidate_ancestors(anchors: &[Anchor], retention: NameRetention) -> io::Result<()> {
+        let mut parent = None;
+        for held in anchors {
+            let current = native::open_directory(parent.as_ref(), &held.path, retention)?;
+            let info = native::info(&current)?;
+            if !info.directory || info.file.identity != held.identity {
+                return Err(denied("directory ancestor identity changed during removal"));
+            }
+            parent = Some(current);
+        }
+        Ok(())
+    }
+
     fn remove_file_then(
         &self,
         name: &OsStr,
@@ -632,6 +728,107 @@ impl Directory {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn checked_tree_removal_consumes_only_regular_private_descendants() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Directory::ensure_private(&temporary.path().join("root")).unwrap();
+        let nested = Directory::ensure_private(&root.path().join("nested")).unwrap();
+        nested
+            .create_new(OsStr::new("record"))
+            .unwrap()
+            .write_all(b"private bytes")
+            .unwrap();
+        // The descendant's checked handle would legitimately prevent native
+        // Windows deletion, so close it before observing a successful tree
+        // removal on every supported host.
+        drop(nested);
+        let outside = Directory::ensure_private(&temporary.path().join("outside")).unwrap();
+        outside
+            .create_new(OsStr::new("sentinel"))
+            .unwrap()
+            .write_all(b"outside bytes")
+            .unwrap();
+        drop(outside);
+
+        root.remove_tree().unwrap();
+        assert!(!temporary.path().join("root").exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join("outside/sentinel")).unwrap(),
+            b"outside bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_tree_removal_rejects_a_symlink_descendant() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Directory::ensure_private(&temporary.path().join("root")).unwrap();
+        let outside = Directory::ensure_private(&temporary.path().join("outside")).unwrap();
+        outside
+            .create_new(OsStr::new("sentinel"))
+            .unwrap()
+            .write_all(b"outside bytes")
+            .unwrap();
+        symlink(outside.path(), root.path().join("link")).unwrap();
+
+        let error = root.remove_tree().unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert!(temporary.path().join("root/link").is_symlink());
+        assert_eq!(
+            std::fs::read(temporary.path().join("outside/sentinel")).unwrap(),
+            b"outside bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_tree_removal_rejects_a_replaced_root_without_touching_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root_path = temporary.path().join("root");
+        let root = Directory::ensure_private(&root_path).unwrap();
+        root.create_new(OsStr::new("original"))
+            .unwrap()
+            .write_all(b"original bytes")
+            .unwrap();
+        let parked = temporary.path().join("parked-original");
+        std::fs::rename(&root_path, &parked).unwrap();
+        let replacement = Directory::ensure_private(&root_path).unwrap();
+        replacement
+            .create_new(OsStr::new("replacement"))
+            .unwrap()
+            .write_all(b"replacement bytes")
+            .unwrap();
+
+        let error = root.remove_tree().unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(
+            std::fs::read(root_path.join("replacement")).unwrap(),
+            b"replacement bytes"
+        );
+        assert_eq!(
+            std::fs::read(parked.join("original")).unwrap(),
+            b"original bytes"
+        );
+    }
+
+    #[test]
+    fn checked_tree_removal_rejects_a_pinned_root_before_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("root");
+        let root = Directory::ensure_private(&path).unwrap();
+        root.create_new(OsStr::new("record"))
+            .unwrap()
+            .write_all(b"retained")
+            .unwrap();
+        let pinned = Directory::open(&path, Privacy::OwnerOnly, NameRetention::Pinned).unwrap();
+
+        let error = pinned.remove_tree().unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert_eq!(std::fs::read(path.join("record")).unwrap(), b"retained");
+    }
 
     #[test]
     fn impossible_directory_move_preserves_native_error_and_source_identity() {

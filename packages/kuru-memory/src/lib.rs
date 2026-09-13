@@ -9,6 +9,7 @@ pub mod server;
 mod store;
 
 pub use progress::{MemoryOpenProgress, MemoryOpenStage};
+pub use store::purge::PurgeOutcome;
 pub use store::{
     ActiveExportSnapshot, Candidate, ExportCursor, ExportPage, ExportProvenance, MemoryStatus,
     MemoryStore, MemoryView, OpenOptions, Revision, StorageRecord, StoredNote,

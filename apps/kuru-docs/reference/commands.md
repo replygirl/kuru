@@ -58,6 +58,7 @@ Model, effort, and framework selections made here are [saved for the project](./
 | `kuru memory history`                   | List committed memory updates; use `--limit` to select 1–1000 entries                       |
 | `kuru memory notes ID`                  | Read newest durable notes for one selected-mode identity; `--limit` is 1–1000 (default 100) |
 | `kuru memory forget ID --note SEQUENCE` | Remove one selected current note and retain prior revision history                          |
+| `kuru memory purge --yes`               | Remove one project's managed current memory and Dolt history after explicit confirmation    |
 | `kuru memory export`                    | Export every application record from one committed active-memory snapshot                   |
 | `kuru dream`                            | Run explicit consolidation                                                                  |
 | `kuru undo-dream`                       | Restore the previous topology change                                                        |
@@ -103,6 +104,17 @@ tool host, or conversation. Each note includes its stable `sequence` and stored
 role. `kuru memory forget ID --note SEQUENCE` deletes exactly that current notes
 row in a new Dolt revision; it leaves conversations, other notes, and earlier
 revisions intact, so it is not secure erasure or a history-recovery command.
+
+`kuru memory purge --yes` explicitly removes the selected canonical project's
+managed current Dolt store, all of its managed revisions, and recognised managed
+recovery copies. It retains original/shared legacy SQLite input and migration
+snapshots, user exports and backups, other projects, engine cache, and stable
+lock objects. It suppresses future automatic import of the selected project from
+that shared legacy source. It refuses an active owner, never kills it, does not
+rewrite history outside Kuru's managed store, and is not secure erasure. After
+memory removal it removes the selected bounded diagnostics ring. If an earlier
+purge recorded incomplete work, rerun the same command; it only resumes the
+recorded remaining identities.
 
 `kuru memory export [--format json|markdown] [--output PATH]` is provider-free
 inspection of the current committed `main` snapshot. Its JSON manifest includes
