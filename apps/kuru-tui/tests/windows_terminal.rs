@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, ensure};
-use kuru_core::{Config, Mode};
+use kuru_core::Config;
 use kuru_delivery::command::BlockingCommand;
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde_json::{Value, json};
@@ -211,10 +211,6 @@ impl Sandbox {
         );
         Ok(String::from_utf8(output.stdout)?)
     }
-
-    fn config(&self) -> Result<Config> {
-        Ok(toml::from_str(&self.output("config")?)?)
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -307,11 +303,6 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
     let report = terminal.finish(EXIT)?;
     assert_eq!(report["status"], 0);
     drop(terminal);
-    let saved = sandbox.config()?;
-    assert_eq!(
-        (saved.mode, saved.model.as_str(), saved.effort.as_deref()),
-        (Mode::Jungian, "demo", None)
-    );
     let sessions: Vec<kuru_runtime::Session> = serde_json::from_str(&sandbox.output("sessions")?)?;
     ensure!(
         sessions
@@ -320,6 +311,8 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
         "chat was not durably saved"
     );
 
+    // Reopening memory is the authoritative persistence check. The storage-free
+    // config snapshot intentionally omits project preferences.
     let mut reopened = sandbox.start("reopened", "app", &[], true, "demo", &[])?;
     reopened.text(
         &["demo", "Jungian", "default", "enter send"],

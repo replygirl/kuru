@@ -386,6 +386,25 @@ KURU_FAKE_SECRET = "credential-value"
     assert!(!sandbox.data.join("memory").exists());
 }
 
+#[test]
+fn persistent_approval_replaces_inspects_and_revokes_its_record() {
+    let sandbox = Sandbox::new("allow_shell = true\n");
+
+    sandbox.success(&["trust", "approve", "--yes"]);
+    let first_status = sandbox.success(&["trust", "status"]);
+    assert!(text(&first_status.stdout).contains("Status: approved"));
+
+    // A second explicit approval replaces the held existing record.
+    sandbox.success(&["trust", "approve", "--yes"]);
+    let second_status = sandbox.success(&["trust", "status"]);
+    assert!(text(&second_status.stdout).contains("Status: approved"));
+
+    let revoked = sandbox.success(&["trust", "revoke"]);
+    assert!(text(&revoked.stdout).contains("Workspace approval revoked"));
+    let final_status = sandbox.success(&["trust", "status"]);
+    assert!(text(&final_status.stdout).contains("Status: not approved"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdio_and_http_mcp_require_cli_approval_before_activation() {
     let stdio = NativeMcpFixture::new();

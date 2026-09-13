@@ -158,8 +158,10 @@ impl<'a> ApprovalStore<'a> {
         else {
             return Ok(false);
         };
+        let operations = movable_record_directory(&directory)
+            .map_err(|_| anyhow::anyhow!("workspace approval storage is unavailable or unsafe"))?;
         let name = record_name(self.root);
-        let record = match directory.read(&name) {
+        let record = match operations.read(&name) {
             Ok(record) => record,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
             Err(_) => bail!("workspace approval record is unsafe and was not removed"),
@@ -167,18 +169,25 @@ impl<'a> ApprovalStore<'a> {
         let _lock = lock(&directory, &lock_name(self.root))
             .map_err(|_| anyhow::anyhow!("workspace approval storage is busy or unsafe"))?;
         directory
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("workspace approval storage changed before revocation"))?;
+        operations
             .verify(&name, &record)
             .map_err(|_| anyhow::anyhow!("workspace approval record changed before revocation"))?;
-        match directory.remove_file(&name, record) {
-            Ok(()) => Ok(true),
+        let removed = match operations.remove_file(&name, record) {
+            Ok(()) => true,
             Err(error) if error.phase == PublicationPhase::Uncertain => {
-                match directory.read(&name) {
-                    Err(missing) if missing.kind() == ErrorKind::NotFound => Ok(true),
+                match operations.read(&name) {
+                    Err(missing) if missing.kind() == ErrorKind::NotFound => true,
                     _ => bail!("workspace approval revocation could not be verified"),
                 }
             }
             Err(_) => bail!("workspace approval record could not be removed safely"),
-        }
+        };
+        directory
+            .revalidate()
+            .map_err(|_| anyhow::anyhow!("workspace approval storage changed during revocation"))?;
+        Ok(removed)
     }
 
     fn read_record(&self) -> Result<Option<ApprovalRecord>> {
@@ -271,26 +280,41 @@ fn lock(directory: &Directory, name: &OsStr) -> Result<File> {
     Ok(file)
 }
 
+/// Retain the pinned store directory as the authority anchor while using a
+/// separately checked movable handle for record replacement and removal.
+fn movable_record_directory(directory: &Directory) -> Result<Directory> {
+    directory.revalidate()?;
+    let operations = Directory::open(directory.path(), Privacy::OwnerOnly, NameRetention::Movable)?;
+    ensure!(
+        operations.identity() == directory.identity(),
+        "approval storage changed before record operation"
+    );
+    Ok(operations)
+}
+
 fn publish(directory: &Directory, destination: &OsStr, bytes: &[u8]) -> Result<()> {
+    let operations = movable_record_directory(directory)?;
     let pending = pending_name(destination);
-    remove_pending(directory, &pending)?;
-    let mut file = directory.create_new(&pending)?;
+    remove_pending(&operations, &pending)?;
+    let mut file = operations.create_new(&pending)?;
     file.write_all(bytes)?;
     seal_private(&file, false)?;
     let identity = regular_file_info(&file)?.identity;
-    match directory.publish_file(
-        directory,
+    match operations.publish_file(
+        &operations,
         &pending,
         &file,
         destination,
         Publication::ReplaceRegular,
     ) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(error) if error.phase == PublicationPhase::Uncertain => {
-            reconcile_publication(directory, destination, identity, bytes)
+            reconcile_publication(&operations, destination, identity, bytes)?;
         }
-        Err(error) => Err(error.into()),
+        Err(error) => return Err(error.into()),
     }
+    directory.revalidate()?;
+    Ok(())
 }
 
 fn reconcile_publication(

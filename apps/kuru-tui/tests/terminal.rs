@@ -142,6 +142,18 @@ fn terminal_fixture_process() -> Result<()> {
             std::io::stdout().flush()?;
             std::thread::sleep(Duration::from_secs(30));
         }
+        "dimensions" => {
+            let (cols, rows) = crossterm::terminal::size()?;
+            println!("SIZE:{cols}x{rows}");
+            std::io::stdout().flush()?;
+        }
+        "nested-dimensions" => {
+            let mut terminal = fixture_with_size("dimensions", 35, 120)?;
+            terminal.wait_text(&["SIZE:120x35"], &[])?;
+            terminal.wait_exit(EXIT_TIMEOUT)?;
+            println!("INNER_SIZE_OK");
+            std::io::stdout().flush()?;
+        }
         "fragmented-frame" => {
             crossterm::terminal::enable_raw_mode()?;
             let mut input = std::io::stdin().lock();
@@ -213,6 +225,10 @@ fn terminal_fixture_process() -> Result<()> {
 }
 
 fn fixture(mode: &str) -> Result<Terminal> {
+    fixture_with_size(mode, 35, 120)
+}
+
+fn fixture_with_size(mode: &str, rows: u16, cols: u16) -> Result<Terminal> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args([
@@ -223,7 +239,7 @@ fn fixture(mode: &str) -> Result<Terminal> {
             "--test-threads=1",
         ])
         .env("KURU_TERMINAL_FIXTURE", mode);
-    Terminal::spawn(command, 35, 120)
+    Terminal::spawn(command, rows, cols)
 }
 
 fn error_unwind_fixture(report: &std::path::Path) -> Result<Terminal> {
@@ -268,6 +284,32 @@ fn terminal_driver_drains_backpressure_and_bounds_stalled_processes() -> Result<
         "{error}"
     );
     assert!(error.to_string().contains("STALLED"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn terminal_fixture_uses_its_requested_controlling_dimensions() -> Result<()> {
+    // The outer fixture deliberately owns a terminal too small to satisfy the
+    // inner assertion. The inner spawn must establish its own controlling PTY
+    // instead of inheriting these dimensions through `/dev/tty`.
+    let mut outer = fixture_with_size("nested-dimensions", 7, 19)?;
+    outer.wait(
+        "nested terminal reports its own size",
+        READY_TIMEOUT,
+        |terminal| {
+            Ok(terminal
+                .output
+                .windows(b"INNER_SIZE_OK".len())
+                .any(|bytes| bytes == b"INNER_SIZE_OK"))
+        },
+    )?;
+    outer.wait_exit(EXIT_TIMEOUT)
+}
+
+#[test]
+fn terminal_reader_cleanup_is_bounded_while_its_source_remains_open() -> Result<()> {
+    let elapsed = terminal::bounded_reader_cleanup_probe(Duration::from_millis(100))?;
+    assert!(elapsed < Duration::from_secs(1));
     Ok(())
 }
 

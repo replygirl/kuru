@@ -165,6 +165,7 @@ fn validate_config(values: &BTreeMap<String, String>, origin: &str) -> Result<()
         let allowed = match key.as_str() {
             "core.repositoryformatversion" => value == "0",
             "core.filemode" | "core.ignorecase" | "core.precomposeunicode" => boolean(value),
+            "core.symlinks" => value == "false",
             "core.bare" => value == "false",
             "core.logallrefupdates" => value == "true",
             "remote.origin.url" => value == origin,
@@ -621,6 +622,11 @@ mod tests {
             ("remote.origin.fetch".into(), FETCH_REFSPEC.into()),
         ]);
         validate_config(&values, ORIGIN).unwrap();
+        values.insert("core.symlinks".into(), "false".into());
+        validate_config(&values, ORIGIN).unwrap();
+        values.insert("core.symlinks".into(), "true".into());
+        assert!(validate_config(&values, ORIGIN).is_err());
+        values.insert("core.symlinks".into(), "false".into());
         values.insert("core.bare".into(), "true".into());
         assert!(validate_config(&values, ORIGIN).is_err());
         values.insert("core.bare".into(), "false".into());

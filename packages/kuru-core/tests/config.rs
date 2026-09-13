@@ -18,6 +18,17 @@ fn load_text(text: &str) -> anyhow::Result<Config> {
     Config::load(None, dir.path(), None)
 }
 
+fn escaped_source(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap()
+        .as_os_str()
+        .to_string_lossy()
+        .chars()
+        .flat_map(char::escape_default)
+        .take(160)
+        .collect()
+}
+
 #[test]
 fn defaults_are_usable_and_preserve_explicit_permission_boundaries() {
     let dir = TempDir::new().unwrap();
@@ -309,12 +320,9 @@ fn external_agent_claims_follow_effective_automatic_values_and_provenance() {
     assert_eq!(claims.len(), 1, "the local review URL is explicit");
     assert!(claims[0].display().as_str().contains("retained"));
     assert_eq!(claims[0].sources().len(), 1);
-    assert!(
-        claims[0].sources()[0]
-            .as_str()
-            .contains("parent/.kuru/config.toml"),
-        "{}",
-        claims[0].sources()[0]
+    assert_eq!(
+        claims[0].sources()[0].as_str(),
+        escaped_source(&parent.join(".kuru/config.toml")),
     );
     let first_digest = first.manifest().full_digest();
 

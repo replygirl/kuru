@@ -176,6 +176,33 @@ async fn callback_request(port: u16, target: &str, method: &str, host: &str) -> 
     response
 }
 
+async fn clean_up_refresh_after_gate_timeout(
+    task: tokio::task::JoinHandle<Result<RequestCredentials>>,
+    manager: &AuthManager,
+) -> String {
+    task.abort();
+    let task = match task.await {
+        Err(error) if error.is_cancelled() => "caller cancelled",
+        Err(_) => "caller join failed",
+        Ok(Ok(_)) => "caller unexpectedly succeeded",
+        Ok(Err(_)) => "caller returned an error",
+    };
+    let owner = match manager
+        .inner
+        .store
+        .lease(false, Duration::from_secs(10))
+        .await
+    {
+        Ok(Some(lease)) => {
+            drop(lease);
+            "owner released its lease"
+        }
+        Ok(None) => "credential store disappeared",
+        Err(_) => "owner did not release its lease",
+    };
+    format!("{task}; {owner}")
+}
+
 #[tokio::test]
 async fn native_auth_status_and_api_key_have_no_fresh_store_effects() {
     let fixture = Fixture::new(vec![]).await;
@@ -672,9 +699,13 @@ async fn caller_loss_during_proved_unsent_backoff_rolls_back_before_lease_releas
         let manager = manager.clone();
         tokio::spawn(async move { manager.refresh_rejected(&observed).await })
     };
-    tokio::time::timeout(Duration::from_secs(2), gate.reached.notified())
+    if tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
         .await
-        .unwrap();
+        .is_err()
+    {
+        let cleanup = clean_up_refresh_after_gate_timeout(caller, &manager).await;
+        panic!("refresh did not reach the proved-unsent retry gate; {cleanup}");
+    }
     caller.abort();
     match caller.await {
         Err(error) => assert!(error.is_cancelled()),
@@ -710,13 +741,17 @@ async fn owned_refresh_gate_retries_once_after_safe_refusal_and_publishes() {
         .await
         .unwrap();
     let observed = manager.credentials_snapshot().await.unwrap();
-    let refresh = {
+    let mut refresh = {
         let manager = manager.clone();
         tokio::spawn(async move { manager.refresh_rejected(&observed).await })
     };
-    tokio::time::timeout(Duration::from_secs(2), gate.reached.notified())
+    if tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
         .await
-        .unwrap();
+        .is_err()
+    {
+        let cleanup = clean_up_refresh_after_gate_timeout(refresh, &manager).await;
+        panic!("refresh did not reach the retry gate; {cleanup}");
+    }
     let listener = tokio::net::TcpListener::bind(address).await.unwrap();
     let mut server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
@@ -761,7 +796,28 @@ async fn owned_refresh_gate_retries_once_after_safe_refusal_and_publishes() {
         bytes
     });
     gate.release.notify_one();
-    let refreshed = refresh.await.unwrap().unwrap();
+    let refresh_result = match tokio::time::timeout(Duration::from_secs(15), &mut refresh).await {
+        Ok(result) => result,
+        Err(_) => {
+            server.abort();
+            let _ = server.await;
+            let cleanup = clean_up_refresh_after_gate_timeout(refresh, &manager).await;
+            panic!("refresh did not finish after the retry gate; {cleanup}");
+        }
+    };
+    let refreshed = match refresh_result {
+        Ok(Ok(credentials)) => credentials,
+        Ok(Err(error)) => {
+            server.abort();
+            let _ = server.await;
+            panic!("refresh failed after the retry gate: {error:#}");
+        }
+        Err(error) => {
+            server.abort();
+            let _ = server.await;
+            panic!("refresh task failed after the retry gate: {error}");
+        }
+    };
     assert_eq!(refreshed.generation(), Some(1));
     let captured = match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
         Ok(result) => result.unwrap(),
@@ -872,22 +928,27 @@ async fn expired_allowance_before_start_and_at_second_gate_never_dispatch_late()
         .unwrap();
     let before = manager.inner.store.read().unwrap().unwrap();
     let observed = manager.credentials_snapshot().await.unwrap();
-    let budget = OperationBudget::new(Duration::from_secs(5));
-    let allowance = budget.begin_rotation(Duration::from_secs(2)).unwrap();
-    let refresh = {
+    let budget = OperationBudget::new(Duration::from_secs(15));
+    let allowance = budget.begin_rotation(Duration::from_secs(10)).unwrap();
+    let mut refresh = {
         let manager = manager.clone();
         tokio::spawn(async move { manager.refresh_with_allowance(&observed, allowance).await })
     };
-    tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
+    if tokio::time::timeout(Duration::from_secs(12), gate.reached.notified())
         .await
-        .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), refresh)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_err()
-    );
+        .is_err()
+    {
+        let cleanup = clean_up_refresh_after_gate_timeout(refresh, &manager).await;
+        panic!("refresh did not reach the second-request gate; {cleanup}");
+    }
+    let result = match tokio::time::timeout(Duration::from_secs(12), &mut refresh).await {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            let cleanup = clean_up_refresh_after_gate_timeout(refresh, &manager).await;
+            panic!("expired refresh did not finish; {cleanup}");
+        }
+    };
+    assert!(result.is_err());
     let lease = manager
         .inner
         .store

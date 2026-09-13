@@ -280,12 +280,12 @@ async fn cli_uses_owned_project_audit_configuration_despite_hostile_cargo_home()
     let environment: serde_json::Value =
         serde_json::from_slice(&fs::read(environment_marker).unwrap()).unwrap();
     assert_eq!(
-        environment["current_directory"],
+        Path::new(environment["current_directory"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .canonicalize()
-            .unwrap()
-            .display()
-            .to_string(),
+            .unwrap(),
     );
     assert_ne!(
         environment["cargo_home"],

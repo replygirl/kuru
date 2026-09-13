@@ -107,8 +107,7 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
             "shell",
             "shell",
             json!({
-                "command":format!("[Console]::Out.Write('{shell_stdout}'); [Console]::Error.Write('native stderr'); [IO.File]::WriteAllText([IO.Path]::Combine((Get-Location).Path,'shell-created.txt'),'shell bytes'); exit 7"),
-                "timeout_ms":10000
+                "command":format!("[Console]::Out.Write('{shell_stdout}'); [Console]::Error.Write('native stderr'); [IO.File]::WriteAllText([IO.Path]::Combine((Get-Location).Path,'shell-created.txt'),'shell bytes'); exit 7")
             }),
         ),
         call(
@@ -220,12 +219,14 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         receipts["read"] == literal,
         "file argument data was interpreted"
     );
-    let listed: Value = serde_json::from_str(&receipts["list"])?;
+    let listed: Value = serde_json::from_str(&receipts["list"])
+        .with_context(|| format!("file-list receipt was not JSON: {}", receipts["list"]))?;
     ensure!(
         listed[literal_path] == "file" && listed.get(".env").is_none(),
         "unexpected listing: {listed}"
     );
-    let shell: Value = serde_json::from_str(&receipts["shell"])?;
+    let shell: Value = serde_json::from_str(&receipts["shell"])
+        .with_context(|| format!("shell receipt was not JSON: {}", receipts["shell"]))?;
     ensure!(
         shell["exit_code"] == 7 && shell["success"] == false,
         "wrong native status: {shell}"

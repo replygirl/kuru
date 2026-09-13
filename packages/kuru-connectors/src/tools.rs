@@ -1525,9 +1525,13 @@ if ($checks -notcontains $false) { [Console]::Out.Write('ok') } else { throw 'sh
         let commands = root.path().join("commands");
         let home = root.path().join("home");
         let temporary = root.path().join("temporary");
+        let local = root.path().join("local");
+        let roaming = root.path().join("roaming");
         std::fs::create_dir(&commands).unwrap();
         std::fs::create_dir(&home).unwrap();
         std::fs::create_dir(&temporary).unwrap();
+        std::fs::create_dir(&local).unwrap();
+        std::fs::create_dir(&roaming).unwrap();
         std::fs::write(commands.join("probe.cmd"), "@echo cmd-ok\r\n").unwrap();
         let system = system_directory().unwrap();
         let path = std::env::join_paths([commands.as_path(), system.as_path()]).unwrap();
@@ -1544,6 +1548,8 @@ if ($checks -notcontains $false) { [Console]::Out.Write('ok') } else { throw 'sh
                 ("pAtH".into(), path.clone()),
                 ("HOME".into(), home.clone().into()),
                 ("userprofile".into(), home.clone().into()),
+                ("LOCALAPPDATA".into(), local.clone().into()),
+                ("APPDATA".into(), roaming.clone().into()),
                 ("TEMP".into(), temporary.clone().into()),
                 ("TMP".into(), temporary.clone().into()),
                 ("NO_COLOR".into(), name.into()),
@@ -1556,6 +1562,18 @@ if ($checks -notcontains $false) { [Console]::Out.Write('ok') } else { throw 'sh
                 (CHILD.into(), "1".into()),
                 (ROOT.into(), root.path().into()),
             ];
+            for key in [
+                "PROCESSOR_ARCHITECTURE",
+                "PROCESSOR_ARCHITEW6432",
+                "ProgramData",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+            ] {
+                if let Some(value) = std::env::var_os(key) {
+                    spec.environment.push((key.into(), value));
+                }
+            }
             if let Some(pathext) = pathext {
                 spec.environment.push(("pAtHeXt".into(), pathext.into()));
             }
@@ -1569,11 +1587,11 @@ if ($checks -notcontains $false) { [Console]::Out.Write('ok') } else { throw 'sh
             let mut stderr = child.take_stderr().unwrap();
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let outcome = timeout(Duration::from_secs(15), async {
+            let outcome = timeout(Duration::from_secs(45), async {
                 let (stdout_truncated, stderr_truncated, status) = tokio::join!(
                     drain_bounded(&mut stdout, &mut out),
                     drain_bounded(&mut stderr, &mut err),
-                    child.wait(Duration::from_secs(10)),
+                    child.wait(Duration::from_secs(40)),
                 );
                 let stdout_truncated = stdout_truncated?;
                 let stderr_truncated = stderr_truncated?;
