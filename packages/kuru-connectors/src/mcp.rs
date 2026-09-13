@@ -429,7 +429,9 @@ impl Sse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{HttpFixture, Reply, StdioFixture, Step, drain_bounded};
+    #[cfg(unix)]
+    use crate::test_support::drain_bounded;
+    use crate::test_support::{HttpFixture, Reply, StdioFixture, Step};
     #[cfg(unix)]
     use tokio::time::{Duration, timeout};
 

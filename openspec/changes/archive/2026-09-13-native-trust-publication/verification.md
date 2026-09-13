@@ -1,7 +1,7 @@
 ## 1. Checked approval publication and removal [critical]
 
 - [x] 1.1 @regression (agent) exercise real approval-store approve, inspect, replacement, and revoke filesystem operations while the pinned storage authority remains held -> the pre-fix Windows self-publication failure is prevented; each state transition retains the checked record identity and returns the expected approval state. Observed 2026-09-12: `mise exec -- cargo test -p kuru --test trust --all-features --locked persistent_approval_replaces_inspects_and_revokes_its_record` passed (1 test); the test performs two persistent approvals, checks exact `Status: approved` output after each, revokes, then checks exact `Status: not approved` output.
-- [ ] 1.2 @e2e (agent) run the native `kuru trust approve`, `trust status`, replacement approval, and `trust revoke` path on supported Windows -> persistent approval publishes and revokes successfully without weakening private storage or workspace identity checks. Unrun locally: supported native Windows execution requires its native CI environment.
+- [x] 1.2 @e2e (agent) run the native `kuru trust approve`, `trust status`, replacement approval, and `trust revoke` path on supported Windows -> exact-head run 34743192947 job 103686288053 passed `persistent_approval_replaces_inspects_and_revokes_its_record` plus all eight trust integration tests and four approval-store unit tests. The native flow completed two approvals, status inspection, replacement and revoke while malformed, oversized, hard-linked and unreconciled records continued to fail closed.
 
 ## 2. Preservation of native safety boundaries
 

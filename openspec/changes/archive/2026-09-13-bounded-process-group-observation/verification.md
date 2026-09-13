@@ -12,7 +12,7 @@
 ## 3. Scoped static and platform boundary
 
 - [x] 3.1 @integration (agent) `mise run //packages/kuru-delivery:lint` and `mise run //packages/kuru-delivery:typecheck` -> both exited 0 in `/private/tmp/kuru-process-group-lint-final.log` and `/private/tmp/kuru-process-group-typecheck-final.log`; format check also exited 0 in `/private/tmp/kuru-process-group-format-final.log`.
-- [ ] 3.2 @integration (agent) native Windows execution -> unrun locally: this Unix-only observer change does not alter Windows process behavior; native Windows fixture execution remains required in CI
+- [x] 3.2 @integration (agent) native Windows execution -> exact-head run 34743192947 job 103686288053 passed the complete instrumented Windows workspace suite and installation checks at 23,329/24,881 lines = 93.76%. The Unix-only process-group observer remained excluded by platform cfg; unchanged Windows shell timeout, cancellation and owned-tree cleanup tests passed, establishing the required native non-regression without claiming Windows exercised Unix `EPERM` observation.
 
 Independent checkpoint coverage also passed: `mise run coverage` in `/private/tmp/kuru-phase0-checkpoint` exited 0 (session 83966), 19,989/20,960 lines = 95.37%, `/private/tmp/kuru-phase0-checkpoint-coverage.log`.
 The unchanged silent-descendant regression and bounded-output group cases ran

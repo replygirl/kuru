@@ -7,7 +7,7 @@
 ## 2. Dream persistence and reversibility [critical]
 
 - [x] 2.1 @integration (agent) apply mixed valid and invalid `Add` proposals through the real candidate, promote it, stop and reload the store, then undo -> native macOS real-Dolt filter exited 0, 1/1 passed in `/private/tmp/kuru-dream-preamble-persistence-final.log`; accepted report retains its original repeated-prefix payload, invalid neighboring addition rejects individually, the stored new part is canonical through stopped reload and archived on undo. An existing unwrapped legacy part retains exact bytes through promotion, stopped reload and undo. Original role/rejection and later-history tests were retained and each passed 1/1 in `/private/tmp/kuru-dream-preamble-existing-rejections-final.log` and `/private/tmp/kuru-dream-preamble-existing-later-history.log`.
-- [ ] 2.2 @integration (agent) run the native Windows real-memory variant of the focused dream persistence fixture -> required before merge: local execution is unavailable; supported Windows CI must observe the same persistence and reversal contract.
+- [x] 2.2 @integration (agent) run the native Windows real-memory variant of the focused dream persistence fixture -> exact-head run 34743192947 job 103686288053 passed `dolt_tests::canonical_dream_additions_survive_promotion_stopped_reload_and_reversal` and `tests::dream_additions_persist_the_equal_peer_preamble` against the bundled real Windows Dolt engine. The same job passed installed offline runtime persistence and self-update from an empty cache.
 
 ## 3. Structural behavior, not semantic policy
 

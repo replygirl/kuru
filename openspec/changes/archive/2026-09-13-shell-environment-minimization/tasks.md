@@ -5,7 +5,7 @@
   Unix case-sensitive and Windows ordinal case-insensitive matching, canonical
   output keys, deterministic rejection of duplicate inherited compatibility
   names, ignored excluded/native-derived input duplicates and no public/config API.
-- [ ] 1.2 Add pure fake-map regressions for exact allowed/excluded values,
+- [x] 1.2 Add pure fake-map regressions for exact allowed/excluded values,
   non-Unicode values, Windows case ambiguity, native-derived system-shell paths,
   inherited `PATHEXT` and its absent-value fallback; verify the tests fail while
   the shell still copies the complete parent environment and pass after the fix.
@@ -19,7 +19,7 @@
   finite projection, retaining absolute stock PowerShell 5.1,
   `-NoProfile -NonInteractive`, native-derived `SystemRoot`/`WINDIR`/`ComSpec`,
   inherited-or-fallback `PATHEXT`, and absent `PSModulePath`.
-- [ ] 2.3 Spawn isolated child fixtures with fake parent values and exercise the
+- [x] 2.3 Spawn isolated child fixtures with fake parent values and exercise the
   real `ToolHost` shell on Unix and native Windows; verify allowed values and
   controlled bare commands work, excluded sentinels are absent, result values
   are not dumped, and the existing timeout, root-replacement and platform cleanup
@@ -38,7 +38,7 @@
 
 ## 4. Verification
 
-- [ ] 4.1 Run focused shell/projection/MCP tests through the owning connector
+- [x] 4.1 Run focused shell/projection/MCP tests through the owning connector
   mise task during implementation and run the applicable cases on native
   Windows; record exact commands, exits and fixture counts without substituting
   cross-compilation for runtime evidence.

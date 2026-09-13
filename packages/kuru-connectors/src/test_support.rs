@@ -217,6 +217,7 @@ impl StdioFixture {
             .collect()
     }
 
+    #[cfg(unix)]
     pub fn environment_observations(&self) -> Vec<String> {
         let mut paths: Vec<_> = std::fs::read_dir(self.directory.path())
             .unwrap()

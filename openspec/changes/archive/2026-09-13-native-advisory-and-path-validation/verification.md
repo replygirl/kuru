@@ -1,7 +1,7 @@
 ## 1. Fresh Git-for-Windows clone validation [critical]
 
 - [x] 1.1 @regression (agent) exercise the advisory local-config validator with `core.symlinks=false` and `core.symlinks=true` -> false was accepted and true rejected by `fresh_owned_setup_has_only_allowlisted_config_and_checked_values`; the retained unknown-key rejection and two related advisory cases also passed, 4/4 in `/private/tmp/kuru-native-advisory-delivery-unit.log`. The preceding PR13 Windows job was the before-fix failure of this validator against a stock fresh clone.
-- [~] 1.2 @integration (agent) execute the delivery advisory unit suite on native Windows -> defer: requires hosted Windows execution after this correction; the preceding PR13 Windows job supplied the before-fix rejection.
+- [x] 1.2 @integration (agent) execute the delivery advisory unit suite on native Windows -> exact-head run 34743192947 job 103686288053 passed all 34 delivery library tests, including `fresh_owned_setup_has_only_allowlisted_config_and_checked_values`, `accepts_fresh_clone_bookkeeping_and_rejects_executable_local_config`, and `refresh_accepts_stale_expected_checkout_before_fetching_a_local_test_origin`. The separate Windows platform coverage and repository RustSec jobs also passed.
 
 ## 2. Native path assertions
 

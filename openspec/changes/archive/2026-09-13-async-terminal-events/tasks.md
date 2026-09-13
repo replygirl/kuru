@@ -20,4 +20,4 @@
 ## 4. Verification
 
 - [x] 4.1 Run focused TUI formatter, lint, typecheck, scheduler and native terminal targets through their owning mise tasks, recording exact exit status and native-platform limits without substituting a generic stream fixture for actual terminal restoration.
-- [ ] 4.2 Coordinate the complete behavioral targets under the single workspace coverage task, verify at least 90 percent line coverage with the production scheduler included, and require the applicable native Windows EventStream/ConPTY job before merge.
+- [x] 4.2 Coordinate the complete behavioral targets under the single workspace coverage task, verify at least 90 percent line coverage with the production scheduler included, and require the applicable native Windows EventStream/ConPTY job before merge.
