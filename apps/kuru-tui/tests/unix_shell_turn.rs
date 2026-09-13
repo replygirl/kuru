@@ -358,6 +358,42 @@ fn expected_receipt() -> String {
     .to_string()
 }
 
+fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
+    let stderr = std::str::from_utf8(stderr).context("startup stderr is not UTF-8")?;
+    let mut lines = stderr.lines();
+    for expected in [
+        "Memory: waiting for project ownership…",
+        "Memory: waiting for verified runtime cache…",
+        "Memory: verifying cached runtime…",
+        "Memory: checking runtime version…",
+        "Memory: preparing database…",
+        "Memory: opening database…",
+        "Memory: ready.",
+    ] {
+        ensure!(
+            lines.next() == Some(expected),
+            "normal kuru run changed startup frame {expected:?}: {stderr:?}"
+        );
+    }
+    let notice = lines
+        .next()
+        .context("normal kuru run omitted first-run notice")?;
+    ensure!(
+        notice.starts_with("Memory is ready at ")
+            && notice.contains("Memory and chat do not expire automatically.")
+            && notice.contains("`kuru memory notes ID`")
+            && notice.contains("`kuru memory export --format json --output PATH`")
+            && notice.contains("`kuru memory forget ID --note SEQUENCE`")
+            && notice.contains("`kuru memory purge --help`"),
+        "normal kuru run changed first-run notice: {notice:?}"
+    );
+    ensure!(
+        lines.next().is_none(),
+        "normal kuru run emitted unexpected stderr after startup and notice: {stderr:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kuru_run_uses_the_owned_shell_and_preserves_the_responses_continuation() -> Result<()> {
     let server = Server::start().await?;
@@ -444,11 +480,12 @@ async fn kuru_run_uses_the_owned_shell_and_preserves_the_responses_continuation(
         );
         let normal = run_cli(server.url.clone(), false).await?;
         ensure!(
-            normal.output.status.success() && normal.output.stderr.is_empty(),
+            normal.output.status.success(),
             "normal kuru run changed diagnostics presentation: stdout {:?}; stderr {:?}",
             String::from_utf8_lossy(&normal.output.stdout),
             String::from_utf8_lossy(&normal.output.stderr),
         );
+        assert_expected_startup_notice(&normal.output.stderr)?;
         let mut debug_turn = turn.clone();
         let mut normal_turn: Value =
             serde_json::from_slice(&normal.output.stdout).context("parse normal kuru run JSON")?;
@@ -489,10 +526,7 @@ async fn normal_cli_trace_redacts_a_failing_owned_shell_receipt() -> Result<()> 
             String::from_utf8_lossy(&run.output.stdout),
             String::from_utf8_lossy(&run.output.stderr),
         );
-        ensure!(
-            run.output.stderr.is_empty(),
-            "normal diagnostics wrote to stderr"
-        );
+        assert_expected_startup_notice(&run.output.stderr)?;
         let turn: Value =
             serde_json::from_slice(&run.output.stdout).context("parse kuru run JSON")?;
         ensure!(
