@@ -1334,6 +1334,9 @@ async fn promotion_receipt_keeps_base_target_and_refuses_divergent_history() {
 const SCHEMA_BOUNDARY_TABLE: &str = "schema_transaction_probe";
 const SCHEMA_BOUNDARY_NAMESPACE: &str = "schema-boundary-source";
 const CANDIDATE_NAMESPACE: &str = "schema-boundary-candidate";
+const V2_RECEIPT_ID: &str = "kuru.memory.receipts.v2";
+const V2_RECEIPT_SQL: &str = "CREATE TABLE kuru_migrations (version INT PRIMARY KEY, id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, digest CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, operation CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE)";
+const V2_RECEIPT_DIGEST: &str = "12ba323bce2fca30bd5a22ff0248adbb72fefb26f5bd5f7333e186a525f2979d";
 
 /// These transaction-boundary probes must begin from the released v1 schema:
 /// updating `kuru_schema` to v2 is part of the atomic DDL receipt they observe.
@@ -1421,12 +1424,23 @@ async fn staged_schema_transaction(
     sqlx::query("CREATE TABLE schema_transaction_probe (id INT PRIMARY KEY, version INT NOT NULL)")
         .execute(&mut *connection)
         .await?;
+    // This is an immutable copy of the current v2 registry definition. The
+    // validator below fails if either the fixture or registry drifts.
+    sqlx::query(V2_RECEIPT_SQL)
+        .execute(&mut *connection)
+        .await?;
     sqlx::query("UPDATE kuru_schema SET version = 2 WHERE id = 1")
         .execute(&mut *connection)
         .await?;
     sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
         .bind(receipt)
         .bind("schema transaction receipt")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (2, ?, ?, ?)")
+        .bind(V2_RECEIPT_ID)
+        .bind(V2_RECEIPT_DIGEST)
+        .bind(receipt)
         .execute(&mut *connection)
         .await?;
     if commit {
@@ -1542,6 +1556,7 @@ async fn assert_schema_commit(
     source_history: &[Message],
     receipt: &str,
 ) {
+    migrations::validate_current(&view.pool).await.unwrap();
     let head = view.revision().await.unwrap();
     assert_ne!(head, before);
     let parent: String = sqlx::query_scalar(
@@ -1665,8 +1680,11 @@ async fn dropping_precommit_ddl_session_retains_dirty_working_ddl_outside_head()
     );
     assert_eq!(
         observation.working_status,
-        vec![(SCHEMA_BOUNDARY_TABLE.into(), 0, "new table".into())],
-        "pinned Dolt retains this uncommitted DDL row outside HEAD: {observation:?}"
+        vec![
+            ("kuru_migrations".into(), 0, "new table".into()),
+            (SCHEMA_BOUNDARY_TABLE.into(), 0, "new table".into()),
+        ],
+        "pinned Dolt retains each uncommitted migration row outside HEAD: {observation:?}"
     );
     assert_eq!(
         store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap(),
@@ -1716,6 +1734,25 @@ async fn working_status(pool: &MySqlPool) -> Vec<(String, i64, String)> {
         .unwrap()
 }
 
+async fn history_at_head(pool: &MySqlPool, namespace: &str) -> Vec<Message> {
+    sqlx::query(
+        "SELECT role, content FROM messages AS OF 'HEAD' WHERE namespace = ? ORDER BY sequence",
+    )
+    .bind(namespace.as_bytes())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        Ok(Message {
+            role: String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?,
+            content: row.try_get("content")?,
+        })
+    })
+    .collect::<Result<Vec<_>>>()
+    .unwrap()
+}
+
 async fn assert_dirty_schema_branch(
     branch: &SchemaBranch,
     receipt: &str,
@@ -1745,16 +1782,23 @@ async fn assert_dirty_schema_branch(
     );
     assert_eq!(
         working_status(branch.view.pool.as_ref()).await,
-        vec![(SCHEMA_BOUNDARY_TABLE.into(), 0, "new table".into())],
+        vec![
+            ("kuru_migrations".into(), 0, "new table".into()),
+            (SCHEMA_BOUNDARY_TABLE.into(), 0, "new table".into()),
+        ],
         "failed exact-base branch must preserve its dirty DDL"
     );
     assert_eq!(
+        history_at_head(branch.view.pool.as_ref(), SCHEMA_BOUNDARY_NAMESPACE).await,
+        source_history
+    );
+    assert!(
         branch
             .view
             .history(SCHEMA_BOUNDARY_NAMESPACE, 10)
             .await
-            .unwrap(),
-        source_history
+            .is_err(),
+        "the public historical reader must reject pending receipt authority"
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT name FROM dolt_branches WHERE name = ?")
@@ -2276,12 +2320,26 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
     assert_eq!(affected.resolve_uncertain().await.unwrap(), Some(true));
     assert!(affected.shared.uncertain.lock().unwrap().is_none());
     assert_eq!(store.revision().await.unwrap(), target);
-    assert_schema_commit(&store, &base, &source_history, &receipt).await;
     assert_eq!(affected.resolve_uncertain().await.unwrap(), None);
+
+    // The original v1 main pool remains attached to its original schema. The
+    // proxy owns another Arc to it, so stop and drop that fixture first; then
+    // release the last main view before acquiring a fresh current-schema pool.
+    let shared = store.shared.clone();
+    affected.pool.close().await;
+    proxy.close().await;
+    drop(affected);
+    drop(store);
+    let current = MemoryStore {
+        pool: shared.server.pool("main").await.unwrap(),
+        shared,
+        branch: "main".into(),
+    };
+    assert_schema_commit(&current, &base, &source_history, &receipt).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_log WHERE commit_hash = ?")
             .bind(&target)
-            .fetch_one(store.pool.as_ref())
+            .fetch_one(current.pool.as_ref())
             .await
             .unwrap(),
         1,
@@ -2290,9 +2348,7 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
     assert_dirty_schema_branch(&failed, &failed_receipt, &source_history).await;
     assert_candidate_unchanged(&candidate).await;
 
-    affected.pool.close().await;
-    proxy.close().await;
-    store.close().await.unwrap();
+    current.close().await.unwrap();
 }
 
 struct AckDropProxy {
