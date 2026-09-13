@@ -49,6 +49,8 @@ pub struct Session {
     pub mode: Mode,
     pub turns: usize,
     pub label: String,
+    #[serde(default)]
+    pub last_completed_speaker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +157,7 @@ impl Harness {
                 mode: config.mode,
                 turns: 0,
                 label: String::new(),
+                last_completed_speaker: None,
             }
         };
         let mut config = config;
@@ -745,7 +748,9 @@ impl Harness {
             !drafts.is_empty(),
             "all peers failed to produce a contribution; inspect provider/model configuration and event errors"
         );
-        let speaker = target.unwrap_or_else(|| self.select_speaker(&drafts));
+        let (speaker, selection_reason) = target
+            .map(|target| (target, "caller-target"))
+            .unwrap_or_else(|| self.select_speaker(&drafts));
         let relation = self
             .topology
             .relationships
@@ -763,6 +768,7 @@ impl Harness {
                 .map(|t| vec![json!({"sender":speaker,"text":t})])
                 .unwrap_or_default()
         };
+        self.emit("speaker-selection", &speaker, selection_reason);
         self.emit(
             "speaker",
             &speaker,
@@ -854,7 +860,7 @@ impl Harness {
         self.memory
             .append(&self.transcript_key(), "assistant", &text)
             .await?;
-        self.finish_turn(prompt).await?;
+        self.finish_turn(prompt, &speaker).await?;
         self.emit("response", &speaker, &text);
         if self.config.dream_every > 0 && self.session.turns.is_multiple_of(self.config.dream_every)
         {
@@ -875,13 +881,14 @@ impl Harness {
         })
     }
 
-    async fn finish_turn(&mut self, prompt: &str) -> Result<()> {
+    async fn finish_turn(&mut self, prompt: &str, speaker: &str) -> Result<()> {
         self.reconcile().await?;
         let mut session = self.session.clone();
         session.turns += 1;
         if session.label.is_empty() {
             session.label = prompt.chars().take(80).collect();
         }
+        session.last_completed_speaker = Some(speaker.into());
         let mut topology = self.topology.clone();
         if let Some(focus) = &mut topology.focus {
             focus.remaining = focus.remaining.saturating_sub(1);
@@ -893,26 +900,45 @@ impl Harness {
             .await
     }
 
-    fn select_speaker(&self, drafts: &BTreeMap<String, String>) -> String {
+    fn select_speaker(&self, drafts: &BTreeMap<String, String>) -> (String, &'static str) {
         if let Some(focus) = &self.topology.focus
             && focus.remaining > 0
             && self.actors.contains_key(&focus.id)
         {
-            return focus.id.clone();
+            return (focus.id.clone(), "active-focus");
         }
-        let ready = drafts.keys().collect::<Vec<_>>();
-        let offset = self.session.turns % ready.len();
-        (0..ready.len())
-            .map(|i| ready[(i + offset) % ready.len()])
-            .max_by(|a, b| {
-                self.topology
-                    .states
-                    .get(*a)
-                    .map_or(0.0, |s| s.activation)
-                    .total_cmp(&self.topology.states.get(*b).map_or(0.0, |s| s.activation))
-            })
+        let activation = |id: &str| {
+            self.topology
+                .states
+                .get(id)
+                .map_or(0.0, |state| state.activation)
+        };
+        let maximum = drafts
+            .keys()
+            .map(|id| activation(id))
+            .max_by(f64::total_cmp)
+            .expect("nonempty drafts validated");
+        let maximum_candidates = drafts
+            .keys()
+            .filter(|id| activation(id).total_cmp(&maximum).is_eq())
+            .cloned()
+            .collect::<Vec<_>>();
+        if maximum_candidates.len() > 1
+            && let Some(previous) = self.session.last_completed_speaker.as_deref()
+            && maximum_candidates.iter().any(|id| id == previous)
+        {
+            return (previous.into(), "previous-completed-speaker");
+        }
+        let speaker = maximum_candidates
+            .first()
             .expect("nonempty drafts validated")
-            .clone()
+            .clone();
+        let reason = if maximum_candidates.len() > 1 {
+            "stable-identity"
+        } else {
+            "maximum-activation"
+        };
+        (speaker, reason)
     }
 
     async fn cognitive_call(
@@ -1328,7 +1354,7 @@ mod publication_tests {
             assert!(harness.pending_publication.is_some());
             if finalize {
                 harness
-                    .finish_turn("Keep the accepted modeled state")
+                    .finish_turn("Keep the accepted modeled state", &second)
                     .await
                     .unwrap();
                 assert_eq!(harness.session.turns, 1);
