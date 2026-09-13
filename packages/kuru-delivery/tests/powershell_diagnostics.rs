@@ -48,3 +48,36 @@ fn valid_envelopes_without_errors_cannot_satisfy_a_rejection_message() {
         assert_eq!(powershell_diagnostic::message(envelope.as_bytes()), "");
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn pwsh_set_content_preserves_long_cargo_json_lines() {
+    use std::{fs, process::Command};
+
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("cargo.json");
+    let value = serde_json::json!({
+        "reason": "compiler-artifact",
+        "target": {"name": "fixture", "src_path": "x".repeat(4096)},
+        "filenames": ["y".repeat(4096)]
+    });
+    let line = serde_json::to_string(&value).unwrap().replace('\'', "''");
+    let script = format!(
+        "@('{line}') | Set-Content -LiteralPath '{}' -Encoding utf8NoBOM; if (-not $?) {{ exit 1 }}",
+        output.display()
+    );
+    let status = Command::new("pwsh")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let bytes = fs::read(output).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed, value);
+}

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use kuru_delivery::{advisory, archive, bundle, docs, published_windows, repo};
-use std::path::PathBuf;
+use kuru_delivery::{advisory, archive, bundle, coverage, docs, published_windows, repo};
+use std::{ffi::OsString, path::PathBuf};
 
 #[derive(Parser)]
 #[command(about = "Kuru installation and repository delivery checks")]
@@ -21,6 +21,11 @@ enum Command {
     Bundle {
         #[command(subcommand)]
         command: BundleCommand,
+    },
+    /// Prepare and validate fail-closed native coverage shard evidence.
+    Coverage {
+        #[command(subcommand)]
+        command: CoverageCommand,
     },
     /// Install a checksum-verified release atomically.
     Install {
@@ -114,6 +119,128 @@ enum BundleCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum CoverageCommand {
+    /// Reject a different or modified tracked source tree before compiling.
+    VerifySource {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        expected_source: String,
+        #[arg(long)]
+        llvm_cov: PathBuf,
+    },
+    /// Canonicalize the full instrumented Cargo artifact inventory.
+    Inventory {
+        #[arg(long)]
+        metadata: PathBuf,
+        #[arg(long)]
+        messages: PathBuf,
+        #[arg(long)]
+        target_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify that a package selection reuses the full artifact inventory.
+    Selection {
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long, value_delimiter = ',')]
+        packages: Vec<String>,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Write an exact Cargo native-runner configuration for one shard.
+    RunnerConfig {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        helper: PathBuf,
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long)]
+        selection: PathBuf,
+        #[arg(long)]
+        target_dir: PathBuf,
+        #[arg(long)]
+        ledger: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Dispatch one Cargo-selected test and record its exact shard action.
+    Dispatch {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long)]
+        selection: PathBuf,
+        #[arg(long)]
+        target_dir: PathBuf,
+        #[arg(long)]
+        ledger: PathBuf,
+        executable: PathBuf,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    /// Require Cargo to have invoked every full-inventory test exactly once.
+    ValidateRun {
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long)]
+        selection: PathBuf,
+        #[arg(long)]
+        ledger: PathBuf,
+    },
+    /// Remove only compile-phase profiles before accepting uploaded test profiles.
+    DiscardCompileProfiles {
+        #[arg(long)]
+        profiles: PathBuf,
+    },
+    /// Bind successful raw profiles to their exact source and artifact inventory.
+    Receipt {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long)]
+        selection: PathBuf,
+        #[arg(long)]
+        ledger: PathBuf,
+        #[arg(long)]
+        profiles: PathBuf,
+        #[arg(long)]
+        shard: String,
+        #[arg(long)]
+        run_attempt: String,
+        #[arg(long)]
+        expected_source: String,
+        #[arg(long)]
+        llvm_cov: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify every shard receipt and copy only accepted profiles for reporting.
+    Collect {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long)]
+        inputs: PathBuf,
+        #[arg(long)]
+        target_dir: PathBuf,
+        #[arg(long)]
+        expected_source: String,
+        #[arg(long)]
+        run_attempt: String,
+        #[arg(long)]
+        llvm_cov: PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
@@ -151,6 +278,156 @@ async fn main() -> Result<()> {
             })
             .await?;
             println!("{}", prepared.display());
+        }
+        Command::Coverage {
+            command:
+                CoverageCommand::VerifySource {
+                    root,
+                    expected_source,
+                    llvm_cov,
+                },
+        } => {
+            coverage::verify_source(&root, &expected_source, &llvm_cov).await?;
+        }
+        Command::Coverage {
+            command:
+                CoverageCommand::Inventory {
+                    metadata,
+                    messages,
+                    target_dir,
+                    output,
+                },
+        } => {
+            coverage::write_inventory(&metadata, &messages, &target_dir, &output)?;
+        }
+        Command::Coverage {
+            command:
+                CoverageCommand::Selection {
+                    inventory,
+                    packages,
+                    output,
+                },
+        } => {
+            coverage::write_selection(&inventory, &packages, &output)?;
+        }
+        Command::Coverage {
+            command:
+                CoverageCommand::RunnerConfig {
+                    root,
+                    host,
+                    helper,
+                    inventory,
+                    selection,
+                    target_dir,
+                    ledger,
+                    output,
+                },
+        } => {
+            coverage::write_runner_config(&coverage::RunnerConfigOptions {
+                root: &root,
+                host: &host,
+                helper: &helper,
+                inventory: &inventory,
+                selection: &selection,
+                target_dir: &target_dir,
+                ledger: &ledger,
+                output: &output,
+            })?;
+        }
+        Command::Coverage {
+            command:
+                CoverageCommand::Dispatch {
+                    root,
+                    inventory,
+                    selection,
+                    target_dir,
+                    ledger,
+                    executable,
+                    args,
+                },
+        } => {
+            let status = coverage::dispatch_test(
+                &root,
+                &inventory,
+                &selection,
+                &target_dir,
+                &ledger,
+                &executable,
+                &args,
+            )
+            .await?;
+            if let Some(status) = status
+                && !status.success()
+            {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+        Command::Coverage {
+            command:
+                CoverageCommand::ValidateRun {
+                    inventory,
+                    selection,
+                    ledger,
+                },
+        } => {
+            coverage::validate_run_ledger(&inventory, &selection, &ledger)?;
+        }
+        Command::Coverage {
+            command: CoverageCommand::DiscardCompileProfiles { profiles },
+        } => {
+            println!("{}", coverage::discard_compile_profiles(&profiles)?);
+        }
+        Command::Coverage {
+            command:
+                CoverageCommand::Receipt {
+                    root,
+                    inventory,
+                    selection,
+                    ledger,
+                    profiles,
+                    shard,
+                    run_attempt,
+                    expected_source,
+                    llvm_cov,
+                    output,
+                },
+        } => {
+            coverage::write_receipt(&coverage::ReceiptOptions {
+                root: &root,
+                inventory: &inventory,
+                selection: &selection,
+                ledger: &ledger,
+                profiles: &profiles,
+                shard: &shard,
+                run_attempt: &run_attempt,
+                expected_source: &expected_source,
+                llvm_cov: &llvm_cov,
+                output: &output,
+            })
+            .await?;
+        }
+        Command::Coverage {
+            command:
+                CoverageCommand::Collect {
+                    root,
+                    inventory,
+                    inputs,
+                    target_dir,
+                    expected_source,
+                    run_attempt,
+                    llvm_cov,
+                },
+        } => {
+            coverage::collect_profiles(
+                &root,
+                &inventory,
+                &inputs,
+                &target_dir,
+                &expected_source,
+                &run_attempt,
+                &llvm_cov,
+            )
+            .await?;
         }
         Command::Install {
             version,

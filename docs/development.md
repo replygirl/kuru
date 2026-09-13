@@ -45,8 +45,14 @@ require Communiqué or maintainer setup.
 
 CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
 managed-file checks and documentation as separate Ubuntu jobs. Native coverage
-runs on Linux x86_64, macOS arm64 and Windows x86_64, followed by source
-installation and actual installed offline runtime tests. Linux Clippy does not
+runs as one workspace suite on Linux x86_64 and macOS arm64. Windows x86_64
+runs four package shards in parallel, validates their exact source, toolchain,
+artifact inventory, Cargo-native runner ledger and raw-profile receipts, and
+then enforces one 90% workspace report. Each shard compiles the same full
+workspace/all-target/all-feature graph; its task-private runner executes only
+the assigned standard test targets while Cargo retains package cwd and runtime
+environment. Its source installation and installed offline-runtime checks run beside
+the coverage shards after independently preparing their locked inputs. Linux Clippy does not
 analyze platform-specific conditional code; the native suites compile and test
 those branches. Intel macOS and Linux arm64 additionally build and package the
 native executable, exercise real memory and verify the packaged offline runtime.

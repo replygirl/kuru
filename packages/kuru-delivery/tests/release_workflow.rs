@@ -7,13 +7,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use kuru_delivery::archive::digest;
 use kuru_delivery::release::{self, GitHub, Version};
+use kuru_delivery::{archive::digest, command};
 use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tempfile::TempDir;
 
@@ -75,6 +76,174 @@ fn published_windows_verifier_is_post_publish_exact_sha_and_gates_docs() {
     );
     assert!(!task.contains("kuru-memory"));
     assert!(!task.contains("kuru-tui"));
+}
+
+#[test]
+fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow = fs::read_to_string(root.join(".github/workflows/native-tests.yml")).unwrap();
+    for required in [
+        "if: inputs.os != 'windows-2025'",
+        "windows-coverage:",
+        "windows-coverage-report:",
+        "windows-install:",
+        "native-gate:",
+        "needs: windows-coverage",
+        "needs: [coverage, windows-coverage, windows-coverage-report, windows-install]",
+        "test \"$KURU_NATIVE_WINDOWS_SHARDS\" = success",
+        "test \"$KURU_NATIVE_WINDOWS_REPORT\" = success",
+        "test \"$KURU_NATIVE_WINDOWS_INSTALL\" = success",
+        "test \"$KURU_NATIVE_WINDOWS_INSTALL\" = skipped",
+        "test \"$KURU_NATIVE_COVERAGE\" = skipped",
+        "test \"$KURU_NATIVE_COVERAGE\" = success",
+        "test \"$KURU_NATIVE_WINDOWS_SHARDS\" = skipped",
+        "test \"$KURU_NATIVE_WINDOWS_REPORT\" = skipped",
+        "delivery-archive",
+        "kuru-delivery,kuru-archive",
+        "application",
+        "packages: kuru",
+        "memory-runtime",
+        "kuru-memory,kuru-runtime",
+        "connectors-core-platform",
+        "kuru-connectors,kuru-core,kuru-platform",
+        "KURU_COVERAGE_TARGET",
+        "KURU_COVERAGE_SOURCE",
+        "KURU_COVERAGE_ATTEMPT",
+        "KURU_COVERAGE_SHARD",
+        "KURU_COVERAGE_PACKAGES",
+        "KURU_COVERAGE_OUTPUT",
+        "KURU_COVERAGE_INPUTS",
+        "KURU_COVERAGE_REPORT",
+        "coverage:windows:shard",
+        "coverage:windows:collect",
+        "cargo fetch --locked",
+        "KURU_DOLT_BUNDLE_OFFLINE: \"true\"",
+        "if-no-files-found: error",
+    ] {
+        assert!(workflow.contains(required), "missing {required}");
+    }
+    assert_eq!(
+        workflow
+            .matches("shared-key: native-coverage-windows-")
+            .count(),
+        1
+    );
+    assert_eq!(workflow.matches("actions/download-artifact@").count(), 4);
+    assert_eq!(
+        workflow
+            .matches("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
+            .count(),
+        4
+    );
+    assert_eq!(workflow.matches("if: ${{ !cancelled() }}").count(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_workflow_gate_rejects_incomplete_windows_results() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow = fs::read_to_string(root.join(".github/workflows/native-tests.yml")).unwrap();
+    let gate = workflow
+        .split("\n  native-gate:\n")
+        .nth(1)
+        .unwrap()
+        .split("        run: |\n")
+        .nth(1)
+        .unwrap();
+    async fn run(
+        root: &Path,
+        gate: &str,
+        (os, install, coverage, shards, report, windows_install): (
+            &str,
+            &str,
+            &str,
+            &str,
+            &str,
+            &str,
+        ),
+    ) -> bool {
+        let mut command = command::rooted(root, "bash");
+        command
+            .args(["-c", gate])
+            .env("KURU_NATIVE_OS", os)
+            .env("KURU_NATIVE_INSTALL", install)
+            .env("KURU_NATIVE_COVERAGE", coverage)
+            .env("KURU_NATIVE_WINDOWS_SHARDS", shards)
+            .env("KURU_NATIVE_WINDOWS_REPORT", report)
+            .env("KURU_NATIVE_WINDOWS_INSTALL", windows_install);
+        command::bounded_output(&mut command, Duration::from_secs(5), 4096)
+            .await
+            .unwrap()
+            .status
+            .success()
+    }
+
+    assert!(
+        run(
+            &root,
+            gate,
+            (
+                "windows-2025",
+                "true",
+                "skipped",
+                "success",
+                "success",
+                "success"
+            )
+        )
+        .await
+    );
+    assert!(
+        run(
+            &root,
+            gate,
+            (
+                "windows-2025",
+                "false",
+                "skipped",
+                "success",
+                "success",
+                "skipped"
+            )
+        )
+        .await
+    );
+    assert!(
+        run(
+            &root,
+            gate,
+            (
+                "ubuntu-24.04",
+                "true",
+                "success",
+                "skipped",
+                "skipped",
+                "skipped"
+            )
+        )
+        .await
+    );
+    for (label, shards, report, install) in [
+        ("missing shard", "skipped", "success", "success"),
+        ("failed shard", "failure", "success", "success"),
+        ("cancelled shard", "cancelled", "success", "success"),
+        ("missing report", "success", "skipped", "success"),
+        ("failed report", "success", "failure", "success"),
+        ("cancelled report", "success", "cancelled", "success"),
+        ("missing install", "success", "success", "skipped"),
+        ("failed install", "success", "success", "failure"),
+        ("cancelled install", "success", "success", "cancelled"),
+    ] {
+        assert!(
+            !run(
+                &root,
+                gate,
+                ("windows-2025", "true", "skipped", shards, report, install),
+            )
+            .await,
+            "native gate accepted {label}"
+        );
+    }
 }
 struct Repo {
     temp: TempDir,

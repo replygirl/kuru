@@ -7,6 +7,8 @@ pub mod archive;
 pub mod bundle;
 pub mod command;
 #[cfg(feature = "tooling")]
+pub mod coverage;
+#[cfg(feature = "tooling")]
 pub mod docs;
 #[cfg(feature = "tooling")]
 pub mod mise_isolation;

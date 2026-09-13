@@ -32,12 +32,47 @@ run_windows = "cargo run -p kuru-delivery --features tooling --locked --bin kuru
 depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]
 description = "Combine all package coverage with the delivery fixture toolchain"
 dir = "{{config_root}}/../.."
+tools."cargo:cargo-llvm-cov" = "0.9.1"
 tools."aqua:cocogitto/cocogitto" = "{{vars.kuru_cocogitto_version}}"
 tools."github:jdx/communique" = "{{vars.kuru_communique_version}}"
-run = "cargo llvm-cov --workspace --all-targets --all-features --locked --no-fail-fast --fail-under-lines 90 --lcov --output-path target/coverage.lcov"
+run = '''
+llvm_cov="$(mise bin-paths cargo:cargo-llvm-cov@0.9.1)/cargo-llvm-cov"
+test "$("$llvm_cov" llvm-cov --version)" = "cargo-llvm-cov 0.9.1"
+"$llvm_cov" llvm-cov --workspace --all-targets --all-features --locked --no-fail-fast --fail-under-lines 90 --lcov --output-path target/coverage.lcov
+'''
+run_windows = '''
+$llvmCov = Join-Path ((mise bin-paths 'cargo:cargo-llvm-cov@0.9.1').Trim()) 'cargo-llvm-cov.exe'
+if ((& $llvmCov llvm-cov --version).Trim() -ne 'cargo-llvm-cov 0.9.1') { throw 'Wrong cargo-llvm-cov version' }
+& $llvmCov llvm-cov --workspace --all-targets --all-features --locked --no-fail-fast --fail-under-lines 90 --lcov --output-path target/coverage.lcov
+'''
 
 [tasks."coverage:workspace".env]
 RUST_TEST_THREADS = "2"
+KURU_TEST_SUPERVISOR_PREPARED = false
+
+[tasks."coverage:windows:shard"]
+depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]
+description = "Run one fail-closed Windows workspace coverage package shard"
+dir = "{{config_root}}/../.."
+tools."cargo:cargo-llvm-cov" = "0.9.1"
+tools."aqua:cocogitto/cocogitto" = "{{vars.kuru_cocogitto_version}}"
+tools."github:jdx/communique" = "{{vars.kuru_communique_version}}"
+run = "echo 'coverage:windows:shard requires native Windows' >&2; exit 1"
+run_windows = "& packages/kuru-delivery/support/windows-coverage.ps1 -Mode Shard -TargetDir $env:KURU_COVERAGE_TARGET -ExpectedSource $env:KURU_COVERAGE_SOURCE -RunAttempt $env:KURU_COVERAGE_ATTEMPT -Shard $env:KURU_COVERAGE_SHARD -Packages $env:KURU_COVERAGE_PACKAGES -OutputDir $env:KURU_COVERAGE_OUTPUT"
+
+[tasks."coverage:windows:shard".env]
+RUST_TEST_THREADS = "2"
+KURU_TEST_SUPERVISOR_PREPARED = false
+
+[tasks."coverage:windows:collect"]
+depends = ["//packages/kuru-memory:bundle:prepare", "//packages/kuru-memory:bundle:test-fixtures"]
+description = "Validate Windows coverage shard receipts and enforce one workspace report"
+dir = "{{config_root}}/../.."
+tools."cargo:cargo-llvm-cov" = "0.9.1"
+run = "echo 'coverage:windows:collect requires native Windows' >&2; exit 1"
+run_windows = "& packages/kuru-delivery/support/windows-coverage.ps1 -Mode Collect -TargetDir $env:KURU_COVERAGE_TARGET -ExpectedSource $env:KURU_COVERAGE_SOURCE -RunAttempt $env:KURU_COVERAGE_ATTEMPT -Inputs $env:KURU_COVERAGE_INPUTS -OutputPath $env:KURU_COVERAGE_REPORT"
+
+[tasks."coverage:windows:collect".env]
 KURU_TEST_SUPERVISOR_PREPARED = false
 
 [tasks."build"]
