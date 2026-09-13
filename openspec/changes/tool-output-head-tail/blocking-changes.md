@@ -6,12 +6,11 @@ None.
 
 ## Soft-blocked by
 
-- [ ] `tool-result-redaction` — provides the reviewed scanner and the existing
-  marker-safe runtime truncation helper; its source is present at
-  `packages/kuru-connectors/src/redaction.rs`, but its record remains active.
-- [ ] `owned-unix-shell-lifecycle` — provides the retained Unix shell capture
-  path at `packages/kuru-connectors/src/unix_shell.rs`; its source is present,
-  but its record remains active.
+- [x] `tool-result-redaction` — provides the reviewed scanner and existing
+  marker-safe runtime truncation helper at
+  `packages/kuru-connectors/src/redaction.rs`. *(archived 2026-09-13)*
+- [x] `owned-unix-shell-lifecycle` — provides the retained Unix shell capture
+  path at `packages/kuru-connectors/src/unix_shell.rs`. *(archived 2026-09-13)*
 
 ## Siblings
 

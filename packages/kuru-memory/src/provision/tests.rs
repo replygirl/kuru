@@ -553,6 +553,43 @@ async fn observed_provision_reports_actual_cold_warm_and_failure_stages() {
         ]
     );
 
+    let corrupt_cached_entry = root.path().join("corrupt-cached-entry");
+    let binary = provision_managed(
+        &config,
+        &corrupt_cached_entry,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+    )
+    .await
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut corrupted = SCRIPT.to_vec();
+    corrupted[0] = b'!';
+    executable(&binary, &corrupted);
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let corrupt = provision_managed_observed(
+        &config,
+        &corrupt_cached_entry,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+        &mut reporter,
+    )
+    .await;
+    drop(reporter);
+    assert!(
+        corrupt
+            .unwrap_err()
+            .to_string()
+            .contains("cache is invalid")
+    );
+    assert_eq!(
+        observed_stages(&mut progress).await,
+        [
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::VerifyingRuntimeCache,
+        ]
+    );
+
     let corrupt_cache = root.path().join("corrupt");
     let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
     let corrupt = provision_managed_observed(
