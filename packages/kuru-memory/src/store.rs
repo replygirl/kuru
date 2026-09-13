@@ -18,8 +18,9 @@ use uuid::Uuid;
 use {std::sync::OnceLock, tokio::sync::Semaphore};
 
 use crate::{
-    files,
+    MemoryOpenProgress, MemoryOpenStage, files,
     migration::{self, LegacyImport, MigrationReceipt},
+    progress::ProgressReporter,
     provision,
     server::{LifecycleLease, Server, ServerOptions},
 };
@@ -217,7 +218,26 @@ impl MemoryStore {
     }
 
     pub async fn open(options: OpenOptions) -> Result<Self> {
-        Self::open_inner(options, None, None, None).await
+        let mut progress = ProgressReporter::silent();
+        Self::open_inner(options, None, None, None, &mut progress).await
+    }
+
+    /// Open memory and return bounded, optional observations of startup work.
+    ///
+    /// The returned future owns the ordinary open operation. Dropping the
+    /// progress receiver changes only whether observations are delivered.
+    pub fn open_observed(
+        options: OpenOptions,
+    ) -> (
+        MemoryOpenProgress,
+        impl std::future::Future<Output = Result<Self>> + Send + 'static,
+    ) {
+        let (progress, reporter) = ProgressReporter::observed();
+        let opening = async move {
+            let mut reporter = reporter;
+            Self::open_inner(options, None, None, None, &mut reporter).await
+        };
+        (progress, opening)
     }
 
     async fn open_inner(
@@ -225,10 +245,12 @@ impl MemoryStore {
         temporary: Option<Arc<tempfile::TempDir>>,
         permit: Option<OwnedSemaphorePermit>,
         mut marker_pause: Option<marker_fixture::ReadyMarkerPause>,
+        progress: &mut ProgressReporter,
     ) -> Result<Self> {
         options.config.validate()?;
         let directory = project_directory(&options.data_dir, &options.project_scope)?;
-        private_dir(&options.data_dir)?;
+        private_dir(&options.data_dir)
+            .map_err(|error| migration::legacy_data_directory_error(&options.data_dir, error))?;
         let parent = directory.parent().context("project store has no parent")?;
         private_dir(parent)?;
         let locks = parent.join("locks");
@@ -236,6 +258,7 @@ impl MemoryStore {
         let lock_directory = Directory::open(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
         let name = directory.file_name().context("project store has no name")?;
         let lock = lock_directory.lock_file(name)?;
+        progress.report(MemoryOpenStage::WaitingForProjectOwnership);
         let mut lock = Some(
             acquire_lock(
                 lock,
@@ -244,8 +267,12 @@ impl MemoryStore {
             .await?,
         );
         lock_directory.verify(name, lock.as_ref().expect("startup lock"))?;
-        let binary =
-            provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?;
+        let binary = provision::provision_observed(
+            &options.config,
+            &options.data_dir.join("tools/dolt"),
+            progress,
+        )
+        .await?;
         let supervisor = options
             .supervisor
             .clone()
@@ -265,6 +292,7 @@ impl MemoryStore {
             retained: temporary.clone(),
             lifecycle_root: lifecycle_root.clone(),
         };
+        progress.report(MemoryOpenStage::PreparingDatabase);
         if !Self::exists(&options.data_dir, &options.project_scope)? {
             ensure!(
                 !options.read_only,
@@ -280,6 +308,7 @@ impl MemoryStore {
                 legacy.as_ref(),
                 &make_options,
                 &mut lock,
+                progress,
             )
             .await?;
             let mut staging = if let Some(staging) = recovered {
@@ -291,6 +320,7 @@ impl MemoryStore {
                     Uuid::new_v4()
                 ));
                 private_dir(&staging)?;
+                progress.report(MemoryOpenStage::OpeningDatabase);
                 let server = Server::open_with_guard(
                     make_options(staging.clone(), false),
                     lock.take().expect("startup lock"),
@@ -336,6 +366,7 @@ impl MemoryStore {
                 // Migration itself is an accepted worker just as it is for an
                 // existing project.  A cancelled stage opener cannot abandon
                 // DDL or release its writer lock before the supervisor reaps.
+                progress.report(MemoryOpenStage::OpeningDatabase);
                 let server = Server::open_with_guard(
                     make_options(staging.clone(), false),
                     lock.take().expect("startup lock"),
@@ -361,6 +392,7 @@ impl MemoryStore {
                     return Err(error);
                 }
 
+                progress.report(MemoryOpenStage::OpeningDatabase);
                 let server = Server::open_with_guard(
                     make_options(staging.clone(), false),
                     lock.take().expect("startup lock"),
@@ -437,6 +469,7 @@ impl MemoryStore {
             drop(staging);
         }
         read_activation(&directory, &options.project_scope)?;
+        progress.report(MemoryOpenStage::OpeningDatabase);
         let server = Server::open_with_guard(
             make_options(directory.clone(), options.read_only),
             lock.take().expect("startup lock"),
@@ -465,6 +498,7 @@ impl MemoryStore {
             #[cfg(not(test))]
             let (lock, migrated) = run_migration_worker(server, pool).await?;
             migrated?;
+            progress.report(MemoryOpenStage::OpeningDatabase);
             let server = Server::open_with_guard(make_options(directory.clone(), false), lock)
                 .await
                 .context("reopen migrated memory server")?;
@@ -492,11 +526,13 @@ impl MemoryStore {
             uncertain: StdMutex::new(None),
             _permit: permit,
         });
-        Ok(Self {
+        let store = Self {
             shared,
             pool,
             branch: "main".into(),
-        })
+        };
+        progress.report(MemoryOpenStage::Ready);
+        Ok(store)
     }
 
     /// Real isolated Dolt fixture. Missing runtime/helper is an error, never a skip.
@@ -514,7 +550,15 @@ impl MemoryStore {
         options.config.cache_dir = Some(test_cache());
         options.config.offline = true;
         options.supervisor = Some(test_supervisor()?);
-        Self::open_inner(options, Some(Arc::new(directory)), Some(permit), None).await
+        let mut progress = ProgressReporter::silent();
+        Self::open_inner(
+            options,
+            Some(Arc::new(directory)),
+            Some(permit),
+            None,
+            &mut progress,
+        )
+        .await
     }
 
     fn readable(&self) -> Result<()> {
@@ -1129,6 +1173,7 @@ async fn recover_staging(
     legacy: Option<&LegacyImport>,
     options: &impl Fn(PathBuf, bool) -> ServerOptions,
     startup_lock: &mut Option<File>,
+    progress: &mut ProgressReporter,
 ) -> Result<Option<StoppedStage>> {
     let parent = directory.parent().context("project store has no parent")?;
     let prefix = format!(
@@ -1173,6 +1218,7 @@ async fn recover_staging(
             // an incomplete bootstrap always owns one. In either case this
             // opener retains the startup lock before its first await.
             let inspection = activation.is_some();
+            progress.report(MemoryOpenStage::OpeningDatabase);
             let server = Server::open_with_guard(
                 options(stage.clone(), inspection),
                 startup_lock.take().expect("startup lock"),
@@ -1389,6 +1435,72 @@ pub(crate) fn test_supervisor() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn observed_open_reports_ready_only_after_a_usable_store() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", "d".repeat(64)),
+        )?;
+        let (mut progress, opening) = MemoryStore::open_observed(options);
+        let store = opening.await?;
+        assert!(!store.revision().await?.is_empty());
+        store.close().await?;
+
+        let mut stages = Vec::new();
+        while let Some(stage) = progress.recv().await {
+            stages.push(stage);
+        }
+        assert_eq!(
+            stages.first(),
+            Some(&MemoryOpenStage::WaitingForProjectOwnership)
+        );
+        assert!(stages.contains(&MemoryOpenStage::PreparingDatabase));
+        assert!(stages.contains(&MemoryOpenStage::OpeningDatabase));
+        assert_eq!(stages.last(), Some(&MemoryOpenStage::Ready));
+        assert_eq!(
+            stages
+                .iter()
+                .filter(|stage| **stage == MemoryOpenStage::Ready)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_open_observer_does_not_cancel_the_store() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", "e".repeat(64)),
+        )?;
+        let (progress, opening) = MemoryStore::open_observed(options);
+        drop(progress);
+        let store = opening.await?;
+        assert!(!store.revision().await?.is_empty());
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_observed_open_never_reports_ready() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let mut options = OpenOptions::new(
+            root.path().to_owned(),
+            format!("project/{}", "f".repeat(64)),
+        );
+        options.config.startup_timeout_secs = 0;
+        let (mut progress, opening) = MemoryStore::open_observed(options);
+        assert!(opening.await.is_err());
+        let mut stages = Vec::new();
+        while let Some(stage) = progress.recv().await {
+            stages.push(stage);
+        }
+        assert!(!stages.contains(&MemoryOpenStage::Ready));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn explicit_close_rejects_reads_and_writes_through_retained_clone() -> Result<()> {

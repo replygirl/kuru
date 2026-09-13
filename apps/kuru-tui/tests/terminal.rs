@@ -447,6 +447,29 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {
     }
     let mut terminal = Terminal::spawn(command, 35, 120)?;
     terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.wait_composer_frame(&["KURU", "enter send"], READY_TIMEOUT)?;
+    let alternate = terminal
+        .output
+        .windows(b"\x1b[?1049h".len())
+        .position(|bytes| bytes == b"\x1b[?1049h")
+        .context("terminal did not enter its alternate screen")?;
+    let startup = &terminal.output[..alternate];
+    let mut previous = 0;
+    for stage in [
+        b"Memory: waiting for project ownership".as_slice(),
+        b"Memory: waiting for verified runtime cache",
+        b"Memory: verifying cached runtime",
+        b"Memory: checking runtime version",
+        b"Memory: preparing database",
+        b"Memory: opening database",
+        b"Memory: ready.",
+    ] {
+        let offset = startup[previous..]
+            .windows(stage.len())
+            .position(|bytes| bytes == stage)
+            .context("memory startup progress did not precede the first completed TUI frame")?;
+        previous += offset + stage.len();
+    }
     assert!(
         terminal
             .output

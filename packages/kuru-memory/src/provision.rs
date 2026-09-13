@@ -1,8 +1,10 @@
 //! Bounded, private installation of the exact supported full-Dolt engine.
 
+use crate::MemoryOpenStage;
 pub use crate::catalog::DOLT_VERSION;
 use crate::catalog::{Asset, BUNDLED_ASSET, EMBEDDED_ARCHIVE, MAX_COMPRESSED, MAX_EXPANDED};
 use crate::files::{self, PrivateTemp};
+use crate::progress::ProgressReporter;
 use anyhow::{Context, Result, bail, ensure};
 use flate2::bufread::GzDecoder;
 use kuru_core::MemoryConfig;
@@ -30,33 +32,58 @@ const OUTPUT_LIMIT: u64 = 4096;
 /// first use. An explicit development binary still passes the exact version
 /// guard; managed entries also pass their immutable payload checksums.
 pub async fn provision(config: &MemoryConfig, default_cache: &Path) -> Result<PathBuf> {
+    let mut progress = ProgressReporter::silent();
+    provision_observed(config, default_cache, &mut progress).await
+}
+
+pub(crate) async fn provision_observed(
+    config: &MemoryConfig,
+    default_cache: &Path,
+    progress: &mut ProgressReporter,
+) -> Result<PathBuf> {
     config.validate()?;
     if let Some(binary) = &config.dolt_binary {
         checked_regular(binary, true)?;
         let binary = binary
             .canonicalize()
             .context("resolve configured Dolt executable")?;
+        progress.report(MemoryOpenStage::CheckingRuntimeVersion);
         private_probe(binary.clone()).await?;
         return Ok(binary);
     }
-    provision_managed(
+    provision_managed_observed(
         config,
         default_cache,
         BUNDLED_ASSET,
         Cow::Borrowed(EMBEDDED_ARCHIVE),
+        progress,
     )
     .await
 }
 
+#[cfg(test)]
 async fn provision_managed(
     config: &MemoryConfig,
     default_cache: &Path,
     asset: Asset<'static>,
     archive: Cow<'static, [u8]>,
 ) -> Result<PathBuf> {
-    provision_with_extractor(config, default_cache, asset, archive, extract).await
+    let mut progress = ProgressReporter::silent();
+    provision_managed_observed(config, default_cache, asset, archive, &mut progress).await
 }
 
+async fn provision_managed_observed(
+    config: &MemoryConfig,
+    default_cache: &Path,
+    asset: Asset<'static>,
+    archive: Cow<'static, [u8]>,
+    progress: &mut ProgressReporter,
+) -> Result<PathBuf> {
+    provision_with_extractor_observed(config, default_cache, asset, archive, extract, progress)
+        .await
+}
+
+#[cfg(test)]
 async fn provision_with_extractor(
     config: &MemoryConfig,
     default_cache: &Path,
@@ -64,15 +91,37 @@ async fn provision_with_extractor(
     archive: Cow<'static, [u8]>,
     extractor: impl FnOnce(&[u8], &Path, Asset<'static>) -> Result<()> + Send + 'static,
 ) -> Result<PathBuf> {
+    let mut progress = ProgressReporter::silent();
+    provision_with_extractor_observed(
+        config,
+        default_cache,
+        asset,
+        archive,
+        extractor,
+        &mut progress,
+    )
+    .await
+}
+
+async fn provision_with_extractor_observed(
+    config: &MemoryConfig,
+    default_cache: &Path,
+    asset: Asset<'static>,
+    archive: Cow<'static, [u8]>,
+    extractor: impl FnOnce(&[u8], &Path, Asset<'static>) -> Result<()> + Send + 'static,
+    progress: &mut ProgressReporter,
+) -> Result<PathBuf> {
     let cache = config.cache_dir.as_deref().unwrap_or(default_cache);
     private_directory(cache)?;
     let cache = cache.canonicalize()?;
+    progress.report(MemoryOpenStage::WaitingForRuntimeCache);
     let _lock = cache_lock(&cache, LOCK_TIMEOUT).await?;
     let versions = cache.join(DOLT_VERSION);
     private_directory(&versions)?;
     let destination = versions.join(asset.target);
     if destination.try_exists()? {
-        return verified_cache(&destination, asset).await.with_context(|| {
+        progress.report(MemoryOpenStage::VerifyingRuntimeCache);
+        return verified_cache_observed(&destination, asset, progress).await.with_context(|| {
             format!(
                 "Dolt cache is invalid at {}; preserve or remove that version directory and retry",
                 destination.display()
@@ -85,6 +134,7 @@ async fn provision_with_extractor(
         "Dolt cache destination is not a new directory"
     );
     let staging = PrivateTemp::new(".install-", Some(&versions))?;
+    progress.report(MemoryOpenStage::ExtractingEmbeddedRuntime);
     let candidate = staging.path().join("runtime");
     let candidate_path = candidate.clone();
     let (staging, _lock, extraction) = tokio::task::spawn_blocking(move || {
@@ -95,6 +145,7 @@ async fn provision_with_extractor(
     })
     .await?;
     extraction?;
+    progress.report(MemoryOpenStage::CheckingRuntimeVersion);
     let (staging, _lock) = owned_probe(
         candidate.join(asset.executable_name),
         staging.path().join("probe"),
@@ -105,7 +156,17 @@ async fn provision_with_extractor(
     Ok(destination.join(asset.executable_name))
 }
 
+#[cfg(test)]
 async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
+    let mut progress = ProgressReporter::silent();
+    verified_cache_observed(directory, asset, &mut progress).await
+}
+
+async fn verified_cache_observed(
+    directory: &Path,
+    asset: Asset<'_>,
+    progress: &mut ProgressReporter,
+) -> Result<PathBuf> {
     check_directory(directory)?;
     let binary = directory.join(asset.executable_name);
     let executable = binary.clone();
@@ -119,6 +180,7 @@ async fn verified_cache(directory: &Path, asset: Asset<'_>) -> Result<PathBuf> {
         verify_payload(&licenses, license_bytes, &license_sha256, false)
     })
     .await??;
+    progress.report(MemoryOpenStage::CheckingRuntimeVersion);
     private_probe(binary.clone()).await?;
     Ok(binary)
 }

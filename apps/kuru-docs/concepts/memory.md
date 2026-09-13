@@ -52,6 +52,11 @@ If `XDG_DATA_HOME` is unset, the data directory is `~/.local/share/kuru` on macO
 
 Kuru includes its verified native Dolt engine and license notices in the executable. First memory use extracts them locally, including when offline; later runs verify and reuse the cache at `tools/dolt` inside the data directory. No separate engine installation or runtime download is needed. `memory.cache_dir` selects another extraction directory. Corrupt existing caches fail explicitly and remain preserved.
 
+Before memory opens, Kuru shows a small fixed progress sequence on standard
+error for current local work such as acquiring ownership, checking or extracting
+the runtime, and opening the database. It is not a timer or proof that a stage
+succeeded. Command output, including JSON, remains on standard output.
+
 The authenticated SQL sidecar runs only while its owning Kuru process needs it. Existing SQLite data is imported from a consistent snapshot; the original and snapshot remain preserved.
 
 Use `kuru memory status` to inspect the store and current revision, `kuru memory
@@ -86,6 +91,12 @@ An operating-system writer lock prevents two Kuru processes from overwriting the
 ## Migration and backups
 
 Close older Kuru sessions before the first launch with Dolt. Kuru imports the current project's rows from `memory.sqlite3`, verifies them, and preserves the original plus a complete snapshot under `memory/legacy/`. Other projects are imported when opened. After migration, older Kuru versions write only to the old SQLite store, so avoid using them with the same data directory.
+
+The legacy data directory must be private. On macOS and Linux, Kuru names an
+unsafe directory and asks you to run `chmod 700` on it; it never changes access
+modes automatically. On Windows, correct the directory's owner-only access in
+native file security settings before retrying. Kuru refuses before import, so
+the original SQLite files remain untouched.
 
 An interrupted import can resume after validation. Partial imports are stopped and preserved under `memory/interrupted/`; a failed import never becomes the active store. Keep the original and snapshots until you have checked every project you want to retain.
 

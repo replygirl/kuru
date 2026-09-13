@@ -12,7 +12,7 @@ use kuru_core::{
     AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
     ProjectPreferences, SafeManifest,
 };
-use kuru_memory::{MemoryStore, OpenOptions as MemoryOptions};
+use kuru_memory::{MemoryOpenStage, MemoryStore, OpenOptions as MemoryOptions};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_runtime::{Harness, forget_note, read_notes};
 use sha2::{Digest, Sha256};
@@ -274,6 +274,152 @@ pub fn validate_effort(models: &[ModelInfo], model: &str, effort: Option<&str>) 
     Ok(())
 }
 
+struct MemoryProgressOutput {
+    terminal: bool,
+    enabled: bool,
+    width: usize,
+}
+
+impl MemoryProgressOutput {
+    fn new() -> Self {
+        Self {
+            terminal: io::stderr().is_terminal(),
+            enabled: true,
+            width: 0,
+        }
+    }
+
+    fn stage(&mut self, stage: MemoryOpenStage) {
+        if !self.enabled || stage == MemoryOpenStage::Ready {
+            return;
+        }
+        let text = memory_open_label(stage);
+        let mut stderr = io::stderr().lock();
+        let result = if self.terminal {
+            let padding = " ".repeat(self.width.saturating_sub(text.len()));
+            write!(stderr, "\r{text}{padding}").and_then(|()| stderr.flush())
+        } else {
+            writeln!(stderr, "{text}").and_then(|()| stderr.flush())
+        };
+        if result.is_err() {
+            self.enabled = false;
+        } else {
+            self.width = self.width.max(text.len());
+        }
+    }
+
+    fn complete(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let text = memory_open_label(MemoryOpenStage::Ready);
+        let mut stderr = io::stderr().lock();
+        let result = if self.terminal {
+            let padding = " ".repeat(self.width.saturating_sub(text.len()));
+            writeln!(stderr, "\r{text}{padding}")
+        } else {
+            writeln!(stderr, "{text}")
+        }
+        .and_then(|()| stderr.flush());
+        if result.is_err() {
+            self.enabled = false;
+        }
+    }
+
+    fn abandon(&mut self) {
+        if !self.enabled || !self.terminal || self.width == 0 {
+            return;
+        }
+        let mut stderr = io::stderr().lock();
+        if write!(stderr, "\r{}\r", " ".repeat(self.width))
+            .and_then(|()| stderr.flush())
+            .is_err()
+        {
+            self.enabled = false;
+        }
+    }
+}
+
+fn memory_open_label(stage: MemoryOpenStage) -> &'static str {
+    match stage {
+        MemoryOpenStage::WaitingForProjectOwnership => "Memory: waiting for project ownership…",
+        MemoryOpenStage::WaitingForRuntimeCache => "Memory: waiting for verified runtime cache…",
+        MemoryOpenStage::VerifyingRuntimeCache => "Memory: verifying cached runtime…",
+        MemoryOpenStage::ExtractingEmbeddedRuntime => "Memory: extracting embedded runtime…",
+        MemoryOpenStage::CheckingRuntimeVersion => "Memory: checking runtime version…",
+        MemoryOpenStage::PreparingDatabase => "Memory: preparing database…",
+        MemoryOpenStage::OpeningDatabase => "Memory: opening database…",
+        MemoryOpenStage::Ready => "Memory: ready.",
+        _ => "Memory: preparing database…",
+    }
+}
+
+async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
+    let (mut progress, opening) = MemoryStore::open_observed(options);
+    let mut opening = Box::pin(opening);
+    let mut output = MemoryProgressOutput::new();
+    let mut observed_ready = false;
+    let mut progress_open = true;
+    let result = loop {
+        tokio::select! {
+            result = &mut opening => break result,
+            stage = progress.recv(), if progress_open => match stage {
+                Some(MemoryOpenStage::Ready) => observed_ready = true,
+                Some(stage) => output.stage(stage),
+                None => progress_open = false,
+            },
+        }
+    };
+    drop(opening);
+    while let Some(stage) = progress.recv().await {
+        if stage == MemoryOpenStage::Ready {
+            observed_ready = true;
+        } else {
+            output.stage(stage);
+        }
+    }
+    match result {
+        Ok(store) => {
+            // Ready is emitted only with a completed usable store. Keeping this
+            // check makes a future memory stage addition unable to create a
+            // synthetic success line by itself.
+            debug_assert!(observed_ready, "successful observed open must report ready");
+            output.complete();
+            Ok(store)
+        }
+        Err(error) => {
+            output.abandon();
+            Err(error)
+        }
+    }
+}
+
+fn legacy_data_directory_error(data: &Path, error: std::io::Error) -> anyhow::Error {
+    #[cfg(unix)]
+    if error.kind() == io::ErrorKind::PermissionDenied
+        && let (Ok(directory), Ok(source)) = (
+            std::fs::symlink_metadata(data),
+            std::fs::symlink_metadata(data.join("memory.sqlite3")),
+        )
+        && directory.is_dir()
+        && source.is_file()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if directory.permissions().mode() & 0o077 != 0 {
+            return anyhow::Error::from(error).context(format!(
+                "legacy memory directory {data:?} is not owner-private; restrict this exact directory to mode 0700 (for example with chmod, using shell quoting) and retry"
+            ));
+        }
+    }
+    #[cfg(windows)]
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        return anyhow::Error::from(error).context(format!(
+            "legacy memory directory {data:?} is not owner-private; correct this directory's owner-only access with Windows file security settings and retry"
+        ));
+    }
+    error.into()
+}
+
 pub async fn run() -> Result<()> {
     execute(Cli::parse()).await
 }
@@ -439,7 +585,12 @@ pub async fn execute(cli: Cli) -> Result<()> {
     };
     let migrate = legacy && !exists;
     let _lease = if writer || migrate {
-        Directory::ensure_private(&data)?;
+        if let Err(error) = Directory::ensure_private(&data) {
+            if migrate {
+                return Err(legacy_data_directory_error(&data, error));
+            }
+            return Err(error.into());
+        }
         ensure_outside_workspace(&data, &cwd)?;
         Some(project_lease(&data, &cwd)?)
     } else {
@@ -453,7 +604,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config.clone();
         options.read_only = !writer && !migrate;
-        Some(MemoryStore::open(options).await?)
+        Some(open_memory(options).await?)
     } else {
         None
     };
@@ -571,7 +722,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             None => {
                 let mut options = MemoryOptions::new(data, scope);
                 options.config = memory_config;
-                MemoryStore::open(options).await?
+                open_memory(options).await?
             }
         };
         memory_to_close = Some(memory.clone());

@@ -197,3 +197,9 @@ startup_timeout_secs = 30
 Kuru includes its pinned full-Dolt engine and licenses. First memory use extracts them locally into `tools/dolt` inside the data directory, or the configured `cache_dir`; an empty cache works offline. Existing caches are verified, and corrupt entries fail without automatic repair.
 
 `offline` remains accepted for compatibility; bundled engine provisioning never uses HTTP. `cache_dir` and `dolt_binary` must be absolute native paths and are not resolved relative to a configuration file. `dolt_binary` is an optional development override and must report the supported exact version. The startup timeout is 1–300 seconds. Provider network access is independent of these memory settings.
+
+Commands that open memory print at most one fixed standard-error line for each
+actual startup stage: private ownership, runtime cache work, runtime checking,
+database preparation, database opening, and ready. These lines do not estimate
+duration or establish success; the final command result does. They never alter
+standard output, including JSON.

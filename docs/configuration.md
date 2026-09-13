@@ -17,6 +17,11 @@ memory. It prints an omission notice on stderr. User defaults are read from
 `$env:APPDATA\kuru\config.toml` on Windows. Windows also falls back to
 `$env:USERPROFILE\AppData\Roaming` when `APPDATA` is unset. `--config` selects the
 final local layer. CLI flags take precedence over file values.
+
+When a command opens memory, fixed progress messages appear on standard error
+while Kuru acquires private ownership, verifies or extracts the bundled runtime,
+and opens the database. They describe work in progress, not an estimate or a
+successful open; JSON and other command results remain on standard output.
 Ancestor `AGENTS.md` files provide project instructions, ordered so local
 instructions have precedence. Kuru does not automatically follow arbitrary
 links in instruction files; repositories can put their applicable instructions

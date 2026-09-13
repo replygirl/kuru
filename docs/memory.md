@@ -52,6 +52,13 @@ inside the Kuru data directory; `memory.cache_dir` selects another location.
 Subsequent runs verify and reuse the extracted engine. Corrupt existing caches
 fail explicitly and remain preserved for inspection.
 
+Before an application command opens memory, Kuru may print bounded progress on
+standard error for the current work: waiting for private ownership, checking or
+extracting the verified runtime, preparing and opening the database, then ready.
+These messages do not estimate time or prove a stage succeeded; the command's
+ordinary result remains authoritative. JSON and other command output stay on
+standard output, and library callers do not receive progress messages.
+
 `memory.offline` remains accepted for configuration compatibility; bundled engine
 provisioning always works offline. An explicit `memory.dolt_binary` is an optional
 development override and must report the supported exact version. The authoritative
@@ -82,6 +89,13 @@ treated as the active store. A completed import can be resumed after validation;
 partial or superseded imports are stopped and preserved under `memory/interrupted`
 before retry. Unknown data fails explicitly. Correct the reported error and retry;
 do not delete the source or bypass identity checks to force an import.
+
+The legacy data directory must remain private. On macOS and Linux, if Kuru finds
+group or other access, it names that directory and asks you to run `chmod 700`
+on it before retrying; Kuru never changes the mode automatically. On Windows,
+correct the data directory's owner-only access using native file security
+settings and retry. These checks occur before Kuru imports or modifies legacy
+data.
 
 ## Schema upgrades
 

@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Error, Result, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy, Publication};
 use rusqlite::{
     Connection, OpenFlags,
@@ -13,6 +13,8 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::files;
 use crate::store::{identifier, private_dir, private_file};
@@ -195,7 +197,7 @@ struct SourcePins {
 }
 impl SourcePins {
     fn new(path: &Path) -> Result<Self> {
-        files::directory(path)?;
+        files::directory(path).map_err(|error| legacy_data_directory_error(path, error))?;
         let parent = Directory::open(path, Privacy::Inherited, NameRetention::Pinned)?;
         let mut pins = Self {
             parent,
@@ -249,6 +251,34 @@ impl SourcePins {
     }
 }
 
+pub(crate) fn legacy_data_directory_error(path: &Path, error: Error) -> Error {
+    #[cfg(unix)]
+    if let (Ok(directory), Ok(source)) = (
+        fs::symlink_metadata(path),
+        fs::symlink_metadata(path.join("memory.sqlite3")),
+    ) && error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        && directory.is_dir()
+        && source.is_file()
+        && directory.permissions().mode() & 0o077 != 0
+    {
+        return error.context(format!(
+            "legacy memory directory {path:?} is not owner-private; restrict this exact directory to mode 0700 (for example with chmod, using shell quoting) and retry"
+        ));
+    }
+    #[cfg(windows)]
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        return error.context(format!(
+            "legacy memory directory {path:?} is not owner-private; correct this directory's owner-only access with Windows file security settings and retry"
+        ));
+    }
+    error
+}
+
 fn validate(connection: &Connection) -> Result<()> {
     let identity: i64 = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -287,6 +317,27 @@ mod tests {
             .pragma_update(None, "application_id", 0x4b55_5255_i64)
             .unwrap();
         database
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_legacy_directory_refuses_with_a_safe_local_remedy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = fixture();
+        files::write(&root.path().join("memory.sqlite3"), b"legacy source").unwrap();
+        let mode = fs::metadata(root.path()).unwrap().permissions().mode();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let result = SourcePins::new(root.path());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(mode)).unwrap();
+        let error = match result {
+            Ok(_) => panic!("public legacy data directory must be rejected"),
+            Err(error) => error,
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains("is not owner-private"), "{text}");
+        assert!(text.contains("mode 0700"), "{text}");
+        assert!(text.contains(&format!("{:?}", root.path())), "{text}");
     }
 
     #[test]

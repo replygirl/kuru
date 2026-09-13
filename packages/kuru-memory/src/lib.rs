@@ -3,10 +3,12 @@ mod catalog;
 mod engine;
 mod files;
 mod migration;
+mod progress;
 pub mod provision;
 pub mod server;
 mod store;
 
+pub use progress::{MemoryOpenProgress, MemoryOpenStage};
 pub use store::{
     ActiveExportSnapshot, Candidate, ExportCursor, ExportPage, ExportProvenance, MemoryStatus,
     MemoryStore, MemoryView, OpenOptions, Revision, StorageRecord, StoredNote,
