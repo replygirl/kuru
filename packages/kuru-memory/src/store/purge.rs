@@ -663,11 +663,11 @@ mod tests {
         let root = crate::test_support::tempdir()?;
         let scope = format!("project/{}", "f".repeat(64));
         let mut options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
-        options.config.startup_timeout_secs = 1;
         let store = MemoryStore::open(options.clone()).await?;
         let project = project_directory(root.path(), &scope)?;
         let revision = store.revision().await?;
 
+        options.config.startup_timeout_secs = 1;
         let error = MemoryStore::purge(options).await.unwrap_err();
         assert!(format!("{error:#}").contains("memory lifecycle remains active"));
         assert_eq!(store.revision().await?, revision);
