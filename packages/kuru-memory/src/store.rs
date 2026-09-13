@@ -196,8 +196,10 @@ struct StoppedStage {
     _lease: LifecycleLease,
 }
 
+mod export;
 pub(crate) mod marker_fixture;
 mod migrations;
+pub use export::{ActiveExportSnapshot, ExportCursor, ExportPage, ExportProvenance, StorageRecord};
 
 impl MemoryStore {
     pub fn exists(data_dir: &Path, project_scope: &str) -> Result<bool> {
@@ -565,6 +567,7 @@ impl MemoryStore {
     /// Read durable rows with their stable sequence for a caller that already
     /// owns namespace selection. This deliberately preserves every stored role.
     pub async fn notes(&self, namespace: &str, limit: usize) -> Result<Vec<StoredNote>> {
+        self.readable()?;
         identifier("namespace", namespace, 1024)?;
         let limit = i64::try_from(limit).context("notes limit exceeds integer range")?;
         let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
@@ -774,6 +777,21 @@ impl MemoryStore {
     pub async fn close(self) -> Result<()> {
         let _guard = self.shared.write.lock().await;
         self.shared.server.close().await
+    }
+
+    pub(crate) async fn fixture_commit_malformed_state(&self, key: &str) -> Result<()> {
+        self.writable()?;
+        identifier("state key", key, 1024)?;
+        sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+            .bind(key.as_bytes())
+            .bind("{malformed")
+            .execute(self.pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'malformed fixture state', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(self.pool.as_ref())
+            .await?;
+        Ok(())
     }
 }
 

@@ -68,6 +68,13 @@ notes row and commits that change as a new revision. It does not alter a
 conversation, other notes, or earlier revisions. This is active-memory control,
 not secure erasure, and Kuru does not expose a history-recovery command.
 
+`kuru memory export` reads every application message and state row from one
+captured committed `main` revision. The JSON default and Markdown option preserve
+the same rows and a manifest with revision, schema and row counts. Previous
+revisions, candidate branches, uncommitted rows, operations and schema tables are excluded. Export is
+provider-free and refuses fresh stores, legacy import, and overwriting an output
+path; it is not a history-rewrite, purge, or secure-erasure operation.
+
 History follows the Dolt commit graph from the current revision toward older
 ancestors, with a stable hash tie-break rather than wall-clock ordering. Kuru
 reconciles an interrupted write against its durable receipt before it continues,

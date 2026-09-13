@@ -349,6 +349,13 @@ fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
         !env.data.exists(),
         "fresh selected-note deletion created memory state"
     );
+    let output = env.run(&["memory", "export"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+    assert!(
+        !env.data.exists(),
+        "fresh memory export created memory state"
+    );
     std::fs::write(&config_path, config).unwrap();
     env.success(&["run", "Make a durable revision"]);
     let sessions = env.success(&["sessions"]);
@@ -371,6 +378,148 @@ fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"));
     }
+}
+
+#[tokio::test]
+async fn memory_export_is_provider_free_and_publishes_one_committed_snapshot() {
+    use kuru_memory::MemoryStore;
+    use kuru_runtime::project_scope;
+
+    let env = Sandbox::new();
+    let scope = project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope).unwrap();
+    let memory = MemoryStore::open(options).await.unwrap();
+    memory
+        .append(
+            "export/notes",
+            "dream",
+            "literal fence ```\nremains content",
+        )
+        .await
+        .unwrap();
+    memory
+        .put("export/unknown", &serde_json::json!({"future":[true, 7]}))
+        .await
+        .unwrap();
+    let revision = memory.revision().await.unwrap();
+    memory.close().await.unwrap();
+
+    let mut json_command = env.command_for("responses");
+    json_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "export"]);
+    let output = json_command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["manifest"]["snapshot"], "committed active main");
+    assert_eq!(json["manifest"]["provenance"]["revision"], revision);
+    assert_eq!(
+        json["manifest"]["excludes"],
+        serde_json::json!([
+            "previous revisions",
+            "candidate branches",
+            "uncommitted working rows",
+            "operations and schema tables"
+        ])
+    );
+    let records = json["records"].as_array().unwrap();
+    assert!(records.iter().any(|record| {
+        record["kind"] == "message"
+            && record["role"] == "dream"
+            && record["content"] == "literal fence ```\nremains content"
+    }));
+    assert!(
+        records
+            .iter()
+            .any(|record| { record["kind"] == "state" && record["key"] == "export/unknown" })
+    );
+
+    let output_path = env.root.path().join("committed-memory.md");
+    let mut markdown_command = env.command_for("responses");
+    markdown_command.env_remove("OPENAI_API_KEY").args([
+        "memory",
+        "export",
+        "--format",
+        "markdown",
+        "--output",
+        "../committed-memory.md",
+    ]);
+    let output = markdown_command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    let markdown = std::fs::read_to_string(&output_path).unwrap();
+    assert!(markdown.contains("# Kuru committed memory export"));
+    assert!(markdown.contains("committed active main"));
+    let markdown_values: Vec<Value> = markdown
+        .split("```json\n")
+        .skip(1)
+        .map(|block| serde_json::from_str(block.split("\n```").next().unwrap()).unwrap())
+        .collect();
+    assert_eq!(markdown_values[0], json["manifest"]);
+    assert_eq!(&markdown_values[1..], records.as_slice());
+    let original = std::fs::read(&output_path).unwrap();
+    let output = env.run(&[
+        "memory",
+        "export",
+        "--format",
+        "markdown",
+        "--output",
+        "../committed-memory.md",
+    ]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Rejected publication"));
+    assert_eq!(std::fs::read(&output_path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn malformed_export_fails_after_private_staging_without_publishing_a_partial_file() {
+    use kuru_memory::MemoryStore;
+    use kuru_runtime::project_scope;
+
+    let env = Sandbox::new();
+    let scope = project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope).unwrap();
+    let memory = MemoryStore::open(options).await.unwrap();
+    kuru_memory::test_support::commit_malformed_state(&memory, "export/malformed")
+        .await
+        .unwrap();
+    memory.close().await.unwrap();
+
+    let mut before: Vec<_> = std::fs::read_dir(env.root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    before.sort();
+    let output_path = env.root.path().join("failed-memory.json");
+    let mut command = env.command_for("responses");
+    command.env_remove("OPENAI_API_KEY").args([
+        "memory",
+        "export",
+        "--output",
+        "../failed-memory.json",
+    ]);
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid JSON"));
+    assert!(!output_path.exists());
+    let mut after: Vec<_> = std::fs::read_dir(env.root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    after.sort();
+    assert_eq!(after, before, "failed export retained a staging directory");
 }
 
 #[tokio::test]
@@ -548,6 +697,10 @@ async fn notes_cli_reads_existing_modes_without_provider_or_legacy_import() {
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert!(!legacy.data.join("memory").exists());
     let output = legacy.run(&["memory", "forget", "missing", "--note", "1"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let output = legacy.run(&["memory", "export"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
     assert_eq!(std::fs::read(&path).unwrap(), original);

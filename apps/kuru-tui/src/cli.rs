@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use kuru_connectors::{Provider, ToolHost, provider};
 use kuru_core::{
     AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
@@ -18,7 +18,10 @@ use kuru_runtime::{Harness, forget_note, read_notes};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use crate::trust::{ApprovalState, ApprovalStore};
+use crate::{
+    memory_export,
+    trust::{ApprovalState, ApprovalStore},
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -140,6 +143,12 @@ pub enum TrustCommand {
     Revoke,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ExportFormat {
+    Json,
+    Markdown,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum MemoryCommand {
     /// Show the active project, engine version and revision.
@@ -148,6 +157,13 @@ pub enum MemoryCommand {
     History {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Export every application record from one committed active-memory snapshot.
+    Export {
+        #[arg(long, value_enum, default_value_t = ExportFormat::Json)]
+        format: ExportFormat,
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Read one peer or relationship's durable notes without starting a conversation.
     Notes {
@@ -404,13 +420,15 @@ pub async fn execute(cli: Cli) -> Result<()> {
         )
     );
     let exists = MemoryStore::exists(&data, &scope)?;
-    let notes_control = matches!(
+    let memory_control = matches!(
         cli.command,
         Some(Command::Memory {
-            command: MemoryCommand::Notes { .. } | MemoryCommand::Forget { .. }
+            command: MemoryCommand::Notes { .. }
+                | MemoryCommand::Forget { .. }
+                | MemoryCommand::Export { .. }
         })
     );
-    if notes_control && !exists {
+    if memory_control && !exists {
         bail!("this project has no memory yet; start a conversation first");
     }
     let legacy_path = data.join("memory.sqlite3");
@@ -476,6 +494,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
                             "{}",
                             serde_json::to_string_pretty(&memory.revisions(*limit).await?)?
                         );
+                    }
+                    MemoryCommand::Export { format, output } => {
+                        memory_export::export(memory, *format, output.as_deref(), &cwd).await?;
                     }
                     MemoryCommand::Notes { identity, limit } => {
                         println!(

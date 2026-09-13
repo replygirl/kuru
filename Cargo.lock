@@ -1483,6 +1483,7 @@ dependencies = [
  "tokio",
  "toml",
  "unicode-width",
+ "uuid",
  "vt100",
 ]
 

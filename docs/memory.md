@@ -10,6 +10,7 @@ kuru memory status
 kuru memory history
 kuru memory notes ID --limit 100
 kuru memory forget ID --note SEQUENCE
+kuru memory export --format json --output committed-memory.json
 ```
 
 Status identifies the current project store, branch and revision. History lists
@@ -30,6 +31,17 @@ notes written by dreaming. `kuru memory forget ID --note SEQUENCE` removes that
 one row from the selected identity's active notes namespace and records a new
 Dolt revision. It does not remove conversations, other notes, or older revisions;
 it is not secure erasure and does not provide a history-recovery command.
+
+`kuru memory export` writes every application message and state record from one
+captured, committed `main` revision. It uses JSON by default; `--format markdown`
+renders the same records as JSON fenced blocks. Without `--output PATH`, JSON is
+written to standard output. With `--output PATH`, Kuru completes a private staged
+file before publishing a new destination and refuses to overwrite an existing
+file. The manifest records the project scope, revision, schema version, counts,
+and explicit exclusions for previous revisions, candidate branches, uncommitted
+rows, operations, and schema tables. Export never starts a provider, imports legacy SQLite data,
+or creates a fresh memory store. It is a current committed snapshot, not a
+historical-revision browser or a secure-erasure/archive facility.
 
 ## Runtime and offline use
 
