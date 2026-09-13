@@ -37,6 +37,15 @@ outer runner terminal.
   overrides remain hostile so projection is still proved.
 - CLI shell evidence uses literal, test-controlled values encoded into the
   PowerShell source. Custom `KURU_*` inheritance would contradict the policy.
+- The ToolHost shell fixture also encodes the lexical `PATH`, `HOME`, `TEMP` and
+  native system values supplied by its isolated parent. It does not reconstruct
+  expected paths from PowerShell's working-directory spelling. Failed checks are
+  labeled inside the already bounded shell receipt without dumping the process
+  environment.
+- Trust corruption fixtures retain the pinned approval-store directory while
+  reopening the identity-matched record directory through the production movable
+  operation boundary. This lets the fixture replace and remove its own synthetic
+  records on Windows without weakening the store anchor.
 - Picker persistence is observed through reopening the memory-backed TUI; the
   `config` command remains a non-creating snapshot operation.
 - Unix terminal fixtures use the already pinned `portable-pty` spawn boundary,

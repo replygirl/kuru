@@ -16,6 +16,12 @@ budget or observation failure. Correcting only these tests preserves the shipped
 deadlines, reduced shell authority, real loopback refusal, native process cleanup,
 and observable preference persistence.
 
+A subsequent native run reached the real shell but compared lexically preserved
+`PATH`, `HOME` and `TEMP` values with paths reconstructed from PowerShell's
+canonicalized working directory. Windows can spell the same directory with a
+short or long component, so that observation can reject the required lexical
+preservation without identifying which condition failed.
+
 ## What Changes
 
 - Give real stock PowerShell and refused-connect fixtures bounded observation
@@ -24,6 +30,10 @@ and observable preference persistence.
   Windows compatibility variables needed by the outer native shell fixture.
 - Embed controlled fixture paths and values directly in authorized PowerShell
   source instead of relying on custom environment variables that Kuru must drop.
+- Compare projected Windows shell values with the exact controlled values supplied
+  by the fixture, and name failed conditions in the bounded tool receipt.
+- Use the checked movable approval-record operation boundary when the trust
+  corruption fixture replaces synthetic records under a retained pinned store.
 - Make native replay failures name the raw failed receipt and verify saved picker
   choices through the memory-backed behavior that owns them.
 - Launch Unix terminal fixtures through the existing safe portable PTY boundary

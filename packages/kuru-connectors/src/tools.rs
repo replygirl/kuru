@@ -1461,6 +1461,18 @@ mod tests {
             let root = PathBuf::from(std::env::var_os(ROOT).expect("missing test root"));
             let home = root.join("home");
             let temporary = root.join("temporary");
+            let commands = root.join("commands");
+            let system = system_directory().unwrap();
+            let windows = system.parent().unwrap();
+            let expected_path = std::env::join_paths([commands.as_path(), system.as_path()])
+                .expect("fixture paths must form a Windows PATH");
+            let powershell_literal =
+                |value: &OsStr| format!("'{}'", value.to_string_lossy().replace('\'', "''"));
+            let expected_path = powershell_literal(&expected_path);
+            let expected_home = powershell_literal(home.as_os_str());
+            let expected_temporary = powershell_literal(temporary.as_os_str());
+            let expected_windows = powershell_literal(windows.as_os_str());
+            let expected_comspec = powershell_literal(system.join("cmd.exe").as_os_str());
             let host = ToolHost::new(
                 &root,
                 &Config {
@@ -1469,47 +1481,60 @@ mod tests {
                 },
             )
             .unwrap();
-            let output: Value = serde_json::from_str(
-                &host
-                    .execute(
-                        "shell",
-                        json!({"command":r#"
-$nativeSystem = [Environment]::SystemDirectory
-$nativeWindows = Split-Path -Parent $nativeSystem
-$expectedPath = (Join-Path $PWD.Path 'commands') + ';' + $nativeSystem
-$expectedPathext = if ($env:NO_COLOR -eq 'inherited') { '.EXE;.CMD' } else { '.COM;.EXE;.BAT;.CMD' }
+            let shell = format!(
+                r#"
+$expectedPath = {expected_path}
+$expectedHome = {expected_home}
+$expectedTemporary = {expected_temporary}
+$expectedWindows = {expected_windows}
+$expectedComSpec = {expected_comspec}
+$expectedPathext = if ($env:NO_COLOR -eq 'inherited') {{ '.EXE;.CMD' }} else {{ '.COM;.EXE;.BAT;.CMD' }}
 [IO.File]::WriteAllText((Join-Path $env:USERPROFILE 'shell-home.txt'), 'home')
 [IO.File]::WriteAllText((Join-Path $env:TEMP 'shell-temp.txt'), 'temp')
 $where = & where.exe cmd.exe
 $whereOk = $LASTEXITCODE -eq 0
 $probe = & probe
-$checks = @(
-    ($env:PATH -eq $expectedPath)
-    ($env:HOME -eq (Join-Path $PWD.Path 'home'))
-    ($env:USERPROFILE -eq (Join-Path $PWD.Path 'home'))
-    ($env:TEMP -eq (Join-Path $PWD.Path 'temporary'))
-    ($env:PATHEXT -eq $expectedPathext)
-    ($env:SystemRoot -eq $nativeWindows)
-    ($env:WINDIR -eq $nativeWindows)
-    ($env:ComSpec -eq (Join-Path $nativeSystem 'cmd.exe'))
-    (-not (Test-Path Env:OPENAI_API_KEY))
-    (-not (Test-Path Env:HTTP_PROXY))
-    (-not [string]::IsNullOrEmpty($env:PSModulePath))
-    ($env:PSModulePath -notlike '*fake-modules*')
-    (-not (Test-Path Env:KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_CHILD))
-    (-not (Test-Path Env:LLVM_PROFILE_FILE))
-    ((Get-Command Get-ChildItem -ErrorAction Stop).CommandType -eq 'Cmdlet')
-    ($whereOk)
-    ($probe -contains 'cmd-ok')
-)
-if ($checks -notcontains $false) { [Console]::Out.Write('ok') } else { throw 'shell compatibility fixture condition failed' }
-"#}),
-                    )
+$checks = [ordered]@{{
+    PATH = [string]::Equals($env:PATH, $expectedPath, [System.StringComparison]::Ordinal)
+    HOME = [string]::Equals($env:HOME, $expectedHome, [System.StringComparison]::Ordinal)
+    USERPROFILE = [string]::Equals($env:USERPROFILE, $expectedHome, [System.StringComparison]::Ordinal)
+    TEMP = [string]::Equals($env:TEMP, $expectedTemporary, [System.StringComparison]::Ordinal)
+    PATHEXT = [string]::Equals($env:PATHEXT, $expectedPathext, [System.StringComparison]::Ordinal)
+    SystemRoot = [string]::Equals($env:SystemRoot, $expectedWindows, [System.StringComparison]::Ordinal)
+    WINDIR = [string]::Equals($env:WINDIR, $expectedWindows, [System.StringComparison]::Ordinal)
+    ComSpec = [string]::Equals($env:ComSpec, $expectedComSpec, [System.StringComparison]::Ordinal)
+    OPENAI_API_KEY_absent = -not (Test-Path Env:OPENAI_API_KEY)
+    HTTP_PROXY_absent = -not (Test-Path Env:HTTP_PROXY)
+    PSModulePath_reconstructed = -not [string]::IsNullOrEmpty($env:PSModulePath)
+    PSModulePath_hostile_absent = $env:PSModulePath -notlike '*fake-modules*'
+    fixture_child_absent = -not (Test-Path Env:KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_CHILD)
+    LLVM_PROFILE_FILE_absent = -not (Test-Path Env:LLVM_PROFILE_FILE)
+    stock_cmdlet = (Get-Command Get-ChildItem -ErrorAction Stop).CommandType -eq 'Cmdlet'
+    where_cmd = $whereOk
+    probe_cmd = $probe -contains 'cmd-ok'
+}}
+$failed = @()
+foreach ($check in $checks.GetEnumerator()) {{
+    if (-not $check.Value) {{ $failed += [string]$check.Key }}
+}}
+if ($failed.Count -eq 0) {{
+    [Console]::Out.Write('ok')
+}} else {{
+    throw ('shell compatibility fixture conditions failed: ' + [string]::Join(',', $failed))
+}}
+"#
+            );
+            let output: Value = serde_json::from_str(
+                &host
+                    .execute("shell", json!({"command":shell}))
                     .await
                     .unwrap(),
             )
             .unwrap();
-            assert!(output["success"] == true && output["stdout"] == "ok");
+            assert!(
+                output["success"] == true && output["stdout"] == "ok",
+                "Windows shell projection fixture failed: receipt={output}"
+            );
             assert_eq!(
                 std::fs::read_to_string(home.join("shell-home.txt")).unwrap(),
                 "home"

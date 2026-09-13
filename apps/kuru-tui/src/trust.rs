@@ -459,9 +459,10 @@ mod tests {
     }
 
     fn replace_record(directory: &Directory, name: &OsStr, bytes: &[u8]) {
-        let current = directory.read(name).unwrap();
-        directory.remove_file(name, current).unwrap();
-        let mut replacement = directory.create_new(name).unwrap();
+        let operations = movable_record_directory(directory).unwrap();
+        let current = operations.read(name).unwrap();
+        operations.remove_file(name, current).unwrap();
+        let mut replacement = operations.create_new(name).unwrap();
         replacement.write_all(bytes).unwrap();
         seal_private(&replacement, false).unwrap();
     }
