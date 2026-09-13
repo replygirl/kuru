@@ -91,3 +91,4 @@
   `mise run //packages/kuru-memory:typecheck`, strict-validate this change, then
   run the single coordinated workspace coverage task; verify every command exits
   zero and coverage remains at or above 90 percent without exclusions.
+- [ ] 5.5 Restore the native Windows acceptance owners' explicit empty reap-guard state for fixture launches that do not install a migration startup lock; verify the target compiles and the existing supervisor lifetime fixtures still complete through `finish_owner`.

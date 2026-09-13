@@ -428,10 +428,19 @@ impl ToolHost {
                         (1..=120_000).contains(&duration),
                         "timeout_ms must be 1..120000"
                     );
+                    #[cfg(unix)]
                     let result = shell(
                         self.shells(),
                         self.root_guard.clone(),
                         self.root.clone(),
+                        string(&args, "command")?,
+                        Duration::from_millis(duration),
+                    )
+                    .await?;
+                    #[cfg(windows)]
+                    let result = shell(
+                        &self.root_guard,
+                        &self.root,
                         string(&args, "command")?,
                         Duration::from_millis(duration),
                     )
