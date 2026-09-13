@@ -11,4 +11,4 @@
 ## 3. Documentation and focused validation
 
 - [x] 3.1 Document committed full-project export scope, provenance, formats, output behavior, and retained-history boundary in owning public pages; verify documentation checks.
-- [x] 3.2 Run focused memory/TUI tests and granular format, lint, and typecheck tasks; record actual evidence and explicitly retain pending native Windows and coordinated coverage rows.
+- [x] 3.2 Run focused memory/TUI tests and granular format, lint, and typecheck tasks; record actual evidence: all eight a820d795b8f2ef514697aea82a2b6d49988d08a7 hook categories passed (26,947/28,220 LF/LH, 95.4890%) and CI 34742990010 passed export/store Windows cases before an unrelated connector `PATHEXT` fixture failure; retain final integrated native and coverage rows pending.

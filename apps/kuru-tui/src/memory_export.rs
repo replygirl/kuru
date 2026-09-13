@@ -300,3 +300,53 @@ impl Drop for PrivateStage {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::io::Write;
+
+    use kuru_platform::fs::PublicationError;
+
+    use super::*;
+
+    #[test]
+    fn held_source_payload_retains_the_private_stage_after_uncertain_new_publication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = Directory::ensure_private(&temporary.path().join("exports")).unwrap();
+        let destination = parent.path().join("committed.json");
+        let target = OutputTarget {
+            directory: Directory::open(parent.path(), Privacy::OwnerOnly, NameRetention::Pinned)
+                .unwrap(),
+            name: "committed.json".into(),
+        };
+        let mut staged = StagedExport::new(&parent).unwrap();
+        staged.file_mut().write_all(b"committed export").unwrap();
+        staged.complete().unwrap();
+        let stage_path = staged.temp.path.as_ref().unwrap().clone();
+        let source = Directory::open(
+            staged.directory.as_ref().unwrap().path(),
+            Privacy::OwnerOnly,
+            NameRetention::Pinned,
+        )
+        .unwrap();
+        let held = source.read(OsStr::new(STAGED_PAYLOAD)).unwrap();
+
+        let error = staged.publish(target).unwrap_err();
+        let publication = error.downcast_ref::<PublicationError>().unwrap();
+        assert_eq!(publication.phase, PublicationPhase::Uncertain);
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read(stage_path.join(STAGED_PAYLOAD)).unwrap(),
+            b"committed export"
+        );
+        assert!(error.to_string().contains("staging directory retained at"));
+        assert!(
+            error
+                .to_string()
+                .contains(stage_path.to_string_lossy().as_ref())
+        );
+
+        drop(held);
+        drop(source);
+    }
+}
