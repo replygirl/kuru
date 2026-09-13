@@ -72,11 +72,17 @@ files, prior history, configured MCP environments, credential stores, and each
 producer's own size limit stay unchanged. It does not discover arbitrary,
 encoded, split, transformed, or future secret formats, so an unrecognized value
 may remain visible; a matching ordinary string may be projected. Tool output is
-therefore not a byte-exact backup. Kuru does not capture MCP stderr for this
-feature.
+therefore not a byte-exact backup. Stdio MCP stderr is scanned before a bounded,
+terminal-escaped tail is retained for direct human diagnostics. The finite
+scanner does not remove every ordinary URL, path, or configuration-like value.
+Captured stderr is not placed in runtime events, model input, or memory.
 
 ## Third-party tools
 
 Configured MCP servers bring their own authority. Kuru's built-in write and shell switches do not restrict what those services can do. Select services and credentials accordingly; [MCP configuration](./mcp) covers transport and lifecycle behavior.
 
-Tool discovery and calls report unavailable servers and malformed responses as errors. Mutating MCP calls are not automatically retried after transport failure.
+MCP discovery publishes complete catalogs per configured alias. One unavailable
+server does not hide built-in or healthy-server tools; its prior routes dispatch
+nothing until a later explicit discovery succeeds. Transport failures and
+ambiguous cancellation do not automatically retry mutating calls. MCP
+application errors remain useful results and do not disable a healthy server.

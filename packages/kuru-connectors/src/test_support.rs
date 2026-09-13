@@ -143,6 +143,10 @@ pub enum Step {
     Write(Value),
     Raw(&'static str),
     Repeat(usize),
+    Stderr(&'static str),
+    StderrRepeat(usize),
+    StderrInvalid,
+    HoldStderr(u64),
     Sleep(u64),
     Eof,
 }
@@ -183,6 +187,10 @@ impl StdioFixture {
                 Step::Write(value) => format!("write {value}\n"),
                 Step::Raw(line) => format!("write {line}\n"),
                 Step::Repeat(count) => format!("repeat {count}\n"),
+                Step::Stderr(line) => format!("stderr {line}\n"),
+                Step::StderrRepeat(count) => format!("stderr-repeat {count}\n"),
+                Step::StderrInvalid => "stderr-invalid\n".into(),
+                Step::HoldStderr(milliseconds) => format!("hold-stderr {milliseconds}\n"),
                 Step::Sleep(milliseconds) => format!("sleep {milliseconds}\n"),
                 Step::Eof => "eof\n".into(),
             })
@@ -215,6 +223,19 @@ impl StdioFixture {
                     .collect()
             })
             .collect()
+    }
+
+    pub async fn wait_for_requests(&self, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if self.conversations().iter().map(Vec::len).sum::<usize>() >= count {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("request observation timed out: {}", self.diagnostics()));
     }
 
     #[cfg(unix)]
@@ -686,8 +707,8 @@ mod tests {
 #[cfg(windows)]
 mod windows_tests {
     use super::{CompiledPeer, FixtureCache, StdioFixture, Step, cargo_peer, snapshot_peer};
-    use crate::rpc::Rpc;
-    use kuru_platform::fs::regular_file_info;
+    use crate::{mcp::Admission, rpc::Rpc};
+    use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info};
     use serde_json::json;
     use std::{collections::BTreeMap, fs::File, sync::Arc, time::Duration};
 
@@ -737,9 +758,18 @@ mod windows_tests {
             &[],
             &BTreeMap::new(),
             fixture.directory.path(),
+            Arc::new(
+                Directory::open(
+                    fixture.directory.path(),
+                    Privacy::Inherited,
+                    NameRetention::Pinned,
+                )
+                .unwrap(),
+            ),
+            Arc::new(Admission::new()),
         )
-        .await
         .unwrap();
+        rpc.ready().await.unwrap();
         let exchange = tokio::time::timeout(Duration::from_secs(10), async {
             rpc.send(json!({"request":"retained snapshot"}))
                 .await

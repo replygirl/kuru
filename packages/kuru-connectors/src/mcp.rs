@@ -1,19 +1,23 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[cfg(test)]
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
+use futures::future::join_all;
 use kuru_core::{McpConfig, ToolSpec};
 use kuru_platform::fs::Directory;
 #[cfg(test)]
 use kuru_platform::fs::{NameRetention, Privacy};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::{IO_TIMEOUT, MAX_BYTES, http, rpc::Rpc, tool_output::ToolFailureKind};
 
@@ -23,6 +27,88 @@ const SUPPORTED: &[&str] = &[VERSION, "2025-06-18", "2025-03-26", "2024-11-05"];
 pub(crate) struct McpHosts {
     clients: BTreeMap<String, Arc<McpClient>>,
     routes: RwLock<BTreeMap<String, (String, String)>>,
+    admission: Arc<Admission>,
+}
+
+pub(crate) struct Admission {
+    closed: AtomicBool,
+    #[cfg(test)]
+    pause_launch: AtomicBool,
+    #[cfg(test)]
+    launched: Notify,
+    #[cfg(test)]
+    resume_launch: Notify,
+    #[cfg(test)]
+    fail_setup: AtomicBool,
+}
+
+impl Admission {
+    pub(crate) fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            #[cfg(test)]
+            pause_launch: AtomicBool::new(false),
+            #[cfg(test)]
+            launched: Notify::new(),
+            #[cfg(test)]
+            resume_launch: Notify::new(),
+            #[cfg(test)]
+            fail_setup: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn enter(&self) -> Result<()> {
+        ensure!(!self.is_closed(), "MCP host is closed");
+        Ok(())
+    }
+
+    fn close_admission(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn after_launch(&self) {
+        if self.pause_launch.swap(false, Ordering::AcqRel) {
+            let resume = self.resume_launch.notified();
+            tokio::pin!(resume);
+            self.launched.notify_waiters();
+            resume.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_setup(&self) -> bool {
+        self.fail_setup.swap(false, Ordering::AcqRel)
+    }
+}
+
+pub struct McpStatus {
+    alias: String,
+    available: bool,
+    diagnostic: Option<String>,
+}
+
+impl McpStatus {
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub fn available(&self) -> bool {
+        self.available
+    }
+
+    pub fn diagnostic(&self) -> Option<&str> {
+        self.diagnostic.as_deref()
+    }
+}
+
+pub(crate) struct McpCatalog {
+    pub(crate) tools: Vec<ToolSpec>,
+    pub(crate) statuses: Vec<McpStatus>,
 }
 
 #[derive(Debug)]
@@ -45,10 +131,10 @@ impl McpCallFailure {
         }
     }
 
-    fn call(error: anyhow::Error) -> Self {
+    fn call(alias: &str) -> Self {
         Self {
             kind: ToolFailureKind::McpCall,
-            error,
+            error: anyhow::anyhow!("configured MCP server {alias} is unavailable"),
         }
     }
 }
@@ -72,6 +158,7 @@ impl McpHosts {
         root_guard.revalidate()?;
         let root = root_guard.path().to_path_buf();
         let mut clients = BTreeMap::new();
+        let admission = Arc::new(Admission::new());
         for (name, config) in configs {
             ensure!(
                 config.command.is_some() != config.url.is_some(),
@@ -86,58 +173,140 @@ impl McpHosts {
                     config: config.clone(),
                     root: root.clone(),
                     root_guard: root_guard.clone(),
-                    transport: Mutex::new(None),
+                    state: Mutex::new(ClientState::default()),
+                    available: AtomicBool::new(false),
+                    admission: admission.clone(),
+                    stop: Notify::new(),
                 }),
             );
         }
         Ok(Self {
             clients,
             routes: RwLock::new(BTreeMap::new()),
+            admission,
         })
     }
 
+    #[cfg(test)]
     pub async fn specs(&self) -> Result<Vec<ToolSpec>> {
-        let mut routes = BTreeMap::new();
-        let mut specs = Vec::new();
-        for (alias, client) in &self.clients {
-            for tool in client
-                .list()
-                .await
-                .with_context(|| format!("MCP {alias} discovery failed"))?
-            {
-                let original = tool["name"].as_str().context("MCP tool lacks name")?;
-                let key = format!(
-                    "mcp_{}",
-                    uuid::Uuid::new_v5(
-                        &uuid::Uuid::NAMESPACE_URL,
-                        format!("{alias}\0{original}").as_bytes()
-                    )
-                    .simple()
-                );
-                ensure!(
-                    routes
-                        .insert(key.clone(), (alias.clone(), original.into()))
-                        .is_none(),
-                    "duplicate MCP tool name for {alias}"
-                );
-                ensure!(
-                    tool["inputSchema"].is_object(),
-                    "MCP tool lacks inputSchema object"
-                );
-                specs.push(ToolSpec {
-                    name: key,
-                    description: format!(
-                        "MCP {alias}/{original}: {}",
-                        tool["description"]
-                            .as_str()
-                            .unwrap_or("Configured external tool")
-                    ),
-                    parameters: tool["inputSchema"].clone(),
-                });
+        Ok(self.catalog().await?.tools)
+    }
+
+    pub(crate) async fn catalog(&self) -> Result<McpCatalog> {
+        ensure_open(&self.admission)?;
+        let discoveries = self.clients.iter().map(|(alias, client)| async move {
+            let mut state = client.state.lock().await;
+            ensure_open(&self.admission)?;
+            let mut disable = DisableOnDrop::new(&client.available);
+            let tools = match client.list(&mut state).await {
+                Ok(tools) => tools,
+                Err(_) => {
+                    if !state.close_attempted {
+                        let _ = close_transport(&mut state).await;
+                    }
+                    return Ok::<_, anyhow::Error>((
+                        Vec::new(),
+                        McpStatus {
+                            alias: alias.clone(),
+                            available: false,
+                            diagnostic: state.diagnostic.clone(),
+                        },
+                    ));
+                }
+            };
+            let candidate = (|| {
+                let mut routes = BTreeMap::new();
+                let mut toolspecs = Vec::new();
+                for tool in tools {
+                    let original = tool["name"].as_str().context("MCP tool lacks name")?;
+                    let key = format!(
+                        "mcp_{}",
+                        uuid::Uuid::new_v5(
+                            &uuid::Uuid::NAMESPACE_URL,
+                            format!("{alias}\0{original}").as_bytes()
+                        )
+                        .simple()
+                    );
+                    ensure!(
+                        routes
+                            .insert(key.clone(), (alias.clone(), original.into()))
+                            .is_none(),
+                        "duplicate MCP tool name for {alias}"
+                    );
+                    ensure!(
+                        tool["inputSchema"].is_object(),
+                        "MCP tool lacks inputSchema object"
+                    );
+                    toolspecs.push(ToolSpec {
+                        name: key,
+                        description: format!(
+                            "MCP {alias}/{original}: {}",
+                            tool["description"]
+                                .as_str()
+                                .unwrap_or("Configured external tool")
+                        ),
+                        parameters: tool["inputSchema"].clone(),
+                    });
+                }
+                Ok::<_, anyhow::Error>((routes, toolspecs))
+            })();
+            match candidate {
+                Ok((candidate_routes, candidate_specs)) => {
+                    let mut routes = self.routes.write().await;
+                    if candidate_routes
+                        .keys()
+                        .any(|name| routes.get(name).is_some_and(|(owner, _)| owner != alias))
+                    {
+                        drop(routes);
+                        let _ = close_transport(&mut state).await;
+                        return Ok::<_, anyhow::Error>((
+                            Vec::new(),
+                            McpStatus {
+                                alias: alias.clone(),
+                                available: false,
+                                diagnostic: state.diagnostic.clone(),
+                            },
+                        ));
+                    }
+                    routes.retain(|_, (owner, _)| owner != alias);
+                    for (name, route) in candidate_routes {
+                        routes.insert(name, route);
+                    }
+                    client.available.store(true, Ordering::Release);
+                    disable.disarm();
+                    Ok::<_, anyhow::Error>((
+                        candidate_specs,
+                        McpStatus {
+                            alias: alias.clone(),
+                            available: true,
+                            diagnostic: None,
+                        },
+                    ))
+                }
+                Err(_) => {
+                    let _ = close_transport(&mut state).await;
+                    Ok::<_, anyhow::Error>((
+                        Vec::new(),
+                        McpStatus {
+                            alias: alias.clone(),
+                            available: false,
+                            diagnostic: state.diagnostic.clone(),
+                        },
+                    ))
+                }
             }
+        });
+        let mut specs = Vec::new();
+        let mut statuses = Vec::with_capacity(self.clients.len());
+        for result in join_all(discoveries).await {
+            let (candidate_specs, status) = result?;
+            specs.extend(candidate_specs);
+            statuses.push(status);
         }
-        *self.routes.write().await = routes;
-        Ok(specs)
+        Ok(McpCatalog {
+            tools: specs,
+            statuses,
+        })
     }
 
     pub(crate) async fn execute(
@@ -155,10 +324,21 @@ impl McpHosts {
             .clients
             .get(&alias)
             .ok_or_else(|| McpCallFailure::route(anyhow::anyhow!("MCP route no longer exists")))?;
-        let result = client
-            .call(&original, arguments)
-            .await
-            .map_err(McpCallFailure::call)?;
+        ensure_open(&self.admission).map_err(McpCallFailure::route)?;
+        let mut state = client.state.lock().await;
+        ensure_open(&self.admission).map_err(McpCallFailure::route)?;
+        if !client.available.load(Ordering::Acquire) {
+            return Err(McpCallFailure::call(&alias));
+        }
+        let mut disable = DisableOnDrop::new(&client.available);
+        let result = client.call(&mut state, &original, arguments).await;
+        let result = match result {
+            Ok(result) => {
+                disable.disarm();
+                result
+            }
+            Err(_) => return Err(McpCallFailure::call(&alias)),
+        };
         if result["isError"] == true {
             Ok(McpExecution::ApplicationError(result["content"].clone()))
         } else {
@@ -167,11 +347,32 @@ impl McpHosts {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        let mut first_error = None;
+        self.admission.close_admission();
+        let mut clients = tokio::task::JoinSet::new();
         for client in self.clients.values() {
-            if let Err(error) = client.close().await {
-                first_error.get_or_insert(error);
+            client.stop.notify_waiters();
+            let client = Arc::clone(client);
+            clients.spawn(async move { client.close().await });
+        }
+        let mut first_error = None;
+        let joined = tokio::time::timeout(IO_TIMEOUT, async {
+            while let Some(result) = clients.join_next().await {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        first_error.get_or_insert(error);
+                    }
+                    Err(_) => {
+                        first_error
+                            .get_or_insert_with(|| anyhow::anyhow!("MCP cleanup task failed"));
+                    }
+                }
             }
+        })
+        .await;
+        if joined.is_err() {
+            clients.abort_all();
+            return Err(anyhow::anyhow!("MCP shutdown remains unconfirmed"));
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -184,12 +385,63 @@ struct McpClient {
     config: McpConfig,
     root: PathBuf,
     root_guard: Arc<Directory>,
-    transport: Mutex<Option<Transport>>,
+    state: Mutex<ClientState>,
+    available: AtomicBool,
+    admission: Arc<Admission>,
+    stop: Notify,
+}
+
+#[derive(Default)]
+struct ClientState {
+    transport: Option<Transport>,
+    diagnostic: Option<String>,
+    close_attempted: bool,
+}
+
+struct DisableOnDrop<'a> {
+    available: &'a AtomicBool,
+    armed: bool,
+}
+
+impl<'a> DisableOnDrop<'a> {
+    fn new(available: &'a AtomicBool) -> Self {
+        Self {
+            available,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DisableOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.available.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl McpClient {
-    async fn initialize(&self) -> Result<Transport> {
-        let mut transport = if let Some(url) = &self.config.url {
+    async fn while_open<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let stopped = self.stop.notified();
+        tokio::pin!(stopped);
+        ensure_open(&self.admission)?;
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            _ = &mut stopped => Err(anyhow::anyhow!("MCP host is closed")),
+            result = &mut operation => result,
+        }
+    }
+
+    async fn initialize(&self, state: &mut ClientState) -> Result<()> {
+        state.transport = Some(if let Some(url) = &self.config.url {
             Transport::Http(HttpRpc {
                 client: http::client()?,
                 url: url.clone(),
@@ -198,56 +450,65 @@ impl McpClient {
                 next_id: 0,
             })
         } else {
-            self.root_guard.revalidate()?;
-            Transport::Stdio(Box::new(
-                Rpc::spawn(
-                    self.config
-                        .command
-                        .as_deref()
-                        .context("missing MCP command")?,
-                    &self.config.args,
-                    &self.config.env,
-                    &self.root,
-                )
-                .await?,
-            ))
-        };
+            Transport::Stdio(Box::new(Rpc::spawn(
+                self.config
+                    .command
+                    .as_deref()
+                    .context("missing MCP command")?,
+                &self.config.args,
+                &self.config.env,
+                &self.root,
+                self.root_guard.clone(),
+                self.admission.clone(),
+            )?))
+        });
+        state.close_attempted = false;
         let initialization = async {
-            let result = transport.request("initialize", json!({"protocolVersion":VERSION,"capabilities":{},"clientInfo":{"name":"kuru","version":env!("CARGO_PKG_VERSION")}})).await?;
+            let transport = state
+                .transport
+                .as_mut()
+                .context("MCP initialization failed")?;
+            self.while_open(transport.ready()).await?;
+            let result = self.while_open(transport.request("initialize", json!({"protocolVersion":VERSION,"capabilities":{},"clientInfo":{"name":"kuru","version":env!("CARGO_PKG_VERSION")}}))).await?;
             let version = result["protocolVersion"].as_str().context("MCP initialize lacks protocolVersion")?;
             ensure!(SUPPORTED.contains(&version), "unsupported MCP protocol version: {version}");
             ensure!(result["capabilities"]["tools"].is_object(), "MCP server did not advertise tools capability");
-            if let Transport::Http(http) = &mut transport { http.version = Some(version.into()); }
-            transport.notify("notifications/initialized", json!({})).await
+            if let Transport::Http(http) = &mut *transport { http.version = Some(version.into()); }
+            self.while_open(transport.notify("notifications/initialized", json!({}))).await
         }.await;
         if let Err(error) = initialization {
-            let _ = transport.close().await;
+            let _ = close_transport(state).await;
             return Err(error);
         }
-        Ok(transport)
+        Ok(())
     }
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let mut state = self.transport.lock().await;
-        if state.is_none() {
-            *state = Some(self.initialize().await?);
+    async fn request(&self, state: &mut ClientState, method: &str, params: Value) -> Result<Value> {
+        if state.transport.is_none() {
+            self.initialize(state).await?;
         }
-        let result = state
-            .as_mut()
-            .context("MCP initialization failed")?
-            .request(method, params)
+        let result = self
+            .while_open(
+                state
+                    .transport
+                    .as_mut()
+                    .context("MCP initialization failed")?
+                    .request(method, params),
+            )
             .await;
         if result.is_err() {
             // Never automatically retry a tool mutation. A subsequent explicit
             // call may establish a fresh session after a failed transport.
-            if let Some(mut transport) = state.take() {
-                let _ = transport.close().await;
-            }
+            let _ = close_transport(state).await;
         }
         result
     }
 
-    async fn list(&self) -> Result<Vec<Value>> {
+    async fn list(&self, state: &mut ClientState) -> Result<Vec<Value>> {
+        if !self.available.load(Ordering::Acquire) {
+            close_transport(state).await?;
+        }
+        state.diagnostic = None;
         let mut cursor = Value::Null;
         let mut seen = BTreeSet::new();
         let mut tools = Vec::new();
@@ -257,7 +518,7 @@ impl McpClient {
             } else {
                 json!({"cursor":cursor})
             };
-            let result = self.request("tools/list", params).await?;
+            let result = self.request(state, "tools/list", params).await?;
             tools.extend(
                 result["tools"]
                     .as_array()
@@ -280,17 +541,39 @@ impl McpClient {
         Ok(tools)
     }
 
-    async fn call(&self, name: &str, arguments: Value) -> Result<Value> {
-        self.request("tools/call", json!({"name":name,"arguments":arguments}))
-            .await
+    async fn call(&self, state: &mut ClientState, name: &str, arguments: Value) -> Result<Value> {
+        self.request(
+            state,
+            "tools/call",
+            json!({"name":name,"arguments":arguments}),
+        )
+        .await
     }
 
     async fn close(&self) -> Result<()> {
-        if let Some(mut transport) = self.transport.lock().await.take() {
-            transport.close().await?;
-        }
-        Ok(())
+        self.available.store(false, Ordering::Release);
+        let mut state = self.state.lock().await;
+        close_transport(&mut state).await
     }
+}
+
+async fn close_transport(state: &mut ClientState) -> Result<()> {
+    let Some(transport) = state.transport.as_mut() else {
+        state.close_attempted = false;
+        return Ok(());
+    };
+    state.close_attempted = true;
+    let result = transport.close().await;
+    state.diagnostic = transport.stderr_diagnostic();
+    result?;
+    state.transport.take();
+    state.close_attempted = false;
+    Ok(())
+}
+
+fn ensure_open(admission: &Admission) -> Result<()> {
+    ensure!(!admission.is_closed(), "MCP host is closed");
+    Ok(())
 }
 
 enum Transport {
@@ -299,6 +582,19 @@ enum Transport {
 }
 
 impl Transport {
+    async fn ready(&mut self) -> Result<()> {
+        match self {
+            Self::Stdio(rpc) => rpc.ready().await,
+            Self::Http(_) => Ok(()),
+        }
+    }
+
+    fn stderr_diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Stdio(rpc) => rpc.stderr_diagnostic(),
+            Self::Http(_) => None,
+        }
+    }
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         match self {
             Self::Stdio(rpc) => rpc.request(method, params, IO_TIMEOUT).await,
@@ -313,7 +609,7 @@ impl Transport {
                 rpc.send(json!({"jsonrpc":"2.0","method":method,"params":params}))
                     .await
             }
-            Self::Http(rpc) => {
+            Self::Http(rpc) => tokio::time::timeout(IO_TIMEOUT, async {
                 http::body(
                     rpc.post()
                         .json(&json!({"jsonrpc":"2.0","method":method,"params":params}))
@@ -322,14 +618,16 @@ impl Transport {
                 )
                 .await?;
                 Ok(())
-            }
+            })
+            .await
+            .context("MCP HTTP notification timed out")?,
         }
     }
     async fn close(&mut self) -> Result<()> {
         match self {
             Self::Stdio(rpc) => rpc.close().await,
             Self::Http(rpc) => {
-                if let Some(session) = rpc.session.take() {
+                if let Some(session) = rpc.session.clone() {
                     let mut request = rpc
                         .client
                         .delete(&rpc.url)
@@ -344,6 +642,7 @@ impl Transport {
                         "MCP session DELETE failed: {}",
                         result.status()
                     );
+                    rpc.session = None;
                 }
                 Ok(())
             }
@@ -738,8 +1037,9 @@ mod tests {
         std::fs::rename(&root, parent.path().join("replaced")).unwrap();
         std::fs::create_dir(&root).unwrap();
 
-        let error = hosts.specs().await.unwrap_err();
-        assert!(format!("{error:#}").contains("identity changed"));
+        let catalog = hosts.catalog().await.unwrap();
+        assert!(catalog.tools.is_empty());
+        assert!(!catalog.statuses[0].available());
         assert!(script.conversations().is_empty());
     }
 
@@ -766,11 +1066,15 @@ mod tests {
                 config: http_config(&peer.url).remove("test").unwrap(),
                 root: root.path().to_path_buf(),
                 root_guard: root,
-                transport: Mutex::new(None),
+                state: Mutex::new(ClientState::default()),
+                available: AtomicBool::new(false),
+                admission: Arc::new(Admission::new()),
+                stop: Notify::new(),
             };
+            let mut state = client.state.lock().await;
             assert!(
                 client
-                    .list()
+                    .list(&mut state)
                     .await
                     .unwrap_err()
                     .to_string()
@@ -785,14 +1089,9 @@ mod tests {
         ])
         .await;
         let hosts = McpHosts::new(Path::new("."), &http_config(&peer.url)).unwrap();
-        assert!(
-            hosts
-                .specs()
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("duplicate")
-        );
+        let catalog = hosts.catalog().await.unwrap();
+        assert!(catalog.tools.is_empty());
+        assert!(!catalog.statuses[0].available());
         hosts.shutdown().await.unwrap();
         let peer = HttpFixture::new(vec![
             initialized(),
@@ -803,7 +1102,22 @@ mod tests {
         ])
         .await;
         let hosts = McpHosts::new(Path::new("."), &http_config(&peer.url)).unwrap();
-        assert!(format!("{:#}", hosts.specs().await.unwrap_err()).contains("pagination"));
+        let catalog = hosts.catalog().await.unwrap();
+        assert!(catalog.tools.is_empty());
+        assert!(!catalog.statuses[0].available());
+        hosts.shutdown().await.unwrap();
+
+        let peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":(0..=10_000).map(|index| tool(&format!("tool-{index}"))).collect::<Vec<_>>()})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let hosts = McpHosts::new(Path::new("."), &http_config(&peer.url)).unwrap();
+        let catalog = hosts.catalog().await.unwrap();
+        assert!(catalog.tools.is_empty());
+        assert!(!catalog.statuses[0].available());
         hosts.shutdown().await.unwrap();
     }
 
@@ -832,7 +1146,10 @@ mod tests {
         assert_eq!(success["content"][0]["text"], "usable");
         let failure = hosts.execute(name, json!({})).await.unwrap_err();
         assert_eq!(failure.kind, ToolFailureKind::McpCall);
-        assert!(failure.error.to_string().contains("server failed"));
+        assert_eq!(
+            failure.error.to_string(),
+            "configured MCP server test is unavailable"
+        );
         assert_eq!(peer.requests.lock().await.len(), 7);
         hosts.shutdown().await.unwrap();
         let failure = hosts.execute("unknown", json!({})).await.unwrap_err();
@@ -848,6 +1165,657 @@ mod tests {
         )]
         .into();
         assert!(McpHosts::new(Path::new("."), &invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_call_retains_unconfirmed_http_close_without_replay() {
+        let mut rejected = Reply::json(json!({}));
+        rejected.status = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+        let peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("mutate")]})),
+            Reply::json(json!({"id":"$ID","error":{"code":-32000,"message":"lost"}})),
+            rejected,
+            Reply::json(json!({})),
+        ])
+        .await;
+        let hosts = McpHosts::new(Path::new("."), &http_config(&peer.url)).unwrap();
+        let name = hosts.specs().await.unwrap()[0].name.clone();
+        let failure = hosts.execute(&name, json!({})).await.unwrap_err();
+        assert_eq!(failure.kind, ToolFailureKind::McpCall);
+        assert_eq!(peer.requests.lock().await.len(), 5);
+
+        let disabled = hosts.execute(&name, json!({})).await.unwrap_err();
+        assert_eq!(disabled.kind, ToolFailureKind::McpCall);
+        assert_eq!(peer.requests.lock().await.len(), 5);
+        assert!(
+            hosts.clients["test"].state.lock().await.transport.is_some(),
+            "failed session cleanup must remain observable"
+        );
+
+        hosts.shutdown().await.unwrap();
+        let requests = peer.requests.lock().await;
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[3].body["method"], "tools/call");
+        assert_eq!(requests[4].method, axum::http::Method::DELETE);
+        assert_eq!(requests[5].method, axum::http::Method::DELETE);
+    }
+
+    #[tokio::test]
+    async fn explicit_catalog_recovers_a_failed_alias_without_replaying_its_call() {
+        let peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("mutate")]})),
+            Reply::json(json!({"id":"$ID","error":{"code":-32000,"message":"lost"}})),
+            Reply::json(json!({})),
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("mutate")]})),
+            Reply::rpc(json!({"content":[{"type":"text","text":"recovered"}]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let hosts = McpHosts::new(Path::new("."), &http_config(&peer.url)).unwrap();
+        let name = hosts.specs().await.unwrap()[0].name.clone();
+        assert!(hosts.execute(&name, json!({})).await.is_err());
+        assert_eq!(peer.requests.lock().await.len(), 5);
+        let catalog = hosts.catalog().await.unwrap();
+        assert!(catalog.statuses[0].available());
+        assert_eq!(catalog.tools[0].name, name);
+        assert_eq!(peer.requests.lock().await.len(), 8);
+        let McpExecution::Success(result) = hosts.execute(&name, json!({})).await.unwrap() else {
+            panic!("expected recovered call success");
+        };
+        assert_eq!(result["content"][0]["text"], "recovered");
+        hosts.shutdown().await.unwrap();
+        let requests = peer.requests.lock().await;
+        assert_eq!(requests.len(), 10);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.body["method"] == "tools/call")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_catalog_does_not_replace_unconfirmed_stdio_cleanup() {
+        let replacement = StdioFixture::new([Step::Read]);
+        let hosts = McpHosts::new(
+            Path::new("."),
+            &BTreeMap::from([(
+                "stdio".into(),
+                McpConfig {
+                    command: Some(replacement.command().into()),
+                    ..Default::default()
+                },
+            )]),
+        )
+        .unwrap();
+        hosts.clients["stdio"].state.lock().await.transport =
+            Some(Transport::Stdio(Box::new(Rpc::unconfirmed_for_test())));
+
+        for _ in 0..2 {
+            let catalog = hosts.catalog().await.unwrap();
+            assert!(catalog.tools.is_empty());
+            assert!(!catalog.statuses[0].available());
+            assert!(
+                hosts.clients["stdio"]
+                    .state
+                    .lock()
+                    .await
+                    .transport
+                    .is_some()
+            );
+            assert!(replacement.conversations().is_empty());
+        }
+        assert!(hosts.shutdown().await.is_err());
+        assert!(replacement.conversations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_stdio_call_is_never_dispatched_twice() {
+        let script = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[tool("mutate")]}})),
+            Step::Read,
+            Step::Sleep(5_000),
+        ]);
+        let hosts = Arc::new(
+            McpHosts::new(
+                Path::new("."),
+                &BTreeMap::from([(
+                    "stdio".into(),
+                    McpConfig {
+                        command: Some(script.command().into()),
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .unwrap(),
+        );
+        let name = hosts.specs().await.unwrap()[0].name.clone();
+
+        let held = hosts.clients["stdio"].state.lock().await;
+        let before_hosts = hosts.clone();
+        let before_name = name.clone();
+        let before =
+            tokio::spawn(async move { before_hosts.execute(&before_name, json!({})).await });
+        tokio::task::yield_now().await;
+        before.abort();
+        assert!(before.await.unwrap_err().is_cancelled());
+        drop(held);
+        assert_eq!(script.conversations()[0].len(), 3);
+
+        let after_hosts = hosts.clone();
+        let after_name = name.clone();
+        let after = tokio::spawn(async move { after_hosts.execute(&after_name, json!({})).await });
+        script.wait_for_requests(4).await;
+        after.abort();
+        assert!(after.await.unwrap_err().is_cancelled());
+        let disabled = hosts.execute(&name, json!({})).await.unwrap_err();
+        assert_eq!(disabled.kind, ToolFailureKind::McpCall);
+        assert_eq!(script.conversations()[0].len(), 4);
+        hosts.shutdown().await.unwrap();
+        assert_eq!(script.conversations()[0].len(), 4);
+    }
+
+    #[tokio::test]
+    async fn catalog_keeps_healthy_http_alias_when_stdio_alias_fails_in_either_order() {
+        for failed_first in [true, false] {
+            let healthy = HttpFixture::new(vec![
+                initialized(),
+                Reply::json(json!({})),
+                Reply::rpc(json!({"tools":[tool("usable")]})),
+                Reply::json(json!({})),
+            ])
+            .await;
+            let failed = StdioFixture::new([Step::Read, Step::Raw("not JSON")]);
+            let (failed_alias, healthy_alias) = if failed_first {
+                ("a_failed", "z_healthy")
+            } else {
+                ("z_failed", "a_healthy")
+            };
+            let config = BTreeMap::from([
+                (
+                    failed_alias.into(),
+                    McpConfig {
+                        command: Some(failed.command().into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    healthy_alias.into(),
+                    McpConfig {
+                        url: Some(healthy.url.clone()),
+                        ..Default::default()
+                    },
+                ),
+            ]);
+            let hosts = McpHosts::new(Path::new("."), &config).unwrap();
+            let catalog = hosts.catalog().await.unwrap();
+            assert_eq!(catalog.tools.len(), 1);
+            assert_eq!(catalog.statuses.len(), 2);
+            assert!(
+                catalog
+                    .statuses
+                    .iter()
+                    .any(|status| status.alias() == healthy_alias && status.available())
+            );
+            assert!(
+                catalog
+                    .statuses
+                    .iter()
+                    .any(|status| status.alias() == failed_alias && !status.available())
+            );
+            hosts.shutdown().await.unwrap();
+            failed.assert_completed(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_later_catalog_page_never_publishes_partial_routes() {
+        for failure in ["malformed", "repeated", "oversized"] {
+            let second_page = match failure {
+                "malformed" => Reply::rpc(json!({})),
+                "repeated" => Reply::rpc(json!({"tools":[],"nextCursor":"p2"})),
+                "oversized" => Reply::rpc(json!({
+                    "tools": (0..10_000)
+                        .map(|index| tool(&format!("extra-{index}")))
+                        .collect::<Vec<_>>()
+                })),
+                _ => unreachable!(),
+            };
+            let failed = HttpFixture::new(vec![
+                initialized(),
+                Reply::json(json!({})),
+                Reply::rpc(json!({"tools":[tool("partial")],"nextCursor":"p2"})),
+                second_page,
+                Reply::json(json!({})),
+            ])
+            .await;
+            let healthy = HttpFixture::new(vec![
+                initialized(),
+                Reply::json(json!({})),
+                Reply::rpc(json!({"tools":[tool("usable")]})),
+                Reply::json(json!({})),
+            ])
+            .await;
+            let hosts = McpHosts::new(
+                Path::new("."),
+                &BTreeMap::from([
+                    (
+                        "failed".into(),
+                        McpConfig {
+                            url: Some(failed.url.clone()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "healthy".into(),
+                        McpConfig {
+                            url: Some(healthy.url.clone()),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            )
+            .unwrap();
+
+            let catalog = hosts.catalog().await.unwrap();
+            assert_eq!(catalog.tools.len(), 1, "{failure}");
+            assert!(catalog.tools[0].description.contains("healthy/usable"));
+            assert_eq!(hosts.routes.read().await.len(), 1, "{failure}");
+            assert!(
+                hosts
+                    .routes
+                    .read()
+                    .await
+                    .values()
+                    .all(|route| route.0 == "healthy")
+            );
+            assert!(
+                catalog
+                    .statuses
+                    .iter()
+                    .any(|status| { status.alias() == "failed" && !status.available() })
+            );
+            assert!(
+                catalog
+                    .statuses
+                    .iter()
+                    .any(|status| { status.alias() == "healthy" && status.available() })
+            );
+            hosts.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn multipage_discovery_serializes_same_alias_while_other_alias_proceeds() {
+        let slow = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[tool("target")]}})),
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":3,"result":{"tools":[tool("target")],"nextCursor":"p2"}}),
+            ),
+            Step::Read,
+            Step::Sleep(400),
+            Step::Write(json!({"jsonrpc":"2.0","id":4,"result":{"tools":[tool("extra")]}})),
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"slow done"}]}}),
+            ),
+            Step::Eof,
+        ]);
+        let independent = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[tool("other")]}})),
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":3,"result":{"tools":[tool("other")]}})),
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"other done"}]}}),
+            ),
+            Step::Eof,
+        ]);
+        let hosts = Arc::new(
+            McpHosts::new(
+                Path::new("."),
+                &BTreeMap::from([
+                    (
+                        "independent".into(),
+                        McpConfig {
+                            command: Some(independent.command().into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "slow".into(),
+                        McpConfig {
+                            command: Some(slow.command().into()),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            )
+            .unwrap(),
+        );
+        let initial = hosts.catalog().await.unwrap();
+        let slow_name = initial
+            .tools
+            .iter()
+            .find(|tool| tool.description.contains("slow/target"))
+            .unwrap()
+            .name
+            .clone();
+        let independent_name = initial
+            .tools
+            .iter()
+            .find(|tool| tool.description.contains("independent/other"))
+            .unwrap()
+            .name
+            .clone();
+
+        let catalog_hosts = hosts.clone();
+        let catalog = tokio::spawn(async move { catalog_hosts.catalog().await });
+        slow.wait_for_requests(4).await;
+        let slow_hosts = hosts.clone();
+        let same_alias =
+            tokio::spawn(async move { slow_hosts.execute(&slow_name, json!({})).await });
+        let other_hosts = hosts.clone();
+        let other_alias =
+            tokio::spawn(async move { other_hosts.execute(&independent_name, json!({})).await });
+
+        let McpExecution::Success(other) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), other_alias)
+                .await
+                .expect("independent alias was blocked by another alias")
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected independent MCP success");
+        };
+        assert_eq!(other["content"][0]["text"], "other done");
+        assert!(!same_alias.is_finished());
+        assert_eq!(catalog.await.unwrap().unwrap().tools.len(), 3);
+        let McpExecution::Success(slow_result) = same_alias.await.unwrap().unwrap() else {
+            panic!("expected serialized MCP success");
+        };
+        assert_eq!(slow_result["content"][0]["text"], "slow done");
+        hosts.shutdown().await.unwrap();
+        let slow_conversations = slow.conversations();
+        let slow_methods: Vec<_> = slow_conversations[0]
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            slow_methods,
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/list",
+                "tools/list",
+                "tools/call"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_shutdown_waits_for_pending_client_cleanup() {
+        let script = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})),
+            Step::Eof,
+        ]);
+        let hosts = Arc::new(
+            McpHosts::new(
+                Path::new("."),
+                &BTreeMap::from([(
+                    "stdio".into(),
+                    McpConfig {
+                        command: Some(script.command().into()),
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .unwrap(),
+        );
+        hosts.catalog().await.unwrap();
+
+        let active = hosts.clients["stdio"].state.lock().await;
+        let first_hosts = hosts.clone();
+        let first = tokio::spawn(async move { first_hosts.shutdown().await });
+        while !hosts.admission.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        let second_hosts = hosts.clone();
+        let second = tokio::spawn(async move { second_hosts.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        drop(active);
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(hosts.catalog().await.is_err());
+        script.assert_completed(1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_active_call_and_rejects_later_admission() {
+        let script = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[tool("slow")]}})),
+            Step::Read,
+            Step::Sleep(5_000),
+        ]);
+        let hosts = Arc::new(
+            McpHosts::new(
+                Path::new("."),
+                &BTreeMap::from([(
+                    "stdio".into(),
+                    McpConfig {
+                        command: Some(script.command().into()),
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .unwrap(),
+        );
+        let name = hosts.specs().await.unwrap()[0].name.clone();
+        let call_hosts = hosts.clone();
+        let call_name = name.clone();
+        let call = tokio::spawn(async move { call_hosts.execute(&call_name, json!({})).await });
+        script.wait_for_requests(4).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(8), hosts.shutdown())
+            .await
+            .expect("active MCP shutdown exceeded the owned cleanup bound")
+            .unwrap();
+        let failure = call.await.unwrap().unwrap_err();
+        assert_eq!(failure.kind, ToolFailureKind::McpCall);
+        assert!(hosts.catalog().await.is_err());
+        assert_eq!(
+            hosts.execute(&name, json!({})).await.unwrap_err().kind,
+            ToolFailureKind::McpRoute
+        );
+        assert_eq!(script.conversations()[0].len(), 4);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_admission_before_waiting_catalog_can_start() {
+        let script = StdioFixture::new([Step::Read]);
+        let hosts = Arc::new(
+            McpHosts::new(
+                Path::new("."),
+                &BTreeMap::from([(
+                    "stdio".into(),
+                    McpConfig {
+                        command: Some(script.command().into()),
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .unwrap(),
+        );
+        let held = hosts.clients["stdio"].state.lock().await;
+        let catalog_hosts = hosts.clone();
+        let catalog = tokio::spawn(async move { catalog_hosts.catalog().await });
+        tokio::task::yield_now().await;
+        let shutdown_hosts = hosts.clone();
+        let shutdown = tokio::spawn(async move { shutdown_hosts.shutdown().await });
+        while !hosts.admission.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+
+        assert!(catalog.await.unwrap().is_err());
+        shutdown.await.unwrap().unwrap();
+        assert!(script.conversations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_startup_is_cleaned_before_explicit_recovery_spawns() {
+        let script = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})),
+            Step::Eof,
+        ]);
+        let hosts = Arc::new(
+            McpHosts::new(
+                Path::new("."),
+                &BTreeMap::from([(
+                    "stdio".into(),
+                    McpConfig {
+                        command: Some(script.command().into()),
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .unwrap(),
+        );
+        hosts.admission.pause_launch.store(true, Ordering::Release);
+        let launched = hosts.admission.launched.notified();
+        tokio::pin!(launched);
+        let catalog_hosts = hosts.clone();
+        let pending = tokio::spawn(async move { catalog_hosts.catalog().await });
+        launched.await;
+        pending.abort();
+        match pending.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("pending catalog was not cancelled"),
+        }
+        hosts.admission.resume_launch.notify_waiters();
+
+        let recovered = hosts.catalog().await.unwrap();
+        assert!(recovered.statuses[0].available());
+        hosts.shutdown().await.unwrap();
+        let conversations = script.conversations();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations.iter().map(Vec::len).sum::<usize>(), 3);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_admitted_startup_cleanup_before_success() {
+        let script = StdioFixture::new([Step::Read]);
+        let hosts = Arc::new(
+            McpHosts::new(
+                Path::new("."),
+                &BTreeMap::from([(
+                    "stdio".into(),
+                    McpConfig {
+                        command: Some(script.command().into()),
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .unwrap(),
+        );
+        hosts.admission.pause_launch.store(true, Ordering::Release);
+        let launched = hosts.admission.launched.notified();
+        tokio::pin!(launched);
+        let catalog_hosts = hosts.clone();
+        let catalog = tokio::spawn(async move { catalog_hosts.catalog().await });
+        launched.await;
+        let shutdown_hosts = hosts.clone();
+        let shutdown = tokio::spawn(async move { shutdown_hosts.shutdown().await });
+        while !hosts.admission.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        hosts.admission.resume_launch.notify_waiters();
+
+        let catalog = catalog.await.unwrap().unwrap();
+        assert!(!catalog.statuses[0].available());
+        shutdown.await.unwrap().unwrap();
+        assert!(hosts.catalog().await.is_err());
+        assert!(script.conversations().iter().all(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn post_spawn_setup_failure_retains_owner_until_cleanup_is_confirmed() {
+        let script = StdioFixture::new([Step::Read]);
+        let hosts = McpHosts::new(
+            Path::new("."),
+            &BTreeMap::from([(
+                "stdio".into(),
+                McpConfig {
+                    command: Some(script.command().into()),
+                    ..Default::default()
+                },
+            )]),
+        )
+        .unwrap();
+        hosts.admission.fail_setup.store(true, Ordering::Release);
+
+        let catalog = hosts.catalog().await.unwrap();
+        assert!(!catalog.statuses[0].available());
+        assert!(
+            hosts.clients["stdio"]
+                .state
+                .lock()
+                .await
+                .transport
+                .is_none()
+        );
+        hosts.shutdown().await.unwrap();
+        assert!(script.conversations().iter().all(Vec::is_empty));
     }
 
     #[test]
@@ -907,10 +1875,13 @@ mod tests {
             Reply::json(json!({})),
             stream,
             failed_delete,
+            Reply::json(json!({})),
         ])
         .await;
         let hosts = McpHosts::new(Path::new("."), &http_config(&peer.url)).unwrap();
-        assert!(format!("{:#}", hosts.specs().await.unwrap_err()).contains("stream ended"));
+        let catalog = hosts.catalog().await.unwrap();
+        assert!(catalog.tools.is_empty());
+        assert!(!catalog.statuses[0].available());
         hosts.shutdown().await.unwrap();
         let mut failed_delete = Reply::json(json!({}));
         failed_delete.status = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
@@ -919,6 +1890,7 @@ mod tests {
             Reply::json(json!({})),
             Reply::rpc(json!({"tools":[]})),
             failed_delete,
+            Reply::json(json!({})),
         ])
         .await;
         let hosts = McpHosts::new(Path::new("."), &http_config(&peer.url)).unwrap();
@@ -931,5 +1903,6 @@ mod tests {
                 .to_string()
                 .contains("DELETE failed")
         );
+        hosts.shutdown().await.unwrap();
     }
 }

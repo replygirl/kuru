@@ -791,7 +791,13 @@ impl Harness {
             serde_json::to_string(&shared)?
         ))];
         let mut tools = cognition_tools();
-        tools.extend(self.tools.specs().await?);
+        let catalog = self.tools.catalog().await?;
+        for status in catalog.mcp() {
+            if !status.available() {
+                self.emit("mcp", status.alias(), "configured server unavailable");
+            }
+        }
+        tools.extend(catalog.into_tools());
         if !self.config.external_agents.is_empty() {
             tools.push(external_tool());
         }

@@ -18,7 +18,7 @@ use std::cell::Cell;
 use std::{
     io,
     os::unix::process::CommandExt,
-    process::{Child, ChildStderr, ChildStdout, Command, ExitStatus},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus},
 };
 
 const MAX_EINTR_ATTEMPTS: usize = 8;
@@ -138,6 +138,14 @@ impl OwnedProcessGroup {
             #[cfg(test)]
             syscalls: Cell::new(0),
         })
+    }
+
+    /// Take the owned standard-input pipe once.
+    pub fn take_stdin(&mut self) -> io::Result<ChildStdin> {
+        self.child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("owned child stdin was not piped"))
     }
 
     /// Take the owned standard-output pipe once.
@@ -594,6 +602,31 @@ mod tests {
             GroupPresence::InvalidPhase
         ));
         assert_eq!(owner.syscall_count(), after_cleanup);
+    }
+
+    #[test]
+    fn actual_owner_exposes_each_configured_pipe_once() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat >/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin");
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        let mut owner = OwnedProcessGroup::spawn(command).unwrap();
+        let input = owner.take_stdin().unwrap();
+        let output = owner.take_stdout().unwrap();
+        let error = owner.take_stderr().unwrap();
+        assert!(owner.take_stdin().is_err());
+        assert!(owner.take_stdout().is_err());
+        assert!(owner.take_stderr().is_err());
+        drop((input, output, error));
+        finish_test_owner(&mut owner).unwrap();
     }
 
     fn finish_test_owner(owner: &mut OwnedProcessGroup) -> Result<(), String> {

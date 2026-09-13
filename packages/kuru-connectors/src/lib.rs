@@ -21,9 +21,10 @@ mod test_support;
 
 pub use a2a::a2a_send;
 pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
+pub use mcp::McpStatus;
 pub use providers::{DemoProvider, Provider, ResponsesProvider, provider};
 pub use redaction::truncate_tool_output;
-pub use tools::ToolHost;
+pub use tools::{ToolCatalog, ToolHost};
 
 /// Maximum protocol message/body size; limits also apply to chunked responses.
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;

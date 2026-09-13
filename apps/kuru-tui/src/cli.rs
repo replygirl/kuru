@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
-use kuru_connectors::{Provider, ToolHost, provider};
+use kuru_connectors::{McpStatus, Provider, ToolHost, provider};
 use kuru_core::{
     AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
     ProjectPreferences, SafeManifest,
@@ -521,7 +521,8 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 let host = ToolHost::with_retained_root(root.clone(), &config)?;
                 let result = async {
                     let arguments = serde_json::from_str(args)?;
-                    host.specs().await?;
+                    let catalog = host.catalog().await?;
+                    report_mcp_statuses(catalog.mcp());
                     host.execute(name, arguments).await
                 }
                 .await;
@@ -532,9 +533,11 @@ pub async fn execute(cli: Cli) -> Result<()> {
             }
             Some(Command::Tools) => {
                 let host = ToolHost::with_retained_root(root.clone(), &config)?;
-                let specs = host.specs().await;
+                let catalog = host.catalog().await;
                 let cleanup = host.shutdown().await;
-                println!("{}", serde_json::to_string_pretty(&specs?)?);
+                let catalog = catalog?;
+                report_mcp_statuses(catalog.mcp());
+                println!("{}", serde_json::to_string_pretty(catalog.tools())?);
                 cleanup?;
                 return Ok(());
             }
@@ -648,6 +651,18 @@ pub async fn execute(cli: Cli) -> Result<()> {
     };
     result?;
     cleanup
+}
+
+fn report_mcp_statuses(statuses: &[McpStatus]) {
+    for status in statuses {
+        if status.available() {
+            continue;
+        }
+        eprintln!("MCP {}: configured server unavailable", status.alias());
+        if let Some(diagnostic) = status.diagnostic() {
+            eprintln!("{diagnostic}");
+        }
+    }
 }
 
 fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClaimCategory> {
