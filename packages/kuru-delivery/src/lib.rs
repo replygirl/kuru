@@ -9,7 +9,11 @@ pub mod command;
 #[cfg(feature = "tooling")]
 pub mod docs;
 #[cfg(feature = "tooling")]
+pub mod mise_isolation;
+#[cfg(feature = "tooling")]
 pub mod notes;
+#[cfg(feature = "tooling")]
+pub mod published_windows;
 #[cfg(feature = "tooling")]
 pub mod release;
 #[cfg(feature = "tooling")]

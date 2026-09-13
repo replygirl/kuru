@@ -19,6 +19,8 @@ mise use -g github:replygirl/kuru@VERSION
 
 Mise applies a release-age cooldown when resolving latest; a full `major.minor.patch` pin also lets you select a newly published release. `mise install github:replygirl/kuru@VERSION` downloads the version without selecting it. Use `mise exec github:replygirl/kuru@VERSION -- kuru` to run that version explicitly.
 
+Each Release run checks the published Windows package through this ordinary mise route on native Windows before Kuru's documentation is published. The check starts with empty application and engine caches, verifies the public release and bundled Dolt bytes, and resumes a saved offline conversation; installation still needs no compiler or separate database.
+
 ## Install with the shell bootstrap
 
 On macOS or Linux:

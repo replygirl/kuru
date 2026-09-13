@@ -287,7 +287,7 @@ fn zip_limits(limit: usize) -> Limits {
     }
 }
 
-fn extract_binary(bytes: &[u8], target: &Target, limit: usize) -> Result<Vec<u8>> {
+pub(crate) fn extract_binary(bytes: &[u8], target: &Target, limit: usize) -> Result<Vec<u8>> {
     ensure!(bytes.len() <= limit, "release archive exceeds size limit");
     if target.format == ArchiveFormat::Zip {
         let expected = [target.executable, "LICENSE", "README.md"].map(|name| MemberSpec {

@@ -275,11 +275,45 @@ jobs:
           RELEASE_SHA: ${{ needs.bump.outputs.sha }}
         run: mise run release:tool -- publish --version "$RELEASE_VERSION" --sha "$RELEASE_SHA" --directory dist --notes RELEASE_NOTES.md
 
+  verify-published-windows:
+    name: Verify published Windows release
+    needs: [plan, bump, publish]
+    runs-on: windows-2025
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      MISE_NO_HOOKS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Verify the exact published package
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
+          RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          KURU_PUBLISHED_WINDOWS_RECEIPT: ${{ github.workspace }}/published-windows-verification.json
+        run: mise run //packages/kuru-delivery:verify:published-windows
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: published-windows-verification
+          path: published-windows-verification.json
+          if-no-files-found: error
+          overwrite: true
+
   # Keep documentation in this release run, built from its published commit.
   # To recover a docs-only failure, rerun these jobs on the same release run.
   build-docs:
     name: Build docs
-    needs: [bump, publish]
+    needs: [bump, publish, verify-published-windows]
     runs-on: ubuntu-24.04
     outputs:
       artifact_name: ${{ steps.artifact.outputs.name }}
