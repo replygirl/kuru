@@ -72,6 +72,16 @@ These messages do not estimate time or prove a stage succeeded; the command's
 ordinary result remains authoritative. JSON and other command output stay on
 standard output, and library callers do not receive progress messages.
 
+After the first conversation/runtime command (`kuru run`, `kuru dream`,
+`kuru undo-dream`, the TUI, or `kuru serve`) opens a writable project store, the
+application shows one informational local notice. It names the escaped managed directory and points to
+`kuru memory notes ID`, `kuru memory export --format json --output PATH`,
+`kuru memory forget ID --note SEQUENCE`, and `kuru memory purge --help`. The
+notice records only that this project/version was displayed, after stderr is
+flushed or the TUI frame is complete. It is not sent to a provider or added to a
+peer conversation. Memory and chat do not expire automatically; forgetting a
+selected active note retains prior Dolt revisions.
+
 `memory.offline` remains accepted for configuration compatibility; bundled engine
 provisioning always works offline. An explicit `memory.dolt_binary` is an optional
 development override and must report the supported exact version. The authoritative

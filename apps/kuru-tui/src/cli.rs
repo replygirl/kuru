@@ -782,6 +782,9 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             let memory = existing_memory
                 .as_ref()
                 .context("this project has no memory yet; start a conversation first")?;
+            if let Some(notice) = crate::memory_notice::MemoryNotice::pending(memory.clone()).await? {
+                notice.announce().await?;
+            }
             kuru_runtime::undo_dream(&config, &scope, memory, cli.resume.as_deref()).await?;
             println!("Previous membership restored.");
             return Ok(());
@@ -810,6 +813,14 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             }
         };
         memory_to_close = Some(memory.clone());
+        let notice = crate::memory_notice::MemoryNotice::pending(memory.clone()).await?;
+        if matches!(
+            cli.command,
+            Some(Command::Run { .. } | Command::Dream | Command::Serve { .. })
+        ) && let Some(notice) = &notice
+        {
+            notice.announce().await?;
+        }
         let tools = ToolHost::with_retained_root(root.clone(), &config)?;
         let mut harness = Harness::with_tool_host(
             config,
@@ -873,7 +884,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 kuru_runtime::server::serve(listener, app).await?;
                 harness.lock().await.shutdown(false).await?;
             }
-            None => crate::ui::run(harness, models).await?,
+            None => crate::ui::run_with_notice(harness, models, notice).await?,
             _ => unreachable!("early-return commands handled above"),
         }
         Ok::<_, anyhow::Error>(())

@@ -1,0 +1,14 @@
+## 1. Visible and durable first-run notice [critical]
+
+- [x] 1.1 @e2e (agent) extended the completed-frame PTY smoke flow across two launches -> first writable TUI frame contains the notice before input and the reopened project omits it. The adapter test verifies the escaped actual directory and all four controls; the successful UI test verifies pending-none after a real-store reopen; the provider-free CLI undo test verifies exact persisted version `1` after reopen. Observed `mise run //apps/kuru-tui:test -- real_pty_accepts_chat_navigation_commands_and_restores_terminal` exit 0, 1 test (`/private/tmp/kuru-memory-notice-pty-test.log`), plus `mise run //apps/kuru-tui:test -- notice` exit 0, 5 tests (`/private/tmp/kuru-memory-notice-focused-tests-final2.log`).
+- [x] 1.2 @runtime (agent) drove failing and successful initial draws through the existing UI backend -> a failed draw leaves the marker pending, successful draw records before controlled input, and a capturing provider's real turn request omits notice text. Observed 5 focused tests exit 0 (`/private/tmp/kuru-memory-notice-focused-tests-final-rerun.log`).
+
+## 2. Headless and provider-free boundaries [critical]
+
+- [x] 2.1 @integration (agent) ran isolated JSON `kuru run` twice and provider-free `undo-dream` -> first stderr contains the notice, JSON stdout remains parseable, the warm run retains only startup progress, and undo reaches its ordinary no-dream failure without `OPENAI_API_KEY` or provider construction. Observed `cli_memory_progress_is_bounded_and_keeps_json_on_stdout` and `cli_undo_dream_shows_one_notice_without_constructing_a_provider` exit 0 (`/private/tmp/kuru-memory-notice-cli-progress-test.log`, `/private/tmp/kuru-memory-notice-focused-tests-final-rerun.log`).
+- [x] 2.2 @integration (agent) ran the existing storage-free inspection regression -> help/config/models/tools/sessions and missing memory controls do not create memory state. Observed `fresh_inspection_never_provisions_memory_and_history_is_read_only` exit 0 (`/private/tmp/kuru-memory-notice-fresh-inspection-test.log`).
+
+## 3. Documentation and quality
+
+- [x] 3.1 @integration (agent) ran owning docs and focused app checks -> public memory docs distinguish the notice, selected revision-preserving forget, and confirmed project purge without automatic expiry or secure-erasure claims. Observed `mise run //apps/kuru-docs:check` exit 0 (`/private/tmp/kuru-memory-notice-docs-check.log`), app typecheck exit 0 (`/private/tmp/kuru-memory-notice-tui-typecheck-final.log`), and app lint exit 0 (`/private/tmp/kuru-memory-notice-tui-lint.log`).
+- [ ] 3.2 @integration (agent) run native Windows UI/CLI notice fixtures and coordinated workspace coverage -> supported platform output/order and workspace coverage are observed.

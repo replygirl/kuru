@@ -170,6 +170,19 @@ fn cli_requires_explicit_project_purge_confirmation_and_removes_its_diagnostics_
     assert_eq!(result["project"], scope);
     assert_eq!(result["legacy_import_suppressed"], true);
     assert!(!ring.exists());
+
+    let reopened = env.run(&["run", "fresh memory after purge", "--json"]);
+    assert!(
+        reopened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert!(serde_json::from_slice::<Value>(&reopened.stdout).is_ok());
+    assert!(
+        String::from_utf8_lossy(&reopened.stderr).contains("Memory is ready at"),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
 }
 
 #[tokio::test]
@@ -1021,9 +1034,9 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     );
     let cold_json: Value = serde_json::from_slice(&cold.stdout).unwrap();
     assert!(cold_json["text"].as_str().unwrap().contains("demo"));
-    assert_eq!(
-        String::from_utf8_lossy(&cold.stderr),
-        concat!(
+    let cold_stderr = String::from_utf8_lossy(&cold.stderr);
+    assert!(
+        cold_stderr.starts_with(concat!(
             "Memory: waiting for project ownership…\n",
             "Memory: waiting for verified runtime cache…\n",
             "Memory: extracting embedded runtime…\n",
@@ -1031,7 +1044,13 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
             "Memory: preparing database…\n",
             "Memory: opening database…\n",
             "Memory: ready.\n",
-        )
+        )),
+        "{cold_stderr}"
+    );
+    assert!(cold_stderr.contains("Memory is ready at"), "{cold_stderr}");
+    assert!(
+        cold_stderr.contains("kuru memory notes ID"),
+        "{cold_stderr}"
     );
 
     let warm_started = std::time::Instant::now();
@@ -1050,6 +1069,66 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     );
     eprintln!(
         "observed isolated CLI startup wall time: cold={cold_elapsed:?}; warm={warm_elapsed:?}; no optimization claim"
+    );
+}
+
+#[tokio::test]
+async fn cli_undo_dream_shows_one_notice_without_constructing_a_provider() {
+    use kuru_memory::MemoryStore;
+
+    let env = Sandbox::new();
+    kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    MemoryStore::open(options.clone())
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+
+    let mut first = env.command_for("responses");
+    let first = first
+        .env_remove("OPENAI_API_KEY")
+        .args(["undo-dream"])
+        .output()
+        .unwrap();
+    assert!(
+        !first.status.success(),
+        "undo without a dream must still fail"
+    );
+    assert!(first.stdout.is_empty());
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first_stderr.contains("Memory is ready at"),
+        "{first_stderr}"
+    );
+    assert!(
+        !first_stderr.contains("OPENAI_API_KEY"),
+        "undo-dream attempted provider setup: {first_stderr}"
+    );
+
+    let reopened = MemoryStore::open(options.clone()).await.unwrap();
+    assert_eq!(
+        reopened
+            .get(&format!("{scope}/notice/memory-storage"))
+            .await
+            .unwrap(),
+        Some(serde_json::json!({"version": 1}))
+    );
+    reopened.close().await.unwrap();
+
+    let mut second = env.command_for("responses");
+    let second = second
+        .env_remove("OPENAI_API_KEY")
+        .args(["undo-dream"])
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(
+        !String::from_utf8_lossy(&second.stderr).contains("Memory is ready at"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
     );
 }
 

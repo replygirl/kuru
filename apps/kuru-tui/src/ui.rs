@@ -28,7 +28,7 @@ use tokio::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::cli::validate_effort;
+use crate::{cli::validate_effort, memory_notice::MemoryNotice};
 
 mod render;
 #[cfg(test)]
@@ -709,13 +709,23 @@ impl Drop for TerminalSession {
 }
 
 pub async fn run(harness: Harness, models: Vec<ModelInfo>) -> Result<()> {
+    run_with_notice(harness, models, None).await
+}
+
+/// App-private notice delivery keeps the public UI adapter independent of
+/// durable presentation state.
+pub(crate) async fn run_with_notice(
+    harness: Harness,
+    models: Vec<ModelInfo>,
+    notice: Option<MemoryNotice>,
+) -> Result<()> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "interactive mode requires a terminal; use kuru run PROMPT"
     );
     let mut guard = TerminalSession::enter(&mut io::stdout())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run_loop(&mut terminal, harness, models).await;
+    let result = run_loop_with_notice(&mut terminal, harness, models, notice).await;
     // Ratatui's Drop may show its cursor. Finish that while terminal output
     // processing is still active, before restoring the caller's console modes.
     drop(terminal);
@@ -726,15 +736,16 @@ pub async fn run(harness: Harness, models: Vec<ModelInfo>) -> Result<()> {
     }
 }
 
-async fn run_loop<B: Backend>(
+async fn run_loop_with_notice<B: Backend>(
     terminal: &mut Terminal<B>,
     harness: Harness,
     models: Vec<ModelInfo>,
+    notice: Option<MemoryNotice>,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
 {
-    run_loop_with_stream(terminal, harness, models, EventStream::new()).await
+    run_loop_with_stream_and_notice(terminal, harness, models, EventStream::new(), notice).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1027,11 +1038,27 @@ async fn cancel_operation(
     Ok(activity.closed)
 }
 
+#[cfg(test)]
 async fn run_loop_with_stream<B, S>(
     terminal: &mut Terminal<B>,
     harness: Harness,
     models: Vec<ModelInfo>,
+    input: S,
+) -> Result<()>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+    S: Stream<Item = io::Result<TerminalEvent>> + Unpin,
+{
+    run_loop_with_stream_and_notice(terminal, harness, models, input, None).await
+}
+
+async fn run_loop_with_stream_and_notice<B, S>(
+    terminal: &mut Terminal<B>,
+    harness: Harness,
+    models: Vec<ModelInfo>,
     mut input: S,
+    mut notice: Option<MemoryNotice>,
 ) -> Result<()>
 where
     B: Backend,
@@ -1040,6 +1067,11 @@ where
 {
     let initial = project_initial_view(&harness).await?;
     let mut view = View::from_initial(initial, models);
+    if let Some(notice) = &notice {
+        view.transcript
+            .push(("system".into(), notice.text().into()));
+        view.show_scene = false;
+    }
     let mut events = harness.subscribe();
     let harness = Arc::new(Mutex::new(harness));
     let (tx, mut rx) = mpsc::channel::<(u64, Result<DispatchOutcome>)>(8);
@@ -1062,6 +1094,11 @@ where
                     .draw(|frame| draw(frame, &view))
                     .map_err(|error| anyhow::anyhow!("terminal draw: {error}"))?;
                 dirty = false;
+                if let Some(notice) = notice.take() {
+                    // This frame contains the system transcript entry. Persist
+                    // only after it completed and before input is admitted.
+                    notice.record().await?;
+                }
             }
 
             let wake = next_wake(

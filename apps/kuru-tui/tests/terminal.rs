@@ -454,15 +454,28 @@ fn real_event_stream_preserves_co_ready_resize_and_paste() -> Result<()> {
     Ok(())
 }
 
-fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {
+fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> Result<()> {
     let mut command = sandbox.command("demo");
     command.args(["--mode", "freudian"]);
     if reduced {
         command.env("KURU_REDUCED_MOTION", "1");
     }
     let mut terminal = Terminal::spawn(command, 35, 120)?;
-    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
-    terminal.wait_composer_frame(&["KURU", "enter send"], READY_TIMEOUT)?;
+    let expected = if expect_notice {
+        vec!["KURU", "enter send", "Memory is ready at"]
+    } else {
+        vec!["KURU", "enter send"]
+    };
+    terminal.wait_text_with_timeout(
+        &expected,
+        if expect_notice {
+            &[]
+        } else {
+            &["Memory is ready at"]
+        },
+        sandbox.startup_timeout,
+    )?;
+    terminal.wait_composer_frame(&expected, READY_TIMEOUT)?;
     let alternate = terminal
         .output
         .windows(b"\x1b[?1049h".len())
@@ -546,8 +559,8 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {
 #[test]
 fn real_pty_accepts_chat_navigation_commands_and_restores_terminal() -> Result<()> {
     let sandbox = Sandbox::new()?;
-    smoke(&sandbox, false, true)?;
-    smoke(&sandbox, true, false)?;
+    smoke(&sandbox, false, true, true)?;
+    smoke(&sandbox, true, false, false)?;
     assert!(
         sandbox
             .sessions()?

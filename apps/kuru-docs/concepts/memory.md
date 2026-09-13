@@ -57,6 +57,16 @@ error for current local work such as acquiring ownership, checking or extracting
 the runtime, and opening the database. It is not a timer or proof that a stage
 succeeded. Command output, including JSON, remains on standard output.
 
+The first conversation/runtime command (`kuru run`, `kuru dream`, `kuru
+undo-dream`, the TUI, or `kuru serve`) that opens a writable project store also
+shows one short local storage notice after the store is actually ready. It names the escaped managed directory and
+links the available controls: `kuru memory notes ID`, `kuru memory export
+--format json --output PATH`, `kuru memory forget ID --note SEQUENCE`, and
+`kuru memory purge --help`. Kuru records that the notice was shown only after
+stderr or the first TUI frame completes. It is not provider input or peer chat.
+Memory and chat do not expire automatically; selected-note forgetting changes
+current memory while retaining earlier Dolt revisions.
+
 The authenticated SQL sidecar runs only while its owning Kuru process needs it. Existing SQLite data is imported from a consistent snapshot; the original and snapshot remain preserved.
 
 Use `kuru memory status` to inspect the store and current revision, `kuru memory
