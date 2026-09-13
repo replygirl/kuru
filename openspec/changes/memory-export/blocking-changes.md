@@ -6,7 +6,7 @@ None.
 
 ## Soft-blocked by
 
-- [ ] `ordered-dolt-migrations` — source-present version-dispatched historical-schema validation and committed receipts; native/integrated gates remain active
+- [x] `ordered-dolt-migrations` — provides version-dispatched historical-schema validation and committed receipts *(archived 2026-09-13)*
 - [ ] `store-api-hazards` — source-present closed-view and deterministic revision inspection semantics; its active record still carries integrated gates
 
 ## Siblings

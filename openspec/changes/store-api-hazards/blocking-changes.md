@@ -6,4 +6,4 @@ None.
 
 ## Soft-blocked by
 
-- [ ] `ordered-dolt-migrations` — provides the current guarded server-close and pinned-Dolt migration baseline used by this correction; its source is present at this branch base, while its final integrated/native verification remains active.
+- [x] `ordered-dolt-migrations` — provides the guarded server-close and pinned-Dolt migration baseline used by this correction *(archived 2026-09-13)*

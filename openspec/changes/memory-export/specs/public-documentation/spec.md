@@ -10,8 +10,11 @@ command-specific noninteractive behavior, redacted review and diagnostic output,
 the non-persistent subset-only one-invocation grant, `config`'s saved-preferences
 omission, and that workspace trust does not provide process sandboxing or an
 atomic Unix cwd binding. It MUST state that provider failure text is classified from
-bounded input rather than treated as authoritative remote text. It MUST describe
-that catalog and completion retries are bounded by one operation deadline and
+bounded input rather than treated as authoritative remote text. The memory
+reference MUST document selected-note sequence IDs and explicit forgetting as an
+active-view deletion that retains prior Dolt revisions and does not claim secure
+erasure, removal of other text, automatic expiry, or a restore command. It MUST
+describe that catalog and completion retries are bounded by one operation deadline and
 finite attempts, apply only to selected rejected provider responses before a
 response is accepted, and do not promise replay after a stream, partial output,
 ambiguous transport outcome, or possibly dispatched credential refresh. It MUST
@@ -22,6 +25,10 @@ history. It MUST distinguish JSON as the interchange format from Markdown's
 equivalent rendering, explain stdout versus checked no-replacement file output,
 and state that uncommitted, candidate-only, prior-revision, and operational data
 are excluded.
+
+#### Scenario: Selected-note retention disclosure
+- **WHEN** a visitor reads the memory command reference
+- **THEN** it explains how to select one stored note and that forgetting leaves prior revisions and unrelated text intact
 
 #### Scenario: First use
 - **WHEN** a visitor follows the first conversation guide
