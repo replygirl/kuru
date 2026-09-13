@@ -183,7 +183,7 @@ impl Rpc {
         {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => self.completion.result(),
-            Err(_) => Err(anyhow::anyhow!("MCP cleanup remains unconfirmed")),
+            Err(_) => self.completion.result(),
         }
     }
 }
@@ -268,6 +268,7 @@ async fn worker(
                 settle(&mut session, reply, result).await
             }
             Command::Close(reply) => {
+                commands.close();
                 let confirmed = session.cleanup(true).await;
                 let result = confirmed
                     .then_some(())
@@ -821,6 +822,11 @@ async fn cleanup_owner(owner: &mut Owner, graceful: bool, deadline: Instant) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Wake, Waker},
+    };
+
     use super::*;
     use crate::{
         IO_TIMEOUT,
@@ -831,6 +837,66 @@ mod tests {
     fn root_guard() -> Arc<Directory> {
         let root = Path::new(".").canonicalize().unwrap();
         Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Pinned).unwrap())
+    }
+
+    struct CloseReplyWake {
+        commands: mpsc::UnboundedSender<Command>,
+        completion: Arc<Completion>,
+        observation: StdMutex<Option<(bool, bool)>>,
+        notified: tokio::sync::Notify,
+    }
+
+    impl Wake for CloseReplyWake {
+        fn wake(self: Arc<Self>) {
+            let observation = (
+                self.commands.is_closed(),
+                self.completion.confirmed.load(Ordering::Acquire),
+            );
+            assert!(
+                lock(&self.observation).replace(observation).is_none(),
+                "close reply receiver woke more than once"
+            );
+            self.notified.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn close_closes_admission_before_publishing_confirmed_completion() {
+        let script = StdioFixture::new([Step::Eof]);
+        let mut rpc = Rpc::spawn(
+            script.command(),
+            &[],
+            &BTreeMap::new(),
+            Path::new("."),
+            root_guard(),
+            Arc::new(Admission::new()),
+        )
+        .unwrap();
+        rpc.ready().await.unwrap();
+
+        let (reply, result) = oneshot::channel();
+        let mut result = Box::pin(result);
+        let wake = Arc::new(CloseReplyWake {
+            commands: rpc.commands.clone(),
+            completion: rpc.completion.clone(),
+            observation: StdMutex::new(None),
+            notified: tokio::sync::Notify::new(),
+        });
+        let waker = Waker::from(wake.clone());
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(result.as_mut().poll(&mut context), Poll::Pending));
+
+        rpc.commands.send(Command::Close(reply)).unwrap();
+        tokio::time::timeout(
+            CLEANUP + GRACE + STDERR_DRAIN + Duration::from_secs(1),
+            wake.notified.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*lock(&wake.observation), Some((true, true)));
+        result.await.unwrap().unwrap();
+        rpc.close().await.unwrap();
+        script.assert_completed(1);
     }
 
     #[tokio::test]
