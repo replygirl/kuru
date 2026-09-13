@@ -22,7 +22,11 @@ uuid.workspace = true
 kuru-memory = { workspace = true, features = ["test-support"] }
 async-trait.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+nix.workspace = true
 
 [lints]
 workspace = true

@@ -1609,6 +1609,7 @@ dependencies = [
  "kuru-connectors",
  "kuru-core",
  "kuru-memory",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",

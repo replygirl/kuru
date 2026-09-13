@@ -711,7 +711,7 @@ impl Harness {
     }
 
     #[cfg(test)]
-    async fn pause_after_memory_write(&mut self) -> Result<()> {
+    pub(crate) async fn pause_after_memory_write(&mut self) -> Result<()> {
         let Some(pause) = self.publication_pause.take() else {
             return Ok(());
         };

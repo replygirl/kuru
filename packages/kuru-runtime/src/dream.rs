@@ -193,6 +193,8 @@ impl Harness {
             updates,
         });
         candidate.promote().await?;
+        #[cfg(test)]
+        self.pause_after_memory_write().await?;
         self.publish_pending();
         Ok(())
     }
@@ -386,4 +388,163 @@ fn dream_tool() -> ToolSpec {
         {"type":"object","properties":{"action":{"const":"retire","type":"string"},"id":{"type":"string"}},"required":["action","id"],"additionalProperties":false}
     ]});
     tool
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use std::sync::Arc;
+
+    use kuru_connectors::DemoProvider;
+    use kuru_core::{Config, Mode};
+    use kuru_memory::MemoryStore;
+
+    use super::*;
+
+    fn config() -> Config {
+        Config {
+            mode: Mode::Freudian,
+            provider: "demo".into(),
+            model: "demo".into(),
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_dream_keeps_an_accepted_candidate_write_isolated() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            config(),
+            project.path(),
+            memory.clone(),
+            Arc::new(DemoProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let live_revision = memory.revision().await.unwrap();
+        let candidate = memory
+            .begin_candidate("cancelled dream write")
+            .await
+            .unwrap();
+        candidate
+            .view()
+            .append("candidate-proof", "dream", "accepted candidate only")
+            .await
+            .unwrap();
+        let candidate_revision = candidate.view().revision().await.unwrap();
+        assert_ne!(candidate_revision, live_revision);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = harness
+            .finish_dream(
+                &candidate,
+                harness.topology.clone(),
+                &DreamReport::default(),
+                &cancellation,
+            )
+            .await
+            .unwrap_err();
+        assert!(turn_was_cancelled(&error));
+        assert_eq!(memory.revision().await.unwrap(), live_revision);
+        assert!(
+            memory
+                .history("candidate-proof", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            candidate
+                .view()
+                .history("candidate-proof", 10)
+                .await
+                .unwrap()[0]
+                .content,
+            "accepted candidate only"
+        );
+        assert_eq!(
+            candidate.view().revision().await.unwrap(),
+            candidate_revision
+        );
+        drop(candidate);
+        harness
+            .run("continue after candidate cancellation")
+            .await
+            .unwrap();
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_dream_promotion_wins_cancellation_and_publishes_exactly() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            config(),
+            project.path(),
+            memory.clone(),
+            Arc::new(DemoProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let scope = harness.scope.clone();
+        let role = harness.topology.parts[0].role.clone();
+        let (topology, report) = harness
+            .plan_dream(vec![DreamProposal::Add {
+                name: "Accepted promotion".into(),
+                role,
+                instruction: "Remain durable when cancellation loses the promotion race".into(),
+            }])
+            .unwrap();
+        let expected = serde_json::to_value(&topology).unwrap();
+        let before = memory.revision().await.unwrap();
+        let candidate = memory.begin_candidate("accepted promotion").await.unwrap();
+        let (promoted, release) = harness.pause_after_next_memory_write();
+        let cancellation = CancellationToken::new();
+        let controlled = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let result = harness
+                .finish_dream(&candidate, topology, &report, &controlled)
+                .await;
+            (harness, candidate, result)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), promoted)
+            .await
+            .expect("dream promotion did not reach accepted publication")
+            .unwrap();
+        let accepted = memory.revision().await.unwrap();
+        assert_ne!(accepted, before);
+        cancellation.cancel();
+        release.send(()).unwrap();
+        let (mut harness, candidate, result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .expect("accepted dream promotion did not settle")
+                .unwrap();
+        result.unwrap();
+        assert_eq!(memory.revision().await.unwrap(), accepted);
+        assert_eq!(candidate.view().revision().await.unwrap(), accepted);
+        assert_eq!(serde_json::to_value(&harness.topology).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(
+                read_topology(&memory, &scope, Mode::Freudian)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            expected
+        );
+        assert!(harness.pending_publication.is_none());
+        drop(candidate);
+        harness
+            .run("continue after accepted promotion")
+            .await
+            .unwrap();
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
 }

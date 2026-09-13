@@ -7,15 +7,15 @@
 ## 2. Explicit runtime cancellation
 
 - [x] 2.1 Add one cancellation token and controlled run entrypoint, carry it through actor mailbox/semaphore/provider waits, and persist interruption after accepted writes settle; verify cancellation at each actor boundary releases the permit and permits a later turn
-- [ ] 2.2 Observe the same token around built-in/MCP tools, cognitive operations, peer requests, and outbound A2A without changing provider or ToolHost public traits; verify pre-dispatch exclusion, one observed ambiguous dispatch without replay, reconciled memory writes, and retained process cleanup
-- [ ] 2.3 Make turn and standalone dreaming cancellable across actor work, candidate writes, and promotion reconciliation; verify active history remains valid, accepted promotion is published exactly, and abandoned candidates are not deleted
+- [x] 2.2 Observe the same token around built-in/MCP tools, cognitive operations, peer requests, and outbound A2A without changing provider or ToolHost public traits; verify pre-dispatch exclusion, one observed ambiguous dispatch without replay, reconciled memory writes, and retained process cleanup
+- [x] 2.3 Make turn and standalone dreaming cancellable across actor work, candidate writes, and promotion reconciliation; verify active history remains valid, accepted promotion is published exactly, and abandoned candidates are not deleted
 - [x] 2.4 Freeze the existing-shape `TurnOutput` at the ended checkpoint before response publication and periodic dream maintenance; verify cancellation or dream failure after completion returns the stored byte-equivalent output and only broadcasts later dream activity
 
 ## 3. Application and shutdown integration
 
 - [ ] 3.1 Replace normal TUI job abort with signal-and-settle cancellation while retaining generation fencing and abnormal-exit cleanup; verify real PTY interruption, completion-race authority, next-command usability, and unchanged plain/JSON run shapes
 - [x] 3.2 Route inbound A2A message IDs through controlled turns and return bounded mismatch/uncertainty failures; verify duplicate completed requests reuse one answer without another provider/tool call
-- [ ] 3.3 Bound shutdown dreaming with an aggregate cancellation deadline and always attempt existing actor and ToolHost cleanup; verify dream timeout and cleanup failure are both reported without treating the deadline as process cleanup proof
+- [x] 3.3 Bound shutdown dreaming with an aggregate cancellation deadline and always attempt existing actor and ToolHost cleanup; verify dream timeout and cleanup failure are both reported without treating the deadline as process cleanup proof
 
 ## 4. Documentation and coordinated verification
 
