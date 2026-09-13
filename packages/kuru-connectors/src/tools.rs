@@ -1190,7 +1190,27 @@ mod tests {
         assert!(!format!("{failure:#} {failure:?}").contains(SECRET));
         assert_eq!(failure.chain().count(), 1);
         host.shutdown().await.unwrap();
-        peer.assert_completed(1);
+        assert_eq!(
+            peer.conversations(),
+            vec![vec![
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":1,
+                    "method":"initialize",
+                    "params":{
+                        "protocolVersion":"2025-11-25",
+                        "capabilities":{},
+                        "clientInfo":{"name":"kuru","version":env!("CARGO_PKG_VERSION")},
+                    },
+                }),
+                json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+                json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remote","arguments":{}}}),
+                json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"remote","arguments":{}}}),
+                json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"remote","arguments":{}}}),
+            ]],
+            "the protocol-error cleanup may terminate the peer before its planned EOF, but it must not skip or replay a request"
+        );
     }
 
     #[tokio::test]

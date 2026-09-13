@@ -43,4 +43,19 @@
 - Exact-base push gate: all eight normal hook categories exited 0 at `4de6b2a19ea24e458867d765916d697120ed3a47`; combined LCOV covered 27,740 of 29,085 lines (95.3756%). This predates the three proof-only tests above, so their combined coverage remains pending.
 - Strict cospec validation and the acknowledged apply gate exited 0 with only the declared `tool-result-redaction` and `owned-unix-shell-lifecycle` soft blockers.
 
-Pending: one coordinated workspace coverage run including the proof-only additions; native Linux and Windows ownership/stderr execution; the unchecked compound rows above whose complete multi-surface fixture composition has not yet run. Cross-compilation is not recorded as native evidence.
+Pending: native Windows ownership/stderr execution and the unchecked compound rows above whose complete multi-surface fixture composition has not yet run. Coordinated coverage and hosted macOS/Linux execution are observed; cross-compilation is not recorded as native evidence.
+
+- Exact-base hook: `b8c186f` completed all eight normal hook categories; the
+  authoritative LCOV total was 27,966/29,315 (95.3983%).
+- Hosted macOS run `34742573359` failed only
+  `toolhost_stdio_mcp_projects_application_success_and_protocol_results`: its
+  fixture recorded initialize, initialized, list, and exactly three calls, then
+  protocol-error cleanup ended the peer before its planned `Step::Eof`
+  created `.done`. `.done` is not guaranteed during protocol-error cleanup; the
+  correction asserts the complete ordered wire transcript after successful
+  `ToolHost::shutdown` instead. The focused local test, connector typecheck, and
+  connector lint each passed after the correction.
+
+- Hosted CI `34743613521` observed hosted Linux fully green and instrumented
+  macOS green for the b8 base. The exact base hook remains the authoritative
+  27,966/29,315 (95.3983%) LCOV evidence; native Windows remains pending.
