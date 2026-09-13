@@ -28,6 +28,17 @@ impl fmt::Display for Operation {
     }
 }
 
+impl Operation {
+    pub(super) const fn tracing_label(self) -> &'static str {
+        match self {
+            Self::ResponsesCompletion => "responses-completion",
+            Self::ResponsesCatalog => "responses-catalog",
+            Self::ChatgptCompletion => "chatgpt-completion",
+            Self::ChatgptCatalog => "chatgpt-catalog",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum TransportKind {
     Timeout,

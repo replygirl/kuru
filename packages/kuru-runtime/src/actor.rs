@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use kuru_connectors::Provider;
@@ -9,8 +13,9 @@ use tokio::{
     sync::{Semaphore, mpsc, oneshot},
     task::JoinHandle,
 };
+use tracing::Instrument;
 
-use crate::engine::CancellationToken;
+use crate::engine::{CancellationToken, turn_was_cancelled};
 
 #[derive(Debug)]
 pub(crate) struct MemoryFailure(pub anyhow::Error);
@@ -30,6 +35,7 @@ pub(crate) struct Work {
     pub tools: Vec<ToolSpec>,
     pub history_limit: usize,
     pub cancellation: CancellationToken,
+    pub span: tracing::Span,
     pub reply: oneshot::Sender<Result<Completion>>,
 }
 
@@ -43,6 +49,8 @@ impl Actor {
         let (tx, mut rx) = mpsc::channel::<Work>(16);
         let task = tokio::spawn(async move {
             while let Some(mut work) = rx.recv().await {
+                let span = work.span.clone();
+                let started = Instant::now();
                 let run = async {
                     work.cancellation.check()?;
                     let _permit = work
@@ -145,10 +153,24 @@ impl Actor {
                     }
                     Ok(completion)
                 };
-                tokio::select! {
-                    result = run => { let _ = work.reply.send(result); }
-                    () = work.reply.closed() => {}
+                async {
+                    tokio::select! {
+                        result = run => {
+                            let status = match &result {
+                                Ok(_) => "ok",
+                                Err(error) if turn_was_cancelled(error) => "cancelled",
+                                Err(_) => "error",
+                            };
+                            tracing::info!(target: "kuru.actor", status, elapsed_ms = started.elapsed().as_millis() as u64, "actor completion finished");
+                            let _ = work.reply.send(result);
+                        }
+                        () = work.reply.closed() => {
+                            tracing::info!(target: "kuru.actor", status = "cancelled", elapsed_ms = started.elapsed().as_millis() as u64, "actor completion caller closed");
+                        }
+                    }
                 }
+                .instrument(span)
+                .await;
             }
         });
         Self { tx, task }

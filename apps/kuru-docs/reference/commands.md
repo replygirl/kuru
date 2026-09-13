@@ -81,6 +81,7 @@ unchanged. For API-key access, set `OPENAI_API_KEY` and select
 | `-C`, `--directory PATH` | Select the project directory                                               |
 | `--config PATH`          | Add a final configuration-file layer                                       |
 | `--data-dir PATH`        | Choose a separate private storage directory                                |
+| `--debug`                | Add bounded local operational detail for runtime-owning commands           |
 | `--provider NAME`        | Choose `codex`, `responses`, or `demo`                                     |
 | `--mode NAME`            | Choose a framework                                                         |
 | `--model ID`             | Choose a model                                                             |

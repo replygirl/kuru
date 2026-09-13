@@ -59,6 +59,12 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        help = "Record additional bounded local operational diagnostics"
+    )]
+    pub debug: bool,
+    #[arg(
+        long,
+        global = true,
         help = "Authorize this command's reviewed workspace authority without saving approval"
     )]
     pub trust_workspace_once: bool,
@@ -424,7 +430,16 @@ pub async fn run() -> Result<()> {
     execute(Cli::parse()).await
 }
 
+/// Binary-only entrypoint. Library callers remain subscriber-neutral.
+pub async fn run_with_diagnostics() -> Result<()> {
+    execute_inner(Cli::parse(), true).await
+}
+
 pub async fn execute(cli: Cli) -> Result<()> {
+    execute_inner(cli, false).await
+}
+
+async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     if let Some(Command::Update {
         version,
         release_base,
@@ -565,6 +580,12 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 }
         )
     );
+    let runtime_owner = matches!(
+        cli.command,
+        None | Some(
+            Command::Run { .. } | Command::Dream | Command::UndoDream | Command::Serve { .. }
+        )
+    );
     let exists = MemoryStore::exists(&data, &scope)?;
     let memory_control = matches!(
         cli.command,
@@ -596,17 +617,38 @@ pub async fn execute(cli: Cli) -> Result<()> {
     } else {
         None
     };
+    let mut diagnostics = if install_diagnostics && runtime_owner {
+        crate::diagnostics::install(&data, &scope, cli.debug)?
+    } else {
+        None
+    };
     // A new installation can inspect configuration without creating state. An
     // existing store supplies only this project's interactive choices, never a
     // resumed transcript. Refuse tool-root storage before opening its database.
-    let existing_memory = if exists || legacy {
+    let existing_memory = match async {
+        if !exists && !legacy {
+            return Ok::<Option<MemoryStore>, anyhow::Error>(None);
+        }
         ensure_outside_workspace(&data, &cwd)?;
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config.clone();
         options.read_only = !writer && !migrate;
-        Some(open_memory(options).await?)
-    } else {
-        None
+        Ok(Some(open_memory(options).await?))
+    }
+    .await
+    {
+        Ok(memory) => memory,
+        Err(error) => {
+            if let Some(diagnostics) = diagnostics.take()
+                && let Err(finish) = diagnostics.finish()
+            {
+                let _ = finish;
+                return Err(
+                    error.context("diagnostic cleanup also failed; diagnostics may be incomplete")
+                );
+            }
+            return Err(error);
+        }
     };
     // Keep cleanup outside every command/error return and retain the project
     // lease until the owned supervisor has reaped Dolt.
@@ -800,8 +842,25 @@ pub async fn execute(cli: Cli) -> Result<()> {
     } else {
         Ok(())
     };
-    result?;
-    cleanup
+    let diagnostic_cleanup = match diagnostics {
+        Some(diagnostics) => diagnostics.finish(),
+        None => Ok(()),
+    };
+    match (result, cleanup, diagnostic_cleanup) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(()), Err(_)) => {
+            eprintln!("diagnostic cleanup failed; diagnostics may be incomplete");
+            Ok(())
+        }
+        (Err(primary), _, Err(_)) => {
+            Err(primary.context("diagnostic cleanup also failed; diagnostics may be incomplete"))
+        }
+        (Err(primary), _, Ok(())) => Err(primary),
+        (Ok(()), Err(error), Err(_)) => {
+            Err(error.context("diagnostic cleanup also failed; diagnostics may be incomplete"))
+        }
+        (Ok(()), Err(error), Ok(())) => Err(error),
+    }
 }
 
 fn report_mcp_statuses(statuses: &[McpStatus]) {

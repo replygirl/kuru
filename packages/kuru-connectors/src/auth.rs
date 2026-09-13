@@ -5,8 +5,9 @@ use serde::Serialize;
 use std::{
     path::PathBuf,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tracing::Instrument;
 
 use crate::retry::{OperationBudget, RefreshAllowance};
 
@@ -260,6 +261,8 @@ impl AuthManager {
         // A refresh can rotate its token after the caller disappears. The same
         // bounded worker owns its reactor, lease, response and durable write.
         let deadline = allowance.deadline();
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         std::thread::Builder::new()
             .name("kuru-auth-refresh".into())
             .spawn(move || {
@@ -269,10 +272,15 @@ impl AuthManager {
                         .enable_all()
                         .build()
                         .context("create authentication refresh runtime")?;
-                    runtime.block_on(async {
-                        manager
-                            .refresh_owned(observed, allowance, &mut sender)
-                            .await
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        runtime.block_on(
+                            async {
+                                manager
+                                    .refresh_owned(observed, allowance, &mut sender)
+                                    .await
+                            }
+                            .instrument(span),
+                        )
                     })
                 })();
                 let _ = sender.send(result);
@@ -291,6 +299,7 @@ impl AuthManager {
         allowance: RefreshAllowance,
         sender: &mut tokio::sync::oneshot::Sender<Result<RequestCredentials>>,
     ) -> Result<RequestCredentials> {
+        let started = Instant::now();
         let lease = self
             .inner
             .store
@@ -370,6 +379,7 @@ impl AuthManager {
             Err(http::RefreshFailure::NotDispatched) if allowance.can_repeat_refresh() => {
                 match allowance.retry_delay() {
                     crate::retry::RetryDecision::Delay(delay) => {
+                        tracing::info!(target: "kuru.provider", operation = "chatgpt-refresh", status = "not-dispatched", delay_ms = delay.as_millis() as u64, elapsed_ms = started.elapsed().as_millis() as u64, "refresh retry scheduled");
                         if let Err(error) = wait_refresh_backoff(sender, &allowance, delay).await {
                             if rollback_refresh(&lease, &pending, &previous).is_err() {
                                 bail!(
@@ -380,6 +390,7 @@ impl AuthManager {
                         }
                     }
                     crate::retry::RetryDecision::Exhausted => {
+                        tracing::info!(target: "kuru.provider", operation = "chatgpt-refresh", status = "retry-exhausted", elapsed_ms = started.elapsed().as_millis() as u64, "refresh retry exhausted");
                         rollback_refresh(&lease, &pending, &previous)?;
                         bail!("ChatGPT refresh retry budget exhausted")
                     }
@@ -411,6 +422,7 @@ impl AuthManager {
                 match prepared.send(allowance.deadline()).await {
                     Ok(response) => response,
                     Err(http::RefreshFailure::NotDispatched) => {
+                        tracing::info!(target: "kuru.provider", operation = "chatgpt-refresh", status = "not-dispatched-terminal", elapsed_ms = started.elapsed().as_millis() as u64, "refresh retry terminal");
                         rollback_refresh(&lease, &pending, &previous)?;
                         bail!("OpenAI authentication connection failed before token dispatch")
                     }

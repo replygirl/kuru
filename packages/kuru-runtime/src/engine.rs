@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore, broadcast, oneshot};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
@@ -447,15 +448,34 @@ impl Harness {
     }
 
     fn turn_journal_key(&self, id: &str) -> String {
+        format!(
+            "{}/session/{}/turn/{}",
+            self.scope,
+            self.session.id,
+            self.turn_correlation(id)
+        )
+    }
+
+    fn turn_correlation(&self, id: &str) -> String {
         let mut digest = Sha256::new();
         digest.update(b"kuru.turn-journal.v1\0");
         digest.update(id.as_bytes());
-        let digest = digest
+        digest
             .finalize()
             .iter()
             .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        format!("{}/session/{}/turn/{}", self.scope, self.session.id, digest)
+            .collect()
+    }
+
+    fn actor_correlation(&self, id: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"kuru.actor-trace.v1\0");
+        digest.update(id.as_bytes());
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     async fn admit_turn(
@@ -984,6 +1004,7 @@ impl Harness {
             tools,
             history_limit,
             cancellation: cancellation.clone(),
+            span: tracing::info_span!(target: "kuru.actor", "actor", actor = self.actor_correlation(id), operation = "completion"),
             reply,
         };
         cancellation
@@ -1044,18 +1065,33 @@ impl Harness {
                 resolved_target,
             } => (key, journal, resolved_target),
         };
+        let turn = self.turn_correlation(turn_id);
+        let span = tracing::info_span!(
+            target: "kuru.runtime",
+            "turn",
+            session = self.session.id.as_str(),
+            turn = turn.as_str(),
+            operation = "turn"
+        );
+        let started = std::time::Instant::now();
         let result = self
             .run_admitted(prompt, resolved_target, &key, &mut journal, cancellation)
+            .instrument(span.clone())
             .await;
         match result {
             Err(error) => {
                 if let Some(output) = self.record_interruption(&key, journal).await? {
+                    tracing::info!(target: "kuru.runtime", parent: &span, status = "interrupted", elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
                     Ok(output)
                 } else {
+                    tracing::info!(target: "kuru.runtime", parent: &span, status = if turn_was_cancelled(&error) { "cancelled" } else { "error" }, elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
                     Err(error)
                 }
             }
-            result => result,
+            Ok(output) => {
+                tracing::info!(target: "kuru.runtime", parent: &span, status = "ok", elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
+                Ok(output)
+            }
         }
     }
 
@@ -1266,10 +1302,33 @@ impl Harness {
                         }
                         result
                     } else {
-                        match cancellation
+                        let span = tracing::info_span!(
+                            target: "kuru.tool",
+                            "tool",
+                            tool = "external",
+                            operation = "external"
+                        );
+                        let started = std::time::Instant::now();
+                        let result = cancellation
                             .wait(self.tools.execute(&call.name, call.arguments.clone()))
-                            .await
-                        {
+                            .instrument(span.clone())
+                            .await;
+                        let status = match &result {
+                            Ok(output)
+                                if call.name == "shell"
+                                    && serde_json::from_str::<Value>(output)
+                                        .ok()
+                                        .and_then(|value| value["success"].as_bool())
+                                        == Some(false) =>
+                            {
+                                "error"
+                            }
+                            Ok(_) => "ok",
+                            Err(error) if turn_was_cancelled(error) => "cancelled",
+                            Err(_) => "error",
+                        };
+                        tracing::info!(target: "kuru.tool", parent: &span, status, elapsed_ms = started.elapsed().as_millis() as u64, "external tool finished");
+                        match result {
                             Err(error) if turn_was_cancelled(&error) => return Err(error),
                             result => result,
                         }
@@ -1390,6 +1449,39 @@ impl Harness {
     }
 
     async fn cognitive_call(
+        &mut self,
+        sender: &str,
+        call: &ToolCall,
+        pending: &mut BTreeMap<String, Vec<Message>>,
+        cancellation: &CancellationToken,
+    ) -> Result<String> {
+        let span = tracing::info_span!(
+            target: "kuru.tool",
+            "tool",
+            tool = "cognitive",
+            operation = "cognitive"
+        );
+        let started = std::time::Instant::now();
+        let result = self
+            .cognitive_call_inner(sender, call, pending, cancellation)
+            .instrument(span.clone())
+            .await;
+        let status = match &result {
+            Ok(_) => "ok",
+            Err(error) if turn_was_cancelled(error) => "cancelled",
+            Err(_) => "error",
+        };
+        tracing::info!(
+            target: "kuru.tool",
+            parent: &span,
+            status,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "cognitive tool finished"
+        );
+        result
+    }
+
+    async fn cognitive_call_inner(
         &mut self,
         sender: &str,
         call: &ToolCall,

@@ -147,3 +147,9 @@ and its process-authority limits.
 `serve` exposes the authenticated local A2A subset; see [protocols](protocols.md).
 `update` installs an explicit verified release or rebuilds a chosen source
 checkout; see [installation](install.md).
+
+Runtime-owning commands keep a small fixed set of private per-project diagnostic
+files while they run. `--debug` adds bounded operational status detail to those
+files; it does not enable `RUST_LOG`, capture prompts, tool arguments/results,
+credentials, or remote error text, and it does not change command stdout or TUI
+rendering. These files are operational diagnostics, not conversation history.

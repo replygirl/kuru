@@ -123,6 +123,21 @@ impl Sandbox {
     }
 }
 
+fn diagnostics(data: &std::path::Path) -> Result<String> {
+    std::fs::read_dir(data.join("diagnostics"))
+        .context("read PTY diagnostics root")?
+        .flatten()
+        .map(|entry| entry.path())
+        .flat_map(|scope| {
+            std::fs::read_dir(scope)
+                .into_iter()
+                .flat_map(|entries| entries.flatten())
+        })
+        .map(|entry| std::fs::read_to_string(entry.path()))
+        .collect::<std::io::Result<String>>()
+        .map_err(Into::into)
+}
+
 // Re-executed by the terminal driver tests, with an explicit mode. Keeping this
 // subprocess entry in the test binary avoids shipping a fixture executable.
 #[test]
@@ -604,7 +619,9 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     }));
     let mut command = sandbox.command("responses");
     command
-        .args(["--model", "fixture", "--mode", "freudian", "--config"])
+        .args([
+            "--debug", "--model", "fixture", "--mode", "freudian", "--config",
+        ])
         .arg(config)
         .env("KURU_FIXTURE_KEY", "fixture")
         .env("KURU_REDUCED_MOTION", "1");
@@ -644,6 +661,18 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     terminal.send(b"/quit\r")?;
     terminal.wait_exit(EXIT_TIMEOUT)?;
     terminal.assert_restored()?;
+    let transcript = String::from_utf8_lossy(&terminal.output);
+    ensure!(
+        !transcript.contains("span_open") && !transcript.contains("diagnostics"),
+        "debug diagnostics leaked to the PTY transcript: {transcript}"
+    );
+    let logs = diagnostics(&sandbox.data)?;
+    ensure!(logs.contains("\"target\":\"kuru.actor\""));
+    ensure!(logs.contains("\"status\":\"cancelled\""));
+    ensure!(
+        logs.contains("span_close"),
+        "cancelled spans were not closed"
+    );
 
     let sessions = sandbox.sessions()?;
     assert_eq!(sessions.len(), 1);
