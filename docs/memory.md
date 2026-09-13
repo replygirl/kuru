@@ -9,6 +9,7 @@ generated local credentials and runs only while its owning Kuru process needs it
 kuru memory status
 kuru memory history
 kuru memory notes ID --limit 100
+kuru memory forget ID --note SEQUENCE
 ```
 
 Status identifies the current project store, branch and revision. History lists
@@ -22,6 +23,12 @@ the newest requested messages in chronological order, with `requested_limit`
 and `truncated` in the result. `kuru memory notes ID --limit N` accepts N from
 1 through 1000 and defaults to 100. It reads an existing current Dolt store and
 does not import legacy SQLite data or create memory for a fresh project.
+
+Each returned note includes its stable `sequence` and stored `role`, including
+notes written by dreaming. `kuru memory forget ID --note SEQUENCE` removes that
+one row from the selected identity's active notes namespace and records a new
+Dolt revision. It does not remove conversations, other notes, or older revisions;
+it is not secure erasure and does not provide a history-recovery command.
 
 ## Runtime and offline use
 

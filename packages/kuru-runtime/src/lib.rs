@@ -8,8 +8,8 @@ pub mod server;
 pub use bus::PeerMessage;
 pub use dream::{DreamProposal, DreamReport, undo_dream};
 pub use engine::{
-    Event, Harness, NotesView, Session, StateReport, Topology, TurnOutput, project_scope,
-    read_notes,
+    Event, ForgetNoteResult, Harness, NotesView, Session, StateReport, Topology, TurnOutput,
+    forget_note, project_scope, read_notes,
 };
 
 #[cfg(test)]

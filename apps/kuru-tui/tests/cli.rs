@@ -342,6 +342,13 @@ fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
         !env.data.exists(),
         "fresh notes inspection created memory state"
     );
+    let output = env.run(&["memory", "forget", "missing", "--note", "1"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+    assert!(
+        !env.data.exists(),
+        "fresh selected-note deletion created memory state"
+    );
     std::fs::write(&config_path, config).unwrap();
     env.success(&["run", "Make a durable revision"]);
     let sessions = env.success(&["sessions"]);
@@ -425,6 +432,14 @@ async fn notes_cli_reads_existing_modes_without_provider_or_legacy_import() {
         .unwrap();
     memory
         .append(
+            &format!("{scope}/freudian/identity/{freudian_id}/notes"),
+            "dream",
+            "FREUDIAN-DREAM",
+        )
+        .await
+        .unwrap();
+    memory
+        .append(
             &format!("{scope}/ifs/identity/{ifs_id}/notes"),
             "note",
             "IFS-NOTE",
@@ -448,6 +463,42 @@ async fn notes_cli_reads_existing_modes_without_provider_or_legacy_import() {
     assert_eq!(saved["identity"], freudian_id);
     assert_eq!(saved["requested_limit"], 100);
     assert_eq!(saved["notes"][0]["content"], "FREUDIAN-NOTE");
+    assert_eq!(saved["notes"][1]["role"], "dream");
+    let dream_sequence = saved["notes"][1]["sequence"].as_i64().unwrap();
+
+    let mut forget_command = env.command_for("responses");
+    forget_command.env_remove("OPENAI_API_KEY").args([
+        "memory",
+        "forget",
+        &freudian_id,
+        "--note",
+        &dream_sequence.to_string(),
+    ]);
+    let output = forget_command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let forgotten: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(forgotten["mode"], "freudian");
+    assert_eq!(forgotten["identity"], freudian_id);
+    assert_eq!(forgotten["sequence"], dream_sequence);
+    assert_eq!(forgotten["history_retained"], true);
+
+    let mut after_command = env.command_for("responses");
+    after_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "notes", &freudian_id]);
+    let output = after_command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(after["notes"].as_array().map(Vec::len), Some(1));
+    assert_eq!(after["notes"][0]["content"], "FREUDIAN-NOTE");
 
     let mut explicit_command = env.command_for("responses");
     explicit_command
@@ -494,7 +545,12 @@ async fn notes_cli_reads_existing_modes_without_provider_or_legacy_import() {
     let output = legacy.run(&["memory", "notes", "missing"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
-    assert_eq!(std::fs::read(path).unwrap(), original);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(!legacy.data.join("memory").exists());
+    let output = legacy.run(&["memory", "forget", "missing", "--note", "1"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
     assert!(!legacy.data.join("memory").exists());
 }
 

@@ -1,10 +1,10 @@
 use anyhow::Result;
 use kuru_core::{Framework, Mode, Relationship, RelationshipKind};
-use kuru_memory::MemoryStore;
+use kuru_memory::{MemoryStore, StoredNote};
 use serde_json::to_value;
 use tempfile::TempDir;
 
-use crate::{NotesView, Topology, project_scope, read_notes};
+use crate::{NotesView, Topology, forget_note, project_scope, read_notes};
 
 async fn seeded(mode: Mode) -> (TempDir, MemoryStore, String, Topology) {
     let project = tempfile::tempdir().unwrap();
@@ -59,7 +59,8 @@ async fn notes_view_is_provider_free_and_separate_from_conversation() {
         NotesView {
             mode: Mode::Ifs,
             identity,
-            notes: vec![kuru_core::Message {
+            notes: vec![StoredNote {
+                sequence: view.notes[0].sequence,
                 role: "note".into(),
                 content: "NOTE-MARKER".into(),
             }],
@@ -67,6 +68,58 @@ async fn notes_view_is_provider_free_and_separate_from_conversation() {
             truncated: false,
         }
     );
+}
+
+#[tokio::test]
+async fn forgetting_exact_current_note_keeps_dream_rows_and_other_namespaces() -> Result<()> {
+    let (project, memory, scope, topology) = seeded(Mode::Ifs).await;
+    let identity = topology.parts[0].id.clone();
+    let notes = notes_key(&scope, Mode::Ifs, &identity);
+    let transcript = format!("{scope}/ifs/identity/{identity}");
+    memory.append(&notes, "note", "KEEP-NOTE").await?;
+    memory.append(&notes, "dream", "REMOVE-DREAM").await?;
+    memory
+        .append(&transcript, "user", "CONVERSATION-REMAINS")
+        .await?;
+    let before = read_notes(&memory, project.path(), Mode::Ifs, &identity, 100).await?;
+    let dream = before
+        .notes
+        .iter()
+        .find(|row| row.role == "dream")
+        .expect("dream-authored notes are visible");
+    let deleted = forget_note(
+        &memory,
+        project.path(),
+        Mode::Ifs,
+        &identity,
+        dream.sequence,
+    )
+    .await?;
+    assert_eq!(deleted.identity, identity);
+    assert_eq!(deleted.sequence, dream.sequence);
+    assert!(deleted.history_retained);
+    let after = read_notes(&memory, project.path(), Mode::Ifs, &identity, 100).await?;
+    assert_eq!(after.notes.len(), 1);
+    assert_eq!(after.notes[0].role, "note");
+    assert_eq!(after.notes[0].content, "KEEP-NOTE");
+    assert_eq!(
+        memory.history(&transcript, 10).await?[0].content,
+        "CONVERSATION-REMAINS"
+    );
+    let committed = memory.revision().await?;
+    assert!(
+        forget_note(
+            &memory,
+            project.path(),
+            Mode::Ifs,
+            &identity,
+            dream.sequence
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(memory.revision().await?, committed);
+    Ok(())
 }
 
 #[tokio::test]
@@ -99,6 +152,8 @@ async fn notes_view_reads_exact_archived_part_and_relationship_only() {
             .await
             .unwrap();
         assert_eq!(view.identity, *identity);
+        assert_ne!(view.notes[0].sequence, 0);
+        assert_eq!(view.notes[0].role, "note");
         assert_eq!(view.notes[0].content, *identity);
     }
     let archived_name = topology.parts[1].name.clone();

@@ -11,7 +11,7 @@ use kuru_core::{
     Completion, Config, Framework, Message, Mode, ModelPreference, Part, ProjectPreferences,
     Relationship, RelationshipKind, ToolCall, ToolSpec, load_instructions,
 };
-use kuru_memory::{MemoryStatus, MemoryStore, Revision};
+use kuru_memory::{MemoryStatus, MemoryStore, Revision, StoredNote};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -77,9 +77,18 @@ pub struct TurnOutput {
 pub struct NotesView {
     pub mode: Mode,
     pub identity: String,
-    pub notes: Vec<Message>,
+    pub notes: Vec<StoredNote>,
     pub requested_limit: usize,
     pub truncated: bool,
+}
+
+/// The result of removing one selected row from the current active notes view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgetNoteResult {
+    pub mode: Mode,
+    pub identity: String,
+    pub sequence: i64,
+    pub history_retained: bool,
 }
 
 pub struct Harness {
@@ -1135,6 +1144,47 @@ pub async fn read_notes(
         (1..=1000).contains(&limit),
         "notes limit must be between 1 and 1000"
     );
+    let (identity, namespace) = resolve_notes_namespace(memory, cwd, mode, identity).await?;
+    let mut notes = memory.notes(&namespace, limit + 1).await?;
+    let truncated = notes.len() > limit;
+    if truncated {
+        notes.remove(0);
+    }
+    Ok(NotesView {
+        mode,
+        identity,
+        notes,
+        requested_limit: limit,
+        truncated,
+    })
+}
+
+/// Remove a selected current note after resolving the same live-mode namespace
+/// used by read-only notes inspection. The deletion is a new durable revision;
+/// it does not rewrite historical revisions or any other namespace.
+pub async fn forget_note(
+    memory: &MemoryStore,
+    cwd: &Path,
+    mode: Mode,
+    identity: &str,
+    sequence: i64,
+) -> Result<ForgetNoteResult> {
+    let (identity, namespace) = resolve_notes_namespace(memory, cwd, mode, identity).await?;
+    memory.forget_note(&namespace, sequence).await?;
+    Ok(ForgetNoteResult {
+        mode,
+        identity,
+        sequence,
+        history_retained: true,
+    })
+}
+
+async fn resolve_notes_namespace(
+    memory: &MemoryStore,
+    cwd: &Path,
+    mode: Mode,
+    identity: &str,
+) -> Result<(String, String)> {
     ensure!(
         memory.status().await?.branch == "main",
         "notes inspection requires the live memory branch"
@@ -1148,23 +1198,8 @@ pub async fn read_notes(
             serde_json::from_value(value).context("invalid persisted topology for selected mode")
         })?;
     let identity = resolve_human_identity(&topology, identity)?;
-    let mut notes = memory
-        .history(
-            &format!("{scope}/{mode}/identity/{identity}/notes"),
-            limit + 1,
-        )
-        .await?;
-    let truncated = notes.len() > limit;
-    if truncated {
-        notes.remove(0);
-    }
-    Ok(NotesView {
-        mode,
-        identity,
-        notes,
-        requested_limit: limit,
-        truncated,
-    })
+    let namespace = format!("{scope}/{mode}/identity/{identity}/notes");
+    Ok((identity, namespace))
 }
 
 fn resolve_human_identity(topology: &Topology, identity: &str) -> Result<String> {

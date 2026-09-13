@@ -1,5 +1,5 @@
 use kuru_core::Message;
-use kuru_memory::MemoryStore;
+use kuru_memory::{MemoryStore, StoredNote};
 use serde_json::{Value, json};
 
 #[tokio::test]
@@ -130,6 +130,94 @@ async fn clear_state_upserts_and_validation_preserve_unrelated_data() {
     store.put_many(&[]).await.unwrap();
     store.close().await.unwrap();
     assert!(store.put("closed", &json!(1)).await.is_err());
+}
+
+#[tokio::test]
+async fn selected_note_deletion_keeps_other_rows_and_prior_revision() {
+    let store = MemoryStore::temporary().await.unwrap();
+    let notes = "project/example/ifs/identity/part/one/notes";
+    let other_notes = "project/example/ifs/identity/part/two/notes";
+    let transcript = "project/example/ifs/identity/part/one";
+    store.append(notes, "note", "remember this").await.unwrap();
+    store.append(notes, "dream", "dream insight").await.unwrap();
+    store
+        .append(transcript, "user", "conversation remains")
+        .await
+        .unwrap();
+    store
+        .append(other_notes, "note", "another identity remains")
+        .await
+        .unwrap();
+    let other_rows = store.notes(other_notes, 10).await.unwrap();
+    let before = store.revision().await.unwrap();
+    let retained = store.begin_candidate("retained-note").await.unwrap();
+    let rows = store.notes(notes, 10).await.unwrap();
+    assert_eq!(
+        rows,
+        [
+            StoredNote {
+                sequence: rows[0].sequence,
+                role: "note".into(),
+                content: "remember this".into(),
+            },
+            StoredNote {
+                sequence: rows[1].sequence,
+                role: "dream".into(),
+                content: "dream insight".into(),
+            },
+        ]
+    );
+    let removed = rows[1].sequence;
+    store.forget_note(notes, removed).await.unwrap();
+    assert_eq!(
+        store.notes(notes, 10).await.unwrap(),
+        [StoredNote {
+            sequence: rows[0].sequence,
+            role: "note".into(),
+            content: "remember this".into(),
+        }]
+    );
+    assert_eq!(
+        store.history(transcript, 10).await.unwrap()[0].content,
+        "conversation remains"
+    );
+    let committed = store.revision().await.unwrap();
+    assert!(store.forget_note(notes, removed).await.is_err());
+    assert!(
+        store
+            .forget_note(transcript, rows[0].sequence)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .forget_note(other_notes, rows[0].sequence)
+            .await
+            .is_err(),
+        "a sequence from one notes namespace must not select another identity's row"
+    );
+    assert_eq!(store.notes(other_notes, 10).await.unwrap(), other_rows);
+    assert_eq!(store.revision().await.unwrap(), committed);
+    let after = store.revision().await.unwrap();
+    assert_ne!(after, before);
+    let revisions = store.revisions(20).await.unwrap();
+    assert!(revisions.iter().any(|revision| revision.hash == before));
+    assert!(revisions.iter().any(|revision| {
+        revision.hash == after && revision.message.starts_with("forget note [")
+    }));
+    assert!(
+        retained
+            .view()
+            .notes(notes, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row.sequence == removed && row.role == "dream" && row.content == "dream insight"
+            }),
+        "the pre-deletion committed revision remains available to Dolt history"
+    );
+    store.close().await.unwrap();
 }
 
 #[tokio::test]

@@ -153,9 +153,10 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
     assert_eq!(notes["requested_limit"], 100);
     assert_eq!(notes["truncated"], false);
     assert!(notes["notes"].as_array().is_some_and(|notes| {
-        notes
-            .iter()
-            .any(|note| note["content"] == "[demo] Offline demo memory consolidation.")
+        notes.iter().any(|note| {
+            note["sequence"].as_i64().is_some()
+                && note["content"] == "[demo] Offline demo memory consolidation."
+        })
     }));
     h.apply_dream(vec![kuru_runtime::DreamProposal::Add {
         name: "Extra".into(),

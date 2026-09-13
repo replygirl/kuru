@@ -62,6 +62,12 @@ active identity resolution. Notes limits are 1–1000, defaulting to 100. Dream
 candidates stay private until promotion. Undo adds a compensating revision and
 preserves later conversations.
 
+Notes output includes a stable sequence and stored role for each current row.
+`kuru memory forget ID --note SEQUENCE` explicitly removes one selected active
+notes row and commits that change as a new revision. It does not alter a
+conversation, other notes, or earlier revisions. This is active-memory control,
+not secure erasure, and Kuru does not expose a history-recovery command.
+
 An operating-system writer lock prevents two Kuru processes from overwriting the same project's topology. Read-only session listing remains available.
 
 ## Migration and backups

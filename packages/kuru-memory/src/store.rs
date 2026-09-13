@@ -85,6 +85,17 @@ pub struct MemoryStore {
 }
 pub type MemoryView = MemoryStore;
 
+/// One durable message row with its stable store sequence.
+///
+/// Callers that present selected active notes use the sequence only with an
+/// already-authorized namespace; it is not a global message identifier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredNote {
+    pub sequence: i64,
+    pub role: String,
+    pub content: String,
+}
+
 #[derive(Debug)]
 pub struct Candidate {
     live: MemoryStore,
@@ -390,6 +401,41 @@ impl MemoryStore {
             })
             .collect()
     }
+    /// Read durable rows with their stable sequence for a caller that already
+    /// owns namespace selection. This deliberately preserves every stored role.
+    pub async fn notes(&self, namespace: &str, limit: usize) -> Result<Vec<StoredNote>> {
+        identifier("namespace", namespace, 1024)?;
+        let limit = i64::try_from(limit).context("notes limit exceeds integer range")?;
+        let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
+            "SELECT sequence, role, content FROM (SELECT sequence, role, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
+        ).bind(namespace.as_bytes()).bind(limit).fetch_all(self.pool.as_ref())).await.context("memory read deadline exceeded")??;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StoredNote {
+                    sequence: row.try_get("sequence")?,
+                    role: String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?,
+                    content: row.try_get("content")?,
+                })
+            })
+            .collect()
+    }
+    /// Remove exactly one current row from an already-authorized notes namespace.
+    /// Historical Dolt revisions remain intact.
+    pub async fn forget_note(&self, namespace: &str, sequence: i64) -> Result<()> {
+        identifier("namespace", namespace, 1024)?;
+        ensure!(
+            namespace.ends_with("/notes"),
+            "selected deletion requires a notes namespace"
+        );
+        self.mutate(
+            "forget note",
+            Mutation::ForgetNote {
+                namespace: namespace.into(),
+                sequence,
+            },
+        )
+        .await
+    }
     pub async fn put(&self, key: &str, value: &Value) -> Result<()> {
         self.put_many(&[(key.into(), value.clone())]).await
     }
@@ -568,6 +614,10 @@ enum Mutation {
     },
     State(Vec<(String, String)>),
     Clear(String),
+    ForgetNote {
+        namespace: String,
+        sequence: i64,
+    },
 }
 
 async fn apply(
@@ -600,6 +650,20 @@ async fn apply(
                 .bind(namespace.as_bytes())
                 .execute(&mut *transaction)
                 .await?;
+        }
+        Mutation::ForgetNote {
+            namespace,
+            sequence,
+        } => {
+            let deleted = sqlx::query("DELETE FROM messages WHERE namespace = ? AND sequence = ?")
+                .bind(namespace.as_bytes())
+                .bind(sequence)
+                .execute(&mut *transaction)
+                .await?;
+            ensure!(
+                deleted.rows_affected() == 1,
+                "note sequence {sequence} is not present in this notes namespace"
+            );
         }
     }
     sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
@@ -1032,6 +1096,39 @@ mod tests {
             );
             assert!(!data_dir.exists());
         }
+    }
+
+    #[tokio::test]
+    async fn notes_preserve_and_select_a_signed_legacy_sequence() {
+        let store = MemoryStore::temporary().await.unwrap();
+        let namespace = "project/example/ifs/identity/legacy/notes";
+        sqlx::query(
+            "INSERT INTO messages (sequence, namespace, role, content) VALUES (?, ?, ?, ?)",
+        )
+        .bind(-7_i64)
+        .bind(namespace.as_bytes())
+        .bind(b"dream".as_slice())
+        .bind("signed legacy note")
+        .execute(store.pool.as_ref())
+        .await
+        .unwrap();
+        sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
+            .bind("signed legacy note")
+            .bind(AUTHOR)
+            .fetch_all(store.pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.notes(namespace, 10).await.unwrap(),
+            [StoredNote {
+                sequence: -7,
+                role: "dream".into(),
+                content: "signed legacy note".into(),
+            }]
+        );
+        store.forget_note(namespace, -7).await.unwrap();
+        assert!(store.notes(namespace, 10).await.unwrap().is_empty());
+        store.close().await.unwrap();
     }
 
     #[tokio::test]
