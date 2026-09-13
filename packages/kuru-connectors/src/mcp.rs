@@ -1204,7 +1204,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_catalog_recovers_a_failed_alias_without_replaying_its_call() {
-        let peer = HttpFixture::new(vec![
+        let recovering = HttpFixture::new(vec![
             initialized(),
             Reply::json(json!({})),
             Reply::rpc(json!({"tools":[tool("mutate")]})),
@@ -1217,20 +1217,81 @@ mod tests {
             Reply::json(json!({})),
         ])
         .await;
-        let hosts = McpHosts::new(Path::new("."), &http_config(&peer.url)).unwrap();
-        let name = hosts.specs().await.unwrap()[0].name.clone();
-        assert!(hosts.execute(&name, json!({})).await.is_err());
-        assert_eq!(peer.requests.lock().await.len(), 5);
+        let steady = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("steady")]})),
+            Reply::rpc(json!({"content":[{"type":"text","text":"before"}]})),
+            Reply::rpc(json!({"tools":[tool("steady")]})),
+            Reply::rpc(json!({"content":[{"type":"text","text":"after"}]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let hosts = McpHosts::new(
+            Path::new("."),
+            &BTreeMap::from([
+                (
+                    "recovering".into(),
+                    McpConfig {
+                        url: Some(recovering.url.clone()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "steady".into(),
+                    McpConfig {
+                        url: Some(steady.url.clone()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        )
+        .unwrap();
+        let initial = hosts.catalog().await.unwrap();
+        let recovering_name = initial
+            .tools
+            .iter()
+            .find(|tool| tool.description.starts_with("MCP recovering/"))
+            .unwrap()
+            .name
+            .clone();
+        let steady_name = initial
+            .tools
+            .iter()
+            .find(|tool| tool.description.starts_with("MCP steady/"))
+            .unwrap()
+            .name
+            .clone();
+        let McpExecution::Success(before) = hosts.execute(&steady_name, json!({})).await.unwrap()
+        else {
+            panic!("expected independent alias success before recovery");
+        };
+        assert_eq!(before["content"][0]["text"], "before");
+        assert!(hosts.execute(&recovering_name, json!({})).await.is_err());
+        assert_eq!(recovering.requests.lock().await.len(), 5);
         let catalog = hosts.catalog().await.unwrap();
-        assert!(catalog.statuses[0].available());
-        assert_eq!(catalog.tools[0].name, name);
-        assert_eq!(peer.requests.lock().await.len(), 8);
-        let McpExecution::Success(result) = hosts.execute(&name, json!({})).await.unwrap() else {
+        assert!(catalog.statuses.iter().all(McpStatus::available));
+        assert!(
+            catalog
+                .tools
+                .iter()
+                .any(|tool| tool.name == recovering_name)
+        );
+        assert!(catalog.tools.iter().any(|tool| tool.name == steady_name));
+        assert_eq!(recovering.requests.lock().await.len(), 8);
+        let McpExecution::Success(result) =
+            hosts.execute(&recovering_name, json!({})).await.unwrap()
+        else {
             panic!("expected recovered call success");
         };
         assert_eq!(result["content"][0]["text"], "recovered");
+        let McpExecution::Success(after) = hosts.execute(&steady_name, json!({})).await.unwrap()
+        else {
+            panic!("expected independent alias success after recovery");
+        };
+        assert_eq!(after["content"][0]["text"], "after");
         hosts.shutdown().await.unwrap();
-        let requests = peer.requests.lock().await;
+        let requests = recovering.requests.lock().await;
         assert_eq!(requests.len(), 10);
         assert_eq!(
             requests
@@ -1239,6 +1300,59 @@ mod tests {
                 .count(),
             2
         );
+        let steady_requests = steady.requests.lock().await;
+        assert_eq!(
+            steady_requests
+                .iter()
+                .filter(|request| request.body["method"] == "tools/call")
+                .count(),
+            2
+        );
+        assert_eq!(steady_requests[3].body["params"]["name"], "steady");
+        assert_eq!(steady_requests[5].body["params"]["name"], "steady");
+    }
+
+    #[tokio::test]
+    async fn received_stdio_mutation_disconnects_once_and_disables_later_calls() {
+        let script = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[tool("mutate")]}})),
+            Step::Read,
+        ]);
+        let hosts = McpHosts::new(
+            Path::new("."),
+            &BTreeMap::from([(
+                "stdio".into(),
+                McpConfig {
+                    command: Some(script.command().into()),
+                    ..Default::default()
+                },
+            )]),
+        )
+        .unwrap();
+        let name = hosts.specs().await.unwrap()[0].name.clone();
+
+        let failure = hosts.execute(&name, json!({"write":"once"})).await;
+        assert!(failure.is_err());
+        script.assert_completed(1);
+        let requests = script.conversations();
+        assert_eq!(requests[0].len(), 4);
+        assert_eq!(requests[0][3]["method"], "tools/call");
+        assert_eq!(requests[0][3]["params"]["name"], "mutate");
+        assert_eq!(requests[0][3]["params"]["arguments"]["write"], "once");
+
+        for _ in 0..2 {
+            let disabled = hosts.execute(&name, json!({"write":"again"})).await;
+            assert_eq!(disabled.unwrap_err().kind, ToolFailureKind::McpCall);
+        }
+        assert_eq!(script.conversations()[0].len(), 4);
+        hosts.shutdown().await.unwrap();
+        assert_eq!(script.conversations()[0].len(), 4);
     }
 
     #[tokio::test]
@@ -1378,6 +1492,77 @@ mod tests {
             );
             hosts.shutdown().await.unwrap();
             failed.assert_completed(1);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_keeps_healthy_stdio_alias_when_http_alias_fails_in_either_order() {
+        for failed_first in [true, false] {
+            let healthy = StdioFixture::new([
+                Step::Read,
+                Step::Write(
+                    json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{}}}}),
+                ),
+                Step::Read,
+                Step::Read,
+                Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[tool("usable")]}})),
+                Step::Read,
+                Step::Write(
+                    json!({"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"used"}]}}),
+                ),
+                Step::Eof,
+            ]);
+            let mut rejected = Reply::json(json!({}));
+            rejected.status = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+            let failed = HttpFixture::new(vec![rejected]).await;
+            let (failed_alias, healthy_alias) = if failed_first {
+                ("a_failed", "z_healthy")
+            } else {
+                ("z_failed", "a_healthy")
+            };
+            let config = BTreeMap::from([
+                (
+                    failed_alias.into(),
+                    McpConfig {
+                        url: Some(failed.url.clone()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    healthy_alias.into(),
+                    McpConfig {
+                        command: Some(healthy.command().into()),
+                        ..Default::default()
+                    },
+                ),
+            ]);
+            let hosts = McpHosts::new(Path::new("."), &config).unwrap();
+            let catalog = hosts.catalog().await.unwrap();
+            assert_eq!(catalog.tools.len(), 1);
+            assert_eq!(catalog.statuses.len(), 2);
+            assert!(
+                catalog
+                    .statuses
+                    .iter()
+                    .any(|status| status.alias() == healthy_alias && status.available())
+            );
+            assert!(
+                catalog
+                    .statuses
+                    .iter()
+                    .any(|status| status.alias() == failed_alias && !status.available())
+            );
+            let McpExecution::Success(result) = hosts
+                .execute(&catalog.tools[0].name, json!({}))
+                .await
+                .unwrap()
+            else {
+                panic!("expected healthy stdio alias to remain callable");
+            };
+            assert_eq!(result["content"][0]["text"], "used");
+            hosts.shutdown().await.unwrap();
+            healthy.assert_completed(1);
+            assert_eq!(failed.requests.lock().await.len(), 1);
         }
     }
 
