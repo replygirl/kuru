@@ -6,7 +6,7 @@ None.
 
 ## Soft-blocked by
 
-- [x] `mcp-server-degradation` — its reviewed implementation is present at this branch's exact base `4de6b2a`, providing retained stdio ownership, alias-local no-replay state, and bounded cleanup after MCP caller loss; native Linux/Windows evidence and archive delivery remain pending *(archived 2026-09-13)*
+- [x] `mcp-server-degradation` — provides retained stdio ownership, alias-local no-replay state, and bounded cleanup after MCP caller loss. *(archived 2026-09-13)*
 - [x] `owned-unix-shell-lifecycle` — provides registered Unix shell ownership
   and cleanup that survives caller/runtime loss. *(archived 2026-09-13)*
 
