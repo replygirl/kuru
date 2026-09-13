@@ -172,6 +172,144 @@ fn cli_requires_explicit_project_purge_confirmation_and_removes_its_diagnostics_
     assert!(!ring.exists());
 }
 
+#[tokio::test]
+async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_project() {
+    use kuru_memory::MemoryStore;
+    use std::io::Write;
+
+    let env = Sandbox::new();
+    let other_project = env.root.path().join("other-project");
+    std::fs::create_dir(&other_project).unwrap();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let other_scope = kuru_runtime::project_scope(&other_project).unwrap();
+
+    kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
+    let legacy_path = env.data.join("memory.sqlite3");
+    let legacy = rusqlite::Connection::open(&legacy_path).unwrap();
+    legacy
+        .execute_batch(
+            "PRAGMA application_id=1263882837;
+             PRAGMA user_version=1;
+             CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+             CREATE TABLE state (`key` TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+        )
+        .unwrap();
+    let selected_key = format!("{scope}/purge-acceptance");
+    let other_key = format!("{other_scope}/purge-acceptance");
+    legacy
+        .execute(
+            "INSERT INTO state VALUES (?1, ?2)",
+            rusqlite::params![selected_key, r#"{"owner":"selected"}"#],
+        )
+        .unwrap();
+    legacy
+        .execute(
+            "INSERT INTO state VALUES (?1, ?2)",
+            rusqlite::params![other_key, r#"{"owner":"other"}"#],
+        )
+        .unwrap();
+    drop(legacy);
+    let legacy_before = std::fs::read(&legacy_path).unwrap();
+
+    let selected_options =
+        kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let selected = MemoryStore::open(selected_options.clone()).await.unwrap();
+    assert_eq!(
+        selected.get(&selected_key).await.unwrap(),
+        Some(serde_json::json!({"owner":"selected"}))
+    );
+    selected.close().await.unwrap();
+    let other_options =
+        kuru_memory::test_support::open_options(env.data.clone(), other_scope.clone()).unwrap();
+    let other = MemoryStore::open(other_options.clone()).await.unwrap();
+    assert_eq!(
+        other.get(&other_key).await.unwrap(),
+        Some(serde_json::json!({"owner":"other"}))
+    );
+    other.close().await.unwrap();
+
+    let snapshots = env.data.join("memory/legacy");
+    let mut snapshot_before: Vec<_> = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), std::fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    snapshot_before.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(snapshot_before.len(), 1, "legacy import snapshot drifted");
+
+    let export_path = env.root.path().join("selected-memory.json");
+    let mut export_command = env.command_for("responses");
+    let export = export_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "export", "--output", "../selected-memory.json"])
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(export.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&export.stderr),
+        warm_memory_progress()
+    );
+    let export_before = std::fs::read(&export_path).unwrap();
+
+    let engine =
+        kuru_platform::fs::Directory::ensure_private(&env.data.join("tools/dolt")).unwrap();
+    engine
+        .create_new(std::ffi::OsStr::new("purge-sentinel"))
+        .unwrap()
+        .write_all(b"shared engine cache survives")
+        .unwrap();
+    drop(engine);
+
+    let mut purge_command = env.command_for("responses");
+    let output = purge_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "purge", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["project"], scope);
+    assert_eq!(result["legacy_import_suppressed"], true);
+
+    assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+    let mut snapshot_after: Vec<_> = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), std::fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    snapshot_after.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(snapshot_after, snapshot_before);
+    assert_eq!(std::fs::read(&export_path).unwrap(), export_before);
+    assert_eq!(
+        std::fs::read(env.data.join("tools/dolt/purge-sentinel")).unwrap(),
+        b"shared engine cache survives"
+    );
+
+    let other = MemoryStore::open(other_options).await.unwrap();
+    assert_eq!(
+        other.get(&other_key).await.unwrap(),
+        Some(serde_json::json!({"owner":"other"}))
+    );
+    other.close().await.unwrap();
+    let fresh = MemoryStore::open(selected_options).await.unwrap();
+    assert_eq!(fresh.get(&selected_key).await.unwrap(), None);
+    fresh.close().await.unwrap();
+}
+
 #[test]
 fn cli_file_crud_and_shell_require_real_capabilities() {
     const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
