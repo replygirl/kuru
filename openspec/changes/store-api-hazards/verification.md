@@ -1,0 +1,15 @@
+## 1. Shared-store lifecycle [critical]
+
+- [x] 1.1 @regression (agent) On pre-fix source, explicitly close one real store view while retaining a clone and read through the clone -> native macOS `mise run //packages/kuru-memory:test -- explicit_close_rejects_reads_and_writes_through_retained_clone` exited 101 in `/private/tmp/kuru-store-api-close-prefx-regression.log`; the retained read reached SQL and reported `attempted to acquire a connection on a closed pool` instead of the unified error.
+- [x] 1.2 @integration (agent) Drop one real-Dolt clone, append and read through the other, then consume close while retaining a clone -> native macOS `mise run //packages/kuru-memory:test -- explicit_close_rejects_reads_and_writes_through_retained_clone` exited 0, 1/1 passed in `/private/tmp/kuru-store-api-close-final.log`. Dropping the first clone leaves the other writable; consuming close rejects retained history, state, revision, revisions, status, reconciliation, append and put with exactly `memory store is closed`, and a subsequent real owner reopens and writes successfully.
+
+## 2. Durable inspection [critical]
+
+- [x] 2.1 @regression (agent) Simulate an accepted SQL operation whose reply is lost, then reconcile through the public API -> native macOS `mise run //packages/kuru-memory:test -- failed_database_batch_rolls_back_and_committed_receipt_reconciles` exited 0, 1/1 passed in `/private/tmp/kuru-store-api-close-reconcile-final.log`. The real durable receipt returns `Some(true)` without replay, a second call returns `None`, and an unknown receipt returns `Some(false)` after the accepted SQL session has ended.
+- [x] 2.2 @integration (agent) Create tied-date ancestor/descendant revisions with pinned real Dolt and request a bounded history -> native macOS `mise run //packages/kuru-memory:test -- revisions_use_graph_order_when_ancestor_dates_tie` exited 0, 1/1 passed in `/private/tmp/kuru-store-api-graph-order-final.log`. The pinned engine accepts equal `--date` values and exposes `commit_order` increasing toward `HEAD`; the public bounded result returns descendant before ancestor using `commit_order DESC, commit_hash ASC`.
+
+## 3. Static and platform gates
+
+- [x] 3.1 @integration (agent) Run focused memory tests, typecheck, lint, and documentation checks -> the three focused real-Dolt probes passed in `/private/tmp/kuru-store-api-close-reconcile-final.log` and `/private/tmp/kuru-store-api-graph-order-final.log`; memory, runtime and TUI typechecks exited 0 in `/private/tmp/kuru-store-api-memory-typecheck-final.log`, `/private/tmp/kuru-store-api-runtime-typecheck.log` and `/private/tmp/kuru-store-api-tui-typecheck.log`; memory lint exited 0 in `/private/tmp/kuru-store-api-memory-lint.log`; docs check exited 0 in `/private/tmp/kuru-store-api-docs-check-final.log`.
+- [~] 3.2 @integration (agent) Run actual memory lifecycle and history probes on native Windows -> defer: native Windows execution requires CI.
+- [~] 3.3 @integration (agent) Run integrated workspace coverage -> defer: root coordinates the sole coverage writer.

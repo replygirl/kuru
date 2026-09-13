@@ -13,7 +13,8 @@ kuru memory forget ID --note SEQUENCE
 ```
 
 Status identifies the current project store, branch and revision. History lists
-committed memory updates. These commands do not expose database credentials.
+committed memory updates in Dolt graph order, newest first; timestamps do not
+decide the order. These commands do not expose database credentials.
 `/memory-status` and `/memory-history` provide revision inspection in the TUI.
 `/memory NAME_OR_ID` continues to inspect an identity's conversation. `/notes
 NAME_OR_ID` reads that identity's separate durable notes. Both use the selected
@@ -121,3 +122,9 @@ ownership. Normal command exit waits for owned database cleanup, including when
 the command reports an error. Migration and recovery also hold the lifecycle lock
 through directory activation, so an active database cannot be moved underneath
 another process.
+
+Within Kuru, dropping a memory view only releases that view. An explicit close
+shuts down its shared database handle and every view using it, then awaits the
+owned cleanup. If a write reply is interrupted, Kuru checks the durable receipt
+before proceeding; it distinguishes no pending write, a committed write, and a
+write that did not commit.

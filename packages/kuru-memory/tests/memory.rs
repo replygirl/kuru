@@ -128,8 +128,9 @@ async fn clear_state_upserts_and_validation_preserve_unrelated_data() {
     assert_eq!(store.get("one").await.unwrap(), Some(json!(1)));
     assert_eq!(store.get("two").await.unwrap(), Some(json!(2)));
     store.put_many(&[]).await.unwrap();
+    let closed = store.clone();
     store.close().await.unwrap();
-    assert!(store.put("closed", &json!(1)).await.is_err());
+    assert!(closed.put("closed", &json!(1)).await.is_err());
 }
 
 #[tokio::test]

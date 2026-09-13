@@ -478,7 +478,7 @@ mod tests {
         );
         let revision = store.revision().await.unwrap();
         store.close().await.unwrap();
-        drop(store);
+
         let reopened = MemoryStore::open(options).await.unwrap();
         assert_eq!(reopened.revision().await.unwrap(), revision);
         assert_eq!(reopened.history(&namespace, 10).await.unwrap().len(), 2);

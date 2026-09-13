@@ -515,10 +515,14 @@ impl MemoryStore {
         Self::open_inner(options, Some(Arc::new(directory)), Some(permit), None).await
     }
 
-    fn writable(&self) -> Result<()> {
-        ensure!(!self.shared.read_only, "this memory view is read-only");
+    fn readable(&self) -> Result<()> {
         ensure!(!self.pool.is_closed(), "memory store is closed");
         Ok(())
+    }
+
+    fn writable(&self) -> Result<()> {
+        ensure!(!self.shared.read_only, "this memory view is read-only");
+        self.readable()
     }
 
     pub async fn append(&self, namespace: &str, role: &str, content: &str) -> Result<()> {
@@ -535,6 +539,7 @@ impl MemoryStore {
         .await
     }
     pub async fn history(&self, namespace: &str, limit: usize) -> Result<Vec<Message>> {
+        self.readable()?;
         identifier("namespace", namespace, 1024)?;
         // Candidate branches can intentionally retain an older schema after
         // main advances. Main was validated at open; only historical views
@@ -609,6 +614,7 @@ impl MemoryStore {
         self.mutate("state", Mutation::State(encoded)).await
     }
     pub async fn get(&self, key: &str) -> Result<Option<Value>> {
+        self.readable()?;
         identifier("state key", key, 1024)?;
         let value: Option<String> = tokio::time::timeout(
             QUERY_TIMEOUT,
@@ -690,9 +696,12 @@ impl MemoryStore {
         }
         Ok(None)
     }
-    pub async fn reconcile(&self) -> Result<()> {
+    /// Resolve one pending durable operation, returning `None` when there was
+    /// none, `Some(true)` when it committed, and `Some(false)` otherwise.
+    pub async fn reconcile(&self) -> Result<Option<bool>> {
+        self.readable()?;
         let _guard = self.shared.write.lock().await;
-        self.resolve_uncertain().await.map(|_| ())
+        self.resolve_uncertain().await
     }
     pub async fn begin_candidate(&self, label: &str) -> Result<Candidate> {
         self.writable()?;
@@ -723,13 +732,17 @@ impl MemoryStore {
         })
     }
     pub async fn revision(&self) -> Result<String> {
+        self.readable()?;
         revision(&self.pool).await
     }
     pub async fn revisions(&self, limit: usize) -> Result<Vec<Revision>> {
+        self.readable()?;
         let limit = i64::try_from(limit).context("revision limit exceeds integer range")?;
         let rows = tokio::time::timeout(
             QUERY_TIMEOUT,
-            sqlx::query("SELECT commit_hash, message FROM dolt_log LIMIT ?")
+            sqlx::query(
+                "SELECT commit_hash, message FROM dolt_log ORDER BY commit_order DESC, commit_hash ASC LIMIT ?",
+            )
                 .bind(limit)
                 .fetch_all(self.pool.as_ref()),
         )
@@ -745,6 +758,7 @@ impl MemoryStore {
             .collect()
     }
     pub async fn status(&self) -> Result<MemoryStatus> {
+        self.readable()?;
         Ok(MemoryStatus {
             engine: "dolt",
             engine_version: provision::DOLT_VERSION,
@@ -755,7 +769,9 @@ impl MemoryStore {
             read_only: self.shared.read_only,
         })
     }
-    pub async fn close(&self) -> Result<()> {
+    /// Explicitly shut down this shared server handle and every view that
+    /// clones it. Dropping a view only releases that view.
+    pub async fn close(self) -> Result<()> {
         let _guard = self.shared.write.lock().await;
         self.shared.server.close().await
     }
@@ -1296,6 +1312,143 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn explicit_close_rejects_reads_and_writes_through_retained_clone() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", "c".repeat(64)),
+        )?;
+        let store = MemoryStore::open(options.clone()).await?;
+        store.append("close", "user", "before shutdown").await?;
+        let released = store.clone();
+        drop(released);
+        store.append("close", "user", "after view drop").await?;
+        let retained = store.clone();
+        store.close().await?;
+
+        for error in [
+            retained
+                .history("close", 10)
+                .await
+                .expect_err("closed history"),
+            retained.get("close").await.expect_err("closed state read"),
+            retained.revision().await.expect_err("closed revision read"),
+            retained
+                .revisions(10)
+                .await
+                .expect_err("closed revisions read"),
+            retained.status().await.expect_err("closed status read"),
+            retained
+                .reconcile()
+                .await
+                .expect_err("closed reconciliation"),
+            retained
+                .append("close", "user", "after shutdown")
+                .await
+                .expect_err("closed append"),
+            retained
+                .put("close", &json!(true))
+                .await
+                .expect_err("closed state write"),
+        ] {
+            assert_eq!(error.to_string(), "memory store is closed");
+        }
+        drop(retained);
+
+        let reopened = MemoryStore::open(options).await?;
+        reopened.append("close", "user", "after reopen").await?;
+        assert_eq!(
+            reopened
+                .history("close", 10)
+                .await?
+                .last()
+                .expect("reopened history")
+                .content,
+            "after reopen"
+        );
+        reopened.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revisions_use_graph_order_when_ancestor_dates_tie() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let date = "2025-01-02T03:04:05Z";
+        let first_key = format!("graph-order-first-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+            .bind(first_key.as_bytes())
+            .bind("true")
+            .execute(store.pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?, '--date', ?)")
+            .bind("graph-order ancestor")
+            .bind(AUTHOR)
+            .bind(date)
+            .fetch_all(store.pool.as_ref())
+            .await?;
+        let ancestor = store.revision().await?;
+
+        let descendant_key = format!("graph-order-descendant-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+            .bind(descendant_key.as_bytes())
+            .bind("true")
+            .execute(store.pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?, '--date', ?)")
+            .bind("graph-order descendant")
+            .bind(AUTHOR)
+            .bind(date)
+            .fetch_all(store.pool.as_ref())
+            .await?;
+        let descendant = store.revision().await?;
+
+        let rows = sqlx::query(
+            "SELECT commit_hash, commit_order, CAST(date AS CHAR) AS date FROM dolt_log WHERE commit_hash IN (?, ?)",
+        )
+        .bind(&ancestor)
+        .bind(&descendant)
+        .fetch_all(store.pool.as_ref())
+        .await?;
+        assert_eq!(rows.len(), 2, "pinned Dolt must expose both graph entries");
+        let ancestor_row = rows
+            .iter()
+            .find(|row| {
+                row.try_get::<String, _>("commit_hash")
+                    .is_ok_and(|hash| hash == ancestor)
+            })
+            .expect("ancestor log row");
+        let descendant_row = rows
+            .iter()
+            .find(|row| {
+                row.try_get::<String, _>("commit_hash")
+                    .is_ok_and(|hash| hash == descendant)
+            })
+            .expect("descendant log row");
+        assert_eq!(
+            ancestor_row.try_get::<String, _>("date")?,
+            descendant_row.try_get::<String, _>("date")?,
+            "fixture commits must tie on their wall-clock date"
+        );
+        assert!(
+            descendant_row.try_get::<u64, _>("commit_order")?
+                > ancestor_row.try_get::<u64, _>("commit_order")?,
+            "pinned Dolt must order a descendant before its tied-date ancestor"
+        );
+
+        let revisions = store.revisions(2).await?;
+        assert_eq!(
+            revisions
+                .iter()
+                .map(|revision| revision.hash.as_str())
+                .collect::<Vec<_>>(),
+            vec![descendant.as_str(), ancestor.as_str()],
+            "public revision order must follow pinned Dolt graph order before the hash tie-break"
+        );
+        store.close().await?;
+        Ok(())
+    }
+
     /// Materialize a released v1 store without going through `open`: production
     /// writable open intentionally upgrades it immediately, so this fixture
     /// must stop a real v1 server and preserve the ordinary format-1 marker.
@@ -1621,7 +1774,7 @@ mod tests {
         let head = store.revision().await?;
         old_pool.close().await;
         store.close().await?;
-        drop(store);
+
         let reopened = MemoryStore::open(options).await?;
         assert_eq!(reopened.revision().await?, head);
         assert_eq!(
@@ -1782,7 +1935,6 @@ mod tests {
         assert_eq!(receipt.0, 2);
         assert!(Uuid::parse_str(&receipt.3).is_ok());
         store.close().await?;
-        drop(store);
 
         let mut current_readonly = options.clone();
         current_readonly.read_only = true;
@@ -1871,7 +2023,6 @@ mod tests {
         assert_eq!(inspection_snapshot(&store.pool).await?, before);
         attached.close().await?;
         store.close().await?;
-        drop(store);
 
         let stopped = MemoryStore::open(readonly).await?;
         assert_eq!(stopped.revision().await?, before.0);
@@ -2018,15 +2169,14 @@ mod tests {
             raw_branch(&store, name).await?;
         }
         store.close().await?;
-        drop(store);
+
         let ignored = MemoryStore::open(options.clone()).await?;
         ignored.close().await?;
-        drop(ignored);
 
         let valid = MemoryStore::open(options.clone()).await?;
         raw_branch(&valid, "kuru_migration_bad").await?;
         valid.close().await?;
-        drop(valid);
+
         assert!(MemoryStore::open(options).await.is_err());
         Ok(())
     }
@@ -2041,7 +2191,7 @@ mod tests {
             raw_branch(&store, &format!("kuru_migration_v0000000002_{number:032x}")).await?;
         }
         store.close().await?;
-        drop(store);
+
         let error = MemoryStore::open(options).await.unwrap_err();
         assert!(format!("{error:#}").contains("too many retained Dolt migration attempts"));
         Ok(())
@@ -2181,10 +2331,17 @@ mod tests {
             connection: id,
             receipt: Receipt::Operation(operation),
         });
-        store.reconcile().await.unwrap();
+        assert_eq!(store.reconcile().await.unwrap(), Some(true));
         assert!(store.shared.uncertain.lock().unwrap().is_none());
         assert_eq!(store.get("two").await.unwrap(), Some(json!(2)));
         assert_eq!(store.revision().await.unwrap(), before);
+        assert_eq!(store.reconcile().await.unwrap(), None);
+        *store.shared.uncertain.lock().unwrap() = Some(Pending {
+            pool: store.pool.clone(),
+            connection: id,
+            receipt: Receipt::Operation(Uuid::new_v4().to_string()),
+        });
+        assert_eq!(store.reconcile().await.unwrap(), Some(false));
         store.close().await.unwrap();
     }
 
@@ -2199,7 +2356,7 @@ mod tests {
         store.put("choice", &json!("jungian")).await.unwrap();
         let revision = store.revision().await.unwrap();
         store.close().await.unwrap();
-        drop(store);
+
         let mut readonly = options.clone();
         readonly.read_only = true;
         let reader = MemoryStore::open(readonly).await.unwrap();
@@ -2213,7 +2370,7 @@ mod tests {
         assert!(reader.begin_candidate("dream").await.is_err());
         assert!(reader.status().await.unwrap().read_only);
         reader.close().await.unwrap();
-        drop(reader);
+
         let store = MemoryStore::open(options.clone()).await.unwrap();
         sqlx::query("UPDATE kuru_schema SET version = 99")
             .execute(store.pool.as_ref())
@@ -2274,7 +2431,7 @@ mod tests {
         let initial = store.revision().await.unwrap();
         let active = project_directory(data.path(), &scope).unwrap();
         store.close().await.unwrap();
-        drop(store);
+
         let namespace = cfg!(windows).then(|| data.path().join("memory/lifecycles"));
         let mut lease =
             Server::quiescence_at(&active, namespace.as_deref(), Duration::from_secs(5))
@@ -2337,7 +2494,7 @@ mod tests {
         let initial = store.revision().await.unwrap();
         let active = project_directory(data.path(), &scope).unwrap();
         store.close().await.unwrap();
-        drop(store);
+
         // Model interruption at the actual durable boundary: the complete store
         // and activation receipt exist, but directory publication did not happen.
         let staging =
@@ -2365,7 +2522,7 @@ mod tests {
         );
         assert!(MemoryStore::exists(data.path(), &scope).unwrap());
         store.close().await.unwrap();
-        drop(store);
+
         fs::remove_file(active.join("ready.json")).unwrap();
         assert!(
             MemoryStore::exists(data.path(), &scope).is_err(),
@@ -2383,7 +2540,7 @@ mod tests {
         let store = MemoryStore::open(options.clone()).await.unwrap();
         let initial = store.revision().await.unwrap();
         store.close().await.unwrap();
-        drop(store);
+
         let active = project_directory(data.path(), &scope).unwrap();
         let stage = active.with_file_name(format!("{}.staging-{}", "8".repeat(64), Uuid::new_v4()));
         fs::rename(&active, &stage).unwrap();
@@ -2458,10 +2615,9 @@ mod tests {
             .await
             .unwrap();
         let branch = view.branch.clone();
-        store.close().await.unwrap();
         drop(view);
         drop(candidate);
-        drop(store);
+        store.close().await.unwrap();
         copy_tree(
             &source.path().join("memory"),
             &restored.path().join("memory"),

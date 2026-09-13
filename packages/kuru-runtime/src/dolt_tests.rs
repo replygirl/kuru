@@ -276,7 +276,6 @@ async fn undo_is_a_new_revision_that_preserves_later_chats_preferences_and_archi
     harness.shutdown(false).await.unwrap();
     memory.close().await.unwrap();
     drop(harness);
-    drop(memory);
 
     let memory = MemoryStore::open(options).await.unwrap();
     let preferences = Harness::load_preferences(&memory, project.path())
@@ -401,7 +400,6 @@ async fn canonical_dream_additions_survive_promotion_stopped_reload_and_reversal
     harness.shutdown(false).await.unwrap();
     memory.close().await.unwrap();
     drop(harness);
-    drop(memory);
 
     let memory = MemoryStore::open(options).await.unwrap();
     let mut reloaded = Harness::new(

@@ -68,6 +68,12 @@ notes row and commits that change as a new revision. It does not alter a
 conversation, other notes, or earlier revisions. This is active-memory control,
 not secure erasure, and Kuru does not expose a history-recovery command.
 
+History follows the Dolt commit graph from the current revision toward older
+ancestors, with a stable hash tie-break rather than wall-clock ordering. Kuru
+reconciles an interrupted write against its durable receipt before it continues,
+so it can distinguish no pending operation, a completed operation, and one that
+did not commit.
+
 An operating-system writer lock prevents two Kuru processes from overwriting the same project's topology. Read-only session listing remains available.
 
 ## Migration and backups

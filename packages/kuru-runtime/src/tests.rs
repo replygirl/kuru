@@ -211,7 +211,6 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
     harness.shutdown(false).await.unwrap();
     memory.close().await.unwrap();
     drop(harness);
-    drop(memory);
 
     let memory = MemoryStore::open(options).await.unwrap();
     let mut resumed = Harness::new(
@@ -623,7 +622,6 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     harness.shutdown(false).await.unwrap();
     memory.close().await.unwrap();
     drop(harness);
-    drop(memory);
     let memory = MemoryStore::open(options).await.unwrap();
     let mut reopened = Harness::new(
         config,
@@ -686,7 +684,6 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     reopened.shutdown(false).await.unwrap();
     memory.close().await.unwrap();
     drop(reopened);
-    drop(memory);
 }
 
 #[tokio::test]
