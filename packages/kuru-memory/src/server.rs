@@ -1561,5 +1561,5 @@ mod tests;
 #[path = "server/windows_tests.rs"]
 mod windows_tests;
 
-#[cfg(windows)]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub(crate) mod windows_fixture;
