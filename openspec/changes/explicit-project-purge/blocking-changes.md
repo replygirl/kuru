@@ -7,7 +7,7 @@ None.
 ## Soft-blocked by
 
 - [x] `ordered-dolt-migrations` — source-present current-schema and recovery validation retained by purge/open integration *(archived 2026-09-13)*
-- [ ] `memory-export` — source-present committed-snapshot command and documentation boundary; exports remain outside purge ownership
+- [x] `memory-export` — source-present committed-snapshot command and documentation boundary; exports remain outside purge ownership *(archived 2026-09-13)*
 
 ## Siblings
 

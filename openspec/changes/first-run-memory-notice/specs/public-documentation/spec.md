@@ -10,6 +10,11 @@ It MUST describe that catalog and completion retries are bounded by one operatio
 - **WHEN** a visitor reads the memory command reference
 - **THEN** it explains how to select one stored note and that forgetting leaves prior revisions and unrelated text intact.
 
+#### Scenario: Memory snapshot export
+- **WHEN** a visitor reads the memory command reference
+- **THEN** they can request a committed full-project JSON or Markdown snapshot
+  without inferring that it deletes, redacts, or includes candidate working data
+
 #### Scenario: First use
 - **WHEN** a visitor follows the first conversation guide
 - **THEN** they can run the offline demo without credentials and find model discovery and authenticated setup instructions.
