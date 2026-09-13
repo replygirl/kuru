@@ -1911,7 +1911,6 @@ mod publication_tests {
         first.shutdown(false).await.unwrap();
         memory.close().await.unwrap();
         drop(first);
-        drop(memory);
 
         let memory = MemoryStore::open(options).await.unwrap();
         let mut resumed = Harness::new(
