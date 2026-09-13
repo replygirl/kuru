@@ -17,7 +17,7 @@
 
 ## 4. Compatibility, documentation, and verification
 
-- [ ] 4.1 Preserve and run existing shell environment, status/output/input/timeout, workspace-root, stdio MCP, Windows Job, and actor-to-tool behavior; add the fake-provider conversational CLI fixture using delivery's existing bounded runner through a TUI-only dev feature, and run native macOS and Linux lifecycle fixtures through owning package tasks.
+- [x] 4.1 Preserve and run existing shell environment, status/output/input/timeout, workspace-root, stdio MCP, Windows Job, and actor-to-tool behavior; add the fake-provider conversational CLI fixture using delivery's existing bounded runner through a TUI-only dev feature, and run native macOS and Linux lifecycle fixtures through owning package tasks.
 - [x] 4.2 Update `AGENTS.md`, platform crate/module descriptions, `docs/protocols.md`, and the curated tools reference with the bounded Unix owner and its limitations, without a general process framework, sandbox, escaped-process, memory-lease, or synchronous-Drop claim.
-- [ ] 4.3 Run focused platform/connectors format, lint, typecheck, and package tests plus the single coordinated workspace coverage task; record native results and leave unavailable platform evidence explicitly unchecked.
-- [ ] 4.4 Keep built-in shell dispatch target-specific so Unix passes its owned registry while Windows retains its existing root-capability contract; verify both native targets compile and the Windows shell fixture still runs through the platform-owned process boundary.
+- [x] 4.3 Run focused platform/connectors format, lint, typecheck, and package tests plus the single coordinated workspace coverage task; record native results and leave unavailable platform evidence explicitly unchecked.
+- [x] 4.4 Keep built-in shell dispatch target-specific so Unix passes its owned registry while Windows retains its existing root-capability contract; verify both native targets compile and the Windows shell fixture still runs through the platform-owned process boundary.

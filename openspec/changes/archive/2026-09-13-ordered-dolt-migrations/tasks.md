@@ -78,17 +78,17 @@
   `ready.json`, identity and supervisor formats in `docs/memory.md` and the
   curated `apps/kuru-docs/concepts/memory.md`; verify `mise run docs:check`
   renders and validates the updated content.
-- [ ] 5.2 Complete focused named real-Dolt test cases for persisted upgrade,
+- [x] 5.2 Complete focused named real-Dolt test cases for persisted upgrade,
   wire faults, cancellation, staging and candidates; run those filters through
   `mise run //packages/kuru-memory:test -- <filter>` during implementation and
   verify each leaves no live child/session or fixture artifact.
-- [ ] 5.3 Run the applicable migration and owner-loss fixtures in the supported
+- [x] 5.3 Run the applicable migration and owner-loss fixtures in the supported
   native Windows job and record actual runtime evidence before merge; verify
   real Windows Dolt/process/lock behavior passes rather than substituting
   cross-target compilation.
-- [ ] 5.4 Run `mise run format:check`,
+- [x] 5.4 Run `mise run format:check`,
   `mise run //packages/kuru-memory:lint` and
   `mise run //packages/kuru-memory:typecheck`, strict-validate this change, then
   run the single coordinated workspace coverage task; verify every command exits
   zero and coverage remains at or above 90 percent without exclusions.
-- [ ] 5.5 Restore the native Windows acceptance owners' explicit empty reap-guard state for fixture launches that do not install a migration startup lock; verify the target compiles and the existing supervisor lifetime fixtures still complete through `finish_owner`.
+- [x] 5.5 Restore the native Windows acceptance owners' explicit empty reap-guard state for fixture launches that do not install a migration startup lock; verify the target compiles and the existing supervisor lifetime fixtures still complete through `finish_owner`.

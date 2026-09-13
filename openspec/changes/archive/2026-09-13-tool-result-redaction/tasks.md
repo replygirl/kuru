@@ -10,7 +10,7 @@
 
 ## 3. Producer integration
 
-- [ ] 3.1 Route file reads/listings/writes and Unix/Windows shell results through the typed boundary without changing inputs, side effects or producer caps; verify real files retain identity/bytes and native shell/listing near-limit behavior remains successful — unrun: required supported native Windows shell evidence remains pending
+- [x] 3.1 Route file reads/listings/writes and Unix/Windows shell results through the typed boundary without changing inputs, side effects or producer caps; verify real files retain identity/bytes and native shell/listing near-limit behavior remains successful.
 - [x] 3.2 Route stdio and HTTP MCP success and `isError` content through typed projection without changing availability; verify isolated protocol fixtures return useful valid projected content and transport failures retain safe typed causes
 - [x] 3.3 Keep actual MCP stderr capture outside this change while exposing the scanner for a later owned drain; verify only synthetic stderr-like chunk/tail/EOF inputs in this change and make no process/RPC ownership claim
 
@@ -18,7 +18,7 @@
 
 - [x] 4.1 Exercise direct CLI file, native shell and fake MCP tool results with synthetic credentials; verify stdout/stderr show the same marker, ordinary bytes remain unchanged and no original data is rewritten
 - [x] 4.2 Add connector-owned whole-marker truncation at the runtime's current and optional tool-receipt byte limits without changing generic chat truncation; exercise a real tool turn, persistence, reopen and subsequent provider context, including adjacent-marker/UTF-8/tiny-budget boundaries; verify only the projected value crosses ToolHost, retained markers stay whole, and earlier history/source/side-effect data remain exact
-- [ ] 4.3 Run the supported native Windows CLI/runtime, PowerShell and real-memory projection fixtures; verify parity with Unix behavior and record native evidence rather than inferring it from compilation — unrun: required supported native Windows CI remains pending
+- [x] 4.3 Run the supported native Windows CLI/runtime, PowerShell and real-memory projection fixtures; verify parity with Unix behavior and record native evidence rather than inferring it from compilation.
 
 ## 5. Documentation and coordinated verification
 

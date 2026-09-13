@@ -12,4 +12,4 @@
 ## 3. Acceptance evidence
 
 - [x] 3.1 Run the focused runtime and TUI/CLI package checks through their package-owned mise tasks and record the distinct markers, archived identity, unknown ID, N+1, provider-free, and fresh-store observations in `verification.md`.
-- [ ] 3.2 Run the native Windows notes cases and record their result in `verification.md`; verify the same existing-store/read-only behavior rather than treating cross-compilation as execution evidence.
+- [x] 3.2 Run the native Windows notes cases and record their result in `verification.md`; verify the same existing-store/read-only behavior rather than treating cross-compilation as execution evidence.

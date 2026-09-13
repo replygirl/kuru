@@ -11,7 +11,7 @@
 
 ## 3. Native portability
 
-- [ ] 3.1 @runtime (agent) run the selected-note CLI/store behavior on native Windows -> current-row deletion and retained-history disclosure pass under the native Dolt supervisor.
+- [x] 3.1 @runtime (agent) run the selected-note CLI/store behavior on native Windows -> PR14 CI run 34747712455 executed `selected_note_deletion_keeps_other_rows_and_prior_revision` and `notes_tests::forgetting_exact_current_note_keeps_dream_rows_and_other_namespaces` under the native Windows Dolt supervisor; both passed, `/private/tmp/kuru-pr14-windows-ci-86f.log`.
 
 ## Observed evidence
 
@@ -21,4 +21,4 @@
 - The focused real-Dolt selected-row test and signed legacy sequence test each passed one test; `/private/tmp/kuru-note-controls-memory-selected-test.log` and `/private/tmp/kuru-note-controls-memory-signed-sequence-test.log`.
 - The focused runtime dream-role deletion, provider-free CLI/reopen, and TUI `/notes` rendering tests each passed one test; `/private/tmp/kuru-note-controls-runtime-forget-test.log`, `/private/tmp/kuru-note-controls-tui-forget-cli-test.log`, and `/private/tmp/kuru-note-controls-tui-notes-render-test.log`.
 - `mise run //apps/kuru-docs:format:check` exited 0 after the package formatter fixed the edited markdown.
-- Native Windows selected-note behavior remains required and unrun; no non-Windows build or fixture is treated as native evidence.
+- Native Windows selected-note behavior passed in PR14 CI run 34747712455; its later source-install failure was a separate feature-free compilation issue after the complete instrumented behavioral suite finished successfully.

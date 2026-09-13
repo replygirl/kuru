@@ -6,7 +6,7 @@ None.
 
 ## Soft-blocked by
 
-- [ ] `owned-unix-shell-lifecycle` — shares the ToolHost shell-result boundary and native shell fixtures
+- [x] `owned-unix-shell-lifecycle` — shares the ToolHost shell-result boundary and native shell fixtures *(archived 2026-09-13)*
 - [x] `shell-environment-minimization` — shares connector tool source, fixtures and curated tool documentation *(archived 2026-09-13)*
 - [x] `bounded-provider-retries` — shares connector static/coverage scheduling and protocol documentation *(archived 2026-09-13)*
 

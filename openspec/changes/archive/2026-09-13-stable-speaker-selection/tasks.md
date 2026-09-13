@@ -7,4 +7,4 @@
 ## 2. Documentation and verification
 
 - [x] 2.1 Document the concrete selection rule and additive session/event metadata without introducing new framework policy or commands; run documentation checks.
-- [ ] 2.2 Run scoped format, lint, typecheck and combined coverage, recording native platform evidence separately; complete strict validation and archive after required checks pass.
+- [x] 2.2 Run scoped format, lint, typecheck and combined coverage, recording native platform evidence separately; complete strict validation and archive after required checks pass.

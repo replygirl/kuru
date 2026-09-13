@@ -9,5 +9,5 @@
 ## 2. Quality and portability
 
 - [x] 2.1 @manual (agent) inspect documentation and emitted selection metadata -> `apps/kuru-docs/concepts/sessions.md` documents the rule; `mise run //apps/kuru-docs:check` exited 0.
-- [~] 2.2 @integration (agent) run package format, lint, typecheck, documentation and combined coverage checks -> defer: runtime format, lint, typecheck, and docs check passed; root coordinates combined coverage.
-- [~] 2.3 @runtime (agent) execute the runtime suite on supported native CI platforms -> defer: supported native CI remains required; no local Windows claim.
+- [x] 2.2 @integration (agent) run package format, lint, typecheck, documentation and combined coverage checks -> the integrated normal hook passed all eight categories and 26,266/27,518 lines (95.4503%) at head `86f7d5695d6ba53f0e7aaa04ea691b79e9277030`; `/private/tmp/kuru-pr14-integrated-prepush-retry.log`.
+- [x] 2.3 @runtime (agent) execute the runtime suite on supported native CI platforms -> PR14 CI run 34747712455 passed the Linux and macOS native jobs and the complete Windows instrumented runtime suite; `automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen`, `equal_activation_keeps_the_same_speaker_across_completed_turns`, and `failed_speaking_does_not_replace_completed_speaker` passed on Windows, `/private/tmp/kuru-pr14-windows-ci-86f.log`.
