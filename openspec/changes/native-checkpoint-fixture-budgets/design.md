@@ -47,6 +47,14 @@ outer runner terminal.
   checks. On shell failure the test reads at most 4 KiB of those labels. This
   localizes a native stall without exposing environment contents, changing the
   production timeout or inserting timing between operations.
+- The stock-PowerShell negative module control uses separate private `APPDATA`
+  and `LOCALAPPDATA` directories from the positive Kuru invocation. PowerShell
+  reads its module-analysis cache beneath `LOCALAPPDATA`; a control that analyzes
+  an incompatible manifest must not mutate the authoritative invocation's cache.
+- Kuru's pure projection test retains exact inherited-or-fallback `PATHEXT`
+  assertions. The real inner-shell fixture expects stock PowerShell's subsequent
+  `.CPL` addition during engine construction, without treating that child-local
+  mutation as a change to Kuru's launch projection.
 - Trust corruption fixtures retain the pinned approval-store directory while
   reopening the identity-matched record directory through the production movable
   operation boundary. This lets the fixture replace and remove its own synthetic

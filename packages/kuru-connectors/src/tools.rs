@@ -1509,7 +1509,9 @@ $expectedHome = {expected_home}
 $expectedTemporary = {expected_temporary}
 $expectedWindows = {expected_windows}
 $expectedComSpec = {expected_comspec}
-$expectedPathext = if ($env:NO_COLOR -eq 'inherited') {{ '.EXE;.CMD' }} else {{ '.COM;.EXE;.BAT;.CMD' }}
+# Kuru supplies the exact inherited value or fallback. Stock PowerShell then
+# appends .CPL during engine construction when that extension is absent.
+$expectedPathext = if ($env:NO_COLOR -eq 'inherited') {{ '.EXE;.CMD;.CPL' }} else {{ '.COM;.EXE;.BAT;.CMD;.CPL' }}
 [IO.File]::WriteAllText((Join-Path $env:USERPROFILE 'shell-home.txt'), 'home')
 [IO.File]::WriteAllText((Join-Path $env:TEMP 'shell-temp.txt'), 'temp')
 [IO.File]::AppendAllText($stage, "home-temp-written`n")

@@ -5,6 +5,8 @@
 - [x] 1.3 Give runtime replay the ordinary shell budget and retain the failed receipt in parse diagnostics.
 - [x] 1.4 Compare the ToolHost Windows shell projection with exact controlled lexical values and report labeled failed checks in its bounded receipt.
 - [x] 1.5 Record fixed private stage labels around the isolated ToolHost shell operations and include at most 4 KiB of those labels when the real shell call fails.
+- [x] 1.6 Isolate the deliberately incompatible stock-PowerShell control from Kuru's module-analysis cache while preserving the real negative and positive module-discovery assertions.
+- [x] 1.7 Retain exact pre-launch `PATHEXT` projection coverage and expect stock PowerShell's own `.CPL` addition only after the child engine starts.
 
 ## 2. Refresh and TUI fixtures
 

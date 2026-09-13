@@ -28,6 +28,14 @@ Because the script emitted output only after every assertion, that evidence does
 not distinguish startup from a blocked file write, native command, batch probe,
 module autoload or final check.
 
+Fixed stage labels in the following run localized a separate CLI shell timeout
+to first-use `Get-FileHash` discovery. That fixture launched a negative stock
+PowerShell control and the authoritative Kuru child with the same `APPDATA` and
+`LOCALAPPDATA`, allowing the control's deliberately incompatible module manifest
+to affect PowerShell's shared module-analysis cache before Kuru ran. The same run
+also showed that stock PowerShell appends `.CPL` to an inherited `PATHEXT` during
+engine construction, after Kuru has already supplied the exact projected value.
+
 ## What Changes
 
 - Give real stock PowerShell and refused-connect fixtures bounded observation
@@ -40,6 +48,10 @@ module autoload or final check.
   by the fixture, and name failed conditions in the bounded tool receipt.
 - Append fixed stage labels to a private fixture file around each shell probe and
   report a bounded label prefix when the real shell operation itself fails.
+- Give the deliberately failing stock-PowerShell module control separate private
+  cache directories from Kuru's authoritative shell invocation.
+- Keep the exact pre-launch `PATHEXT` projection assertion and account for stock
+  PowerShell's own `.CPL` addition only in the inner-process expectation.
 - Use the checked movable approval-record operation boundary when the trust
   corruption fixture replaces synthetic records under a retained pinned store.
 - Make native replay failures name the raw failed receipt and verify saved picker
@@ -60,7 +72,8 @@ Only native and cross-platform test code changes: connector authentication and
 shell tests, runtime Windows tool replay, Windows CLI/TUI integration tests, and
 Unix terminal test support. The already pinned portable PTY development
 dependency becomes available to Unix tests; no production API, configuration,
-timeout, allowlist, dependency version, or migration changes.
+timeout, allowlist, dependency version, or migration changes. PowerShell cache
+isolation and post-startup `PATHEXT` expectations remain fixture-only.
 
 ## Surfaces
 

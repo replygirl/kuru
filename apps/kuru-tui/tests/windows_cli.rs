@@ -372,7 +372,15 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("workspace 日本語");
     let modules = root.path().join("incompatible modules");
-    for directory in [&project, &modules, &root.path().join("tools")] {
+    let control_config = root.path().join("control config");
+    let control_local = root.path().join("control local");
+    for directory in [
+        &project,
+        &modules,
+        &root.path().join("tools"),
+        &control_config,
+        &control_local,
+    ] {
         fs::create_dir(directory).unwrap();
     }
     let incompatible = modules.join("Microsoft.PowerShell.Utility");
@@ -418,6 +426,11 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
         .unwrap()
         .join("WindowsPowerShell/v1.0/powershell.exe");
     let control = child(&powershell)
+        // Command discovery writes a cache below LOCALAPPDATA. Keep this
+        // deliberately incompatible control from changing the authoritative
+        // Kuru invocation's cache before its first stock-module lookup.
+        .env("APPDATA", &control_config)
+        .env("LOCALAPPDATA", &control_local)
         .args([
             "-NoLogo",
             "-NoProfile",
