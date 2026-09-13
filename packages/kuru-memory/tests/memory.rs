@@ -131,6 +131,7 @@ async fn clear_state_upserts_and_validation_preserve_unrelated_data() {
     let closed = store.clone();
     store.close().await.unwrap();
     assert!(closed.put("closed", &json!(1)).await.is_err());
+    assert!(closed.notes("project/example/notes", 1).await.is_err());
 }
 
 #[tokio::test]
