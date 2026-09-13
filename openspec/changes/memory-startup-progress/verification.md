@@ -15,3 +15,5 @@
 - [x] 3.2 @runtime (agent) exercise a real PTY startup -> progress precedes the first completed TUI frame and normal terminal restoration remains intact. Observed `real_pty_accepts_chat_navigation_commands_and_restores_terminal` passed (exit 0; `/private/tmp/kuru-startup-pty-progress-test.log`), asserting staged stderr before alternate-screen/completed TUI frame and existing restoration behavior.
 - [~] 3.3 @integration (agent) run native Windows observed provisioning/import fixtures -> defer: native Windows execution requires CI after implementation.
 - [~] 3.4 @integration (agent) run coordinated workspace coverage -> defer: root schedules the sole coverage writer after focused source freeze.
+
+- 2026-09-13 hosted PR18 `d9d49ad`: Ubuntu and macOS native behavior jobs passed. Windows full application provisioning/import evidence remains pending: rerun attempt 2 passed `real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_before_execution`, but the job then failed an inherited encoded-stock-PowerShell timeout (`built_in_shell_reconstructs_stock_module_paths_without_losing_other_environment`).

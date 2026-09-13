@@ -63,6 +63,7 @@ rustix.workspace = true
 vt100.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
+base64.workspace = true
 vt100.workspace = true
 
 [lints]

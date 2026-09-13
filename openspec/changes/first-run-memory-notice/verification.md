@@ -12,3 +12,5 @@
 
 - [x] 3.1 @integration (agent) ran owning docs and focused app checks -> public memory docs distinguish the notice, selected revision-preserving forget, and confirmed project purge without automatic expiry or secure-erasure claims. Observed `mise run //apps/kuru-docs:check` exit 0 (`/private/tmp/kuru-memory-notice-docs-check.log`), app typecheck exit 0 (`/private/tmp/kuru-memory-notice-tui-typecheck-final.log`), and app lint exit 0 (`/private/tmp/kuru-memory-notice-tui-lint.log`).
 - [ ] 3.2 @integration (agent) run native Windows UI/CLI notice fixtures and coordinated workspace coverage -> supported platform output/order and workspace coverage are observed.
+
+- 2026-09-13 hosted PR18 `d9d49ad`: Ubuntu and macOS native behavior jobs passed. Windows full UI/CLI notice evidence remains pending: rerun attempt 2 passed the previously failing unchanged memory provisioning fixture, but the job then failed an inherited encoded-stock-PowerShell timeout (`built_in_shell_reconstructs_stock_module_paths_without_losing_other_environment`).

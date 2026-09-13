@@ -34,3 +34,5 @@
 - `mise run //packages/kuru-connectors:typecheck`, connector lint, runtime and
   TUI typecheck/lint, `mise run format:rust:fix`, and `mise run docs:check`
   passed. Native Windows and the coordinated coverage writer remain pending.
+
+- 2026-09-13 hosted PR18 `d9d49ad`: Ubuntu and macOS native behavior jobs passed. Rerun attempt 2 passed the previously failing unchanged memory provisioning fixture, then failed an inherited encoded-stock-PowerShell timeout (`built_in_shell_reconstructs_stock_module_paths_without_losing_other_environment`); the separate Windows platform job passed at 90.1435%, but neither result establishes Windows shell-capture acceptance.
