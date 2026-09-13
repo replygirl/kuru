@@ -7,7 +7,10 @@ pub mod server;
 
 pub use bus::PeerMessage;
 pub use dream::{DreamProposal, DreamReport, undo_dream};
-pub use engine::{Event, Harness, Session, StateReport, Topology, TurnOutput, project_scope};
+pub use engine::{
+    Event, ForgetNoteResult, Harness, NotesView, Session, StateReport, Topology, TurnOutput,
+    forget_note, project_scope, read_notes,
+};
 
 #[cfg(test)]
 mod tests;
@@ -20,6 +23,9 @@ mod preferences_tests;
 
 #[cfg(test)]
 mod dolt_tests;
+
+#[cfg(test)]
+mod notes_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tool_tests;

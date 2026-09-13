@@ -12,8 +12,8 @@ depends = [
     "{{usage.target}}",
   ] },
 ]
-run = 'cargo build -p kuru --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
-run_windows = 'cargo build -p kuru --all-features --locked --target {% if usage.target == "host" %}x86_64-pc-windows-msvc{% else %}"%usage_target%"{% endif %}'
+run = 'cargo build -p kuru --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru --locked --target {% if usage.target == "host" %}x86_64-pc-windows-msvc{% else %}"%usage_target%"{% endif %}'
 
 [tasks."build:release"]
 shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
@@ -27,8 +27,8 @@ depends = [
     "{{usage.target}}",
   ] },
 ]
-run = 'cargo build -p kuru --release --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
-run_windows = 'cargo build -p kuru --release --all-features --locked --target {% if usage.target == "host" %}x86_64-pc-windows-msvc{% else %}"%usage_target%"{% endif %}'
+run = 'cargo build -p kuru --release --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru --release --locked --target {% if usage.target == "host" %}x86_64-pc-windows-msvc{% else %}"%usage_target%"{% endif %}'
 
 [tasks."test"]
 env.RUST_TEST_THREADS = "2"

@@ -87,15 +87,26 @@ fn text(bytes: &[u8]) -> String {
 struct HttpMcpFixture {
     url: String,
     requests: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct HttpMcpState {
+    requests: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
 }
 
 impl HttpMcpFixture {
     async fn new() -> Self {
         let requests = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
         let router = Router::new()
             .fallback(any(http_mcp))
-            .with_state(requests.clone());
+            .with_state(HttpMcpState {
+                requests: requests.clone(),
+                calls: calls.clone(),
+            });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
@@ -104,12 +115,17 @@ impl HttpMcpFixture {
         Self {
             url,
             requests,
+            calls,
             task,
         }
     }
 
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
@@ -119,8 +135,8 @@ impl Drop for HttpMcpFixture {
     }
 }
 
-async fn http_mcp(State(requests): State<Arc<AtomicUsize>>, body: Bytes) -> axum::Json<Value> {
-    requests.fetch_add(1, Ordering::SeqCst);
+async fn http_mcp(State(state): State<HttpMcpState>, body: Bytes) -> axum::Json<Value> {
+    state.requests.fetch_add(1, Ordering::SeqCst);
     let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let response = match request["method"].as_str() {
         Some("initialize") => json!({
@@ -134,8 +150,34 @@ async fn http_mcp(State(requests): State<Arc<AtomicUsize>>, body: Bytes) -> axum
         Some("tools/list") => json!({
             "jsonrpc": "2.0",
             "id": request["id"],
-            "result": { "tools": [] }
+            "result": { "tools": [
+                {
+                    "name": "projected_result",
+                    "description": "isolated projection fixture",
+                    "inputSchema": {"type":"object","additionalProperties":false}
+                },
+                {
+                    "name": "projected_failure",
+                    "description": "isolated projected error fixture",
+                    "inputSchema": {"type":"object","additionalProperties":false}
+                }
+            ] }
         }),
+        Some("tools/call") => {
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            let result = if request["params"]["name"] == "projected_failure" {
+                json!({
+                    "content": [{"type":"text","text":"MCP fixture refused openai_api_key=sk-proj-abcdefghijklmnop0123456789; ordinary-control-remains-exact"}],
+                    "isError": true
+                })
+            } else {
+                json!({
+                    "content": [{"type":"text","text":"openai_api_key=sk-proj-abcdefghijklmnop0123456789; ordinary-control-remains-exact"}],
+                    "isError": false
+                })
+            };
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+        }
         _ => json!({}),
     };
     axum::Json(response)
@@ -271,6 +313,19 @@ fn mcp_config(stdio: &NativeMcpFixture, http: &HttpMcpFixture) -> String {
             },
         ),
     ]);
+    toml::to_string(&BTreeMap::from([("mcp", mcp)])).unwrap()
+}
+
+fn http_mcp_config(http: &HttpMcpFixture) -> String {
+    let mcp = BTreeMap::from([(
+        "http".to_owned(),
+        McpConfig {
+            command: None,
+            args: Vec::new(),
+            url: Some(http.url.clone()),
+            env: BTreeMap::new(),
+        },
+    )]);
     toml::to_string(&BTreeMap::from([("mcp", mcp)])).unwrap()
 }
 
@@ -439,6 +494,78 @@ async fn stdio_and_http_mcp_require_cli_approval_before_activation() {
         "approved HTTP MCP did not complete initialize, notification, and discovery"
     );
     assert!(!sandbox.data.join("trust").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_cli_mcp_tool_results_are_projected_before_stdout() {
+    const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
+    const ORDINARY_CONTROL: &str = "ordinary-control-remains-exact";
+    const MARKER: &str = "[REDACTED:recognized-secret]";
+
+    let http = HttpMcpFixture::new().await;
+    let sandbox = Sandbox::new(&http_mcp_config(&http));
+    tokio::task::block_in_place(|| sandbox.success(&["trust", "approve", "--yes"]));
+    let tools = tokio::task::block_in_place(|| sandbox.success(&["tools"]));
+    let tools: Value = serde_json::from_slice(&tools.stdout).unwrap();
+    let name = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| {
+            tool["description"] == "MCP http/projected_result: isolated projection fixture"
+        })
+        .and_then(|tool| tool["name"].as_str())
+        .unwrap();
+    let output = tokio::task::block_in_place(|| sandbox.success(&["tool", name, "--args", "{}"]));
+    let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        output["content"][0]["text"],
+        format!("openai_api_key={MARKER}; {ORDINARY_CONTROL}"),
+    );
+    assert_eq!(output["isError"], false);
+    assert_eq!(
+        http.calls(),
+        1,
+        "actual CLI did not call the isolated MCP tool"
+    );
+    assert!(!output.to_string().contains(TOOL_TOKEN));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_cli_mcp_tool_failures_are_projected_before_stderr() {
+    const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
+    const MARKER: &str = "[REDACTED:recognized-secret]";
+
+    let http = HttpMcpFixture::new().await;
+    let sandbox = Sandbox::new(&http_mcp_config(&http));
+    tokio::task::block_in_place(|| sandbox.success(&["trust", "approve", "--yes"]));
+    let tools = tokio::task::block_in_place(|| sandbox.success(&["tools"]));
+    let tools: Value = serde_json::from_slice(&tools.stdout).unwrap();
+    let name = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| {
+            tool["description"] == "MCP http/projected_failure: isolated projected error fixture"
+        })
+        .and_then(|tool| tool["name"].as_str())
+        .unwrap();
+    let output = tokio::task::block_in_place(|| sandbox.run(&["tool", name, "--args", "{}"]));
+    let stderr = text(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "unexpected stdout: {:?}",
+        output.stdout
+    );
+    assert!(stderr.contains("MCP tool application error"), "{stderr}");
+    assert!(stderr.contains(MARKER), "{stderr}");
+    assert!(!stderr.contains(TOOL_TOKEN), "{stderr}");
+    assert_eq!(
+        http.calls(),
+        1,
+        "actual CLI did not call the isolated MCP error tool"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

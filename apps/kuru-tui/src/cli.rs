@@ -14,7 +14,7 @@ use kuru_core::{
 };
 use kuru_memory::{MemoryStore, OpenOptions as MemoryOptions};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
-use kuru_runtime::Harness;
+use kuru_runtime::{Harness, forget_note, read_notes};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -148,6 +148,18 @@ pub enum MemoryCommand {
     History {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Read one peer or relationship's durable notes without starting a conversation.
+    Notes {
+        identity: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Remove one selected current note while retaining prior Dolt revisions.
+    Forget {
+        identity: String,
+        #[arg(long)]
+        note: i64,
     },
 }
 
@@ -382,10 +394,25 @@ pub async fn execute(cli: Cli) -> Result<()> {
     let writer = matches!(
         cli.command,
         None | Some(
-            Command::Run { .. } | Command::Dream | Command::UndoDream | Command::Serve { .. }
+            Command::Run { .. }
+                | Command::Dream
+                | Command::UndoDream
+                | Command::Serve { .. }
+                | Command::Memory {
+                    command: MemoryCommand::Forget { .. }
+                }
         )
     );
     let exists = MemoryStore::exists(&data, &scope)?;
+    let notes_control = matches!(
+        cli.command,
+        Some(Command::Memory {
+            command: MemoryCommand::Notes { .. } | MemoryCommand::Forget { .. }
+        })
+    );
+    if notes_control && !exists {
+        bail!("this project has no memory yet; start a conversation first");
+    }
     let legacy_path = data.join("memory.sqlite3");
     let legacy = match std::fs::symlink_metadata(&legacy_path) {
         Ok(_) => true,
@@ -448,6 +475,22 @@ pub async fn execute(cli: Cli) -> Result<()> {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&memory.revisions(*limit).await?)?
+                        );
+                    }
+                    MemoryCommand::Notes { identity, limit } => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &read_notes(memory, &cwd, config.mode, identity, *limit).await?
+                            )?
+                        );
+                    }
+                    MemoryCommand::Forget { identity, note } => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &forget_note(memory, &cwd, config.mode, identity, *note).await?
+                            )?
                         );
                     }
                 }

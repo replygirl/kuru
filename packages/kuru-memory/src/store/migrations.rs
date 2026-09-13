@@ -1,0 +1,2352 @@
+//! Private, immutable Dolt schema migration registry.
+//!
+//! A migration changes a versioned database, never an activation record or the
+//! sidecar identity protocol.  Keeping the definitions here makes the receipt
+//! validator the authority for both cold discovery and ordinary startup.
+use super::{AUTHOR, QUERY_TIMEOUT, revision, validate_schema_v1};
+use anyhow::{Context, Result, bail, ensure};
+use sha2::{Digest, Sha256};
+use sqlx::{MySqlPool, Row};
+use std::collections::BTreeSet;
+use uuid::Uuid;
+
+use crate::server::Server;
+
+pub(super) const CURRENT_VERSION: i32 = 2;
+const RESERVED_PREFIX: &str = "kuru_migration_";
+const INVENTORY_LIMIT: usize = 64;
+const DEFINITION_LIMIT: usize = 64;
+const FIELD_LIMIT: usize = 1024;
+const MIGRATION_ID_LIMIT: usize = 128;
+const RECEIPT_PROTOCOL: &str = "kuru.memory.migration.receipt.v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MigrationBoundary {
+    BeforeBranch,
+    BeforeDdl,
+    AfterDdl,
+    BeforeCommit,
+    BeforePublish,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct MigrationPause {
+    boundary: MigrationBoundary,
+    reached: std::sync::Arc<tokio::sync::Semaphore>,
+    resume: std::sync::Arc<tokio::sync::Semaphore>,
+    route_ready: std::sync::Arc<tokio::sync::Semaphore>,
+    route_resume: std::sync::Arc<tokio::sync::Semaphore>,
+    route_source: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<MySqlPool>>>>,
+    metadata: std::sync::Arc<std::sync::Mutex<MigrationMetadata>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MigrationMetadata {
+    branch: Option<String>,
+    target: Option<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct MigrationRunnerHooks {
+    #[cfg(test)]
+    pause: Option<MigrationPause>,
+    #[cfg(test)]
+    route: Option<(MigrationBoundary, u16)>,
+}
+
+#[cfg(test)]
+pub(super) struct MigrationPauseControl {
+    reached: std::sync::Arc<tokio::sync::Semaphore>,
+    resume: std::sync::Arc<tokio::sync::Semaphore>,
+    route_ready: std::sync::Arc<tokio::sync::Semaphore>,
+    route_resume: std::sync::Arc<tokio::sync::Semaphore>,
+    route_source: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<MySqlPool>>>>,
+    metadata: std::sync::Arc<std::sync::Mutex<MigrationMetadata>>,
+}
+
+impl std::fmt::Debug for MigrationRunnerHooks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("MigrationRunnerHooks");
+        #[cfg(test)]
+        {
+            debug.field("pause", &self.pause.as_ref().map(|pause| pause.boundary));
+            debug.field("route", &self.route);
+        }
+        debug.finish()
+    }
+}
+
+impl MigrationRunnerHooks {
+    fn none() -> Self {
+        Self {
+            #[cfg(test)]
+            pause: None,
+            #[cfg(test)]
+            route: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn paused(boundary: MigrationBoundary) -> (Self, MigrationPauseControl) {
+        let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let resume = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let route_ready = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let route_resume = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let route_source = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let metadata = std::sync::Arc::new(std::sync::Mutex::new(MigrationMetadata::default()));
+        (
+            Self {
+                pause: Some(MigrationPause {
+                    boundary,
+                    reached: reached.clone(),
+                    resume: resume.clone(),
+                    route_ready: route_ready.clone(),
+                    route_resume: route_resume.clone(),
+                    route_source: route_source.clone(),
+                    metadata: metadata.clone(),
+                }),
+                route: None,
+            },
+            MigrationPauseControl {
+                reached,
+                resume,
+                route_ready,
+                route_resume,
+                route_source,
+                metadata,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_route(mut self, boundary: MigrationBoundary, proxy_port: u16) -> Self {
+        self.route = Some((boundary, proxy_port));
+        self
+    }
+
+    async fn reach(&self, boundary: MigrationBoundary) -> Result<()> {
+        #[cfg(not(test))]
+        {
+            let _ = boundary;
+            Ok(())
+        }
+        #[cfg(test)]
+        let Some(pause) = self
+            .pause
+            .as_ref()
+            .filter(|pause| pause.boundary == boundary)
+        else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        {
+            pause.reached.add_permits(1);
+            pause
+                .resume
+                .acquire()
+                .await
+                .context("migration fixture resume channel closed")?
+                .forget();
+            Ok(())
+        }
+    }
+
+    fn describe(&self, boundary: MigrationBoundary, branch: &str, target: Option<&str>) {
+        #[cfg(not(test))]
+        let _ = (boundary, branch, target);
+        #[cfg(test)]
+        if let Some(pause) = self
+            .pause
+            .as_ref()
+            .filter(|pause| pause.boundary == boundary)
+        {
+            let mut metadata = pause
+                .metadata
+                .lock()
+                .expect("migration fixture metadata lock");
+            metadata.branch = Some(branch.to_owned());
+            metadata.target = target.map(str::to_owned);
+        }
+    }
+}
+
+#[cfg(test)]
+impl MigrationPauseControl {
+    pub(super) async fn route_source(&self) -> Result<std::sync::Arc<MySqlPool>> {
+        self.route_ready
+            .acquire()
+            .await
+            .context("migration fixture route channel closed")?
+            .forget();
+        self.route_source
+            .lock()
+            .expect("migration fixture route source lock")
+            .clone()
+            .context("migration fixture route observer missing")
+    }
+
+    pub(super) fn resume_route(&self) {
+        self.route_resume.add_permits(1);
+    }
+
+    pub(super) async fn reached(&self) -> Result<()> {
+        self.reached
+            .acquire()
+            .await
+            .context("migration fixture reached channel closed")?
+            .forget();
+        Ok(())
+    }
+
+    pub(super) fn resume(&self) {
+        self.resume.add_permits(1);
+    }
+
+    pub(super) fn branch_name(&self) -> Result<String> {
+        self.metadata
+            .lock()
+            .expect("migration fixture metadata lock")
+            .branch
+            .clone()
+            .context("migration fixture branch name missing")
+    }
+
+    pub(super) fn publication_target(&self) -> Result<String> {
+        self.metadata
+            .lock()
+            .expect("migration fixture metadata lock")
+            .target
+            .clone()
+            .context("migration fixture publication target missing")
+    }
+}
+
+async fn routed_pool(
+    direct: &MySqlPool,
+    hooks: &MigrationRunnerHooks,
+    boundary: MigrationBoundary,
+) -> Result<Option<MySqlPool>> {
+    #[cfg(not(test))]
+    {
+        let _ = (direct, hooks, boundary);
+        Ok(None)
+    }
+    #[cfg(test)]
+    {
+        let Some((_, port)) = hooks.route.filter(|(selected, _)| *selected == boundary) else {
+            return Ok(None);
+        };
+        ensure!(port != 0, "migration fixture proxy port is invalid");
+        let options = direct
+            .connect_options()
+            .as_ref()
+            .clone()
+            .host("127.0.0.1")
+            .port(port);
+        if let Some(pause) = hooks
+            .pause
+            .as_ref()
+            .filter(|pause| pause.boundary == boundary)
+        {
+            *pause
+                .route_source
+                .lock()
+                .expect("migration fixture route source lock") =
+                Some(std::sync::Arc::new(direct.clone()));
+            pause.route_ready.add_permits(1);
+            pause
+                .route_resume
+                .acquire()
+                .await
+                .context("migration fixture route resume channel closed")?
+                .forget();
+        }
+        Ok(Some(
+            sqlx::mysql::MySqlPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(QUERY_TIMEOUT)
+                .connect_with(options)
+                .await
+                .context("connect migration fixture proxy")?,
+        ))
+    }
+}
+
+async fn bounded_query<T>(
+    query: impl std::future::Future<Output = std::result::Result<T, sqlx::Error>>,
+) -> Result<T> {
+    tokio::time::timeout(QUERY_TIMEOUT, query)
+        .await
+        .context("Dolt migration query deadline exceeded")?
+        .map_err(Into::into)
+}
+
+#[derive(Clone, Copy)]
+struct Definition {
+    from: i32,
+    to: i32,
+    id: &'static str,
+    sql: &'static [&'static str],
+    transform: &'static str,
+    postcondition: &'static str,
+    failed_status: &'static [StatusRow],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct StatusRow {
+    table: &'static str,
+    staged: i64,
+    status: &'static str,
+}
+
+const V2: Definition = Definition {
+    from: 1,
+    to: 2,
+    id: "kuru.memory.receipts.v2",
+    sql: &[
+        "CREATE TABLE kuru_migrations (version INT PRIMARY KEY, id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, digest CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, operation CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE)",
+    ],
+    transform: "none",
+    postcondition: "version=2;exact receipt ID/digest/canonical UUID;v1 tables remain readable",
+    failed_status: &[StatusRow {
+        table: "kuru_migrations",
+        staged: 0,
+        status: "new table",
+    }],
+};
+
+const DEFINITIONS: &[Definition] = &[V2];
+
+#[derive(Clone, Copy)]
+struct Registry {
+    current: i32,
+    definitions: &'static [Definition],
+}
+
+const REGISTRY: Registry = Registry {
+    current: CURRENT_VERSION,
+    definitions: DEFINITIONS,
+};
+
+#[cfg(test)]
+fn definition(to: i32) -> Result<&'static Definition> {
+    REGISTRY.definition(to)
+}
+
+impl Registry {
+    fn definition(self, to: i32) -> Result<&'static Definition> {
+        self.validate()?;
+        self.definitions
+            .iter()
+            .find(|definition| definition.to == to)
+            .context("unsupported Dolt memory schema transition")
+    }
+
+    fn validate(self) -> Result<()> {
+        ensure!(
+            !self.definitions.is_empty() && self.definitions.len() <= DEFINITION_LIMIT,
+            "compiled Dolt migration registry has an invalid size"
+        );
+        ensure!(
+            self.definitions
+                .last()
+                .is_some_and(|definition| definition.to == self.current),
+            "compiled Dolt migration registry does not end at current schema"
+        );
+        let mut ids = BTreeSet::new();
+        let mut targets = BTreeSet::new();
+        for (index, definition) in self.definitions.iter().enumerate() {
+            let expected_from = i32::try_from(index)? + 1;
+            ensure!(
+                definition.from == expected_from && definition.to == expected_from + 1,
+                "compiled Dolt migration registry is not consecutive"
+            );
+            ensure!(
+                ids.insert(definition.id) && targets.insert(definition.to),
+                "compiled Dolt migration registry contains a duplicate"
+            );
+            ensure!(
+                !definition.id.is_empty()
+                    && definition.id.len() <= MIGRATION_ID_LIMIT
+                    && definition.id.is_ascii()
+                    && !definition.id.contains('\0'),
+                "invalid compiled Dolt memory migration definition"
+            );
+            for value in [definition.transform, definition.postcondition] {
+                ensure!(
+                    !value.is_empty()
+                        && value.len() <= FIELD_LIMIT
+                        && value.is_ascii()
+                        && !value.contains('\0'),
+                    "invalid compiled Dolt memory migration definition"
+                );
+            }
+            ensure!(
+                !definition.sql.is_empty() && definition.sql.len() <= DEFINITION_LIMIT,
+                "invalid compiled Dolt migration SQL"
+            );
+            for statement in definition.sql {
+                ensure!(
+                    !statement.is_empty()
+                        && statement.len() <= 32 * 1024
+                        && !statement.contains('\0'),
+                    "invalid compiled Dolt migration SQL"
+                );
+            }
+            ensure!(
+                definition.failed_status.len() <= DEFINITION_LIMIT
+                    && definition
+                        .failed_status
+                        .windows(2)
+                        .all(|rows| rows[0] < rows[1]),
+                "invalid compiled Dolt migration failed-status definition"
+            );
+            for row in definition.failed_status {
+                ensure!(
+                    !row.table.is_empty()
+                        && row.table.len() <= FIELD_LIMIT
+                        && row.table.is_ascii()
+                        && !row.table.contains('\0')
+                        && !row.status.is_empty()
+                        && row.status.len() <= FIELD_LIMIT
+                        && row.status.is_ascii()
+                        && !row.status.contains('\0')
+                        && matches!(row.staged, 0 | 1),
+                    "invalid compiled Dolt migration failed-status definition"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn digest(definition: &Definition) -> String {
+    // Domain separation prevents a receipt digest from being confused with a
+    // hash of a user value or another Kuru durable record.
+    let mut hash = Sha256::new();
+    hash_field(&mut hash, b"protocol", RECEIPT_PROTOCOL.as_bytes());
+    hash_field(&mut hash, b"from", &definition.from.to_be_bytes());
+    hash_field(&mut hash, b"to", &definition.to.to_be_bytes());
+    hash_field(&mut hash, b"id", definition.id.as_bytes());
+    hash_field(
+        &mut hash,
+        b"sql-count",
+        &u64::try_from(definition.sql.len())
+            .expect("bounded definition count")
+            .to_be_bytes(),
+    );
+    for statement in definition.sql {
+        hash_field(&mut hash, b"sql", statement.as_bytes());
+    }
+    hash_field(&mut hash, b"transform", definition.transform.as_bytes());
+    hash_field(
+        &mut hash,
+        b"postcondition",
+        definition.postcondition.as_bytes(),
+    );
+    hash_field(
+        &mut hash,
+        b"failed-status-count",
+        &u64::try_from(definition.failed_status.len())
+            .expect("bounded failed-status count")
+            .to_be_bytes(),
+    );
+    for row in definition.failed_status {
+        hash_field(&mut hash, b"failed-table", row.table.as_bytes());
+        hash_field(&mut hash, b"failed-staged", &row.staged.to_be_bytes());
+        hash_field(&mut hash, b"failed-status", row.status.as_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hash_field(hash: &mut Sha256, tag: &[u8], value: &[u8]) {
+    hash.update(
+        u64::try_from(tag.len())
+            .expect("static digest tag length")
+            .to_be_bytes(),
+    );
+    hash.update(tag);
+    hash.update(
+        u64::try_from(value.len())
+            .expect("bounded digest field length")
+            .to_be_bytes(),
+    );
+    hash.update(value);
+}
+
+pub(super) async fn version(pool: &MySqlPool) -> Result<i32> {
+    version_from_query(pool, "SELECT id, version FROM kuru_schema LIMIT 2").await
+}
+
+async fn version_from_query(pool: &MySqlPool, query: &'static str) -> Result<i32> {
+    let rows = bounded_query(sqlx::query(query).fetch_all(pool))
+        .await
+        .context("database is not an initialized Kuru memory store")?;
+    ensure!(
+        rows.len() == 1,
+        "Dolt memory schema must contain one stable version row"
+    );
+    let id: i32 = rows[0].try_get("id")?;
+    ensure!(
+        id == 1,
+        "Dolt memory schema version row has an invalid identity"
+    );
+    let version: i32 = rows[0].try_get("version")?;
+    ensure!(version >= 1, "invalid Dolt memory schema version {version}");
+    Ok(version)
+}
+
+pub(super) async fn validate_supported(pool: &MySqlPool) -> Result<i32> {
+    validate_supported_with(REGISTRY, pool).await
+}
+
+/// Validate a historical branch through its own version dispatcher.
+/// This never migrates the branch or applies latest-main validation.
+pub(super) async fn validate_historical(pool: &MySqlPool) -> Result<i32> {
+    let version = validate_supported_with(REGISTRY, pool).await?;
+    authority_working_set(pool).await?;
+    Ok(version)
+}
+
+async fn validate_supported_with(registry: Registry, pool: &MySqlPool) -> Result<i32> {
+    registry.validate()?;
+    let found = version(pool).await?;
+    validate_version_with(registry, pool, found).await?;
+    Ok(found)
+}
+
+async fn validate_version_with(registry: Registry, pool: &MySqlPool, expected: i32) -> Result<()> {
+    let found = version(pool).await?;
+    ensure!(
+        found == expected,
+        "Dolt migration branch has schema version {found}, expected {expected}"
+    );
+    validate_schema_with(registry, pool, expected).await
+}
+
+async fn validate_schema_with(registry: Registry, pool: &MySqlPool, found: i32) -> Result<()> {
+    ensure!(
+        (1..=registry.current).contains(&found),
+        "unsupported Dolt memory schema version {found}"
+    );
+    validate_schema_v1(pool).await?;
+    if found == 1 {
+        let receipt_tables: i64 = bounded_query(
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND BINARY table_name = BINARY 'kuru_migrations'",
+            )
+            .fetch_one(pool),
+        )
+        .await?;
+        ensure!(
+            receipt_tables == 0,
+            "Dolt memory schema 1 must not contain migration receipt authority"
+        );
+    }
+    if found >= 2 {
+        validate_receipts(registry, pool, found).await?;
+    }
+    #[cfg(test)]
+    if found >= 3 {
+        bounded_query(
+            sqlx::query("SELECT marker FROM kuru_migration_test_v3 LIMIT 0").fetch_all(pool),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn validate_current(pool: &MySqlPool) -> Result<()> {
+    validate_current_with(REGISTRY, pool).await
+}
+
+async fn validate_current_with(registry: Registry, pool: &MySqlPool) -> Result<()> {
+    let found = validate_supported_with(registry, pool).await?;
+    ensure!(
+        found == registry.current,
+        "memory schema version {found} requires writable upgrade to {}",
+        registry.current
+    );
+    inventory_with(registry, pool).await?;
+    Ok(())
+}
+
+pub(super) async fn validate_active(server: &Server, pool: &MySqlPool) -> Result<()> {
+    validate_active_with(REGISTRY, server, pool).await
+}
+
+/// Validate a current-schema read-only main without treating unrelated working
+/// data as a migration failure.
+pub(super) async fn validate_inspection(server: &Server, pool: &MySqlPool) -> Result<()> {
+    validate_current_with(REGISTRY, pool).await?;
+    authority_working_set(pool).await?;
+    classify_historical_attempts(REGISTRY, server, pool, REGISTRY.current).await
+}
+
+/// Validate a stopped staging database exactly at the version published in its
+/// immutable ready marker. A supported older stage remains activatable, but it
+/// cannot contain attempts for work its publishing binary had not completed.
+pub(super) async fn validate_ready(server: &Server, pool: &MySqlPool) -> Result<i32> {
+    validate_ready_with(REGISTRY, server, pool).await
+}
+
+async fn validate_ready_with(registry: Registry, server: &Server, pool: &MySqlPool) -> Result<i32> {
+    let found = validate_supported_with(registry, pool).await?;
+    inventory_with(registry, pool).await?;
+    clean(pool).await?;
+    for name in reserved_names(pool).await? {
+        let (target, _) = parse_attempt(&name)?;
+        ensure!(
+            target <= found,
+            "ready Dolt memory stage contains an attempt newer than its schema"
+        );
+    }
+    classify_historical_attempts(registry, server, pool, found).await?;
+    Ok(found)
+}
+
+async fn validate_active_with(registry: Registry, server: &Server, pool: &MySqlPool) -> Result<()> {
+    validate_current_with(registry, pool).await?;
+    clean(pool).await?;
+    classify_historical_attempts(registry, server, pool, registry.current).await
+}
+
+async fn validate_receipts(registry: Registry, pool: &MySqlPool, found: i32) -> Result<()> {
+    let expected: Vec<_> = registry
+        .definitions
+        .iter()
+        .filter(|definition| definition.to <= found)
+        .collect();
+    let limit = i64::try_from(expected.len() + 1)?;
+    let rows = bounded_query(
+        sqlx::query(
+            "SELECT version, id, digest, operation FROM kuru_migrations ORDER BY version LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool),
+    )
+    .await?;
+    ensure!(
+        rows.len() == expected.len(),
+        "Dolt memory migration receipt chain is incomplete or has extra entries"
+    );
+    let mut operations = BTreeSet::new();
+    for (row, definition) in rows.iter().zip(expected) {
+        let version: i32 = row.try_get("version")?;
+        let id: String = row.try_get("id")?;
+        let observed: String = row.try_get("digest")?;
+        let operation: String = row.try_get("operation")?;
+        ensure!(
+            version == definition.to,
+            "Dolt memory migration receipt version is out of order"
+        );
+        ensure!(
+            id == definition.id,
+            "Dolt memory migration receipt ID differs"
+        );
+        ensure!(
+            observed == digest(definition),
+            "Dolt memory migration receipt definition differs"
+        );
+        let parsed = Uuid::parse_str(&operation)
+            .context("Dolt memory migration receipt UUID is malformed")?;
+        ensure!(
+            parsed.hyphenated().to_string() == operation,
+            "Dolt memory migration receipt UUID must use lowercase canonical form"
+        );
+        ensure!(
+            operations.insert(operation),
+            "Dolt memory migration receipt operation is repeated"
+        );
+    }
+    Ok(())
+}
+
+fn attempt_name(to: i32, operation: Uuid) -> String {
+    format!("{RESERVED_PREFIX}v{to:010}_{}", operation.simple())
+}
+
+fn parse_attempt(name: &str) -> Result<(i32, Uuid)> {
+    let rest = name
+        .strip_prefix(RESERVED_PREFIX)
+        .context("reserved migration branch is malformed")?;
+    let (version, operation) = rest
+        .strip_prefix('v')
+        .and_then(|rest| rest.split_once('_'))
+        .context("reserved migration branch is malformed")?;
+    ensure!(
+        version.len() == 10 && version.bytes().all(|byte| byte.is_ascii_digit()),
+        "reserved migration branch is malformed"
+    );
+    let version: i32 = version
+        .parse()
+        .context("reserved migration branch has invalid version")?;
+    let operation =
+        Uuid::parse_str(operation).context("reserved migration branch has invalid UUID")?;
+    ensure!(
+        operation.simple().to_string() == name.rsplit_once('_').expect("split above").1,
+        "reserved migration branch UUID must use lowercase simple form"
+    );
+    Ok((version, operation))
+}
+
+async fn clean(pool: &MySqlPool) -> Result<()> {
+    let changes: i64 =
+        bounded_query(sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(pool))
+            .await?;
+    ensure!(
+        changes == 0,
+        "Dolt migration branch has uncommitted changes"
+    );
+    Ok(())
+}
+
+/// Read-only compatibility may observe ordinary uncommitted data, but schema
+/// and receipt authority must always remain committed and unchanged.
+async fn authority_working_set(pool: &MySqlPool) -> Result<()> {
+    let rows = bounded_query(
+        sqlx::query(
+            "SELECT table_name, staged, status FROM dolt_status WHERE BINARY table_name = BINARY 'kuru_schema' OR BINARY table_name = BINARY 'kuru_migrations' ORDER BY BINARY table_name, staged, BINARY status LIMIT 3",
+        )
+        .fetch_all(pool),
+    )
+    .await?;
+    ensure!(
+        rows.is_empty(),
+        "Dolt memory schema or migration receipt authority has uncommitted changes"
+    );
+    Ok(())
+}
+
+async fn retained_failed_shape(pool: &MySqlPool, definition: &Definition) -> Result<bool> {
+    let limit = i64::try_from(definition.failed_status.len() + 1)?;
+    let rows = bounded_query(
+        sqlx::query(
+            "SELECT table_name, staged, status FROM dolt_status ORDER BY BINARY table_name, staged, BINARY status LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool),
+    )
+    .await?;
+    ensure!(
+        rows.len() == definition.failed_status.len(),
+        "Dolt migration failed-status inventory is incomplete or excessive"
+    );
+    for (row, expected) in rows.iter().zip(definition.failed_status) {
+        ensure!(
+            row.try_get::<String, _>("table_name")? == expected.table
+                && row.try_get::<i64, _>("staged")? == expected.staged
+                && row.try_get::<String, _>("status")? == expected.status,
+            "Dolt migration failed-status inventory differs from its definition"
+        );
+    }
+    Ok(true)
+}
+
+async fn inventory_with(registry: Registry, pool: &MySqlPool) -> Result<()> {
+    let names = reserved_names(pool).await?;
+    ensure!(
+        names.len() <= INVENTORY_LIMIT,
+        "too many retained Dolt migration attempts"
+    );
+    for name in names {
+        let (target, _) = parse_attempt(&name)?;
+        registry.definition(target)?;
+    }
+    Ok(())
+}
+
+async fn reserved_names(pool: &MySqlPool) -> Result<Vec<String>> {
+    // Do not use LIKE: underscores in the namespace are wildcards there. The
+    // bounded SQL-side prefix comparison keeps arbitrary user refs out of the
+    // reserved inventory and caps allocation before parsing.
+    let names: Vec<String> = bounded_query(
+        sqlx::query_scalar(
+            "SELECT name FROM dolt_branches WHERE LEFT(BINARY name, ?) = BINARY ? LIMIT 65",
+        )
+        .bind(i64::try_from(RESERVED_PREFIX.len())?)
+        .bind(RESERVED_PREFIX)
+        .fetch_all(pool),
+    )
+    .await?;
+    Ok(names)
+}
+
+async fn close_routed_pool(pool: Option<MySqlPool>) -> Result<()> {
+    if let Some(pool) = pool {
+        tokio::time::timeout(QUERY_TIMEOUT, pool.close())
+            .await
+            .context("migration fixture connection-pool close deadline exceeded")?;
+    }
+    Ok(())
+}
+
+async fn close_branch_pool(pool: &MySqlPool) -> Result<()> {
+    tokio::time::timeout(QUERY_TIMEOUT, pool.close())
+        .await
+        .context("Dolt migration branch pool close deadline exceeded")
+}
+
+fn after_cleanup<T>(result: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "Dolt migration branch cleanup also failed: {cleanup:#}"
+        ))),
+    }
+}
+
+/// Build each missing schema version on its own exact-base branch.  The caller
+/// retains server and startup-lock ownership until this returns and all pools
+/// have been closed, so an accepted attempt cannot be abandoned by cancellation.
+pub(super) async fn upgrade(server: &Server, main: &MySqlPool) -> Result<()> {
+    upgrade_with(REGISTRY, server, main, &MigrationRunnerHooks::none()).await
+}
+
+#[cfg(test)]
+pub(super) async fn upgrade_with_hooks(
+    server: &Server,
+    main: &MySqlPool,
+    hooks: &MigrationRunnerHooks,
+) -> Result<()> {
+    upgrade_with(REGISTRY, server, main, hooks).await
+}
+
+async fn upgrade_with(
+    registry: Registry,
+    server: &Server,
+    main: &MySqlPool,
+    hooks: &MigrationRunnerHooks,
+) -> Result<()> {
+    loop {
+        let found = validate_supported_with(registry, main).await?;
+        inventory_with(registry, main).await?;
+        classify_historical_attempts(registry, server, main, found).await?;
+        if found == registry.current {
+            return Ok(());
+        }
+        ensure!(
+            found < registry.current,
+            "unsupported Dolt memory schema version {found}"
+        );
+        let definition = registry.definition(found + 1)?;
+        let base = revision(main).await?;
+        clean(main).await?;
+        let (branch, operation, ready) =
+            discover_current_attempt(registry, server, main, definition, &base, hooks).await?;
+        if ready {
+            let attempt = server.pool(&branch).await?;
+            let inspected = async {
+                let target = revision(&attempt).await?;
+                validate_attempt(registry, &attempt, definition, operation, &base).await?;
+                Ok(target)
+            }
+            .await;
+            let target = after_cleanup(inspected, close_branch_pool(&attempt).await)?;
+            publish(registry, main, definition, &branch, &base, &target, hooks).await?;
+            continue;
+        }
+        let attempt = server.pool(&branch).await?;
+        let built = async {
+            hooks.reach(MigrationBoundary::BeforeDdl).await?;
+            build_attempt(registry, &attempt, definition, operation, hooks).await?;
+            let target = revision(&attempt).await?;
+            validate_attempt(registry, &attempt, definition, operation, &base).await?;
+            Ok(target)
+        }
+        .await;
+        let target = after_cleanup(built, close_branch_pool(&attempt).await)?;
+        publish(registry, main, definition, &branch, &base, &target, hooks).await?;
+    }
+}
+
+async fn classify_historical_attempts(
+    registry: Registry,
+    server: &Server,
+    main: &MySqlPool,
+    current: i32,
+) -> Result<()> {
+    let main_head = revision(main).await?;
+    for name in reserved_names(main).await? {
+        let (target, operation) = parse_attempt(&name)?;
+        ensure!(
+            target <= current + 1,
+            "reserved Dolt migration branch targets an out-of-order step"
+        );
+        if target > current {
+            continue;
+        }
+        let definition = registry.definition(target)?;
+        let attempt = server.pool(&name).await?;
+        let inspected = async {
+            let head = revision(&attempt).await?;
+            let head_version: i32 = bounded_query(
+                sqlx::query_scalar("SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1")
+                    .fetch_one(attempt.as_ref()),
+            )
+            .await?;
+            let dirty: i64 = bounded_query(
+                sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status").fetch_one(attempt.as_ref()),
+            )
+            .await?;
+            let outcome = if dirty == 0 {
+                validate_version_with(registry, &attempt, definition.to).await?;
+                let receipt: String = bounded_query(
+                    sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = ?")
+                        .bind(definition.to)
+                        .fetch_one(attempt.as_ref()),
+                )
+                .await?;
+                ensure!(
+                    receipt == operation.hyphenated().to_string(),
+                    "historical Dolt migration receipt does not match its branch"
+                );
+                let parent = sole_parent(&attempt, &head).await?;
+                validate_commit_version(registry, server, &parent, definition.from).await?;
+                ancestor(main, &head).await? && ancestor(main, &parent).await?
+            } else {
+                ensure!(
+                    head_version == definition.from,
+                    "dirty historical Dolt migration branch has an unexpected schema"
+                );
+                validate_commit_version(registry, server, &head, definition.from).await?;
+                ensure!(
+                    retained_failed_shape(&attempt, definition).await?,
+                    "dirty historical Dolt migration branch has an unexpected working set"
+                );
+                ancestor(main, &head).await?
+            };
+            Ok((head, outcome))
+        }
+        .await;
+        let (head, outcome) = after_cleanup(inspected, close_branch_pool(&attempt).await)?;
+        ensure!(
+            outcome,
+            "historical Dolt migration branch is not retained by active history"
+        );
+        ensure!(
+            head != main_head || target == current,
+            "historical Dolt migration branch unexpectedly names active main"
+        );
+    }
+    Ok(())
+}
+
+async fn ancestor(main: &MySqlPool, ancestor: &str) -> Result<bool> {
+    let count: i64 = bounded_query(
+        sqlx::query_scalar("SELECT COUNT(*) FROM dolt_log WHERE commit_hash = ?")
+            .bind(ancestor)
+            .fetch_one(main),
+    )
+    .await?;
+    Ok(count == 1)
+}
+
+async fn sole_parent(pool: &MySqlPool, commit: &str) -> Result<String> {
+    let parents: Vec<String> = bounded_query(
+        sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? ORDER BY parent_index LIMIT 2",
+        )
+        .bind(commit)
+        .fetch_all(pool),
+    )
+    .await?;
+    ensure!(
+        parents.len() == 1,
+        "Dolt migration target does not have exactly one parent"
+    );
+    Ok(parents.into_iter().next().expect("one parent checked"))
+}
+
+async fn validate_commit_version(
+    registry: Registry,
+    server: &Server,
+    commit: &str,
+    expected: i32,
+) -> Result<()> {
+    let pool = server.pool(commit).await?;
+    let validation = validate_version_with(registry, &pool, expected).await;
+    after_cleanup(validation, close_branch_pool(&pool).await)
+}
+
+/// Return the sole pristine branch for this exact base, or create one.  A
+/// completed branch is returned as `ready`; retained dirty attempts are
+/// evidence, never a reset/reuse target.  Every other shape is ambiguous.
+async fn discover_current_attempt(
+    registry: Registry,
+    server: &Server,
+    main: &MySqlPool,
+    definition: &Definition,
+    base: &str,
+    hooks: &MigrationRunnerHooks,
+) -> Result<(String, Uuid, bool)> {
+    let names = reserved_names(main).await?;
+    let inventory_len = names.len();
+    let mut reusable = None;
+    for name in names {
+        let (target, operation) = parse_attempt(&name)?;
+        if target != definition.to {
+            continue;
+        }
+        let attempt = server.pool(&name).await?;
+        let inspected = async {
+            let head = revision(&attempt).await?;
+            let dirty = bounded_query(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_status")
+                    .fetch_one(attempt.as_ref()),
+            )
+            .await?;
+            let head_version: i32 = bounded_query(
+                sqlx::query_scalar("SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1")
+                    .fetch_one(attempt.as_ref()),
+            )
+            .await?;
+            if head == base && dirty == 0 && head_version == definition.from {
+                validate_version_with(registry, &attempt, definition.from).await?;
+                Ok(Some(false)) // pristine
+            } else if dirty == 0 && head_version == definition.to {
+                validate_attempt(registry, &attempt, definition, operation, base).await?;
+                Ok(Some(true))
+            } else if head == base && dirty > 0 && head_version == definition.from {
+                validate_commit_version(registry, server, &head, definition.from).await?;
+                ensure!(
+                    retained_failed_shape(&attempt, definition).await?,
+                    "reserved Dolt migration branch has an unexpected failed working set"
+                );
+                Ok(None) // retained failed attempt
+            } else {
+                bail!("reserved Dolt migration branch has an unresolved state");
+            }
+        }
+        .await;
+        let shape = after_cleanup(inspected, close_branch_pool(&attempt).await)?;
+        if let Some(ready) = shape {
+            ensure!(
+                reusable.is_none(),
+                "multiple publishable Dolt migration attempts exist"
+            );
+            reusable = Some((name, operation, ready));
+        }
+    }
+    if let Some(attempt) = reusable {
+        return Ok(attempt);
+    }
+    ensure!(
+        inventory_len < INVENTORY_LIMIT,
+        "retained Dolt migration attempts leave no capacity for a fresh attempt"
+    );
+    let operation = Uuid::new_v4();
+    let branch = attempt_name(definition.to, operation);
+    hooks.describe(MigrationBoundary::BeforeBranch, &branch, None);
+    let routed = routed_pool(main, hooks, MigrationBoundary::BeforeBranch).await?;
+    let command_pool = routed.as_ref().unwrap_or(main);
+    let (mut connection, connection_id) = super::owned_connection(command_pool).await?;
+    let created = async {
+        hooks.reach(MigrationBoundary::BeforeBranch).await?;
+        bounded_query(
+            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                .bind(&branch)
+                .bind(base)
+                .fetch_all(&mut connection),
+        )
+        .await
+    }
+    .await;
+    drop(connection);
+    let close_result = close_routed_pool(routed).await;
+    let session_result = super::await_session_end(main, connection_id, QUERY_TIMEOUT).await;
+    if let Err(cleanup) = after_cleanup(close_result, session_result) {
+        return match created {
+            Ok(_) => Err(cleanup),
+            Err(error) => Err(error.context(format!(
+                "Dolt migration branch-create cleanup also failed: {cleanup:#}"
+            ))),
+        };
+    }
+    let observed: Option<String> = bounded_query(
+        sqlx::query_scalar("SELECT hash FROM dolt_branches WHERE name = ?")
+            .bind(&branch)
+            .fetch_optional(main),
+    )
+    .await?;
+    match (created, observed) {
+        (Ok(_), Some(observed)) | (Err(_), Some(observed)) if observed == base => {
+            Ok((branch, operation, false))
+        }
+        (Ok(_), Some(_)) | (Err(_), Some(_)) => {
+            bail!("new Dolt migration branch did not retain its exact base")
+        }
+        (Ok(_), None) => bail!("Dolt did not retain a created migration branch"),
+        (Err(error), None) => Err(error).context("create isolated Dolt migration branch"),
+    }
+}
+
+async fn build_attempt(
+    registry: Registry,
+    pool: &MySqlPool,
+    definition: &Definition,
+    operation: Uuid,
+    hooks: &MigrationRunnerHooks,
+) -> Result<()> {
+    let routed = routed_pool(pool, hooks, MigrationBoundary::BeforeCommit).await?;
+    let command_pool = routed.as_ref().unwrap_or(pool);
+    let (mut connection, id) = super::owned_connection(command_pool).await?;
+    let result = async {
+        for statement in definition.sql {
+            bounded_query(sqlx::query(*statement).execute(&mut connection)).await?;
+        }
+        hooks.reach(MigrationBoundary::AfterDdl).await?;
+        bounded_query(sqlx::query("START TRANSACTION").execute(&mut connection)).await?;
+        let advanced = bounded_query(
+            sqlx::query("UPDATE kuru_schema SET version = ? WHERE id = 1 AND version = ?")
+                .bind(definition.to)
+                .bind(definition.from)
+                .execute(&mut connection),
+        )
+        .await?;
+        ensure!(
+            advanced.rows_affected() == 1,
+            "Dolt migration schema version did not advance exactly once"
+        );
+        bounded_query(
+            sqlx::query(
+                "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (?, ?, ?, ?)",
+            )
+            .bind(definition.to)
+            .bind(definition.id)
+            .bind(digest(definition))
+            .bind(operation.hyphenated().to_string())
+            .execute(&mut connection),
+        )
+        .await?;
+        hooks.reach(MigrationBoundary::BeforeCommit).await?;
+        bounded_query(
+            sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
+                .bind(format!(
+                    "Upgrade Kuru memory schema {} [{}]",
+                    definition.to, operation
+                ))
+                .bind(AUTHOR)
+                .fetch_all(&mut connection),
+        )
+        .await?;
+        bounded_query(sqlx::query("COMMIT").execute(&mut connection)).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    drop(connection);
+    let close_result = close_routed_pool(routed).await;
+    let session_result = super::await_session_end(pool, id, QUERY_TIMEOUT).await;
+    if let Err(cleanup) = after_cleanup(close_result, session_result) {
+        return after_cleanup(result, Err(cleanup));
+    }
+    if result.is_ok() {
+        return Ok(());
+    }
+    // A dropped reply after DOLT_COMMIT must be reconciled from the branch's
+    // durable head and receipt, never replayed on a second branch.
+    if validate_version_with(registry, pool, definition.to)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    result.context("Dolt migration commit failed")
+}
+
+async fn validate_attempt(
+    registry: Registry,
+    pool: &MySqlPool,
+    definition: &Definition,
+    operation: Uuid,
+    base: &str,
+) -> Result<()> {
+    clean(pool).await?;
+    validate_version_with(registry, pool, definition.to).await?;
+    let actual: String = bounded_query(
+        sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = ?")
+            .bind(definition.to)
+            .fetch_one(pool),
+    )
+    .await?;
+    ensure!(
+        actual == operation.hyphenated().to_string(),
+        "Dolt migration branch receipt does not match its name"
+    );
+    let target = revision(pool).await?;
+    let parent = sole_parent(pool, &target).await?;
+    ensure!(
+        parent == base,
+        "Dolt migration target does not have its exact sole base parent"
+    );
+    Ok(())
+}
+
+async fn publish(
+    registry: Registry,
+    main: &MySqlPool,
+    definition: &Definition,
+    branch: &str,
+    base: &str,
+    target: &str,
+    hooks: &MigrationRunnerHooks,
+) -> Result<()> {
+    ensure!(
+        revision(main).await? == base,
+        "Dolt main changed before migration publication"
+    );
+    clean(main).await?;
+    validate_version_with(registry, main, definition.from).await?;
+    hooks.describe(MigrationBoundary::BeforePublish, branch, Some(target));
+    let routed = routed_pool(main, hooks, MigrationBoundary::BeforePublish).await?;
+    let command_pool = routed.as_ref().unwrap_or(main);
+    let (mut connection, id) = super::owned_connection(command_pool).await?;
+    let result = async {
+        hooks.reach(MigrationBoundary::BeforePublish).await?;
+        bounded_query(
+            sqlx::query("CALL DOLT_MERGE(?, '--ff-only')")
+                .bind(branch)
+                .fetch_all(&mut connection),
+        )
+        .await
+    }
+    .await;
+    drop(connection);
+    let close_result = close_routed_pool(routed).await;
+    let session_result = super::await_session_end(main, id, QUERY_TIMEOUT).await;
+    if let Err(cleanup) = after_cleanup(close_result, session_result) {
+        return after_cleanup(result.map(|_| ()), Err(cleanup));
+    }
+    let observed = revision(main).await?;
+    ensure!(
+        observed == base || observed == target,
+        "cannot reconcile Dolt migration publication: main diverged"
+    );
+    if observed == target {
+        clean(main).await?;
+        validate_version_with(registry, main, definition.to).await?;
+        return Ok(());
+    }
+    clean(main).await?;
+    result.context("Dolt migration fast-forward failed")?;
+    bail!("Dolt migration did not fast-forward to its validated target")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct DurableSnapshot {
+        head: String,
+        refs: Vec<(String, String)>,
+        status: Vec<(String, i64, String)>,
+    }
+
+    const V3: Definition = Definition {
+        from: 2,
+        to: 3,
+        id: "kuru.memory.test-marker.v3",
+        sql: &["CREATE TABLE kuru_migration_test_v3 (marker INT PRIMARY KEY)"],
+        transform: "none",
+        postcondition: "version=3;test marker table exists;v2 receipts remain exact",
+        failed_status: &[StatusRow {
+            table: "kuru_migration_test_v3",
+            staged: 0,
+            status: "new table",
+        }],
+    };
+    const TEST_DEFINITIONS: &[Definition] = &[V2, V3];
+    const TEST_REGISTRY: Registry = Registry {
+        current: 3,
+        definitions: TEST_DEFINITIONS,
+    };
+
+    async fn durable_snapshot(pool: &MySqlPool) -> Result<DurableSnapshot> {
+        let ref_rows = bounded_query(
+            sqlx::query("SELECT name, hash FROM dolt_branches ORDER BY BINARY name LIMIT 129")
+                .fetch_all(pool),
+        )
+        .await?;
+        ensure!(
+            ref_rows.len() <= 128,
+            "fixture branch inventory is excessive"
+        );
+        let status_rows = bounded_query(
+            sqlx::query(
+                "SELECT table_name, staged, status FROM dolt_status ORDER BY BINARY table_name, staged, BINARY status LIMIT 65",
+            )
+            .fetch_all(pool),
+        )
+        .await?;
+        ensure!(
+            status_rows.len() <= 64,
+            "fixture status inventory is excessive"
+        );
+        Ok(DurableSnapshot {
+            head: revision(pool).await?,
+            refs: ref_rows
+                .into_iter()
+                .map(|row| Ok((row.try_get("name")?, row.try_get("hash")?)))
+                .collect::<Result<_>>()?,
+            status: status_rows
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get("table_name")?,
+                        row.try_get("staged")?,
+                        row.try_get("status")?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    async fn commit_fixture(pool: &MySqlPool, message: &str) -> Result<()> {
+        bounded_query(
+            sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
+                .bind(message)
+                .bind(AUTHOR)
+                .fetch_all(pool),
+        )
+        .await?;
+        clean(pool).await
+    }
+
+    async fn assert_failed_runner_unchanged(
+        registry: Registry,
+        server: &Server,
+        main: &MySqlPool,
+        before: &DurableSnapshot,
+        expected: &str,
+    ) -> Result<()> {
+        let hooks = MigrationRunnerHooks::none();
+        let error = upgrade_with(registry, server, main, &hooks)
+            .await
+            .expect_err("invalid migration state was accepted");
+        assert!(
+            format!("{error:#}").contains(expected),
+            "unexpected migration rejection: {error:#}"
+        );
+        assert_eq!(&durable_snapshot(main).await?, before);
+        Ok(())
+    }
+
+    async fn snapshot_attempts(
+        server: &Server,
+        names: &[String],
+    ) -> Result<Vec<(String, DurableSnapshot)>> {
+        let mut snapshots = Vec::with_capacity(names.len());
+        for name in names {
+            let pool = server.pool(name).await?;
+            let snapshot = durable_snapshot(&pool).await;
+            let snapshot = after_cleanup(snapshot, close_branch_pool(&pool).await)?;
+            snapshots.push((name.clone(), snapshot));
+        }
+        Ok(snapshots)
+    }
+
+    async fn assert_attempts_unchanged(
+        server: &Server,
+        before: Vec<(String, DurableSnapshot)>,
+    ) -> Result<()> {
+        for (name, expected) in before {
+            let pool = server.pool(&name).await?;
+            let observed = durable_snapshot(&pool).await;
+            let observed = after_cleanup(observed, close_branch_pool(&pool).await)?;
+            assert_eq!(observed, expected, "migration attempt {name} changed");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registry_definitions_and_reserved_names_are_bounded() {
+        REGISTRY.validate().unwrap();
+        TEST_REGISTRY.validate().unwrap();
+        let definition = definition(2).unwrap();
+        assert_eq!(definition.from, 1);
+        assert_eq!(digest(definition).len(), 64);
+        let name = attempt_name(2, Uuid::nil());
+        assert_eq!(parse_attempt(&name).unwrap(), (2, Uuid::nil()));
+        let future = attempt_name(3, Uuid::nil());
+        assert_eq!(parse_attempt(&future).unwrap(), (3, Uuid::nil()));
+        assert!(REGISTRY.definition(3).is_err());
+        for invalid in [
+            "kuru_migration_v2_bad",
+            "kuru_migration_v0000000002_NOT-A-UUID",
+            "KURU_MIGRATION_v0000000002_00000000000000000000000000000000",
+            "kuru_migration_v0000000002_00000000-0000-0000-0000-000000000000",
+        ] {
+            assert!(parse_attempt(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn registry_rejects_ambiguous_or_out_of_order_definitions() {
+        const GAP: Definition = Definition {
+            from: 2,
+            to: 3,
+            ..V2
+        };
+        const DUPLICATE_ID: Definition = Definition {
+            from: 2,
+            to: 3,
+            ..V2
+        };
+        const UNSORTED_STATUS: &[StatusRow] = &[
+            StatusRow {
+                table: "z",
+                staged: 0,
+                status: "new table",
+            },
+            StatusRow {
+                table: "a",
+                staged: 0,
+                status: "new table",
+            },
+        ];
+        const BAD_STATUS: Definition = Definition {
+            failed_status: UNSORTED_STATUS,
+            ..V2
+        };
+
+        assert!(
+            Registry {
+                current: 3,
+                definitions: &[GAP],
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Registry {
+                current: 3,
+                definitions: &[V2, DUPLICATE_ID],
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Registry {
+                current: 2,
+                definitions: &[BAD_STATUS],
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn receipt_digest_binds_each_declared_definition_field() {
+        let baseline = digest(&V2);
+        for changed in [
+            Definition { from: 0, ..V2 },
+            Definition { to: 3, ..V2 },
+            Definition {
+                id: "kuru.memory.receipts.changed.v2",
+                ..V2
+            },
+            Definition {
+                sql: &["CREATE TABLE another_table (id INT PRIMARY KEY)"],
+                ..V2
+            },
+            Definition {
+                transform: "copy legacy values",
+                ..V2
+            },
+            Definition {
+                postcondition: "different validator identity",
+                ..V2
+            },
+            Definition {
+                failed_status: &[],
+                ..V2
+            },
+            Definition {
+                failed_status: &[StatusRow {
+                    table: "kuru_migrations",
+                    staged: 1,
+                    status: "new table",
+                }],
+                ..V2
+            },
+        ] {
+            assert_ne!(digest(&changed), baseline);
+        }
+        assert_ne!(digest(&V2), digest(&V3));
+    }
+
+    #[tokio::test]
+    async fn persisted_invalid_schema_authority_is_rejected_without_mutation() -> Result<()> {
+        #[derive(Clone, Copy)]
+        enum Corruption {
+            MissingReceipt,
+            ChangedReceipt,
+            ExtraReceipt,
+            FutureSchema,
+        }
+
+        for (index, corruption) in [
+            Corruption::MissingReceipt,
+            Corruption::ChangedReceipt,
+            Corruption::ExtraReceipt,
+            Corruption::FutureSchema,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = crate::test_support::tempdir()?;
+            let options = crate::test_support::open_options(
+                root.path().join("private"),
+                format!("project/{index:064x}"),
+            )?;
+            let store = super::super::MemoryStore::open(options.clone()).await?;
+            match corruption {
+                Corruption::MissingReceipt => {
+                    bounded_query(
+                        sqlx::query("DELETE FROM kuru_migrations WHERE version = 2")
+                            .execute(store.pool.as_ref()),
+                    )
+                    .await?;
+                }
+                Corruption::ChangedReceipt => {
+                    bounded_query(
+                        sqlx::query("UPDATE kuru_migrations SET digest = ? WHERE version = 2")
+                            .bind("0".repeat(64))
+                            .execute(store.pool.as_ref()),
+                    )
+                    .await?;
+                }
+                Corruption::ExtraReceipt => {
+                    bounded_query(
+                        sqlx::query("INSERT INTO kuru_migrations VALUES (3, ?, ?, ?)")
+                            .bind("fixture.extra.v3")
+                            .bind("0".repeat(64))
+                            .bind(Uuid::new_v4().hyphenated().to_string())
+                            .execute(store.pool.as_ref()),
+                    )
+                    .await?;
+                }
+                Corruption::FutureSchema => {
+                    bounded_query(
+                        sqlx::query("UPDATE kuru_schema SET version = 99 WHERE id = 1")
+                            .execute(store.pool.as_ref()),
+                    )
+                    .await?;
+                }
+            }
+            commit_fixture(&store.pool, "Persist invalid schema authority fixture").await?;
+            let before = durable_snapshot(&store.pool).await?;
+            store.close().await?;
+
+            let error = super::super::MemoryStore::open(options.clone())
+                .await
+                .expect_err("invalid persisted schema authority was accepted");
+            let expected = match corruption {
+                Corruption::MissingReceipt | Corruption::ExtraReceipt => {
+                    "receipt chain is incomplete or has extra entries"
+                }
+                Corruption::ChangedReceipt => "receipt definition differs",
+                Corruption::FutureSchema => "unsupported Dolt memory schema version 99",
+            };
+            assert!(
+                format!("{error:#}").contains(expected),
+                "unexpected persisted-schema rejection: {error:#}"
+            );
+            let server = super::super::tests::released_server(&options).await?;
+            let main = server.pool("main").await?;
+            assert_eq!(durable_snapshot(&main).await?, before);
+            main.close().await;
+            drop(main);
+            server.close().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_attempt_rejection_covers_ambiguous_ready_and_dirty_shapes() -> Result<()> {
+        #[derive(Clone, Copy)]
+        enum InvalidAttempt {
+            AmbiguousPristine,
+            AmbiguousReady,
+            NameReceiptMismatch,
+            UnexpectedDirty,
+            NonBase,
+            DirtyNonBase,
+        }
+
+        for (index, invalid) in [
+            InvalidAttempt::AmbiguousPristine,
+            InvalidAttempt::AmbiguousReady,
+            InvalidAttempt::NameReceiptMismatch,
+            InvalidAttempt::UnexpectedDirty,
+            InvalidAttempt::NonBase,
+            InvalidAttempt::DirtyNonBase,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let store = super::super::MemoryStore::temporary().await?;
+            let base = store.revision().await?;
+            let count = if matches!(
+                invalid,
+                InvalidAttempt::AmbiguousPristine | InvalidAttempt::AmbiguousReady
+            ) {
+                2
+            } else {
+                1
+            };
+            let mut attempts = Vec::new();
+            for _ in 0..count {
+                let operation = Uuid::new_v4();
+                let name = attempt_name(3, operation);
+                bounded_query(
+                    sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                        .bind(&name)
+                        .bind(&base)
+                        .fetch_all(store.pool.as_ref()),
+                )
+                .await?;
+                attempts.push((name, operation));
+            }
+            match invalid {
+                InvalidAttempt::AmbiguousPristine => {}
+                InvalidAttempt::AmbiguousReady => {
+                    for (name, operation) in &attempts {
+                        let attempt = store.shared.server.pool(name).await?;
+                        let built = build_attempt(
+                            TEST_REGISTRY,
+                            &attempt,
+                            &V3,
+                            *operation,
+                            &MigrationRunnerHooks::none(),
+                        )
+                        .await;
+                        after_cleanup(built, close_branch_pool(&attempt).await)?;
+                    }
+                }
+                InvalidAttempt::NameReceiptMismatch => {
+                    let attempt = store.shared.server.pool(&attempts[0].0).await?;
+                    let mismatched = Uuid::new_v4();
+                    ensure!(mismatched != attempts[0].1, "fixture UUIDs must differ");
+                    let built = build_attempt(
+                        TEST_REGISTRY,
+                        &attempt,
+                        &V3,
+                        mismatched,
+                        &MigrationRunnerHooks::none(),
+                    )
+                    .await;
+                    after_cleanup(built, close_branch_pool(&attempt).await)?;
+                }
+                InvalidAttempt::UnexpectedDirty => {
+                    let attempt = store.shared.server.pool(&attempts[0].0).await?;
+                    bounded_query(
+                        sqlx::query("CREATE TABLE unrelated_fixture (id INT PRIMARY KEY)")
+                            .execute(attempt.as_ref()),
+                    )
+                    .await?;
+                    close_branch_pool(&attempt).await?;
+                }
+                InvalidAttempt::NonBase | InvalidAttempt::DirtyNonBase => {
+                    let attempt = store.shared.server.pool(&attempts[0].0).await?;
+                    bounded_query(
+                        sqlx::query(
+                            "INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)",
+                        )
+                        .bind(b"fixture".as_slice())
+                        .bind(b"user".as_slice())
+                        .bind(format!("non-base {index}"))
+                        .execute(attempt.as_ref()),
+                    )
+                    .await?;
+                    commit_fixture(&attempt, "Create non-base migration fixture").await?;
+                    if matches!(invalid, InvalidAttempt::DirtyNonBase) {
+                        bounded_query(
+                            sqlx::query(
+                                "CREATE TABLE unrelated_dirty_fixture (id INT PRIMARY KEY)",
+                            )
+                            .execute(attempt.as_ref()),
+                        )
+                        .await?;
+                    }
+                    close_branch_pool(&attempt).await?;
+                }
+            }
+            let names: Vec<_> = attempts.iter().map(|(name, _)| name.clone()).collect();
+            let attempt_before = snapshot_attempts(&store.shared.server, &names).await?;
+            let before = durable_snapshot(&store.pool).await?;
+            assert_failed_runner_unchanged(
+                TEST_REGISTRY,
+                &store.shared.server,
+                &store.pool,
+                &before,
+                match invalid {
+                    InvalidAttempt::AmbiguousPristine | InvalidAttempt::AmbiguousReady => {
+                        "multiple publishable"
+                    }
+                    InvalidAttempt::NameReceiptMismatch => "receipt does not match its name",
+                    InvalidAttempt::UnexpectedDirty => "failed-status inventory",
+                    InvalidAttempt::NonBase | InvalidAttempt::DirtyNonBase => "unresolved state",
+                },
+            )
+            .await?;
+            assert_attempts_unchanged(&store.shared.server, attempt_before).await?;
+            store.close().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_attempt_rejection_preserves_exact_capacity() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().join("private"),
+            format!("project/{}", "6".repeat(64)),
+        )?;
+        super::super::tests::released_v1(&options).await?;
+        let server = super::super::tests::released_server(&options).await?;
+        let main = server.pool("main").await?;
+
+        bounded_query(sqlx::query(V2.sql[0]).execute(main.as_ref())).await?;
+        let operation = Uuid::new_v4();
+        bounded_query(
+            sqlx::query("INSERT INTO kuru_migrations VALUES (2, ?, ?, ?)")
+                .bind(V2.id)
+                .bind(digest(&V2))
+                .bind(operation.hyphenated().to_string())
+                .execute(main.as_ref()),
+        )
+        .await?;
+        bounded_query(
+            sqlx::query("UPDATE kuru_schema SET version = 2 WHERE id = 1").execute(main.as_ref()),
+        )
+        .await?;
+        commit_fixture(&main, "Create branch-free schema v2 capacity fixture").await?;
+        validate_version_with(TEST_REGISTRY, &main, 2).await?;
+
+        let base = revision(&main).await?;
+        let mut names = Vec::with_capacity(INVENTORY_LIMIT);
+        for _ in 0..INVENTORY_LIMIT {
+            let name = attempt_name(3, Uuid::new_v4());
+            bounded_query(
+                sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                    .bind(&name)
+                    .bind(&base)
+                    .fetch_all(main.as_ref()),
+            )
+            .await?;
+            let attempt = server.pool(&name).await?;
+            let prepared = bounded_query(sqlx::query(V3.sql[0]).execute(attempt.as_ref())).await;
+            after_cleanup(prepared.map(|_| ()), close_branch_pool(&attempt).await)?;
+            names.push(name);
+        }
+        assert_eq!(reserved_names(&main).await?.len(), INVENTORY_LIMIT);
+        let before = durable_snapshot(&main).await?;
+        let attempts_before = snapshot_attempts(&server, &names).await?;
+        assert_failed_runner_unchanged(
+            TEST_REGISTRY,
+            &server,
+            &main,
+            &before,
+            "leave no capacity for a fresh attempt",
+        )
+        .await?;
+        assert_attempts_unchanged(&server, attempts_before).await?;
+        main.close().await;
+        drop(main);
+        server.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_attempt_rejection_preserves_invalid_inventory() -> Result<()> {
+        #[derive(Clone, Copy)]
+        enum InvalidInventory {
+            Malformed,
+            UnknownTarget,
+            Excess,
+        }
+
+        for invalid in [
+            InvalidInventory::Malformed,
+            InvalidInventory::UnknownTarget,
+            InvalidInventory::Excess,
+        ]
+        .into_iter()
+        {
+            let store = super::super::MemoryStore::temporary().await?;
+            let base = store.revision().await?;
+            let names = match invalid {
+                InvalidInventory::Malformed => vec!["kuru_migration_bad".to_owned()],
+                InvalidInventory::UnknownTarget => {
+                    vec![attempt_name(4, Uuid::new_v4())]
+                }
+                InvalidInventory::Excess => {
+                    let existing = reserved_names(&store.pool).await?.len();
+                    ensure!(
+                        existing <= INVENTORY_LIMIT,
+                        "fixture inventory is already excessive"
+                    );
+                    (0..=(INVENTORY_LIMIT - existing))
+                        .map(|_| attempt_name(3, Uuid::new_v4()))
+                        .collect()
+                }
+            };
+            for name in &names {
+                bounded_query(
+                    sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                        .bind(name)
+                        .bind(&base)
+                        .fetch_all(store.pool.as_ref()),
+                )
+                .await?;
+            }
+            let before = durable_snapshot(&store.pool).await?;
+            let attempts_before = snapshot_attempts(&store.shared.server, &names).await?;
+            assert_failed_runner_unchanged(
+                TEST_REGISTRY,
+                &store.shared.server,
+                &store.pool,
+                &before,
+                match invalid {
+                    InvalidInventory::Malformed => "reserved migration branch is malformed",
+                    InvalidInventory::UnknownTarget => "unsupported Dolt memory schema transition",
+                    InvalidInventory::Excess => "too many retained Dolt migration attempts",
+                },
+            )
+            .await?;
+            assert_attempts_unchanged(&store.shared.server, attempts_before).await?;
+            store.close().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v3_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
+        for repeated_operation in [false, true] {
+            let store = super::super::MemoryStore::temporary().await?;
+            upgrade_with(
+                TEST_REGISTRY,
+                &store.shared.server,
+                &store.pool,
+                &MigrationRunnerHooks::none(),
+            )
+            .await?;
+            if repeated_operation {
+                bounded_query(
+                    sqlx::query("ALTER TABLE kuru_migrations DROP INDEX operation")
+                        .execute(store.pool.as_ref()),
+                )
+                .await?;
+                let operation: String = bounded_query(
+                    sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 2")
+                        .fetch_one(store.pool.as_ref()),
+                )
+                .await?;
+                bounded_query(
+                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 3")
+                        .bind(operation)
+                        .execute(store.pool.as_ref()),
+                )
+                .await?;
+            } else {
+                bounded_query(
+                    sqlx::query("UPDATE kuru_migrations SET version = 1 WHERE version = 2")
+                        .execute(store.pool.as_ref()),
+                )
+                .await?;
+            }
+            commit_fixture(&store.pool, "Persist invalid v3 receipt chain fixture").await?;
+            let before = durable_snapshot(&store.pool).await?;
+            assert_failed_runner_unchanged(
+                TEST_REGISTRY,
+                &store.shared.server,
+                &store.pool,
+                &before,
+                if repeated_operation {
+                    "receipt operation is repeated"
+                } else {
+                    "receipt version is out of order"
+                },
+            )
+            .await?;
+            store.close().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persisted_v1_future_receipt_authority_fails_before_new_attempt() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().join("private"),
+            format!("project/{}", "b".repeat(64)),
+        )?;
+        super::super::tests::released_v1(&options).await?;
+        let server = super::super::tests::released_server(&options).await?;
+        let main = server.pool("main").await?;
+        bounded_query(sqlx::query(V2.sql[0]).execute(main.as_ref())).await?;
+        bounded_query(
+            sqlx::query("INSERT INTO kuru_migrations VALUES (2, ?, ?, ?)")
+                .bind(V2.id)
+                .bind(digest(&V2))
+                .bind(Uuid::new_v4().hyphenated().to_string())
+                .execute(main.as_ref()),
+        )
+        .await?;
+        commit_fixture(&main, "Persist future receipt authority in schema v1").await?;
+        let before = durable_snapshot(&main).await?;
+        assert_failed_runner_unchanged(
+            REGISTRY,
+            &server,
+            &main,
+            &before,
+            "schema 1 must not contain migration receipt authority",
+        )
+        .await?;
+        assert!(
+            before
+                .refs
+                .iter()
+                .all(|(name, _)| !name.starts_with(RESERVED_PREFIX)),
+            "fixture must prove rejection before a reserved attempt is created"
+        );
+        main.close().await;
+        drop(main);
+        server.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_and_out_of_order_attempts_fail_without_mutation() -> Result<()> {
+        let store = super::super::MemoryStore::temporary().await?;
+        let operation = Uuid::new_v4();
+        let name = attempt_name(2, operation);
+        let head = store.revision().await?;
+        bounded_query(
+            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                .bind(&name)
+                .bind(&head)
+                .fetch_all(store.pool.as_ref()),
+        )
+        .await?;
+        let before = durable_snapshot(&store.pool).await?;
+        let attempt = store.shared.server.pool(&name).await?;
+        let attempt_before = durable_snapshot(&attempt).await?;
+        attempt.close().await;
+        drop(attempt);
+        assert_failed_runner_unchanged(
+            TEST_REGISTRY,
+            &store.shared.server,
+            &store.pool,
+            &before,
+            "receipt does not match its branch",
+        )
+        .await?;
+        let attempt = store.shared.server.pool(&name).await?;
+        assert_eq!(durable_snapshot(&attempt).await?, attempt_before);
+        attempt.close().await;
+        drop(attempt);
+        store.close().await?;
+
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().join("private"),
+            format!("project/{}", "a".repeat(64)),
+        )?;
+        super::super::tests::released_v1(&options).await?;
+        let server = super::super::tests::released_server(&options).await?;
+        let main = server.pool("main").await?;
+        let v1_base = revision(&main).await?;
+        let divergent = format!("candidate_{}", Uuid::new_v4().simple());
+        bounded_query(
+            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                .bind(&divergent)
+                .bind(&v1_base)
+                .fetch_all(main.as_ref()),
+        )
+        .await?;
+        let divergent_pool = server.pool(&divergent).await?;
+        bounded_query(
+            sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
+                .bind(b"fixture".as_slice())
+                .bind(b"user".as_slice())
+                .bind("divergent v1 history")
+                .execute(divergent_pool.as_ref()),
+        )
+        .await?;
+        commit_fixture(&divergent_pool, "Create divergent v1 fixture").await?;
+        let divergent_head = revision(&divergent_pool).await?;
+        divergent_pool.close().await;
+        drop(divergent_pool);
+        upgrade_with(REGISTRY, &server, &main, &MigrationRunnerHooks::none()).await?;
+        let operation = Uuid::new_v4();
+        let non_ancestral_name = attempt_name(2, operation);
+        bounded_query(
+            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                .bind(&non_ancestral_name)
+                .bind(&divergent_head)
+                .fetch_all(main.as_ref()),
+        )
+        .await?;
+        let non_ancestral = server.pool(&non_ancestral_name).await?;
+        build_attempt(
+            REGISTRY,
+            &non_ancestral,
+            &V2,
+            operation,
+            &MigrationRunnerHooks::none(),
+        )
+        .await?;
+        validate_attempt(REGISTRY, &non_ancestral, &V2, operation, &divergent_head).await?;
+        let non_ancestral_before = durable_snapshot(&non_ancestral).await?;
+        non_ancestral.close().await;
+        drop(non_ancestral);
+        let before = durable_snapshot(&main).await?;
+        assert_failed_runner_unchanged(
+            REGISTRY,
+            &server,
+            &main,
+            &before,
+            "not retained by active history",
+        )
+        .await?;
+        let non_ancestral = server.pool(&non_ancestral_name).await?;
+        assert_eq!(
+            durable_snapshot(&non_ancestral).await?,
+            non_ancestral_before
+        );
+        non_ancestral.close().await;
+        drop(non_ancestral);
+        main.close().await;
+        drop(main);
+        server.close().await?;
+
+        let store = super::super::MemoryStore::temporary().await?;
+        let completed_name = reserved_names(&store.pool)
+            .await?
+            .into_iter()
+            .find(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 2))
+            .context("temporary store did not retain its v2 migration branch")?;
+        let completed = store.shared.server.pool(&completed_name).await?;
+        bounded_query(
+            sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
+                .bind(b"fixture".as_slice())
+                .bind(b"assistant".as_slice())
+                .bind("advanced retained migration branch")
+                .execute(completed.as_ref()),
+        )
+        .await?;
+        commit_fixture(&completed, "Advance retained migration branch").await?;
+        completed.close().await;
+        drop(completed);
+        bounded_query(
+            sqlx::query("CALL DOLT_MERGE(?, '--ff-only')")
+                .bind(&completed_name)
+                .fetch_all(store.pool.as_ref()),
+        )
+        .await?;
+        let completed = store.shared.server.pool(&completed_name).await?;
+        let completed_before = durable_snapshot(&completed).await?;
+        completed.close().await;
+        drop(completed);
+        let before = durable_snapshot(&store.pool).await?;
+        assert_failed_runner_unchanged(
+            TEST_REGISTRY,
+            &store.shared.server,
+            &store.pool,
+            &before,
+            "schema version 2, expected 1",
+        )
+        .await?;
+        let completed = store.shared.server.pool(&completed_name).await?;
+        assert_eq!(durable_snapshot(&completed).await?, completed_before);
+        completed.close().await;
+        drop(completed);
+        store.close().await?;
+
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().join("private"),
+            format!("project/{}", "f".repeat(64)),
+        )?;
+        super::super::tests::released_v1(&options).await?;
+        let server = super::super::tests::released_server(&options).await?;
+        let main = server.pool("main").await?;
+        let base = revision(&main).await?;
+        let name = attempt_name(3, Uuid::new_v4());
+        bounded_query(
+            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                .bind(&name)
+                .bind(&base)
+                .fetch_all(main.as_ref()),
+        )
+        .await?;
+        let before = durable_snapshot(&main).await?;
+        assert_failed_runner_unchanged(TEST_REGISTRY, &server, &main, &before, "out-of-order step")
+            .await?;
+        main.close().await;
+        drop(main);
+        server.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_v2_attempts_and_candidate_survive_test_v3_progression() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().join("private"),
+            format!("project/{}", "3".repeat(64)),
+        )?;
+        let store = super::super::MemoryStore::open(options.clone()).await?;
+        store
+            .append("conversation", "user", "written after the v2 upgrade")
+            .await?;
+        let candidate = store.begin_candidate("pre-v3 candidate").await?;
+        candidate
+            .view()
+            .append("candidate", "assistant", "kept on schema v2")
+            .await?;
+        let candidate_head = candidate.view().revision().await?;
+
+        let completed_name = reserved_names(&store.pool)
+            .await?
+            .into_iter()
+            .find(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 2))
+            .context("temporary store did not retain its v2 migration branch")?;
+        let completed = store.shared.server.pool(&completed_name).await?;
+        let completed_head = revision(&completed).await?;
+        let base: String = bounded_query(
+            sqlx::query_scalar(
+                "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+            )
+            .bind(&completed_head)
+            .fetch_one(completed.as_ref()),
+        )
+        .await?;
+        completed.close().await;
+        drop(completed);
+
+        let failed_operation = Uuid::new_v4();
+        let failed_name = attempt_name(2, failed_operation);
+        bounded_query(
+            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                .bind(&failed_name)
+                .bind(&base)
+                .fetch_all(store.pool.as_ref()),
+        )
+        .await?;
+        let failed = store.shared.server.pool(&failed_name).await?;
+        bounded_query(sqlx::query(V2.sql[0]).execute(failed.as_ref())).await?;
+        assert!(retained_failed_shape(&failed, &V2).await?);
+        let failed_head = revision(&failed).await?;
+        failed.close().await;
+        drop(failed);
+
+        assert_eq!(
+            validate_ready_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?,
+            2
+        );
+        let v3_operation = Uuid::new_v4();
+        let v3_name = attempt_name(3, v3_operation);
+        let current_base = store.revision().await?;
+        bounded_query(
+            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                .bind(&v3_name)
+                .bind(&current_base)
+                .fetch_all(store.pool.as_ref()),
+        )
+        .await?;
+        assert!(
+            validate_ready_with(TEST_REGISTRY, &store.shared.server, &store.pool)
+                .await
+                .is_err(),
+            "a ready v2 stage must reject even a pristine v3 attempt"
+        );
+
+        upgrade_with(
+            TEST_REGISTRY,
+            &store.shared.server,
+            &store.pool,
+            &MigrationRunnerHooks::none(),
+        )
+        .await?;
+        validate_active_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?;
+        assert_eq!(version(&store.pool).await?, 3);
+        let v3_attempt = store.shared.server.pool(&v3_name).await?;
+        assert_eq!(revision(&v3_attempt).await?, store.revision().await?);
+        let v3_receipt: String = bounded_query(
+            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 3")
+                .fetch_one(v3_attempt.as_ref()),
+        )
+        .await?;
+        assert_eq!(v3_receipt, v3_operation.hyphenated().to_string());
+        v3_attempt.close().await;
+        drop(v3_attempt);
+        assert_eq!(
+            reserved_names(&store.pool)
+                .await?
+                .into_iter()
+                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 3))
+                .count(),
+            1,
+            "the pristine exact-base v3 attempt must be reused"
+        );
+        assert_eq!(
+            store.history("conversation", 10).await?[0].content,
+            "written after the v2 upgrade"
+        );
+
+        let completed = store.shared.server.pool(&completed_name).await?;
+        assert_eq!(revision(&completed).await?, completed_head);
+        validate_version_with(TEST_REGISTRY, &completed, 2).await?;
+        completed.close().await;
+        drop(completed);
+        let failed = store.shared.server.pool(&failed_name).await?;
+        assert_eq!(revision(&failed).await?, failed_head);
+        assert!(retained_failed_shape(&failed, &V2).await?);
+        failed.close().await;
+        drop(failed);
+
+        let old_view = candidate.view();
+        let old_candidate_name = old_view.branch.clone();
+        assert_eq!(old_view.revision().await?, candidate_head);
+        assert_eq!(
+            validate_supported_with(TEST_REGISTRY, &old_view.pool).await?,
+            2
+        );
+        assert_eq!(
+            old_view.history("candidate", 10).await?[0].content,
+            "kept on schema v2"
+        );
+        assert!(candidate.promote().await.is_err());
+
+        let fresh = store.begin_candidate("post-v3 candidate").await?;
+        fresh
+            .view()
+            .put("post-v3", &json!({"preserved": true}))
+            .await?;
+        fresh.promote().await?;
+        store
+            .append("conversation", "assistant", "written after schema v3")
+            .await?;
+        validate_active_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?;
+        assert_eq!(version(&store.pool).await?, 3);
+        assert_eq!(
+            store.get("post-v3").await?,
+            Some(json!({"preserved": true}))
+        );
+
+        let final_head = store.revision().await?;
+        let final_refs: BTreeSet<(String, String)> = {
+            let mut refs = BTreeSet::new();
+            for name in reserved_names(&store.pool).await? {
+                let hash: String = bounded_query(
+                    sqlx::query_scalar("SELECT hash FROM dolt_branches WHERE name = ?")
+                        .bind(&name)
+                        .fetch_one(store.pool.as_ref()),
+                )
+                .await?;
+                refs.insert((name, hash));
+            }
+            refs
+        };
+        let old_pool = old_view.pool.clone();
+        drop(old_view);
+        drop(candidate);
+        tokio::time::timeout(QUERY_TIMEOUT, old_pool.close())
+            .await
+            .context("close old candidate fixture pool")?;
+        let fresh_view = fresh.view();
+        drop(fresh);
+        tokio::time::timeout(QUERY_TIMEOUT, fresh_view.pool.close())
+            .await
+            .context("close fresh candidate fixture pool")?;
+        drop(fresh_view);
+        store.close().await?;
+
+        let server = super::super::tests::released_server(&options).await?;
+        let main = server.pool("main").await?;
+        upgrade_with(TEST_REGISTRY, &server, &main, &MigrationRunnerHooks::none()).await?;
+        validate_active_with(TEST_REGISTRY, &server, &main).await?;
+        assert_eq!(revision(&main).await?, final_head);
+        let reopened_refs: BTreeSet<(String, String)> = {
+            let mut refs = BTreeSet::new();
+            for name in reserved_names(&main).await? {
+                let hash: String = bounded_query(
+                    sqlx::query_scalar("SELECT hash FROM dolt_branches WHERE name = ?")
+                        .bind(&name)
+                        .fetch_one(main.as_ref()),
+                )
+                .await?;
+                refs.insert((name, hash));
+            }
+            refs
+        };
+        assert_eq!(reopened_refs, final_refs);
+        let messages: Vec<String> = bounded_query(
+            sqlx::query_scalar(
+                "SELECT content FROM messages WHERE namespace = ? ORDER BY sequence",
+            )
+            .bind(b"conversation".as_slice())
+            .fetch_all(main.as_ref()),
+        )
+        .await?;
+        assert_eq!(
+            messages,
+            ["written after the v2 upgrade", "written after schema v3"]
+        );
+        let value: String = bounded_query(
+            sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
+                .bind(b"post-v3".as_slice())
+                .fetch_one(main.as_ref()),
+        )
+        .await?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&value)?,
+            json!({"preserved": true})
+        );
+        let v3_commits: i64 = bounded_query(
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 3 [%]'",
+            )
+            .fetch_one(main.as_ref()),
+        )
+        .await?;
+        assert_eq!(v3_commits, 1, "cold reopen must not replay schema v3");
+        let failed = server.pool(&failed_name).await?;
+        assert_eq!(revision(&failed).await?, failed_head);
+        assert!(retained_failed_shape(&failed, &V2).await?);
+        failed.close().await;
+        drop(failed);
+        let old_candidate = server.pool(&old_candidate_name).await?;
+        assert_eq!(revision(&old_candidate).await?, candidate_head);
+        assert_eq!(
+            validate_supported_with(TEST_REGISTRY, &old_candidate).await?,
+            2
+        );
+        let old_content: String = bounded_query(
+            sqlx::query_scalar("SELECT content FROM messages WHERE namespace = ?")
+                .bind(b"candidate".as_slice())
+                .fetch_one(old_candidate.as_ref()),
+        )
+        .await?;
+        assert_eq!(old_content, "kept on schema v2");
+        old_candidate.close().await;
+        drop(old_candidate);
+        main.close().await;
+        drop(main);
+        server.close().await?;
+        Ok(())
+    }
+}

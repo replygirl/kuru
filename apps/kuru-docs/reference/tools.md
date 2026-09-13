@@ -48,7 +48,32 @@ reduces accidental environment disclosure; it does not restrict filesystem,
 process, or network authority. Configured stdio MCP servers retain their own
 inherited environment and configured overrides.
 
-Commands use `sh` on macOS/Linux and stock Windows PowerShell on Windows. The default timeout is 30 seconds. `timeout_ms` accepts 1–120000 milliseconds. Standard output and standard error are each bounded to 2 MiB. Timeout or cancellation terminates the owned Unix process group or Windows Job, including descendants.
+Commands use `sh` on macOS/Linux and stock Windows PowerShell on Windows. The default timeout is 30 seconds. `timeout_ms` accepts 1–120000 milliseconds. Standard output and standard error are each bounded to 2 MiB. On Unix, a registered owner retains the standard shell root, both pipes, and its fresh process group through cleanup; it signals that original group before reaping the root and confirms absence before normal completion. If bounded confirmation is unavailable, Kuru reports it while retaining the owner for later observation. A selected execution/startup deadline may use one additional five-second cleanup-confirmation allowance; delayed startup returns at the deadline plus that allowance, and host shutdown shares one five-second window across registered shells. This does not control processes that leave the original group. Windows retains its existing Job cleanup.
+
+Before Kuru returns a built-in file or shell result, or an MCP success or
+application error, it replaces recognized credential spans with
+`[REDACTED:recognized-secret]`. The finite rules cover Basic/Bearer
+Authorization and Proxy-Authorization values; OpenAI `sk-svcacct-`, `sk-proj-`,
+then `sk-` prefixes, longest first, with at least 16 token bytes after that
+prefix; GitHub `ghp_`, `github_pat_`, `gho_`, `ghu_`, `ghs_`, and `ghr_` forms
+with at least 8 following token bytes; AWS `AKIA`/`ASIA` followed by exactly
+16 uppercase-alphanumeric bytes; supported PEM private-key blocks; and exact
+sensitive field names including `api_key`, `password`, and `refresh_token`.
+Outward tool-failure details, including error formatting and source chains,
+receive the same projection.
+OpenAI and GitHub minimum lengths are local false-positive controls, not proof
+that a value is valid. In JSON, an exact sensitive or Authorization key replaces
+its whole value; otherwise Kuru replaces only recognized text spans.
+AWS matching uses its uppercase-alphanumeric token alphabet for the trailing
+boundary, so a following lowercase byte is outside that token shape.
+
+The projection changes only the returned value. Tool arguments, writes, source
+files, prior history, configured MCP environments, credential stores, and each
+producer's own size limit stay unchanged. It does not discover arbitrary,
+encoded, split, transformed, or future secret formats, so an unrecognized value
+may remain visible; a matching ordinary string may be projected. Tool output is
+therefore not a byte-exact backup. Kuru does not capture MCP stderr for this
+feature.
 
 ## Third-party tools
 

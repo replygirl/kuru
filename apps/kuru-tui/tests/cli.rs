@@ -110,6 +110,9 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
 
 #[test]
 fn cli_file_crud_and_shell_require_real_capabilities() {
+    const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
+    const ORDINARY_CONTROL: &str = "ordinary-control-remains-exact";
+    const MARKER: &str = "[REDACTED:recognized-secret]";
     let env = Sandbox::new();
     let tools: Value = serde_json::from_str(&env.success(&["tools"])).unwrap();
     let shell_args = if cfg!(windows) {
@@ -138,6 +141,34 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
     assert!(
         env.success(&["tool", "file_read", "--args", r#"{"path":"notes.txt"}"#])
             .contains("A real note")
+    );
+    let projected_source = format!("openai_api_key={TOOL_TOKEN}\n{ORDINARY_CONTROL}");
+    let projected_path = env.project.join("projection.txt");
+    std::fs::write(&projected_path, &projected_source).unwrap();
+    let projected_identity =
+        kuru_platform::fs::regular_file_info(&std::fs::File::open(&projected_path).unwrap())
+            .unwrap()
+            .identity;
+    let projected = env.success(&[
+        "tool",
+        "file_read",
+        "--args",
+        r#"{"path":"projection.txt"}"#,
+    ]);
+    assert_eq!(
+        projected,
+        format!("openai_api_key={MARKER}\n{ORDINARY_CONTROL}\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&projected_path).unwrap(),
+        projected_source
+    );
+    assert_eq!(
+        kuru_platform::fs::regular_file_info(&std::fs::File::open(&projected_path).unwrap())
+            .unwrap()
+            .identity,
+        projected_identity,
+        "file_read replaced the source object"
     );
     assert!(
         env.success(&["tool", "file_list", "--args", r#"{"path":"."}"#])
@@ -189,6 +220,37 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
     assert_eq!(result["exit_code"], 0, "{diagnostic}");
     assert_eq!(result["stdout"], "shell-ok", "{diagnostic}");
     assert_eq!(result["stderr"], "", "{diagnostic}");
+    let projected_shell_command = if cfg!(windows) {
+        format!("[Console]::Write('{ORDINARY_CONTROL} openai_api_key={TOOL_TOKEN}')")
+    } else {
+        format!("printf '{ORDINARY_CONTROL} openai_api_key={TOOL_TOKEN}'")
+    };
+    let projected_shell_args = serde_json::json!({"command": projected_shell_command}).to_string();
+    let projected_shell = env.run(&[
+        "--allow-shell",
+        "tool",
+        "shell",
+        "--args",
+        &projected_shell_args,
+    ]);
+    let projected_diagnostic = format!(
+        "status {}; stdout {:?}; stderr {:?}",
+        projected_shell.status,
+        String::from_utf8_lossy(&projected_shell.stdout[..projected_shell.stdout.len().min(4096)]),
+        String::from_utf8_lossy(&projected_shell.stderr[..projected_shell.stderr.len().min(4096)]),
+    );
+    assert!(projected_shell.status.success(), "{projected_diagnostic}");
+    assert!(projected_shell.stderr.is_empty(), "{projected_diagnostic}");
+    let projected_shell: Value = serde_json::from_slice(&projected_shell.stdout).unwrap();
+    let stdout = projected_shell["stdout"].as_str().unwrap();
+    assert_eq!(projected_shell["success"], true, "{projected_diagnostic}");
+    assert_eq!(projected_shell["exit_code"], 0, "{projected_diagnostic}");
+    assert_eq!(projected_shell["stderr"], "", "{projected_diagnostic}");
+    assert_eq!(
+        stdout,
+        format!("{ORDINARY_CONTROL} openai_api_key={MARKER}"),
+        "{projected_diagnostic}"
+    );
     #[cfg(windows)]
     {
         assert_eq!(markers[0].as_deref().unwrap(), b"entered");
@@ -273,6 +335,20 @@ fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
     assert!(!env.data.exists());
+    let output = env.run(&["memory", "notes", "missing"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+    assert!(
+        !env.data.exists(),
+        "fresh notes inspection created memory state"
+    );
+    let output = env.run(&["memory", "forget", "missing", "--note", "1"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+    assert!(
+        !env.data.exists(),
+        "fresh selected-note deletion created memory state"
+    );
     std::fs::write(&config_path, config).unwrap();
     env.success(&["run", "Make a durable revision"]);
     let sessions = env.success(&["sessions"]);
@@ -295,6 +371,187 @@ fn fresh_inspection_never_provisions_memory_and_history_is_read_only() {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"));
     }
+}
+
+#[tokio::test]
+async fn notes_cli_reads_existing_modes_without_provider_or_legacy_import() {
+    use kuru_core::{Framework, Mode, ProjectPreferences};
+    use kuru_memory::MemoryStore;
+    use kuru_runtime::{Topology, project_scope};
+
+    let env = Sandbox::new();
+    let scope = project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let memory = MemoryStore::open(options).await.unwrap();
+    let freudian = Topology {
+        parts: Framework::builtin(Mode::Freudian).parts,
+        relationships: vec![],
+        states: Default::default(),
+        focus: None,
+    };
+    let ifs = Topology {
+        parts: Framework::builtin(Mode::Ifs).parts,
+        relationships: vec![],
+        states: Default::default(),
+        focus: None,
+    };
+    let freudian_id = freudian.parts[0].id.clone();
+    let ifs_id = ifs.parts[0].id.clone();
+    memory
+        .put(
+            &format!("{scope}/freudian/topology"),
+            &serde_json::to_value(&freudian).unwrap(),
+        )
+        .await
+        .unwrap();
+    memory
+        .put(
+            &format!("{scope}/ifs/topology"),
+            &serde_json::to_value(&ifs).unwrap(),
+        )
+        .await
+        .unwrap();
+    memory
+        .put(
+            &format!("{scope}/preferences"),
+            &serde_json::to_value(ProjectPreferences {
+                mode: Some(Mode::Freudian),
+                ..ProjectPreferences::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    memory
+        .append(
+            &format!("{scope}/freudian/identity/{freudian_id}/notes"),
+            "note",
+            "FREUDIAN-NOTE",
+        )
+        .await
+        .unwrap();
+    memory
+        .append(
+            &format!("{scope}/freudian/identity/{freudian_id}/notes"),
+            "dream",
+            "FREUDIAN-DREAM",
+        )
+        .await
+        .unwrap();
+    memory
+        .append(
+            &format!("{scope}/ifs/identity/{ifs_id}/notes"),
+            "note",
+            "IFS-NOTE",
+        )
+        .await
+        .unwrap();
+    memory.close().await.unwrap();
+
+    let mut saved_command = env.command_for("responses");
+    saved_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "notes", &freudian_id]);
+    let output = saved_command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(saved["mode"], "freudian");
+    assert_eq!(saved["identity"], freudian_id);
+    assert_eq!(saved["requested_limit"], 100);
+    assert_eq!(saved["notes"][0]["content"], "FREUDIAN-NOTE");
+    assert_eq!(saved["notes"][1]["role"], "dream");
+    let dream_sequence = saved["notes"][1]["sequence"].as_i64().unwrap();
+
+    let mut forget_command = env.command_for("responses");
+    forget_command.env_remove("OPENAI_API_KEY").args([
+        "memory",
+        "forget",
+        &freudian_id,
+        "--note",
+        &dream_sequence.to_string(),
+    ]);
+    let output = forget_command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let forgotten: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(forgotten["mode"], "freudian");
+    assert_eq!(forgotten["identity"], freudian_id);
+    assert_eq!(forgotten["sequence"], dream_sequence);
+    assert_eq!(forgotten["history_retained"], true);
+
+    let mut after_command = env.command_for("responses");
+    after_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "notes", &freudian_id]);
+    let output = after_command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(after["notes"].as_array().map(Vec::len), Some(1));
+    assert_eq!(after["notes"][0]["content"], "FREUDIAN-NOTE");
+
+    let mut explicit_command = env.command_for("responses");
+    explicit_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["--mode", "ifs", "memory", "notes", &ifs_id, "--limit", "1"]);
+    let output = explicit_command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let explicit: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(explicit["mode"], "ifs");
+    assert_eq!(explicit["notes"][0]["content"], "IFS-NOTE");
+    let mut max_command = env.command_for("responses");
+    max_command.env_remove("OPENAI_API_KEY").args([
+        "memory",
+        "notes",
+        &freudian_id,
+        "--limit",
+        "1000",
+    ]);
+    let output = max_command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let max: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(max["requested_limit"], 1000);
+    assert_eq!(max["notes"].as_array().map(Vec::len), Some(1));
+    assert_eq!(max["truncated"], false);
+    for limit in ["0", "1001"] {
+        let output = env.run(&["memory", "notes", &freudian_id, "--limit", limit]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"));
+    }
+
+    let legacy = Sandbox::new();
+    std::fs::create_dir(&legacy.data).unwrap();
+    let original = b"legacy notes must not be imported";
+    let path = legacy.data.join("memory.sqlite3");
+    std::fs::write(&path, original).unwrap();
+    let output = legacy.run(&["memory", "notes", "missing"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(!legacy.data.join("memory").exists());
+    let output = legacy.run(&["memory", "forget", "missing", "--note", "1"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no memory yet"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(!legacy.data.join("memory").exists());
 }
 
 #[cfg(unix)]

@@ -11,6 +11,13 @@ kuru --resume SESSION_ID
 
 Session listing does not create a session. Resuming restores the chosen transcript and its framework, even when a different `--mode` was supplied. It does not change the remembered framework for future fresh conversations.
 
+When Kuru chooses a speaker automatically, it selects an eligible peer with the
+highest reported activation. Equal activations keep the session's previously
+completed speaker when that peer is still tied; otherwise the first stable
+identity wins. A caller target and active focus still take precedence. The
+completed speaker is saved with the session, and the event trace records the
+fixed reason for each selection.
+
 You can resume from a script too:
 
 ```sh

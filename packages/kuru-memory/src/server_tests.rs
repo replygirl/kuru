@@ -80,6 +80,61 @@ fn cleanup_observer_retains_real_child_and_directory_after_query_error_and_deadl
     Ok(())
 }
 
+#[test]
+fn owner_drop_transfers_installed_reap_guard_until_real_child_reaps() -> Result<()> {
+    use std::io::Write;
+    let root = Arc::new(fixture()?);
+    let locks = root.path().join("locks");
+    private_directory(&locks)?;
+    let locks = Directory::open(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
+    let guard = locks.lock_file(std::ffi::OsStr::new("startup"))?;
+    guard.lock()?;
+    let contender = locks.lock_file(std::ffi::OsStr::new("startup"))?;
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "IFS= read -r token; exit 0"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut release = child.stdin.take().context("controlled child stdin")?;
+    let reap_guard = Arc::new(StdMutex::new(Some(guard)));
+    drop(Owner {
+        child: Some(child),
+        lifetime: None,
+        retained: Some(root.clone()),
+        reap_guard,
+    });
+    let held_before_release =
+        matches!(contender.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+    let release_result = writeln!(release, "finish").map_err(anyhow::Error::from);
+    drop(release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let reaped = loop {
+        match contender.try_lock() {
+            Ok(()) => break Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                break Err(anyhow!("observer did not release guard after child reap"));
+            }
+            Err(error) => break Err(error.into()),
+        }
+    };
+    match (held_before_release, release_result, reaped) {
+        (true, Ok(()), Ok(())) => Ok(()),
+        (false, Ok(()), Ok(())) => {
+            bail!("owner drop released the installed reap guard before child exit")
+        }
+        (_, Err(release), Ok(())) => Err(release),
+        (_, Ok(()), Err(reap)) => Err(reap),
+        (_, Err(release), Err(reap)) => Err(release.context(format!(
+            "observer cleanup also failed after control-release failure: {reap:#}"
+        ))),
+    }
+}
+
 #[tokio::test]
 async fn cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit() -> Result<()> {
     let root = fixture()?;

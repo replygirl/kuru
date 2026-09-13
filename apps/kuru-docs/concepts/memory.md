@@ -14,7 +14,12 @@ The runtime schedules those calls and enforces limits on rounds, tools, and conc
 
 Joining a relationship does not merge the members' private memories. One part's private history is not silently concatenated into another part's prompt.
 
-You can inspect identities with `/parts` and their stored history with `/memory NAME_OR_ID`. The human user can inspect private memory; the separation governs what the actors receive.
+You can inspect identities with `/parts` and their stored conversation history
+with `/memory NAME_OR_ID`. `/notes NAME_OR_ID` and `kuru memory notes ID` read
+the separate durable notes namespace. The notes view returns chronological newest
+notes plus its requested limit and `truncated` flag, so it does not imply a full
+export. The human user can inspect private memory; the separation governs what
+the actors receive.
 
 ## Relationships
 
@@ -49,7 +54,19 @@ Kuru includes its verified native Dolt engine and license notices in the executa
 
 The authenticated SQL sidecar runs only while its owning Kuru process needs it. Existing SQLite data is imported from a consistent snapshot; the original and snapshot remain preserved.
 
-Use `kuru memory status` to inspect the store and current revision, or `kuru memory history` to list committed changes. Dream candidates stay private until promotion. Undo adds a compensating revision and preserves later conversations.
+Use `kuru memory status` to inspect the store and current revision, `kuru memory
+history` to list committed changes, or `kuru memory notes ID --limit N` to read
+one identity's current-mode notes from an existing live store. Exact retained
+part and relationship IDs remain readable after inactivity; names and roles use
+active identity resolution. Notes limits are 1–1000, defaulting to 100. Dream
+candidates stay private until promotion. Undo adds a compensating revision and
+preserves later conversations.
+
+Notes output includes a stable sequence and stored role for each current row.
+`kuru memory forget ID --note SEQUENCE` explicitly removes one selected active
+notes row and commits that change as a new revision. It does not alter a
+conversation, other notes, or earlier revisions. This is active-memory control,
+not secure erasure, and Kuru does not expose a history-recovery command.
 
 An operating-system writer lock prevents two Kuru processes from overwriting the same project's topology. Read-only session listing remains available.
 
@@ -58,6 +75,20 @@ An operating-system writer lock prevents two Kuru processes from overwriting the
 Close older Kuru sessions before the first launch with Dolt. Kuru imports the current project's rows from `memory.sqlite3`, verifies them, and preserves the original plus a complete snapshot under `memory/legacy/`. Other projects are imported when opened. After migration, older Kuru versions write only to the old SQLite store, so avoid using them with the same data directory.
 
 An interrupted import can resume after validation. Partial imports are stopped and preserved under `memory/interrupted/`; a failed import never becomes the active store. Keep the original and snapshots until you have checked every project you want to retain.
+
+Kuru also applies compatible database schema upgrades automatically when a
+writable project opens. Each upgrade is prepared on an internal isolated branch
+and is fast-forwarded only after its committed receipt and schema validate.
+Interrupted attempts are retained for inspection instead of reset or deleted.
+Read-only access reports an older supported schema without changing it; an
+unknown or inconsistent schema stops safely. The database schema version is
+separate from the format-1 activation record, database identity record and
+supervisor protocol format, and older dream candidates remain historical rather
+than being rewritten.
+
+Startup also stops if retained migration attempts are ambiguous or exceed its
+bounded inventory. It keeps that history and reports the condition for recovery
+rather than deleting or resetting branches.
 
 Revision history shares the database's disk. For a backup, close all Kuru processes using the data directory, let their database processes finish, then copy the entire data directory. Restore the copy into a separate location and open it with `--data-dir`. Keep the same canonical workspace path to retain the project identity. Do not copy a live `.dolt` directory or remove a held lockfile.
 

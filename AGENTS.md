@@ -16,7 +16,7 @@ when applying that standard. AGENTS.md is canonical; CLAUDE.md imports it with
 - `apps/kuru-docs`: curated public documentation site and theme.
 - `packages/kuru-core`: framework/configuration types and shared contracts.
 - `packages/kuru-memory`: managed Dolt, private SQL lifecycle, versioned storage and legacy import.
-- `packages/kuru-platform`: checked native filesystems and Windows process/IPC primitives.
+- `packages/kuru-platform`: checked native filesystems, owned process primitives and Windows private IPC.
 - `packages/kuru-archive`: bounded archive codecs, independent of filesystems, targets and installation policy.
 - `packages/kuru-connectors`: inference providers, tool host, MCP and outbound A2A.
 - `packages/kuru-runtime`: actor pool, peer routing, relationships, dreaming and A2A ingress.
@@ -130,6 +130,8 @@ demonstrate it.
 Keep platform mechanics independent of domain packages. Windows process creation
 and private asynchronous IPC live behind safe APIs in `kuru-platform`; filesystem
 operations retain handles and distinguish rejected from uncertain publication.
+Unix process-group operations retain the owned child through signal-before-reap
+and never authorize termination from a reaped numeric identity.
 Only its audited Windows interop modules may locally allow unsafe code under the
 package's deny-by-default policy. Every consumer retains the workspace prohibition.
 Platform CI proves those primitives; application support additionally requires the

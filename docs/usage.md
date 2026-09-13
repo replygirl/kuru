@@ -29,6 +29,7 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | `/focus auto` | Return to contextual speaker selection |
 | `/relate alliance ID,ID` | Activate a relationship of 2–4 parts |
 | `/memory NAME_OR_ID` | Inspect an identity's stored memory |
+| `/notes NAME_OR_ID` | Inspect an identity's durable notes, separate from its conversation |
 | `/dream` | Run bounded memory/topology consolidation |
 | `/undo-dream` | Restore the previous topology change |
 | `/quit` | End the session |
@@ -37,6 +38,10 @@ Supported relationship kinds are `protection`, `polarization` and `alliance`.
 Use `/parts` to find unambiguous identities; roles containing multiple members
 need a unique name or ID. The human user can inspect private memories; parts
 receive only the memory available to their own identity.
+
+`/notes` returns the selected identity's newest 100 durable notes with the
+selected mode, canonical identity, requested limit, and `truncated` metadata.
+It does not show that identity's conversation; use `/memory` for that history.
 
 ## The live interface
 
@@ -74,6 +79,7 @@ kuru --provider demo --mode jungian run "Explore the assumptions in this design.
 kuru --provider demo run "Plan the next step." --json
 kuru sessions
 kuru --resume SESSION_ID --provider demo run "Continue from our last turn."
+kuru memory notes ID --limit 100
 ```
 
 JSON output includes `session`, `speaker`, `text`, `relationship`, token counts,
@@ -81,6 +87,13 @@ JSON output includes `session`, `speaker`, `text`, `relationship`, token counts,
 constrained the turn. Session listing does not create a new session. Reusing a
 session restores its transcript; peer and relationship histories also persist
 across sessions within their project and framework scope.
+
+`kuru memory notes ID` reads an existing project's selected-mode durable notes
+without starting a conversation, provider, or tool. It returns the same bounded
+notes view as `/notes`: `mode`, canonical `identity`, chronological `notes`,
+`requested_limit`, and `truncated`. Limits are 1 through 1000 and default to
+100. An exact retained part or relationship ID remains readable after it is no
+longer active; names and roles resolve only among active identities.
 
 `kuru --resume SESSION_ID dream` runs explicit consolidation and
 `kuru --resume SESSION_ID undo-dream` restores the previous accepted topology.

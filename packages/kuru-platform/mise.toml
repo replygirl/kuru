@@ -24,10 +24,10 @@ description = "Check Windows-specific Rust diagnostics before native CI"
 run = "cargo clippy -p kuru-platform --target x86_64-pc-windows-msvc --all-targets --all-features --locked -- -D warnings"
 
 [tasks.build]
-run = "cargo build -p kuru-platform --all-features --locked"
+run = "cargo build -p kuru-platform --locked"
 
 [tasks."build:release"]
-run = "cargo build -p kuru-platform --release --all-features --locked"
+run = "cargo build -p kuru-platform --release --locked"
 
 [tasks.test]
 env.RUST_TEST_THREADS = "2"

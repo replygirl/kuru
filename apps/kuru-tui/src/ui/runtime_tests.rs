@@ -143,6 +143,21 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
         .contains("hello")
     );
     assert!(command_text(dispatch(&mut h, &models, "/dream").await.unwrap()).contains("summaries"));
+    let notes: serde_json::Value = serde_json::from_str(&command_text(
+        dispatch(&mut h, &models, &format!("/notes {}", ids[0]))
+            .await
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(notes["identity"], ids[0]);
+    assert_eq!(notes["requested_limit"], 100);
+    assert_eq!(notes["truncated"], false);
+    assert!(notes["notes"].as_array().is_some_and(|notes| {
+        notes.iter().any(|note| {
+            note["sequence"].as_i64().is_some()
+                && note["content"] == "[demo] Offline demo memory consolidation."
+        })
+    }));
     h.apply_dream(vec![kuru_runtime::DreamProposal::Add {
         name: "Extra".into(),
         role: h.topology.parts[0].role.clone(),

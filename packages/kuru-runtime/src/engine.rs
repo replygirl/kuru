@@ -11,7 +11,7 @@ use kuru_core::{
     Completion, Config, Framework, Message, Mode, ModelPreference, Part, ProjectPreferences,
     Relationship, RelationshipKind, ToolCall, ToolSpec, load_instructions,
 };
-use kuru_memory::{MemoryStatus, MemoryStore, Revision};
+use kuru_memory::{MemoryStatus, MemoryStore, Revision, StoredNote};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -49,6 +49,8 @@ pub struct Session {
     pub mode: Mode,
     pub turns: usize,
     pub label: String,
+    #[serde(default)]
+    pub last_completed_speaker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +70,25 @@ pub struct TurnOutput {
     pub output_tokens: u64,
     pub limited: bool,
     pub events: Vec<Event>,
+}
+
+/// A bounded, current-mode projection of one identity's durable notes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotesView {
+    pub mode: Mode,
+    pub identity: String,
+    pub notes: Vec<StoredNote>,
+    pub requested_limit: usize,
+    pub truncated: bool,
+}
+
+/// The result of removing one selected row from the current active notes view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgetNoteResult {
+    pub mode: Mode,
+    pub identity: String,
+    pub sequence: i64,
+    pub history_retained: bool,
 }
 
 pub struct Harness {
@@ -145,6 +166,7 @@ impl Harness {
                 mode: config.mode,
                 turns: 0,
                 label: String::new(),
+                last_completed_speaker: None,
             }
         };
         let mut config = config;
@@ -210,20 +232,11 @@ impl Harness {
         self.memory.history(&self.transcript_key(), 500).await
     }
     pub async fn memory_for(&self, identity: &str) -> Result<Vec<Message>> {
-        // Human inspection may address archived identities by exact ID; peer
-        // routing still uses resolve(), which deliberately requires activity.
-        let id = if self.topology.parts.iter().any(|part| part.id == identity)
-            || self
-                .topology
-                .relationships
-                .iter()
-                .any(|relation| relation.id == identity)
-        {
-            identity.to_owned()
-        } else {
-            self.resolve(identity)?
-        };
+        let id = resolve_human_identity(&self.topology, identity)?;
         self.memory.history(&self.namespace(&id), 100).await
+    }
+    pub async fn notes_for(&self, identity: &str, limit: usize) -> Result<NotesView> {
+        read_notes(&self.memory, &self.cwd, self.config.mode, identity, limit).await
     }
     pub async fn sessions(&self) -> Result<Vec<Session>> {
         Ok(self
@@ -494,30 +507,7 @@ impl Harness {
     }
 
     pub fn resolve(&self, identity: &str) -> Result<String> {
-        if self.topology.relationships.iter().any(|r| {
-            r.id == identity
-                && r.members
-                    .iter()
-                    .all(|id| self.topology.parts.iter().any(|p| p.active && &p.id == id))
-        }) {
-            return Ok(identity.into());
-        }
-        let matches = self
-            .topology
-            .parts
-            .iter()
-            .filter(|p| {
-                p.active
-                    && (p.id == identity
-                        || p.name.eq_ignore_ascii_case(identity)
-                        || p.role.eq_ignore_ascii_case(identity))
-            })
-            .collect::<Vec<_>>();
-        ensure!(
-            matches.len() == 1,
-            "identity '{identity}' is unknown or ambiguous; use a part ID or unique name"
-        );
-        Ok(matches[0].id.clone())
+        resolve_active_identity(&self.topology, identity)
     }
 
     pub async fn focus(&mut self, identity: Option<&str>) -> Result<()> {
@@ -767,7 +757,9 @@ impl Harness {
             !drafts.is_empty(),
             "all peers failed to produce a contribution; inspect provider/model configuration and event errors"
         );
-        let speaker = target.unwrap_or_else(|| self.select_speaker(&drafts));
+        let (speaker, selection_reason) = target
+            .map(|target| (target, "caller-target"))
+            .unwrap_or_else(|| self.select_speaker(&drafts));
         let relation = self
             .topology
             .relationships
@@ -785,6 +777,7 @@ impl Harness {
                 .map(|t| vec![json!({"sender":speaker,"text":t})])
                 .unwrap_or_default()
         };
+        self.emit("speaker-selection", &speaker, selection_reason);
         self.emit(
             "speaker",
             &speaker,
@@ -876,7 +869,7 @@ impl Harness {
         self.memory
             .append(&self.transcript_key(), "assistant", &text)
             .await?;
-        self.finish_turn(prompt).await?;
+        self.finish_turn(prompt, &speaker).await?;
         self.emit("response", &speaker, &text);
         if self.config.dream_every > 0 && self.session.turns.is_multiple_of(self.config.dream_every)
         {
@@ -897,13 +890,14 @@ impl Harness {
         })
     }
 
-    async fn finish_turn(&mut self, prompt: &str) -> Result<()> {
+    async fn finish_turn(&mut self, prompt: &str, speaker: &str) -> Result<()> {
         self.reconcile().await?;
         let mut session = self.session.clone();
         session.turns += 1;
         if session.label.is_empty() {
             session.label = prompt.chars().take(80).collect();
         }
+        session.last_completed_speaker = Some(speaker.into());
         let mut topology = self.topology.clone();
         if let Some(focus) = &mut topology.focus {
             focus.remaining = focus.remaining.saturating_sub(1);
@@ -915,26 +909,45 @@ impl Harness {
             .await
     }
 
-    fn select_speaker(&self, drafts: &BTreeMap<String, String>) -> String {
+    fn select_speaker(&self, drafts: &BTreeMap<String, String>) -> (String, &'static str) {
         if let Some(focus) = &self.topology.focus
             && focus.remaining > 0
             && self.actors.contains_key(&focus.id)
         {
-            return focus.id.clone();
+            return (focus.id.clone(), "active-focus");
         }
-        let ready = drafts.keys().collect::<Vec<_>>();
-        let offset = self.session.turns % ready.len();
-        (0..ready.len())
-            .map(|i| ready[(i + offset) % ready.len()])
-            .max_by(|a, b| {
-                self.topology
-                    .states
-                    .get(*a)
-                    .map_or(0.0, |s| s.activation)
-                    .total_cmp(&self.topology.states.get(*b).map_or(0.0, |s| s.activation))
-            })
+        let activation = |id: &str| {
+            self.topology
+                .states
+                .get(id)
+                .map_or(0.0, |state| state.activation)
+        };
+        let maximum = drafts
+            .keys()
+            .map(|id| activation(id))
+            .max_by(f64::total_cmp)
+            .expect("nonempty drafts validated");
+        let maximum_candidates = drafts
+            .keys()
+            .filter(|id| activation(id).total_cmp(&maximum).is_eq())
+            .cloned()
+            .collect::<Vec<_>>();
+        if maximum_candidates.len() > 1
+            && let Some(previous) = self.session.last_completed_speaker.as_deref()
+            && maximum_candidates.iter().any(|id| id == previous)
+        {
+            return (previous.into(), "previous-completed-speaker");
+        }
+        let speaker = maximum_candidates
+            .first()
             .expect("nonempty drafts validated")
-            .clone()
+            .clone();
+        let reason = if maximum_candidates.len() > 1 {
+            "stable-identity"
+        } else {
+            "maximum-activation"
+        };
+        (speaker, reason)
     }
 
     async fn cognitive_call(
@@ -1052,7 +1065,7 @@ fn tool_result(call: &ToolCall, result: Result<String>) -> Message {
         Ok(output) => output,
         Err(error) => format!("ERROR: {error:#}"),
     };
-    let output = crate::actor::truncate_text(&output, 8192);
+    let output = kuru_connectors::truncate_tool_output(&output, 8192);
     Message {
         role: "tool".into(),
         content: json!({"call_id":call.id,"output":output}).to_string(),
@@ -1118,6 +1131,120 @@ fn is_cognitive(name: &str) -> bool {
         "peer_send" | "relate" | "state_report" | "remember" | "a2a_send"
     )
 }
+
+/// Read durable notes without constructing a harness or any provider machinery.
+pub async fn read_notes(
+    memory: &MemoryStore,
+    cwd: &Path,
+    mode: Mode,
+    identity: &str,
+    limit: usize,
+) -> Result<NotesView> {
+    ensure!(
+        (1..=1000).contains(&limit),
+        "notes limit must be between 1 and 1000"
+    );
+    let (identity, namespace) = resolve_notes_namespace(memory, cwd, mode, identity).await?;
+    let mut notes = memory.notes(&namespace, limit + 1).await?;
+    let truncated = notes.len() > limit;
+    if truncated {
+        notes.remove(0);
+    }
+    Ok(NotesView {
+        mode,
+        identity,
+        notes,
+        requested_limit: limit,
+        truncated,
+    })
+}
+
+/// Remove a selected current note after resolving the same live-mode namespace
+/// used by read-only notes inspection. The deletion is a new durable revision;
+/// it does not rewrite historical revisions or any other namespace.
+pub async fn forget_note(
+    memory: &MemoryStore,
+    cwd: &Path,
+    mode: Mode,
+    identity: &str,
+    sequence: i64,
+) -> Result<ForgetNoteResult> {
+    let (identity, namespace) = resolve_notes_namespace(memory, cwd, mode, identity).await?;
+    memory.forget_note(&namespace, sequence).await?;
+    Ok(ForgetNoteResult {
+        mode,
+        identity,
+        sequence,
+        history_retained: true,
+    })
+}
+
+async fn resolve_notes_namespace(
+    memory: &MemoryStore,
+    cwd: &Path,
+    mode: Mode,
+    identity: &str,
+) -> Result<(String, String)> {
+    ensure!(
+        memory.status().await?.branch == "main",
+        "notes inspection requires the live memory branch"
+    );
+    let scope = project_scope(cwd)?;
+    let topology: Topology = memory
+        .get(&format!("{scope}/{mode}/topology"))
+        .await?
+        .context("no persisted topology exists for the selected mode")
+        .and_then(|value| {
+            serde_json::from_value(value).context("invalid persisted topology for selected mode")
+        })?;
+    let identity = resolve_human_identity(&topology, identity)?;
+    let namespace = format!("{scope}/{mode}/identity/{identity}/notes");
+    Ok((identity, namespace))
+}
+
+fn resolve_human_identity(topology: &Topology, identity: &str) -> Result<String> {
+    // Exact retained IDs remain inspectable even after their part or relationship
+    // is inactive; ordinary routing remains deliberately active-only.
+    if topology.parts.iter().any(|part| part.id == identity)
+        || topology
+            .relationships
+            .iter()
+            .any(|relationship| relationship.id == identity)
+    {
+        return Ok(identity.to_owned());
+    }
+    resolve_active_identity(topology, identity)
+}
+
+fn resolve_active_identity(topology: &Topology, identity: &str) -> Result<String> {
+    if topology.relationships.iter().any(|relationship| {
+        relationship.id == identity
+            && relationship.members.iter().all(|id| {
+                topology
+                    .parts
+                    .iter()
+                    .any(|part| part.active && &part.id == id)
+            })
+    }) {
+        return Ok(identity.to_owned());
+    }
+    let matches = topology
+        .parts
+        .iter()
+        .filter(|part| {
+            part.active
+                && (part.id == identity
+                    || part.name.eq_ignore_ascii_case(identity)
+                    || part.role.eq_ignore_ascii_case(identity))
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "identity '{identity}' is unknown or ambiguous; use a part ID or unique name"
+    );
+    Ok(matches[0].id.clone())
+}
+
 pub(crate) async fn read_topology(
     memory: &MemoryStore,
     scope: &str,
@@ -1262,7 +1389,7 @@ mod publication_tests {
             assert!(harness.pending_publication.is_some());
             if finalize {
                 harness
-                    .finish_turn("Keep the accepted modeled state")
+                    .finish_turn("Keep the accepted modeled state", &second)
                     .await
                     .unwrap();
                 assert_eq!(harness.session.turns, 1);
@@ -1291,5 +1418,53 @@ mod publication_tests {
             assert!(harness.pending_publication.is_none());
         }
         harness.shutdown(false).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tool_result_tests {
+    use super::*;
+
+    const REDACTION_MARKER: &str = "[REDACTED:recognized-secret]";
+    const TRUNCATED: &str = "[truncated]";
+
+    fn assert_complete_markers(text: &str) {
+        let mut rest = text;
+        while let Some(index) = rest.find('[') {
+            let suffix = &rest[index..];
+            assert!(
+                suffix.starts_with(REDACTION_MARKER) || suffix.starts_with(TRUNCATED),
+                "partial redaction marker in {text:?}"
+            );
+            rest = &suffix[1..];
+        }
+    }
+
+    #[test]
+    fn fixed_runtime_tool_limit_keeps_redaction_markers_whole() {
+        let call = ToolCall {
+            id: "fixed-runtime-limit".into(),
+            name: "file_read".into(),
+            arguments: Value::Null,
+        };
+        for cut in 1..REDACTION_MARKER.len() {
+            let ordinary_prefix = "x".repeat(8192 - TRUNCATED.len() - cut);
+            let output = format!("{ordinary_prefix}{}{}", REDACTION_MARKER, "tail".repeat(32));
+            let receipt = tool_result(&call, Ok(output));
+            let value: Value = serde_json::from_str(&receipt.content).unwrap();
+            assert_eq!(value["call_id"], call.id);
+            let output = value["output"].as_str().unwrap();
+            assert!(output.len() <= 8192);
+            assert_eq!(
+                output,
+                format!(
+                    "{}{}{}",
+                    "x".repeat(8192 - REDACTION_MARKER.len() - TRUNCATED.len()),
+                    REDACTION_MARKER,
+                    TRUNCATED,
+                )
+            );
+            assert_complete_markers(output);
+        }
     }
 }

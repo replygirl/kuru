@@ -59,8 +59,8 @@ instruction/configuration paths. Mutations and shell execution MUST require
 explicit opt-ins and matching workspace approval when automatic ancestor
 configuration contributes their effective grant. Shell execution MUST have time
 and output bounds and SHALL be described as process authority rather than a
-filesystem sandbox; workspace approval does not widen tool roots or make private
-same-user state inaccessible to a shell.
+filesystem sandbox; workspace approval does not widen tool roots or make
+private same-user state inaccessible to a shell.
 
 The built-in shell MUST receive only this finite inherited compatibility
 environment when each entry exists. Unix entries are `PATH`, `HOME`, `USER`,
@@ -87,13 +87,30 @@ authority, and an allowlisted name MUST NOT be treated as proof that its value
 is nonsecret. Configured stdio MCP inheritance and `McpConfig.env` overrides
 MUST remain unchanged.
 
-#### Scenario: Symlink escape
+The built-in Unix shell MUST register an independent owner before launch and
+retain its root child, stdout/stderr readers, and exact workspace `Directory`
+through cleanup. Its public timeout MUST begin at invocation acceptance and its
+caller wait MUST end within that operation deadline plus one five-second
+cleanup-confirmation allowance. Natural completion MUST require both pipe EOFs
+and non-reaping root-exit observation, terminate remaining members of the
+original group before reaping the root, preserve that root's original status,
+and observe group absence before returning success. Timeout, overflow, read
+failure, caller loss, parent-runtime loss, and shutdown MUST enter the same
+owned cleanup path without replacing the primary failure.
 
+`ToolHost` shutdown MUST close shell registration, request cancellation, and
+await all registered owners within one bounded observation window while still
+running MCP cleanup. A bounded unconfirmed result MUST leave the independent
+worker holding its process, pipe, and workspace capability until later reap and
+absence confirmation; it MUST NOT claim synchronous cleanup. This ownership is
+limited to the built-in shell and MUST NOT claim control of escaped processes,
+the memory writer lease, or configured MCP lifecycles.
+
+#### Scenario: Symlink escape
 - **WHEN** a filesystem call follows a workspace symlink outside the root
 - **THEN** the operation fails without modifying the outside file.
 
 #### Scenario: Pending shell or write grant
-
 - **WHEN** an automatic ancestor enables shell or writes without matching approval
 - **THEN** the tool host neither exposes nor executes that authority.
 
@@ -111,6 +128,22 @@ MUST remain unchanged.
 
 - **WHEN** a configured stdio MCP starts after built-in shell minimization with one fake inherited non-allowlisted sentinel and one explicit `McpConfig.env` override
 - **THEN** the MCP child receives both under its existing contract rather than the built-in shell projection.
+
+#### Scenario: Unix root exits with a silent descendant
+- **WHEN** both shell pipes close and the root exits while a same-group descendant remains alive
+- **THEN** Kuru terminates the remaining group before root reap and returns the exact root status only after group absence is observed.
+
+#### Scenario: Unix shell caller disappears
+- **WHEN** a shell call or its parent Tokio runtime disappears after launch
+- **THEN** the independent registered owner retains the child, pipes, and workspace capability through bounded cleanup, and `ToolHost` shutdown observes confirmation or reports that ownership remains unconfirmed.
+
+#### Scenario: Unix worker is delayed before launch
+- **WHEN** a registered worker is delayed beyond the accepted operation deadline and cleanup allowance while no child has spawned
+- **THEN** the caller returns a fixed bounded cancellation or unconfirmed-cleanup result, and the later worker observes cancellation and starts no child.
+
+#### Scenario: Unix ownership observation remains interrupted
+- **WHEN** repeated bounded `EINTR` leaves an owned root anchored beyond the caller's cleanup allowance
+- **THEN** the caller receives a fixed unconfirmed result while the registered worker retains ownership, later makes its one destructive transition after a valid observation, and never signals again after that transition starts.
 
 ### Requirement: Standard protocol adapters
 
@@ -299,3 +332,112 @@ authentication-management behavior.
   duration
 - **THEN** the operation returns a fixed exhaustion failure without sleeping or
   sending a replay
+
+### Requirement: Recognizable-secret tool-result projection
+
+Before returning any built-in, shell or MCP result through `ToolHost::execute`,
+the connector SHALL project a finite documented set of recognizable credential
+patterns to the exact marker `[REDACTED:recognized-secret]`. The projection MUST
+cover successful text and typed JSON, useful MCP application-error content and
+every outward tool error Display, alternate Display, Debug and source-chain path.
+It MUST NOT claim recognition of arbitrary, encoded, split, transformed or future
+secret formats.
+
+The finite set MUST include Basic and Bearer Authorization and
+Proxy-Authorization values; bounded local OpenAI, GitHub and AWS token heuristics;
+supported private-key blocks; and exact contextual sensitive field names. In
+typed JSON, an exact contextual or Authorization key MUST replace its complete
+associated value even when that value is non-string, while other string keys and
+values replace only recognized spans. Typed JSON MUST remain valid and MUST fail
+safely rather than overwrite members if projected keys collide. Arbitrary text
+which happens to parse as JSON MUST remain text, while bare and matching-quoted
+contextual/header assignment syntax is still recognized.
+
+#### Scenario: Successful tool content is projected
+
+- **WHEN** an allowed file read, native shell result or successful stdio or HTTP MCP response contains a supported synthetic credential pattern
+- **THEN** `ToolHost::execute` returns the visible marker in place of that pattern and returns no raw match through another error or formatting path
+
+#### Scenario: Sensitive typed field is projected
+
+- **WHEN** a typed JSON tool result contains an exact sensitive or Authorization key with a string, numeric, boolean, null, array or object value
+- **THEN** its whole associated value is the marker, all unrelated structure remains semantically unchanged and the serialization is valid JSON
+
+#### Scenario: Quoted contextual text is projected without JSON coercion
+
+- **WHEN** arbitrary text contains a matching-quoted contextual or Authorization key and value in JSON-like syntax
+- **THEN** only its recognized value span is replaced and the surrounding text is not parsed, reordered or reserialized
+
+#### Scenario: Unrecognized ordinary output is preserved
+
+- **WHEN** tool output contains ordinary source text, hashes, UUIDs, model names, generic base64 or JWT-like values, certificates or provider-like strings below the documented local floors
+- **THEN** its unmatched bytes remain identical and Kuru makes no claim that an unknown credential shape would be found
+
+### Requirement: Typed tool output and application errors
+
+Tool implementations SHALL retain a private text-versus-JSON result type through
+projection while preserving the public `Result<String>` interface. MCP
+`isError=true` content MUST remain a useful projected application error and MUST
+NOT be reclassified as transport unavailability. Tool transport and protocol
+failures MUST retain a typed safe category without parsing formatted text, and
+the outward error MUST NOT retain a raw source-chain bypass.
+
+#### Scenario: MCP application error remains useful
+
+- **WHEN** a healthy MCP server returns `isError=true` with ordinary instructions and a supported synthetic credential
+- **THEN** the caller receives the useful instructions with the credential replaced and the server is not marked unavailable
+
+#### Scenario: Raw remote failure cannot escape through formatting
+
+- **WHEN** an MCP transport or protocol error contains a supported synthetic credential in its remote detail
+- **THEN** Display, alternate Display, Debug and complete source-chain formatting expose only the typed safe category and projected detail
+
+### Requirement: Projection preserves authority and producer bounds
+
+Tool-result projection MUST NOT change tool arguments, file writes, remote
+requests, earlier durable history, provider credential stores or environment
+selection. It SHALL preserve the existing per-producer limits: 2 MiB file reads,
+10,000-entry complete file listings, independently bounded 2 MiB shell stdout and
+stderr fields, and bounded MCP messages/responses. It MUST NOT impose a new
+global 2 MiB result limit. Projection allocation and runtime MUST remain bounded
+relative to already-admitted producer input, and redaction MUST occur before any
+truncation or human terminal escaping.
+
+#### Scenario: Write input remains exact
+
+- **WHEN** an authorized file write receives content matching a supported detector
+- **THEN** the exact requested bytes are written and only a later returned projection is eligible for filtering
+
+#### Scenario: Combined shell output keeps its current allowance
+
+- **WHEN** shell stdout and stderr each contain an allowed result near their independent existing limits
+- **THEN** the complete typed shell result remains successful and projection does not reject it under a new combined 2 MiB limit
+
+#### Scenario: Chunk and EOF boundaries do not leak
+
+- **WHEN** a supported token, contextual value or private-key block crosses any scanner chunk boundary or ends incompletely at EOF
+- **THEN** streaming and whole-value projection agree and no recognized fragment is exposed by truncation or finalization
+
+### Requirement: Projected runtime tool authority
+
+Only the projected result or safe projected error SHALL cross from ToolHost into
+direct CLI output or runtime tool forwarding. Runtime persistence and subsequent
+provider prompts MUST use that same projected value, while prior history and the
+tool's source or side-effect data remain unchanged.
+
+Existing context byte limits MAY omit projected content. Tool-specific
+truncation MUST keep retained replacement markers whole and MUST NOT bisect an
+earlier marker when shortening a prefix to fit one. If a complete marker cannot
+fit the available budget, it MUST be wholly omitted with the existing bounded
+truncation indication. Generic chat truncation and legacy tool-history parsing
+semantics MUST remain unchanged.
+
+#### Scenario: Runtime persists the projection
+
+- **WHEN** a real tool turn returns a supported synthetic credential followed by an ordinary completion
+- **THEN** the persisted tool message and next provider-facing context contain the same marker, existing activity remains metadata-only, and none contains the raw credential
+
+#### Scenario: Context limit intersects a replacement marker
+
+- **WHEN** a current tool output or older tool message reaches an existing byte limit inside a replacement marker
+- **THEN** the retained marker is complete when it fits, otherwise it is wholly omitted with bounded truncation indication; UTF-8 and existing byte limits remain valid, and arbitrary legacy tool text gains no new parsing requirement

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Checked native filesystem, Windows process ownership and private IPC for Kuru"
+description = "Checked native filesystem plus owned Windows and Unix process primitives for Kuru"
 
 [features]
 default = []

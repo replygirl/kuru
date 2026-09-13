@@ -11,6 +11,10 @@ description = "Private versioned Dolt memory and managed runtime for Kuru"
 [[bin]]
 name = "kuru-memory-parent-fixture"
 path = "tests/fixtures/parent.rs"
+required-features = ["test-support"]
+
+[features]
+test-support = []
 
 [dependencies]
 anyhow.workspace = true

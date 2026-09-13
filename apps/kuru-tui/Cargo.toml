@@ -42,6 +42,8 @@ sha2.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
+kuru-memory = { workspace = true, features = ["test-support"] }
+kuru-delivery = { workspace = true, features = ["tooling"] }
 async-trait.workspace = true
 tempfile.workspace = true
 axum.workspace = true

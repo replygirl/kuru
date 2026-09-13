@@ -2,7 +2,7 @@ use kuru_memory::MemoryStore;
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -105,6 +105,277 @@ async fn fixture(mode: Mode, fake: Arc<dyn Provider>) -> (TempDir, Harness) {
     .await
     .unwrap();
     (directory, harness)
+}
+
+#[tokio::test]
+async fn equal_activation_keeps_the_same_speaker_across_completed_turns() {
+    let provider = Fake::new(|request| {
+        if request.instructions.contains("Phase: deliberate") {
+            Completion {
+                text: "equal contribution".into(),
+                calls: vec![call(
+                    "state_report",
+                    json!({"activation":0.5,"note":"equal fixture"}),
+                )],
+                input_tokens: 1,
+                output_tokens: 1,
+            }
+        } else {
+            answer("completed reply")
+        }
+    });
+    let (_directory, mut harness) = fixture(Mode::Ifs, provider).await;
+    let first = harness.run("first equal turn").await.unwrap();
+    let second = harness.run("second equal turn").await.unwrap();
+    assert_eq!(second.speaker, first.speaker);
+    harness.shutdown(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() {
+    let project = tempfile::tempdir().unwrap();
+    let data = kuru_memory::test_support::tempdir().unwrap();
+    let options = kuru_memory::test_support::open_options(
+        data.path().to_owned(),
+        crate::project_scope(project.path()).unwrap(),
+    )
+    .unwrap();
+    let higher = Arc::new(Mutex::new(None::<String>));
+    let provider = Fake::new({
+        let higher = higher.clone();
+        move |request| {
+            if request.instructions.contains("Phase: deliberate") {
+                let activation = if higher
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .is_some_and(|id| request.actor.ends_with(id))
+                {
+                    0.9
+                } else {
+                    0.5
+                };
+                Completion {
+                    text: format!("draft from {}", request.actor),
+                    calls: vec![call(
+                        "state_report",
+                        json!({"activation":activation,"note":"fixture"}),
+                    )],
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }
+            } else {
+                answer(&format!("spoken by {}", request.actor))
+            }
+        }
+    });
+    let memory = MemoryStore::open(options.clone()).await.unwrap();
+    let mut harness = Harness::new(
+        Config {
+            mode: Mode::Ifs,
+            provider: "demo".into(),
+            model: "demo".into(),
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        },
+        project.path(),
+        memory.clone(),
+        provider.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let first = harness.run("first tie").await.unwrap();
+    assert_eq!(
+        first
+            .events
+            .iter()
+            .find(|event| event.kind == "speaker-selection")
+            .unwrap()
+            .detail,
+        "stable-identity"
+    );
+    let second = harness.run("second tie").await.unwrap();
+    assert_eq!(second.speaker, first.speaker);
+    assert_eq!(
+        second
+            .events
+            .iter()
+            .find(|event| event.kind == "speaker-selection")
+            .unwrap()
+            .detail,
+        "previous-completed-speaker"
+    );
+    let session = harness.session.id.clone();
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+    drop(harness);
+    drop(memory);
+
+    let memory = MemoryStore::open(options).await.unwrap();
+    let mut resumed = Harness::new(
+        Config {
+            mode: Mode::Ifs,
+            provider: "demo".into(),
+            model: "demo".into(),
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        },
+        project.path(),
+        memory.clone(),
+        provider.clone(),
+        Some(&session),
+    )
+    .await
+    .unwrap();
+    let resumed_turn = resumed.run("resumed tie").await.unwrap();
+    assert_eq!(resumed_turn.speaker, first.speaker);
+    assert_eq!(
+        resumed_turn
+            .events
+            .iter()
+            .find(|event| event.kind == "speaker-selection")
+            .unwrap()
+            .detail,
+        "previous-completed-speaker"
+    );
+    resumed.session.last_completed_speaker = Some("retired-fixture-identity".into());
+    let unavailable = resumed.run("missing prior").await.unwrap();
+    assert_eq!(unavailable.speaker, first.speaker);
+    assert!(
+        unavailable.events.iter().any(|event| {
+            event.kind == "speaker-selection" && event.detail == "stable-identity"
+        })
+    );
+    let higher_id = provider
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| {
+            request.instructions.contains("Phase: deliberate")
+                && request.actor.rsplit('/').next() != Some(&first.speaker)
+        })
+        .unwrap()
+        .actor
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    *higher.lock().unwrap() = Some(higher_id.clone());
+    let higher_turn = resumed.run("higher activation").await.unwrap();
+    assert_eq!(higher_turn.speaker, higher_id);
+    assert_eq!(
+        higher_turn
+            .events
+            .iter()
+            .find(|event| event.kind == "speaker-selection")
+            .unwrap()
+            .detail,
+        "maximum-activation"
+    );
+    let higher_again = resumed.run("higher activation again").await.unwrap();
+    assert_eq!(higher_again.speaker, higher_id);
+    assert!(higher_again.events.iter().any(|event| {
+        event.kind == "speaker-selection" && event.detail == "maximum-activation"
+    }));
+    let targeted = resumed
+        .run_for("target", Some(&first.speaker))
+        .await
+        .unwrap();
+    assert_eq!(targeted.speaker, first.speaker);
+    assert!(
+        targeted
+            .events
+            .iter()
+            .any(|event| event.kind == "speaker-selection" && event.detail == "caller-target")
+    );
+    resumed.focus(Some(&higher_id)).await.unwrap();
+    let focused = resumed.run("focused").await.unwrap();
+    assert_eq!(focused.speaker, higher_id);
+    assert!(
+        focused
+            .events
+            .iter()
+            .any(|event| event.kind == "speaker-selection" && event.detail == "active-focus")
+    );
+    resumed.shutdown(false).await.unwrap();
+}
+
+struct FailingSpeaker(AtomicBool);
+
+#[async_trait]
+impl Provider for FailingSpeaker {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        if request.instructions.contains("Phase: deliberate") {
+            Ok(Completion {
+                text: "draft".into(),
+                calls: vec![call(
+                    "state_report",
+                    json!({"activation":0.5,"note":"fixture"}),
+                )],
+                ..Completion::default()
+            })
+        } else if self.0.load(Ordering::SeqCst) {
+            Err(anyhow::anyhow!("speaking fixture failed"))
+        } else {
+            Ok(answer("completed"))
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_speaking_does_not_replace_completed_speaker() {
+    let provider = Arc::new(FailingSpeaker(AtomicBool::new(false)));
+    let (directory, mut harness) = fixture(Mode::Ifs, provider.clone()).await;
+    let completed = harness.run("completed").await.unwrap().speaker;
+    let other = harness
+        .topology
+        .parts
+        .iter()
+        .map(|part| part.id.as_str())
+        .find(|id| *id != completed)
+        .unwrap()
+        .to_owned();
+    provider.0.store(true, Ordering::SeqCst);
+    assert!(harness.run_for("failed", Some(&other)).await.is_err());
+    assert_eq!(
+        harness.session.last_completed_speaker.as_deref(),
+        Some(completed.as_str())
+    );
+    let saved: crate::Session = serde_json::from_value(
+        harness
+            .memory
+            .get(&format!("{}/session/{}", harness.scope, harness.session.id))
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        saved.last_completed_speaker.as_deref(),
+        Some(completed.as_str())
+    );
+    harness.shutdown(false).await.unwrap();
+    drop(directory);
+}
+
+#[test]
+fn legacy_session_without_continuity_value_deserializes() {
+    let session: crate::Session = serde_json::from_value(json!({
+        "id":"legacy-session",
+        "mode":"ifs",
+        "turns":2,
+        "label":"legacy"
+    }))
+    .unwrap();
+    assert!(session.last_completed_speaker.is_none());
 }
 
 #[tokio::test]
@@ -262,14 +533,24 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
 
 #[tokio::test]
 async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
-    let fake = Fake::new(|r| {
+    const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
+    const PRIOR_TOKEN: &str = "sk-proj-priorhistory0123456789";
+    const ORDINARY_CONTROL: &str = "ordinary-control-remains-exact";
+    const MARKER: &str = "[REDACTED:recognized-secret]";
+    let resumed_phase = Arc::new(AtomicBool::new(false));
+    let provider_phase = resumed_phase.clone();
+    let fake = Fake::new(move |r| {
         let mut reply = answer("Draft");
         if r.instructions.contains("Phase: speak") {
-            if r.messages
-                .iter()
-                .any(|m| m.role == "tool" && m.content.contains("unique-file-content"))
-            {
-                reply.text = "Read unique-file-content from actual tool".into();
+            if r.messages.iter().any(|m| {
+                m.role == "tool"
+                    && m.content.contains(MARKER)
+                    && m.content.contains(ORDINARY_CONTROL)
+                    && !m.content.contains(TOOL_TOKEN)
+            }) {
+                reply.text = format!("Read {ORDINARY_CONTROL} from actual tool");
+            } else if provider_phase.load(Ordering::SeqCst) {
+                reply.text = "The resumed context omitted its persisted tool receipt".into();
             } else {
                 reply
                     .calls
@@ -278,17 +559,134 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
         }
         reply
     });
-    let (dir, mut harness) = fixture(Mode::Freudian, fake.clone()).await;
-    std::fs::write(dir.path().join("sample.txt"), "unique-file-content").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let data = kuru_memory::test_support::tempdir().unwrap();
+    let config = Config {
+        mode: Mode::Freudian,
+        provider: "demo".into(),
+        model: "demo".into(),
+        dream_every: 0,
+        dream_on_exit: false,
+        ..Config::default()
+    };
+    let options = kuru_memory::test_support::open_options(
+        data.path().to_owned(),
+        crate::project_scope(dir.path()).unwrap(),
+    )
+    .unwrap();
+    let memory = MemoryStore::open(options.clone()).await.unwrap();
+    let mut harness = Harness::new(
+        config.clone(),
+        dir.path(),
+        memory.clone(),
+        fake.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let prior_owner = harness.topology.parts[0].id.clone();
+    harness.focus(Some(&prior_owner)).await.unwrap();
+    let prior_history = format!("preexisting history openai_api_key={PRIOR_TOKEN}");
+    harness
+        .memory
+        .append(
+            &harness.namespace(&prior_owner),
+            "assistant",
+            &prior_history,
+        )
+        .await
+        .unwrap();
+    let source = format!("openai_api_key={TOOL_TOKEN}\n{ORDINARY_CONTROL}");
+    let source_path = dir.path().join("sample.txt");
+    std::fs::write(&source_path, &source).unwrap();
     let result = harness.run("Read sample.txt").await.unwrap();
-    assert!(result.text.contains("unique-file-content"));
+    assert!(result.text.contains(ORDINARY_CONTROL));
     let tool_event = result.events.iter().find(|e| e.kind == "tool").unwrap();
     assert_eq!(tool_event.detail, "file_read");
-    assert!(fake.requests.lock().unwrap().iter().any(|r| {
-        r.messages
-            .iter()
-            .any(|m| m.role == "tool" && m.content.contains("unique-file-content"))
+    assert!(!tool_event.detail.contains(TOOL_TOKEN));
+
+    let speaker = result.speaker.clone();
+    assert_eq!(speaker, prior_owner);
+    let session = harness.session.id.clone();
+    let stored = harness.memory_for(&speaker).await.unwrap();
+    let receipt = stored.iter().find(|m| m.role == "tool").unwrap();
+    let receipt: Value = serde_json::from_str(&receipt.content).unwrap();
+    let call_id = receipt["call_id"].as_str().unwrap().to_owned();
+    let output = receipt["output"].as_str().unwrap();
+    assert_eq!(
+        output,
+        format!("openai_api_key={MARKER}\n{ORDINARY_CONTROL}")
+    );
+    assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
+
+    let requests_before_reopen = fake.requests.lock().unwrap().len();
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+    drop(harness);
+    drop(memory);
+    let memory = MemoryStore::open(options).await.unwrap();
+    let mut reopened = Harness::new(
+        config,
+        dir.path(),
+        memory.clone(),
+        fake.clone(),
+        Some(&session),
+    )
+    .await
+    .unwrap();
+    reopened.focus(Some(&speaker)).await.unwrap();
+    let persisted = reopened.memory_for(&speaker).await.unwrap();
+    assert!(persisted.iter().any(|message| {
+        message.role == "tool"
+            && message.content.contains(MARKER)
+            && message.content.contains(ORDINARY_CONTROL)
+            && !message.content.contains(TOOL_TOKEN)
     }));
+    assert!(
+        reopened
+            .memory_for(&prior_owner)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.role == "assistant" && message.content == prior_history)
+    );
+    resumed_phase.store(true, Ordering::SeqCst);
+    let continued = reopened.run("Continue from the tool result").await.unwrap();
+    assert!(continued.text.contains(ORDINARY_CONTROL));
+    {
+        let requests = fake.requests.lock().unwrap();
+        let resumed_request = requests[requests_before_reopen..]
+            .iter()
+            .find(|request| request.actor.ends_with(&speaker))
+            .unwrap();
+        assert!(resumed_request.messages.iter().any(|message| {
+            message.role == "tool"
+                && serde_json::from_str::<Value>(&message.content)
+                    .ok()
+                    .is_some_and(|receipt| receipt["call_id"] == call_id)
+                && message.content.contains(MARKER)
+                && message.content.contains(ORDINARY_CONTROL)
+                && !message.content.contains(TOOL_TOKEN)
+        }));
+        for request in requests
+            .iter()
+            .filter(|request| !request.actor.ends_with(&speaker))
+        {
+            assert!(
+                !request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "tool"),
+                "tool receipt crossed private peer boundary: {}",
+                request.actor
+            );
+        }
+    }
+    assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
+    reopened.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+    drop(reopened);
+    drop(memory);
 }
 
 #[tokio::test]

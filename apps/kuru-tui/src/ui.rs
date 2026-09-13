@@ -36,7 +36,7 @@ mod runtime_tests;
 mod scene;
 pub use render::draw;
 
-const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /dream · /undo-dream · /quit\n/memory-status · /memory-history\nModel, effort and mode selections are remembered for this project.";
+const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /notes ID · /dream · /undo-dream · /quit\n/memory-status · /memory-history\nModel, effort and mode selections are remembered for this project.";
 const ACTIVITY_DRAIN_CAP: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1255,6 +1255,7 @@ pub(crate) async fn dispatch(
             format!("Activated {} · {}", relation.kind, relation.id)
         }
         "/memory" => serde_json::to_string_pretty(&harness.memory_for(args).await?)?,
+        "/notes" => serde_json::to_string_pretty(&harness.notes_for(args, 100).await?)?,
         "/memory-status" => serde_json::to_string_pretty(&harness.memory_status().await?)?,
         "/memory-history" => serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?,
         "/dream" => serde_json::to_string_pretty(&harness.dream().await?)?,

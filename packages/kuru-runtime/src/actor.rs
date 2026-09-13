@@ -171,7 +171,7 @@ fn bounded_receipt(message: &Message, limit: usize) -> Result<Message> {
     );
     let mut text_limit = limit - envelope;
     loop {
-        let content = json!({"call_id":id,"output":truncate_text(&output, text_limit)}).to_string();
+        let content = json!({"call_id":id,"output":kuru_connectors::truncate_tool_output(&output, text_limit)}).to_string();
         if content.len() <= limit {
             return Ok(Message {
                 role: "tool".into(),
@@ -214,7 +214,11 @@ fn bounded_history(
         if selected.contains_key(&index) {
             continue;
         }
-        let content = truncate_text(&message.content, remaining.min(32_768));
+        let content = if message.role == "tool" {
+            kuru_connectors::truncate_tool_output(&message.content, remaining.min(32_768))
+        } else {
+            truncate_text(&message.content, remaining.min(32_768))
+        };
         remaining -= content.len();
         selected.insert(
             index,
@@ -230,5 +234,112 @@ fn bounded_history(
 impl Drop for Actor {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tool_receipt_tests {
+    use super::*;
+
+    const REDACTION_MARKER: &str = "[REDACTED:recognized-secret]";
+    const TRUNCATED: &str = "[truncated]";
+
+    fn assert_complete_markers(text: &str) {
+        let mut rest = text;
+        while let Some(index) = rest.find('[') {
+            let suffix = &rest[index..];
+            assert!(
+                suffix.starts_with(REDACTION_MARKER) || suffix.starts_with(TRUNCATED),
+                "partial redaction marker in {text:?}"
+            );
+            rest = &suffix[1..];
+        }
+    }
+
+    #[test]
+    fn current_and_optional_tool_receipt_limits_keep_redaction_markers_whole() {
+        let id = "receipt-with-utf8";
+        let envelope = json!({"call_id":id,"output":""}).to_string().len();
+        let text_limit = 128;
+        let utf8_prefix = "🪶".repeat(8);
+        for cut in 1..REDACTION_MARKER.len() {
+            let ordinary_prefix = format!(
+                "{}{}",
+                utf8_prefix,
+                "x".repeat(text_limit - TRUNCATED.len() - cut - utf8_prefix.len()),
+            );
+            let output = format!("{ordinary_prefix}{}{}", REDACTION_MARKER, "tail".repeat(32));
+            let receipt = Message {
+                role: "tool".into(),
+                content: json!({"call_id":id,"output":output}).to_string(),
+            };
+            let limit = envelope + text_limit;
+            let bounded = bounded_receipt(&receipt, limit).unwrap();
+            assert!(bounded.content.len() <= limit);
+            let value: Value = serde_json::from_str(&bounded.content).unwrap();
+            let output = value["output"].as_str().unwrap();
+            let expected = format!(
+                "{}{}{}",
+                &format!(
+                    "{}{}",
+                    utf8_prefix,
+                    "x".repeat(
+                        text_limit - REDACTION_MARKER.len() - TRUNCATED.len() - utf8_prefix.len()
+                    ),
+                ),
+                REDACTION_MARKER,
+                TRUNCATED,
+            );
+            assert_eq!(output, expected);
+            assert_complete_markers(output);
+        }
+
+        for limit in [0, 1, 3, 10, 15, 40] {
+            let receipt = Message {
+                role: "tool".into(),
+                content: json!({
+                    "call_id": id,
+                    "output": format!("{}{}tail", "x".repeat(40), REDACTION_MARKER),
+                })
+                .to_string(),
+            };
+            let bounded = bounded_receipt(&receipt, envelope + limit).unwrap();
+            let output: Value = serde_json::from_str(&bounded.content).unwrap();
+            let output = output["output"].as_str().unwrap();
+            assert!(output.len() <= limit);
+            assert_complete_markers(output);
+        }
+
+        let legacy_prefix = "x".repeat(128 - TRUNCATED.len() - 1);
+        let legacy = format!("{legacy_prefix}{REDACTION_MARKER}tail");
+        let history = vec![Message {
+            role: "tool".into(),
+            content: legacy.clone(),
+        }];
+        let bounded = bounded_history(history, 0, 128).unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].role, "tool");
+        assert!(bounded[0].content.len() <= 128);
+        assert_eq!(
+            bounded[0].content,
+            format!(
+                "{}{}{}",
+                "x".repeat(128 - REDACTION_MARKER.len() - TRUNCATED.len()),
+                REDACTION_MARKER,
+                TRUNCATED,
+            )
+        );
+        assert_complete_markers(&bounded[0].content);
+
+        let non_tool = bounded_history(
+            vec![Message {
+                role: "assistant".into(),
+                content: legacy.clone(),
+            }],
+            0,
+            128,
+        )
+        .unwrap();
+        assert_eq!(non_tool[0].content, truncate_text(&legacy, 128));
     }
 }

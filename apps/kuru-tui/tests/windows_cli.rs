@@ -22,7 +22,18 @@ fn fixture_environment(root: &Path) -> Vec<(OsString, OsString)> {
     .into_iter()
     .map(|(key, value)| (OsString::from(key), value.into_os_string()))
     .collect();
-    for key in ["SystemRoot", "LLVM_PROFILE_FILE"] {
+    // Match the machine-scoped inputs that the production built-in shell
+    // deliberately preserves. The fixture still owns every user/cache path.
+    for key in [
+        "SystemRoot",
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_ARCHITEW6432",
+        "LLVM_PROFILE_FILE",
+    ] {
         if let Some(value) = std::env::var_os(key) {
             environment.push((key.into(), value));
         }
@@ -50,6 +61,36 @@ fn shell_marker(path: &Path, limit: u64) -> std::io::Result<String> {
     String::from_utf8(bytes).map_err(|_| std::io::Error::other("shell marker is not UTF-8"))
 }
 
+fn machine_environment_diagnostic() -> String {
+    let mut fields = Vec::new();
+    for key in [
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+    ] {
+        let state = std::env::var_os(key).map_or("missing", |value| {
+            if Path::new(&value).is_absolute() {
+                "absolute"
+            } else {
+                "relative"
+            }
+        });
+        fields.push(format!("{key}={state}"));
+    }
+    for key in ["PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432"] {
+        fields.push(format!(
+            "{key}={}",
+            if std::env::var_os(key).is_some() {
+                "present"
+            } else {
+                "missing"
+            }
+        ));
+    }
+    fields.join(",")
+}
+
 fn powershell_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -62,7 +103,8 @@ fn stock_shell_source(progress: &Path, input: &Path, sentinel: &str) -> String {
         r#"$ErrorActionPreference = 'Stop'
 [IO.File]::WriteAllText({progress}, "entered`n")
 if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {{ throw 'expected stock PowerShell 5.1' }}
-[IO.File]::AppendAllText({progress}, "version-checked`nhash-started`n")
+if ([string]::IsNullOrWhiteSpace($env:ProgramData) -or [string]::IsNullOrWhiteSpace($env:ProgramFiles) -or [string]::IsNullOrWhiteSpace(${{env:ProgramFiles(x86)}}) -or [string]::IsNullOrWhiteSpace($env:ProgramW6432) -or [string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITECTURE)) {{ throw 'expected stock Windows machine environment' }}
+[IO.File]::AppendAllText({progress}, "version-checked`nmachine-environment-checked`nhash-started`n")
 $hash = (Get-FileHash -LiteralPath {input} -Algorithm SHA256).Hash
 [IO.File]::AppendAllText({progress}, "hashed`n")
 [Console]::Write($hash + '|' + {sentinel})
@@ -411,6 +453,7 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     let kuru_progress = root.path().join("kuru-progress");
     let trace_progress = root.path().join("trace-progress");
     let sentinel = "retained & literal 日本語";
+    let machine_environment = machine_environment_diagnostic();
     let control_source = stock_shell_source(&control_progress, &input, sentinel);
     let kuru_source = stock_shell_source(&kuru_progress, &input, sentinel);
     let child = |binary: &Path| {
@@ -443,14 +486,14 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
         .output();
     let control_stages = shell_marker(&control_progress, 256);
     let control = control.unwrap_or_else(|error| {
-        panic!("stock PowerShell control failed: {error}; stages={control_stages:?}")
+        panic!("stock PowerShell control failed: {error}; stages={control_stages:?}; machine_environment={machine_environment}")
     });
     let diagnostic = String::from_utf8_lossy(&control.stderr);
     let preview =
         |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
     assert!(
         !control.status.success(),
-        "unsanitized control must fail: status={} stdout={:?} stderr={:?} stages={control_stages:?}",
+        "unsanitized control must fail: status={} stdout={:?} stderr={:?} stages={control_stages:?} machine_environment={machine_environment}",
         control.status,
         preview(&control.stdout),
         preview(&control.stderr)
@@ -459,13 +502,13 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
         diagnostic.contains("Get-FileHash")
             && diagnostic.contains("CouldNotAutoloadMatchingModule")
             && diagnostic.contains("Microsoft.PowerShell.Utility"),
-        "control must reach the incompatible module's autoload failure: {:?}; stages={control_stages:?}",
+        "control must reach the incompatible module's autoload failure: {:?}; stages={control_stages:?}; machine_environment={machine_environment}",
         preview(&control.stderr)
     );
     assert!(control.stdout.is_empty());
     assert_eq!(
         control_stages.as_deref().ok(),
-        Some("entered\nversion-checked\nhash-started\n"),
+        Some("entered\nversion-checked\nmachine-environment-checked\nhash-started\n"),
         "control must stop at the actual hash command: {control_stages:?}"
     );
     // The first Kuru request must exercise the unwrapped source. Observation
@@ -489,13 +532,15 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     };
     assert!(
         output.status.success(),
-        "{}\n{}\nstages={kuru_stages:?}\n{trace}",
+        "{}\n{}\nstages={kuru_stages:?}\nmachine_environment={machine_environment}\n{trace}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
         kuru_stages.as_deref().ok(),
-        Some("entered\nversion-checked\nhash-started\nhashed\ncompleted\n"),
+        Some(
+            "entered\nversion-checked\nmachine-environment-checked\nhash-started\nhashed\ncompleted\n"
+        ),
         "Kuru must complete its own source sequence: {kuru_stages:?}"
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

@@ -15,7 +15,7 @@ use kuru_platform::fs::{NameRetention, Privacy};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::{IO_TIMEOUT, MAX_BYTES, http, rpc::Rpc};
+use crate::{IO_TIMEOUT, MAX_BYTES, http, rpc::Rpc, tool_output::ToolFailureKind};
 
 const VERSION: &str = "2025-11-25";
 const SUPPORTED: &[&str] = &[VERSION, "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -23,6 +23,34 @@ const SUPPORTED: &[&str] = &[VERSION, "2025-06-18", "2025-03-26", "2024-11-05"];
 pub(crate) struct McpHosts {
     clients: BTreeMap<String, Arc<McpClient>>,
     routes: RwLock<BTreeMap<String, (String, String)>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum McpExecution {
+    Success(Value),
+    ApplicationError(Value),
+}
+
+#[derive(Debug)]
+pub(crate) struct McpCallFailure {
+    pub(crate) kind: ToolFailureKind,
+    pub(crate) error: anyhow::Error,
+}
+
+impl McpCallFailure {
+    fn route(error: anyhow::Error) -> Self {
+        Self {
+            kind: ToolFailureKind::McpRoute,
+            error,
+        }
+    }
+
+    fn call(error: anyhow::Error) -> Self {
+        Self {
+            kind: ToolFailureKind::McpCall,
+            error,
+        }
+    }
 }
 
 impl McpHosts {
@@ -112,22 +140,30 @@ impl McpHosts {
         Ok(specs)
     }
 
-    pub async fn execute(&self, name: &str, arguments: Value) -> Result<String> {
+    pub(crate) async fn execute(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> std::result::Result<McpExecution, McpCallFailure> {
         let route = self.routes.read().await.get(name).cloned();
-        let (alias, original) = route.with_context(|| {
-            format!("unknown tool: {name}; discover configured MCP tools first")
+        let (alias, original) = route.ok_or_else(|| {
+            McpCallFailure::route(anyhow::anyhow!(
+                "unknown tool: {name}; discover configured MCP tools first"
+            ))
         })?;
         let client = self
             .clients
             .get(&alias)
-            .context("MCP route no longer exists")?;
-        let result = client.call(&original, arguments).await?;
-        ensure!(
-            result["isError"] != true,
-            "MCP {alias}/{original} returned a tool error: {}",
-            result.get("content").unwrap_or(&Value::Null)
-        );
-        Ok(result.to_string())
+            .ok_or_else(|| McpCallFailure::route(anyhow::anyhow!("MCP route no longer exists")))?;
+        let result = client
+            .call(&original, arguments)
+            .await
+            .map_err(McpCallFailure::call)?;
+        if result["isError"] == true {
+            Ok(McpExecution::ApplicationError(result["content"].clone()))
+        } else {
+            Ok(McpExecution::Success(result))
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -465,13 +501,13 @@ mod tests {
         assert_eq!(specs.len(), 2);
         assert_ne!(specs[0].name, "file_read");
         assert!(specs[0].name.len() < 64);
-        let value: Value = serde_json::from_str(
-            &hosts
-                .execute(&specs[0].name, json!({"path":"a"}))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let McpExecution::Success(value) = hosts
+            .execute(&specs[0].name, json!({"path":"a"}))
+            .await
+            .unwrap()
+        else {
+            panic!("expected an MCP success");
+        };
         assert_eq!(value["structuredContent"]["value"], 42);
         hosts.shutdown().await.unwrap();
         let requests = peer.requests.lock().await;
@@ -524,8 +560,12 @@ mod tests {
             hosts.execute(&specs[0].name, json!({})),
             hosts.execute(&specs[0].name, json!({}))
         );
-        let one: Value = serde_json::from_str(&one.unwrap()).unwrap();
-        let two: Value = serde_json::from_str(&two.unwrap()).unwrap();
+        let McpExecution::Success(one) = one.unwrap() else {
+            panic!("expected first MCP success");
+        };
+        let McpExecution::Success(two) = two.unwrap() else {
+            panic!("expected second MCP success");
+        };
         assert_eq!(one["content"][0]["text"], "1");
         assert_eq!(two["content"][0]["text"], "2");
         assert_eq!(hosts.specs().await.unwrap()[0].name, specs[0].name);
@@ -768,37 +808,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_error_and_protocol_failure_are_distinct_and_not_automatically_retried() {
+    async fn tool_application_error_retains_the_session_while_protocol_failure_is_typed() {
         let peer = HttpFixture::new(vec![
             initialized(),
             Reply::json(json!({})),
             Reply::rpc(json!({"tools":[tool("a")]})),
             Reply::rpc(json!({"isError":true,"content":[{"type":"text","text":"denied"}]})),
+            Reply::rpc(json!({"content":[{"type":"text","text":"usable"}]})),
             Reply::json(json!({"id":"$ID","error":{"code":-32000,"message":"server failed"}})),
             Reply::json(json!({})),
         ])
         .await;
         let hosts = McpHosts::new(Path::new("."), &http_config(&peer.url)).unwrap();
         let name = &hosts.specs().await.unwrap()[0].name;
-        assert!(
-            hosts
-                .execute(name, json!({}))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("tool error")
-        );
-        assert!(
-            hosts
-                .execute(name, json!({}))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("server failed")
-        );
-        assert_eq!(peer.requests.lock().await.len(), 6);
+        let McpExecution::ApplicationError(content) = hosts.execute(name, json!({})).await.unwrap()
+        else {
+            panic!("expected MCP application error");
+        };
+        assert_eq!(content[0]["text"], "denied");
+        let McpExecution::Success(success) = hosts.execute(name, json!({})).await.unwrap() else {
+            panic!("expected MCP success after application error");
+        };
+        assert_eq!(success["content"][0]["text"], "usable");
+        let failure = hosts.execute(name, json!({})).await.unwrap_err();
+        assert_eq!(failure.kind, ToolFailureKind::McpCall);
+        assert!(failure.error.to_string().contains("server failed"));
+        assert_eq!(peer.requests.lock().await.len(), 7);
         hosts.shutdown().await.unwrap();
-        assert!(hosts.execute("unknown", json!({})).await.is_err());
+        let failure = hosts.execute("unknown", json!({})).await.unwrap_err();
+        assert_eq!(failure.kind, ToolFailureKind::McpRoute);
         let invalid = [(
             "bad".into(),
             McpConfig {

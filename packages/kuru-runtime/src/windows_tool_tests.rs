@@ -92,9 +92,18 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
     std::fs::hard_link(&outside, project.join("alias"))?;
     std::fs::write(project.join(".env"), b"private fixture value")?;
     std::fs::write(project.join("ordinary"), b"ordinary bytes")?;
+    let token = "sk-proj-abcdefghijklmnop0123456789";
+    let marker = "[REDACTED:recognized-secret]";
+    let projection_control = "projection-control-remains-exact";
+    let projection_source = format!("openai_api_key={token}\n{projection_control}");
+    let projected_file_output = format!("openai_api_key={marker}\n{projection_control}");
+    let projection_path = project.join("projection.txt");
+    std::fs::write(&projection_path, &projection_source)?;
     let literal_path = "literal & name.txt";
     let literal = "$(Set-Content escaped.txt changed) & | %PATH% ! 日本語";
-    let shell_stdout = "literal & | < > ^ %PATH% ! 日本語";
+    let shell_control = "literal & | < > ^ %PATH% ! 日本語";
+    let shell_stdout = format!("{shell_control}; openai_api_key={token}");
+    let projected_shell_stdout = format!("{shell_control}; openai_api_key={marker}");
     let mut calls = vec![
         call(
             "create",
@@ -102,6 +111,11 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
             json!({"path":literal_path,"content":literal}),
         ),
         call("read", "file_read", json!({"path":literal_path})),
+        call(
+            "redacted-read",
+            "file_read",
+            json!({"path":"projection.txt"}),
+        ),
         call("list", "file_list", json!({"path":"."})),
         call(
             "shell",
@@ -219,6 +233,11 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         receipts["read"] == literal,
         "file argument data was interpreted"
     );
+    ensure!(
+        receipts["redacted-read"] == projected_file_output,
+        "file result was not projected: {}",
+        receipts["redacted-read"]
+    );
     let listed: Value = serde_json::from_str(&receipts["list"])
         .with_context(|| format!("file-list receipt was not JSON: {}", receipts["list"]))?;
     ensure!(
@@ -231,8 +250,13 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         shell["exit_code"] == 7 && shell["success"] == false,
         "wrong native status: {shell}"
     );
+    let stdout = shell["stdout"].as_str().context("native stdout")?;
     ensure!(
-        shell["stdout"] == shell_stdout && shell["stderr"] == "native stderr",
+        stdout == projected_shell_stdout,
+        "wrong projected native stdout: {shell}"
+    );
+    ensure!(
+        shell["stderr"] == "native stderr",
         "wrong native output: {shell}"
     );
     ensure!(
@@ -274,6 +298,10 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
     ensure!(
         std::fs::read(project.join("ordinary"))? == b"ordinary bytes",
         "stream base changed"
+    );
+    ensure!(
+        std::fs::read_to_string(&projection_path)? == projection_source,
+        "projected file source was changed"
     );
     ensure!(
         !project.join("ordinary:stream").exists(),

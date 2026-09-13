@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use crate::unix_shell::ShellRegistry;
 use anyhow::{Context, Result, bail, ensure};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
@@ -18,10 +20,11 @@ use kuru_platform::fs::{Directory, NameRetention, Privacy};
 #[cfg(windows)]
 use kuru_platform::fs::{regular_file_info, validate_component};
 use serde_json::{Value, json};
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use std::process::Stdio;
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use tokio::process::Command;
+#[cfg(any(windows, test))]
 use tokio::{io::AsyncReadExt, time::timeout};
 #[cfg(windows)]
 type PathGuard = Directory;
@@ -160,7 +163,12 @@ fn windows_shell_environment(
     Ok(projected)
 }
 
-use crate::{MAX_BYTES, mcp::McpHosts};
+use crate::{
+    MAX_BYTES,
+    mcp::{McpExecution, McpHosts},
+    redaction,
+    tool_output::{ProjectedToolError, ToolContent, ToolExecution, ToolFailure, ToolFailureKind},
+};
 
 /// File tools operate under an opened directory capability. Shell and MCP
 /// authorization grant process/server authority; cwd is not an OS sandbox.
@@ -171,6 +179,8 @@ pub struct ToolHost {
     allow_write: bool,
     allow_shell: bool,
     mcp: McpHosts,
+    #[cfg(unix)]
+    shells: ShellRegistry,
 }
 
 impl ToolHost {
@@ -198,6 +208,8 @@ impl ToolHost {
             root_guard,
             allow_write: config.allow_write,
             allow_shell: config.allow_shell,
+            #[cfg(unix)]
+            shells: ShellRegistry::new(),
         })
     }
 
@@ -251,152 +263,236 @@ impl ToolHost {
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> Result<String> {
-        ensure!(args.is_object(), "tool arguments must be an object");
+        match self.execute_inner(name, args).await {
+            Ok(execution) => project_execution(execution),
+            Err(failure) => project_failure(failure),
+        }
+    }
+
+    async fn execute_inner(
+        &self,
+        name: &str,
+        args: Value,
+    ) -> std::result::Result<ToolExecution, ToolFailure> {
+        if !args.is_object() {
+            return Err(ToolFailure::built_in(anyhow::anyhow!(
+                "tool arguments must be an object"
+            )));
+        }
         match name {
             "file_read" => {
-                let (directory, path, _guard) = self.path(string(&args, "path")?, false)?;
-                let mut options = OpenOptions::new();
-                options.read(true).follow(FollowSymlinks::No);
-                #[cfg(unix)]
-                {
-                    use cap_std::fs::OpenOptionsExt;
-                    options.custom_flags(nix::libc::O_NONBLOCK);
-                }
-                let file = directory.open_with(path, &options)?;
-                #[cfg(windows)]
-                let file = {
-                    let file = file.into_std();
+                let execution = (|| -> Result<ToolExecution> {
+                    let (directory, path, _guard) = self.path(string(&args, "path")?, false)?;
+                    let mut options = OpenOptions::new();
+                    options.read(true).follow(FollowSymlinks::No);
+                    #[cfg(unix)]
+                    {
+                        use cap_std::fs::OpenOptionsExt;
+                        options.custom_flags(nix::libc::O_NONBLOCK);
+                    }
+                    let file = directory.open_with(path, &options)?;
+                    #[cfg(windows)]
+                    let file = {
+                        let file = file.into_std();
+                        ensure!(
+                            regular_file_info(&file)?.links == 1,
+                            "hard-linked files are not readable through file tools"
+                        );
+                        file
+                    };
                     ensure!(
-                        regular_file_info(&file)?.links == 1,
-                        "hard-linked files are not readable through file tools"
+                        file.metadata()?.is_file(),
+                        "file_read requires a regular file"
                     );
-                    file
-                };
-                ensure!(
-                    file.metadata()?.is_file(),
-                    "file_read requires a regular file"
-                );
-                #[cfg(unix)]
-                {
-                    use cap_std::fs::MetadataExt;
-                    ensure!(
-                        file.metadata()?.nlink() == 1,
-                        "hard-linked files are not readable through file tools"
-                    );
-                }
-                let mut bytes = Vec::new();
-                file.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes)?;
-                ensure!(bytes.len() <= MAX_BYTES, "file exceeds 2 MiB limit");
-                String::from_utf8(bytes).context("file is not UTF-8")
+                    #[cfg(unix)]
+                    {
+                        use cap_std::fs::MetadataExt;
+                        ensure!(
+                            file.metadata()?.nlink() == 1,
+                            "hard-linked files are not readable through file tools"
+                        );
+                    }
+                    let mut bytes = Vec::new();
+                    file.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+                    ensure!(bytes.len() <= MAX_BYTES, "file exceeds 2 MiB limit");
+                    Ok(ToolExecution::Text(
+                        String::from_utf8(bytes).context("file is not UTF-8")?,
+                    ))
+                })();
+                execution.map_err(ToolFailure::built_in)
             }
             "file_write" => {
-                ensure!(self.allow_write, "file writes require allow_write=true");
-                let content = string(&args, "content")?;
-                ensure!(
-                    content.len() <= MAX_BYTES,
-                    "file content exceeds 2 MiB limit"
-                );
-                let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
-                let temporary = format!(".kuru-write-{}", uuid::Uuid::new_v4());
-                let mut options = OpenOptions::new();
-                options
-                    .write(true)
-                    .create_new(true)
-                    .follow(FollowSymlinks::No);
-                let mut file = directory.open_with(&temporary, &options)?;
-                let written = (|| -> Result<()> {
-                    file.write_all(content.as_bytes())?;
-                    file.sync_all()?;
-                    if let Ok(metadata) = directory.symlink_metadata(&path) {
-                        file.set_permissions(metadata.permissions())?;
+                let execution = (|| -> Result<ToolExecution> {
+                    ensure!(self.allow_write, "file writes require allow_write=true");
+                    let content = string(&args, "content")?;
+                    ensure!(
+                        content.len() <= MAX_BYTES,
+                        "file content exceeds 2 MiB limit"
+                    );
+                    let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
+                    let temporary = format!(".kuru-write-{}", uuid::Uuid::new_v4());
+                    let mut options = OpenOptions::new();
+                    options
+                        .write(true)
+                        .create_new(true)
+                        .follow(FollowSymlinks::No);
+                    let mut file = directory.open_with(&temporary, &options)?;
+                    let written = (|| -> Result<()> {
+                        file.write_all(content.as_bytes())?;
+                        file.sync_all()?;
+                        if let Ok(metadata) = directory.symlink_metadata(&path) {
+                            file.set_permissions(metadata.permissions())?;
+                        }
+                        directory.rename(&temporary, &directory, &path)?;
+                        Ok(())
+                    })();
+                    if written.is_err() {
+                        let _ = directory.remove_file(&temporary);
                     }
-                    directory.rename(&temporary, &directory, &path)?;
-                    Ok(())
+                    written?;
+                    Ok(ToolExecution::Text(format!(
+                        "Wrote {} bytes",
+                        content.len()
+                    )))
                 })();
-                if written.is_err() {
-                    let _ = directory.remove_file(&temporary);
-                }
-                written?;
-                Ok(format!("Wrote {} bytes", content.len()))
+                execution.map_err(ToolFailure::built_in)
             }
             "file_delete" => {
-                ensure!(self.allow_write, "file deletion requires allow_write=true");
-                let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
-                ensure!(
-                    directory.symlink_metadata(&path)?.is_file(),
-                    "file_delete requires a regular file"
-                );
-                directory.remove_file(path)?;
-                Ok("Deleted file".into())
+                let execution = (|| -> Result<ToolExecution> {
+                    ensure!(self.allow_write, "file deletion requires allow_write=true");
+                    let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
+                    ensure!(
+                        directory.symlink_metadata(&path)?.is_file(),
+                        "file_delete requires a regular file"
+                    );
+                    directory.remove_file(path)?;
+                    Ok(ToolExecution::Text("Deleted file".into()))
+                })();
+                execution.map_err(ToolFailure::built_in)
             }
             "file_list" => {
-                let input_path = args
-                    .get("path")
-                    .map(|value| value.as_str().context("path must be a string"))
-                    .transpose()?
-                    .unwrap_or(".");
-                let (directory, path, _guard) = self.path(input_path, false)?;
-                #[cfg(windows)]
-                let _listing_guard = Directory::open(
-                    &_guard.path().join(&path),
-                    Privacy::Inherited,
-                    NameRetention::Pinned,
-                )?;
-                let directory = directory.open_dir_nofollow(path)?;
-                let mut entries = BTreeMap::new();
-                for entry in directory.entries()? {
-                    let entry = entry?;
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if protected_component(&name, false) || entry.file_type()?.is_symlink() {
-                        continue;
+                let execution = (|| -> Result<ToolExecution> {
+                    let input_path = args
+                        .get("path")
+                        .map(|value| value.as_str().context("path must be a string"))
+                        .transpose()?
+                        .unwrap_or(".");
+                    let (directory, path, _guard) = self.path(input_path, false)?;
+                    #[cfg(windows)]
+                    let _listing_guard = Directory::open(
+                        &_guard.path().join(&path),
+                        Privacy::Inherited,
+                        NameRetention::Pinned,
+                    )?;
+                    let directory = directory.open_dir_nofollow(path)?;
+                    let mut entries = BTreeMap::new();
+                    for entry in directory.entries()? {
+                        let entry = entry?;
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if protected_component(&name, false) || entry.file_type()?.is_symlink() {
+                            continue;
+                        }
+                        entries.insert(
+                            name,
+                            if entry.file_type()?.is_dir() {
+                                "directory"
+                            } else {
+                                "file"
+                            },
+                        );
+                        ensure!(
+                            entries.len() <= 10_000,
+                            "directory exceeds 10000 entries; select a narrower path"
+                        );
                     }
-                    entries.insert(
-                        name,
-                        if entry.file_type()?.is_dir() {
-                            "directory"
-                        } else {
-                            "file"
-                        },
-                    );
-                    ensure!(
-                        entries.len() <= 10_000,
-                        "directory exceeds 10000 entries; select a narrower path"
-                    );
-                }
-                Ok(serde_json::to_string(&entries)?)
+                    Ok(ToolExecution::Json(serde_json::to_value(entries)?))
+                })();
+                execution.map_err(ToolFailure::built_in)
             }
             "shell" => {
-                ensure!(
-                    self.allow_shell,
-                    "shell requires allow_shell=true (process authority)"
-                );
-                let duration = args
-                    .get("timeout_ms")
-                    .map(|value| {
-                        value
-                            .as_u64()
-                            .context("timeout_ms must be a positive integer")
-                    })
-                    .transpose()?
-                    .unwrap_or(30_000);
-                ensure!(
-                    (1..=120_000).contains(&duration),
-                    "timeout_ms must be 1..120000"
-                );
-                shell(
-                    self.root_guard.as_ref(),
-                    &self.root,
-                    string(&args, "command")?,
-                    Duration::from_millis(duration),
-                )
-                .await
+                let execution = async {
+                    ensure!(
+                        self.allow_shell,
+                        "shell requires allow_shell=true (process authority)"
+                    );
+                    let duration = args
+                        .get("timeout_ms")
+                        .map(|value| {
+                            value
+                                .as_u64()
+                                .context("timeout_ms must be a positive integer")
+                        })
+                        .transpose()?
+                        .unwrap_or(30_000);
+                    ensure!(
+                        (1..=120_000).contains(&duration),
+                        "timeout_ms must be 1..120000"
+                    );
+                    #[cfg(unix)]
+                    let result = shell(
+                        self.shells(),
+                        self.root_guard.clone(),
+                        self.root.clone(),
+                        string(&args, "command")?,
+                        Duration::from_millis(duration),
+                    )
+                    .await?;
+                    #[cfg(windows)]
+                    let result = shell(
+                        &self.root_guard,
+                        &self.root,
+                        string(&args, "command")?,
+                        Duration::from_millis(duration),
+                    )
+                    .await?;
+                    Ok(ToolExecution::Json(
+                        serde_json::from_str(&result).context("shell emitted invalid result")?,
+                    ))
+                }
+                .await;
+                execution.map_err(ToolFailure::built_in)
             }
-            _ => self.mcp.execute(name, args).await,
+            _ => match self.mcp.execute(name, args).await {
+                Ok(McpExecution::Success(result)) => Ok(ToolExecution::Json(result)),
+                Ok(McpExecution::ApplicationError(content)) => {
+                    Ok(ToolExecution::ApplicationError {
+                        kind: ToolFailureKind::McpApplication,
+                        content: ToolContent::Json(content),
+                    })
+                }
+                Err(failure) => Err(ToolFailure {
+                    kind: failure.kind,
+                    error: failure.error,
+                }),
+            },
         }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let (shell, mcp) = tokio::join!(self.shells.shutdown(), self.mcp.shutdown());
+            match (shell, mcp) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(shell), Ok(())) => Err(shell),
+                (Ok(()), Err(mcp)) => Err(mcp),
+                (Err(shell), Err(mcp)) => {
+                    Err(shell).context(format!("MCP shutdown also failed: {mcp:#}"))
+                }
+            }
+        }
+        #[cfg(not(unix))]
         self.mcp.shutdown().await
+    }
+
+    #[cfg(unix)]
+    fn shells(&self) -> &ShellRegistry {
+        &self.shells
+    }
+
+    #[cfg(all(unix, test))]
+    fn test_shells(&self) -> &ShellRegistry {
+        &self.shells
     }
 
     fn path(&self, value: &str, writing: bool) -> Result<(Dir, PathBuf, PathGuard)> {
@@ -483,6 +579,36 @@ impl ToolHost {
     }
 }
 
+fn project_execution(execution: ToolExecution) -> Result<String> {
+    match execution {
+        ToolExecution::Text(text) => project_text(text),
+        ToolExecution::Json(value) => project_json(value),
+        ToolExecution::ApplicationError { kind, content } => {
+            let detail = project_content(content)?;
+            Err(ProjectedToolError::new(kind, detail).into())
+        }
+    }
+}
+
+fn project_failure(failure: ToolFailure) -> Result<String> {
+    let detail = project_text(format!("{:#}", failure.error))?;
+    Err(ProjectedToolError::new(failure.kind, detail).into())
+}
+
+fn project_content(content: ToolContent) -> Result<String> {
+    match content {
+        ToolContent::Json(value) => project_json(value),
+    }
+}
+
+fn project_text(text: String) -> Result<String> {
+    redaction::text(&text).map_err(|_| ProjectedToolError::output_withheld().into())
+}
+
+fn project_json(value: Value) -> Result<String> {
+    redaction::json(value).map_err(|_| ProjectedToolError::output_withheld().into())
+}
+
 fn protected_component(value: &str, writing: bool) -> bool {
     let name = value.to_ascii_lowercase();
     matches!(
@@ -529,65 +655,18 @@ fn spec(name: &str, description: &str, fields: &[&str], required: &[&str]) -> To
 }
 
 #[cfg(unix)]
-pub(crate) struct ProcessGroup(pub(crate) Option<u32>);
-
-#[cfg(unix)]
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0 {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-    }
-}
-
-#[cfg(unix)]
 async fn shell(
-    root_guard: &Directory,
-    root: &Path,
+    registry: &ShellRegistry,
+    root_guard: Arc<Directory>,
+    root: PathBuf,
     command: &str,
     duration: Duration,
 ) -> Result<String> {
-    ensure!(!command.trim().is_empty(), "shell command is empty");
-    let environment = unix_shell_environment(std::env::vars_os());
-    let mut process = Command::new("sh");
-    process
-        .arg("-c")
-        .arg(command)
-        .env_clear()
-        .envs(environment)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    process.process_group(0);
-    root_guard.revalidate()?;
-    let mut child = process.spawn().context("cannot start shell")?;
-    let _group = ProcessGroup(child.id());
-    let stdout = child.stdout.take().context("missing shell stdout")?;
-    let stderr = child.stderr.take().context("missing shell stderr")?;
-    let operation = async {
-        let read = async |reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>| -> Result<Vec<u8>> {
-            let mut bytes = Vec::new();
-            reader
-                .take((MAX_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .await?;
-            ensure!(bytes.len() <= MAX_BYTES, "shell output exceeds 2 MiB limit");
-            Ok(bytes)
-        };
-        let (out, err) = tokio::try_join!(read(Box::new(stdout)), read(Box::new(stderr)))?;
-        let status = child.wait().await?;
-        Ok::<_, anyhow::Error>(json!({"exit_code":status.code(),"success":status.success(),"stdout":String::from_utf8_lossy(&out),"stderr":String::from_utf8_lossy(&err)}).to_string())
-    };
-    timeout(duration, operation)
+    registry
+        .execute(root_guard, root, command.into(), duration, || {
+            unix_shell_environment(std::env::vars_os())
+        })
         .await
-        .context("shell timed out; process group terminated")?
 }
 
 #[cfg(windows)]
@@ -743,7 +822,10 @@ impl ShellCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::drain_bounded;
+    use crate::test_support::{HttpFixture, Reply, drain_bounded};
+    #[cfg(unix)]
+    use crate::test_support::{StdioFixture, Step};
+    use kuru_core::McpConfig;
 
     #[tokio::test]
     async fn cancelled_shell_capture_preserves_received_bytes_until_actual_eof() {
@@ -905,6 +987,326 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_projection_redacts_results_without_altering_files_or_arguments() {
+        const SECRET: &str = "sk-abcdefghijklmnop";
+        const MARKER: &str = "[REDACTED:recognized-secret]";
+        let root = tempfile::tempdir().unwrap();
+        let filename = "read.txt";
+        let source = format!("ordinary {SECRET} retained on disk");
+        std::fs::write(root.path().join(filename), &source).unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                allow_write: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let read = host
+            .execute("file_read", json!({"path":&filename}))
+            .await
+            .unwrap();
+        assert!(read.contains(MARKER));
+        assert!(!read.contains(SECRET));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(filename)).unwrap(),
+            source
+        );
+
+        let written = "write.txt";
+        host.execute("file_write", json!({"path":&written,"content":&source}))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(written)).unwrap(),
+            source
+        );
+
+        let listing = host.execute("file_list", json!({})).await.unwrap();
+        let listing: Value = serde_json::from_str(&listing).unwrap();
+        assert_eq!(listing[filename], "file");
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_read_accepts_exactly_the_existing_byte_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let contents = "x".repeat(MAX_BYTES);
+        std::fs::write(root.path().join("at-limit"), &contents).unwrap();
+        let host = ToolHost::new(root.path(), &Config::default()).unwrap();
+        assert_eq!(
+            host.execute("file_read", json!({"path":"at-limit"}))
+                .await
+                .unwrap(),
+            contents
+        );
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_file_failure_withholds_original_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("bad"), b"sk-abcdefghijklmnop\xff").unwrap();
+        let host = ToolHost::new(root.path(), &Config::default()).unwrap();
+        let error = host
+            .execute("file_read", json!({"path":"bad"}))
+            .await
+            .unwrap_err();
+        for rendered in [
+            error.to_string(),
+            format!("{error:#}"),
+            format!("{error:?}"),
+        ] {
+            assert!(rendered.contains("file is not UTF-8"));
+            assert!(!rendered.contains("sk-abcdefghijklmnop"));
+        }
+        assert_eq!(error.chain().count(), 1);
+        assert!(error.downcast_ref::<std::string::FromUtf8Error>().is_none());
+        host.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn projected_tool_failures_do_not_retain_raw_error_sources() {
+        const SECRET: &str = "sk-abcdefghijklmnop";
+        let error =
+            anyhow::anyhow!("outer failure {SECRET}").context(format!("inner failure {SECRET}"));
+        let error = project_failure(ToolFailure::built_in(error)).unwrap_err();
+        for rendered in [
+            error.to_string(),
+            format!("{error:#}"),
+            format!("{error:?}"),
+            error
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" | "),
+        ] {
+            assert!(rendered.contains("[REDACTED:recognized-secret]"));
+            assert!(!rendered.contains(SECRET));
+        }
+        assert_eq!(error.chain().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn toolhost_stdio_mcp_projects_application_success_and_protocol_results() {
+        const SECRET: &str = "sk-abcdefghijklmnop";
+        let peer = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"remote","inputSchema":{"type":"object"}}]}}),
+            ),
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":3,"result":{"isError":true,"content":[{"type":"text","text":format!("denied {SECRET}")}]}}),
+            ),
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":format!("usable {SECRET}")}]}}),
+            ),
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":5,"error":{"code":-32000,"message":format!("failed {SECRET}")}}),
+            ),
+            Step::Eof,
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                mcp: [(
+                    "fixture".into(),
+                    McpConfig {
+                        command: Some(peer.command().into()),
+                        args: vec![],
+                        url: None,
+                        env: BTreeMap::new(),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let name = host
+            .specs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|spec| spec.description.starts_with("MCP fixture/remote:"))
+            .expect("missing discovered fixture MCP tool")
+            .name;
+        let application = host.execute(&name, json!({})).await.unwrap_err();
+        for rendered in [
+            application.to_string(),
+            format!("{application:#}"),
+            format!("{application:?}"),
+        ] {
+            assert!(rendered.contains("denied"));
+            assert!(rendered.contains("[REDACTED:recognized-secret]"));
+            assert!(!rendered.contains(SECRET));
+        }
+        let success = host.execute(&name, json!({})).await.unwrap();
+        assert!(success.contains("[REDACTED:recognized-secret]"));
+        assert!(!success.contains(SECRET));
+        let failure = host.execute(&name, json!({})).await.unwrap_err();
+        assert!(failure.to_string().contains("MCP tool call failed"));
+        assert!(failure.to_string().contains("failed"));
+        assert!(failure.to_string().contains("[REDACTED:recognized-secret]"));
+        assert!(!format!("{failure:#} {failure:?}").contains(SECRET));
+        assert_eq!(failure.chain().count(), 1);
+        host.shutdown().await.unwrap();
+        peer.assert_completed(1);
+    }
+
+    #[tokio::test]
+    async fn toolhost_http_mcp_projects_application_success_and_protocol_results() {
+        const SECRET: &str = "sk-abcdefghijklmnop";
+        let mut initialized =
+            Reply::rpc(json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}));
+        initialized.session = true;
+        let peer = HttpFixture::new(vec![
+            initialized,
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[{"name":"remote","description":"fixture","inputSchema":{"type":"object"}}]})),
+            Reply::rpc(json!({"isError":true,"content":[{"type":"text","text":format!("denied {SECRET}")}]})),
+            Reply::rpc(json!({"content":[{"type":"text","text":format!("usable {SECRET}")}],"structuredContent":{"nested":{"value":7}}})),
+            Reply::json(json!({"id":"$ID","error":{"code":-32000,"message":format!("failed {SECRET}")}})),
+            Reply::json(json!({})),
+        ]).await;
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                mcp: [(
+                    "http".into(),
+                    McpConfig {
+                        command: None,
+                        args: vec![],
+                        url: Some(peer.url.clone()),
+                        env: BTreeMap::new(),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let name = host
+            .specs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|spec| spec.description.starts_with("MCP http/remote:"))
+            .expect("missing discovered HTTP MCP tool")
+            .name;
+        let application = host
+            .execute(&name, json!({"input": SECRET}))
+            .await
+            .unwrap_err();
+        for rendered in [
+            application.to_string(),
+            format!("{application:#}"),
+            format!("{application:?}"),
+        ] {
+            assert!(rendered.contains("denied"));
+            assert!(rendered.contains("[REDACTED:recognized-secret]"));
+            assert!(!rendered.contains(SECRET));
+        }
+        let success: Value =
+            serde_json::from_str(&host.execute(&name, json!({})).await.unwrap()).unwrap();
+        assert_eq!(success["structuredContent"]["nested"]["value"], 7);
+        assert_eq!(
+            success["content"][0]["text"],
+            "usable [REDACTED:recognized-secret]"
+        );
+        let failure = host.execute(&name, json!({})).await.unwrap_err();
+        for rendered in [
+            failure.to_string(),
+            format!("{failure:#}"),
+            format!("{failure:?}"),
+        ] {
+            assert!(rendered.contains("failed"));
+            assert!(rendered.contains("[REDACTED:recognized-secret]"));
+            assert!(!rendered.contains(SECRET));
+        }
+        assert_eq!(failure.chain().count(), 1);
+        host.shutdown().await.unwrap();
+        let requests = peer.requests.lock().await;
+        assert_eq!(requests.len(), 7);
+        assert_eq!(requests[3].body["method"], "tools/call");
+        assert_eq!(
+            requests[3].body["params"]["arguments"],
+            json!({"input": SECRET})
+        );
+    }
+
+    #[tokio::test]
+    async fn file_list_keeps_its_independent_entry_cap_above_result_limit() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..10_000 {
+            let name = format!("{index:05}-{}", "x".repeat(238));
+            std::fs::write(root.path().join(name), []).unwrap();
+        }
+        let host = ToolHost::new(root.path(), &Config::default()).unwrap();
+        let listed = host.execute("file_list", json!({})).await.unwrap();
+        assert!(listed.len() > MAX_BYTES);
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        assert_eq!(listed.as_object().unwrap().len(), 10_000);
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn toolhost_http_mcp_accepts_an_exact_wire_body_limit() {
+        let mut initialized =
+            Reply::rpc(json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}));
+        initialized.session = true;
+        let empty = Reply::rpc(json!({"content":[{"type":"text","text":""}]}));
+        let payload = "x".repeat(MAX_BYTES - empty.body.replace("\"$ID\"", "3").len());
+        let reply = Reply::rpc(json!({"content":[{"type":"text","text":payload}]}));
+        assert_eq!(reply.body.replace("\"$ID\"", "3").len(), MAX_BYTES);
+        let peer = HttpFixture::new(vec![initialized, Reply::json(json!({})), Reply::rpc(json!({"tools":[{"name":"remote","description":"fixture","inputSchema":{"type":"object"}}]})), reply, Reply::json(json!({}))]).await;
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                mcp: [(
+                    "http".into(),
+                    McpConfig {
+                        command: None,
+                        args: vec![],
+                        url: Some(peer.url.clone()),
+                        env: BTreeMap::new(),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let name = host
+            .specs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|spec| spec.description.starts_with("MCP http/remote:"))
+            .unwrap()
+            .name;
+        let value: Value =
+            serde_json::from_str(&host.execute(&name, json!({})).await.unwrap()).unwrap();
+        host.shutdown().await.unwrap();
+        let requests = peer.requests.lock().await;
+        assert_eq!(requests[3].body["id"], 3);
+        assert_eq!(value, json!({"content":[{"type":"text","text":payload}]}));
+    }
+
+    #[tokio::test]
     async fn permissions_and_size_limits_reject_before_mutation() {
         let root = tempfile::tempdir().unwrap();
         let read_only = ToolHost::new(root.path(), &Config::default()).unwrap();
@@ -1012,16 +1414,18 @@ mod tests {
     #[tokio::test]
     async fn shell_returns_status_bounds_output_and_terminates_on_timeout() {
         #[cfg(unix)]
-        let (command, stall, flood) = (
+        let (command, stall, flood, stderr_flood) = (
             "printf hello; printf problem >&2; exit 7",
             "sleep 5",
             "yes output",
+            "yes problem >&2",
         );
         #[cfg(windows)]
-        let (command, stall, flood) = (
+        let (command, stall, flood, stderr_flood) = (
             "[Console]::Out.Write('hello'); [Console]::Error.Write('problem'); exit 7",
             "Start-Sleep -Seconds 5",
             "[Console]::Out.Write('x' * 2097153)",
+            "[Console]::Error.Write('x' * 2097153)",
         );
         let root = tempfile::tempdir().unwrap();
         let host = ToolHost::new(
@@ -1072,6 +1476,397 @@ mod tests {
                 .to_string()
                 .contains("limit")
         );
+        assert!(
+            host.execute("shell", json!({"command":stderr_flood}))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_keeps_independent_near_limit_stdout_and_stderr() {
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                allow_shell: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let output = host
+            .execute(
+                "shell",
+                json!({
+                    "command": "head -c 2097152 /dev/zero | tr '\\0' o; head -c 2097152 /dev/zero | tr '\\0' e >&2"
+                }),
+            )
+            .await
+            .unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["stdout"], "o".repeat(MAX_BYTES));
+        assert_eq!(output["stderr"], "e".repeat(MAX_BYTES));
+        assert!(output["success"] == true);
+        host.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_projection_redacts_both_streams_without_changing_exit_status() {
+        const SECRET: &str = "sk-abcdefghijklmnop";
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                allow_shell: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let output = host
+            .execute(
+                "shell",
+                json!({"command":format!("printf 'out {SECRET}'; printf 'err {SECRET}' >&2; exit 7")}),
+            )
+            .await
+            .unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["stdout"], "out [REDACTED:recognized-secret]");
+        assert_eq!(output["stderr"], "err [REDACTED:recognized-secret]");
+        assert_eq!(output["exit_code"], 7);
+        assert!(output["success"] == false);
+        host.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_shell_timeout_projects_a_fixed_failure_without_captured_stderr() {
+        const SECRET: &str = "sk-abcdefghijklmnop";
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("timeout-ready");
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                allow_shell: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let command = format!("printf '%s' '{SECRET}' >&2; : > timeout-ready; exec sleep 5");
+        let (ready_result, call_result) = tokio::join!(
+            timeout(Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }),
+            timeout(
+                Duration::from_secs(10),
+                host.execute(
+                    "shell",
+                    json!({
+                        "command": command,
+                        "timeout_ms": 3_000,
+                    }),
+                ),
+            )
+        );
+        let shutdown_result = timeout(Duration::from_secs(6), host.shutdown()).await;
+
+        assert!(
+            matches!(shutdown_result, Ok(Ok(()))),
+            "timed shell shutdown did not finish"
+        );
+        ready_result.expect("timed shell did not reach readiness before the bounded wait");
+        let error = call_result
+            .expect("timed shell did not return within its timeout and cleanup allowance")
+            .unwrap_err();
+        let rendered = [
+            error.to_string(),
+            format!("{error:#}"),
+            format!("{error:?}"),
+            error
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" | "),
+        ];
+        let chain_length = error.chain().count();
+
+        assert_eq!(rendered[0], "tool execution failed: shell timed out");
+        for output in rendered {
+            assert!(!output.contains(SECRET));
+            assert!(!output.contains(&command));
+        }
+        assert_eq!(chain_length, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_shell_requires_both_eof_and_root_exit_then_reaps_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                allow_shell: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let output: Value = serde_json::from_str(
+            &host
+                .execute("shell", json!({"command":"exec 1>&- 2>&-; sleep 0.15"}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(output["exit_code"], 0);
+        assert_eq!(output["stdout"], "");
+        assert_eq!(output["stderr"], "");
+
+        let output: Value = serde_json::from_str(
+            &host
+                .execute(
+                    "shell",
+                    json!({"command":"sleep 5 </dev/null >/dev/null 2>/dev/null & exit 7"}),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output["exit_code"], 7);
+        assert_eq!(output["success"], false);
+        host.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_shell_caller_loss_keeps_registered_owner_for_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("caller-ready");
+        let host = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    allow_shell: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let call = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.execute(
+                    "shell",
+                    json!({"command":": > caller-ready; exec sleep 5", "timeout_ms":120_000}),
+                )
+                .await
+            }
+        });
+        timeout(Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell caller did not reach readiness");
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(6), host.shutdown())
+            .await
+            .expect("registered shell owner did not finish bounded shutdown")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_shutdown_cancels_starting_and_active_shells_and_closes_mcp() {
+        let peer = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})),
+            Step::Eof,
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let active_ready = root.path().join("active-ready");
+        let host = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    allow_shell: true,
+                    mcp: [(
+                        "fixture".into(),
+                        McpConfig {
+                            command: Some(peer.command().into()),
+                            args: vec![],
+                            url: None,
+                            env: BTreeMap::new(),
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(
+            host.specs()
+                .await
+                .unwrap()
+                .iter()
+                .any(|spec| spec.name == "shell")
+        );
+        let starting_gate = host.test_shells().test_arm_start_gate();
+        let starting = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.execute(
+                    "shell",
+                    json!({"command":": > started-after-shutdown", "timeout_ms":120_000}),
+                )
+                .await
+            }
+        });
+        timeout(Duration::from_secs(1), async {
+            while host.test_shells().test_owner_count() != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("starting shell was not registered");
+        timeout(Duration::from_secs(1), async {
+            while !starting_gate.entered() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("starting shell did not reach its controlled gate");
+        let active = tokio::spawn({
+            let host = host.clone();
+            async move {
+                host.execute(
+                    "shell",
+                    json!({"command":": > active-ready; exec sleep 5", "timeout_ms":120_000}),
+                )
+                .await
+            }
+        });
+        let active_ready_result = timeout(Duration::from_secs(2), async {
+            while !active_ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if active_ready_result.is_err() {
+            let active_result = timeout(Duration::from_millis(100), active).await;
+            starting_gate.release();
+            let _ = host.shutdown().await;
+            panic!("active shell did not reach readiness: {active_result:?}");
+        }
+        let shutdown = tokio::spawn({
+            let host = host.clone();
+            async move { host.shutdown().await }
+        });
+        timeout(Duration::from_secs(1), async {
+            while !host.test_shells().test_is_closing() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown did not close shell registration");
+        let rejected = host
+            .execute("shell", json!({"command":": > launched-after-shutdown"}))
+            .await
+            .unwrap_err();
+        assert!(rejected.to_string().contains("shutting down"));
+        starting_gate.release();
+        timeout(Duration::from_secs(6), shutdown)
+            .await
+            .expect("combined shell/MCP shutdown did not finish")
+            .unwrap()
+            .unwrap();
+        assert!(
+            starting
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert!(
+            active
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        peer.assert_completed(1);
+        assert!(!root.path().join("started-after-shutdown").exists());
+        assert!(!root.path().join("launched-after-shutdown").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_outlives_a_destroyed_parent_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("worker-ready");
+        let host = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    allow_shell: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let root = root.path().to_path_buf();
+            runtime.block_on(async {
+                let _call = tokio::spawn({
+                    let host = host.clone();
+                    async move {
+                        host.execute(
+                            "shell",
+                            json!({"command":": > worker-ready; exec sleep 5", "timeout_ms":120_000}),
+                        )
+                        .await
+                    }
+                });
+                timeout(Duration::from_secs(2), async {
+                    while !root.join("worker-ready").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("shell worker did not reach readiness before runtime destruction");
+            });
+        }
+        assert!(ready.exists());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            timeout(Duration::from_secs(6), host.shutdown())
+                .await
+                .expect("retained worker did not finish after parent runtime destruction")
+                .unwrap();
+        });
     }
 
     #[cfg(unix)]

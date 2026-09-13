@@ -7,6 +7,9 @@ pub mod provision;
 pub mod server;
 mod store;
 
-pub use store::{Candidate, MemoryStatus, MemoryStore, MemoryView, OpenOptions, Revision};
+pub use store::{
+    Candidate, MemoryStatus, MemoryStore, MemoryView, OpenOptions, Revision, StoredNote,
+};
 
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
