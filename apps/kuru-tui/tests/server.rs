@@ -24,6 +24,7 @@ fn expected_startup_line(line: &str) -> bool {
         "Memory: waiting for project ownership…"
             | "Memory: waiting for verified runtime cache…"
             | "Memory: verifying cached runtime…"
+            | "Memory: extracting embedded runtime…"
             | "Memory: checking runtime version…"
             | "Memory: preparing database…"
             | "Memory: opening database…"

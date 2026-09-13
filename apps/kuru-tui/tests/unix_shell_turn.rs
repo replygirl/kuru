@@ -364,8 +364,28 @@ fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
     for expected in [
         "Memory: waiting for project ownership…",
         "Memory: waiting for verified runtime cache…",
-        "Memory: verifying cached runtime…",
-        "Memory: checking runtime version…",
+    ] {
+        ensure!(
+            lines.next() == Some(expected),
+            "normal kuru run changed startup frame {expected:?}: {stderr:?}"
+        );
+    }
+    let runtime = lines
+        .next()
+        .context("normal kuru run omitted runtime-version startup frame")?;
+    ensure!(
+        runtime == "Memory: verifying cached runtime…"
+            || runtime == "Memory: extracting embedded runtime…",
+        "normal kuru run changed cache startup frame: {stderr:?}"
+    );
+    let next = lines
+        .next()
+        .context("normal kuru run omitted runtime-version startup frame")?;
+    ensure!(
+        next == "Memory: checking runtime version…",
+        "normal kuru run changed runtime-version startup frame: {stderr:?}"
+    );
+    for expected in [
         "Memory: preparing database…",
         "Memory: opening database…",
         "Memory: ready.",
