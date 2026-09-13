@@ -19,6 +19,16 @@ another application's tokens are never imported. Session revisions prevent a
 late login or refresh from overwriting logout or a newer sign-in. An uncertain
 refresh outcome requires sign-in again rather than replaying the token exchange.
 
+The subscription route is a fixed compatibility dependency: client
+`app_EMoamEEZ73f0CkXaXp7hrann`, issuer `https://auth.openai.com`, backend
+`https://chatgpt.com/backend-api/codex`, and catalog `client_version=0.154.0`.
+Its browser/token and device paths are fixed connector literals. Kuru's
+loopback auth fixtures and subscription fixtures independently assert those
+wire values; update the literal and the applicable fixture together. This is
+not a public OpenAI support promise for Kuru, and it cannot detect an upstream
+service change. `kuru logout` removes only Kuru's local credentials; no remote
+revocation endpoint is established by this contract.
+
 Subscription requests use the fixed ChatGPT backend with bearer and account
 headers. Kuru reads its model catalog, preserving advertised model IDs and
 reasoning efforts. Responses stream over SSE with `store` disabled; a truncated

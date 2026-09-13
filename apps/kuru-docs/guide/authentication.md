@@ -49,6 +49,29 @@ Kuru's ChatGPT credentials; an API key supplied through the environment remains
 unchanged. Sessions refresh when needed. If login or refresh fails, follow the
 reported sign-in guidance; Kuru does not switch providers automatically.
 
+## Subscription compatibility
+
+`codex` is Kuru's native compatibility route for a ChatGPT subscription. It
+uses client `app_EMoamEEZ73f0CkXaXp7hrann`, issuer `https://auth.openai.com`,
+the fixed subscription base `https://chatgpt.com/backend-api/codex`, and catalog
+compatibility version `0.154.0`. Browser OAuth uses `/oauth/authorize` and
+`/oauth/token`; device authorization uses the issuer's `/api/accounts/deviceauth`
+paths. These are fixed connector values, not configuration options or a public
+OpenAI contract for Kuru, so availability can change or stop working.
+
+`responses` remains the separate, explicit API-key route. It alone honors
+`api_base` and `api_key_env`; Kuru never sends a ChatGPT session to that
+endpoint. `kuru logout` removes Kuru's local ChatGPT credentials only. No
+remote OAuth-revocation endpoint is established for this route, so logout does
+not claim to revoke a remote grant.
+
+When this compatibility contract changes, update the connector literals and
+their independent loopback assertions together: `auth/tests.rs` covers browser
+and device OAuth paths, and `providers/subscription_tests.rs` covers the fixed
+subscription base and catalog version. Run `kuru auth` and `kuru models` to
+inspect local status and the current catalog; a user-participating live check is
+separate from these deterministic tests.
+
 For existing configurations, remove `codex_command`; it no longer selects an
 external executable. Keep `provider = "codex"` and run `kuru login` to establish
 Kuru's own session.
