@@ -2337,6 +2337,348 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn windows_shell_projection_source(root: &Path, case: &str) -> String {
+        let home = root.join("home");
+        let temporary = root.join("temporary");
+        let commands = root.join("commands");
+        let system = kuru_platform::windows::process::system_directory().unwrap();
+        let windows = system.parent().unwrap();
+        let expected_path = std::env::join_paths([commands.as_path(), system.as_path()])
+            .expect("fixture paths must form a Windows PATH");
+        let powershell_literal =
+            |value: &OsStr| format!("'{}'", value.to_string_lossy().replace('\'', "''"));
+        let expected_path = powershell_literal(&expected_path);
+        let expected_home = powershell_literal(home.as_os_str());
+        let expected_temporary = powershell_literal(temporary.as_os_str());
+        let expected_windows = powershell_literal(windows.as_os_str());
+        let expected_comspec = powershell_literal(system.join("cmd.exe").as_os_str());
+        let expected_stage = powershell_literal(
+            temporary
+                .join(format!("shell-stage-{case}.txt"))
+                .as_os_str(),
+        );
+        format!(
+            r#"
+[IO.File]::AppendAllText({expected_stage}, "entered`n")
+$stage = {expected_stage}
+$expectedPath = {expected_path}
+$expectedHome = {expected_home}
+$expectedTemporary = {expected_temporary}
+$expectedWindows = {expected_windows}
+$expectedComSpec = {expected_comspec}
+# Kuru supplies the exact inherited value or fallback. Stock PowerShell then
+# appends .CPL during engine construction when that extension is absent.
+$expectedPathext = if ($env:NO_COLOR -eq 'inherited') {{ '.EXE;.CMD;.CPL' }} else {{ '.COM;.EXE;.BAT;.CMD;.CPL' }}
+[IO.File]::AppendAllText($stage, "before-join-path`n")
+$homePath = Join-Path $env:USERPROFILE 'shell-home.txt'
+[IO.File]::AppendAllText($stage, "after-join-path`n")
+[IO.File]::WriteAllText($homePath, 'home')
+$temporaryPath = Join-Path $env:TEMP 'shell-temp.txt'
+[IO.File]::WriteAllText($temporaryPath, 'temp')
+[IO.File]::AppendAllText($stage, "home-temp-written`n")
+[IO.File]::AppendAllText($stage, "before-where`n")
+$where = & where.exe cmd.exe
+$whereOk = $LASTEXITCODE -eq 0
+[IO.File]::AppendAllText($stage, "after-where`n")
+[IO.File]::AppendAllText($stage, "before-probe`n")
+$probe = & probe
+[IO.File]::AppendAllText($stage, "after-probe`n")
+[IO.File]::AppendAllText($stage, "before-checks`n")
+$checks = [ordered]@{{
+    PATH = [string]::Equals($env:PATH, $expectedPath, [System.StringComparison]::Ordinal)
+    HOME = [string]::Equals($env:HOME, $expectedHome, [System.StringComparison]::Ordinal)
+    USERPROFILE = [string]::Equals($env:USERPROFILE, $expectedHome, [System.StringComparison]::Ordinal)
+    TEMP = [string]::Equals($env:TEMP, $expectedTemporary, [System.StringComparison]::Ordinal)
+    PATHEXT = [string]::Equals($env:PATHEXT, $expectedPathext, [System.StringComparison]::Ordinal)
+    SystemRoot = [string]::Equals($env:SystemRoot, $expectedWindows, [System.StringComparison]::Ordinal)
+    WINDIR = [string]::Equals($env:WINDIR, $expectedWindows, [System.StringComparison]::Ordinal)
+    ComSpec = [string]::Equals($env:ComSpec, $expectedComSpec, [System.StringComparison]::Ordinal)
+    OPENAI_API_KEY_absent = -not (Test-Path Env:OPENAI_API_KEY)
+    HTTP_PROXY_absent = -not (Test-Path Env:HTTP_PROXY)
+    PSModulePath_reconstructed = -not [string]::IsNullOrEmpty($env:PSModulePath)
+    PSModulePath_hostile_absent = $env:PSModulePath -notlike '*fake-modules*'
+    fixture_child_absent = -not (Test-Path Env:KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_CHILD)
+    LLVM_PROFILE_FILE_absent = -not (Test-Path Env:LLVM_PROFILE_FILE)
+    stock_cmdlet = (Get-Command Get-ChildItem -ErrorAction Stop).CommandType -eq 'Cmdlet'
+    where_cmd = $whereOk
+    probe_cmd = $probe -contains 'cmd-ok'
+}}
+[IO.File]::AppendAllText($stage, "after-checks`n")
+$failed = @()
+foreach ($check in $checks.GetEnumerator()) {{
+    if (-not $check.Value) {{ $failed += [string]$check.Key }}
+}}
+if ($failed.Count -eq 0) {{
+    [Console]::Out.Write('ok')
+}} else {{
+    throw ('shell compatibility fixture conditions failed: ' + [string]::Join(',', $failed))
+}}
+"#
+        )
+    }
+
+    #[cfg(windows)]
+    fn windows_shell_projection_stages(root: &Path, case: &str) -> String {
+        let stage = root
+            .join("temporary")
+            .join(format!("shell-stage-{case}.txt"));
+        let mut bytes = Vec::new();
+        match std::fs::File::open(stage) {
+            Ok(file) => {
+                let mut limited = std::io::Read::take(file, 4096);
+                match std::io::Read::read_to_end(&mut limited, &mut bytes) {
+                    Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(error) => format!("<unreadable: {error}>"),
+                }
+            }
+            Err(error) => format!("<unavailable: {error}>"),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn windows_shell_projection_failure_controls(
+        inherited: &[(OsString, OsString)],
+        case: &str,
+    ) -> Vec<String> {
+        use base64::Engine;
+        use kuru_platform::windows::process::{
+            Console, Stdio, configured_command, system_directory,
+        };
+
+        let mut results = Vec::new();
+        for (name, encoded, console) in [
+            ("encoded-inherit", true, Console::Inherit),
+            ("command-inherit", false, Console::Inherit),
+            ("encoded-private-hidden", true, Console::PrivateHidden),
+        ] {
+            let root = match tempfile::tempdir() {
+                Ok(root) => root,
+                Err(_) => {
+                    results.push(format!("{name}: private-root-error"));
+                    continue;
+                }
+            };
+            let commands = root.path().join("commands");
+            let home = root.path().join("home");
+            let temporary = root.path().join("temporary");
+            let local = root.path().join("local");
+            let roaming = root.path().join("roaming");
+            if [&commands, &home, &temporary, &local, &roaming]
+                .into_iter()
+                .any(|path| std::fs::create_dir(path).is_err())
+                || std::fs::write(commands.join("probe.cmd"), "@echo cmd-ok\r\n").is_err()
+            {
+                results.push(format!("{name}: private-root-setup-error"));
+                continue;
+            }
+            let system = match system_directory() {
+                Ok(system) => system,
+                Err(_) => {
+                    results.push(format!("{name}: system-directory-error"));
+                    continue;
+                }
+            };
+            let path = match std::env::join_paths([commands.as_path(), system.as_path()]) {
+                Ok(path) => path,
+                Err(_) => {
+                    results.push(format!("{name}: path-setup-error"));
+                    continue;
+                }
+            };
+            let mut source_environment: Vec<_> = inherited
+                .iter()
+                .filter(|(key, _)| {
+                    ![
+                        "PATH",
+                        "HOME",
+                        "USERPROFILE",
+                        "LOCALAPPDATA",
+                        "APPDATA",
+                        "TEMP",
+                        "TMP",
+                    ]
+                    .iter()
+                    .any(|name| {
+                        kuru_platform::windows::process::environment_key_eq(key, OsStr::new(name))
+                    })
+                })
+                .cloned()
+                .collect();
+            source_environment.extend([
+                ("pAtH".into(), path),
+                ("HOME".into(), home.into()),
+                ("userprofile".into(), root.path().join("home").into()),
+                ("LOCALAPPDATA".into(), local.into()),
+                ("APPDATA".into(), roaming.into()),
+                ("TEMP".into(), temporary.into()),
+                ("TMP".into(), root.path().join("temporary").into()),
+            ]);
+            let environment = match windows_shell_environment(source_environment, &system) {
+                Ok(environment) => environment,
+                Err(_) => {
+                    results.push(format!("{name}: projected-environment-error"));
+                    continue;
+                }
+            };
+            let command = windows_shell_projection_source(root.path(), case);
+            let source = format!(
+                "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
+            );
+            let mut args: Vec<OsString> = [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-OutputFormat",
+                "Text",
+            ]
+            .map(Into::into)
+            .into();
+            if encoded {
+                let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                args.push("-EncodedCommand".into());
+                args.push(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(bytes)
+                        .into(),
+                );
+            } else {
+                args.push("-Command".into());
+                args.push(source.into());
+            }
+            let program = system.join("WindowsPowerShell/v1.0/powershell.exe");
+            let mut spec =
+                match configured_command(program.as_os_str(), &args, root.path(), environment) {
+                    Ok(spec) => spec,
+                    Err(_) => {
+                        results.push(format!("{name}: configured-command-error"));
+                        continue;
+                    }
+                };
+            spec.console = console;
+            spec.stdout = Stdio::Pipe;
+            spec.stderr = Stdio::Pipe;
+            let mut child = match spec.spawn().await {
+                Ok(child) => child,
+                Err(_) => {
+                    results.push(format!("{name}: launch-error"));
+                    continue;
+                }
+            };
+            let mut stdout = match child.take_stdout() {
+                Some(stdout) => stdout,
+                None => {
+                    let requested = child.terminate();
+                    let stderr_close = match child.take_stderr() {
+                        Some(mut stderr) => stderr.close(Duration::from_secs(5)).await.is_ok(),
+                        None => true,
+                    };
+                    let reap = child.wait(Duration::from_secs(5)).await;
+                    if stderr_close && reap.is_ok() {
+                        results.push(format!(
+                            "{name}: missing-stdout, terminate={}",
+                            requested.is_ok()
+                        ));
+                    } else {
+                        let preserved = root.keep();
+                        results.push(format!(
+                            "{name}: missing-stdout, terminate={}; cleanup-unconfirmed; preserved={}",
+                            requested.is_ok(),
+                            preserved.display()
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let mut stderr = match child.take_stderr() {
+                Some(stderr) => stderr,
+                None => {
+                    let requested = child.terminate();
+                    let stdout_close = stdout.close(Duration::from_secs(5)).await;
+                    let reap = child.wait(Duration::from_secs(5)).await;
+                    if stdout_close.is_ok() && reap.is_ok() {
+                        results.push(format!(
+                            "{name}: missing-stderr, terminate={}",
+                            requested.is_ok()
+                        ));
+                    } else {
+                        let preserved = root.keep();
+                        results.push(format!(
+                            "{name}: missing-stderr, terminate={}; cleanup-unconfirmed; preserved={}",
+                            requested.is_ok(),
+                            preserved.display()
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let outcome = timeout(Duration::from_secs(30), async {
+                let (stdout_truncated, stderr_truncated, status) = tokio::join!(
+                    drain_bounded(&mut stdout, &mut out),
+                    drain_bounded(&mut stderr, &mut err),
+                    child.wait(Duration::from_secs(30)),
+                );
+                Ok::<_, std::io::Error>((stdout_truncated?, stderr_truncated?, status?))
+            })
+            .await;
+            let (state, cleanup_confirmed) = match outcome {
+                Ok(Ok((stdout_truncated, stderr_truncated, status))) => {
+                    let (stdout_close, stderr_close) = tokio::join!(
+                        stdout.close(Duration::from_secs(5)),
+                        stderr.close(Duration::from_secs(5)),
+                    );
+                    (
+                        format!(
+                            "status={:?}, stdout={}B, stderr={}B, truncated={}",
+                            status.code(),
+                            out.len(),
+                            err.len(),
+                            stdout_truncated || stderr_truncated
+                        ),
+                        stdout_close.is_ok() && stderr_close.is_ok(),
+                    )
+                }
+                Ok(Err(_)) => {
+                    let requested = child.terminate();
+                    let (stdout_close, stderr_close, reap) = tokio::join!(
+                        stdout.close(Duration::from_secs(5)),
+                        stderr.close(Duration::from_secs(5)),
+                        child.wait(Duration::from_secs(5)),
+                    );
+                    (
+                        format!("operation-error, terminate={}", requested.is_ok()),
+                        stdout_close.is_ok() && stderr_close.is_ok() && reap.is_ok(),
+                    )
+                }
+                Err(_) => {
+                    let requested = child.terminate();
+                    let (stdout_close, stderr_close, reap) = tokio::join!(
+                        stdout.close(Duration::from_secs(5)),
+                        stderr.close(Duration::from_secs(5)),
+                        child.wait(Duration::from_secs(5)),
+                    );
+                    (
+                        format!("timed-out, terminate={}", requested.is_ok()),
+                        stdout_close.is_ok() && stderr_close.is_ok() && reap.is_ok(),
+                    )
+                }
+            };
+            let stages = windows_shell_projection_stages(root.path(), case);
+            if cleanup_confirmed {
+                results.push(format!("{name}: {state}; stages={stages:?}"));
+            } else {
+                let preserved = root.keep();
+                results.push(format!(
+                    "{name}: {state}; cleanup-unconfirmed; preserved={}; stages={stages:?}",
+                    preserved.display()
+                ));
+            }
+        }
+        results
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn isolated_toolhost_shell_receives_only_compatibility_environment() {
@@ -2521,37 +2863,12 @@ mod tests {
             let root = PathBuf::from(std::env::var_os(ROOT).expect("missing test root"));
             let home = root.join("home");
             let temporary = root.join("temporary");
-            let commands = root.join("commands");
-            let system = system_directory().unwrap();
-            let windows = system.parent().unwrap();
-            let expected_path = std::env::join_paths([commands.as_path(), system.as_path()])
-                .expect("fixture paths must form a Windows PATH");
-            let powershell_literal =
-                |value: &OsStr| format!("'{}'", value.to_string_lossy().replace('\'', "''"));
-            let expected_path = powershell_literal(&expected_path);
-            let expected_home = powershell_literal(home.as_os_str());
-            let expected_temporary = powershell_literal(temporary.as_os_str());
-            let expected_windows = powershell_literal(windows.as_os_str());
-            let expected_comspec = powershell_literal(system.join("cmd.exe").as_os_str());
-            let stage = temporary.join(match std::env::var("NO_COLOR").as_deref() {
-                Ok("inherited") => "shell-stage-inherited.txt",
-                Ok("fallback") => "shell-stage-fallback.txt",
+            let case = match std::env::var("NO_COLOR").as_deref() {
+                Ok("inherited") => "inherited",
+                Ok("fallback") => "fallback",
                 value => panic!("unexpected Windows shell fixture case: {value:?}"),
-            });
-            let expected_stage = powershell_literal(stage.as_os_str());
-            let stage_trace = || {
-                let mut bytes = Vec::new();
-                match std::fs::File::open(&stage) {
-                    Ok(file) => {
-                        let mut limited = std::io::Read::take(file, 4096);
-                        match std::io::Read::read_to_end(&mut limited, &mut bytes) {
-                            Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
-                            Err(error) => format!("<unreadable: {error}>"),
-                        }
-                    }
-                    Err(error) => format!("<unavailable: {error}>"),
-                }
             };
+            let stage_trace = || windows_shell_projection_stages(&root, case);
             let host = ToolHost::new(
                 &root,
                 &Config {
@@ -2560,60 +2877,7 @@ mod tests {
                 },
             )
             .unwrap();
-            let shell = format!(
-                r#"
-[IO.File]::AppendAllText({expected_stage}, "entered`n")
-$stage = {expected_stage}
-$expectedPath = {expected_path}
-$expectedHome = {expected_home}
-$expectedTemporary = {expected_temporary}
-$expectedWindows = {expected_windows}
-$expectedComSpec = {expected_comspec}
-# Kuru supplies the exact inherited value or fallback. Stock PowerShell then
-# appends .CPL during engine construction when that extension is absent.
-$expectedPathext = if ($env:NO_COLOR -eq 'inherited') {{ '.EXE;.CMD;.CPL' }} else {{ '.COM;.EXE;.BAT;.CMD;.CPL' }}
-[IO.File]::WriteAllText((Join-Path $env:USERPROFILE 'shell-home.txt'), 'home')
-[IO.File]::WriteAllText((Join-Path $env:TEMP 'shell-temp.txt'), 'temp')
-[IO.File]::AppendAllText($stage, "home-temp-written`n")
-[IO.File]::AppendAllText($stage, "before-where`n")
-$where = & where.exe cmd.exe
-$whereOk = $LASTEXITCODE -eq 0
-[IO.File]::AppendAllText($stage, "after-where`n")
-[IO.File]::AppendAllText($stage, "before-probe`n")
-$probe = & probe
-[IO.File]::AppendAllText($stage, "after-probe`n")
-[IO.File]::AppendAllText($stage, "before-checks`n")
-$checks = [ordered]@{{
-    PATH = [string]::Equals($env:PATH, $expectedPath, [System.StringComparison]::Ordinal)
-    HOME = [string]::Equals($env:HOME, $expectedHome, [System.StringComparison]::Ordinal)
-    USERPROFILE = [string]::Equals($env:USERPROFILE, $expectedHome, [System.StringComparison]::Ordinal)
-    TEMP = [string]::Equals($env:TEMP, $expectedTemporary, [System.StringComparison]::Ordinal)
-    PATHEXT = [string]::Equals($env:PATHEXT, $expectedPathext, [System.StringComparison]::Ordinal)
-    SystemRoot = [string]::Equals($env:SystemRoot, $expectedWindows, [System.StringComparison]::Ordinal)
-    WINDIR = [string]::Equals($env:WINDIR, $expectedWindows, [System.StringComparison]::Ordinal)
-    ComSpec = [string]::Equals($env:ComSpec, $expectedComSpec, [System.StringComparison]::Ordinal)
-    OPENAI_API_KEY_absent = -not (Test-Path Env:OPENAI_API_KEY)
-    HTTP_PROXY_absent = -not (Test-Path Env:HTTP_PROXY)
-    PSModulePath_reconstructed = -not [string]::IsNullOrEmpty($env:PSModulePath)
-    PSModulePath_hostile_absent = $env:PSModulePath -notlike '*fake-modules*'
-    fixture_child_absent = -not (Test-Path Env:KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_CHILD)
-    LLVM_PROFILE_FILE_absent = -not (Test-Path Env:LLVM_PROFILE_FILE)
-    stock_cmdlet = (Get-Command Get-ChildItem -ErrorAction Stop).CommandType -eq 'Cmdlet'
-    where_cmd = $whereOk
-    probe_cmd = $probe -contains 'cmd-ok'
-}}
-[IO.File]::AppendAllText($stage, "after-checks`n")
-$failed = @()
-foreach ($check in $checks.GetEnumerator()) {{
-    if (-not $check.Value) {{ $failed += [string]$check.Key }}
-}}
-if ($failed.Count -eq 0) {{
-    [Console]::Out.Write('ok')
-}} else {{
-    throw ('shell compatibility fixture conditions failed: ' + [string]::Join(',', $failed))
-}}
-"#
-            );
+            let shell = windows_shell_projection_source(&root, case);
             let receipt = host
                 .execute("shell", json!({"command":shell}))
                 .await
@@ -2636,7 +2900,7 @@ if ($failed.Count -eq 0) {{
             );
             assert_eq!(
                 stage_trace(),
-                "entered\nhome-temp-written\nbefore-where\nafter-where\nbefore-probe\nafter-probe\nbefore-checks\nafter-checks\n"
+                "entered\nbefore-join-path\nafter-join-path\nhome-temp-written\nbefore-where\nafter-where\nbefore-probe\nafter-probe\nbefore-checks\nafter-checks\n"
             );
             assert_eq!(
                 std::fs::read_to_string(home.join("shell-home.txt")).unwrap(),
@@ -2708,6 +2972,7 @@ if ($failed.Count -eq 0) {{
             if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
                 spec.environment.push(("LLVM_PROFILE_FILE".into(), profile));
             }
+            let control_environment = spec.environment.clone();
             spec.stdout = Stdio::Pipe;
             spec.stderr = Stdio::Pipe;
             let mut child = spec.spawn().await.unwrap();
@@ -2772,12 +3037,15 @@ if ($failed.Count -eq 0) {{
                     );
                 }
             };
-            assert!(
-                status.success(),
-                "Windows shell fixture {name} failed: stdout={} stderr={}",
-                String::from_utf8_lossy(&out),
-                String::from_utf8_lossy(&err)
-            );
+            if !status.success() {
+                let controls =
+                    windows_shell_projection_failure_controls(&control_environment, name).await;
+                panic!(
+                    "Windows shell fixture {name} failed: stdout={} stderr={}; failure-only controls={controls:?}",
+                    String::from_utf8_lossy(&out),
+                    String::from_utf8_lossy(&err)
+                );
+            }
         }
     }
 }
