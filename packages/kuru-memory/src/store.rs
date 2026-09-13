@@ -2713,7 +2713,11 @@ mod tests {
         let mut readonly = options.clone();
         readonly.read_only = true;
         let error = MemoryStore::open(readonly).await.unwrap_err();
-        assert!(format!("{error:#}").contains("version 1 requires writable upgrade to 2"));
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("version 1 requires writable upgrade to 2"),
+            "unexpected read-only v1 open error: {error}"
+        );
         assert_eq!(fs::read(directory.join("ready.json"))?, marker);
         let inspector = released_server(&options).await?;
         let inspected = inspector.pool("main").await?;
