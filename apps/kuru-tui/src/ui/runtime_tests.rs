@@ -20,7 +20,7 @@ use ratatui::{
     Terminal,
     backend::{Backend, ClearType, TestBackend, WindowSize},
     buffer::Cell,
-    layout::{Position, Size},
+    layout::{Constraint, Layout, Position, Size},
 };
 use tokio::{
     sync::{Notify, broadcast, mpsc},
@@ -481,14 +481,31 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
         let result =
             run_loop_with_stream_and_notice(&mut terminal, harness, models, input, Some(notice))
                 .await;
-        let screen = terminal
-            .backend()
-            .buffer()
+        let buffer = terminal.backend().buffer();
+        let screen = buffer
             .content
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        (result, screen)
+        let rows = Layout::vertical([
+            Constraint::Length(if buffer.area.height >= 16 { 2 } else { 1 }),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(5), // Empty editor: two input rows, one control row, and borders.
+            Constraint::Length(1),
+        ])
+        .split(buffer.area);
+        let transcript =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(34)]).split(rows[1])[0];
+        let transcript_text = (transcript.y..transcript.bottom())
+            .map(|y| {
+                (transcript.x..transcript.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (result, screen, transcript_text)
     });
 
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -512,13 +529,21 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
         )))
         .await
         .unwrap();
-    let (result, screen) = tokio::time::timeout(Duration::from_secs(10), loop_task)
-        .await
-        .expect("notice loop did not exit")
-        .expect("notice loop task panicked");
+    let (result, screen, transcript_text) =
+        tokio::time::timeout(Duration::from_secs(10), loop_task)
+            .await
+            .expect("notice loop did not exit")
+            .expect("notice loop task panicked");
     result.unwrap();
     assert!(screen.contains("Memory is ready at"), "{screen}");
-    assert!(screen.contains("kuru memory notes ID"), "{screen}");
+    let transcript_text = transcript_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        transcript_text.contains("Read notes with kuru memory notes ID;"),
+        "{transcript_text}"
+    );
 
     drop(store);
     let reopened = reopen_store(options).await;
