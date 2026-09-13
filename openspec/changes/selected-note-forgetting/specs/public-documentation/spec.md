@@ -16,6 +16,12 @@ explicit forgetting as an active-view deletion that retains prior Dolt revisions
 and does not claim secure erasure, removal of other text, automatic expiry, or a
 restore command.
 
+It MUST describe that catalog and completion retries are bounded by one
+operation deadline and finite attempts, apply only to selected rejected provider
+responses before a response is accepted, and do not promise replay after a
+stream, partial output, ambiguous transport outcome, or possibly dispatched
+credential refresh.
+
 #### Scenario: Selected-note retention disclosure
 - **WHEN** a visitor reads the memory command reference
 - **THEN** it explains how to select one stored note and that forgetting leaves prior revisions and unrelated text intact
@@ -34,3 +40,8 @@ restore command.
 - **WHEN** a visitor reads the provider protocol reference
 - **THEN** it explains that completion and model-catalog failures use fixed,
   bounded, redacted diagnostics without exposing provider body text
+
+#### Scenario: Provider retry contract
+- **WHEN** a visitor reads the provider protocol reference
+- **THEN** it explains finite retry and Retry-After limits without claiming that
+  Kuru replays accepted streams, ambiguous requests, or rotating credential POSTs
