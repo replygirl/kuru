@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     fs::{self, File},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
@@ -12,8 +12,10 @@ use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Connection, MySqlConnection, MySqlPool, Row};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use uuid::Uuid;
+#[cfg(any(test, feature = "test-support"))]
+use {std::sync::OnceLock, tokio::sync::Semaphore};
 
 use crate::{
     files,
@@ -337,6 +339,7 @@ impl MemoryStore {
     }
 
     /// Real isolated Dolt fixture. Missing runtime/helper is an error, never a skip.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn temporary() -> Result<Self> {
         static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
         let permit = PERMITS
@@ -957,11 +960,13 @@ async fn acquire_lock(file: File, duration: Duration) -> Result<File> {
         }
     }
 }
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_cache() -> PathBuf {
     std::env::var_os("KURU_DOLT_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("kuru-dolt-test-cache"))
 }
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_supervisor() -> Result<PathBuf> {
     if let Some(snapshot) = crate::test_support::prepared_supervisor()? {
         return Ok(snapshot);

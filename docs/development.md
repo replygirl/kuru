@@ -329,8 +329,10 @@ and publication; [installation and updates](install.md) covers using releases.
 ## Tests without credentials
 
 Memory tests use actual full Dolt. `packages/kuru-memory` owns bundled extraction,
-the supervisor fixture and integration checks. Runtime/TUI test tasks depend on
-those fixtures. `mise run //packages/kuru-memory:prefetch` extracts and verifies
+the supervisor fixture and integration checks. The `test-support` feature is
+enabled by package test tasks and their dev-dependency edges, so ordinary Cargo
+builds do not include it.
+Runtime/TUI test tasks depend on those fixtures. `mise run //packages/kuru-memory:prefetch` extracts and verifies
 the embedded engine into the shared test cache. Its build dependency prepares
 the archive as described above, downloading it only when needed and permitted.
 Cold-cache tests

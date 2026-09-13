@@ -3,6 +3,7 @@ async fn main() -> anyhow::Result<()> {
     let argument = std::env::args().nth(1);
     match argument.as_deref() {
         Some("--internal-dolt-supervisor") => kuru_memory::server::supervisor_entry().await,
+        #[cfg(feature = "test-support")]
         Some("prefetch") => {
             // Cargo may republish its top-level binary alias after this task
             // completes. Ordinary test processes use this immutable snapshot.
@@ -14,6 +15,9 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", binary.display());
             Ok(())
         }
+        #[cfg(feature = "test-support")]
         _ => anyhow::bail!("expected prefetch or --internal-dolt-supervisor"),
+        #[cfg(not(feature = "test-support"))]
+        _ => anyhow::bail!("expected --internal-dolt-supervisor"),
     }
 }

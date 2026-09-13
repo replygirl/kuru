@@ -9,4 +9,5 @@ mod store;
 
 pub use store::{Candidate, MemoryStatus, MemoryStore, MemoryView, OpenOptions, Revision};
 
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

@@ -17,16 +17,16 @@ shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
 usage = 'flag "--target <target>" default="{{vars.kuru_memory_bundle_target}}"'
 env.CARGO_BUILD_TARGET = false
 depends = [{ task = "bundle:prepare", args = ["--target", "{{usage.target}}"] }]
-run = 'cargo build -p kuru-memory --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
-run_windows = 'cargo build -p kuru-memory --all-features --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
+run = 'cargo build -p kuru-memory --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru-memory --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
 
 [tasks."build:release"]
 shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
 usage = 'flag "--target <target>" default="{{vars.kuru_memory_bundle_target}}"'
 env.CARGO_BUILD_TARGET = false
 depends = [{ task = "bundle:prepare", args = ["--target", "{{usage.target}}"] }]
-run = 'cargo build -p kuru-memory --release --all-features --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
-run_windows = 'cargo build -p kuru-memory --release --all-features --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
+run = 'cargo build -p kuru-memory --release --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
+run_windows = 'cargo build -p kuru-memory --release --locked {% if usage.target != "host" %}--target "%usage_target%"{% endif %}'
 
 [tasks.test]
 env.RUST_TEST_THREADS = "2"
@@ -59,7 +59,7 @@ run = "cargo clippy -p kuru-memory --all-targets --all-features --locked -- -D w
 [tasks.prefetch]
 description = "Extract and verify the bundled full-Dolt runtime for local tests"
 depends = ["bundle:prepare"]
-run = "cargo run -p kuru-memory --locked -- prefetch"
+run = "cargo run -p kuru-memory --features test-support --locked -- prefetch"
 
 [tasks."deps:lock"]
 description = "Resolve exact workspace dependency changes"
