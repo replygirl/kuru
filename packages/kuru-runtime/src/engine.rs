@@ -1074,10 +1074,11 @@ impl Harness {
             operation = "turn"
         );
         let started = std::time::Instant::now();
-        let result = self
-            .run_admitted(prompt, resolved_target, &key, &mut journal, cancellation)
-            .instrument(span.clone())
-            .await;
+        let result = Box::pin(
+            self.run_admitted(prompt, resolved_target, &key, &mut journal, cancellation)
+                .instrument(span.clone()),
+        )
+        .await;
         match result {
             Err(error) => {
                 if let Some(output) = self.record_interruption(&key, journal).await? {

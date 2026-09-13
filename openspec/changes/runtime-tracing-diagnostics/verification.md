@@ -1,7 +1,7 @@
 ## 1. Safe runtime observations [critical]
 
 - [x] 1.1 @integration (agent) drive a fake-provider retry with actor and external tool success/failure through a real CLI child -> correlated turn/actor/tool/retry records contain only typed safe fields and no fake sentinel in every rotated file. Observed: `/private/tmp/kuru-tracing-cli-provider-tool-test-final5.log` and `/private/tmp/kuru-tracing-cli-failing-shell-test-final2.log` exit 0; the focused four-slot layer test exercises rotation with a fake sentinel.
-- [x] 1.2 @runtime (agent) cancel an asynchronous turn after actor/tool work begins -> relevant spans close and no entered span is retained across awaits. Observed: `/private/tmp/kuru-tracing-pty-cancellation-test-final.log` exits 0; actual debug PTY cancellation observes `cancelled` and `span_close`, followed by a successful next turn and terminal restoration.
+- [x] 1.2 @runtime (agent) cancel an asynchronous turn after actor/tool work begins -> relevant spans close and no entered span is retained across awaits. Observed: `/private/tmp/kuru-tracing-pty-cancellation-test-final.log` exits 0; actual debug PTY cancellation observes `cancelled` and `span_close`, followed by a successful next turn and terminal restoration. The admitted-turn future is heap-pinned only at `Harness::run_controlled`'s caller boundary; `/private/tmp/kuru-pr18-stack-runtime-cancellation.log` exits 0 for the existing real-Dolt provider-cancellation/actor-permit regression after that change. Native Windows remains pending in row 3.2.
 
 ## 2. Bounded private diagnostic ring [critical]
 
