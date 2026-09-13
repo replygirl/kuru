@@ -7,7 +7,7 @@
 
 - [x] 2.1 @integration (agent) hold the actual lifecycle owner and invoke purge -> `store::purge::tests::live_owner_refusal_leaves_no_purge_control_or_tree_change` passed against an isolated real-Dolt owner (exit 0), `/private/tmp/kuru-project-purge-memory-purge-tests-final.log`; refusal leaves the activation present and unchanged, leaves the purge control absent, and kills no process.
 - [x] 2.2 @integration (agent) interrupt after durable intent and after checked quarantine move, replace original roots, then retry -> `reconstructed_pending_purge_blocks_open_then_resumes_only_its_recorded_tree` reconstructs a durable active-path intent and a later exact quarantined tree with its `ready.json` removed; each retry blocks ordinary open and removes only the recorded identity. `pending_purge_refuses_a_replacement_root_without_deleting_it` retains both replacement and parked original. All passed in `/private/tmp/kuru-project-purge-memory-purge-tests-final.log` (exit 0). These are reconstructed durable states, not a killed-process claim.
-- [ ] 2.3 @integration (agent) present symlink/reparse and held-handle removal cases -> Unix symlink/replacement and cross-host success/Pinned-root fixtures passed in `/private/tmp/kuru-project-purge-platform-tree-test-final.log` (exit 0). Windows reparse-target preservation and held-root partial-removal/`Uncertain` fixture definitions compile in `/private/tmp/kuru-project-purge-platform-windows-typecheck-final.log` (exit 0), but native Windows execution remains pending.
+- [ ] 2.3 @integration (agent) present symlink/reparse and held-handle removal cases -> Unix symlink/replacement and cross-host success/Pinned-root fixtures passed in `/private/tmp/kuru-project-purge-platform-tree-test-final.log` (exit 0). PR18 hosted Windows job 103722690701 exercised the held-root fixture but failed its post-release cleanup assumption at `windows.rs:768`: Windows completed the pending deletion after `Pinned` dropped, so reopening returned `NotFound`. The required pre-release `Uncertain`, root-present, and child-removed assertions passed; the fixture now verifies disappearance directly after accepting either checked removal or `NotFound`. Corrected native execution remains pending.
 
 ## 3. User boundary and application cleanup
 
@@ -16,5 +16,5 @@
 
 ## 4. Native and coordinated evidence
 
-- [ ] 4.1 @integration (agent) run native Windows checked-tree and project-purge fixtures -> held-handle, reparse, and uncertain removal behavior are observed natively.
+- [ ] 4.1 @integration (agent) run native Windows checked-tree and project-purge fixtures -> PR18 job 103722690701 failed only the held-root fixture's post-release reopen assumption; corrected hosted native execution must observe held-handle, reparse, and uncertain removal behavior.
 - [ ] 4.2 @integration (agent) run coordinated workspace coverage -> project purge contributes to the required workspace coverage result.

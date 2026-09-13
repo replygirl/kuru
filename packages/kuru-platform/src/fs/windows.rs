@@ -764,10 +764,15 @@ mod tests {
         );
 
         drop(pinned);
-        Directory::open(&root_path, Privacy::OwnerOnly, NameRetention::Movable)
-            .unwrap()
-            .remove_tree()
-            .unwrap();
+        match Directory::open(&root_path, Privacy::OwnerOnly, NameRetention::Movable) {
+            Ok(root) => root.remove_tree().unwrap(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("held root had an unexpected cleanup result: {error}"),
+        }
+        assert_eq!(
+            std::fs::symlink_metadata(&root_path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
