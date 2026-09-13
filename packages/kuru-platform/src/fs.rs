@@ -783,7 +783,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn checked_tree_removal_rejects_a_replaced_root_without_touching_it() {
         let temporary = tempfile::tempdir().unwrap();

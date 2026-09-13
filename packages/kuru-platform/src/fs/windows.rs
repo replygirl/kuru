@@ -603,6 +603,7 @@ pub(super) fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
@@ -773,6 +774,136 @@ mod tests {
             std::fs::symlink_metadata(&root_path).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn checked_removal_rejects_rebound_names_without_touching_either_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+
+        let mut file = directory.create_new(OsStr::new("file")).unwrap();
+        file.write_all(b"original file").unwrap();
+        drop(file);
+        let file_path = directory.path().join("file");
+        let held_file = open(
+            &file_path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let file_identity = info(&held_file).unwrap().file.identity;
+        let parked_file = directory.path().join("parked-file");
+        fs::rename(&file_path, &parked_file).unwrap();
+        directory
+            .create_new(OsStr::new("file"))
+            .unwrap()
+            .write_all(b"replacement file")
+            .unwrap();
+        let error = remove_regular(&file_path, held_file, file_identity).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Rejected);
+        assert_eq!(fs::read(&parked_file).unwrap(), b"original file");
+        assert_eq!(fs::read(&file_path).unwrap(), b"replacement file");
+
+        let dir_path = directory.path().join("child");
+        let child = Directory::ensure_private(&dir_path).unwrap();
+        child
+            .create_new(OsStr::new("original"))
+            .unwrap()
+            .write_all(b"original directory")
+            .unwrap();
+        drop(child);
+        let held_dir = open(
+            &dir_path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let dir_identity = info(&held_dir).unwrap().file.identity;
+        let parked_dir = directory.path().join("parked-child");
+        fs::rename(&dir_path, &parked_dir).unwrap();
+        let replacement = Directory::ensure_private(&dir_path).unwrap();
+        replacement
+            .create_new(OsStr::new("replacement"))
+            .unwrap()
+            .write_all(b"replacement directory")
+            .unwrap();
+        drop(replacement);
+        let error = remove_empty_directory(&dir_path, held_dir, dir_identity).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Rejected);
+        assert_eq!(
+            fs::read(parked_dir.join("original")).unwrap(),
+            b"original directory"
+        );
+        assert_eq!(
+            fs::read(dir_path.join("replacement")).unwrap(),
+            b"replacement directory"
+        );
+
+        let mut removed = false;
+        let error = pin_directory(&dir_path, dir_identity, &mut removed).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Rejected);
+        assert!(!removed);
+
+        directory.remove_tree().unwrap();
+    }
+
+    #[test]
+    fn checked_removal_marks_real_late_refusals_uncertain_and_preserves_contents() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut file = directory.create_new(OsStr::new("readonly")).unwrap();
+        file.write_all(b"readonly bytes").unwrap();
+        drop(file);
+        let file_path = directory.path().join("readonly");
+        let mut permissions = fs::metadata(&file_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file_path, permissions).unwrap();
+        let held_file = open(
+            &file_path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let file_identity = info(&held_file).unwrap().file.identity;
+        let error = remove_regular(&file_path, held_file, file_identity).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Uncertain);
+        assert_eq!(fs::read(&file_path).unwrap(), b"readonly bytes");
+        assert!(fs::metadata(&file_path).unwrap().permissions().readonly());
+
+        let child_path = directory.path().join("nonempty");
+        let child = Directory::ensure_private(&child_path).unwrap();
+        drop(child);
+        let held_dir = open(
+            &child_path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let child_identity = info(&held_dir).unwrap().file.identity;
+        fs::write(child_path.join("retained"), b"child bytes").unwrap();
+        let error = remove_empty_directory(&child_path, held_dir, child_identity).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Uncertain);
+        assert_eq!(
+            fs::read(child_path.join("retained")).unwrap(),
+            b"child bytes"
+        );
+
+        let mut permissions = fs::metadata(&file_path).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&file_path, permissions).unwrap();
+        directory.remove_tree().unwrap();
     }
 
     #[test]
