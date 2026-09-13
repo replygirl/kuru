@@ -76,6 +76,20 @@ Close older Kuru sessions before the first launch with Dolt. Kuru imports the cu
 
 An interrupted import can resume after validation. Partial imports are stopped and preserved under `memory/interrupted/`; a failed import never becomes the active store. Keep the original and snapshots until you have checked every project you want to retain.
 
+Kuru also applies compatible database schema upgrades automatically when a
+writable project opens. Each upgrade is prepared on an internal isolated branch
+and is fast-forwarded only after its committed receipt and schema validate.
+Interrupted attempts are retained for inspection instead of reset or deleted.
+Read-only access reports an older supported schema without changing it; an
+unknown or inconsistent schema stops safely. The database schema version is
+separate from the format-1 activation record, database identity record and
+supervisor protocol format, and older dream candidates remain historical rather
+than being rewritten.
+
+Startup also stops if retained migration attempts are ambiguous or exceed its
+bounded inventory. It keeps that history and reports the condition for recovery
+rather than deleting or resetting branches.
+
 Revision history shares the database's disk. For a backup, close all Kuru processes using the data directory, let their database processes finish, then copy the entire data directory. Restore the copy into a separate location and open it with `--data-dir`. Keep the same canonical workspace path to retain the project identity. Do not copy a live `.dolt` directory or remove a held lockfile.
 
 See [sessions and dreaming](./sessions) for resuming a transcript and changing the pool's membership.

@@ -28,6 +28,10 @@ use crate::{
 #[path = "store/recovery_tests.rs"]
 mod recovery_tests;
 
+#[cfg(test)]
+#[path = "store/migration_lifecycle_tests.rs"]
+mod migration_lifecycle_tests;
+
 pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTHOR: &str = "Kuru <memory@kuru.local>";
 
@@ -38,6 +42,8 @@ pub struct OpenOptions {
     pub config: MemoryConfig,
     pub read_only: bool,
     pub supervisor: Option<PathBuf>,
+    #[cfg(test)]
+    migration_hooks: Option<Arc<migrations::MigrationRunnerHooks>>,
 }
 impl OpenOptions {
     pub fn new(data_dir: PathBuf, project_scope: String) -> Self {
@@ -47,6 +53,8 @@ impl OpenOptions {
             config: MemoryConfig::default(),
             read_only: false,
             supervisor: None,
+            #[cfg(test)]
+            migration_hooks: None,
         }
     }
 }
@@ -189,6 +197,7 @@ struct StoppedStage {
 }
 
 pub(crate) mod marker_fixture;
+mod migrations;
 
 impl MemoryStore {
     pub fn exists(data_dir: &Path, project_scope: &str) -> Result<bool> {
@@ -225,12 +234,14 @@ impl MemoryStore {
         let lock_directory = Directory::open(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
         let name = directory.file_name().context("project store has no name")?;
         let lock = lock_directory.lock_file(name)?;
-        let lock = acquire_lock(
-            lock,
-            Duration::from_secs(options.config.startup_timeout_secs),
-        )
-        .await?;
-        lock_directory.verify(name, &lock)?;
+        let mut lock = Some(
+            acquire_lock(
+                lock,
+                Duration::from_secs(options.config.startup_timeout_secs),
+            )
+            .await?,
+        );
+        lock_directory.verify(name, lock.as_ref().expect("startup lock"))?;
         let binary =
             provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?;
         let supervisor = options
@@ -266,6 +277,7 @@ impl MemoryStore {
                 &options.project_scope,
                 legacy.as_ref(),
                 &make_options,
+                &mut lock,
             )
             .await?;
             let mut staging = if let Some(staging) = recovered {
@@ -277,15 +289,88 @@ impl MemoryStore {
                     Uuid::new_v4()
                 ));
                 private_dir(&staging)?;
-                let server = Server::open(make_options(staging.clone(), false))
-                    .await
-                    .context("open staged memory server")?;
+                let server = Server::open_with_guard(
+                    make_options(staging.clone(), false),
+                    lock.take().expect("startup lock"),
+                )
+                .await
+                .context("open staged memory server")?;
                 let pool = server.pool("main").await.context("open staged main pool")?;
                 let initialized = async {
                     initialize(&pool).await?;
                     if let Some(legacy) = &legacy {
                         import(&pool, legacy).await?;
                     }
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                match (initialized, close_migration_worker(server, pool).await) {
+                    (Ok(()), Ok(returned_lock)) => lock = Some(returned_lock),
+                    (Err(error), Ok(returned_lock)) => {
+                        let retained_lock = returned_lock;
+                        if let Err(preserve) = preserve_unready_stage(
+                            &staging,
+                            parent,
+                            lifecycle_root.as_deref(),
+                            timeout,
+                        )
+                        .await
+                        {
+                            return Err(error.context(format!(
+                                "memory staging initialization preservation also failed: {preserve:#}"
+                            )));
+                        }
+                        drop(retained_lock);
+                        return Err(error);
+                    }
+                    (Ok(()), Err(cleanup)) => return Err(cleanup),
+                    (Err(error), Err(cleanup)) => {
+                        return Err(error.context(format!(
+                            "memory staging initialization cleanup also failed: {cleanup:#}"
+                        )));
+                    }
+                }
+
+                // Migration itself is an accepted worker just as it is for an
+                // existing project.  A cancelled stage opener cannot abandon
+                // DDL or release its writer lock before the supervisor reaps.
+                let server = Server::open_with_guard(
+                    make_options(staging.clone(), false),
+                    lock.take().expect("startup lock"),
+                )
+                .await
+                .context("reopen staged memory server for migration")?;
+                let pool = server.pool("main").await.context("open staged main pool")?;
+                #[cfg(test)]
+                let (returned_lock, migrated) =
+                    run_migration_worker(server, pool, options.migration_hooks.clone()).await?;
+                #[cfg(not(test))]
+                let (returned_lock, migrated) = run_migration_worker(server, pool).await?;
+                lock = Some(returned_lock);
+                if let Err(error) = migrated {
+                    if let Err(preserve) =
+                        preserve_unready_stage(&staging, parent, lifecycle_root.as_deref(), timeout)
+                            .await
+                    {
+                        return Err(error.context(format!(
+                            "memory staging migration preservation also failed: {preserve:#}"
+                        )));
+                    }
+                    return Err(error);
+                }
+
+                let server = Server::open_with_guard(
+                    make_options(staging.clone(), false),
+                    lock.take().expect("startup lock"),
+                )
+                .await
+                .context("reopen migrated staged memory server")?;
+                let pool = server
+                    .pool("main")
+                    .await
+                    .context("open migrated staged main pool")?;
+                let activated = async {
+                    migrations::validate_active(&server, &pool).await?;
                     let initial_revision = revision(&pool).await?;
                     let activation = Activation {
                         format: 1,
@@ -311,10 +396,33 @@ impl MemoryStore {
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
-                pool.close().await;
-                let stopped = server.close().await;
-                initialized?;
-                stopped?;
+                match (activated, close_migration_worker(server, pool).await) {
+                    (Ok(()), Ok(returned_lock)) => lock = Some(returned_lock),
+                    (Err(error), Ok(returned_lock)) => {
+                        let retained_lock = returned_lock;
+                        if !staging.join("ready.json").exists()
+                            && let Err(preserve) = preserve_unready_stage(
+                                &staging,
+                                parent,
+                                lifecycle_root.as_deref(),
+                                timeout,
+                            )
+                            .await
+                        {
+                            return Err(error.context(format!(
+                                "memory staging activation preservation also failed: {preserve:#}"
+                            )));
+                        }
+                        drop(retained_lock);
+                        return Err(error);
+                    }
+                    (Ok(()), Err(cleanup)) => return Err(cleanup),
+                    (Err(error), Err(cleanup)) => {
+                        return Err(error.context(format!(
+                            "memory staging activation cleanup also failed: {cleanup:#}"
+                        )));
+                    }
+                }
                 let lease =
                     Server::quiescence_at(&staging, lifecycle_root.as_deref(), timeout).await?;
                 StoppedStage { _lease: lease }
@@ -327,11 +435,51 @@ impl MemoryStore {
             drop(staging);
         }
         read_activation(&directory, &options.project_scope)?;
-        let server = Server::open(make_options(directory.clone(), options.read_only))
-            .await
-            .context("open active memory server")?;
+        let server = Server::open_with_guard(
+            make_options(directory.clone(), options.read_only),
+            lock.take().expect("startup lock"),
+        )
+        .await
+        .context("open active memory server")?;
         let pool = server.pool("main").await.context("open active main pool")?;
-        validate_schema(&pool).await?;
+        let found = migrations::version(&pool).await?;
+        if options.read_only && found < migrations::CURRENT_VERSION {
+            migrations::validate_supported(&pool).await?;
+            let lock: File = server.close_installed_guard().await?;
+            drop(lock);
+            bail!(
+                "memory schema version {found} requires writable upgrade to {}",
+                migrations::CURRENT_VERSION
+            );
+        }
+        if found > migrations::CURRENT_VERSION {
+            migrations::validate_supported(&pool).await?;
+            bail!("unsupported Dolt memory schema version {found}");
+        }
+        let (server, pool) = if found < migrations::CURRENT_VERSION {
+            #[cfg(test)]
+            let (lock, migrated) =
+                run_migration_worker(server, pool, options.migration_hooks.clone()).await?;
+            #[cfg(not(test))]
+            let (lock, migrated) = run_migration_worker(server, pool).await?;
+            migrated?;
+            let server = Server::open_with_guard(make_options(directory.clone(), false), lock)
+                .await
+                .context("reopen migrated memory server")?;
+            let pool = server
+                .pool("main")
+                .await
+                .context("open migrated main pool")?;
+            (server, pool)
+        } else {
+            (server, pool)
+        };
+        if options.read_only {
+            migrations::validate_inspection(&server, &pool).await?;
+        } else {
+            migrations::validate_active(&server, &pool).await?;
+        }
+        let lock: File = server.take_reap_guard();
         drop(lock);
         let shared = Arc::new(Shared {
             server,
@@ -388,6 +536,14 @@ impl MemoryStore {
     }
     pub async fn history(&self, namespace: &str, limit: usize) -> Result<Vec<Message>> {
         identifier("namespace", namespace, 1024)?;
+        // Candidate branches can intentionally retain an older schema after
+        // main advances. Main was validated at open; only historical views
+        // need the version-dispatched reader check before their query.
+        if self.branch != "main" {
+            tokio::time::timeout(QUERY_TIMEOUT, migrations::validate_historical(&self.pool))
+                .await
+                .context("historical memory reader validation deadline exceeded")??;
+        }
         let limit = i64::try_from(limit).context("history limit exceeds integer range")?;
         let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
             "SELECT role, content FROM (SELECT sequence, role, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
@@ -605,6 +761,50 @@ impl MemoryStore {
     }
 }
 
+async fn run_migration_worker(
+    server: Server,
+    pool: Arc<MySqlPool>,
+    #[cfg(test)] hooks: Option<Arc<migrations::MigrationRunnerHooks>>,
+) -> Result<(File, Result<()>)> {
+    let (result, waiting) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        #[cfg(test)]
+        let upgrade = match hooks {
+            Some(hooks) => migrations::upgrade_with_hooks(&server, &pool, &hooks).await,
+            None => migrations::upgrade(&server, &pool).await,
+        };
+        #[cfg(not(test))]
+        let upgrade = migrations::upgrade(&server, &pool).await;
+        let cleanup = close_migration_worker(server, pool).await;
+        let outcome = match (upgrade, cleanup) {
+            (upgrade, Ok(lock)) => Ok((lock, upgrade)),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("memory migration cleanup also failed: {cleanup:#}")))
+            }
+        };
+        let _ = result.send(outcome);
+    });
+    waiting
+        .await
+        .context("memory migration worker stopped before cleanup")?
+}
+
+async fn close_migration_worker(server: Server, _pool: Arc<MySqlPool>) -> Result<File> {
+    // The caller installed the startup guard before it began any operation.
+    // If cancellation happens while pools drain, Owner::drop transfers it to
+    // the independent reaper.
+    // `Server::close_installed_guard` drains every registered branch pool under
+    // its existing bounded close/reap discipline. Do not await an unbounded
+    // individual pool close before that ownership boundary.
+    let stopped = server.close_installed_guard().await;
+    drop(server);
+    // Even a bounded-close error is not permission to hand writer authority to
+    // another opener: Owner transfers the installed guard to its independent
+    // supervisor observer until Dolt has actually reaped.
+    stopped
+}
+
 #[derive(Debug)]
 enum Mutation {
     Append {
@@ -743,26 +943,19 @@ async fn initialize(pool: &MySqlPool) -> Result<()> {
         .bind(AUTHOR)
         .fetch_all(pool)
         .await?;
-    validate_schema(pool).await
+    migrations::validate_supported(pool).await?;
+    Ok(())
 }
-async fn validate_schema(pool: &MySqlPool) -> Result<()> {
-    let version: i32 = sqlx::query_scalar("SELECT version FROM kuru_schema WHERE id = 1")
-        .fetch_one(pool)
-        .await
-        .context("database is not an initialized Kuru memory store")?;
-    ensure!(
-        version == 1,
-        "unsupported Dolt memory schema version {version}"
-    );
-    sqlx::query("SELECT sequence, namespace, role, content FROM messages LIMIT 0")
-        .fetch_all(pool)
-        .await?;
-    sqlx::query("SELECT `key`, value FROM state LIMIT 0")
-        .fetch_all(pool)
-        .await?;
-    sqlx::query("SELECT id, label FROM operations LIMIT 0")
-        .fetch_all(pool)
-        .await?;
+async fn validate_schema_v1(pool: &MySqlPool) -> Result<()> {
+    for query in [
+        "SELECT sequence, namespace, role, content FROM messages LIMIT 0",
+        "SELECT `key`, value FROM state LIMIT 0",
+        "SELECT id, label FROM operations LIMIT 0",
+    ] {
+        tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(query).fetch_all(pool))
+            .await
+            .context("schema v1 validation deadline exceeded")??;
+    }
     Ok(())
 }
 async fn import(pool: &MySqlPool, legacy: &LegacyImport) -> Result<()> {
@@ -841,6 +1034,7 @@ async fn recover_staging(
     scope: &str,
     legacy: Option<&LegacyImport>,
     options: &impl Fn(PathBuf, bool) -> ServerOptions,
+    startup_lock: &mut Option<File>,
 ) -> Result<Option<StoppedStage>> {
     let parent = directory.parent().context("project store has no parent")?;
     let prefix = format!(
@@ -881,34 +1075,54 @@ async fn recover_staging(
             .transpose()?;
         let identity_exists = fs::symlink_metadata(stage.join("identity.json")).is_ok();
         if identity_exists {
-            // A completed stage needs only inspection. It may still have an
-            // owner, so the quiescence lease below is required after closing.
-            // An incomplete bootstrap needs exclusive server ownership.
-            let server = Server::open(options(stage.clone(), activation.is_some())).await?;
+            // A completed stage may attach read-only to another owner, while
+            // an incomplete bootstrap always owns one. In either case this
+            // opener retains the startup lock before its first await.
+            let inspection = activation.is_some();
+            let server = Server::open_with_guard(
+                options(stage.clone(), inspection),
+                startup_lock.take().expect("startup lock"),
+            )
+            .await?;
+            let pool = if inspection {
+                Some(server.pool("main").await?)
+            } else {
+                None
+            };
             let checked = async {
-                if let Some(activation) = &activation {
-                    let pool = server.pool("main").await?;
-                    validate_schema(&pool).await?;
+                if let (Some(activation), Some(pool)) = (&activation, &pool) {
+                    migrations::validate_ready(&server, pool).await?;
                     ensure!(
-                        revision(&pool).await? == activation.initial_revision,
+                        revision(pool).await? == activation.initial_revision,
                         "interrupted import revision differs from its activation record"
                     );
-                    let dirty: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status")
-                        .fetch_one(pool.as_ref())
-                        .await?;
+                    let dirty: i64 = tokio::time::timeout(
+                        QUERY_TIMEOUT,
+                        sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status")
+                            .fetch_one(pool.as_ref()),
+                    )
+                    .await
+                    .context("interrupted memory stage clean-state deadline exceeded")??;
                     ensure!(
                         dirty == 0,
                         "interrupted import has uncommitted changes; preserve {} before recovery",
                         stage.display()
                     );
-                    pool.close().await;
                 }
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-            let stopped = server.close().await;
-            checked?;
-            stopped?;
+            let stopped = server.close_installed_guard().await;
+            match (checked, stopped) {
+                (Ok(()), Ok(lock)) => *startup_lock = Some(lock),
+                (Err(error), Ok(_)) => return Err(error),
+                (Ok(()), Err(error)) => return Err(error),
+                (Err(error), Err(cleanup)) => {
+                    return Err(error.context(format!(
+                        "interrupted-stage validation cleanup also failed: {cleanup:#}"
+                    )));
+                }
+            }
         } else {
             let mut recognized = true;
             for entry in fs::read_dir(&stage)? {
@@ -960,6 +1174,24 @@ async fn recover_staging(
         }
     }
     Ok(recovered)
+}
+
+async fn preserve_unready_stage(
+    stage: &Path,
+    parent: &Path,
+    lifecycle_root: Option<&Path>,
+    timeout: Duration,
+) -> Result<()> {
+    let mut lease = Server::quiescence_at(stage, lifecycle_root, timeout).await?;
+    let interrupted = parent.join("interrupted");
+    private_dir(&interrupted)?;
+    let destination = interrupted.join(stage.file_name().context("staging path has no name")?);
+    ensure!(
+        fs::symlink_metadata(&destination).is_err(),
+        "interrupted import preservation path already exists"
+    );
+    lease.move_to(&destination)?;
+    Ok(())
 }
 
 pub(crate) fn identifier(label: &str, value: &str, maximum: usize) -> Result<()> {
@@ -1063,6 +1295,779 @@ pub(crate) fn test_supervisor() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Materialize a released v1 store without going through `open`: production
+    /// writable open intentionally upgrades it immediately, so this fixture
+    /// must stop a real v1 server and preserve the ordinary format-1 marker.
+    pub(super) async fn released_v1(options: &OpenOptions) -> Result<()> {
+        let directory = project_directory(&options.data_dir, &options.project_scope)?;
+        private_dir(&options.data_dir)?;
+        let parent = directory
+            .parent()
+            .context("released fixture has no parent")?;
+        private_dir(parent)?;
+        private_dir(&directory)?;
+        let binary =
+            provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?;
+        let server = Server::open(ServerOptions {
+            binary,
+            directory: directory.clone(),
+            project_scope: options.project_scope.clone(),
+            supervisor: options
+                .supervisor
+                .clone()
+                .context("released fixture needs supervisor")?,
+            timeout: Duration::from_secs(options.config.startup_timeout_secs),
+            read_only: false,
+            retained: None,
+            lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+        })
+        .await?;
+        let pool = server.pool("main").await?;
+        initialize(&pool).await?;
+        let activation = Activation {
+            format: 1,
+            project_scope: options.project_scope.clone(),
+            initial_revision: revision(&pool).await?,
+            migration: None,
+        };
+        write_json(&directory.join("ready.json"), &activation)?;
+        pool.close().await;
+        server.close().await?;
+        Ok(())
+    }
+
+    pub(super) async fn released_server(options: &OpenOptions) -> Result<Server> {
+        let directory = project_directory(&options.data_dir, &options.project_scope)?;
+        released_server_at(options, directory).await
+    }
+
+    async fn released_server_at(options: &OpenOptions, directory: PathBuf) -> Result<Server> {
+        Server::open(ServerOptions {
+            binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt"))
+                .await?,
+            directory,
+            project_scope: options.project_scope.clone(),
+            supervisor: options
+                .supervisor
+                .clone()
+                .context("released fixture needs supervisor")?,
+            timeout: Duration::from_secs(options.config.startup_timeout_secs),
+            read_only: false,
+            retained: None,
+            lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+        })
+        .await
+    }
+
+    async fn stopped_ready_v1_stage(
+        options: &OpenOptions,
+    ) -> Result<(PathBuf, PathBuf, Vec<u8>, String)> {
+        released_v1(options).await?;
+        let active = project_directory(&options.data_dir, &options.project_scope)?;
+        let marker = fs::read(active.join("ready.json"))?;
+        let server = released_server(options).await?;
+        let pool = server.pool("main").await?;
+        let head = revision(&pool).await?;
+        pool.close().await;
+        server.close().await?;
+        let stage = active.with_file_name(format!(
+            "{}.staging-{}",
+            active
+                .file_name()
+                .context("released v1 path has no name")?
+                .to_string_lossy(),
+            Uuid::new_v4()
+        ));
+        fs::rename(&active, &stage)?;
+        Ok((active, stage, marker, head))
+    }
+
+    #[tokio::test]
+    async fn ready_released_v1_stage_activates_its_original_marker_then_upgrades() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "9".repeat(64));
+        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let (active, stage, _initial_marker, _base) = stopped_ready_v1_stage(&options).await?;
+        // Model a released v1 stage whose first activation already contained
+        // durable user state. The marker is written once with that exact v1
+        // head, then the production opener must preserve it byte-for-byte.
+        let server = released_server_at(&options, stage.clone()).await?;
+        let pool = server.pool("main").await?;
+        sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+            .bind(b"ready-v1-state".as_slice())
+            .bind("{\"retained\":true}")
+            .execute(pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'released v1 ready payload', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(pool.as_ref())
+            .await?;
+        let base = revision(&pool).await?;
+        write_json(
+            &stage.join("ready.json"),
+            &Activation {
+                format: 1,
+                project_scope: options.project_scope.clone(),
+                initial_revision: base.clone(),
+                migration: None,
+            },
+        )?;
+        pool.close().await;
+        server.close().await?;
+        let marker = fs::read(stage.join("ready.json"))?;
+
+        let store = MemoryStore::open(options.clone()).await?;
+        assert!(!stage.exists());
+        assert_eq!(fs::read(active.join("ready.json"))?, marker);
+        assert_eq!(migrations::version(&store.pool).await?, 2);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT value FROM state WHERE `key` = ?")
+                .bind(b"ready-v1-state".as_slice())
+                .fetch_one(store.pool.as_ref())
+                .await?,
+            "{\"retained\":true}"
+        );
+        let upgraded = store.revision().await?;
+        let parent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&upgraded)
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(parent, base);
+        let commits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
+        )
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(commits, 1);
+        store.close().await?;
+
+        let reopened = MemoryStore::open(options).await?;
+        assert_eq!(reopened.revision().await?, upgraded);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT value FROM state WHERE `key` = ?")
+                .bind(b"ready-v1-state".as_slice())
+                .fetch_one(reopened.pool.as_ref())
+                .await?,
+            "{\"retained\":true}"
+        );
+        let commits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
+        )
+        .fetch_one(reopened.pool.as_ref())
+        .await?;
+        assert_eq!(commits, 1, "reopen must not add a second upgrade commit");
+        reopened.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ready_released_v1_stage_rejects_dirty_or_newer_attempts() -> Result<()> {
+        for (case, target, future_schema) in [
+            ("dirty", None, false),
+            ("v2 attempt", Some(2), false),
+            ("v3 attempt", Some(3), false),
+            ("future schema", None, true),
+        ] {
+            let root = crate::test_support::tempdir()?;
+            let scope = format!("project/{}", "d".repeat(64));
+            let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+            let (active, stage, marker, base) = stopped_ready_v1_stage(&options).await?;
+            let server = released_server_at(&options, stage.clone()).await?;
+            let pool = server.pool("main").await?;
+            let attempt = match target {
+                Some(target) => {
+                    let name = format!("kuru_migration_v{target:010}_{}", Uuid::new_v4().simple());
+                    sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                        .bind(&name)
+                        .bind(&base)
+                        .fetch_all(pool.as_ref())
+                        .await?;
+                    Some(name)
+                }
+                None if future_schema => {
+                    sqlx::query("UPDATE kuru_schema SET version = 3 WHERE id = 1")
+                        .execute(pool.as_ref())
+                        .await?;
+                    None
+                }
+                None => {
+                    sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                        .bind(b"dirty".as_slice())
+                        .bind("true")
+                        .execute(pool.as_ref())
+                        .await?;
+                    None
+                }
+            };
+            pool.close().await;
+            server.close().await?;
+
+            let error = MemoryStore::open(options.clone()).await.unwrap_err();
+            let rendered = format!("{error:#}");
+            let expected = match (target, future_schema) {
+                (None, false) => "uncommitted changes",
+                (Some(2), false) => "attempt newer than its schema",
+                (Some(3), false) => "unsupported Dolt memory schema transition",
+                (None, true) => "unsupported Dolt memory schema version 3",
+                _ => unreachable!(),
+            };
+            assert!(rendered.contains(expected), "{case}: {rendered}");
+            assert!(!active.exists(), "invalid ready stage must not activate");
+            assert_eq!(fs::read(stage.join("ready.json"))?, marker);
+            let inspector = released_server_at(&options, stage.clone()).await?;
+            let inspected = inspector.pool("main").await?;
+            assert_eq!(
+                revision(&inspected).await?,
+                base,
+                "{case} changed stage HEAD"
+            );
+            let status: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status")
+                .fetch_one(inspected.as_ref())
+                .await?;
+            if target.is_some() {
+                assert_eq!(status, 0, "{case} must retain a clean main working set");
+                let name = attempt.as_ref().expect("attempt name");
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM dolt_branches WHERE name = ?"
+                    )
+                    .bind(name)
+                    .fetch_one(inspected.as_ref())
+                    .await?,
+                    1,
+                    "{case} must retain its canonical branch for inspection"
+                );
+            } else {
+                assert!(status > 0, "{case} must retain its rejected dirty shape");
+            }
+            inspected.close().await;
+            inspector.close().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stopped_v1_candidate_survives_upgrade_and_stays_stale() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "e".repeat(64));
+        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        released_v1(&options).await?;
+        let server = released_server(&options).await?;
+        let main = server.pool("main").await?;
+        sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
+            .bind(b"main".as_slice())
+            .bind(b"user".as_slice())
+            .bind("v1 main")
+            .execute(main.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'v1 main', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(main.as_ref())
+            .await?;
+        let base = revision(&main).await?;
+        let branch = format!("candidate_{}", Uuid::new_v4().simple());
+        sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            .bind(&branch)
+            .bind(&base)
+            .fetch_all(main.as_ref())
+            .await?;
+        let candidate_pool = server.pool(&branch).await?;
+        sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
+            .bind(b"candidate".as_slice())
+            .bind(b"assistant".as_slice())
+            .bind("v1 only")
+            .execute(candidate_pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'v1 candidate', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(candidate_pool.as_ref())
+            .await?;
+        let candidate_head = revision(&candidate_pool).await?;
+        candidate_pool.close().await;
+        main.close().await;
+        server.close().await?;
+
+        let store = MemoryStore::open(options.clone()).await?;
+        let old_pool = store.shared.server.pool(&branch).await?;
+        assert_eq!(revision(&old_pool).await?, candidate_head);
+        let old = MemoryStore {
+            shared: store.shared.clone(),
+            pool: old_pool.clone(),
+            branch: branch.clone(),
+        };
+        sqlx::query("CREATE TABLE historical_dirty_probe (id INT PRIMARY KEY)")
+            .execute(old_pool.as_ref())
+            .await?;
+        let old_before = inspection_snapshot(&old_pool).await?;
+        assert_eq!(old.history("candidate", 10).await?[0].content, "v1 only");
+        assert_eq!(inspection_snapshot(&old_pool).await?, old_before);
+        assert_eq!(migrations::version(&old_pool).await?, 1);
+        let stale = Candidate {
+            live: store.clone(),
+            view: old.clone(),
+            base,
+        };
+        assert!(stale.promote().await.is_err());
+        let fresh = store.begin_candidate("current").await?;
+        fresh
+            .view()
+            .append("candidate", "assistant", "v2 current")
+            .await?;
+        fresh.promote().await?;
+        store.append("main", "assistant", "later").await?;
+        let head = store.revision().await?;
+        old_pool.close().await;
+        store.close().await?;
+        drop(store);
+        let reopened = MemoryStore::open(options).await?;
+        assert_eq!(reopened.revision().await?, head);
+        assert_eq!(
+            reopened
+                .revisions(20)
+                .await?
+                .iter()
+                .filter(|r| r.message.starts_with("Upgrade Kuru memory schema 2"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .history("main", 10)
+                .await?
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            ["v1 main", "later"]
+        );
+        assert_eq!(
+            reopened.history("candidate", 10).await?[0].content,
+            "v2 current",
+            "the successful current candidate promotion must publish its data"
+        );
+        let preserved = reopened.shared.server.pool(&branch).await?;
+        let preserved_view = MemoryStore {
+            shared: reopened.shared.clone(),
+            pool: preserved.clone(),
+            branch,
+        };
+        assert_eq!(revision(&preserved).await?, candidate_head);
+        assert_eq!(migrations::version(&preserved).await?, 1);
+        assert_eq!(
+            preserved_view.history("candidate", 10).await?[0].content,
+            "v1 only"
+        );
+        preserved.close().await;
+        reopened.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stopped_released_v1_upgrades_once_and_readonly_preserves_it() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "b".repeat(64));
+        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        released_v1(&options).await?;
+        let directory = project_directory(root.path(), &scope)?;
+        let marker = fs::read(directory.join("ready.json"))?;
+        let server = released_server(&options).await?;
+        let pool = server.pool("main").await?;
+        sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
+            .bind(vec![0, 0xff, b'n'])
+            .bind(vec![0x80, b'r'])
+            .bind("released \u{1f642} message")
+            .execute(pool.as_ref())
+            .await?;
+        sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+            .bind(vec![0, 0xfe, b'k'])
+            .bind("{\"released\":true,\"emoji\":\"🙂\"}")
+            .execute(pool.as_ref())
+            .await?;
+        let operation = Uuid::new_v4().hyphenated().to_string();
+        sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
+            .bind(&operation)
+            .bind("released operation")
+            .execute(pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'released v1 payload', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(pool.as_ref())
+            .await?;
+        let base = revision(&pool).await?;
+        let messages: Vec<(i64, Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
+            "SELECT sequence, namespace, role, content FROM messages ORDER BY sequence",
+        )
+        .fetch_all(pool.as_ref())
+        .await?;
+        let state: Vec<(Vec<u8>, String)> =
+            sqlx::query_as("SELECT `key`, value FROM state ORDER BY `key`")
+                .fetch_all(pool.as_ref())
+                .await?;
+        let operations: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, label FROM operations ORDER BY id")
+                .fetch_all(pool.as_ref())
+                .await?;
+        pool.close().await;
+        server.close().await?;
+
+        let mut readonly = options.clone();
+        readonly.read_only = true;
+        let error = MemoryStore::open(readonly).await.unwrap_err();
+        assert!(format!("{error:#}").contains("version 1 requires writable upgrade to 2"));
+        assert_eq!(fs::read(directory.join("ready.json"))?, marker);
+        let inspector = released_server(&options).await?;
+        let inspected = inspector.pool("main").await?;
+        assert_eq!(revision(&inspected).await?, base);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_status")
+                .fetch_one(inspected.as_ref())
+                .await?,
+            0,
+            "a rejected read-only open must not dirty released v1"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_branches")
+                .fetch_one(inspected.as_ref())
+                .await?,
+            1,
+            "a rejected read-only open must not create a migration ref"
+        );
+        inspected.close().await;
+        inspector.close().await?;
+
+        let store = MemoryStore::open(options.clone()).await?;
+        assert_eq!(migrations::version(&store.pool).await?, 2);
+        let first = store.revision().await?;
+        let parent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&first)
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(
+            parent, base,
+            "upgrade must be one direct child of released v1"
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
+                "SELECT sequence, namespace, role, content FROM messages ORDER BY sequence",
+            )
+            .fetch_all(store.pool.as_ref())
+            .await?,
+            messages
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (Vec<u8>, String)>("SELECT `key`, value FROM state ORDER BY `key`")
+                .fetch_all(store.pool.as_ref())
+                .await?,
+            state
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>("SELECT id, label FROM operations ORDER BY id")
+                .fetch_all(store.pool.as_ref())
+                .await?,
+            operations
+        );
+        assert_eq!(fs::read(directory.join("ready.json"))?, marker);
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru_migrations")
+            .fetch_one(store.pool.as_ref())
+            .await?;
+        assert_eq!(receipts, 1);
+        let receipt: (i32, String, String, String) =
+            sqlx::query_as("SELECT version, id, digest, operation FROM kuru_migrations")
+                .fetch_one(store.pool.as_ref())
+                .await?;
+        assert_eq!(receipt.0, 2);
+        assert!(Uuid::parse_str(&receipt.3).is_ok());
+        store.close().await?;
+        drop(store);
+
+        let mut current_readonly = options.clone();
+        current_readonly.read_only = true;
+        let reader = MemoryStore::open(current_readonly).await?;
+        assert_eq!(reader.revision().await?, first);
+        reader.close().await?;
+
+        let reopened = MemoryStore::open(options).await?;
+        assert_eq!(reopened.revision().await?, first);
+        assert_eq!(
+            sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
+                "SELECT sequence, namespace, role, content FROM messages ORDER BY sequence",
+            )
+            .fetch_all(reopened.pool.as_ref())
+            .await?,
+            messages
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (Vec<u8>, String)>("SELECT `key`, value FROM state ORDER BY `key`")
+                .fetch_all(reopened.pool.as_ref())
+                .await?,
+            state
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>("SELECT id, label FROM operations ORDER BY id")
+                .fetch_all(reopened.pool.as_ref())
+                .await?,
+            operations
+        );
+        assert_eq!(fs::read(directory.join("ready.json"))?, marker);
+        let reopened_receipt: (i32, String, String, String) =
+            sqlx::query_as("SELECT version, id, digest, operation FROM kuru_migrations")
+                .fetch_one(reopened.pool.as_ref())
+                .await?;
+        assert_eq!(reopened_receipt, receipt);
+        reopened.close().await?;
+        Ok(())
+    }
+
+    async fn raw_branch(store: &MemoryStore, name: &str) -> Result<()> {
+        sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            .bind(name)
+            .bind(store.revision().await?)
+            .fetch_all(store.pool.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    async fn inspection_snapshot(
+        pool: &MySqlPool,
+    ) -> Result<(String, Vec<(String, String)>, Vec<(String, i64, String)>)> {
+        Ok((
+            revision(pool).await?,
+            sqlx::query_as("SELECT name, hash FROM dolt_branches ORDER BY BINARY name LIMIT 65")
+                .fetch_all(pool)
+                .await?,
+            sqlx::query_as(
+                "SELECT table_name, staged, status FROM dolt_status ORDER BY BINARY table_name, staged, BINARY status LIMIT 65",
+            )
+            .fetch_all(pool)
+            .await?,
+        ))
+    }
+
+    #[tokio::test]
+    async fn readonly_inspection_preserves_dirty_data_and_rejects_dirty_authority() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "4".repeat(64));
+        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let store = MemoryStore::open(options.clone()).await?;
+        sqlx::query("CREATE TABLE inspection_dirty_probe (id INT PRIMARY KEY)")
+            .execute(store.pool.as_ref())
+            .await?;
+        let before = inspection_snapshot(&store.pool).await?;
+        assert!(
+            migrations::validate_active(&store.shared.server, &store.pool)
+                .await
+                .is_err(),
+            "the writable validator must retain its clean-working-set rule"
+        );
+
+        let mut readonly = options.clone();
+        readonly.read_only = true;
+        let attached = MemoryStore::open(readonly.clone()).await?;
+        assert_eq!(attached.revision().await?, before.0);
+        assert_eq!(inspection_snapshot(&store.pool).await?, before);
+        attached.close().await?;
+        store.close().await?;
+        drop(store);
+
+        let stopped = MemoryStore::open(readonly).await?;
+        assert_eq!(stopped.revision().await?, before.0);
+        assert_eq!(inspection_snapshot(&stopped.pool).await?, before);
+        stopped.close().await?;
+
+        for (index, change, expected) in [
+            (
+                0,
+                "ALTER TABLE kuru_schema ADD COLUMN inspection_guard INT NULL",
+                "schema or migration receipt authority has uncommitted changes",
+            ),
+            (
+                1,
+                "ALTER TABLE kuru_migrations ADD COLUMN inspection_guard INT NULL",
+                "schema or migration receipt authority has uncommitted changes",
+            ),
+        ] {
+            let root = crate::test_support::tempdir()?;
+            let scope = format!("project/{index:064x}");
+            let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+            let store = MemoryStore::open(options.clone()).await?;
+            sqlx::query(change).execute(store.pool.as_ref()).await?;
+            let before = inspection_snapshot(&store.pool).await?;
+            let mut readonly = options.clone();
+            readonly.read_only = true;
+            let error = MemoryStore::open(readonly)
+                .await
+                .expect_err("dirty authority was accepted by read-only inspection");
+            assert!(format!("{error:#}").contains(expected));
+            assert_eq!(inspection_snapshot(&store.pool).await?, before);
+            store.close().await?;
+        }
+
+        let root = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "5".repeat(64));
+        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let store = MemoryStore::open(options.clone()).await?;
+        raw_branch(&store, "kuru_migration_bad").await?;
+        let before = inspection_snapshot(&store.pool).await?;
+        let mut readonly = options.clone();
+        readonly.read_only = true;
+        let error = MemoryStore::open(readonly)
+            .await
+            .expect_err("malformed reserved ref was accepted by read-only inspection");
+        assert!(format!("{error:#}").contains("reserved migration branch is malformed"));
+        assert_eq!(inspection_snapshot(&store.pool).await?, before);
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_v1_read_rejects_dirty_dropped_receipt_authority() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "6".repeat(64));
+        let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
+        released_v1(&options).await?;
+        let directory = project_directory(&options.data_dir, &scope)?;
+        let server = released_server(&options).await?;
+        let main = server.pool("main").await?;
+        let branch = format!("candidate_{}", Uuid::new_v4().simple());
+        sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            .bind(&branch)
+            .bind(revision(&main).await?)
+            .fetch_all(main.as_ref())
+            .await?;
+        main.close().await;
+        let pool = server.pool(&branch).await?;
+        sqlx::query("CREATE TABLE kuru_migrations (malformed INT PRIMARY KEY)")
+            .execute(pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'malformed v1 receipt authority', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(pool.as_ref())
+            .await?;
+        sqlx::query("DROP TABLE kuru_migrations")
+            .execute(pool.as_ref())
+            .await?;
+        let before = inspection_snapshot(&pool).await?;
+        assert!(
+            before
+                .2
+                .iter()
+                .any(|(table, _, _)| table == "kuru_migrations"),
+            "pinned Dolt must expose the dirty receipt drop"
+        );
+        let history = MemoryStore {
+            shared: Arc::new(Shared {
+                server,
+                directory,
+                project_scope: scope,
+                read_only: true,
+                write: Arc::new(Mutex::new(())),
+                uncertain: StdMutex::new(None),
+                _permit: None,
+            }),
+            pool: pool.clone(),
+            branch,
+        };
+        let error = history
+            .history("missing", 1)
+            .await
+            .expect_err("dirty-dropped v1 receipt authority was accepted");
+        assert!(
+            format!("{error:#}")
+                .contains("schema or migration receipt authority has uncommitted changes")
+        );
+        assert_eq!(inspection_snapshot(&pool).await?, before);
+        history.close().await?;
+
+        let store = MemoryStore::temporary().await?;
+        let candidate = store.begin_candidate("dirty historical receipt").await?;
+        let view = candidate.view();
+        sqlx::query("ALTER TABLE kuru_migrations ADD COLUMN inspection_guard INT NULL")
+            .execute(view.pool.as_ref())
+            .await?;
+        let before = inspection_snapshot(&view.pool).await?;
+        let error = view
+            .history("missing", 1)
+            .await
+            .expect_err("dirty v2 receipt authority was accepted by historical read");
+        assert!(
+            format!("{error:#}")
+                .contains("schema or migration receipt authority has uncommitted changes")
+        );
+        assert_eq!(inspection_snapshot(&view.pool).await?, before);
+        drop(candidate);
+        view.pool.close().await;
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_inventory_uses_a_literal_lowercase_bounded_prefix() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "c".repeat(64));
+        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let store = MemoryStore::open(options.clone()).await?;
+        for name in [
+            "kuruXmigration_v0000000002_00000000000000000000000000000000",
+            "kuru_migrationXv0000000002_00000000000000000000000000000000",
+            "KURU_MIGRATION_v0000000002_00000000000000000000000000000000",
+        ] {
+            raw_branch(&store, name).await?;
+        }
+        store.close().await?;
+        drop(store);
+        let ignored = MemoryStore::open(options.clone()).await?;
+        ignored.close().await?;
+        drop(ignored);
+
+        let valid = MemoryStore::open(options.clone()).await?;
+        raw_branch(&valid, "kuru_migration_bad").await?;
+        valid.close().await?;
+        drop(valid);
+        assert!(MemoryStore::open(options).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_inventory_refuses_more_than_sixty_four_literal_attempts() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "d".repeat(64));
+        let options = crate::test_support::open_options(root.path().to_owned(), scope)?;
+        let store = MemoryStore::open(options.clone()).await?;
+        for number in 0..=64u128 {
+            raw_branch(&store, &format!("kuru_migration_v0000000002_{number:032x}")).await?;
+        }
+        store.close().await?;
+        drop(store);
+        let error = MemoryStore::open(options).await.unwrap_err();
+        assert!(format!("{error:#}").contains("too many retained Dolt migration attempts"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_validation_rejects_extra_schema_or_receipt_authority() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        sqlx::query("INSERT INTO kuru_schema (id, version) VALUES (2, 2)")
+            .execute(store.pool.as_ref())
+            .await?;
+        assert!(migrations::validate_current(&store.pool).await.is_err());
+        store.close().await?;
+
+        let store = MemoryStore::temporary().await?;
+        sqlx::query(
+            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (3, 'forged', ?, ?)",
+        )
+        .bind("0".repeat(64))
+        .bind(Uuid::new_v4().hyphenated().to_string())
+        .execute(store.pool.as_ref())
+        .await?;
+        assert!(migrations::validate_current(&store.pool).await.is_err());
+        store.close().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn open_rejects_invalid_memory_config_before_creating_store_state() {
@@ -1215,7 +2220,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            validate_schema(&store.pool)
+            migrations::validate_supported(&store.pool)
                 .await
                 .unwrap_err()
                 .to_string()

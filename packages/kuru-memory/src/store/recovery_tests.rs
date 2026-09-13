@@ -1,15 +1,1063 @@
 //! Real-server recovery faults. Packet fixtures never log authentication payloads.
 use super::*;
+#[cfg(windows)]
+use kuru_platform::windows::process::{
+    Console, Lifetime, NativeChild, NativeSpawnSpec, Stdio as NativeStdio,
+};
 use serde_json::json;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(unix, windows))]
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+};
+#[cfg(unix)]
+use tokio::process::Command;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::oneshot,
     task::{JoinHandle, JoinSet},
 };
 
 const TEST_DEADLINE: Duration = Duration::from_secs(10);
 const FRAME_LIMIT: usize = 128 * 1024;
+#[cfg(any(unix, windows))]
+const PROCESS_OUTPUT_LIMIT: usize = 8 * 1024;
+
+#[cfg(any(unix, windows))]
+const PROCESS_LOSS_ROOT: &str = "KURU_MIGRATION_PROCESS_LOSS_ROOT";
+#[cfg(any(unix, windows))]
+const PROCESS_LOSS_SCOPE: &str = "KURU_MIGRATION_PROCESS_LOSS_SCOPE";
+#[cfg(any(unix, windows))]
+const PROCESS_LOSS_READY: &str = "KURU_MIGRATION_PROCESS_LOSS_READY";
+#[cfg(any(unix, windows))]
+const PROCESS_LOSS_STAGE: &str = "KURU_MIGRATION_PROCESS_LOSS_STAGE";
+#[cfg(any(unix, windows))]
+const PROCESS_LOSS_TEST: &str =
+    "store::recovery_tests::process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery";
+#[cfg(any(unix, windows))]
+const PROCESS_LOSS_STAGE_TEST: &str =
+    "store::recovery_tests::fresh_staging_process_loss_after_ddl_is_preserved_and_never_reused";
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy)]
+enum ProcessLossMode {
+    Existing,
+    Staging,
+}
+
+#[cfg(unix)]
+type ProcessLossNativeChild = tokio::process::Child;
+#[cfg(windows)]
+type ProcessLossNativeChild = NativeChild;
+#[cfg(unix)]
+type ProcessLossOutput = tokio::process::ChildStdout;
+#[cfg(windows)]
+type ProcessLossOutput = kuru_platform::windows::pipe::Pipe;
+
+#[cfg(any(unix, windows))]
+struct ProcessLossChild {
+    child: Option<ProcessLossNativeChild>,
+    reader: Option<JoinHandle<Result<Vec<u8>>>>,
+    ready: Option<oneshot::Receiver<()>>,
+    stderr: PathBuf,
+    active_directory: PathBuf,
+    quiescence_directory: Option<PathBuf>,
+    lifecycle_root: Option<PathBuf>,
+    retained_root: Option<Arc<crate::test_support::TempDir>>,
+    descendants_quiescent: bool,
+}
+
+#[cfg(unix)]
+async fn spawn_process_loss_creator(
+    root: &std::path::Path,
+    scope: &str,
+    stderr: &std::path::Path,
+    test_name: &'static str,
+    mode: ProcessLossMode,
+) -> Result<ProcessLossNativeChild> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env(PROCESS_LOSS_ROOT, root)
+        .env(PROCESS_LOSS_SCOPE, scope)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(stderr)?)
+        .kill_on_drop(true);
+    if matches!(mode, ProcessLossMode::Staging) {
+        command.env(PROCESS_LOSS_STAGE, "1");
+    }
+    for name in [
+        "KURU_DOLT_CACHE",
+        "KURU_TEST_SUPERVISOR_PREPARED",
+        "LLVM_PROFILE_FILE",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    Ok(command.spawn()?)
+}
+
+#[cfg(windows)]
+async fn spawn_process_loss_creator(
+    root: &std::path::Path,
+    scope: &str,
+    stderr: &std::path::Path,
+    test_name: &'static str,
+    mode: ProcessLossMode,
+) -> Result<ProcessLossNativeChild> {
+    let executable = std::env::current_exe()?;
+    let system = kuru_platform::windows::process::system_directory()?;
+    let windows = system
+        .parent()
+        .context("Windows system directory has no parent")?;
+    let mut command = NativeSpawnSpec::new(executable, root.to_owned());
+    command.args = ["--exact", test_name, "--nocapture", "--test-threads=1"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    command.environment = vec![
+        ("SystemRoot".into(), windows.as_os_str().into()),
+        ("PATH".into(), system.into_os_string()),
+        (PROCESS_LOSS_ROOT.into(), root.as_os_str().into()),
+        (PROCESS_LOSS_SCOPE.into(), scope.into()),
+    ];
+    if matches!(mode, ProcessLossMode::Staging) {
+        command
+            .environment
+            .push((PROCESS_LOSS_STAGE.into(), "1".into()));
+    }
+    for name in [
+        "KURU_DOLT_CACHE",
+        "KURU_TEST_SUPERVISOR_PREPARED",
+        "LLVM_PROFILE_FILE",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.environment.push((name.into(), value));
+        }
+    }
+    let stderr: std::os::windows::io::OwnedHandle = std::fs::File::create(stderr)?.into();
+    command.stdin = NativeStdio::Null;
+    command.stdout = NativeStdio::Pipe;
+    command.stderr = NativeStdio::Handle(stderr);
+    command.lifetime = Lifetime::TrustedSupervisor;
+    command.console = Console::PrivateHidden;
+    Ok(command.spawn().await?)
+}
+
+#[cfg(unix)]
+fn take_process_loss_stdout(child: &mut ProcessLossNativeChild) -> Option<ProcessLossOutput> {
+    child.stdout.take()
+}
+
+#[cfg(windows)]
+fn take_process_loss_stdout(child: &mut ProcessLossNativeChild) -> Option<ProcessLossOutput> {
+    child.take_stdout()
+}
+
+#[cfg(any(unix, windows))]
+impl ProcessLossChild {
+    async fn spawn(
+        retained_root: Arc<crate::test_support::TempDir>,
+        options: &OpenOptions,
+        stderr: PathBuf,
+        test_name: &'static str,
+        mode: ProcessLossMode,
+    ) -> Result<Self> {
+        ensure!(
+            options.data_dir == retained_root.path(),
+            "process-loss retained root does not own the configured data directory"
+        );
+        let active_directory = project_directory(&options.data_dir, &options.project_scope)?;
+        let child = spawn_process_loss_creator(
+            retained_root.path(),
+            &options.project_scope,
+            &stderr,
+            test_name,
+            mode,
+        )
+        .await?;
+        let mut owned = Self {
+            child: Some(child),
+            reader: None,
+            ready: None,
+            stderr,
+            active_directory: active_directory.clone(),
+            quiescence_directory: matches!(mode, ProcessLossMode::Existing)
+                .then_some(active_directory),
+            lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+            retained_root: Some(retained_root),
+            descendants_quiescent: false,
+        };
+        let output = owned
+            .child
+            .as_mut()
+            .and_then(take_process_loss_stdout)
+            .context("process-loss child stdout missing");
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => return owned.finish(Err(error)).await,
+        };
+        let (send, receive) = oneshot::channel();
+        owned.reader = Some(tokio::spawn(read_process_output(output, send)));
+        owned.ready = Some(receive);
+        Ok(owned)
+    }
+
+    async fn ready(&mut self) -> Result<()> {
+        let ready = self
+            .ready
+            .take()
+            .context("process-loss readiness was already observed")?;
+        tokio::time::timeout(Duration::from_secs(25), ready)
+            .await
+            .context("process-loss child readiness deadline exceeded")?
+            .context("process-loss child did not reach accepted DDL")
+    }
+
+    fn set_staging_quiescence_directory(&mut self, stage: PathBuf) -> Result<()> {
+        let parent = self
+            .active_directory
+            .parent()
+            .context("process-loss active directory has no parent")?;
+        ensure!(
+            stage.parent() == Some(parent),
+            "process-loss staging directory is outside its memory parent"
+        );
+        let active = self
+            .active_directory
+            .file_name()
+            .context("process-loss active directory has no name")?
+            .to_string_lossy();
+        let name = stage
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .context("process-loss staging directory name is invalid")?;
+        let suffix = name
+            .strip_prefix(&format!("{active}.staging-"))
+            .context("process-loss staging directory has an unexpected name")?;
+        ensure!(
+            Uuid::parse_str(suffix).is_ok() && stage.is_dir(),
+            "process-loss staging directory is not a recognized live stage"
+        );
+        self.quiescence_directory = Some(stage);
+        Ok(())
+    }
+
+    async fn assert_descendant_lifecycle_held(&self) -> Result<()> {
+        let directory = self
+            .quiescence_directory
+            .as_deref()
+            .context("process-loss cleanup target was not identified")?;
+        let error = Server::quiescence_at(
+            directory,
+            self.lifecycle_root.as_deref(),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("process-loss creator did not retain its lifecycle lease");
+        ensure!(
+            format!("{error:#}").contains("memory lifecycle remains active"),
+            "unexpected process-loss lifecycle observation: {error:#}"
+        );
+        Ok(())
+    }
+
+    async fn take_quiescence(&mut self) -> Result<LifecycleLease> {
+        let directory = self
+            .quiescence_directory
+            .clone()
+            .context("process-loss cleanup target was not identified")?;
+        let lease =
+            Server::quiescence_at(&directory, self.lifecycle_root.as_deref(), TEST_DEADLINE)
+                .await?;
+        self.descendants_quiescent = self.child.is_none();
+        Ok(lease)
+    }
+
+    async fn finish<T>(mut self, observation: Result<T>) -> Result<T> {
+        let process_cleanup = self.stop_and_reap().await;
+        let quiescence = self.take_quiescence().await;
+        let cleanup = match (process_cleanup, quiescence) {
+            (Ok(output), Ok(lease)) => {
+                drop(lease);
+                Ok(output)
+            }
+            (Err(error), Ok(lease)) => {
+                drop(lease);
+                Err(error)
+            }
+            (Ok(_), Err(error)) => Err(error
+                .context("process-loss descendants did not reach quiescence after child cleanup")),
+            (Err(error), Err(quiescence)) => Err(error.context(format!(
+                "process-loss descendant quiescence also failed: {quiescence:#}"
+            ))),
+        };
+        let diagnostics = format!(
+            "process-loss child stdout: {}; stderr: {}",
+            cleanup
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes))
+                .unwrap_or_else(|_| "<unavailable>".into()),
+            bounded_fixture_text(&self.stderr)
+        );
+        match (observation, cleanup) {
+            (Ok(value), Ok(_)) => Ok(value),
+            (Err(error), Ok(_)) => Err(error.context(diagnostics)),
+            (Ok(_), Err(cleanup)) => Err(cleanup.context(diagnostics)),
+            (Err(error), Err(cleanup)) => Err(error.context(format!(
+                "process-loss child cleanup also failed: {cleanup:#}; {diagnostics}"
+            ))),
+        }
+    }
+
+    async fn stop_and_reap(&mut self) -> Result<Vec<u8>> {
+        let child_cleanup = async {
+            let child = self.child.as_mut().context("process-loss child missing")?;
+            #[cfg(unix)]
+            {
+                if child.try_wait()?.is_none() {
+                    let _ = child.start_kill();
+                }
+                let waited = tokio::time::timeout(TEST_DEADLINE, child.wait())
+                    .await
+                    .context("process-loss child did not exit by the cleanup deadline")?;
+                waited.context("wait for process-loss child")?;
+            }
+            #[cfg(windows)]
+            {
+                if child.try_wait()?.is_none() {
+                    let _ = child.terminate();
+                }
+                child
+                    .wait(TEST_DEADLINE)
+                    .await
+                    .context("process-loss child did not exit by the cleanup deadline")?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if child_cleanup.is_ok() {
+            self.child.take();
+        }
+
+        let reader_cleanup = match self.reader.take() {
+            Some(mut reader) => match tokio::time::timeout(TEST_DEADLINE, &mut reader).await {
+                Ok(result) => result
+                    .context("process-loss stdout reader task failed")
+                    .and_then(|result| result),
+                Err(_) => {
+                    reader.abort();
+                    let _ = reader.await;
+                    Err(anyhow::anyhow!(
+                        "process-loss stdout reader did not exit by the cleanup deadline"
+                    ))
+                }
+            },
+            None => Err(anyhow::anyhow!("process-loss stdout reader missing")),
+        };
+        match (child_cleanup, reader_cleanup) {
+            (Ok(()), Ok(output)) => Ok(output),
+            (Err(error), Ok(_)) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(reader)) => Err(error.context(format!(
+                "process-loss stdout cleanup also failed: {reader:#}"
+            ))),
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for ProcessLossChild {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+        if let Some(child) = self.child.as_mut() {
+            #[cfg(unix)]
+            let _ = child.start_kill();
+            #[cfg(windows)]
+            let _ = child.terminate();
+        }
+        if self.child.is_some() || !self.descendants_quiescent {
+            // Cleanup uncertainty must not delete a directory that a surviving
+            // supervisor or Dolt process can still hold. This remains true
+            // after the creator process has been reaped but before its owned
+            // descendants have released the lifecycle lease.
+            if let Some(root) = self.retained_root.take() {
+                std::mem::forget(root);
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+async fn read_process_output<R>(mut output: R, ready: oneshot::Sender<()>) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let marker = PROCESS_LOSS_READY.as_bytes();
+    let mut ready = Some(ready);
+    let mut captured = Vec::with_capacity(PROCESS_OUTPUT_LIMIT);
+    let mut tail = Vec::with_capacity(marker.len().saturating_sub(1));
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let count = output.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        let bytes = &chunk[..count];
+        let available = PROCESS_OUTPUT_LIMIT.saturating_sub(captured.len());
+        captured.extend_from_slice(&bytes[..bytes.len().min(available)]);
+
+        tail.extend_from_slice(bytes);
+        if tail.windows(marker.len()).any(|window| window == marker)
+            && let Some(ready) = ready.take()
+        {
+            let _ = ready.send(());
+        }
+        let retained = marker.len().saturating_sub(1).min(tail.len());
+        tail.drain(..tail.len() - retained);
+    }
+    Ok(captured)
+}
+
+#[cfg(any(unix, windows))]
+fn bounded_fixture_text(path: &std::path::Path) -> String {
+    let mut bytes = Vec::with_capacity(PROCESS_OUTPUT_LIMIT);
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file
+            .take(PROCESS_OUTPUT_LIMIT as u64)
+            .read_to_end(&mut bytes);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(any(unix, windows))]
+async fn paused_process_loss_child(root: &std::path::Path, scope: String) -> Result<()> {
+    let mut options = crate::test_support::open_options(root.to_owned(), scope)?;
+    let (hooks, control) =
+        migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);
+    options.migration_hooks = Some(Arc::new(hooks));
+    let _opening = tokio::spawn(MemoryStore::open(options));
+    tokio::time::timeout(TEST_DEADLINE, control.reached())
+        .await
+        .context("process-loss child did not reach accepted DDL")??;
+    println!("{PROCESS_LOSS_READY}");
+    std::io::stdout().flush()?;
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -> Result<()> {
+    if let Some(root) = std::env::var_os(PROCESS_LOSS_ROOT) {
+        let scope =
+            std::env::var(PROCESS_LOSS_SCOPE).context("process-loss child scope missing")?;
+        return paused_process_loss_child(std::path::Path::new(&root), scope).await;
+    }
+
+    let root = Arc::new(crate::test_support::tempdir()?);
+    let options = crate::test_support::open_options(
+        root.path().to_owned(),
+        format!("project/{}", "e".repeat(64)),
+    )?;
+    super::tests::released_v1(&options).await?;
+    let server = super::tests::released_server(&options).await?;
+    let main = server.pool("main").await?;
+    sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+        .bind(b"process-loss-source".as_slice())
+        .bind("\"retained\"")
+        .execute(main.as_ref())
+        .await?;
+    sqlx::query("CALL DOLT_COMMIT('-Am', 'process-loss source', '--author', ?)")
+        .bind(AUTHOR)
+        .fetch_all(main.as_ref())
+        .await?;
+    let base = revision(&main).await?;
+    let candidate = format!("candidate_{}", Uuid::new_v4().simple());
+    sqlx::query("CALL DOLT_BRANCH(?, ?)")
+        .bind(&candidate)
+        .bind(&base)
+        .fetch_all(main.as_ref())
+        .await?;
+    let candidate_pool = server.pool(&candidate).await?;
+    sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
+        .bind(b"process-loss-candidate".as_slice())
+        .bind(b"assistant".as_slice())
+        .bind("candidate retained")
+        .execute(candidate_pool.as_ref())
+        .await?;
+    sqlx::query("CALL DOLT_COMMIT('-Am', 'process-loss candidate', '--author', ?)")
+        .bind(AUTHOR)
+        .fetch_all(candidate_pool.as_ref())
+        .await?;
+    let candidate_head = revision(&candidate_pool).await?;
+    candidate_pool.close().await;
+    main.close().await;
+    server.close().await?;
+
+    let stderr = root.path().join("process-loss-child.stderr");
+    let mut child = ProcessLossChild::spawn(
+        root.clone(),
+        &options,
+        stderr,
+        PROCESS_LOSS_TEST,
+        ProcessLossMode::Existing,
+    )
+    .await?;
+    child.ready().await?;
+    assert_startup_lock_held(&options)?;
+    child.assert_descendant_lifecycle_held().await?;
+    let (hooks, control) =
+        migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforeBranch);
+    let mut recovery_options = options.clone();
+    recovery_options.migration_hooks = Some(Arc::new(hooks));
+    let mut recovering = Box::pin(MemoryStore::open(recovery_options));
+    std::future::poll_fn(|context| {
+        std::task::Poll::Ready(
+            match std::future::Future::poll(recovering.as_mut(), context) {
+                std::task::Poll::Pending => Ok(()),
+                std::task::Poll::Ready(Ok(_)) => Err(anyhow::anyhow!(
+                    "production contender crossed the live creator's startup ownership"
+                )),
+                std::task::Poll::Ready(Err(error)) => {
+                    Err(error.context("production contender failed during its first poll"))
+                }
+            },
+        )
+    })
+    .await?;
+    child.assert_descendant_lifecycle_held().await?;
+    let recovering = tokio::spawn(recovering);
+    let _creator_output = child
+        .stop_and_reap()
+        .await
+        .context("terminate and reap process-loss creator")?;
+    // This boundary is inside the same production open future that was pending
+    // against the live creator. Reaching it requires taking the returned startup
+    // guard after the orphaned supervisor has completed its reap.
+    tokio::time::timeout(TEST_DEADLINE, control.reached())
+        .await
+        .context("production contender did not take over after creator cleanup")??;
+    assert_startup_lock_held(&options)?;
+
+    // The contender is now the lifecycle owner but is paused before its first
+    // migration mutation. Inspect through the actual read-only attach path.
+    let inspection = Server::open(ServerOptions {
+        binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?,
+        directory: project_directory(&options.data_dir, &options.project_scope)?,
+        project_scope: options.project_scope.clone(),
+        supervisor: options
+            .supervisor
+            .clone()
+            .context("process-loss inspection supervisor missing")?,
+        timeout: Duration::from_secs(options.config.startup_timeout_secs),
+        read_only: true,
+        retained: None,
+        lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+    })
+    .await?;
+    let inspected_state = async {
+        let inspected = inspection.pool("main").await?;
+        assert_eq!(revision(&inspected).await?, base);
+        assert_eq!(migrations::version(&inspected).await?, 1);
+        assert_clean_status(inspected.as_ref()).await;
+        let failed_branch: String = sqlx::query_scalar(
+            "SELECT name FROM dolt_branches WHERE LEFT(BINARY name, 15) = BINARY 'kuru_migration_'",
+        )
+        .fetch_one(inspected.as_ref())
+        .await?;
+        let failed = inspection.pool(&failed_branch).await?;
+        let failed_head = revision(&failed).await?;
+        assert_eq!(failed_head, base, "failed DDL must remain outside HEAD");
+        assert_eq!(migrations::version(&failed).await?, 1);
+        let failed_status = working_status(&failed).await;
+        assert_eq!(
+            failed_status,
+            vec![("kuru_migrations".into(), 0, "new table".into())],
+            "accepted DDL must retain its exact bounded working-set evidence"
+        );
+        failed.close().await;
+        let inspected_candidate = inspection.pool(&candidate).await?;
+        assert_eq!(revision(&inspected_candidate).await?, candidate_head);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT 1"
+            )
+            .bind(b"process-loss-candidate".as_slice())
+            .fetch_one(inspected_candidate.as_ref())
+            .await?,
+            "candidate retained"
+        );
+        inspected_candidate.close().await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_status")
+                .fetch_one(inspected.as_ref())
+                .await?,
+            0
+        );
+        inspected.close().await;
+        Ok::<_, anyhow::Error>((failed_branch, failed_head, failed_status))
+    }
+    .await;
+    let inspection_cleanup = inspection.close().await;
+    control.resume();
+    let recovered = tokio::time::timeout(TEST_DEADLINE, recovering)
+        .await
+        .context("cold recovery did not finish")?
+        .context("cold recovery worker failed")??;
+    let (failed_branch, failed_head, failed_status) = match (inspected_state, inspection_cleanup) {
+        (Ok(state), Ok(())) => state,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(cleanup)) => {
+            return Err(error.context(format!(
+                "process-loss inspection cleanup also failed: {cleanup:#}"
+            )));
+        }
+    };
+    assert_eq!(migrations::version(&recovered.pool).await?, 2);
+    assert_eq!(
+        recovered.get("process-loss-source").await?,
+        Some(json!("retained"))
+    );
+    assert_clean_status(recovered.pool.as_ref()).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
+            .fetch_one(recovered.pool.as_ref())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_branches WHERE LEFT(BINARY name, 15) = BINARY 'kuru_migration_'")
+            .fetch_one(recovered.pool.as_ref())
+            .await?,
+        2,
+        "cold recovery must retain the failed branch and add one fresh attempt"
+    );
+    let retained_failed = recovered.shared.server.pool(&failed_branch).await?;
+    assert_eq!(revision(&retained_failed).await?, failed_head);
+    assert_eq!(migrations::version(&retained_failed).await?, 1);
+    assert_eq!(working_status(&retained_failed).await, failed_status);
+    retained_failed.close().await;
+    let recovered_head = recovered.revision().await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'"
+        )
+        .fetch_one(recovered.pool.as_ref())
+        .await?,
+        1,
+        "cold recovery must publish exactly one migration commit"
+    );
+    let recovered_candidate = recovered.shared.server.pool(&candidate).await?;
+    assert_eq!(revision(&recovered_candidate).await?, candidate_head);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT 1"
+        )
+        .bind(b"process-loss-candidate".as_slice())
+        .fetch_one(recovered_candidate.as_ref())
+        .await?,
+        "candidate retained"
+    );
+    recovered_candidate.close().await;
+    recovered.close().await?;
+    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
+    assert_eq!(reopened.revision().await?, recovered_head);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'"
+        )
+        .fetch_one(reopened.pool.as_ref())
+        .await?,
+        1,
+        "stopped reopen must not add migration work"
+    );
+    reopened.close().await?;
+    let released_lifecycle = child.take_quiescence().await?;
+    drop(released_lifecycle);
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn fresh_staging_process_loss_after_ddl_is_preserved_and_never_reused() -> Result<()> {
+    if let Some(root) = std::env::var_os(PROCESS_LOSS_ROOT) {
+        ensure!(
+            std::env::var_os(PROCESS_LOSS_STAGE).as_deref() == Some(std::ffi::OsStr::new("1")),
+            "fresh staging child missing its process-loss mode"
+        );
+        let scope =
+            std::env::var(PROCESS_LOSS_SCOPE).context("process-loss child scope missing")?;
+        return paused_process_loss_child(std::path::Path::new(&root), scope).await;
+    }
+    let root = Arc::new(crate::test_support::tempdir()?);
+    let options = crate::test_support::open_options(
+        root.path().to_owned(),
+        format!("project/{}", "f".repeat(64)),
+    )?;
+    let active = project_directory(&options.data_dir, &options.project_scope)?;
+    let parent = active
+        .parent()
+        .context("fresh stage parent missing")?
+        .to_owned();
+    let stderr = root.path().join("fresh-staging-process-loss.stderr");
+    let mut child = ProcessLossChild::spawn(
+        root.clone(),
+        &options,
+        stderr,
+        PROCESS_LOSS_STAGE_TEST,
+        ProcessLossMode::Staging,
+    )
+    .await?;
+    let observation = async {
+        child.ready().await?;
+        let mut stages = std::fs::read_dir(&parent)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(".staging-"))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            stages.len() == 1,
+            "fresh process-loss fixture requires one live staging directory"
+        );
+        let stage = stages.pop().expect("one stage checked");
+        ensure!(
+            !active.exists() && !active.join("ready.json").exists(),
+            "fresh DDL must not activate the project"
+        );
+        ensure!(
+            !stage.join("ready.json").exists(),
+            "fresh DDL stage must remain markerless"
+        );
+        assert_startup_lock_held(&options)?;
+        child.set_staging_quiescence_directory(stage.clone())?;
+        let live_directory = files::directory(&stage)?;
+        Ok::<_, anyhow::Error>((stage, live_directory))
+    }
+    .await;
+    let (stage, stage_directory) = child.finish(observation).await?;
+    ensure!(
+        stage.exists() && !stage.join("ready.json").exists(),
+        "stopped staging identity must remain before cold recovery"
+    );
+    let stage_identity = stage_directory.identity();
+    let before = observe_stopped_stage(&options, &stage).await?;
+    assert_eq!(before.main_version, 1);
+    assert!(before.main_status.is_empty());
+    assert_eq!(before.attempt_head, before.main_head);
+    assert_eq!(before.attempt_version, 1);
+    assert_eq!(
+        before.attempt_status,
+        vec![("kuru_migrations".into(), 0, "new table".into())]
+    );
+
+    let store = MemoryStore::open(options.clone()).await?;
+    assert_eq!(migrations::version(&store.pool).await?, 2);
+    assert_clean_status(store.pool.as_ref()).await;
+    store.close().await?;
+    ensure!(
+        active.join("ready.json").is_file(),
+        "cold open must create a separate active store"
+    );
+    let interrupted = parent
+        .join("interrupted")
+        .join(stage.file_name().context("stage name missing")?);
+    ensure!(
+        interrupted.is_dir(),
+        "cold recovery must preserve the markerless dirty stage"
+    );
+    ensure!(
+        !interrupted.join("ready.json").exists(),
+        "preserved stage must remain markerless"
+    );
+    let interrupted_directory = files::directory(&interrupted)?;
+    assert_eq!(stage_directory.identity(), stage_identity);
+    assert_eq!(interrupted_directory.identity(), stage_identity);
+    assert_ne!(files::directory(&active)?.identity(), stage_identity);
+    assert_eq!(observe_stopped_stage(&options, &interrupted).await?, before);
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Eq, PartialEq)]
+struct StoppedStageSnapshot {
+    main_head: String,
+    main_version: i32,
+    main_status: Vec<(String, i64, String)>,
+    attempt_head: String,
+    attempt_name: String,
+    attempt_version: i32,
+    attempt_status: Vec<(String, i64, String)>,
+}
+
+#[cfg(any(unix, windows))]
+async fn observe_stopped_stage(
+    options: &OpenOptions,
+    directory: &std::path::Path,
+) -> Result<StoppedStageSnapshot> {
+    let binary =
+        provision::provision(&options.config, &options.data_dir.join("tools/dolt")).await?;
+    let server = Server::open(ServerOptions {
+        binary,
+        directory: directory.to_owned(),
+        project_scope: options.project_scope.clone(),
+        supervisor: options
+            .supervisor
+            .clone()
+            .context("stage fixture supervisor missing")?,
+        timeout: Duration::from_secs(options.config.startup_timeout_secs),
+        read_only: true,
+        retained: None,
+        lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+    })
+    .await?;
+    let observed = async {
+        let main = server.pool("main").await?;
+        let branches: Vec<String> = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar(
+                "SELECT name FROM dolt_branches WHERE LEFT(BINARY name, 15) = BINARY 'kuru_migration_' LIMIT 2",
+            )
+            .fetch_all(main.as_ref()),
+        )
+        .await
+        .context("stopped-stage attempt inventory deadline exceeded")??;
+        ensure!(
+            branches.len() == 1,
+            "stopped stage must retain exactly one migration attempt"
+        );
+        let branch = branches.into_iter().next().expect("one branch checked");
+        let failed = server.pool(&branch).await?;
+        Ok::<_, anyhow::Error>(StoppedStageSnapshot {
+            main_head: revision(&main).await?,
+            main_version: migrations::version(&main).await?,
+            main_status: checked_working_status(&main).await?,
+            attempt_head: revision(&failed).await?,
+            attempt_name: branch,
+            attempt_version: migrations::version(&failed).await?,
+            attempt_status: checked_working_status(&failed).await?,
+        })
+    }
+    .await;
+    let closed = server.close().await;
+    match (observed, closed) {
+        (Ok(observed), Ok(())) => Ok(observed),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "stopped-stage inspection cleanup also failed: {cleanup:#}"
+        ))),
+    }
+}
+
+#[cfg(any(unix, windows))]
+async fn checked_working_status(pool: &MySqlPool) -> Result<Vec<(String, i64, String)>> {
+    let rows = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query(
+            "SELECT table_name, staged, status FROM dolt_status ORDER BY BINARY table_name, staged, BINARY status LIMIT 65",
+        )
+        .fetch_all(pool),
+    )
+    .await
+    .context("stopped-stage status inventory deadline exceeded")??;
+    ensure!(
+        rows.len() <= 64,
+        "stopped-stage status inventory is excessive"
+    );
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("table_name")?,
+                row.try_get("staged")?,
+                row.try_get("status")?,
+            ))
+        })
+        .collect()
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn process_loss_child_cleanup_runs_after_failed_observation() -> Result<()> {
+    let root = Arc::new(crate::test_support::tempdir()?);
+    let options = crate::test_support::open_options(
+        root.path().to_owned(),
+        format!("project/{}", "d".repeat(64)),
+    )?;
+    super::tests::released_v1(&options).await?;
+    let server = super::tests::released_server(&options).await?;
+    let main = server.pool("main").await?;
+    let base = revision(&main).await?;
+    main.close().await;
+    server.close().await?;
+
+    let stderr = root.path().join("process-loss-observation.stderr");
+    let mut child = ProcessLossChild::spawn(
+        root.clone(),
+        &options,
+        stderr,
+        PROCESS_LOSS_TEST,
+        ProcessLossMode::Existing,
+    )
+    .await?;
+    let observation = child.ready().await.and_then(|()| {
+        Err::<(), _>(anyhow::anyhow!(
+            "controlled process-loss observation failure"
+        ))
+    });
+    let error = child
+        .finish(observation)
+        .await
+        .expect_err("controlled observation failure was lost");
+    assert!(
+        format!("{error:#}").contains("controlled process-loss observation failure"),
+        "cleanup replaced the observation error: {error:#}"
+    );
+
+    let directory = project_directory(&options.data_dir, &options.project_scope)?;
+    let lifecycle_root = cfg!(windows).then(|| options.data_dir.join("memory/lifecycles"));
+    let lease = Server::quiescence_at(
+        &directory,
+        lifecycle_root.as_deref(),
+        Duration::from_secs(1),
+    )
+    .await?;
+    drop(lease);
+    let inspection = super::tests::released_server(&options).await?;
+    let main = inspection.pool("main").await?;
+    assert_eq!(revision(&main).await?, base);
+    assert_eq!(migrations::version(&main).await?, 1);
+    assert_clean_status(main.as_ref()).await;
+    let attempts: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM dolt_branches WHERE LEFT(BINARY name, 15) = BINARY 'kuru_migration_'",
+    )
+    .fetch_all(main.as_ref())
+    .await?;
+    assert_eq!(attempts.len(), 1, "accepted DDL attempt was not retained");
+    let failed = inspection.pool(&attempts[0]).await?;
+    assert_eq!(revision(&failed).await?, base);
+    assert_eq!(migrations::version(&failed).await?, 1);
+    assert_eq!(
+        working_status(&failed).await,
+        vec![("kuru_migrations".into(), 0, "new table".into())]
+    );
+    failed.close().await;
+    main.close().await;
+    inspection.close().await?;
+    Ok(())
+}
+
+fn assert_startup_lock_held(options: &OpenOptions) -> Result<()> {
+    let directory = project_directory(&options.data_dir, &options.project_scope)?;
+    let parent = directory
+        .parent()
+        .context("fixture project path has no parent")?;
+    let locks = Directory::open(
+        &parent.join("locks"),
+        Privacy::OwnerOnly,
+        NameRetention::Pinned,
+    )?;
+    let name = directory
+        .file_name()
+        .context("fixture project path has no name")?;
+    let file = locks.lock_file(name)?;
+    locks.verify(name, &file)?;
+    ensure!(
+        matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "accepted migration worker released the checked startup lock"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries() -> Result<()> {
+    for boundary in [
+        migrations::MigrationBoundary::BeforeBranch,
+        migrations::MigrationBoundary::BeforeDdl,
+        migrations::MigrationBoundary::AfterDdl,
+        migrations::MigrationBoundary::BeforeCommit,
+        migrations::MigrationBoundary::BeforePublish,
+    ] {
+        let root = crate::test_support::tempdir()?;
+        let mut options = crate::test_support::open_options(
+            root.path().to_owned(),
+            format!("project/{}", Uuid::new_v4().simple().to_string().repeat(2)),
+        )?;
+        super::tests::released_v1(&options).await?;
+        let source = super::tests::released_server(&options).await?;
+        let source_pool = source.pool("main").await?;
+        sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+            .bind(b"migration-source".as_slice())
+            .bind("\"retained\"")
+            .execute(source_pool.as_ref())
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'migration source', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(source_pool.as_ref())
+            .await?;
+        source_pool.close().await;
+        source.close().await?;
+        let (hooks, control) = migrations::MigrationRunnerHooks::paused(boundary);
+        options.migration_hooks = Some(Arc::new(hooks));
+        let opening = tokio::spawn(MemoryStore::open(options.clone()));
+        tokio::time::timeout(TEST_DEADLINE, control.reached())
+            .await
+            .context("migration worker did not reach its accepted cancellation boundary")??;
+        opening.abort();
+        assert!(opening.await.unwrap_err().is_cancelled());
+        assert_startup_lock_held(&options)?;
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(80),
+                MemoryStore::open(options.clone())
+            )
+            .await
+            .is_err(),
+            "a competing opener acquired writer authority before the accepted worker reaped"
+        );
+        control.resume();
+        let store = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options))
+            .await
+            .context("accepted migration worker did not finish after caller cancellation")??;
+        assert_eq!(migrations::version(&store.pool).await?, 2);
+        assert_eq!(
+            store.get("migration-source").await?,
+            Some(json!("retained"))
+        );
+        assert_clean_status(store.pool.as_ref()).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
+                .fetch_one(store.pool.as_ref())
+                .await?,
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM dolt_branches WHERE LEFT(BINARY name, 15) = BINARY 'kuru_migration_'"
+            )
+            .fetch_one(store.pool.as_ref())
+            .await?,
+            1
+        );
+        store.close().await?;
+    }
+    Ok(())
+}
 
 #[tokio::test]
 async fn live_original_session_blocks_receipt_reconciliation_even_after_commit() {
@@ -145,7 +1193,12 @@ async fn lost_commit_reply_recovers_one_durable_update_and_reopens_without_repla
     .unwrap();
     let store = MemoryStore::open(options.clone()).await.unwrap();
     let before = store.revision().await.unwrap();
-    let proxy = AckDropProxy::start(store.pool.clone(), "COMMIT", before).await;
+    let proxy = AckDropProxy::start(
+        store.pool.clone(),
+        "COMMIT",
+        DurableObservation::RevisionAdvanced { base: before },
+    )
+    .await;
     let affected = proxy.view(&store).await;
     tokio::time::timeout(
         TEST_DEADLINE,
@@ -194,7 +1247,9 @@ async fn lost_promotion_reply_reconciles_target_once_and_keeps_later_writes() {
     let proxy = AckDropProxy::start(
         store.pool.clone(),
         "CALL DOLT_MERGE",
-        candidate.base.clone(),
+        DurableObservation::MainAtTarget {
+            target: target.clone(),
+        },
     )
     .await;
     let affected = proxy.view(&store).await;
@@ -279,6 +1334,51 @@ async fn promotion_receipt_keeps_base_target_and_refuses_divergent_history() {
 const SCHEMA_BOUNDARY_TABLE: &str = "schema_transaction_probe";
 const SCHEMA_BOUNDARY_NAMESPACE: &str = "schema-boundary-source";
 const CANDIDATE_NAMESPACE: &str = "schema-boundary-candidate";
+
+/// These transaction-boundary probes must begin from the released v1 schema:
+/// updating `kuru_schema` to v2 is part of the atomic DDL receipt they observe.
+/// `MemoryStore::temporary` deliberately creates the current schema instead.
+async fn stopped_released_v1_store() -> MemoryStore {
+    let root = Arc::new(
+        tempfile::Builder::new()
+            .prefix("kuru-memory-")
+            .tempdir()
+            .unwrap(),
+    );
+    let data = root.path().join("private");
+    let options =
+        crate::test_support::open_options(data, format!("project/{}", "0".repeat(64))).unwrap();
+    super::tests::released_v1(&options).await.unwrap();
+    let directory = project_directory(&options.data_dir, &options.project_scope).unwrap();
+    let server = Server::open(ServerOptions {
+        binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt"))
+            .await
+            .unwrap(),
+        directory: directory.clone(),
+        project_scope: options.project_scope.clone(),
+        supervisor: options.supervisor.clone().unwrap(),
+        timeout: Duration::from_secs(options.config.startup_timeout_secs),
+        read_only: false,
+        retained: Some(root),
+        lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+    })
+    .await
+    .unwrap();
+    let pool = server.pool("main").await.unwrap();
+    MemoryStore {
+        shared: Arc::new(Shared {
+            server,
+            directory,
+            project_scope: options.project_scope,
+            read_only: false,
+            write: Arc::new(Mutex::new(())),
+            uncertain: StdMutex::new(None),
+            _permit: None,
+        }),
+        pool,
+        branch: "main".into(),
+    }
+}
 
 struct CandidateSnapshot {
     view: MemoryStore,
@@ -490,7 +1590,7 @@ async fn assert_schema_commit(
 
 #[tokio::test]
 async fn manual_dolt_commit_atomically_publishes_ddl_version_and_receipt() {
-    let store = MemoryStore::temporary().await.unwrap();
+    let store = stopped_released_v1_store().await;
     store
         .append(SCHEMA_BOUNDARY_NAMESPACE, "user", "main history retained")
         .await
@@ -513,7 +1613,7 @@ async fn manual_dolt_commit_atomically_publishes_ddl_version_and_receipt() {
 
 #[tokio::test]
 async fn dropping_precommit_ddl_session_retains_dirty_working_ddl_outside_head() {
-    let store = MemoryStore::temporary().await.unwrap();
+    let store = stopped_released_v1_store().await;
     store
         .append(SCHEMA_BOUNDARY_NAMESPACE, "user", "main history retained")
         .await
@@ -676,7 +1776,7 @@ async fn assert_dirty_schema_branch(
 
 #[tokio::test]
 async fn lost_manual_dolt_commit_reply_reconciles_one_clean_schema_commit() {
-    let store = MemoryStore::temporary().await.unwrap();
+    let store = stopped_released_v1_store().await;
     store
         .append(SCHEMA_BOUNDARY_NAMESPACE, "user", "main history retained")
         .await
@@ -685,7 +1785,14 @@ async fn lost_manual_dolt_commit_reply_reconciles_one_clean_schema_commit() {
     let source_history = store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap();
     let candidate = preserved_candidate(&store).await;
     let receipt = Uuid::new_v4().to_string();
-    let proxy = AckDropProxy::start(store.pool.clone(), "CALL DOLT_COMMIT", before.clone()).await;
+    let proxy = AckDropProxy::start(
+        store.pool.clone(),
+        "CALL DOLT_COMMIT",
+        DurableObservation::RevisionAdvanced {
+            base: before.clone(),
+        },
+    )
+    .await;
     let affected = proxy.view(&store).await;
     let (mut connection, id) = owned_connection(&affected.pool).await.unwrap();
     let error = staged_schema_transaction(&mut connection, &receipt, true)
@@ -706,8 +1813,371 @@ async fn lost_manual_dolt_commit_reply_reconciles_one_clean_schema_commit() {
 }
 
 #[tokio::test]
+async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_ends() -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let mut options = crate::test_support::open_options(
+        root.path().to_owned(),
+        format!("project/{}", "f".repeat(64)),
+    )?;
+    super::tests::released_v1(&options).await?;
+    let server = super::tests::released_server(&options).await?;
+    let main = server.pool("main").await?;
+    let base = revision(&main).await?;
+    main.close().await;
+    server.close().await?;
+
+    let reserved = ReservedAckDropProxy::reserve().await;
+    let (hooks, control) =
+        migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforeCommit);
+    let hooks = hooks.with_route(migrations::MigrationBoundary::BeforeCommit, reserved.port);
+    options.migration_hooks = Some(Arc::new(hooks));
+    let opening = tokio::spawn(MemoryStore::open(options.clone()));
+
+    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
+        .await
+        .context("production migration did not expose its routed fixture source")??;
+    let proxy = reserved.start(
+        source,
+        "CALL DOLT_COMMIT",
+        DurableObservation::RevisionAdvanced { base: base.clone() },
+    );
+    control.resume_route();
+    tokio::time::timeout(TEST_DEADLINE, control.reached())
+        .await
+        .context("production migration did not reach the commit boundary")??;
+    control.resume();
+
+    let store = tokio::time::timeout(TEST_DEADLINE, opening)
+        .await
+        .context("production migration did not reconcile the lost commit reply")???;
+    assert!(
+        proxy.discarded.load(Ordering::Acquire),
+        "fixture must discard the durable production migration DOLT_COMMIT reply"
+    );
+    assert!(
+        proxy.session_ended.load(Ordering::Acquire),
+        "the proxy must observe the original routed SQL session end before reconciliation"
+    );
+    assert_eq!(migrations::version(&store.pool).await?, 2);
+    assert_clean_status(store.pool.as_ref()).await;
+    let upgraded = store.revision().await?;
+    let commits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
+    )
+    .fetch_one(store.pool.as_ref())
+    .await?;
+    assert_eq!(commits, 1, "production migration must publish exactly once");
+    store.close().await?;
+    proxy.close().await;
+
+    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options))
+        .await
+        .context("reopen replayed a migration hook instead of recognizing the durable upgrade")??;
+    assert_eq!(reopened.revision().await?, upgraded);
+    let commits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
+    )
+    .fetch_one(reopened.pool.as_ref())
+    .await?;
+    assert_eq!(commits, 1, "reopen must not replay a reconciled migration");
+    reopened.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creation() -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let mut options = crate::test_support::open_options(
+        root.path().to_owned(),
+        format!("project/{}", "b".repeat(64)),
+    )?;
+    super::tests::released_v1(&options).await?;
+    let server = super::tests::released_server(&options).await?;
+    let main = server.pool("main").await?;
+    sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+        .bind(b"branch-reply-source".as_slice())
+        .bind("\"retained\"")
+        .execute(main.as_ref())
+        .await?;
+    sqlx::query("CALL DOLT_COMMIT('-Am', 'branch reply source', '--author', ?)")
+        .bind(AUTHOR)
+        .fetch_all(main.as_ref())
+        .await?;
+    let base = revision(&main).await?;
+    main.close().await;
+    server.close().await?;
+
+    let reserved = ReservedAckDropProxy::reserve().await;
+    let (hooks, control) =
+        migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforeBranch);
+    let hooks = hooks.with_route(migrations::MigrationBoundary::BeforeBranch, reserved.port);
+    options.migration_hooks = Some(Arc::new(hooks));
+    let opening = tokio::spawn(MemoryStore::open(options.clone()));
+    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
+        .await
+        .context("production migration did not expose branch-route source")??;
+    let branch = control.branch_name()?;
+    let proxy = reserved.start(
+        source,
+        "CALL DOLT_BRANCH",
+        DurableObservation::BranchAtBase {
+            branch: branch.clone(),
+            base: base.clone(),
+        },
+    );
+    control.resume_route();
+    tokio::time::timeout(TEST_DEADLINE, control.reached())
+        .await
+        .context("production migration did not reach branch boundary")??;
+    control.resume();
+
+    let store = tokio::time::timeout(TEST_DEADLINE, opening)
+        .await
+        .context("production migration did not reconcile lost branch reply")???;
+    assert!(proxy.discarded.load(Ordering::Acquire));
+    assert!(proxy.session_ended.load(Ordering::Acquire));
+    assert_eq!(
+        store.get("branch-reply-source").await?,
+        Some(json!("retained"))
+    );
+    assert_eq!(migrations::version(&store.pool).await?, 2);
+    assert_clean_status(store.pool.as_ref()).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
+            .fetch_one(store.pool.as_ref())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'"
+        )
+        .fetch_one(store.pool.as_ref())
+        .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_branches WHERE name = ?")
+            .bind(&branch)
+            .fetch_one(store.pool.as_ref())
+            .await?,
+        1
+    );
+    let upgraded = store.revision().await?;
+    store.close().await?;
+    proxy.close().await;
+    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
+    assert_eq!(reopened.revision().await?, upgraded);
+    assert_eq!(
+        reopened.get("branch-reply-source").await?,
+        Some(json!("retained"))
+    );
+    reopened.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publication()
+-> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let mut options = crate::test_support::open_options(
+        root.path().to_owned(),
+        format!("project/{}", "c".repeat(64)),
+    )?;
+    super::tests::released_v1(&options).await?;
+    let server = super::tests::released_server(&options).await?;
+    let main = server.pool("main").await?;
+    sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+        .bind(b"fast-forward-reply-source".as_slice())
+        .bind("\"retained\"")
+        .execute(main.as_ref())
+        .await?;
+    sqlx::query("CALL DOLT_COMMIT('-Am', 'fast forward reply source', '--author', ?)")
+        .bind(AUTHOR)
+        .fetch_all(main.as_ref())
+        .await?;
+    main.close().await;
+    server.close().await?;
+
+    let reserved = ReservedAckDropProxy::reserve().await;
+    let (hooks, control) =
+        migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforePublish);
+    let hooks = hooks.with_route(migrations::MigrationBoundary::BeforePublish, reserved.port);
+    options.migration_hooks = Some(Arc::new(hooks));
+    let opening = tokio::spawn(MemoryStore::open(options.clone()));
+    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
+        .await
+        .context("production migration did not expose publish-route source")??;
+    let target = control.publication_target()?;
+    let branch = control.branch_name()?;
+    let proxy = reserved.start(
+        source,
+        "CALL DOLT_MERGE",
+        DurableObservation::MainAtTarget {
+            target: target.clone(),
+        },
+    );
+    control.resume_route();
+    tokio::time::timeout(TEST_DEADLINE, control.reached())
+        .await
+        .context("production migration did not reach publish boundary")??;
+    control.resume();
+
+    let store = tokio::time::timeout(TEST_DEADLINE, opening)
+        .await
+        .context("production migration did not reconcile lost fast-forward reply")???;
+    assert!(proxy.discarded.load(Ordering::Acquire));
+    assert!(proxy.session_ended.load(Ordering::Acquire));
+    assert_eq!(store.revision().await?, target);
+    assert_eq!(
+        store.get("fast-forward-reply-source").await?,
+        Some(json!("retained"))
+    );
+    assert_eq!(migrations::version(&store.pool).await?, 2);
+    assert_clean_status(store.pool.as_ref()).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
+            .fetch_one(store.pool.as_ref())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'"
+        )
+        .fetch_one(store.pool.as_ref())
+        .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_branches WHERE name = ?")
+            .bind(&branch)
+            .fetch_one(store.pool.as_ref())
+            .await?,
+        1
+    );
+    store.close().await?;
+    proxy.close().await;
+    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
+    assert_eq!(reopened.revision().await?, target);
+    assert_eq!(
+        reopened.get("fast-forward-reply-source").await?,
+        Some(json!("retained"))
+    );
+    reopened.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let mut options = crate::test_support::open_options(
+        root.path().to_owned(),
+        format!("project/{}", "d".repeat(64)),
+    )?;
+    super::tests::released_v1(&options).await?;
+    let server = super::tests::released_server(&options).await?;
+    let main = server.pool("main").await?;
+    sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+        .bind(b"absent-fast-forward-source".as_slice())
+        .bind("\"retained\"")
+        .execute(main.as_ref())
+        .await?;
+    sqlx::query("CALL DOLT_COMMIT('-Am', 'absent fast forward source', '--author', ?)")
+        .bind(AUTHOR)
+        .fetch_all(main.as_ref())
+        .await?;
+    let base = revision(&main).await?;
+    main.close().await;
+    server.close().await?;
+
+    let reserved = ReservedAckDropProxy::reserve().await;
+    let (hooks, control) =
+        migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforePublish);
+    let hooks = hooks.with_route(migrations::MigrationBoundary::BeforePublish, reserved.port);
+    options.migration_hooks = Some(Arc::new(hooks));
+    let opening = tokio::spawn(MemoryStore::open(options.clone()));
+    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
+        .await
+        .context("production migration did not expose absent-publish route source")??;
+    let target = control.publication_target()?;
+    let branch = control.branch_name()?;
+    let proxy = reserved.start_absent(
+        source,
+        DurableObservation::MainAtTarget {
+            target: target.clone(),
+        },
+    );
+    control.resume_route();
+    tokio::time::timeout(TEST_DEADLINE, control.reached())
+        .await
+        .context("production migration did not reach absent publish boundary")??;
+    control.resume();
+    let error = tokio::time::timeout(TEST_DEADLINE, opening)
+        .await
+        .context("absent fast-forward did not resolve")?
+        .expect("missing fast-forward must not be treated as published")
+        .expect_err("missing fast-forward must retain a ready attempt");
+    assert!(
+        proxy.discarded.load(Ordering::Acquire),
+        "fixture must drop the merge request before dispatch: {error:#}"
+    );
+    assert!(proxy.session_ended.load(Ordering::Acquire));
+    proxy.close().await;
+    options.migration_hooks = None;
+
+    let inspection = super::tests::released_server(&options).await?;
+    let inspection_main = inspection.pool("main").await?;
+    assert_eq!(revision(&inspection_main).await?, base);
+    assert_eq!(migrations::version(&inspection_main).await?, 1);
+    assert_clean_status(inspection_main.as_ref()).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT hash FROM dolt_branches WHERE name = ?")
+            .bind(&branch)
+            .fetch_one(inspection_main.as_ref())
+            .await?,
+        target,
+        "the exact ready branch must remain for the next open"
+    );
+    inspection_main.close().await;
+    inspection.close().await?;
+    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
+    assert_eq!(reopened.revision().await?, target);
+    assert_eq!(
+        reopened.get("absent-fast-forward-source").await?,
+        Some(json!("retained"))
+    );
+    assert_eq!(migrations::version(&reopened.pool).await?, 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
+            .fetch_one(reopened.pool.as_ref())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT hash FROM dolt_branches WHERE name = ?")
+            .bind(&branch)
+            .fetch_one(reopened.pool.as_ref())
+            .await?,
+        target,
+        "reopen must publish the pre-existing ready target without rebuilding it"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'"
+        )
+        .fetch_one(reopened.pool.as_ref())
+        .await?,
+        1,
+        "reopen must not add a second migration commit"
+    );
+    reopened.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward_reply() {
-    let store = MemoryStore::temporary().await.unwrap();
+    let store = stopped_released_v1_store().await;
     store
         .append(SCHEMA_BOUNDARY_NAMESPACE, "user", "main history retained")
         .await
@@ -772,7 +2242,14 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
         "main must retain schema version 1 until publication"
     );
 
-    let proxy = AckDropProxy::start(store.pool.clone(), "CALL DOLT_MERGE", base.clone()).await;
+    let proxy = AckDropProxy::start(
+        store.pool.clone(),
+        "CALL DOLT_MERGE",
+        DurableObservation::MainAtTarget {
+            target: target.clone(),
+        },
+    )
+    .await;
     let affected = proxy.view(&store).await;
     let (mut merge_connection, merge_id) = owned_connection(&affected.pool).await.unwrap();
     *affected.shared.uncertain.lock().unwrap() = Some(Pending {
@@ -821,21 +2298,85 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
 struct AckDropProxy {
     port: u16,
     discarded: Arc<AtomicBool>,
+    session_ended: Arc<AtomicBool>,
     task: JoinHandle<Result<()>>,
 }
 
+struct ReservedAckDropProxy {
+    listener: TcpListener,
+    port: u16,
+    discarded: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+enum DurableObservation {
+    RevisionAdvanced { base: String },
+    BranchAtBase { branch: String, base: String },
+    MainAtTarget { target: String },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DropKind {
+    ReplyAfterDurability,
+    RequestBeforeDispatch,
+}
+
+async fn durable_observation(
+    observer: &MySqlPool,
+    observation: &DurableObservation,
+) -> Result<bool> {
+    match observation {
+        DurableObservation::RevisionAdvanced { base } => Ok(revision(observer).await? != *base),
+        DurableObservation::BranchAtBase { branch, base } => {
+            let observed: Option<String> =
+                sqlx::query_scalar("SELECT hash FROM dolt_branches WHERE name = ?")
+                    .bind(branch)
+                    .fetch_optional(observer)
+                    .await?;
+            Ok(observed.as_deref() == Some(base))
+        }
+        DurableObservation::MainAtTarget { target } => Ok(revision(observer).await? == *target),
+    }
+}
+
 impl AckDropProxy {
-    async fn start(observer: Arc<MySqlPool>, statement: &'static str, base: String) -> Self {
+    async fn start(
+        observer: Arc<MySqlPool>,
+        statement: &'static str,
+        observation: DurableObservation,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        Self::from_listener(
+            listener,
+            port,
+            observer,
+            statement,
+            observation,
+            Arc::new(AtomicBool::new(false)),
+            DropKind::ReplyAfterDurability,
+        )
+    }
+
+    fn from_listener(
+        listener: TcpListener,
+        port: u16,
+        observer: Arc<MySqlPool>,
+        statement: &'static str,
+        observation: DurableObservation,
+        discarded: Arc<AtomicBool>,
+        drop_kind: DropKind,
+    ) -> Self {
         let upstream = observer.connect_options();
         let upstream = (upstream.get_host().to_owned(), upstream.get_port());
-        let discarded = Arc::new(AtomicBool::new(false));
+        let session_ended = Arc::new(AtomicBool::new(false));
         let fault = Arc::new(Fault {
             observer,
             statement,
-            base,
+            observation,
             discarded: discarded.clone(),
+            session_ended: session_ended.clone(),
+            drop_kind,
         });
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
@@ -854,6 +2395,7 @@ impl AckDropProxy {
         Self {
             port,
             discarded,
+            session_ended,
             task,
         }
     }
@@ -890,11 +2432,58 @@ impl AckDropProxy {
     }
 }
 
+impl ReservedAckDropProxy {
+    async fn reserve() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        Self {
+            listener,
+            port,
+            discarded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn start(
+        self,
+        observer: Arc<MySqlPool>,
+        statement: &'static str,
+        observation: DurableObservation,
+    ) -> AckDropProxy {
+        AckDropProxy::from_listener(
+            self.listener,
+            self.port,
+            observer,
+            statement,
+            observation,
+            self.discarded,
+            DropKind::ReplyAfterDurability,
+        )
+    }
+
+    fn start_absent(
+        self,
+        observer: Arc<MySqlPool>,
+        observation: DurableObservation,
+    ) -> AckDropProxy {
+        AckDropProxy::from_listener(
+            self.listener,
+            self.port,
+            observer,
+            "CALL DOLT_MERGE",
+            observation,
+            self.discarded,
+            DropKind::RequestBeforeDispatch,
+        )
+    }
+}
+
 struct Fault {
     observer: Arc<MySqlPool>,
     statement: &'static str,
-    base: String,
+    observation: DurableObservation,
     discarded: Arc<AtomicBool>,
+    session_ended: Arc<AtomicBool>,
+    drop_kind: DropKind,
 }
 
 #[derive(Default)]
@@ -903,6 +2492,7 @@ struct WireState {
     preparing: bool,
     prepared: Option<u32>,
     discard_next: bool,
+    session_id: Option<u64>,
 }
 
 async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault>) -> Result<()> {
@@ -911,9 +2501,10 @@ async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault
     let state = Arc::new(StdMutex::new(WireState::default()));
     let requests = state.clone();
     let statement = fault.statement;
+    let request_fault = fault.clone();
     let client_to_server = async move {
         while let Some(packet) = read_packet(&mut client_read).await? {
-            {
+            let (discard, session_id) = {
                 let mut state = requests.lock().unwrap();
                 let payload = &packet[4..];
                 if state.authenticated && !payload.is_empty() {
@@ -927,6 +2518,26 @@ async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault
                         _ => {}
                     }
                 }
+                let discard = request_fault.drop_kind == DropKind::RequestBeforeDispatch
+                    && state.discard_next
+                    && request_fault
+                        .discarded
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok();
+                if discard {
+                    state.discard_next = false;
+                }
+                (discard, state.session_id)
+            };
+            if discard {
+                server_write.shutdown().await?;
+                let id =
+                    session_id.context("fixture did not observe the routed MySQL session id")?;
+                await_session_end(&request_fault.observer, id, TEST_DEADLINE)
+                    .await
+                    .context("routed SQL session remained after the absent request")?;
+                request_fault.session_ended.store(true, Ordering::Release);
+                return Ok::<_, anyhow::Error>(());
             }
             server_write.write_all(&packet).await?;
         }
@@ -934,9 +2545,22 @@ async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault
     };
     let server_to_client = async move {
         while let Some(packet) = read_packet(&mut server_read).await? {
-            let discard = {
+            let (discard, session_id) = {
                 let mut state = state.lock().unwrap();
                 let payload = &packet[4..];
+                if !state.authenticated && payload.first() == Some(&0x0a) {
+                    let Some(version_end) = payload[1..].iter().position(|byte| *byte == 0) else {
+                        bail!("fixture received malformed MySQL handshake");
+                    };
+                    let id_start = version_end + 2;
+                    ensure!(
+                        payload.len() >= id_start + 4,
+                        "fixture received truncated MySQL handshake"
+                    );
+                    let id =
+                        u32::from_le_bytes(payload[id_start..id_start + 4].try_into().unwrap());
+                    state.session_id = Some(u64::from(id));
+                }
                 if !state.authenticated && packet[3] >= 2 && payload.first() == Some(&0) {
                     state.authenticated = true;
                 }
@@ -944,11 +2568,13 @@ async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault
                     state.prepared = Some(u32::from_le_bytes(payload[1..5].try_into().unwrap()));
                     state.preparing = false;
                 }
-                std::mem::take(&mut state.discard_next)
+                let discard = fault.drop_kind == DropKind::ReplyAfterDurability
+                    && std::mem::take(&mut state.discard_next)
                     && fault
                         .discarded
                         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
+                        .is_ok();
+                (discard, state.session_id)
             };
             if discard {
                 // Receiving a packet alone may only mean result metadata is
@@ -956,7 +2582,7 @@ async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault
                 // discarding the reply, so the injected fault is a lost ack.
                 tokio::time::timeout(TEST_DEADLINE, async {
                     loop {
-                        if revision(&fault.observer).await? != fault.base {
+                        if durable_observation(&fault.observer, &fault.observation).await? {
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -966,16 +2592,20 @@ async fn proxy_connection(client: TcpStream, server: TcpStream, fault: Arc<Fault
                 .await
                 .context("intercepted SQL did not become durable")??;
                 client_write.shutdown().await?;
+                let id =
+                    session_id.context("fixture did not observe the routed MySQL session id")?;
+                await_session_end(&fault.observer, id, TEST_DEADLINE)
+                    .await
+                    .context("routed SQL session remained after the lost reply")?;
+                fault.session_ended.store(true, Ordering::Release);
                 return Ok::<_, anyhow::Error>(());
             }
             client_write.write_all(&packet).await?;
         }
         Ok(())
     };
-    tokio::select! {
-        result = client_to_server => result,
-        result = server_to_client => result,
-    }
+    let ((), ()) = tokio::try_join!(client_to_server, server_to_client)?;
+    Ok(())
 }
 
 async fn read_packet(reader: &mut (impl AsyncRead + Unpin)) -> Result<Option<Vec<u8>>> {

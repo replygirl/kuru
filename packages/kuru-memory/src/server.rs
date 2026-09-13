@@ -79,6 +79,7 @@ struct ServerInner {
     read_only: bool,
     pools: Mutex<BTreeMap<String, Weak<MySqlPool>>>,
     owner: Mutex<Option<Owner>>,
+    reap_guard: Arc<StdMutex<Option<File>>>,
     closed: AtomicBool,
 }
 
@@ -99,6 +100,7 @@ struct Owner {
     child: Option<SupervisorChild>,
     lifetime: Option<LifetimeSender>,
     retained: Option<Arc<tempfile::TempDir>>,
+    reap_guard: Arc<StdMutex<Option<File>>>,
 }
 
 impl Drop for Owner {
@@ -108,10 +110,16 @@ impl Drop for Owner {
             return;
         };
         let retained = self.retained.take();
+        let guard = self
+            .reap_guard
+            .lock()
+            .expect("memory reap guard lock")
+            .take();
         // Independent of Tokio: tests and CLI shutdown may destroy the runtime
         // immediately after the last store handle. Keep fixture files until the
         // supervisor has confirmed that Dolt is reaped.
         std::thread::spawn(move || {
+            let _guard = guard;
             observe_supervisor(
                 child,
                 retained,
@@ -235,6 +243,20 @@ impl Server {
     }
 
     pub async fn open(options: ServerOptions) -> Result<Self> {
+        Self::open_inner(options, Arc::new(StdMutex::new(None))).await
+    }
+
+    /// Start an owning sidecar while retaining a project startup lock through
+    /// every await and any supervisor-reaper handoff.  Store migration and
+    /// staging callers use this before the server can spawn or authenticate.
+    pub(crate) async fn open_with_guard(options: ServerOptions, guard: File) -> Result<Self> {
+        Self::open_inner(options, Arc::new(StdMutex::new(Some(guard)))).await
+    }
+
+    async fn open_inner(
+        options: ServerOptions,
+        reap_guard: Arc<StdMutex<Option<File>>>,
+    ) -> Result<Self> {
         ensure!(
             options.timeout >= Duration::from_millis(1)
                 && options.timeout <= Duration::from_secs(300),
@@ -260,6 +282,7 @@ impl Server {
                     endpoint,
                     options.read_only,
                     None,
+                    reap_guard,
                 ));
             }
         } else {
@@ -292,9 +315,19 @@ impl Server {
             if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
                 command.env("LLVM_PROFILE_FILE", profile);
             }
-            let mut child = command
+            let child = command
                 .spawn()
                 .context("start memory lifetime supervisor")?;
+            let mut owner = Owner {
+                child: Some(child),
+                lifetime: None,
+                retained: options.retained.clone(),
+                reap_guard: reap_guard.clone(),
+            };
+            let child = owner
+                .child
+                .as_mut()
+                .expect("newly spawned memory supervisor");
             let lifetime = child
                 .stdin
                 .take()
@@ -303,11 +336,6 @@ impl Server {
                 .stdout
                 .take()
                 .context("supervisor readiness pipe missing")?;
-            let mut owner = Owner {
-                child: Some(child),
-                lifetime: None,
-                retained: options.retained.clone(),
-            };
             owner.lifetime = Some(pipe::Sender::from_owned_fd(OwnedFd::from(lifetime))?);
             let mut output = pipe::Receiver::from_owned_fd(OwnedFd::from(output))?;
             let response = timeout(options.timeout + Duration::from_secs(2), async {
@@ -352,6 +380,7 @@ impl Server {
                 child: Some(child),
                 lifetime: None,
                 retained: options.retained.clone(),
+                reap_guard: reap_guard.clone(),
             };
             let response = timeout(options.timeout + Duration::from_secs(2), async {
                 owner.lifetime = Some(accept.await?);
@@ -402,12 +431,20 @@ impl Server {
             )
             .await
             .context("authenticate post-readiness memory connection")?;
-            let result = verify_identity(&probe, &directory, &identity)
+            let verification = verify_identity(&probe, &directory, &identity)
                 .await
                 .context("verify post-readiness memory identity");
-            probe.close().await;
-            result?;
-            Ok::<_, anyhow::Error>(identity)
+            let closed = timeout(CLOSE_GRACE, probe.close())
+                .await
+                .context("post-readiness memory pool close deadline exceeded");
+            match (verification, closed) {
+                (Ok(()), Ok(())) => Ok(identity),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(()), Err(error)) => Err(error),
+                (Err(error), Err(close)) => Err(error.context(format!(
+                    "post-readiness memory cleanup also failed: {close:#}"
+                ))),
+            }
         }
         .await;
         let identity = match verified {
@@ -428,6 +465,7 @@ impl Server {
             endpoint,
             options.read_only,
             owner,
+            reap_guard,
         ))
     }
 
@@ -437,6 +475,7 @@ impl Server {
         endpoint: Endpoint,
         read_only: bool,
         owner: Option<Owner>,
+        reap_guard: Arc<StdMutex<Option<File>>>,
     ) -> Self {
         Self(Arc::new(ServerInner {
             directory,
@@ -445,6 +484,7 @@ impl Server {
             read_only,
             pools: Mutex::new(BTreeMap::new()),
             owner: Mutex::new(owner),
+            reap_guard,
             closed: AtomicBool::new(false),
         }))
     }
@@ -489,7 +529,7 @@ impl Server {
             }
         })
         .await;
-        let stop_result = if let Some(mut owned) = owner.take() {
+        let stop_result: Result<()> = if let Some(mut owned) = owner.take() {
             finish_owner(&mut owned).await
         } else {
             Ok(())
@@ -497,6 +537,38 @@ impl Server {
         stop_result?;
         pool_result.context("memory pool close deadline exceeded")?;
         Ok(())
+    }
+
+    pub(crate) fn take_reap_guard(&self) -> File {
+        self.0
+            .reap_guard
+            .lock()
+            .expect("memory reap guard lock")
+            .take()
+            .expect("installed memory reap guard")
+    }
+
+    pub(crate) async fn close_installed_guard(&self) -> Result<File> {
+        let mut owner = self.0.owner.lock().await;
+        self.0.closed.store(true, Ordering::Release);
+        let pools = std::mem::take(&mut *self.0.pools.lock().await);
+        let pool_result = timeout(CLOSE_GRACE, async {
+            for pool in pools.values().filter_map(Weak::upgrade) {
+                pool.close().await;
+            }
+        })
+        .await;
+        let stop_result: Result<()> = if let Some(mut owned) = owner.take() {
+            match finish_owner(&mut owned).await {
+                Ok(()) => Ok(()),
+                Err(error) => return Err(error),
+            }
+        } else {
+            Ok(())
+        };
+        stop_result?;
+        pool_result.context("memory pool close deadline exceeded")?;
+        Ok(self.take_reap_guard())
     }
 
     /// Transfer an ephemeral fixture's directory to the lifecycle owner. It is

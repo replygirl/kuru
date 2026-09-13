@@ -70,6 +70,25 @@ partial or superseded imports are stopped and preserved under `memory/interrupte
 before retry. Unknown data fails explicitly. Correct the reported error and retry;
 do not delete the source or bypass identity checks to force an import.
 
+## Schema upgrades
+
+Writable opens apply compatible Dolt schema upgrades in order before making a
+store available. Each step is built on an isolated internal branch and reaches
+`main` only through a checked fast-forward after its committed receipt and
+schema are validated. Failed or interrupted attempts remain preserved for
+inspection; Kuru does not reset or delete them during startup. A read-only open
+reports an older supported schema without changing it, and an unknown future or
+inconsistent schema fails without modifying the store.
+
+Startup also stops when retained migration attempts are ambiguous or exceed its
+bounded inventory. It preserves those branches and reports the condition for
+recovery rather than deleting or resetting history.
+
+The SQL schema version is independent from the format-1 `ready.json` activation
+record, the database identity record, and the supervisor protocol. An old dream
+candidate stays on its recorded historical schema and remains stale if `main`
+has since advanced; it is never silently rewritten by an upgrade.
+
 ## Dream revisions and undo
 
 Dreams use an isolated candidate branch. Their notes, histories, reports and

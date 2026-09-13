@@ -124,12 +124,18 @@ mod tests {
                 format!("{error:#}").contains("observer closed before release"),
                 "{error:#}"
             );
-            let lease = Server::quiescence_at(
-                &observed.stage,
-                namespace.as_deref(),
-                Duration::from_secs(5),
-            )
-            .await?;
+            let preserved = root
+                .path()
+                .join("memory/interrupted")
+                .join(observed.stage.file_name().unwrap());
+            let stopped_stage = if after_marker {
+                &observed.stage
+            } else {
+                &preserved
+            };
+            let lease =
+                Server::quiescence_at(stopped_stage, namespace.as_deref(), Duration::from_secs(5))
+                    .await?;
             assert_eq!(lease.directory.identity().to_bytes(), observed.identity);
             assert!(!observed.stage.join("endpoint.json").exists());
             drop(lease);
@@ -142,10 +148,6 @@ mod tests {
                 );
                 assert_eq!(recovered.revision().await?, observed.initial_revision);
             } else {
-                let preserved = root
-                    .path()
-                    .join("memory/interrupted")
-                    .join(observed.stage.file_name().unwrap());
                 assert_eq!(
                     files::directory(&preserved)?.identity().to_bytes(),
                     observed.identity
