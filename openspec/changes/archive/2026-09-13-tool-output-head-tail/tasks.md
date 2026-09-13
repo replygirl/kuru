@@ -21,5 +21,5 @@
 
 - [x] 3.1 Update built-in-tool documentation to distinguish bounded retained
   excerpts from unchanged shell deadlines and hard MCP parser framing limits.
-- [ ] 3.2 Run focused connector/runtime/TUI checks, record native Windows and
+- [x] 3.2 Run focused connector/runtime/TUI checks, record native Windows and
   coordinated coverage evidence honestly, then validate the change strictly.

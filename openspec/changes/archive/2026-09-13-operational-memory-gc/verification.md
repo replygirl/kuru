@@ -23,7 +23,7 @@
 ## 5. Quality and portability
 
 - [x] 5.1 @integration (agent) run focused memory/runtime Rust format, lint, typecheck and actual-Dolt tests -> affected checks pass and exact observed outcomes are recorded
-- [ ] 5.2 @integration (agent) run one coordinated workspace coverage task plus native macOS/Linux and Windows real-Dolt lifecycle fixtures -> workspace line coverage remains at least 90 percent and each platform proves effective GC, ref recovery, session ownership and historical readability
+- [x] 5.2 @integration (agent) run one coordinated workspace coverage task plus native macOS/Linux and Windows real-Dolt lifecycle fixtures -> PR18's coordinated normal hook measured `32886/35006 = 93.9439%`; hosted PR18 `ba4a3b7` run `34769483594` passed Ubuntu, macOS, and Windows full application/native behavior.
 
 ## Observed evidence
 
@@ -31,6 +31,4 @@
 - 2026-09-13 macOS arm64: the focused runtime tests `accepted_dream_promotion_wins_cancellation_and_publishes_exactly`, `explicit_cancellation_keeps_live_dream_state_and_private_histories_isolated` and `stale_promotion_keeps_later_live_data_and_discards_all_candidate_effects` passed against actual Dolt. Log: `/private/tmp/kuru-operational-gc-runtime-tests.log`.
 - 2026-09-13 macOS arm64: `configured_startup_budget_is_not_preempted_by_a_shorter_query_timer` passed and observed `@@GLOBAL.dolt_auto_gc_enabled = 1`. Log: `/private/tmp/kuru-operational-gc-server-setting.log`.
 - 2026-09-13 local static checks: `mise run //packages/kuru-memory:typecheck`, `mise run //packages/kuru-runtime:typecheck`, both package lint tasks, Rust formatting, strict cospec validation and the actual acknowledged apply gate passed. `mise run docs:check` built and checked the curated site successfully. The root `format:check` aggregate reached an unchanged TOML check whose pinned Taplo process panicked in macOS `system-configuration` while creating a dynamic-store object; no TOML file is changed and the affected Rust format gate passes.
-- Pending: the single coordinated workspace coverage run and full native macOS/Linux/Windows acceptance. The focused macOS cases above establish local native behavior for the changed paths but do not replace the coordinated platform row.
-
-- 2026-09-13 hosted PR18 `d9d49ad`: Ubuntu and macOS native behavior jobs passed. Windows full application evidence remains pending: rerun attempt 2 passed the previously failing unchanged memory provisioning fixture, but the job then failed an inherited encoded-stock-PowerShell timeout (`built_in_shell_reconstructs_stock_module_paths_without_losing_other_environment`).
+- The coordinated PR18 normal hook passed all eight categories at `32886/35006 = 93.9439%` (`ba4a3b7`). Hosted PR18 `ba4a3b7` run `34769483594` then passed Ubuntu, macOS, Windows platform, and Windows full-application behavior.

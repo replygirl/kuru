@@ -10,4 +10,4 @@
 ## 3. Documentation and verification
 
 - [x] 3.1 Document the informational notice and exact memory controls in owning memory pages, and verify docs checks.
-- [x] 3.2 Run focused app/memory format, typecheck, lint, and behavior checks; record observed evidence and retain native Windows/combined coverage as pending until run.
+- [x] 3.2 Run focused app/memory format, typecheck, lint, and behavior checks; record observed local, coordinated-coverage, and native Windows evidence.

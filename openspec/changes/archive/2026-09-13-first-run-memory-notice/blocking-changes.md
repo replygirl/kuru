@@ -6,11 +6,11 @@ None.
 
 ## Soft-blocked by
 
-- [ ] `explicit-project-purge` — source-present confirmed purge command and
+- [x] `explicit-project-purge` — source-present confirmed purge command and *(archived 2026-09-13)*
   bounded app diagnostics cleanup supply the linked first-run control boundary.
 - [x] `memory-export` — source-present provider-free committed-snapshot export *(archived 2026-09-13)*
   supplies the exact first-run control spelling.
-- [ ] `turn-journal-cancellation` — source-present completed-frame and ordered
+- [x] `turn-journal-cancellation` — source-present completed-frame and ordered *(archived 2026-09-13)*
   terminal cleanup behavior supplies the TUI presentation boundary.
 
 ## Siblings

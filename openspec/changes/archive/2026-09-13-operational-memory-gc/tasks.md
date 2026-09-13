@@ -22,4 +22,4 @@
 ## 5. Coordinated acceptance
 
 - [x] 5.1 Run focused real-Dolt receipt, candidate, runtime cancellation, GC, Rust format, lint and typecheck checks; record exact observed outcomes in the verification ledger
-- [ ] 5.2 Run the single coordinated workspace coverage task and native macOS/Linux/Windows lifecycle checks; retain the 90 percent floor and record unavailable native evidence honestly
+- [x] 5.2 Run the single coordinated workspace coverage task and native macOS/Linux/Windows lifecycle checks; retain the 90 percent floor and record unavailable native evidence honestly

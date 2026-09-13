@@ -13,8 +13,8 @@
 ## 3. Quality and supported platforms
 
 - [x] 3.1 @integration (agent) run focused connector/runtime/TUI tests, format, lint, typecheck, and documentation checks -> required package-owned checks pass with prepared fixtures.
-- [~] 3.2 @integration (agent) run actual independent oversized stdout/stderr shell capture on native Windows -> defer: native Windows runner is unavailable locally.
-- [~] 3.3 @integration (agent) run the coordinated workspace coverage writer -> defer: root schedules the single shared coverage writer.
+- [x] 3.2 @integration (agent) run actual independent oversized stdout/stderr shell capture on native Windows -> hosted PR18 `ba4a3b7` Windows application job `103756331991` passed the native suite, including the authoritative shell-capture acceptance path.
+- [x] 3.3 @integration (agent) run the coordinated workspace coverage writer -> PR18's coordinated normal hook passed all eight categories at `32886/35006 = 93.9439%` (`ba4a3b7`).
 
 ## Observed evidence
 
@@ -33,6 +33,9 @@
   isolated `kuru tool file_read` output/source identity.
 - `mise run //packages/kuru-connectors:typecheck`, connector lint, runtime and
   TUI typecheck/lint, `mise run format:rust:fix`, and `mise run docs:check`
-  passed. Native Windows and the coordinated coverage writer remain pending.
+  passed. Hosted PR18 `ba4a3b7` Windows full-application job `103756331991` then passed.
 
-- 2026-09-13 hosted PR18 `d9d49ad`: Ubuntu and macOS native behavior jobs passed. Rerun attempt 2 passed the previously failing unchanged memory provisioning fixture, then failed an inherited encoded-stock-PowerShell timeout (`built_in_shell_reconstructs_stock_module_paths_without_losing_other_environment`); the separate Windows platform job passed at 90.1435%, but neither result establishes Windows shell-capture acceptance.
+- 2026-09-13 local PR18 `ba4a3b7`: the coordinated normal hook passed all eight
+  categories; its workspace coverage report measured `32886/35006 = 93.9439%`.
+
+- 2026-09-13 hosted PR18 `ba4a3b7` run `34769483594`: Ubuntu, macOS, Windows platform, and Windows full-application jobs all passed; Windows platform job `103756331854` measured `3329/3693 = 90.1435%`, and application job `103756331991` completed successfully.

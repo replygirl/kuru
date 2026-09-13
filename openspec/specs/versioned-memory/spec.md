@@ -8,13 +8,7 @@ isolated candidates and recoverable legacy imports.
 
 ### Requirement: Managed full Dolt storage
 
-Kuru SHALL use pinned full Dolt for live memory and include the verified official
-native archive and runtime licenses in its executable. It MUST provision the
-matching engine locally without a compiler, separate installation or runtime
-download, including on a first offline launch. It MUST reject unsafe archives
-and corrupt executables before execution and SHALL NOT silently fall back to
-SQLite. Existing verified caches MAY be reused; corrupt existing caches MUST fail
-explicitly without destructive repair.
+Kuru SHALL use pinned full Dolt for live memory and include the verified official native archive and runtime licenses in its executable. It MUST provision the matching engine locally without a compiler, separate installation or runtime download, including on a first offline launch. It MUST reject unsafe archives and corrupt executables before execution and SHALL NOT silently fall back to SQLite. Existing verified caches MAY be reused; corrupt existing caches MUST fail explicitly without destructive repair. An explicit observed open MAY report only fixed, bounded stage values for actual startup work; it MUST leave ordinary library opens silent, must not weaken any payload digest or exact-version probe, and MUST report ready only after final store validation and activation succeed.
 
 #### Scenario: First memory use
 - **WHEN** memory is opened without an extracted runtime
@@ -23,6 +17,10 @@ explicitly without destructive repair.
 #### Scenario: Offline cache
 - **WHEN** offline memory access uses a valid cached runtime
 - **THEN** memory opens using that verified cache; an absent cache is initialized from bundled bytes, while an invalid existing cache gives a clear error.
+
+#### Scenario: Observed startup
+- **WHEN** an application requests an observed memory open
+- **THEN** it receives fixed stages only where project ownership, managed cache verification or extraction, version probing, database preparation or opening actually begins, and receives ready only with a usable returned store.
 
 ### Requirement: Owned private server lifecycle
 
@@ -52,10 +50,7 @@ through any move and revalidate directory and lock identity.
 
 ### Requirement: Isolated durable revisioned memory
 
-Memory SHALL preserve byte-sensitive namespace/key identity, message order,
-opaque JSON values and existing validation. Mutations SHALL be atomic versioned
-batches with operation identity for uncertain-response reconciliation. Views MUST
-remain pinned to their branch, and candidate promotion MUST require its live base.
+Memory SHALL preserve byte-sensitive namespace/key identity, message order, opaque JSON values and existing validation. Mutations SHALL be atomic versioned batches with operation identity for uncertain-response reconciliation. Views MUST remain pinned to their branch, and candidate promotion MUST require its live base. A writable app may record one project-scoped first-run notice version only after the notice has been successfully presented; that state records presentation, not reading or consent. Missing or lower versions are pending, current or higher integer versions are settled, and malformed values MUST fail without a new mutation. Memory and conversation history SHALL NOT expire automatically.
 
 #### Scenario: Transaction failure
 - **WHEN** a batch fails after one row change
@@ -69,13 +64,17 @@ remain pinned to their branch, and candidate promotion MUST require its live bas
 - **WHEN** live memory changes after a candidate captures its base
 - **THEN** promotion fails without overwriting either history.
 
+#### Scenario: First-run presentation is durable
+- **WHEN** a writable project successfully presents the pending notice
+- **THEN** one ordinary committed state revision records its version and a reopened store does not present that version again.
+
+#### Scenario: Presentation fails
+- **WHEN** stderr output or the first completed TUI draw fails before the notice is visible
+- **THEN** the notice version remains pending and no provider or peer history receives notice text.
+
 ### Requirement: Preserved SQLite migration
 
-Migration MUST validate the legacy store, preserve its original and a consistent
-snapshot including committed WAL data, and activate only a validated committed
-Dolt import. It SHALL preserve current-project rows, ordering and JSON exactly;
-other projects SHALL remain recoverable from the preserved source. Interrupted
-imports SHALL be recoverable without duplicate activation or source modification.
+Migration MUST validate the legacy store, preserve its original and a consistent snapshot including committed WAL data, and activate only a validated committed Dolt import. It SHALL preserve current-project rows, ordering and JSON exactly; other projects SHALL remain recoverable from the preserved source. Interrupted imports SHALL be recoverable without duplicate activation or source modification. When a legacy Unix data directory is not owner-private, Kuru MUST refuse before opening or importing it with an actionable remedy naming that directory; it MUST not silently change permissions. Windows guidance MUST use the native owner privacy contract rather than a Unix mode command.
 
 #### Scenario: Existing conversations
 - **WHEN** an existing project first opens with Dolt
@@ -84,6 +83,10 @@ imports SHALL be recoverable without duplicate activation or source modification
 #### Scenario: Failed import
 - **WHEN** validation or activation is interrupted
 - **THEN** the original remains usable and no partial target becomes the active memory store.
+
+#### Scenario: Unsafe legacy directory
+- **WHEN** a Unix legacy SQLite layout is in a non-owner-private data directory
+- **THEN** Kuru refuses before import and identifies the actual directory and its owner-only repair command.
 
 ### Requirement: Memory inspection
 
@@ -321,3 +324,110 @@ dump internal tables.
 - **WHEN** an application reuses a page cursor with another captured snapshot
   or a later page/schema read fails
 - **THEN** the read fails before a successful complete export is reported
+
+### Requirement: Atomic durable turn checkpoints
+
+Each admitted turn SHALL retain a versioned application-state journal value containing its original bounded ID, exact request identity, ordered lifecycle transitions, possible-dispatch state, and any authoritative completed `TurnOutput`. Admission MUST atomically write the started journal state with exactly one early user transcript row. Completion MUST atomically write the ended journal state, exactly one assistant transcript row, and the matching session, topology, and session-index values. Interrupted turns MUST retain their user transcript and journal history without fabricating an assistant message. These records SHALL use the existing message and opaque state schema and remain ordinary durable user content.
+
+#### Scenario: Interrupted admitted prompt
+- **WHEN** a turn is cancelled or fails after its admission checkpoint and before completion
+- **THEN** its user prompt and started/interrupted journal history remain durable with no assistant transcript row.
+
+#### Scenario: Atomic completed answer
+- **WHEN** completion is accepted or its acknowledgement is lost
+- **THEN** reconciliation observes either the complete assistant/session/journal checkpoint or its complete absence, without a partial checkpoint or duplicate transcript row.
+
+#### Scenario: Safe pre-dispatch resume
+- **WHEN** a matching started or interrupted ID has no possible-dispatch marker
+- **THEN** the harness may resume it without appending the existing user transcript again.
+
+### Requirement: Dispatch uncertainty precedes actor work
+
+The journal possible-dispatch marker MUST become durable before work is sent to an actor mailbox or any provider, tool, cognitive, or A2A operation can begin. Recovery MUST treat the marker conservatively and MUST NOT claim whether a particular external call occurred.
+
+#### Scenario: Loss around actor admission
+- **WHEN** cancellation or process loss occurs after possible-dispatch persistence but before or during actor work
+- **THEN** recovery surfaces an incomplete possibly dispatched turn and does not duplicate private actor history or external effects through automatic replay.
+
+### Requirement: Bounded operational storage maintenance
+
+After reconciling any prior uncertain mutation, each branch SHALL retain only
+the current mutation receipt in active state and MUST replace that receipt in
+the same transaction as the next mutation. Candidate branches MUST be reclaimed
+only after an explicit promotion or abandonment is durably represented by an
+exact Kuru-owned branch-ref transition, all accepted candidate writes have
+settled, and every relevant SQL session has ended. Age, process IDs, handle
+drops, broad name-prefix matches and old unrecorded branches MUST NOT authorize
+candidate deletion. Startup MUST NOT finish a merely requested promotion; it
+MAY reclaim a promoting candidate only when its exact head is already reachable
+from live history and MUST otherwise preserve it for explicit resolution.
+Known dirty, mismatched or unresolved candidate refs that require no startup
+mutation MUST NOT prevent ordinary main use; changing or ambiguous identities,
+database observation failures and unsettled SQL sessions MUST still stop startup.
+
+The owned server SHALL enable the pinned engine's bounded, growth-triggered
+automatic garbage collection and retain its diagnostics. GC MUST run inside the
+owned Dolt lifecycle, MUST preserve every referenced live, candidate, historical
+and export view, and MUST NOT be described as expiry or secure erasure.
+
+#### Scenario: Current receipt replaces reconciled receipt
+
+- **WHEN** repeated mutations commit, including one whose acknowledgement is lost
+- **THEN** the lost result is reconciled before the next mutation, which atomically replaces the prior receipt while preserving both committed revisions.
+
+#### Scenario: Candidate transition is partially observed
+
+- **WHEN** process loss or a dropped reply leaves both an ordinary candidate ref and its exact status ref
+- **THEN** Kuru compares both exact names and heads after SQL-session teardown, preserves every mismatched or uncertain state, and removes an exact duplicate only while retaining the durable status ref.
+
+#### Scenario: Promotion was requested before process loss
+
+- **WHEN** startup finds a valid promoting ref whose head has not reached live history
+- **THEN** startup preserves the candidate without merging it or inferring abandonment.
+
+#### Scenario: Preserved candidate is ineligible for cleanup
+
+- **WHEN** startup finds a strict status identity whose dirty or mismatched state cannot be reclaimed without risking private history
+- **THEN** it preserves every ref and permits ordinary main use only after proving that no candidate mutation or SQL session remains unsettled.
+
+#### Scenario: Candidate is explicitly resolved
+
+- **WHEN** promotion has made the candidate head reachable from live history or settled runtime failure explicitly abandons the candidate
+- **THEN** Kuru reclaims only the exact resolved ref under owned no-live-view authority, while promoted main history and unrelated unresolved candidates remain readable.
+
+#### Scenario: Pinned engine performs garbage collection
+
+- **WHEN** the configured growth threshold schedules GC or an actual-engine fixture invokes the same pinned collector
+- **THEN** one engine-owned collection uses session-aware safepoints, preserves referenced revisions and usable connections, and ends when the owned server is reaped.
+
+### Requirement: Explicit managed-project purge
+
+Kuru SHALL expose an explicitly confirmed, canonical-project-scoped purge that
+removes the verified managed Dolt store and all of its managed revision history.
+It MUST acquire and verify the command writer/startup/lifecycle authority before
+publishing any destructive intent, MUST NOT provision an engine, import legacy
+SQLite, construct a provider, or kill another owner, and MUST retain stable lock
+objects. One checked control record MUST retain legacy-import suppression and any
+incomplete original/quarantine identity inventory until removal is verified. An
+ordinary open MUST reject incomplete purge authority; after completed purge it MAY
+create an empty fresh store but MUST NOT automatically import the suppressed
+project from legacy SQLite.
+
+#### Scenario: Confirmed project purge
+- **WHEN** the user confirms purge for a quiescent managed project
+- **THEN** Kuru removes only that project's verified active and retained managed
+  recovery trees, verifies their absence, and records completed legacy-import
+  suppression without altering another project, shared legacy source, export,
+  engine cache, or stable lock.
+
+#### Scenario: Live owner or interrupted removal
+- **WHEN** lifecycle authority cannot be acquired or removal is interrupted
+- **THEN** no unverified path is removed, a live-owner refusal leaves no new
+  purge record, and a retry uses the recorded identities rather than a
+  replacement occupying an original pathname.
+
+#### Scenario: Legacy reopen after purge
+- **WHEN** a project with importable legacy SQLite is purged and later opened
+- **THEN** the project opens as a fresh empty managed store without resurrecting
+  the suppressed project's legacy rows while other project imports remain
+  available.

@@ -58,9 +58,9 @@ Filesystem tools MUST enforce canonical workspace containment and protect
 instruction/configuration paths. Mutations and shell execution MUST require
 explicit opt-ins and matching workspace approval when automatic ancestor
 configuration contributes their effective grant. Shell execution MUST have time
-and output bounds and SHALL be described as process authority rather than a
-filesystem sandbox; workspace approval does not widen tool roots or make
-private same-user state inaccessible to a shell.
+and independent stdout and stderr retained-output bounds and SHALL be described
+as process authority rather than a filesystem sandbox; workspace approval does
+not widen tool roots or make private same-user state inaccessible to a shell.
 
 The built-in shell MUST receive only this finite inherited compatibility
 environment when each entry exists. Unix entries are `PATH`, `HOME`, `USER`,
@@ -106,6 +106,14 @@ absence confirmation; it MUST NOT claim synchronous cleanup. This ownership is
 limited to the built-in shell and MUST NOT claim control of escaped processes,
 the memory writer lease, or configured MCP lifecycles.
 
+Built-in file-read and shell output that exceeds its retained-output budget MUST
+remain a bounded visible head-and-tail excerpt after recognized-secret projection,
+rather than fail solely for crossing that retention budget. The excerpt MUST keep
+UTF-8 boundaries and every visible recognized-secret marker whole. Model-facing
+tool receipts MUST retain the call ID and valid JSON while applying the same
+bounded excerpt rule. MCP stdio, HTTP JSON, and SSE framing/parser admission
+bounds remain separate protocol limits.
+
 #### Scenario: Symlink escape
 - **WHEN** a filesystem call follows a workspace symlink outside the root
 - **THEN** the operation fails without modifying the outside file.
@@ -144,6 +152,17 @@ the memory writer lease, or configured MCP lifecycles.
 #### Scenario: Unix ownership observation remains interrupted
 - **WHEN** repeated bounded `EINTR` leaves an owned root anchored beyond the caller's cleanup allowance
 - **THEN** the caller receives a fixed unconfirmed result while the registered worker retains ownership, later makes its one destructive transition after a valid observation, and never signals again after that transition starts.
+
+#### Scenario: Oversized built-in shell streams
+- **WHEN** shell stdout or stderr exceeds its independent retained-output budget
+- **THEN** the completed tool result preserves a marked head and tail for that
+  stream, drains both streams through EOF within the existing operation and
+  cleanup authority, and does not combine their budgets or extend its deadline.
+
+#### Scenario: Tail survives a model receipt boundary
+- **WHEN** a projected built-in tool result exceeds the model receipt budget
+- **THEN** the receipt remains valid JSON with its original call ID and contains
+  a marked head-and-tail excerpt without a partial recognized-secret marker.
 
 ### Requirement: Standard protocol adapters
 
@@ -488,3 +507,27 @@ Recognizable-secret scanning MUST occur on stderr byte chunks before bounded ret
 
 - **WHEN** shutdown races starting, active, and idle aliases
 - **THEN** no new alias is admitted after closure, every already-admitted client receives a cleanup attempt, successful shutdown confirms their cleanup, and the aggregate wait is bounded once rather than once per configured server
+
+### Requirement: Turn cancellation stops dispatch admission
+
+Provider completion, built-in tool, MCP, and outbound A2A dispatch initiated by a turn MUST observe the same explicit cancellation signal before admission and while awaiting a cancellable response. Cancellation MUST NOT replay an ambiguous request. It MUST release logical runtime permits and locks while connector-owned subprocess workers retain responsibility for bounded cleanup and honest unconfirmed state.
+
+#### Scenario: Cancel before dispatch
+- **WHEN** cancellation becomes visible before an actor, provider, tool, MCP alias, or A2A request is admitted
+- **THEN** that operation sends no request or process input and the next valid operation can proceed.
+
+#### Scenario: Cancel after observed dispatch
+- **WHEN** a local fixture observes one provider, shell, MCP, or A2A dispatch before cancellation
+- **THEN** Kuru sends it at most once, records the turn as interrupted and possibly dispatched, and leaves any process cleanup with its existing retained owner.
+
+#### Scenario: Accepted memory operation during cancellation
+- **WHEN** a cognitive state or note mutation is accepted before cancellation is observed
+- **THEN** the mutation is completed or reconciled before interruption is recorded and a later mutation begins.
+
+### Requirement: Typed retry observation
+
+Provider retry handling SHALL emit only literal operation category, attempt, safe status classification, delay or exhaustion outcome, and elapsed time to the application's operational tracing target. It MUST NOT emit request payloads, headers, endpoints, provider diagnostic text, or error chains.
+
+#### Scenario: Retryable rejection
+- **WHEN** a retryable provider rejection schedules a later attempt
+- **THEN** the diagnostic observation identifies the typed retry outcome without admitting remote text.

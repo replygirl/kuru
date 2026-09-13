@@ -17,58 +17,42 @@ The documentation site MUST publish only deliberately authored product documenta
 
 ### Requirement: Usable product reference
 
-The site SHALL document working installation, authentication, terminal controls,
-framework concepts, memory, dreaming, configuration precedence, workspace trust, tools, MCP, A2A,
-and bounded/redacted provider-failure behavior with examples matching the current
-implementation. It MUST explain exact-root full-manifest approval invalidation,
-command-specific noninteractive behavior, redacted review and diagnostic output,
-the non-persistent subset-only one-invocation grant, `config`'s saved-preferences
-omission, and that workspace trust does not provide process sandboxing or an
-atomic Unix cwd binding. It MUST state that provider failure text is classified from
-bounded input rather than treated as authoritative remote text. The memory
-reference MUST document selected-note sequence IDs and explicit forgetting as an
-active-view deletion that retains prior Dolt revisions and does not claim secure
-erasure, removal of other text, automatic expiry, or a restore command. It MUST
-describe that catalog and completion retries are bounded by one operation deadline and
-finite attempts, apply only to selected rejected provider responses before a
-response is accepted, and do not promise replay after a stream, partial output,
-ambiguous transport outcome, or possibly dispatched credential refresh. It MUST
-document that `kuru memory export` produces one committed active-main snapshot of
-every application message and state record, identifies its revision and schema,
-preserves stored content including unknown fields, and does not erase or rewrite
-history. It MUST distinguish JSON as the interchange format from Markdown's
-equivalent rendering, explain stdout versus checked no-replacement file output,
-and state that uncommitted, candidate-only, prior-revision, and operational data
-are excluded.
+The site SHALL document working installation, authentication, terminal controls, framework concepts, memory, dreaming, configuration precedence, workspace trust, tools, MCP, A2A, and bounded/redacted provider-failure behavior with examples matching the current implementation. It MUST explain exact-root full-manifest approval invalidation, command-specific noninteractive behavior, redacted review and diagnostic output, the non-persistent subset-only one-invocation grant, `config`'s saved-preferences omission, and that workspace trust does not provide process sandboxing or an atomic Unix cwd binding. It MUST state that provider failure text is classified from bounded input rather than treated as authoritative remote text. The memory reference MUST document selected-note sequence IDs and explicit forgetting as an active-view deletion that retains prior Dolt revisions and does not claim secure erasure, removal of other text, automatic expiry, or a restore command. It MUST explain the one-time informational memory notice, its actual-directory/control content, and that explicit project purge remains a separate confirmed managed-history operation with detailed retained-copy help.
+
+It MUST describe that catalog and completion retries are bounded by one operation deadline and finite attempts, apply only to selected rejected provider responses before a response is accepted, and do not promise replay after a stream, partial output, ambiguous transport outcome, or possibly dispatched credential refresh. It MUST document that `kuru memory export` produces one committed active-main snapshot of every application message and state record, identifies its revision and schema, preserves stored content including unknown fields, and does not erase or rewrite history. It MUST distinguish JSON as the interchange format from Markdown's equivalent rendering, explain stdout versus checked no-replacement file output, and state that uncommitted, candidate-only, prior-revision, and operational data are excluded. It MUST explain that memory startup messages describe current verified work on stderr, do not estimate completion or reduce integrity checks, and that an unsafe legacy Unix data directory requires an owner-only permission repair before import.
 
 #### Scenario: Selected-note retention disclosure
 - **WHEN** a visitor reads the memory command reference
-- **THEN** it explains how to select one stored note and that forgetting leaves prior revisions and unrelated text intact
-
-#### Scenario: First use
-- **WHEN** a visitor follows the first conversation guide
-- **THEN** they can run the offline demo without credentials and find model
-  discovery and authenticated setup instructions
-
-#### Scenario: Ancestor authority
-- **WHEN** a visitor encounters a workspace-trust prompt or noninteractive refusal
-- **THEN** the reference explains the approval and revocation flow without
-  suggesting that approval confines shell process authority.
-
-#### Scenario: Provider failure contract
-- **WHEN** a visitor reads the provider protocol reference
-- **THEN** it explains that completion and model-catalog failures use fixed,
-  bounded, redacted diagnostics without exposing provider body text
-
-#### Scenario: Provider retry contract
-- **WHEN** a visitor reads the provider protocol reference
-- **THEN** it explains finite retry and Retry-After limits without claiming that
-  Kuru replays accepted streams, ambiguous requests, or rotating credential POSTs
+- **THEN** it explains how to select one stored note and that forgetting leaves prior revisions and unrelated text intact.
 
 #### Scenario: Memory snapshot export
 - **WHEN** a visitor reads the memory command reference
 - **THEN** they can request a committed full-project JSON or Markdown snapshot
   without inferring that it deletes, redacts, or includes candidate working data
+
+#### Scenario: Memory startup and legacy import
+- **WHEN** a visitor encounters verified memory startup work or a legacy privacy refusal
+- **THEN** the documentation distinguishes fixed progress from completion and gives the applicable owner-private recovery guidance without promising an automatic repair.
+
+#### Scenario: First use
+- **WHEN** a visitor follows the first conversation guide
+- **THEN** they can run the offline demo without credentials and find model discovery and authenticated setup instructions.
+
+#### Scenario: First-run memory controls
+- **WHEN** a visitor reads the memory concept reference
+- **THEN** it distinguishes the informational first-run notice from consent and identifies notes, export, selected forgetting, and confirmed purge boundaries.
+
+#### Scenario: Ancestor authority
+- **WHEN** a visitor encounters a workspace-trust prompt or noninteractive refusal
+- **THEN** the reference explains the approval and revocation flow without suggesting that approval confines shell process authority.
+
+#### Scenario: Provider failure contract
+- **WHEN** a visitor reads the provider protocol reference
+- **THEN** it explains that completion and model-catalog failures use fixed, bounded, redacted diagnostics without exposing provider body text.
+
+#### Scenario: Provider retry contract
+- **WHEN** a visitor reads the provider protocol reference
+- **THEN** it explains finite retry and Retry-After limits without claiming that Kuru replays accepted streams, ambiguous requests, or rotating credential POSTs.
 
 ### Requirement: Accessible navigation and product identity
 
@@ -126,3 +110,30 @@ The curated documentation SHALL explain that MCP tools are discovered per config
 
 - **WHEN** a configured MCP server fails while another server remains healthy
 - **THEN** the tools and protocol references explain which tools remain available, where the safe status and optional stderr diagnostic appear, and why Kuru neither replays the failed call nor claims arbitrary-secret or escaped-process containment
+
+### Requirement: Honest memory maintenance documentation
+
+The owning memory documentation SHALL explain automatic Dolt GC, mutation
+receipt replacement and resolved candidate reclamation. It MUST state that Kuru
+does not automatically expire conversations or notes, preserves reachable Dolt
+revisions and unresolved candidates, continues to grow with retained history,
+and does not provide secure erasure through GC.
+
+#### Scenario: User reviews retention behavior
+
+- **WHEN** a user reads either memory guide to understand storage growth or deletion
+- **THEN** they can distinguish operational cleanup from user-history retention and find no automatic-expiry or secure-erasure claim.
+
+### Requirement: Explicit project-purge boundary
+
+Curated documentation SHALL explain the confirmed project-memory purge command,
+that it removes the selected managed Dolt current store and revision history, and
+that it does not promise secure physical erasure. It MUST distinguish retained
+original/shared legacy SQLite, user exports/backups, engine cache, and other
+projects, and state that selected-note forgetting retains historical revisions.
+
+#### Scenario: User evaluates deletion scope
+- **WHEN** a user reads memory controls before confirming a purge
+- **THEN** they can distinguish managed project-history removal from retained
+  shared/original copies and do not receive a secure-erasure or automatic-expiry
+  promise.
