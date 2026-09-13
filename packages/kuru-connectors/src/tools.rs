@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    io::{Read, Write},
+    io::Write,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -22,10 +22,11 @@ use kuru_platform::fs::{regular_file_info, validate_component};
 use serde_json::{Value, json};
 #[cfg(all(unix, test))]
 use std::process::Stdio;
+use tokio::io::AsyncReadExt;
 #[cfg(all(unix, test))]
 use tokio::process::Command;
 #[cfg(any(windows, test))]
-use tokio::{io::AsyncReadExt, time::timeout};
+use tokio::time::timeout;
 #[cfg(windows)]
 type PathGuard = Directory;
 #[cfg(unix)]
@@ -250,7 +251,7 @@ impl ToolHost {
         let mut specs = vec![
             spec(
                 "file_read",
-                "Read a UTF-8 project file (2 MiB limit).",
+                "Read a UTF-8 project file with a bounded head-and-tail excerpt.",
                 &["path"],
                 &["path"],
             ),
@@ -308,7 +309,7 @@ impl ToolHost {
         }
         match name {
             "file_read" => {
-                let execution = (|| -> Result<ToolExecution> {
+                let execution = async {
                     let (directory, path, _guard) = self.path(string(&args, "path")?, false)?;
                     let mut options = OpenOptions::new();
                     options.read(true).follow(FollowSymlinks::No);
@@ -339,13 +340,16 @@ impl ToolHost {
                             "hard-linked files are not readable through file tools"
                         );
                     }
-                    let mut bytes = Vec::new();
-                    file.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes)?;
-                    ensure!(bytes.len() <= MAX_BYTES, "file exceeds 2 MiB limit");
-                    Ok(ToolExecution::Text(
-                        String::from_utf8(bytes).context("file is not UTF-8")?,
+                    // Bound the stream to the initially checked regular-file extent. A
+                    // concurrent append cannot keep the scanner reading indefinitely.
+                    let extent = file.metadata()?.len();
+                    #[cfg(unix)]
+                    let file = file.into_std();
+                    Ok(ToolExecution::ProjectedText(
+                        read_file_output(tokio::fs::File::from_std(file), extent).await?,
                     ))
-                })();
+                }
+                .await;
                 execution.map_err(ToolFailure::built_in)
             }
             "file_write" => {
@@ -472,7 +476,7 @@ impl ToolHost {
                         Duration::from_millis(duration),
                     )
                     .await?;
-                    Ok(ToolExecution::Json(
+                    Ok(ToolExecution::ProjectedJson(
                         serde_json::from_str(&result).context("shell emitted invalid result")?,
                     ))
                 }
@@ -610,6 +614,8 @@ fn project_execution(execution: ToolExecution) -> Result<String> {
     match execution {
         ToolExecution::Text(text) => project_text(text),
         ToolExecution::Json(value) => project_json(value),
+        ToolExecution::ProjectedText(text) => Ok(text),
+        ToolExecution::ProjectedJson(value) => Ok(serde_json::to_string(&value)?),
         ToolExecution::ApplicationError { kind, content } => {
             let detail = project_content(content)?;
             Err(ProjectedToolError::new(kind, detail).into())
@@ -618,7 +624,15 @@ fn project_execution(execution: ToolExecution) -> Result<String> {
 }
 
 fn project_failure(failure: ToolFailure) -> Result<String> {
-    let detail = project_text(format!("{:#}", failure.error))?;
+    let detail = if let Some(diagnostic) = failure
+        .error
+        .downcast_ref::<ProjectedShellDiagnostic>()
+        .map(|diagnostic| diagnostic.0.clone())
+    {
+        diagnostic
+    } else {
+        project_text(format!("{:#}", failure.error))?
+    };
     Err(ProjectedToolError::new(failure.kind, detail).into())
 }
 
@@ -634,6 +648,36 @@ fn project_text(text: String) -> Result<String> {
 
 fn project_json(value: Value) -> Result<String> {
     redaction::json(value).map_err(|_| ProjectedToolError::output_withheld().into())
+}
+
+async fn read_file_output(mut file: tokio::fs::File, extent: u64) -> Result<String> {
+    let mut output = redaction::StreamingProjection::new(MAX_BYTES);
+    let mut pending = Vec::new();
+    let mut buffer = [0; 8192];
+    let mut remaining = extent;
+    while remaining > 0 {
+        let read = buffer.len().min(remaining.try_into().unwrap_or(usize::MAX));
+        let count = file.read(&mut buffer[..read]).await?;
+        if count == 0 {
+            break;
+        }
+        remaining -= count as u64;
+        pending.extend_from_slice(&buffer[..count]);
+        match std::str::from_utf8(&pending) {
+            Ok(_) => {
+                output.push(&pending)?;
+                pending.clear();
+            }
+            Err(error) if error.error_len().is_none() => {
+                let valid = error.valid_up_to();
+                output.push(&pending[..valid])?;
+                pending = pending[valid..].to_vec();
+            }
+            Err(_) => bail!("file is not UTF-8"),
+        }
+    }
+    ensure!(pending.is_empty(), "file is not UTF-8");
+    output.finish().map_err(Into::into)
 }
 
 fn protected_component(value: &str, writing: bool) -> bool {
@@ -752,11 +796,13 @@ async fn shell(
         .context("cannot start Windows PowerShell")?;
     let mut stdout = child.take_stdout().context("missing shell stdout")?;
     let mut stderr = child.take_stderr().context("missing shell stderr")?;
-    let mut out = ShellCapture::default();
-    let mut err = ShellCapture::default();
+    let mut out = ShellCapture::new();
+    let mut err = ShellCapture::new();
     let mut phase = "read shell output";
     let operation = async {
         tokio::try_join!(out.read(&mut stdout), err.read(&mut stderr))?;
+        out.finish()?;
+        err.finish()?;
         phase = "wait for shell process tree";
         let status = child.wait(duration).await?;
         Ok::<_, anyhow::Error>(status)
@@ -765,6 +811,7 @@ async fn shell(
         .await
         .context("shell timed out")
         .and_then(|result| result);
+    let mut failure_metadata = None;
     let result = match result {
         Ok(status) => Ok(status),
         Err(error) => {
@@ -783,15 +830,13 @@ async fn shell(
                 Ok(()) => "subprocess tree terminated".to_owned(),
                 Err(error) => format!("subprocess cleanup unconfirmed: {error:#}"),
             };
-            let diagnostic = format!(
-                "{error:#}; {phase}; stdout {} bytes (EOF {}); stderr {} bytes (EOF {}); root before cleanup: {root_state}; tree before cleanup: {observed:?}; {stopped}; stderr prefix: {}",
-                out.bytes.len(),
-                out.eof,
-                err.bytes.len(),
-                err.eof,
-                String::from_utf8_lossy(&err.bytes[..err.bytes.len().min(4096)]),
-            );
-            Err(error).context(diagnostic)
+            failure_metadata = Some(ShellFailureMetadata {
+                phase: phase.to_owned(),
+                root_state: root_state.to_owned(),
+                observed: format!("{observed:?}"),
+                stopped,
+            });
+            Err(error)
         }
     };
     let cleanup = async {
@@ -807,27 +852,111 @@ async fn shell(
     match result {
         Ok(status) => {
             cleanup?;
-            Ok(json!({"exit_code":status.code(),"success":status.success(),"stdout":String::from_utf8_lossy(&out.bytes),"stderr":String::from_utf8_lossy(&err.bytes)}).to_string())
+            Ok(json!({"exit_code":status.code(),"success":status.success(),"stdout":out.text,"stderr":err.text}).to_string())
         }
-        Err(error) => match cleanup {
-            Ok(()) => Err(error),
-            Err(cleanup) => Err(error).context(format!("shell pipe cleanup failed: {cleanup:#}")),
-        },
+        Err(error) => {
+            let error = match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => error.context(format!("shell pipe cleanup failed: {cleanup:#}")),
+            };
+            Err(projected_shell_failure(
+                error,
+                &failure_metadata.expect("shell failure metadata was recorded"),
+                &out,
+                &err,
+            )?)
+        }
     }
+}
+
+/// A source-free shell failure that has already combined and projected all raw
+/// operation, cleanup, and process-observation details.
+#[derive(Debug)]
+struct ProjectedShellDiagnostic(String);
+
+impl std::fmt::Display for ProjectedShellDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProjectedShellDiagnostic {}
+
+#[cfg(any(windows, test))]
+struct ShellFailureMetadata {
+    phase: String,
+    root_state: String,
+    observed: String,
+    stopped: String,
+}
+
+#[cfg(any(windows, test))]
+fn projected_shell_failure(
+    error: anyhow::Error,
+    metadata: &ShellFailureMetadata,
+    stdout: &ShellCapture,
+    stderr: &ShellCapture,
+) -> Result<anyhow::Error> {
+    let raw = format!(
+        "{error:#}; {}; stdout {} bytes (EOF {}); stderr {} bytes (EOF {}); root before cleanup: {}; tree before cleanup: {}; {}",
+        metadata.phase,
+        stdout.observed,
+        stdout.eof,
+        stderr.observed,
+        stderr.eof,
+        metadata.root_state,
+        metadata.observed,
+        metadata.stopped,
+    );
+    let diagnostic = format!(
+        "{}; stderr prefix: {}",
+        project_text(raw)?,
+        shell_stderr_diagnostic(stderr),
+    );
+    Ok(ProjectedShellDiagnostic(diagnostic).into())
 }
 
 // Keep accepted output outside the cancellable read future. A timeout must not
 // discard the bytes and EOF observations needed to distinguish a running shell
 // from a completed process whose output is still held by another process.
 #[cfg(any(windows, test))]
-#[derive(Default)]
 struct ShellCapture {
-    bytes: Vec<u8>,
+    projection: Option<redaction::StreamingProjection>,
+    text: Option<String>,
+    observed: usize,
     eof: bool,
+    #[cfg(test)]
+    bytes: Vec<u8>,
+}
+
+#[cfg(any(windows, test))]
+fn shell_stderr_diagnostic(capture: &ShellCapture) -> String {
+    const DIAGNOSTIC_BYTES: usize = 4096;
+
+    if capture.eof {
+        capture
+            .text
+            .as_deref()
+            .map(|text| redaction::truncate_tool_output(text, DIAGNOSTIC_BYTES))
+            .unwrap_or_default()
+    } else {
+        "<pending EOF>".to_owned()
+    }
 }
 
 #[cfg(any(windows, test))]
 impl ShellCapture {
+    fn new() -> Self {
+        Self {
+            projection: Some(redaction::StreamingProjection::new(MAX_BYTES)),
+            text: None,
+            observed: 0,
+            eof: false,
+            #[cfg(test)]
+            bytes: Vec::new(),
+        }
+    }
+
     async fn read(&mut self, reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<()> {
         let mut buffer = [0; 8192];
         loop {
@@ -836,13 +965,24 @@ impl ShellCapture {
                 self.eof = true;
                 return Ok(());
             }
-            let keep = count.min((MAX_BYTES + 1).saturating_sub(self.bytes.len()));
-            self.bytes.extend_from_slice(&buffer[..keep]);
-            ensure!(
-                self.bytes.len() <= MAX_BYTES,
-                "shell output exceeds 2 MiB limit"
-            );
+            self.observed = self.observed.saturating_add(count);
+            self.projection
+                .as_mut()
+                .expect("shell capture was already finished")
+                .push(&buffer[..count])?;
+            #[cfg(test)]
+            self.bytes.extend_from_slice(&buffer[..count]);
         }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.text = Some(
+            self.projection
+                .take()
+                .expect("shell capture was already finished")
+                .finish()?,
+        );
+        Ok(())
     }
 }
 
@@ -868,7 +1008,7 @@ mod tests {
             finishing.await.unwrap();
             writer.shutdown().await.unwrap();
         });
-        let mut capture = ShellCapture::default();
+        let mut capture = ShellCapture::new();
         timeout(Duration::from_secs(2), async {
             tokio::select! {
                 result = capture.read(&mut reader) => panic!("writer still open: {result:?}"),
@@ -886,25 +1026,94 @@ mod tests {
             .unwrap();
         assert_eq!(capture.bytes, b"accepted output!");
         assert!(capture.eof);
+        capture.finish().unwrap();
+        assert_eq!(capture.text.as_deref(), Some("accepted output!"));
         producer.await.unwrap();
     }
 
     #[tokio::test]
-    async fn shell_capture_rejects_overflow_without_retaining_unbounded_output() {
+    async fn shell_capture_retains_marked_head_and_tail_after_overflow() {
         let bytes = vec![b'x'; MAX_BYTES + 16384];
         let mut source = bytes.as_slice();
-        let mut capture = ShellCapture::default();
+        let mut capture = ShellCapture::new();
+        capture.read(&mut source).await.unwrap();
+        capture.finish().unwrap();
+        let text = capture.text.as_deref().unwrap();
+        assert!(text.len() <= MAX_BYTES);
+        assert!(text.starts_with('x'));
+        assert!(text.ends_with('x'));
+        assert!(text.contains("[truncated]"));
+        assert_eq!(capture.observed, bytes.len());
+        assert!(capture.eof);
+    }
+
+    #[tokio::test]
+    async fn shell_capture_lossily_preserves_bounded_invalid_utf8_head_and_tail() {
+        let mut bytes = b"HEAD\xff".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', MAX_BYTES));
+        bytes.extend(b"\xfe:TAIL");
+        let mut source = bytes.as_slice();
+        let mut capture = ShellCapture::new();
+        capture.read(&mut source).await.unwrap();
+        capture.finish().unwrap();
+        let text = capture.text.as_deref().unwrap();
+        assert!(text.len() <= MAX_BYTES);
+        assert!(text.starts_with("HEAD?"));
+        assert!(text.ends_with("?:TAIL"));
+        assert!(text.contains("[truncated]"));
+        assert!(capture.eof);
+    }
+
+    #[tokio::test]
+    async fn shell_error_diagnostic_bounds_projected_stderr_without_reprojecting_marker() {
+        let secret = "sk-proj-abcdefghijklmnop0123456789";
+        let bytes = format!("openai_api_key={secret}\n{}:TAIL", "x".repeat(16 * 1024));
+        let mut source = bytes.as_bytes();
+        let mut capture = ShellCapture::new();
+        capture.read(&mut source).await.unwrap();
+        capture.finish().unwrap();
+
+        let diagnostic = shell_stderr_diagnostic(&capture);
+        assert!(diagnostic.len() <= 4096);
+        assert!(diagnostic.contains("[REDACTED:recognized-secret]"));
+        assert!(diagnostic.contains("[truncated]"));
+        assert!(diagnostic.ends_with(":TAIL"));
+        assert!(!diagnostic.contains(secret));
+        let without_markers = diagnostic
+            .replace("[REDACTED:recognized-secret]", "")
+            .replace("[truncated]", "");
+        assert!(!without_markers.contains(['[', ']']));
+
+        let operation_secret = "sk-proj-operation-secret-0123456789";
+        let cleanup_secret = "sk-proj-cleanup-secret-0123456789";
+        let metadata_secret = "sk-proj-metadata-secret-0123456789";
+        let error = anyhow::anyhow!("shell process failure {operation_secret}")
+            .context(format!("shell pipe cleanup failed: {cleanup_secret}"));
+        let metadata = ShellFailureMetadata {
+            phase: format!("read shell output {metadata_secret}"),
+            root_state: format!("query-error {metadata_secret}"),
+            observed: format!("Err({metadata_secret})"),
+            stopped: format!("subprocess cleanup unconfirmed: {metadata_secret}"),
+        };
+        let error = projected_shell_failure(error, &metadata, &capture, &capture).unwrap();
+        assert!(error.downcast_ref::<ProjectedShellDiagnostic>().is_some());
+        assert_eq!(error.chain().count(), 1);
+        let rendered = project_failure(ToolFailure::built_in(error))
+            .unwrap_err()
+            .to_string();
+        assert!(rendered.contains("[REDACTED:recognized-secret]"));
+        assert!(rendered.contains("[truncated]"));
+        assert!(rendered.contains(":TAIL"));
+        for secret in [secret, operation_secret, cleanup_secret, metadata_secret] {
+            assert!(!rendered.contains(secret));
+        }
+        let without_markers = rendered
+            .replace("[REDACTED:recognized-secret]", "")
+            .replace("[truncated]", "");
         assert!(
-            capture
-                .read(&mut source)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("limit")
+            !without_markers.contains(['[', ']']),
+            "partial marker in {rendered:?}"
         );
-        assert_eq!(capture.bytes.len(), MAX_BYTES + 1);
-        assert!(!capture.eof);
-        assert!(!source.is_empty());
     }
 
     #[tokio::test]
@@ -1354,7 +1563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permissions_and_size_limits_reject_before_mutation() {
+    async fn permissions_and_file_reads_preserve_bounded_visible_output() {
         let root = tempfile::tempdir().unwrap();
         let read_only = ToolHost::new(root.path(), &Config::default()).unwrap();
         let names: Vec<_> = read_only
@@ -1373,16 +1582,20 @@ mod tests {
                     .is_err()
             );
         }
-        std::fs::write(root.path().join("large"), vec![b'a'; MAX_BYTES + 1]).unwrap();
+        std::fs::write(
+            root.path().join("large"),
+            format!("HEAD:{}:TAIL", "x".repeat(MAX_BYTES)),
+        )
+        .unwrap();
         std::fs::write(root.path().join("binary"), [0xff]).unwrap();
-        assert!(
-            read_only
-                .execute("file_read", json!({"path":"large"}))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("limit")
-        );
+        let large = read_only
+            .execute("file_read", json!({"path":"large"}))
+            .await
+            .unwrap();
+        assert!(large.len() <= MAX_BYTES);
+        assert!(large.starts_with("HEAD:"));
+        assert!(large.ends_with(":TAIL"));
+        assert!(large.contains("[truncated]"));
         assert!(
             read_only
                 .execute("file_read", json!({"path":"binary"}))
@@ -1464,8 +1677,8 @@ mod tests {
         let (command, stall, flood, stderr_flood) = (
             "printf hello; printf problem >&2; exit 7",
             "sleep 5",
-            "yes output",
-            "yes problem >&2",
+            "head -c 2097153 /dev/zero | tr '\\0' x",
+            "head -c 2097153 /dev/zero | tr '\\0' x >&2",
         );
         #[cfg(windows)]
         let (command, stall, flood, stderr_flood) = (
@@ -1516,20 +1729,24 @@ mod tests {
             );
         }
         assert!(host.execute("shell", json!({"command":""})).await.is_err());
-        assert!(
-            host.execute("shell", json!({"command":flood}))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("limit")
-        );
-        assert!(
-            host.execute("shell", json!({"command":stderr_flood}))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("limit")
-        );
+        for (command, stream, head, tail) in [
+            (flood, "stdout", "x", "x"),
+            (stderr_flood, "stderr", "x", "x"),
+        ] {
+            let output: Value = serde_json::from_str(
+                &host
+                    .execute("shell", json!({"command":command}))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let retained = output[stream].as_str().unwrap();
+            assert!(output["success"] == true);
+            assert!(retained.len() <= MAX_BYTES);
+            assert!(retained.starts_with(head));
+            assert!(retained.ends_with(tail));
+            assert!(retained.contains("[truncated]"));
+        }
     }
 
     #[cfg(unix)]
@@ -1646,6 +1863,7 @@ mod tests {
         for output in rendered {
             assert!(!output.contains(SECRET));
             assert!(!output.contains(&command));
+            assert!(!output.contains("[REDACTED:recognized-secret]"));
         }
         assert_eq!(chain_length, 1);
     }

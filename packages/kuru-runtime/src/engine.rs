@@ -1461,15 +1461,10 @@ mod tool_result_tests {
             assert_eq!(value["call_id"], call.id);
             let output = value["output"].as_str().unwrap();
             assert!(output.len() <= 8192);
-            assert_eq!(
-                output,
-                format!(
-                    "{}{}{}",
-                    "x".repeat(8192 - REDACTION_MARKER.len() - TRUNCATED.len()),
-                    REDACTION_MARKER,
-                    TRUNCATED,
-                )
-            );
+            assert!(output.starts_with(&"x".repeat((8192 - TRUNCATED.len()) / 2)));
+            assert!(output.ends_with("tailtailtailtail"));
+            assert!(output.contains(REDACTION_MARKER));
+            assert!(output.contains(TRUNCATED));
             assert_complete_markers(output);
         }
     }

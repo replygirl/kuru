@@ -170,6 +170,40 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
         projected_identity,
         "file_read replaced the source object"
     );
+    let oversized_path = env.project.join("oversized-projection.txt");
+    let oversized_source = format!(
+        "HEAD openai_api_key={TOOL_TOKEN}\n{}:TAIL",
+        "x".repeat(2 * 1024 * 1024),
+    );
+    std::fs::write(&oversized_path, &oversized_source).unwrap();
+    let oversized_identity =
+        kuru_platform::fs::regular_file_info(&std::fs::File::open(&oversized_path).unwrap())
+            .unwrap()
+            .identity;
+    let oversized = env.success(&[
+        "tool",
+        "file_read",
+        "--args",
+        r#"{"path":"oversized-projection.txt"}"#,
+    ]);
+    let oversized = oversized.strip_suffix('\n').unwrap();
+    let expected_head = format!("HEAD openai_api_key={MARKER}\n");
+    assert!(oversized.len() <= 2 * 1024 * 1024);
+    assert!(oversized.starts_with(&expected_head));
+    assert!(oversized.ends_with(":TAIL"));
+    assert!(oversized.contains("[truncated]"));
+    assert!(!oversized.contains(TOOL_TOKEN));
+    assert_eq!(
+        std::fs::read_to_string(&oversized_path).unwrap(),
+        oversized_source
+    );
+    assert_eq!(
+        kuru_platform::fs::regular_file_info(&std::fs::File::open(&oversized_path).unwrap())
+            .unwrap()
+            .identity,
+        oversized_identity,
+        "oversized file_read replaced the source object"
+    );
     assert!(
         env.success(&["tool", "file_list", "--args", r#"{"path":"."}"#])
             .contains("notes.txt")

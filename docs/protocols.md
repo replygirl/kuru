@@ -107,9 +107,11 @@ traversal and symlinks are rejected; capability-relative filesystem operations
 provide containment beyond string-prefix checks. Sensitive directories such as
 `.git`, `.kuru`, `.codex`, `.agents`, `.claude`, `.ssh` and credential/config
 files are protected. Instruction files may be read but are protected from
-mutation. Files and protocol/output payloads have 2 MiB bounds. Shell execution
-defaults to a 30-second timeout; an optional `timeout_ms` argument accepts
-1–120000 milliseconds. Stdout and stderr are each bounded to 2 MiB. On Unix,
+mutation. Built-in UTF-8 file reads and shell streams retain a marked 2 MiB
+head-and-tail excerpt after credential projection; shell stdout and stderr keep
+independent budgets. MCP protocol records remain hard-bounded at 2 MiB. Shell
+execution defaults to a 30-second timeout; an optional `timeout_ms` argument
+accepts 1–120000 milliseconds. On Unix,
 a registered owner retains the standard root, its fresh process group,
 both pipes, and the checked workspace capability through cleanup. It signals the
 remaining original group before reaping that root, then confirms group absence

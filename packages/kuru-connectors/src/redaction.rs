@@ -1,6 +1,6 @@
 //! Finite recognizable-secret projection for outward tool results.
 
-use std::{fmt, io};
+use std::{collections::VecDeque, fmt, io};
 
 use serde_json::{Map, Value, map::Entry};
 
@@ -216,6 +216,255 @@ enum State {
     },
 }
 
+pub(crate) trait ProjectionSink {
+    fn len(&self) -> usize;
+
+    fn append(
+        &mut self,
+        bytes: &[u8],
+        written: usize,
+        buffered: usize,
+        limit: usize,
+        atomic: bool,
+    ) -> Result<Option<usize>, ProjectionError>;
+}
+
+impl ProjectionSink for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn append(
+        &mut self,
+        bytes: &[u8],
+        _written: usize,
+        buffered: usize,
+        limit: usize,
+        _atomic: bool,
+    ) -> Result<Option<usize>, ProjectionError> {
+        let requested = reserve_for_append(self, buffered, limit)?;
+        self.extend_from_slice(bytes);
+        Ok(requested)
+    }
+}
+
+/// Bounded output retained while a scanner continues through the complete input.
+pub(crate) struct StreamingProjection {
+    scanner: Option<Scanner>,
+    output: HeadTail,
+}
+
+impl StreamingProjection {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            scanner: Some(Scanner::new()),
+            output: HeadTail::new(limit),
+        }
+    }
+
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<(), ProjectionError> {
+        self.scanner
+            .as_mut()
+            .expect("streaming projection was already finished")
+            .push(bytes, &mut self.output)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<String, ProjectionError> {
+        self.scanner
+            .take()
+            .expect("streaming projection was already finished")
+            .finish(&mut self.output)?;
+        Ok(self.output.into_text())
+    }
+}
+
+struct HeadTail {
+    limit: usize,
+    prefix: Vec<u8>,
+    tail: VecDeque<u8>,
+    prefix_markers: Vec<(usize, usize)>,
+    markers: VecDeque<(usize, usize)>,
+    written: usize,
+    overflowed: bool,
+}
+
+impl HeadTail {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            prefix: Vec::with_capacity(limit),
+            tail: VecDeque::new(),
+            prefix_markers: Vec::new(),
+            markers: VecDeque::new(),
+            written: 0,
+            overflowed: false,
+        }
+    }
+
+    fn prefix_limit(&self) -> usize {
+        self.limit.saturating_sub(TRUNCATED.len()) / 2
+    }
+
+    fn tail_limit(&self) -> usize {
+        self.limit
+            .saturating_sub(TRUNCATED.len())
+            .saturating_sub(self.prefix_limit())
+    }
+
+    fn trim_prefix(&mut self) {
+        let mut end = self.prefix_limit().min(self.prefix.len());
+        for &(start, marker_end) in &self.prefix_markers {
+            if start < end && end < marker_end {
+                end = start;
+                break;
+            }
+        }
+        self.prefix.truncate(end);
+    }
+
+    fn freeze_prefix(&mut self) {
+        if !self.overflowed {
+            self.overflowed = true;
+            self.trim_prefix();
+        }
+    }
+
+    fn trim_tail(&mut self) {
+        let tail_limit = self.tail_limit();
+        let mut start = self.written.saturating_sub(tail_limit);
+        while let Some(&(_, end)) = self.markers.front() {
+            if end <= start {
+                self.markers.pop_front();
+            } else {
+                break;
+            }
+        }
+        if let Some(&(marker_start, marker_end)) = self.markers.front()
+            && marker_start < start
+            && start < marker_end
+        {
+            start = marker_end;
+        }
+        let current_start = self.written.saturating_sub(self.tail.len());
+        for _ in 0..start.saturating_sub(current_start).min(self.tail.len()) {
+            self.tail.pop_front();
+        }
+    }
+
+    fn prefix_without_incomplete_edge(bytes: &[u8]) -> &[u8] {
+        match std::str::from_utf8(bytes) {
+            Ok(_) => bytes,
+            Err(error) if error.error_len().is_none() => &bytes[..error.valid_up_to()],
+            Err(_) => bytes,
+        }
+    }
+
+    fn tail_without_incomplete_edge(bytes: &[u8]) -> &[u8] {
+        for start in 0..=bytes.len().min(3) {
+            match std::str::from_utf8(&bytes[start..]) {
+                Ok(_) => return &bytes[start..],
+                Err(error) if error.valid_up_to() > 0 => return &bytes[start..],
+                Err(_) => {}
+            }
+        }
+        bytes
+    }
+
+    fn append_lossy(output: &mut String, bytes: &[u8]) {
+        let mut bytes = bytes;
+        while !bytes.is_empty() {
+            match std::str::from_utf8(bytes) {
+                Ok(valid) => {
+                    output.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0 {
+                        output.push_str(
+                            std::str::from_utf8(&bytes[..valid]).expect("valid UTF-8 prefix"),
+                        );
+                    }
+                    let invalid = error.error_len().unwrap_or(bytes.len() - valid).max(1);
+                    output.push('?');
+                    bytes = &bytes[(valid + invalid).min(bytes.len())..];
+                }
+            }
+        }
+    }
+
+    fn into_text(self) -> String {
+        if !self.overflowed {
+            let mut output = String::with_capacity(self.prefix.len());
+            Self::append_lossy(&mut output, &self.prefix);
+            return output;
+        }
+        let prefix = Self::prefix_without_incomplete_edge(&self.prefix);
+        let tail = self.tail.into_iter().collect::<Vec<_>>();
+        let tail = Self::tail_without_incomplete_edge(&tail);
+        let mut output = String::with_capacity(prefix.len() + TRUNCATED.len() + tail.len());
+        Self::append_lossy(&mut output, prefix);
+        output.push_str(TRUNCATED);
+        Self::append_lossy(&mut output, tail);
+        output
+    }
+}
+
+impl ProjectionSink for HeadTail {
+    fn len(&self) -> usize {
+        0
+    }
+
+    fn append(
+        &mut self,
+        bytes: &[u8],
+        written: usize,
+        _buffered: usize,
+        _limit: usize,
+        atomic: bool,
+    ) -> Result<Option<usize>, ProjectionError> {
+        let start = self.written;
+        self.written = written;
+        if atomic {
+            if start < self.limit {
+                self.prefix_markers.push((start, written));
+            }
+            self.markers.push_back((start, written));
+        }
+        if !self.overflowed {
+            if atomic && bytes.len() > self.limit.saturating_sub(self.prefix.len()) {
+                self.freeze_prefix();
+            } else {
+                let keep = bytes
+                    .len()
+                    .min(self.limit.saturating_sub(self.prefix.len()));
+                self.prefix.extend_from_slice(&bytes[..keep]);
+                if keep < bytes.len() {
+                    self.freeze_prefix();
+                }
+            }
+        }
+        let tail_limit = self.tail_limit();
+        if tail_limit == 0 {
+            self.tail.clear();
+        } else if bytes.len() >= tail_limit {
+            // `truncate_tool_output` can supply a multi-megabyte ordinary
+            // slice. Only its final tail can survive this sink, so never
+            // transiently allocate or copy the whole slice.
+            self.tail.clear();
+            self.tail
+                .extend(&bytes[bytes.len().saturating_sub(tail_limit)..]);
+        } else {
+            self.tail.extend(bytes);
+        }
+        if self.written > self.limit {
+            self.freeze_prefix();
+        }
+        self.trim_tail();
+        Ok(None)
+    }
+}
+
 /// A bounded-state scanner for byte streams such as a future stderr capture.
 pub(crate) struct Scanner {
     state: State,
@@ -254,10 +503,10 @@ impl Scanner {
         }
     }
 
-    pub(crate) fn push(
+    pub(crate) fn push<S: ProjectionSink>(
         &mut self,
         input: &[u8],
-        output: &mut Vec<u8>,
+        output: &mut S,
     ) -> Result<(), ProjectionError> {
         self.input_bytes = self
             .input_bytes
@@ -270,7 +519,10 @@ impl Scanner {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self, output: &mut Vec<u8>) -> Result<(), ProjectionError> {
+    pub(crate) fn finish<S: ProjectionSink>(
+        mut self,
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
         loop {
             let state = std::mem::replace(&mut self.state, State::Normal);
             match state {
@@ -315,7 +567,7 @@ impl Scanner {
         self.output_limit().map(|_| ())
     }
 
-    fn feed(&mut self, byte: u8, output: &mut Vec<u8>) -> Result<(), ProjectionError> {
+    fn feed<S: ProjectionSink>(&mut self, byte: u8, output: &mut S) -> Result<(), ProjectionError> {
         let state = std::mem::replace(&mut self.state, State::Normal);
         match state {
             State::Normal => self.feed_normal(byte, output),
@@ -401,7 +653,11 @@ impl Scanner {
         }
     }
 
-    fn feed_normal(&mut self, byte: u8, output: &mut Vec<u8>) -> Result<(), ProjectionError> {
+    fn feed_normal<S: ProjectionSink>(
+        &mut self,
+        byte: u8,
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
         let prefix = Prefix {
             raw: vec![byte],
             name_boundary: self.previous.is_none_or(|previous| !is_name_byte(previous)),
@@ -424,11 +680,11 @@ impl Scanner {
         }
     }
 
-    fn start_prefix(
+    fn start_prefix<S: ProjectionSink>(
         &mut self,
         kind: PrefixKind,
         raw: Vec<u8>,
-        output: &mut Vec<u8>,
+        output: &mut S,
     ) -> Result<(), ProjectionError> {
         match kind {
             PrefixKind::Token(kind) => {
@@ -453,12 +709,12 @@ impl Scanner {
         Ok(())
     }
 
-    fn feed_assignment(
+    fn feed_assignment<S: ProjectionSink>(
         &mut self,
         kind: AssignmentKind,
         phase: AssignmentPhase,
         byte: u8,
-        output: &mut Vec<u8>,
+        output: &mut S,
     ) -> Result<(), ProjectionError> {
         match phase {
             AssignmentPhase::AfterName => {
@@ -629,23 +885,31 @@ impl Scanner {
         self.state = State::Assignment { kind, phase };
     }
 
-    fn emit_marker(&mut self, output: &mut Vec<u8>) -> Result<(), ProjectionError> {
+    fn emit_marker<S: ProjectionSink>(&mut self, output: &mut S) -> Result<(), ProjectionError> {
         if !self.last_was_marker {
-            self.append(MARKER.as_bytes(), output)?;
+            self.append(MARKER.as_bytes(), output, true)?;
             self.last_was_marker = true;
         }
         Ok(())
     }
 
-    fn emit_byte(&mut self, byte: u8, output: &mut Vec<u8>) -> Result<(), ProjectionError> {
-        self.append(&[byte], output)?;
+    fn emit_byte<S: ProjectionSink>(
+        &mut self,
+        byte: u8,
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        self.append(&[byte], output, false)?;
         self.consume_byte(byte);
         self.last_was_marker = false;
         Ok(())
     }
 
-    fn emit_raw(&mut self, raw: &[u8], output: &mut Vec<u8>) -> Result<(), ProjectionError> {
-        self.append(raw, output)?;
+    fn emit_raw<S: ProjectionSink>(
+        &mut self,
+        raw: &[u8],
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        self.append(raw, output, false)?;
         self.consume_bytes(raw);
         if !raw.is_empty() {
             self.last_was_marker = false;
@@ -653,7 +917,12 @@ impl Scanner {
         Ok(())
     }
 
-    fn append(&mut self, bytes: &[u8], output: &mut Vec<u8>) -> Result<(), ProjectionError> {
+    fn append<S: ProjectionSink>(
+        &mut self,
+        bytes: &[u8],
+        output: &mut S,
+        atomic: bool,
+    ) -> Result<(), ProjectionError> {
         let written = self
             .written_bytes
             .checked_add(bytes.len())
@@ -664,14 +933,15 @@ impl Scanner {
             .len()
             .checked_add(bytes.len())
             .ok_or(ProjectionError::SizeBound)?;
-        if let Some(_requested_capacity) = reserve_for_append(output, buffered, output_limit)? {
+        if let Some(_requested_capacity) =
+            output.append(bytes, written, buffered, output_limit, atomic)?
+        {
             #[cfg(test)]
             {
                 self.reservation_events += 1;
                 self.requested_capacity = _requested_capacity;
             }
         }
-        output.extend_from_slice(bytes);
         self.written_bytes = written;
         Ok(())
     }
@@ -1065,39 +1335,27 @@ pub fn truncate_tool_output(text: &str, max_bytes: usize) -> String {
     if max_bytes < TRUNCATED.len() {
         return ".".repeat(max_bytes.min(3));
     }
-    let capacity = max_bytes - TRUNCATED.len();
-    let cut = previous_char_boundary(text, capacity);
-    let Some((start, _end)) = marker_crossing(text, cut) else {
-        return format!("{}{TRUNCATED}", &text[..cut]);
-    };
-    if MARKER.len() + TRUNCATED.len() > max_bytes {
-        return format!("{}{TRUNCATED}", &text[..start]);
+    let mut output = HeadTail::new(max_bytes);
+    let mut written = 0;
+    let mut start = 0;
+    for (index, marker) in text.match_indices(MARKER) {
+        let prefix = &text.as_bytes()[start..index];
+        written += prefix.len();
+        output
+            .append(prefix, written, 0, usize::MAX, false)
+            .expect("fixed head/tail sink accepts bounded text");
+        written += marker.len();
+        output
+            .append(marker.as_bytes(), written, 0, usize::MAX, true)
+            .expect("fixed head/tail sink accepts bounded text");
+        start = index + marker.len();
     }
-
-    let mut prefix = capacity - MARKER.len();
-    loop {
-        prefix = previous_char_boundary(text, prefix);
-        if let Some((earlier, _)) = marker_crossing(text, prefix) {
-            prefix = earlier;
-        } else {
-            break;
-        }
-    }
-    format!("{}{}{TRUNCATED}", &text[..prefix], MARKER)
-}
-
-fn previous_char_boundary(text: &str, mut index: usize) -> usize {
-    index = index.min(text.len());
-    while !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-fn marker_crossing(text: &str, cut: usize) -> Option<(usize, usize)> {
-    text.match_indices(MARKER)
-        .map(|(start, marker)| (start, start + marker.len()))
-        .find(|(start, end)| *start < cut && cut < *end)
+    let suffix = &text.as_bytes()[start..];
+    written += suffix.len();
+    output
+        .append(suffix, written, 0, usize::MAX, false)
+        .expect("fixed head/tail sink accepts bounded text");
+    output.into_text()
 }
 
 #[cfg(test)]
@@ -1107,8 +1365,8 @@ mod tests {
     use serde_json::{Map, Value, json};
 
     use super::{
-        BoundedWriter, CountingWriter, MARKER, ProjectionError, Scanner, json, project_value,
-        relative_bound, text, truncate_tool_output,
+        BoundedWriter, CountingWriter, MARKER, ProjectionError, Scanner, TRUNCATED, json,
+        project_value, relative_bound, text, truncate_tool_output,
     };
 
     fn streamed(input: &[u8], splits: &[usize]) -> Result<Vec<u8>, ProjectionError> {
@@ -1467,36 +1725,125 @@ mod tests {
     }
 
     #[test]
-    fn tool_truncation_keeps_markers_atomic_within_existing_caps() {
-        let suffix = "tail that is not retained";
-        let prefix = "x".repeat(MARKER.len());
-        let input = format!("{prefix}{MARKER}{suffix}");
-        let marker_start = prefix.len();
-        for inside in 1..MARKER.len() {
-            let capacity = marker_start + inside;
-            let limit = capacity + "[truncated]".len();
-            let result = truncate_tool_output(&input, limit);
+    fn head_tail_tool_truncation_keeps_visible_markers_whole() {
+        let limit = 128;
+        let head = format!("head-{MARKER}{}", "x".repeat(256));
+        let head_result = truncate_tool_output(&head, limit);
+        assert!(head_result.len() <= limit);
+        assert!(head_result.starts_with(&format!("head-{MARKER}")));
+        assert!(head_result.contains(TRUNCATED));
+        assert!(!head_result.ends_with(TRUNCATED));
+
+        let tail = format!("{}{}tail", "x".repeat(256), MARKER);
+        let tail_result = truncate_tool_output(&tail, limit);
+        assert!(tail_result.len() <= limit);
+        assert!(tail_result.ends_with(&format!("{MARKER}tail")));
+        assert!(tail_result.contains(TRUNCATED));
+
+        let assert_complete_markers = |result: &str| {
             assert!(result.len() <= limit);
-            assert!(result.contains(MARKER));
-            assert!(result.ends_with("[truncated]"));
-            assert_eq!(result, format!("{}{MARKER}[truncated]", "x".repeat(inside)));
+            for (index, _) in result.match_indices('[') {
+                let suffix = &result[index..];
+                assert!(
+                    suffix.starts_with(MARKER) || suffix.starts_with(TRUNCATED),
+                    "partial marker in {result:?}"
+                );
+            }
+            let without_markers = result.replace(MARKER, "").replace(TRUNCATED, "");
+            assert!(
+                !without_markers.contains(['[', ']']),
+                "partial marker in {result:?}"
+            );
+            assert!(result.contains(TRUNCATED));
+        };
+        let head_cut = (limit - TRUNCATED.len()) / 2;
+        for cut in 1..MARKER.len() {
+            let source = format!(
+                "{}{}{}",
+                "x".repeat(head_cut - cut),
+                MARKER,
+                "tail".repeat(64)
+            );
+            assert_complete_markers(&truncate_tool_output(&source, limit));
         }
+        let tail_cut = limit - TRUNCATED.len() - head_cut;
+        for cut in 1..MARKER.len() {
+            let suffix = "t".repeat(tail_cut - MARKER.len() + cut);
+            let source = format!("{}{}{}", "x".repeat(256), MARKER, suffix);
+            assert_complete_markers(&truncate_tool_output(&source, limit));
+        }
+        let adjacent = format!("{}{}tail", "x".repeat(256), MARKER.repeat(2));
+        assert_complete_markers(&truncate_tool_output(&adjacent, limit));
+        let unicode = format!("{}:TAIL", "🪶".repeat(128));
+        let mut unicode_projection = super::StreamingProjection::new(limit);
+        for chunk in unicode.as_bytes().chunks(1) {
+            unicode_projection.push(chunk).unwrap();
+        }
+        let unicode_result = unicode_projection.finish().unwrap();
+        assert!(unicode_result.len() <= limit);
+        assert!(unicode_result.ends_with(":TAIL"));
+        assert!(!unicode_result.contains('?'));
+        assert!(unicode_result.contains(TRUNCATED));
 
-        let adjacent = format!("prefix{MARKER}{MARKER}tail");
-        let cut = "prefix".len() + MARKER.len() + 3;
-        let limit = cut + "[truncated]".len();
-        let result = truncate_tool_output(&adjacent, limit);
+        let exact = "openai_api_key=sk-proj-abcdefghijklmnop0123456789\nordinary";
+        assert_eq!(
+            text(exact).unwrap(),
+            format!("openai_api_key={MARKER}\nordinary")
+        );
+        let mut exact_projection = super::StreamingProjection::new(256);
+        for chunk in exact.as_bytes().chunks(7) {
+            exact_projection.push(chunk).unwrap();
+        }
+        assert_eq!(
+            exact_projection.finish().unwrap(),
+            format!("openai_api_key={MARKER}\nordinary")
+        );
+
+        let crossing_secret = format!("{} sk-abcdefghijklmnop:TAIL", "x".repeat(200));
+        let mut crossing_projection = super::StreamingProjection::new(limit);
+        for chunk in crossing_secret.as_bytes().chunks(3) {
+            crossing_projection.push(chunk).unwrap();
+        }
+        let crossing_result = crossing_projection.finish().unwrap();
+        assert!(crossing_result.contains(MARKER));
+        assert!(!crossing_result.contains("sk-abcdefghijklmnop"));
+        assert!(crossing_result.ends_with(&format!(" {MARKER}:TAIL")));
+        assert!(crossing_result.contains(TRUNCATED));
+
+        let mut projection = super::StreamingProjection::new(limit);
+        let streamed = format!("HEAD: api_key=opaque {}:TAIL", "x".repeat(256));
+        for chunk in streamed.as_bytes().chunks(7) {
+            projection.push(chunk).unwrap();
+        }
+        let result = projection.finish().unwrap();
         assert!(result.len() <= limit);
-        assert!(!result.contains(&MARKER[..3]) || result.contains(MARKER));
-        assert_eq!(result.matches(MARKER).count(), 1);
-
-        let utf8_prefix = "🪶".repeat(8);
-        let utf8 = format!("{utf8_prefix}{MARKER}tail");
-        let limit = utf8_prefix.len() + 4 + "[truncated]".len();
-        let result = truncate_tool_output(&utf8, limit);
-        assert!(result.is_char_boundary(result.len()));
+        assert!(result.starts_with("HEAD: api_key="));
         assert!(result.contains(MARKER));
+        assert!(result.contains(TRUNCATED));
+        assert!(result.ends_with(":TAIL"));
+    }
+
+    #[test]
+    fn head_tail_sink_never_buffers_a_large_single_append() {
+        let limit = 128;
+        let mut sink = super::HeadTail::new(limit);
+        let input = vec![b'x'; 2 * 1024 * 1024];
+        super::ProjectionSink::append(&mut sink, &input, input.len(), 0, usize::MAX, false)
+            .unwrap();
+        assert!(sink.prefix.len() <= sink.prefix_limit());
+        assert!(sink.tail.len() <= sink.tail_limit());
+        assert!(sink.tail.capacity() <= sink.tail_limit().next_power_of_two());
+        let result = sink.into_text();
         assert!(result.len() <= limit);
+        assert!(result.starts_with('x'));
+        assert!(result.ends_with('x'));
+        assert!(result.contains(TRUNCATED));
+
+        let markers = format!("{}tail", MARKER.repeat(10_000));
+        let result = truncate_tool_output(&markers, limit);
+        assert!(result.len() <= limit);
+        assert!(result.ends_with("tail"));
+        assert!(result.contains(TRUNCATED));
     }
 
     #[test]

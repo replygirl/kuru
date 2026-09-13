@@ -32,7 +32,7 @@ kuru --allow-write tool file_write \
 
 Paths are relative to the opened project. Absolute paths, parent traversal, and symlinks are rejected. Sensitive directories and configuration or credential files are protected; instruction files can be read but not mutated.
 
-The built-in file tools enforce containment through capability-relative filesystem operations. File and output payloads have 2 MiB bounds. The private state directory must remain outside the tool root.
+The built-in file tools enforce containment through capability-relative filesystem operations. UTF-8 file reads retain a marked 2 MiB head-and-tail excerpt after credential projection. The private state directory must remain outside the tool root.
 
 ## Shell authority
 
@@ -48,7 +48,7 @@ reduces accidental environment disclosure; it does not restrict filesystem,
 process, or network authority. Configured stdio MCP servers retain their own
 inherited environment and configured overrides.
 
-Commands use `sh` on macOS/Linux and stock Windows PowerShell on Windows. The default timeout is 30 seconds. `timeout_ms` accepts 1–120000 milliseconds. Standard output and standard error are each bounded to 2 MiB. On Unix, a registered owner retains the standard shell root, both pipes, and its fresh process group through cleanup; it signals that original group before reaping the root and confirms absence before normal completion. If bounded confirmation is unavailable, Kuru reports it while retaining the owner for later observation. A selected execution/startup deadline may use one additional five-second cleanup-confirmation allowance; delayed startup returns at the deadline plus that allowance, and host shutdown shares one five-second window across registered shells. This does not control processes that leave the original group. Windows retains its existing Job cleanup.
+Commands use `sh` on macOS/Linux and stock Windows PowerShell on Windows. The default timeout is 30 seconds. `timeout_ms` accepts 1–120000 milliseconds. Standard output and standard error each retain an independent marked 2 MiB head-and-tail excerpt after credential projection. On Unix, a registered owner retains the standard shell root, both pipes, and its fresh process group through cleanup; it signals that original group before reaping the root and confirms absence before normal completion. If bounded confirmation is unavailable, Kuru reports it while retaining the owner for later observation. A selected execution/startup deadline may use one additional five-second cleanup-confirmation allowance; delayed startup returns at the deadline plus that allowance, and host shutdown shares one five-second window across registered shells. This does not control processes that leave the original group. Windows retains its existing Job cleanup. MCP protocol framing stays hard-bounded at 2 MiB.
 
 Before Kuru returns a built-in file or shell result, or an MCP success or
 application error, it replaces recognized credential spans with

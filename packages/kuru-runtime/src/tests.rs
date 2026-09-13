@@ -595,7 +595,11 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
         )
         .await
         .unwrap();
-    let source = format!("openai_api_key={TOOL_TOKEN}\n{ORDINARY_CONTROL}");
+    let source = format!(
+        "openai_api_key={TOOL_TOKEN}\n{}{}:TAIL",
+        "x".repeat(2 * 1024 * 1024),
+        ORDINARY_CONTROL,
+    );
     let source_path = dir.path().join("sample.txt");
     std::fs::write(&source_path, &source).unwrap();
     let result = harness.run("Read sample.txt").await.unwrap();
@@ -612,10 +616,11 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     let receipt: Value = serde_json::from_str(&receipt.content).unwrap();
     let call_id = receipt["call_id"].as_str().unwrap().to_owned();
     let output = receipt["output"].as_str().unwrap();
-    assert_eq!(
-        output,
-        format!("openai_api_key={MARKER}\n{ORDINARY_CONTROL}")
-    );
+    assert!(output.len() <= 8192);
+    assert!(output.starts_with(&format!("openai_api_key={MARKER}\n")));
+    assert!(output.ends_with(&format!("{ORDINARY_CONTROL}:TAIL")));
+    assert!(output.contains("[truncated]"));
+    assert!(!output.contains(TOOL_TOKEN));
     assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
 
     let requests_before_reopen = fake.requests.lock().unwrap().len();
