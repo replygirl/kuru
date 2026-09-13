@@ -13,7 +13,7 @@
 
 ## 3. Application and shutdown integration
 
-- [ ] 3.1 Replace normal TUI job abort with signal-and-settle cancellation while retaining generation fencing and abnormal-exit cleanup; verify real PTY interruption, completion-race authority, next-command usability, and unchanged plain/JSON run shapes
+- [x] 3.1 Replace normal TUI job abort with signal-and-settle cancellation while retaining generation fencing and abnormal-exit cleanup; verify real PTY interruption and next-command usability, compose durable and typed completion-race authority at the shared UI boundary, and preserve plain/JSON run shapes
 - [x] 3.2 Route inbound A2A message IDs through controlled turns and return bounded mismatch/uncertainty failures; verify duplicate completed requests reuse one answer without another provider/tool call
 - [x] 3.3 Bound shutdown dreaming with an aggregate cancellation deadline and always attempt existing actor and ToolHost cleanup; verify dream timeout and cleanup failure are both reported without treating the deadline as process cleanup proof
 
