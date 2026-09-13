@@ -23,8 +23,9 @@ contracts.
   animation deadline.
 - Route every queued or newly received completion through one ordered handler,
   bound its pre-completion activity drain, and schedule ready sources fairly.
-- Treat terminal EOF and read errors as loop exits that abort and await active TUI
-  work before the existing terminal owner restores native state.
+- Treat terminal EOF and read errors as loop exits that abort and await the active
+  dispatch, then use non-dream Harness shutdown to abort and await its nested
+  actor/provider work before the existing terminal owner restores native state.
 - Preserve the current generation fence, typed result authority, completion
   locking, failed-dispatch refresh, cancellation ordering, command behavior,
   motion cadence and reduced-motion behavior.
@@ -40,9 +41,10 @@ contracts.
 
 ## Impact
 
-The implementation is limited to `apps/kuru-tui` dependency declarations,
-`Cargo.lock`, the private interactive loop in `apps/kuru-tui/src/ui.rs`, and its
-focused scheduler and native terminal tests. Public `TurnOutput`, JSON, Harness,
+The implementation covers `apps/kuru-tui` dependency declarations, `Cargo.lock`,
+the private interactive loop in `apps/kuru-tui/src/ui.rs`, the runtime's private
+actor-task cleanup and `Harness::shutdown` implementation, and focused scheduler
+and native terminal tests. Public `TurnOutput`, JSON, Harness signatures,
 provider, memory, authentication, shutdown-dreaming and plain `View` interfaces
 do not change. Dependency versions remain pinned; dependency edges add the
 app-owned crossterm features, inherited futures, and the existing workspace

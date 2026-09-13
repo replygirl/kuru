@@ -42,6 +42,11 @@ outer runner terminal.
   expected paths from PowerShell's working-directory spelling. Failed checks are
   labeled inside the already bounded shell receipt without dumping the process
   environment.
+- The same fixture appends only fixed stage names to a controlled private file at
+  script entry and around file writes, `where.exe`, the batch probe and final
+  checks. On shell failure the test reads at most 4 KiB of those labels. This
+  localizes a native stall without exposing environment contents, changing the
+  production timeout or inserting timing between operations.
 - Trust corruption fixtures retain the pinned approval-store directory while
   reopening the identity-matched record directory through the production movable
   operation boundary. This lets the fixture replace and remove its own synthetic

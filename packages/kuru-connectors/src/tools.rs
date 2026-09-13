@@ -1473,6 +1473,25 @@ mod tests {
             let expected_temporary = powershell_literal(temporary.as_os_str());
             let expected_windows = powershell_literal(windows.as_os_str());
             let expected_comspec = powershell_literal(system.join("cmd.exe").as_os_str());
+            let stage = temporary.join(match std::env::var("NO_COLOR").as_deref() {
+                Ok("inherited") => "shell-stage-inherited.txt",
+                Ok("fallback") => "shell-stage-fallback.txt",
+                value => panic!("unexpected Windows shell fixture case: {value:?}"),
+            });
+            let expected_stage = powershell_literal(stage.as_os_str());
+            let stage_trace = || {
+                let mut bytes = Vec::new();
+                match std::fs::File::open(&stage) {
+                    Ok(file) => {
+                        let mut limited = std::io::Read::take(file, 4096);
+                        match std::io::Read::read_to_end(&mut limited, &mut bytes) {
+                            Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
+                            Err(error) => format!("<unreadable: {error}>"),
+                        }
+                    }
+                    Err(error) => format!("<unavailable: {error}>"),
+                }
+            };
             let host = ToolHost::new(
                 &root,
                 &Config {
@@ -1483,6 +1502,8 @@ mod tests {
             .unwrap();
             let shell = format!(
                 r#"
+[IO.File]::AppendAllText({expected_stage}, "entered`n")
+$stage = {expected_stage}
 $expectedPath = {expected_path}
 $expectedHome = {expected_home}
 $expectedTemporary = {expected_temporary}
@@ -1491,9 +1512,15 @@ $expectedComSpec = {expected_comspec}
 $expectedPathext = if ($env:NO_COLOR -eq 'inherited') {{ '.EXE;.CMD' }} else {{ '.COM;.EXE;.BAT;.CMD' }}
 [IO.File]::WriteAllText((Join-Path $env:USERPROFILE 'shell-home.txt'), 'home')
 [IO.File]::WriteAllText((Join-Path $env:TEMP 'shell-temp.txt'), 'temp')
+[IO.File]::AppendAllText($stage, "home-temp-written`n")
+[IO.File]::AppendAllText($stage, "before-where`n")
 $where = & where.exe cmd.exe
 $whereOk = $LASTEXITCODE -eq 0
+[IO.File]::AppendAllText($stage, "after-where`n")
+[IO.File]::AppendAllText($stage, "before-probe`n")
 $probe = & probe
+[IO.File]::AppendAllText($stage, "after-probe`n")
+[IO.File]::AppendAllText($stage, "before-checks`n")
 $checks = [ordered]@{{
     PATH = [string]::Equals($env:PATH, $expectedPath, [System.StringComparison]::Ordinal)
     HOME = [string]::Equals($env:HOME, $expectedHome, [System.StringComparison]::Ordinal)
@@ -1513,6 +1540,7 @@ $checks = [ordered]@{{
     where_cmd = $whereOk
     probe_cmd = $probe -contains 'cmd-ok'
 }}
+[IO.File]::AppendAllText($stage, "after-checks`n")
 $failed = @()
 foreach ($check in $checks.GetEnumerator()) {{
     if (-not $check.Value) {{ $failed += [string]$check.Key }}
@@ -1524,16 +1552,29 @@ if ($failed.Count -eq 0) {{
 }}
 "#
             );
-            let output: Value = serde_json::from_str(
-                &host
-                    .execute("shell", json!({"command":shell}))
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
+            let receipt = host
+                .execute("shell", json!({"command":shell}))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Windows shell projection fixture failed: {error:#}; stages={}",
+                        stage_trace()
+                    )
+                });
+            let output: Value = serde_json::from_str(&receipt).unwrap_or_else(|error| {
+                panic!(
+                    "Windows shell projection fixture returned invalid receipt: {error}; receipt={receipt}; stages={}",
+                    stage_trace()
+                )
+            });
             assert!(
                 output["success"] == true && output["stdout"] == "ok",
-                "Windows shell projection fixture failed: receipt={output}"
+                "Windows shell projection fixture failed: receipt={output}; stages={}",
+                stage_trace()
+            );
+            assert_eq!(
+                stage_trace(),
+                "entered\nhome-temp-written\nbefore-where\nafter-where\nbefore-probe\nafter-probe\nbefore-checks\nafter-checks\n"
             );
             assert_eq!(
                 std::fs::read_to_string(home.join("shell-home.txt")).unwrap(),

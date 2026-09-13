@@ -10,9 +10,11 @@ the typed result that authoritatively finishes the operation.
 The existing terminal owner already restores raw mode, alternate screen,
 bracketed paste, focus reporting and Windows console modes around `run_loop`, but
 an early draw/read error drops the
-`JoinHandle` and detaches a live TUI dispatch task. The scheduler fix must close
-that task before returning to terminal restoration while leaving Harness and
-runtime cancellation policy unchanged.
+`JoinHandle` and detaches a live TUI dispatch task. Awaiting that outer task alone
+does not close provider work: dispatch awaits a reply from a separately spawned
+runtime actor, and `Actor::Drop` aborts that actor without awaiting its task. The
+scheduler fix must close both ownership levels before returning to terminal
+restoration.
 
 ## Goals / Non-Goals
 
@@ -29,7 +31,7 @@ runtime cancellation policy unchanged.
 **Non-Goals:**
 
 - No public event abstraction, `TurnOutput`/JSON change, streaming response
-  protocol, provider/runtime ownership change or new shutdown policy.
+  protocol, provider cancellation-token framework or new shutdown mode.
 - No new event buffer, crossterm/futures version, terminal design, animation
   cadence, command behavior or persistence behavior.
 
@@ -103,11 +105,23 @@ turn. `/quit` still waits for its same-generation typed shutdown outcome.
 
 Wrap the scheduling/rendering body in a private inner future while `run_loop`
 retains the active `JoinHandle`. If the body returns an input EOF/error, draw
-error, or completion-channel invariant error, the wrapper advances the generation,
-aborts and awaits the active job, then returns the original contextual failure.
+error, or completion-channel invariant error, the wrapper advances the generation
+and aborts and awaits the active job. It then locks the Harness and calls its
+existing non-dream shutdown path. Harness shutdown takes every actor from the
+map, aborts each task, and awaits each task before tool cleanup returns, so the
+provider future nested under an actor cannot outlive terminal restoration.
+
+The original terminal failure remains the primary error. If non-dream cleanup
+also fails, that cleanup failure is attached as context rather than replacing
+the initiating failure. Successful loop completion retains the existing typed
+`/quit` shutdown path and dream decision. `Actor::Drop` remains a last-resort
+abort for paths that cannot await; orderly Harness shutdown now supplies the
+awaited ownership boundary.
+
 The outer `run` drops the EventStream and Ratatui terminal before its existing
-`TerminalSession` restoration. This extends the TUI's existing task ownership to
-all fallible loop exits; it does not change provider, Harness or dream semantics.
+`TerminalSession` restoration. This extends the existing cleanup contract to the
+nested runtime task without adding a cancellation-token framework or changing
+provider interfaces.
 
 ## Integration contract
 

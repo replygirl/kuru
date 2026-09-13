@@ -14,9 +14,10 @@ typed completion.
 
 Terminal input EOF, terminal read failure and rendering failure MUST terminate
 through one cleanup boundary that aborts and awaits any TUI-owned dispatch job
-before native terminal state is restored. Activity-channel closure SHALL only
-disable activity reception and MUST NOT complete work, terminate the session or
-create a busy loop.
+and its nested runtime actor/provider work before native terminal state is
+restored. This failure cleanup MUST NOT request exit dreaming. Activity-channel
+closure SHALL only disable activity reception and MUST NOT complete work,
+terminate the session or create a busy loop.
 
 #### Scenario: Typed completion wakes an idle terminal
 
@@ -41,7 +42,7 @@ create a busy loop.
 #### Scenario: Terminal input or rendering fails during work
 
 - **WHEN** the sole terminal stream returns EOF or an error, or terminal drawing fails while a dispatch job is active
-- **THEN** the TUI aborts and awaits that job, reports the original terminal failure, and restores the native terminal modes it changed.
+- **THEN** the TUI aborts and awaits that job, performs non-dream runtime shutdown until its nested actor/provider work is stopped, reports the original terminal failure with any cleanup failure as secondary context, and restores the native terminal modes it changed.
 
 #### Scenario: Explicit cancellation remains ordered
 

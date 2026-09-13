@@ -192,7 +192,13 @@ impl Harness {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        self.actors.clear();
+        let mut actors = std::mem::take(&mut self.actors);
+        for actor in actors.values() {
+            actor.abort();
+        }
+        for actor in actors.values_mut() {
+            actor.wait().await;
+        }
         let cleanup = self.tools.shutdown().await;
         result?;
         cleanup

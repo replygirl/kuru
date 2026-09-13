@@ -894,11 +894,16 @@ async fn finish_loop(
     result: Result<()>,
     job: &mut Option<JoinHandle<()>>,
     generation: &mut u64,
+    harness: &Arc<Mutex<Harness>>,
 ) -> Result<()> {
-    if result.is_err() {
-        abort_and_fence(job, generation).await;
+    let Err(error) = result else {
+        return Ok(());
+    };
+    abort_and_fence(job, generation).await;
+    match harness.lock().await.shutdown(false).await {
+        Ok(()) => Err(error),
+        Err(cleanup) => Err(error).context(format!("TUI runtime cleanup also failed: {cleanup:#}")),
     }
-    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1194,7 +1199,7 @@ where
         }
     }
     .await;
-    finish_loop(result, &mut job, &mut generation).await
+    finish_loop(result, &mut job, &mut generation, &harness).await
 }
 
 pub(crate) async fn dispatch(
@@ -1545,7 +1550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn common_exit_boundary_aborts_and_awaits_before_propagating_each_error() {
+    async fn abort_fence_awaits_owned_dispatch_cancellation() {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1558,27 +1563,20 @@ mod tests {
             }
         }
 
-        for error in [
-            "terminal input closed",
-            "terminal input: injected read failure",
-            "terminal draw: injected backend failure",
-        ] {
-            let dropped = Arc::new(AtomicBool::new(false));
-            let observed = dropped.clone();
-            let mut job = Some(tokio::spawn(async move {
-                let _drop = OnDrop(observed);
-                std::future::pending::<()>().await;
-            }));
-            tokio::task::yield_now().await;
-            let mut generation = 9;
-            let returned = finish_loop(Err(anyhow::anyhow!(error)), &mut job, &mut generation)
-                .await
-                .unwrap_err();
-            assert!(returned.to_string().contains(error), "{returned:#}");
-            assert_eq!(generation, 10);
-            assert!(job.is_none());
-            assert!(dropped.load(Ordering::SeqCst));
-        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed = dropped.clone();
+        let (ready, entered) = tokio::sync::oneshot::channel();
+        let mut job = Some(tokio::spawn(async move {
+            let _drop = OnDrop(observed);
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        entered.await.unwrap();
+        let mut generation = 9;
+        abort_and_fence(&mut job, &mut generation).await;
+        assert_eq!(generation, 10);
+        assert!(job.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 - [x] 1.2 Embed controlled CLI fixture values in authorized PowerShell source instead of relying on excluded custom environment variables.
 - [x] 1.3 Give runtime replay the ordinary shell budget and retain the failed receipt in parse diagnostics.
 - [x] 1.4 Compare the ToolHost Windows shell projection with exact controlled lexical values and report labeled failed checks in its bounded receipt.
+- [x] 1.5 Record fixed private stage labels around the isolated ToolHost shell operations and include at most 4 KiB of those labels when the real shell call fails.
 
 ## 2. Refresh and TUI fixtures
 

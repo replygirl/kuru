@@ -12,9 +12,10 @@
 
 ## 3. Exit cleanup and regressions
 
-- [x] 3.1 Add one common run-loop error boundary that aborts and awaits TUI-owned work for terminal EOF/read errors, draw/backend errors and completion-channel invariant failures before returning the original error to terminal restoration.
+- [x] 3.1 Extend the common run-loop error boundary to abort and await the active dispatch plus every nested runtime actor/provider task through non-dream Harness shutdown for terminal EOF/read errors, draw/backend errors and completion-channel invariant failures before returning the original error to terminal restoration.
 - [x] 3.2 Add deterministic scheduler regressions targeting the former blocking-poll delay with a completion arriving after the scheduler starts waiting, plus rotating fairness, bounded activity drain, closed-activity behavior, generation rejection and shared failure cleanup. Record baseline source inspection separately from current runtime evidence.
 - [x] 3.3 Extend the native terminal fixtures only as needed for EventStream EOF/error restoration, and retain the full existing PTY/ConPTY, view, scene, adapter, slash, visual, preference, trust and persistence assertion bodies.
+- [x] 3.4 Install the controlled-provider drop guard before its started notification and verify every announced provider future has actually entered the lifecycle interval measured by the regression.
 
 ## 4. Verification
 

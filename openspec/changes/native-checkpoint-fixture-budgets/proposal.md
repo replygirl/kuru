@@ -22,6 +22,12 @@ canonicalized working directory. Windows can spell the same directory with a
 short or long component, so that observation can reject the required lexical
 preservation without identifying which condition failed.
 
+The next exact-head Windows run timed out inside the real shell operation with
+the PowerShell root still running and zero bytes or EOF on both captured streams.
+Because the script emitted output only after every assertion, that evidence does
+not distinguish startup from a blocked file write, native command, batch probe,
+module autoload or final check.
+
 ## What Changes
 
 - Give real stock PowerShell and refused-connect fixtures bounded observation
@@ -32,6 +38,8 @@ preservation without identifying which condition failed.
   source instead of relying on custom environment variables that Kuru must drop.
 - Compare projected Windows shell values with the exact controlled values supplied
   by the fixture, and name failed conditions in the bounded tool receipt.
+- Append fixed stage labels to a private fixture file around each shell probe and
+  report a bounded label prefix when the real shell operation itself fails.
 - Use the checked movable approval-record operation boundary when the trust
   corruption fixture replaces synthetic records under a retained pinned store.
 - Make native replay failures name the raw failed receipt and verify saved picker

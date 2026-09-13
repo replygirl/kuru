@@ -221,9 +221,9 @@ impl Provider for BlockingProvider {
             }
         }
 
+        let _dropped = Dropped(&self.dropped);
         self.started.fetch_add(1, Ordering::SeqCst);
         self.wake.notify_one();
-        let _dropped = Dropped(&self.dropped);
         std::future::pending::<anyhow::Result<Completion>>().await
     }
 }
