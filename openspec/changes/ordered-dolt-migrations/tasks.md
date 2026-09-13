@@ -42,7 +42,7 @@
   opens report old versions and future/inconsistent schemas fail before schema
   mutation; verify stopped persisted-v1 upgrade, second-reopen idempotence,
   process-loss recovery and inspection-owned server contention with real Dolt.
-- [ ] 3.3 Extend owned cleanup so any bounded `Server::close` handoff retains
+- [x] 3.3 Extend owned cleanup so any bounded `Server::close` handoff retains
   the project startup lock until the supervisor has reaped Dolt; verify native
   child/process interruption cannot release writer authority early on Unix or
   Windows. Transfer that guard through the private server-open path before any

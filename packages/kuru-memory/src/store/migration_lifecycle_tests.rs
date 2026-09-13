@@ -43,6 +43,167 @@ fn assert_no_staging_directory(options: &OpenOptions) -> Result<()> {
 }
 
 #[tokio::test]
+async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quiesces() -> Result<()>
+{
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    let root = Arc::new(tempfile::tempdir()?);
+    let data = root.path().join("data");
+    Directory::ensure_private(&data)?;
+    let scope = format!("project/{}", "c".repeat(64));
+    let options = crate::test_support::open_options(data, scope.clone())?;
+    let initialized = MemoryStore::open(options.clone()).await?;
+    initialized.close().await?;
+    drop(initialized);
+
+    let directory = project_directory(&options.data_dir, &scope)?;
+    let parent = directory
+        .parent()
+        .context("fixture memory directory has no parent")?;
+    let locks = Directory::open(
+        &parent.join("locks"),
+        Privacy::OwnerOnly,
+        NameRetention::Pinned,
+    )?;
+    let name = directory
+        .file_name()
+        .context("fixture memory directory has no name")?;
+    let guard = locks.lock_file(name)?;
+    match guard.try_lock() {
+        Ok(()) => {}
+        Err(error) => bail!("fixture startup guard was unexpectedly unavailable: {error}"),
+    }
+    let contender = locks.lock_file(name)?;
+    let lifecycle_root = cfg!(windows).then(|| options.data_dir.join("memory/lifecycles"));
+    let server = Server::open_with_guard(
+        ServerOptions {
+            binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt"))
+                .await?,
+            directory: directory.clone(),
+            project_scope: scope,
+            supervisor: options
+                .supervisor
+                .clone()
+                .context("close-handoff fixture needs supervisor")?,
+            timeout: Duration::from_secs(options.config.startup_timeout_secs),
+            read_only: false,
+            retained: Some(root.clone()),
+            lifecycle_root: lifecycle_root.clone(),
+        },
+        guard,
+    )
+    .await?;
+    let pool = server.pool("main").await?;
+    let mut held = pool.acquire().await?;
+    let closing = tokio::spawn(close_migration_worker(server, pool.clone()));
+    tokio::time::timeout(DEADLINE, async {
+        while !pool.is_closed() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("close handoff did not enter pool shutdown")?;
+    closing.abort();
+    assert!(
+        closing
+            .await
+            .expect_err("close handoff task completed")
+            .is_cancelled(),
+        "close handoff was not cancelled while pool shutdown was pending"
+    );
+
+    // A checked-out pool connection makes the close future pending, but does
+    // not itself keep a terminated supervisor alive. Observe either the still
+    // responsive real Dolt while its original startup guard remains held, or
+    // the observer's already-confirmed guard release followed by quiescence.
+    let retained_while_live = tokio::time::timeout(DEADLINE, async {
+        loop {
+            match contender.try_lock() {
+                Ok(()) => {
+                    let mut quiescence = Box::pin(Server::quiescence_at(
+                        &directory,
+                        lifecycle_root.as_deref(),
+                        DEADLINE,
+                    ));
+                    let lease = std::future::poll_fn(|context| {
+                        std::task::Poll::Ready(
+                            match std::future::Future::poll(quiescence.as_mut(), context) {
+                                std::task::Poll::Ready(Ok(lease)) => Ok(lease),
+                                std::task::Poll::Pending => Err(anyhow::anyhow!(
+                                    "startup guard released before lifecycle quiescence was ready"
+                                )),
+                                std::task::Poll::Ready(Err(error)) => Err(error.context(
+                                    "lifecycle quiescence failed during its first observation",
+                                )),
+                            },
+                        )
+                    })
+                    .await?;
+                    drop(lease);
+                    return Ok::<_, anyhow::Error>(false);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if sqlx::query_scalar::<_, i64>("SELECT 1")
+                        .fetch_one(&mut *held)
+                        .await
+                        .is_ok()
+                    {
+                        return Ok(true);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("close handoff neither retained a live owner nor confirmed cleanup")??;
+    drop(held);
+    drop(pool);
+
+    if retained_while_live {
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                match contender.try_lock() {
+                    Ok(()) => {
+                        let mut quiescence = Box::pin(Server::quiescence_at(
+                            &directory,
+                            lifecycle_root.as_deref(),
+                            DEADLINE,
+                        ));
+                        let lease = std::future::poll_fn(|context| {
+                            std::task::Poll::Ready(
+                                match std::future::Future::poll(quiescence.as_mut(), context) {
+                                    std::task::Poll::Ready(Ok(lease)) => Ok(lease),
+                                    std::task::Poll::Pending => Err(anyhow::anyhow!(
+                                        "startup guard released before lifecycle quiescence was ready"
+                                    )),
+                                    std::task::Poll::Ready(Err(error)) => Err(error.context(
+                                        "lifecycle quiescence failed during its first observation",
+                                    )),
+                                },
+                            )
+                        })
+                        .await?;
+                        drop(lease);
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        })
+        .await
+        .context("reaper did not release the original startup guard")??;
+    }
+    let lease = Server::quiescence_at(&directory, lifecycle_root.as_deref(), DEADLINE).await?;
+    drop(lease);
+    Ok(())
+}
+
+#[tokio::test]
 async fn inspection_owned_old_schema_blocks_writer_without_mutation() -> Result<()> {
     let root = crate::test_support::tempdir()?;
     let scope = format!("project/{}", "7".repeat(64));
