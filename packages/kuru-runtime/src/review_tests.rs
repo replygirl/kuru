@@ -210,7 +210,7 @@ async fn unavailable_mcp_status_stays_out_of_provider_input_and_memory() {
     assert!(!history.contains(SECRET));
     assert!(!history.contains("configured server unavailable"));
     harness.shutdown(false).await.unwrap();
-    harness.memory.close().await.unwrap();
+    harness.memory.clone().close().await.unwrap();
     drop(harness);
     let reopened = MemoryStore::open(options).await.unwrap();
     let reopened_history =
