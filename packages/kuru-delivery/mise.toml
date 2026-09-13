@@ -11,6 +11,11 @@ run = "mise install --include-task-tools"
 description = "Install only the package's pinned behavioral fixture tools"
 run = "mise install aqua:cocogitto/cocogitto@{{vars.kuru_cocogitto_version}} github:jdx/communique@{{vars.kuru_communique_version}}"
 
+[tasks."setup:windows-debugger"]
+description = "Prepare the pinned Windows Debugging Tools input for the temporary shell diagnostic"
+run = "echo 'setup:windows-debugger requires native Windows' >&2; exit 1"
+run_windows = "pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/prepare-windows-debugger.ps1"
+
 [tasks."setup:advisories"]
 description = "Install only the pinned cargo-audit scanner used by advisory tasks"
 run = "mise install --locked \"cargo:cargo-audit[default-features=false,locked=true]@{{vars.kuru_cargo_audit_version}}\""

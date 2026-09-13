@@ -138,6 +138,66 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
     assert_eq!(workflow.matches("if: ${{ !cancelled() }}").count(), 2);
 }
 
+#[test]
+fn windows_debugger_setup_is_limited_to_the_connector_coverage_shard() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow = fs::read_to_string(root.join(".github/workflows/native-tests.yml")).unwrap();
+    let coverage = workflow
+        .split("  windows-coverage:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n  windows-coverage-report:\n")
+        .next()
+        .unwrap();
+    for required in [
+        "if: matrix.shard == 'connectors-core-platform'",
+        "timeout-minutes: 15",
+        "KURU_WINDOWS_DEBUGGER_INPUT_DIR: ${{ runner.temp }}/kuru-windows-debugger-${{ matrix.shard }}-${{ github.run_attempt }}",
+        "mise run //packages/kuru-delivery:setup:windows-debugger",
+    ] {
+        assert!(coverage.contains(required), "missing {required}");
+    }
+    assert_eq!(workflow.matches("setup:windows-debugger").count(), 1);
+    assert_eq!(workflow.matches("KURU_WINDOWS_CDB_PATH").count(), 0);
+    assert!(!workflow.contains("KURU_WINDOWS_STACK_DIAGNOSTIC"));
+
+    let task = fs::read_to_string(root.join("packages/kuru-delivery/mise.toml")).unwrap();
+    let debugger_task = task
+        .split("[tasks.\"setup:windows-debugger\"]")
+        .nth(1)
+        .unwrap()
+        .split("\n[tasks.")
+        .next()
+        .unwrap();
+    assert!(debugger_task.contains("requires native Windows"));
+    assert!(debugger_task.contains("prepare-windows-debugger.ps1"));
+
+    let debugger = fs::read_to_string(
+        root.join("packages/kuru-delivery/support/prepare-windows-debugger.ps1"),
+    )
+    .unwrap();
+    for required in [
+        "https://download.microsoft.com/download/4c09a46e-b908-42d9-bf27-26cb1779c670/KIT_BUNDLE_WINDOWSSDK_MEDIACREATION/winsdksetup.exe",
+        "winsdksetup-10.0.26100.9169.exe",
+        "680aa29dcfa806d35b4e93ea05a3fa2bdcf2935b65295f996c8e944584dd2836",
+        "1449536",
+        "[IO.FileMode]::CreateNew",
+        "ReparsePoint",
+        "Get-AuthenticodeSignature",
+        "O=Microsoft Corporation",
+        "Require-MicrosoftSignature $installer",
+        "Require-MicrosoftSignature $resolvedCdb",
+        "Start-Process -FilePath $installer",
+        "-Wait -PassThru",
+        "$installerProcess.ExitCode -eq 0",
+        "OptionId.WindowsDesktopDebuggers",
+        "Windows Kits\\10\\Debuggers\\x64",
+        "KURU_WINDOWS_CDB_PATH",
+    ] {
+        assert!(debugger.contains(required), "missing {required}");
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn native_workflow_gate_rejects_incomplete_windows_results() {

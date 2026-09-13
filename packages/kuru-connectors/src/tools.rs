@@ -815,6 +815,12 @@ async fn shell(
     let result = match result {
         Ok(status) => Ok(status),
         Err(error) => {
+            #[cfg(all(test, windows))]
+            let mut stack_diagnostic = if tests::windows_stack_diagnostic_selected() {
+                Some(tests::capture_selected_windows_stack(&mut child, root).await)
+            } else {
+                None
+            };
             // Query the retained root separately from whole-Job quiescence;
             // observation failure must never prevent the existing cleanup.
             let root_state = match child.duplicate_process_handle() {
@@ -826,15 +832,29 @@ async fn shell(
                 Err(_) => "query-error",
             };
             let observed = child.try_wait();
-            let stopped = match crate::process::stop(&mut child).await {
+            let stopped_result = crate::process::stop(&mut child).await;
+            let stopped = match &stopped_result {
                 Ok(()) => "subprocess tree terminated".to_owned(),
                 Err(error) => format!("subprocess cleanup unconfirmed: {error:#}"),
+            };
+            #[cfg(all(test, windows))]
+            let stopped = {
+                let mut stopped = stopped;
+                if let Some(diagnostic) = &mut stack_diagnostic {
+                    diagnostic.finish_after_target(stopped_result.is_ok());
+                    if !diagnostic.cleanup_confirmed {
+                        stopped.push_str("; CDB cleanup unconfirmed");
+                    }
+                }
+                stopped
             };
             failure_metadata = Some(ShellFailureMetadata {
                 phase: phase.to_owned(),
                 root_state: root_state.to_owned(),
                 observed: format!("{observed:?}"),
                 stopped,
+                #[cfg(all(test, windows))]
+                stack_diagnostic: stack_diagnostic.map(|diagnostic| diagnostic.detail),
             });
             Err(error)
         }
@@ -888,6 +908,8 @@ struct ShellFailureMetadata {
     root_state: String,
     observed: String,
     stopped: String,
+    #[cfg(test)]
+    stack_diagnostic: Option<String>,
 }
 
 #[cfg(any(windows, test))]
@@ -908,6 +930,11 @@ fn projected_shell_failure(
         metadata.observed,
         metadata.stopped,
     );
+    #[cfg(test)]
+    let raw = match &metadata.stack_diagnostic {
+        Some(diagnostic) => format!("{raw}; CDB stack diagnostic: {diagnostic}"),
+        None => raw,
+    };
     let diagnostic = format!(
         "{}; stderr prefix: {}",
         project_text(raw)?,
@@ -1093,7 +1120,10 @@ mod tests {
             phase: format!("read shell output {metadata_secret}"),
             root_state: format!("query-error {metadata_secret}"),
             observed: format!("Err({metadata_secret})"),
-            stopped: format!("subprocess cleanup unconfirmed: {metadata_secret}"),
+            stopped: format!(
+                "subprocess cleanup unconfirmed: {metadata_secret}; CDB cleanup unconfirmed"
+            ),
+            stack_diagnostic: Some(format!("native stack: {metadata_secret}")),
         };
         let error = projected_shell_failure(error, &metadata, &capture, &capture).unwrap();
         assert!(error.downcast_ref::<ProjectedShellDiagnostic>().is_some());
@@ -1104,6 +1134,8 @@ mod tests {
         assert!(rendered.contains("[REDACTED:recognized-secret]"));
         assert!(rendered.contains("[truncated]"));
         assert!(rendered.contains(":TAIL"));
+        assert!(rendered.contains("CDB cleanup unconfirmed"));
+        assert!(rendered.contains("CDB stack diagnostic"));
         for secret in [secret, operation_secret, cleanup_secret, metadata_secret] {
             assert!(!rendered.contains(secret));
         }
@@ -2338,11 +2370,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn windows_shell_projection_source(
-        root: &Path,
-        case: &str,
-        diagnostic_import: Option<&str>,
-    ) -> String {
+    fn windows_shell_projection_source(root: &Path, case: &str) -> String {
         let home = root.join("home");
         let temporary = root.join("temporary");
         let commands = root.join("commands");
@@ -2362,42 +2390,6 @@ mod tests {
                 .join(format!("shell-stage-{case}.txt"))
                 .as_os_str(),
         );
-        let diagnostic_import = diagnostic_import.map_or_else(String::new, |module| {
-            format!(
-                r#"[IO.File]::AppendAllText($stage, "before-import`nimport-verbose=")
-$importCapacity = 1024
-$importMarker = '[truncated]'
-$importTextCapacity = $importCapacity - $importMarker.Length
-$importWritten = 0
-$importTruncated = $false
-try {{
-    Microsoft.PowerShell.Core\Import-Module -Name '{module}' -Verbose -ErrorAction Stop 4>&1 | Microsoft.PowerShell.Core\ForEach-Object {{
-        if (-not $importTruncated) {{
-            $importRecord = $_.ToString()
-            $importRemaining = $importTextCapacity - $importWritten
-            if ($importRemaining -le 0) {{
-                [IO.File]::AppendAllText($stage, $importMarker)
-                $importWritten += $importMarker.Length
-                $importTruncated = $true
-            }} elseif ($importRecord.Length -gt $importRemaining) {{
-                [IO.File]::AppendAllText($stage, $importRecord.Substring(0, $importRemaining))
-                [IO.File]::AppendAllText($stage, $importMarker)
-                $importWritten += $importRemaining + $importMarker.Length
-                $importTruncated = $true
-            }} else {{
-                [IO.File]::AppendAllText($stage, $importRecord)
-                $importWritten += $importRecord.Length
-            }}
-        }}
-    }}
-}} catch {{
-    throw
-}}
-[IO.File]::AppendAllText($stage, "`n")
-[IO.File]::AppendAllText($stage, "after-import`n")
-"#
-            )
-        });
         format!(
             r#"
 [IO.File]::AppendAllText({expected_stage}, "entered`n")
@@ -2410,7 +2402,7 @@ $expectedComSpec = {expected_comspec}
 # Kuru supplies the exact inherited value or fallback. Stock PowerShell then
 # appends .CPL during engine construction when that extension is absent.
 $expectedPathext = if ($env:NO_COLOR -eq 'inherited') {{ '.EXE;.CMD;.CPL' }} else {{ '.COM;.EXE;.BAT;.CMD;.CPL' }}
-{diagnostic_import}[IO.File]::AppendAllText($stage, "before-join-path`n")
+[IO.File]::AppendAllText($stage, "before-join-path`n")
 $homePath = Join-Path $env:USERPROFILE 'shell-home.txt'
 [IO.File]::AppendAllText($stage, "after-join-path`n")
 [IO.File]::WriteAllText($homePath, 'home')
@@ -2477,240 +2469,688 @@ if ($failed.Count -eq 0) {{
     }
 
     #[cfg(windows)]
-    async fn windows_shell_projection_failure_controls(
-        inherited: &[(OsString, OsString)],
-        case: &str,
-    ) -> Vec<String> {
-        use base64::Engine;
-        use kuru_platform::windows::process::{
-            Console, Stdio, configured_command, system_directory,
-        };
+    pub(super) const WINDOWS_STACK_DIAGNOSTIC_SELECTOR: &str = "KURU_WINDOWS_STACK_DIAGNOSTIC";
+    #[cfg(windows)]
+    const WINDOWS_SHELL_FIXTURE_CHILD: &str = "KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_CHILD";
+    #[cfg(windows)]
+    const WINDOWS_CDB_PATH: &str = "KURU_WINDOWS_CDB_PATH";
+    const CDB_OUTPUT_LIMIT: usize = 512 * 1024;
+    #[cfg(windows)]
+    const CDB_CAPTURE_LIMIT: Duration = Duration::from_secs(20);
+    #[cfg(windows)]
+    const CDB_CLEANUP_LIMIT: Duration = Duration::from_secs(5);
+    #[cfg(windows)]
+    const CDB_COMMANDS: &str = ".echo KURU_CDB_NATIVE_BEGIN\r\n~*e kc 80\r\n.echo KURU_CDB_NATIVE_END\r\n.loadby sos clr\r\n.echo KURU_CDB_MANAGED_BEGIN\r\n~*e !clrstack -n\r\n.echo KURU_CDB_MANAGED_END\r\nqd\r\n";
 
-        let mut results = Vec::new();
-        for (name, module) in [(
-            "encoded-inherit-import-management",
-            "Microsoft.PowerShell.Management",
-        )] {
-            let root = match tempfile::tempdir() {
-                Ok(root) => root,
-                Err(_) => {
-                    results.push(format!("{name}: private-root-error"));
-                    continue;
-                }
+    #[cfg(windows)]
+    pub(super) struct WindowsStackDiagnostic {
+        pub(super) detail: String,
+        pub(super) cleanup_confirmed: bool,
+        command_file: Option<PathBuf>,
+    }
+
+    #[cfg(windows)]
+    impl WindowsStackDiagnostic {
+        pub(super) fn finish_after_target(&mut self, target_stopped: bool) {
+            let Some(command_file) = self.command_file.take() else {
+                return;
             };
-            let commands = root.path().join("commands");
-            let home = root.path().join("home");
-            let temporary = root.path().join("temporary");
-            let local = root.path().join("local");
-            let roaming = root.path().join("roaming");
-            if [&commands, &home, &temporary, &local, &roaming]
-                .into_iter()
-                .any(|path| std::fs::create_dir(path).is_err())
-                || std::fs::write(commands.join("probe.cmd"), "@echo cmd-ok\r\n").is_err()
-            {
-                results.push(format!("{name}: private-root-setup-error"));
-                continue;
+            if !self.cleanup_confirmed || !target_stopped {
+                self.command_file = Some(command_file);
+                return;
             }
-            let system = match system_directory() {
-                Ok(system) => system,
-                Err(_) => {
-                    results.push(format!("{name}: system-directory-error"));
-                    continue;
-                }
-            };
-            let path = match std::env::join_paths([commands.as_path(), system.as_path()]) {
-                Ok(path) => path,
-                Err(_) => {
-                    results.push(format!("{name}: path-setup-error"));
-                    continue;
-                }
-            };
-            let mut source_environment: Vec<_> = inherited
-                .iter()
-                .filter(|(key, _)| {
-                    ![
-                        "PATH",
-                        "HOME",
-                        "USERPROFILE",
-                        "LOCALAPPDATA",
-                        "APPDATA",
-                        "TEMP",
-                        "TMP",
-                    ]
-                    .iter()
-                    .any(|name| {
-                        kuru_platform::windows::process::environment_key_eq(key, OsStr::new(name))
-                    })
-                })
-                .cloned()
-                .collect();
-            source_environment.extend([
-                ("pAtH".into(), path),
-                ("HOME".into(), home.into()),
-                ("userprofile".into(), root.path().join("home").into()),
-                ("LOCALAPPDATA".into(), local.into()),
-                ("APPDATA".into(), roaming.into()),
-                ("TEMP".into(), temporary.into()),
-                ("TMP".into(), root.path().join("temporary").into()),
-            ]);
-            let environment = match windows_shell_environment(source_environment, &system) {
-                Ok(environment) => environment,
-                Err(_) => {
-                    results.push(format!("{name}: projected-environment-error"));
-                    continue;
-                }
-            };
-            let command = windows_shell_projection_source(root.path(), case, Some(module));
-            let source = format!(
-                "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
-            );
-            let mut args: Vec<OsString> = [
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-OutputFormat",
-                "Text",
-            ]
-            .map(Into::into)
-            .into();
-            let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
-            args.push("-EncodedCommand".into());
-            args.push(
-                base64::engine::general_purpose::STANDARD
-                    .encode(bytes)
-                    .into(),
-            );
-            let program = system.join("WindowsPowerShell/v1.0/powershell.exe");
-            let mut spec =
-                match configured_command(program.as_os_str(), &args, root.path(), environment) {
-                    Ok(spec) => spec,
-                    Err(_) => {
-                        results.push(format!("{name}: configured-command-error"));
-                        continue;
-                    }
-                };
-            spec.console = Console::Inherit;
-            spec.stdout = Stdio::Pipe;
-            spec.stderr = Stdio::Pipe;
-            let mut child = match spec.spawn().await {
-                Ok(child) => child,
-                Err(_) => {
-                    results.push(format!("{name}: launch-error"));
-                    continue;
-                }
-            };
-            let mut stdout = match child.take_stdout() {
-                Some(stdout) => stdout,
-                None => {
-                    let requested = child.terminate();
-                    let stderr_close = match child.take_stderr() {
-                        Some(mut stderr) => stderr.close(Duration::from_secs(5)).await.is_ok(),
-                        None => true,
-                    };
-                    let reap = child.wait(Duration::from_secs(5)).await;
-                    if stderr_close && reap.is_ok() {
-                        results.push(format!(
-                            "{name}: missing-stdout, terminate={}",
-                            requested.is_ok()
-                        ));
-                    } else {
-                        let preserved = root.keep();
-                        results.push(format!(
-                            "{name}: missing-stdout, terminate={}; cleanup-unconfirmed; preserved={}",
-                            requested.is_ok(),
-                            preserved.display()
-                        ));
-                    }
-                    continue;
-                }
-            };
-            let mut stderr = match child.take_stderr() {
-                Some(stderr) => stderr,
-                None => {
-                    let requested = child.terminate();
-                    let stdout_close = stdout.close(Duration::from_secs(5)).await;
-                    let reap = child.wait(Duration::from_secs(5)).await;
-                    if stdout_close.is_ok() && reap.is_ok() {
-                        results.push(format!(
-                            "{name}: missing-stderr, terminate={}",
-                            requested.is_ok()
-                        ));
-                    } else {
-                        let preserved = root.keep();
-                        results.push(format!(
-                            "{name}: missing-stderr, terminate={}; cleanup-unconfirmed; preserved={}",
-                            requested.is_ok(),
-                            preserved.display()
-                        ));
-                    }
-                    continue;
-                }
-            };
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            let outcome = timeout(Duration::from_secs(30), async {
-                let (stdout_truncated, stderr_truncated, status) = tokio::join!(
-                    drain_bounded(&mut stdout, &mut out),
-                    drain_bounded(&mut stderr, &mut err),
-                    child.wait(Duration::from_secs(30)),
-                );
-                Ok::<_, std::io::Error>((stdout_truncated?, stderr_truncated?, status?))
-            })
-            .await;
-            let (state, cleanup_confirmed) = match outcome {
-                Ok(Ok((stdout_truncated, stderr_truncated, status))) => {
-                    let (stdout_close, stderr_close) = tokio::join!(
-                        stdout.close(Duration::from_secs(5)),
-                        stderr.close(Duration::from_secs(5)),
-                    );
-                    (
-                        format!(
-                            "status={:?}, stdout={}B, stderr={}B, truncated={}",
-                            status.code(),
-                            out.len(),
-                            err.len(),
-                            stdout_truncated || stderr_truncated
-                        ),
-                        stdout_close.is_ok() && stderr_close.is_ok(),
-                    )
-                }
-                Ok(Err(_)) => {
-                    let requested = child.terminate();
-                    let (stdout_close, stderr_close, reap) = tokio::join!(
-                        stdout.close(Duration::from_secs(5)),
-                        stderr.close(Duration::from_secs(5)),
-                        child.wait(Duration::from_secs(5)),
-                    );
-                    (
-                        format!("operation-error, terminate={}", requested.is_ok()),
-                        stdout_close.is_ok() && stderr_close.is_ok() && reap.is_ok(),
-                    )
-                }
-                Err(_) => {
-                    let requested = child.terminate();
-                    let (stdout_close, stderr_close, reap) = tokio::join!(
-                        stdout.close(Duration::from_secs(5)),
-                        stderr.close(Duration::from_secs(5)),
-                        child.wait(Duration::from_secs(5)),
-                    );
-                    (
-                        format!("timed-out, terminate={}", requested.is_ok()),
-                        stdout_close.is_ok() && stderr_close.is_ok() && reap.is_ok(),
-                    )
-                }
-            };
-            let stages = windows_shell_projection_stages(root.path(), case);
-            if cleanup_confirmed {
-                results.push(format!("{name}: {state}; stages={stages:?}"));
-            } else {
-                let preserved = root.keep();
-                results.push(format!(
-                    "{name}: {state}; cleanup-unconfirmed; preserved={}; stages={stages:?}",
-                    preserved.display()
-                ));
+            if let Err(error) = std::fs::remove_file(&command_file) {
+                self.cleanup_confirmed = false;
+                use std::fmt::Write as _;
+                let _ = write!(self.detail, "; debugger command cleanup failed: {error}");
+                self.command_file = Some(command_file);
             }
         }
-        results
+    }
+
+    struct ParsedCdbStacks {
+        detail: String,
+        managed_sleep: bool,
+    }
+
+    fn cdb_command_echo(line: &str) -> bool {
+        let Some((_, command)) = line.trim().rsplit_once('>') else {
+            return false;
+        };
+        let command = command.trim_start();
+        matches!(
+            command,
+            ".echo KURU_CDB_NATIVE_BEGIN"
+                | "~*e kc 80"
+                | ".echo KURU_CDB_NATIVE_END"
+                | ".loadby sos clr"
+                | ".echo KURU_CDB_MANAGED_BEGIN"
+                | "~*e !clrstack -n"
+                | ".echo KURU_CDB_MANAGED_END"
+                | "qd"
+        )
+    }
+
+    fn hexadecimal_token(token: &str, minimum: usize) -> bool {
+        token.len() >= minimum && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn native_stack_frame(line: &str) -> bool {
+        let mut tokens = line.split_whitespace();
+        let Some(first) = tokens.next() else {
+            return false;
+        };
+        let frame = if hexadecimal_token(first, 1) && first.len() <= 3 {
+            let Some(frame) = tokens.next() else {
+                return false;
+            };
+            frame
+        } else {
+            first
+        };
+        if tokens.next().is_some() {
+            return false;
+        }
+        let Some((module, function)) = frame.split_once('!') else {
+            return false;
+        };
+        !module.is_empty() && !function.is_empty()
+    }
+
+    fn managed_stack_frame(line: &str) -> bool {
+        let Some(address) = line.split_whitespace().next() else {
+            return false;
+        };
+        hexadecimal_token(address, 8) && line.contains('(') && line.contains(')')
+    }
+
+    fn parse_cdb_stacks(stdout: &[u8]) -> Result<ParsedCdbStacks> {
+        const NATIVE_BEGIN: &str = "KURU_CDB_NATIVE_BEGIN";
+        const NATIVE_END: &str = "KURU_CDB_NATIVE_END";
+        const MANAGED_BEGIN: &str = "KURU_CDB_MANAGED_BEGIN";
+        const MANAGED_END: &str = "KURU_CDB_MANAGED_END";
+
+        let output = std::str::from_utf8(stdout).context("CDB output is not UTF-8")?;
+        let mut markers = [0_u8; 4];
+        let mut state = 0_u8;
+        let mut native = Vec::new();
+        let mut managed = Vec::new();
+        for line in output.lines() {
+            let trimmed = line.trim();
+            let marker = match trimmed {
+                NATIVE_BEGIN => Some((0, 1)),
+                NATIVE_END => Some((1, 2)),
+                MANAGED_BEGIN => Some((2, 3)),
+                MANAGED_END => Some((3, 4)),
+                _ => None,
+            };
+            if let Some((index, next)) = marker {
+                ensure!(state == index, "CDB stack markers are out of order");
+                markers[index as usize] = markers[index as usize].saturating_add(1);
+                ensure!(markers[index as usize] == 1, "duplicate CDB stack marker");
+                state = next;
+                continue;
+            }
+            if cdb_command_echo(line) {
+                continue;
+            }
+            match state {
+                1 => native.push(line),
+                3 => managed.push(line),
+                _ => {}
+            }
+        }
+        ensure!(
+            state == 4 && markers == [1, 1, 1, 1],
+            "missing CDB stack marker"
+        );
+
+        let native = native.join("\n").trim().to_owned();
+        let managed = managed.join("\n").trim().to_owned();
+        ensure!(
+            native.lines().any(native_stack_frame),
+            "CDB native section has no module/function frame"
+        );
+        ensure!(
+            managed.contains("OS Thread Id") && managed.lines().any(managed_stack_frame),
+            "CDB managed section has no managed frame"
+        );
+        let lowered = managed.to_ascii_lowercase();
+        ensure!(
+            ![
+                "failed to load",
+                "failed to find runtime",
+                "no export clrstack",
+                "sos is not loaded",
+            ]
+            .iter()
+            .any(|failure| lowered.contains(failure)),
+            "CDB managed stack reports an SOS failure"
+        );
+        ensure!(
+            native.len().saturating_add(managed.len()) <= CDB_OUTPUT_LIMIT,
+            "parsed CDB stack sections exceed 512 KiB"
+        );
+        let managed_sleep = managed.contains("System.Threading.Thread.Sleep");
+        Ok(ParsedCdbStacks {
+            detail: format!("native stack:\n{native}\nmanaged stack:\n{managed}"),
+            managed_sleep,
+        })
+    }
+
+    fn windows_shell_cleanup_uncertain(stdout: &[u8], stderr: &[u8]) -> bool {
+        [
+            b"CDB cleanup unconfirmed".as_slice(),
+            b"subprocess cleanup unconfirmed".as_slice(),
+        ]
+        .into_iter()
+        .any(|marker| {
+            stdout.windows(marker.len()).any(|bytes| bytes == marker)
+                || stderr.windows(marker.len()).any(|bytes| bytes == marker)
+        })
+    }
+
+    #[test]
+    fn cdb_stack_parser_rejects_incomplete_or_unsafe_output() {
+        let valid = concat!(
+            "0:000> .echo KURU_CDB_NATIVE_BEGIN\r\n",
+            "KURU_CDB_NATIVE_BEGIN\r\n",
+            "ntdll!NtWaitForSingleObject+0x14\r\n",
+            "0:000> .echo KURU_CDB_NATIVE_END\r\n",
+            "KURU_CDB_NATIVE_END\r\n",
+            "KURU_CDB_MANAGED_BEGIN\r\n",
+            "OS Thread Id: 0x1234 (0)\r\n",
+            "00000000 System.Threading.Thread.Sleep(Int32)\r\n",
+            "KURU_CDB_MANAGED_END\r\n",
+        );
+        let parsed = parse_cdb_stacks(valid.as_bytes()).expect("valid bounded stacks");
+        assert!(parsed.managed_sleep);
+        assert!(!parsed.detail.contains(".echo KURU_CDB_NATIVE_BEGIN"));
+        parse_cdb_stacks(valid.replace("ntdll!", "00 ntdll!").as_bytes())
+            .expect("indexed native frame remains accepted");
+
+        let failures = [
+            ("missing", valid.replace("KURU_CDB_MANAGED_END\r\n", "")),
+            (
+                "duplicate",
+                valid.replace(
+                    "KURU_CDB_NATIVE_BEGIN\r\nntdll",
+                    "KURU_CDB_NATIVE_BEGIN\r\nKURU_CDB_NATIVE_BEGIN\r\nntdll",
+                ),
+            ),
+            (
+                "out-of-order",
+                valid.replace(
+                    "KURU_CDB_NATIVE_END\r\nKURU_CDB_MANAGED_BEGIN",
+                    "KURU_CDB_MANAGED_BEGIN\r\nKURU_CDB_NATIVE_END",
+                ),
+            ),
+            (
+                "echo-only",
+                valid.replace(
+                    "ntdll!NtWaitForSingleObject+0x14\r\n",
+                    "0:000> ~*e kc 80\r\n",
+                ),
+            ),
+            (
+                "SOS-error",
+                valid.replace(
+                    "00000000 System.Threading.Thread.Sleep(Int32)",
+                    "SOS is not loaded (failure)",
+                ),
+            ),
+            (
+                "managed-header-only",
+                valid.replace("00000000 System.Threading.Thread.Sleep(Int32)\r\n", ""),
+            ),
+            (
+                "native-header-only",
+                valid.replace("ntdll!NtWaitForSingleObject+0x14\r\n", ""),
+            ),
+        ];
+        for (name, output) in failures {
+            assert!(
+                parse_cdb_stacks(output.as_bytes()).is_err(),
+                "{name} output was accepted"
+            );
+        }
+
+        let overflow = valid.replace(
+            "ntdll!NtWaitForSingleObject+0x14",
+            &format!("ntdll!{}", "x".repeat(CDB_OUTPUT_LIMIT)),
+        );
+        assert!(parse_cdb_stacks(overflow.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn windows_shell_cleanup_uncertainty_markers_are_detected() {
+        assert!(windows_shell_cleanup_uncertain(
+            b"prefix CDB cleanup unconfirmed suffix",
+            b""
+        ));
+        assert!(windows_shell_cleanup_uncertain(
+            b"",
+            b"prefix subprocess cleanup unconfirmed suffix"
+        ));
+        assert!(!windows_shell_cleanup_uncertain(
+            b"subprocess tree terminated",
+            b"ordinary failure"
+        ));
+    }
+
+    #[cfg(windows)]
+    async fn read_cdb_pipe(
+        pipe: &mut kuru_platform::windows::pipe::Pipe,
+    ) -> std::io::Result<(Vec<u8>, bool)> {
+        let mut retained = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        let mut overflow = false;
+        loop {
+            let count = pipe.read(&mut buffer).await?;
+            if count == 0 {
+                return Ok((retained, overflow));
+            }
+            let keep = count.min(CDB_OUTPUT_LIMIT.saturating_sub(retained.len()));
+            retained.extend_from_slice(&buffer[..keep]);
+            overflow |= keep != count;
+        }
+    }
+
+    #[cfg(windows)]
+    async fn cleanup_cdb(
+        child: &mut kuru_platform::windows::process::NativeChild,
+        stdout: &mut kuru_platform::windows::pipe::Pipe,
+        stderr: &mut kuru_platform::windows::pipe::Pipe,
+    ) -> bool {
+        let requested = child.terminate().is_ok();
+        let (stdout_close, stderr_close, reaped) = tokio::join!(
+            stdout.close(CDB_CLEANUP_LIMIT),
+            stderr.close(CDB_CLEANUP_LIMIT),
+            child.wait(CDB_CLEANUP_LIMIT),
+        );
+        requested && stdout_close.is_ok() && stderr_close.is_ok() && reaped.is_ok()
+    }
+
+    #[cfg(windows)]
+    async fn capture_windows_stack(
+        target: &mut kuru_platform::windows::process::NativeChild,
+        root: &Path,
+        cdb_path: &Path,
+    ) -> WindowsStackDiagnostic {
+        use kuru_platform::windows::process::{Console, NativeSpawnSpec, Stdio, system_directory};
+
+        let unavailable = |detail: String, command_file| WindowsStackDiagnostic {
+            detail: format!("unavailable: {detail}"),
+            cleanup_confirmed: true,
+            command_file,
+        };
+        if !cdb_path.is_absolute() {
+            return unavailable("CDB path is not absolute".into(), None);
+        }
+        let metadata = match std::fs::symlink_metadata(cdb_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
+            Ok(_) => return unavailable("CDB path is not a regular non-link file".into(), None),
+            Err(error) => {
+                return unavailable(format!("CDB path cannot be inspected: {error}"), None);
+            }
+        };
+        if metadata.len() == 0 {
+            return unavailable("CDB file is empty".into(), None);
+        }
+        let cdb_file = match std::fs::File::open(cdb_path) {
+            Ok(file) => file,
+            Err(error) => return unavailable(format!("CDB cannot be opened: {error}"), None),
+        };
+        if let Err(error) = regular_file_info(&cdb_file) {
+            return unavailable(format!("CDB handle is not a regular file: {error}"), None);
+        }
+
+        let command_file = root.join("kuru-cdb-commands.txt");
+        let mut commands = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&command_file)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                return unavailable(format!("CDB command file cannot be created: {error}"), None);
+            }
+        };
+        if let Err(error) = commands.write_all(CDB_COMMANDS.as_bytes()) {
+            return unavailable(
+                format!("CDB command file cannot be written: {error}"),
+                Some(command_file),
+            );
+        }
+        drop(commands);
+
+        match target.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return unavailable(
+                    "owned target exited before CDB attachment".into(),
+                    Some(command_file),
+                );
+            }
+            Err(error) => {
+                return unavailable(
+                    format!("owned target state cannot be observed: {error}"),
+                    Some(command_file),
+                );
+            }
+        }
+        let pid = target.id();
+        let system = match system_directory() {
+            Ok(system) => system,
+            Err(error) => {
+                return unavailable(
+                    format!("system directory is unavailable: {error}"),
+                    Some(command_file),
+                );
+            }
+        };
+        let Some(windows) = system.parent() else {
+            return unavailable(
+                "system directory has no Windows parent".into(),
+                Some(command_file),
+            );
+        };
+        let mut spec = NativeSpawnSpec::new(cdb_path.to_path_buf(), root.to_path_buf());
+        spec.args = vec![
+            "-pv".into(),
+            "-pd".into(),
+            "-sins".into(),
+            "-p".into(),
+            pid.to_string().into(),
+            "-cf".into(),
+            command_file.as_os_str().to_owned(),
+        ];
+        spec.environment = vec![
+            ("SystemRoot".into(), windows.as_os_str().to_owned()),
+            ("WINDIR".into(), windows.as_os_str().to_owned()),
+            ("ComSpec".into(), system.join("cmd.exe").into()),
+            ("PATH".into(), system.as_os_str().to_owned()),
+            ("TEMP".into(), root.as_os_str().to_owned()),
+            ("TMP".into(), root.as_os_str().to_owned()),
+        ];
+        spec.console = Console::PrivateHidden;
+        spec.stdout = Stdio::Pipe;
+        spec.stderr = Stdio::Pipe;
+        let mut cdb = match spec.spawn().await {
+            Ok(child) => child,
+            Err(error) => {
+                return unavailable(format!("CDB launch failed: {error}"), Some(command_file));
+            }
+        };
+        let stdout = cdb.take_stdout();
+        let stderr = cdb.take_stderr();
+        let (mut stdout, mut stderr) = match (stdout, stderr) {
+            (Some(stdout), Some(stderr)) => (stdout, stderr),
+            (stdout, stderr) => {
+                let requested = cdb.terminate().is_ok();
+                let stdout_close = async {
+                    match stdout {
+                        Some(mut stdout) => stdout.close(CDB_CLEANUP_LIMIT).await.is_ok(),
+                        None => true,
+                    }
+                };
+                let stderr_close = async {
+                    match stderr {
+                        Some(mut stderr) => stderr.close(CDB_CLEANUP_LIMIT).await.is_ok(),
+                        None => true,
+                    }
+                };
+                let (stdout_close, stderr_close, reaped) =
+                    tokio::join!(stdout_close, stderr_close, cdb.wait(CDB_CLEANUP_LIMIT),);
+                return WindowsStackDiagnostic {
+                    detail: "unavailable: a CDB output pipe is missing".into(),
+                    cleanup_confirmed: requested && stdout_close && stderr_close && reaped.is_ok(),
+                    command_file: Some(command_file),
+                };
+            }
+        };
+
+        let outcome = timeout(CDB_CAPTURE_LIMIT, async {
+            let (stdout, stderr, status) = tokio::join!(
+                read_cdb_pipe(&mut stdout),
+                read_cdb_pipe(&mut stderr),
+                cdb.wait(CDB_CAPTURE_LIMIT),
+            );
+            let (stdout, stdout_overflow) = stdout?;
+            let (stderr, stderr_overflow) = stderr?;
+            ensure!(
+                !stdout_overflow && !stderr_overflow,
+                "CDB output exceeds its 512 KiB per-pipe limit"
+            );
+            let status = status?;
+            ensure!(status.success(), "CDB exited unsuccessfully");
+            Ok::<_, anyhow::Error>((stdout, stderr))
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok((stdout_bytes, stderr_bytes))) => {
+                let (stdout_close, stderr_close) = tokio::join!(
+                    stdout.close(CDB_CLEANUP_LIMIT),
+                    stderr.close(CDB_CLEANUP_LIMIT),
+                );
+                let cleanup_confirmed = stdout_close.is_ok() && stderr_close.is_ok();
+                match parse_cdb_stacks(&stdout_bytes) {
+                    Ok(parsed) => WindowsStackDiagnostic {
+                        detail: format!(
+                            "{}; CDB stderr={} bytes; managed-sleep={}",
+                            parsed.detail,
+                            stderr_bytes.len(),
+                            parsed.managed_sleep
+                        ),
+                        cleanup_confirmed,
+                        command_file: Some(command_file),
+                    },
+                    Err(error) => WindowsStackDiagnostic {
+                        detail: format!(
+                            "unavailable: {error:#}; CDB stdout={} bytes; stderr={} bytes",
+                            stdout_bytes.len(),
+                            stderr_bytes.len()
+                        ),
+                        cleanup_confirmed,
+                        command_file: Some(command_file),
+                    },
+                }
+            }
+            Ok(Err(error)) => {
+                let cleanup_confirmed = cleanup_cdb(&mut cdb, &mut stdout, &mut stderr).await;
+                WindowsStackDiagnostic {
+                    detail: format!("unavailable: {error:#}"),
+                    cleanup_confirmed,
+                    command_file: Some(command_file),
+                }
+            }
+            Err(_) => {
+                let cleanup_confirmed = cleanup_cdb(&mut cdb, &mut stdout, &mut stderr).await;
+                WindowsStackDiagnostic {
+                    detail: "unavailable: CDB capture timed out".into(),
+                    cleanup_confirmed,
+                    command_file: Some(command_file),
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn capture_selected_windows_stack(
+        target: &mut kuru_platform::windows::process::NativeChild,
+        root: &Path,
+    ) -> WindowsStackDiagnostic {
+        if !windows_stack_diagnostic_selected() {
+            return WindowsStackDiagnostic {
+                detail: "unavailable: invalid diagnostic selector".into(),
+                cleanup_confirmed: true,
+                command_file: None,
+            };
+        }
+        let Some(cdb_path) = std::env::var_os(WINDOWS_CDB_PATH) else {
+            return WindowsStackDiagnostic {
+                detail: "unavailable: checked CDB path was not supplied".into(),
+                cleanup_confirmed: true,
+                command_file: None,
+            };
+        };
+        capture_windows_stack(target, root, Path::new(&cdb_path)).await
+    }
+
+    #[cfg(windows)]
+    pub(super) fn windows_stack_diagnostic_selected() -> bool {
+        std::env::var(WINDOWS_STACK_DIAGNOSTIC_SELECTOR).as_deref() == Ok("1")
+            && std::env::var(WINDOWS_SHELL_FIXTURE_CHILD).as_deref() == Ok("1")
+            && std::env::var("NO_COLOR").as_deref() == Ok("inherited")
+    }
+
+    #[cfg(windows)]
+    async fn read_stack_target_ready(
+        stdout: &mut kuru_platform::windows::pipe::Pipe,
+    ) -> std::io::Result<()> {
+        const READY: &[u8] = b"KURU_STACK_TARGET_READY\r\n";
+        let mut observed = Vec::with_capacity(READY.len());
+        while observed.len() < READY.len() {
+            let mut byte = [0_u8; 1];
+            let count = stdout.read(&mut byte).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "sleep control closed before readiness",
+                ));
+            }
+            observed.push(byte[0]);
+        }
+        if observed != READY {
+            return Err(std::io::Error::other(
+                "sleep control emitted unexpected readiness bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn windows_stack_known_sleep_control(cdb_path: &Path) -> Result<()> {
+        use kuru_platform::windows::process::{Console, NativeSpawnSpec, Stdio, system_directory};
+
+        let root = tempfile::tempdir()?;
+        let system = system_directory()?;
+        let windows = system
+            .parent()
+            .context("system directory has no Windows parent")?;
+        let program = system.join("WindowsPowerShell/v1.0/powershell.exe");
+        let mut spec = NativeSpawnSpec::new(program, root.path().to_path_buf());
+        spec.args = [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-OutputFormat",
+            "Text",
+            "-Command",
+            "[Console]::Out.WriteLine('KURU_STACK_TARGET_READY'); [Threading.Thread]::Sleep(120000)",
+        ]
+        .map(Into::into)
+        .into();
+        spec.environment = vec![
+            ("SystemRoot".into(), windows.as_os_str().to_owned()),
+            ("WINDIR".into(), windows.as_os_str().to_owned()),
+            ("ComSpec".into(), system.join("cmd.exe").into()),
+            ("PATH".into(), system.as_os_str().to_owned()),
+            ("TEMP".into(), root.path().as_os_str().to_owned()),
+            ("TMP".into(), root.path().as_os_str().to_owned()),
+        ];
+        spec.console = Console::Inherit;
+        spec.stdout = Stdio::Pipe;
+        spec.stderr = Stdio::Pipe;
+        let mut target = spec.spawn().await.context("sleep control launch failed")?;
+        let stdout = target.take_stdout();
+        let stderr = target.take_stderr();
+        let (mut stdout, mut stderr) = match (stdout, stderr) {
+            (Some(stdout), Some(stderr)) => (stdout, stderr),
+            (stdout, stderr) => {
+                let requested = target.terminate().is_ok();
+                let stdout_close = async {
+                    match stdout {
+                        Some(mut stdout) => stdout.close(CDB_CLEANUP_LIMIT).await.is_ok(),
+                        None => true,
+                    }
+                };
+                let stderr_close = async {
+                    match stderr {
+                        Some(mut stderr) => stderr.close(CDB_CLEANUP_LIMIT).await.is_ok(),
+                        None => true,
+                    }
+                };
+                let (stdout_close, stderr_close, reaped) =
+                    tokio::join!(stdout_close, stderr_close, target.wait(CDB_CLEANUP_LIMIT),);
+                if requested && stdout_close && stderr_close && reaped.is_ok() {
+                    bail!("sleep control output pipe is missing");
+                }
+                let preserved = root.keep();
+                bail!(
+                    "sleep control output pipe and cleanup failed; preserved {}",
+                    preserved.display()
+                );
+            }
+        };
+
+        let ready = timeout(
+            Duration::from_secs(10),
+            read_stack_target_ready(&mut stdout),
+        )
+        .await;
+        if !matches!(ready, Ok(Ok(()))) {
+            let requested = target.terminate();
+            let (stdout_close, stderr_close, reaped) = tokio::join!(
+                stdout.close(CDB_CLEANUP_LIMIT),
+                stderr.close(CDB_CLEANUP_LIMIT),
+                target.wait(CDB_CLEANUP_LIMIT),
+            );
+            if requested.is_err()
+                || stdout_close.is_err()
+                || stderr_close.is_err()
+                || reaped.is_err()
+            {
+                let preserved = root.keep();
+                bail!(
+                    "sleep control readiness and cleanup failed; preserved {}",
+                    preserved.display()
+                );
+            }
+            bail!("sleep control did not reach readiness: {ready:?}");
+        }
+
+        let mut diagnostic = capture_windows_stack(&mut target, root.path(), cdb_path).await;
+        let still_running = matches!(target.try_wait(), Ok(None));
+        let requested = target.terminate();
+        let (stdout_close, stderr_close, reaped) = tokio::join!(
+            stdout.close(CDB_CLEANUP_LIMIT),
+            stderr.close(CDB_CLEANUP_LIMIT),
+            target.wait(CDB_CLEANUP_LIMIT),
+        );
+        let target_cleanup =
+            requested.is_ok() && stdout_close.is_ok() && stderr_close.is_ok() && reaped.is_ok();
+        diagnostic.finish_after_target(target_cleanup);
+        if !diagnostic.cleanup_confirmed || !target_cleanup {
+            let preserved = root.keep();
+            bail!(
+                "sleep control cleanup remains unconfirmed; CDB={}; target={}; preserved {}",
+                diagnostic.cleanup_confirmed,
+                target_cleanup,
+                preserved.display()
+            );
+        }
+        ensure!(
+            still_running,
+            "sleep control target exited during noninvasive capture"
+        );
+        ensure!(
+            diagnostic.detail.contains("managed-sleep=true"),
+            "sleep control did not capture System.Threading.Thread.Sleep: {}",
+            diagnostic.detail
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2911,7 +3351,7 @@ if ($failed.Count -eq 0) {{
                 },
             )
             .unwrap();
-            let shell = windows_shell_projection_source(&root, case, None);
+            let shell = windows_shell_projection_source(&root, case);
             let receipt = host
                 .execute("shell", json!({"command":shell}))
                 .await
@@ -2961,6 +3401,9 @@ if ($failed.Count -eq 0) {{
         std::fs::write(commands.join("probe.cmd"), "@echo cmd-ok\r\n").unwrap();
         let system = system_directory().unwrap();
         let path = std::env::join_paths([commands.as_path(), system.as_path()]).unwrap();
+        let cdb_path = std::env::var_os(WINDOWS_CDB_PATH).map(PathBuf::from);
+        let mut failure = None;
+        let mut preserve_root = false;
         for (name, pathext) in [("inherited", Some(".EXE;.CMD")), ("fallback", None)] {
             let mut spec =
                 NativeSpawnSpec::new(std::env::current_exe().unwrap(), root.path().into());
@@ -3006,7 +3449,19 @@ if ($failed.Count -eq 0) {{
             if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
                 spec.environment.push(("LLVM_PROFILE_FILE".into(), profile));
             }
-            let control_environment = spec.environment.clone();
+            let diagnostic_armed = name == "inherited" && cdb_path.is_some();
+            if diagnostic_armed {
+                spec.environment
+                    .push((WINDOWS_STACK_DIAGNOSTIC_SELECTOR.into(), "1".into()));
+                spec.environment.push((
+                    WINDOWS_CDB_PATH.into(),
+                    cdb_path
+                        .as_ref()
+                        .expect("armed diagnostic has a CDB path")
+                        .as_os_str()
+                        .to_owned(),
+                ));
+            }
             spec.stdout = Stdio::Pipe;
             spec.stderr = Stdio::Pipe;
             let mut child = spec.spawn().await.unwrap();
@@ -3014,11 +3469,13 @@ if ($failed.Count -eq 0) {{
             let mut stderr = child.take_stderr().unwrap();
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let outcome = timeout(Duration::from_secs(45), async {
+            let parent_limit = if diagnostic_armed { 75 } else { 45 };
+            let child_limit = if diagnostic_armed { 70 } else { 40 };
+            let outcome = timeout(Duration::from_secs(parent_limit), async {
                 let (stdout_truncated, stderr_truncated, status) = tokio::join!(
                     drain_bounded(&mut stdout, &mut out),
                     drain_bounded(&mut stderr, &mut err),
-                    child.wait(Duration::from_secs(40)),
+                    child.wait(Duration::from_secs(child_limit)),
                 );
                 let stdout_truncated = stdout_truncated?;
                 let stderr_truncated = stderr_truncated?;
@@ -3031,7 +3488,7 @@ if ($failed.Count -eq 0) {{
             })
             .await;
             let status = match outcome {
-                Ok(Ok(status)) => status,
+                Ok(Ok(status)) => Ok(status),
                 Ok(Err(error)) => {
                     let requested = child.terminate();
                     let (stdout_close, stderr_close) = tokio::join!(
@@ -3040,16 +3497,12 @@ if ($failed.Count -eq 0) {{
                     );
                     let reap = child.wait(Duration::from_secs(5)).await;
                     if stdout_close.is_err() || stderr_close.is_err() || reap.is_err() {
-                        let preserved = root.keep();
-                        panic!(
-                            "Windows shell fixture {name} failed: {error}; kill={requested:?}; stdout-close={stdout_close:?}; stderr-close={stderr_close:?}; reap={reap:?}; preserved {}",
-                            preserved.display()
-                        );
+                        preserve_root = true;
                     }
-                    panic!(
-                        "Windows shell fixture {name} failed: {error}; kill={requested:?}; stdout-close={stdout_close:?}; stderr-close={stderr_close:?}; stderr-prefix={}",
+                    Err(format!(
+                        "Windows shell fixture {name} failed: {error}; kill={requested:?}; stdout-close={stdout_close:?}; stderr-close={stderr_close:?}; reap={reap:?}; stderr-prefix={}",
                         String::from_utf8_lossy(&err[..err.len().min(4096)])
-                    );
+                    ))
                 }
                 Err(_) => {
                     let requested = child.terminate();
@@ -3059,27 +3512,45 @@ if ($failed.Count -eq 0) {{
                     );
                     let reap = child.wait(Duration::from_secs(5)).await;
                     if stdout_close.is_err() || stderr_close.is_err() || reap.is_err() {
-                        let preserved = root.keep();
-                        panic!(
-                            "Windows shell fixture {name} timed out; kill={requested:?}; stdout-close={stdout_close:?}; stderr-close={stderr_close:?}; reap={reap:?}; preserved {}",
-                            preserved.display()
-                        );
+                        preserve_root = true;
                     }
-                    panic!(
-                        "Windows shell fixture {name} timed out; kill={requested:?}; stdout-close={stdout_close:?}; stderr-close={stderr_close:?}; stderr-prefix={}",
+                    Err(format!(
+                        "Windows shell fixture {name} timed out; kill={requested:?}; stdout-close={stdout_close:?}; stderr-close={stderr_close:?}; reap={reap:?}; stderr-prefix={}",
                         String::from_utf8_lossy(&err[..err.len().min(4096)])
-                    );
+                    ))
+                }
+            };
+            let status = match status {
+                Ok(status) => status,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
                 }
             };
             if !status.success() {
-                let controls =
-                    windows_shell_projection_failure_controls(&control_environment, name).await;
-                panic!(
-                    "Windows shell fixture {name} failed: stdout={} stderr={}; failure-only controls={controls:?}",
+                preserve_root |= windows_shell_cleanup_uncertain(&out, &err);
+                failure = Some(format!(
+                    "Windows shell fixture {name} failed: stdout={} stderr={}",
                     String::from_utf8_lossy(&out),
                     String::from_utf8_lossy(&err)
-                );
+                ));
+                break;
             }
         }
+        let control = match &cdb_path {
+            Some(cdb_path) => windows_stack_known_sleep_control(cdb_path).await,
+            None => Ok(()),
+        };
+        if let Some(failure) = failure {
+            if preserve_root {
+                let preserved = root.keep();
+                panic!(
+                    "{failure}; known-sleep={control:?}; preserved {}",
+                    preserved.display()
+                );
+            }
+            panic!("{failure}; known-sleep={control:?}");
+        }
+        control.expect("known-sleep CDB control failed");
     }
 }

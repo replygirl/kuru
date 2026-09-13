@@ -143,6 +143,13 @@ jobs:
         run: rustup component add llvm-tools-preview --toolchain 1.98.1
       - name: Install package-owned test tools
         run: mise run //packages/kuru-delivery:setup:test-tools
+      - name: Prepare verified Windows debugger for connector shell diagnostic
+        if: matrix.shard == 'connectors-core-platform'
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          KURU_WINDOWS_DEBUGGER_INPUT_DIR: ${{ runner.temp }}/kuru-windows-debugger-${{ matrix.shard }}-${{ github.run_attempt }}
+        run: mise run //packages/kuru-delivery:setup:windows-debugger
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
