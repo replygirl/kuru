@@ -924,7 +924,6 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
     harness.shutdown(false).await.unwrap();
     drop(harness);
     memory.close().await.unwrap();
-    drop(memory);
 
     let mut config = Config {
         provider: "responses".into(),

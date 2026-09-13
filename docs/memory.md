@@ -10,10 +10,12 @@ kuru memory status
 kuru memory history
 kuru memory notes ID --limit 100
 kuru memory forget ID --note SEQUENCE
+kuru memory export --format json --output committed-memory.json
 ```
 
 Status identifies the current project store, branch and revision. History lists
-committed memory updates. These commands do not expose database credentials.
+committed memory updates in Dolt graph order, newest first; timestamps do not
+decide the order. These commands do not expose database credentials.
 `/memory-status` and `/memory-history` provide revision inspection in the TUI.
 `/memory NAME_OR_ID` continues to inspect an identity's conversation. `/notes
 NAME_OR_ID` reads that identity's separate durable notes. Both use the selected
@@ -29,6 +31,17 @@ notes written by dreaming. `kuru memory forget ID --note SEQUENCE` removes that
 one row from the selected identity's active notes namespace and records a new
 Dolt revision. It does not remove conversations, other notes, or older revisions;
 it is not secure erasure and does not provide a history-recovery command.
+
+`kuru memory export` writes every application message and state record from one
+captured, committed `main` revision. It uses JSON by default; `--format markdown`
+renders the same records as JSON fenced blocks. Without `--output PATH`, JSON is
+written to standard output. With `--output PATH`, Kuru completes a private staged
+file before publishing a new destination and refuses to overwrite an existing
+file. The manifest records the project scope, revision, schema version, counts,
+and explicit exclusions for previous revisions, candidate branches, uncommitted
+rows, operations, and schema tables. Export never starts a provider, imports legacy SQLite data,
+or creates a fresh memory store. It is a current committed snapshot, not a
+historical-revision browser or a secure-erasure/archive facility.
 
 ## Runtime and offline use
 
@@ -121,3 +134,9 @@ ownership. Normal command exit waits for owned database cleanup, including when
 the command reports an error. Migration and recovery also hold the lifecycle lock
 through directory activation, so an active database cannot be moved underneath
 another process.
+
+Within Kuru, dropping a memory view only releases that view. An explicit close
+shuts down its shared database handle and every view using it, then awaits the
+owned cleanup. If a write reply is interrupted, Kuru checks the durable receipt
+before proceeding; it distinguishes no pending write, a committed write, and a
+write that did not commit.

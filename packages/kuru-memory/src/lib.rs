@@ -8,7 +8,8 @@ pub mod server;
 mod store;
 
 pub use store::{
-    Candidate, MemoryStatus, MemoryStore, MemoryView, OpenOptions, Revision, StoredNote,
+    ActiveExportSnapshot, Candidate, ExportCursor, ExportPage, ExportProvenance, MemoryStatus,
+    MemoryStore, MemoryView, OpenOptions, Revision, StorageRecord, StoredNote,
 };
 
 #[cfg(any(test, feature = "test-support"))]

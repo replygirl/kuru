@@ -54,7 +54,6 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
     let options = crate::test_support::open_options(data, scope.clone())?;
     let initialized = MemoryStore::open(options.clone()).await?;
     initialized.close().await?;
-    drop(initialized);
 
     let directory = project_directory(&options.data_dir, &scope)?;
     let parent = directory

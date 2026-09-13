@@ -61,6 +61,11 @@ pub fn open_options(data_dir: PathBuf, project_scope: String) -> Result<OpenOpti
     Ok(options)
 }
 
+/// Commit one invalid state payload for an isolated export-failure fixture.
+pub async fn commit_malformed_state(store: &crate::MemoryStore, key: &str) -> Result<()> {
+    store.fixture_commit_malformed_state(key).await
+}
+
 pub fn cache_dir() -> PathBuf {
     crate::store::test_cache()
 }

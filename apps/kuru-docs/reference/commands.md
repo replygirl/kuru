@@ -58,6 +58,7 @@ Model, effort, and framework selections made here are [saved for the project](./
 | `kuru memory history`                   | List committed memory updates; use `--limit` to select 1–1000 entries                       |
 | `kuru memory notes ID`                  | Read newest durable notes for one selected-mode identity; `--limit` is 1–1000 (default 100) |
 | `kuru memory forget ID --note SEQUENCE` | Remove one selected current note and retain prior revision history                          |
+| `kuru memory export`                    | Export every application record from one committed active-memory snapshot                   |
 | `kuru dream`                            | Run explicit consolidation                                                                  |
 | `kuru undo-dream`                       | Restore the previous topology change                                                        |
 | `kuru tools`                            | Discover built-in and configured MCP tools                                                  |
@@ -101,3 +102,11 @@ tool host, or conversation. Each note includes its stable `sequence` and stored
 role. `kuru memory forget ID --note SEQUENCE` deletes exactly that current notes
 row in a new Dolt revision; it leaves conversations, other notes, and earlier
 revisions intact, so it is not secure erasure or a history-recovery command.
+
+`kuru memory export [--format json|markdown] [--output PATH]` is provider-free
+inspection of the current committed `main` snapshot. Its JSON manifest includes
+revision, schema and row counts; Markdown contains the same manifest and each
+record as JSON. It excludes previous revisions, candidate branches, uncommitted
+working rows, operations and schema tables. A supplied output path is published
+only as a new file after private staging; it never overwrites an existing path.
+It does not create memory or import legacy SQLite data for a fresh project.
