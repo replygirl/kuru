@@ -57,6 +57,7 @@ also pins the native API bindings, strict ZIP codec and ConPTY test driver below
 | `aqua:koalaman/shellcheck` | `0.11.0` |
 | `aqua:rhysd/actionlint` | `1.7.12` |
 | `cargo:cargo-llvm-cov` | `0.9.1` |
+| `cargo:cargo-audit` (delivery package) | `0.22.2` |
 | Node (docs app only) | `26.8.2` |
 | npm (docs app only) | `12.0.2` |
 | VitePress (docs app) | `2.0.0-alpha.20` |
@@ -68,6 +69,38 @@ also pins the native API bindings, strict ZIP codec and ConPTY test driver below
 | CI mise | `2026.9.4` |
 
 Cospec is `0.7.1`, confirmed by its [GitHub release](https://github.com/aligned-team/cospec/releases/tag/v0.7.1). Its standalone executable embeds its supported OpenSpec version. No project OpenSpec, Bun or Python dependency is required. The task-scoped compatibility preload remains necessary; see [development](development.md).
+
+`cargo-audit` is scoped to delivery's advisory quality tasks. It scans only the
+current workspace root `Cargo.lock` against an explicitly refreshed RustSec database;
+the ordinary task runs offline with database fetch and yanked-package index
+checks disabled. It does not enforce licenses, source policy or general
+dependency bans. The package's audit configuration has no ignored advisory IDs:
+an advisory failure needs a dependency correction, or a separate reviewed
+exception with the exact RustSec identifier and rationale.
+
+The scanner runs from delivery's owned `.cargo/audit.toml` and replaces any
+inherited Cargo Home with an empty temporary directory. This isolates
+cargo-audit configuration lookup so a user's Cargo Home audit policy cannot
+change the repository scan.
+
+The delivery task installs the Rust source tool through mise's Cargo backend at
+the exact `0.22.2` pin with Cargo's locked resolution and default features
+disabled; see [mise's Cargo backend options](https://mise.jdx.dev/dev-tools/backends/cargo.html#default-features).
+Refresh the public database in an isolated absolute directory, then scan it:
+
+```sh
+mise run //packages/kuru-delivery:setup:advisories
+KURU_ADVISORY_DB=/absolute/private/kuru-rustsec-db \
+  mise run //packages/kuru-delivery:audit:advisories:refresh
+KURU_ADVISORY_DB=/absolute/private/kuru-rustsec-db \
+  mise run //packages/kuru-delivery:audit:advisories
+```
+
+The refresh command records the checked detached RustSec revision and commit
+time. The offline scan rejects a dirty, foreign, non-detached, or database
+revision older than 90 days; refresh it again rather than bypassing the
+freshness check. The database is public advisory data, never a project or user
+credential store.
 
 The docs app selects npm `12.0.2` separately because Node `26.8.2` bundles
 npm `11.19.1`. Its app-owned mise alias retains npm's PATH priority over Node's

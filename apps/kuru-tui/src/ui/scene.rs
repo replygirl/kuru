@@ -1,8 +1,5 @@
 //! Framework portraits: ornamental contours and factual peer activity are separate layers.
 
-#[cfg(test)]
-use kuru_memory::MemoryStore;
-
 use std::f64::consts::{FRAC_PI_2, TAU};
 
 use kuru_core::RelationshipKind;
@@ -465,34 +462,38 @@ fn draw_peers(frame: &mut Frame<'_>, view: &View, area: Rect, positions: &[Point
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, sync::Arc};
+    use std::collections::BTreeSet;
 
-    use kuru_connectors::DemoProvider;
-    use kuru_core::{Config, Mode, Relationship};
-    use kuru_runtime::Harness;
+    use kuru_core::{Framework, Mode, Relationship};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     use super::*;
+    use crate::ui::{InitialViewData, RuntimeSnapshot};
 
-    async fn view(mode: Mode) -> View {
-        let directory = tempfile::tempdir().unwrap();
-        let harness = Harness::new(
-            Config {
-                mode,
-                provider: "demo".into(),
-                model: "demo".into(),
-                dream_every: 0,
-                dream_on_exit: false,
-                ..Config::default()
+    fn view(mode: Mode) -> View {
+        let framework = Framework::builtin(mode);
+        let mut view = View::from_initial(
+            InitialViewData {
+                transcript: vec![],
+                session: "plain-session".into(),
+                project: "plain-project".into(),
+                motion: true,
+                runtime: RuntimeSnapshot {
+                    turns: 0,
+                    mode: mode.to_string(),
+                    model: "demo".into(),
+                    effort: "default".into(),
+                    parts: framework
+                        .parts
+                        .into_iter()
+                        .map(|part| (part.id, format!("{} · {}", part.name, part.role)))
+                        .collect(),
+                    relationships: vec![],
+                    focus: None,
+                },
             },
-            directory.path(),
-            MemoryStore::temporary().await.unwrap(),
-            Arc::new(DemoProvider),
-            None,
-        )
-        .await
-        .unwrap();
-        let mut view = View::new(&harness, vec![]).await.unwrap();
+            vec![],
+        );
         view.motion = true;
         view.focused = true;
         view
@@ -510,11 +511,11 @@ mod tests {
         buffer.content.iter().map(|cell| cell.symbol()).collect()
     }
 
-    #[tokio::test]
-    async fn framework_silhouettes_are_distinct_and_keep_real_peer_names() {
+    #[test]
+    fn framework_silhouettes_are_distinct_and_keep_real_peer_names() {
         let mut silhouettes = BTreeSet::new();
         for mode in Mode::ALL {
-            let view = view(mode).await;
+            let view = view(mode);
             let buffer = render(&view, 65, 14);
             let screen = text(&buffer);
             if let Some(directory) = std::env::var_os("KURU_VISUAL_ARTIFACTS") {
@@ -550,9 +551,9 @@ mod tests {
         assert_eq!(silhouettes.len(), 4);
     }
 
-    #[tokio::test]
-    async fn reduced_motion_freezes_contour_color_and_keeps_peer_names() {
-        let mut view = view(Mode::Ifs).await;
+    #[test]
+    fn reduced_motion_freezes_contour_color_and_keeps_peer_names() {
+        let mut view = view(Mode::Ifs);
         view.motion = false;
         let still = render(&view, 65, 14);
         for (_, label) in &view.parts {
@@ -562,9 +563,9 @@ mod tests {
         assert_eq!(still, render(&view, 65, 14));
     }
 
-    #[tokio::test]
-    async fn real_relationships_and_routes_change_the_portrait_unknown_endpoints_do_not() {
-        let mut view = view(Mode::Freudian).await;
+    #[test]
+    fn real_relationships_and_routes_change_the_portrait_unknown_endpoints_do_not() {
+        let mut view = view(Mode::Freudian);
         let baseline = render(&view, 65, 14);
         view.routes.push(("unknown".into(), "missing".into()));
         assert_eq!(baseline, render(&view, 65, 14));
@@ -586,10 +587,10 @@ mod tests {
         assert!(text(&route).contains('*'));
     }
 
-    #[tokio::test]
-    async fn compact_portraits_number_peers_and_survive_tiny_clipped_areas() {
+    #[test]
+    fn compact_portraits_number_peers_and_survive_tiny_clipped_areas() {
         for mode in Mode::ALL {
-            let view = view(mode).await;
+            let view = view(mode);
             let compact = text(&render(&view, 31, 9));
             for index in 1..=view.parts.len() {
                 assert!(compact.contains(&format!("○{index}")));

@@ -1,6 +1,6 @@
 //! Pure terminal presentation. Runtime state supplies every activity label and edge.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeMap};
 
 use kuru_core::RelationshipKind;
 use ratatui::{
@@ -31,6 +31,7 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 #[derive(Default)]
 struct TranscriptCache {
     source: Vec<(String, String)>,
+    completion_metadata: BTreeMap<usize, String>,
     width: u16,
     lines: Vec<Line<'static>>,
 }
@@ -230,9 +231,15 @@ fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
     }
     let content = inset(area, u16::from(area.width >= 12) * 2, 1);
     TRANSCRIPT.with_borrow_mut(|cache| {
-        if cache.width != content.width || cache.source != view.transcript {
+        if cache.width != content.width
+            || cache.source != view.transcript
+            || cache.completion_metadata != view.completion_metadata
+        {
             cache.lines = wrap_lines(conversation_lines(view), usize::from(content.width.max(1)));
             cache.source.clone_from(&view.transcript);
+            cache
+                .completion_metadata
+                .clone_from(&view.completion_metadata);
             cache.width = content.width;
         }
         let offset = cache
@@ -259,7 +266,7 @@ fn draw_conversation(frame: &mut Frame<'_>, view: &View, area: Rect) {
 
 fn conversation_lines(view: &View) -> Vec<Line<'static>> {
     let mut lines = vec![Line::default()];
-    for (speaker, body) in &view.transcript {
+    for (index, (speaker, body)) in view.transcript.iter().enumerate() {
         let color = match speaker.as_str() {
             "user" => BLUE,
             "system" | "help" => AMBER,
@@ -314,6 +321,12 @@ fn conversation_lines(view: &View) -> Vec<Line<'static>> {
                 }
                 lines.push(Line::from(spans));
             }
+        }
+        if let Some(metadata) = view.completion_metadata.get(&index) {
+            lines.push(Line::from(Span::styled(
+                format!("  {metadata}"),
+                style(MUTED),
+            )));
         }
         lines.push(Line::default());
     }
@@ -668,12 +681,13 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
     }
     let identity = scene::identity(&view.mode);
     let error = view.status.starts_with("Failed") || view.status.starts_with("error");
+    let cancelled = view.status.starts_with("Cancelled");
     if view.notice.is_none()
         && !view.busy
         && view.show_scene
         && view.transcript.is_empty()
         && !error
-        && view.status != "Cancelled"
+        && !cancelled
     {
         return;
     }
@@ -703,7 +717,7 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
             ),
             if error { ROSE } else { identity.accent },
         )
-    } else if view.status == "Cancelled" || error {
+    } else if cancelled || error {
         (
             if error { "!" } else { "-" },
             view.status.clone(),

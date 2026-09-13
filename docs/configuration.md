@@ -8,8 +8,10 @@ replace. Unknown keys, invalid types, unsupported provider names and invalid
 bounds fail with context. Each configuration file is bounded to 256 KiB and the
 combined input to 1 MiB.
 
-Use `kuru config` and `kuru --help` to inspect effective options and CLI overrides.
-`kuru config` redacts MCP environment values. User defaults are read from
+Use `kuru config` and `kuru --help` to inspect configured options and CLI overrides.
+`kuru config` redacts MCP environment values and deliberately omits saved project
+mode, model and effort preferences so inspection never starts or provisions
+memory. It prints an omission notice on stderr. User defaults are read from
 `$XDG_CONFIG_HOME/kuru/config.toml` when set. Otherwise, Kuru uses
 `~/.config/kuru/config.toml` on macOS/Linux or
 `$env:APPDATA\kuru\config.toml` on Windows. Windows also falls back to
@@ -64,6 +66,64 @@ string, such as `effort = "high"`. Models and effort levels vary by account and
 provider; consult `kuru models` instead of relying on a hardcoded list.
 `model = "auto"` uses provider selection. Kuru preserves newly advertised effort
 strings. The API key itself never belongs in configuration.
+
+## Workspace trust
+
+Kuru reviews effective process, mutation and endpoint authority supplied by
+automatically discovered ancestor `.kuru/config.toml` files before activating it.
+The trust subject is the exact canonical `-C` directory and its current native
+directory identity. Approval does not inherit to parent or child directories.
+User defaults, an explicit `--config` file and CLI flags are deliberate caller
+inputs; an effective value supplied by one of those layers does not require
+workspace approval.
+
+```sh
+kuru -C /path/to/project trust status
+kuru -C /path/to/project trust approve
+kuru -C /path/to/project trust approve --yes
+kuru -C /path/to/project trust revoke
+kuru -C /path/to/project --trust-workspace-once tools
+```
+
+`trust status` displays the normalized root, automatic ancestor sources, safe
+claim descriptions and whether the complete current manifest matches its stored
+approval. `trust approve` reviews and stores that complete manifest; `--yes` is
+the explicit noninteractive form. Any automatic authority addition, removal or
+value change invalidates the whole stored approval. A change only to mode, model,
+effort, budgets, dreaming, memory offline state or timeouts leaves it valid.
+`trust revoke` removes the exact root's record without confirmation. Status and
+an absent revoke create no trust directory, lock or record.
+
+`--trust-workspace-once` authorizes only the current command's applicable claims
+and writes no approval. A matching complete stored approval may satisfy a command
+that uses only part of the manifest; individual stored claim digests are audit
+data and never act as partial grants. Without an approval or the one-time flag,
+noninteractive commands fail with a bounded review and the remedy. Interactive
+TUI startup asks before entering the alternate screen and offers continue once,
+approve the complete configuration, or cancel.
+
+The activation sets are command-specific:
+
+| Commands | Automatic ancestor authority checked before activation |
+| --- | --- |
+| `login`, `logout`, `config`, `trust ...`, `update` | None; login/logout use the fixed ChatGPT route, config omits saved preferences, and revoke does not parse current workspace configuration |
+| `auth` | Active Responses route; under another provider its API-key availability is not checked |
+| `sessions`, `memory ...`, `undo-dream` | Configured memory executable and cache paths |
+| `models` | Configured memory paths used while loading saved selections, plus an active Responses route |
+| `tool`, `tools` | Configured memory paths used while loading saved selections, built-in write/shell grants, and stdio/HTTP MCP configuration |
+| `run`, `dream`, `serve`, interactive TUI | All applicable memory, provider, write, shell, MCP and external-agent claims |
+
+Review output and configuration errors escape and bound source labels and hide
+MCP arguments and environment values, URL queries and credential values. Approval
+records live in checked private files under `<data-dir>/trust/workspaces`, outside
+Dolt and the tool root, and contain digests rather than configuration values.
+
+Workspace trust authorizes configuration; it does not restrict an approved
+process. Shell and stdio MCP processes retain your account's process authority.
+Kuru retains the reviewed workspace directory and detects an observed pathname
+replacement before configured cwd-based launches. On Unix, a replacement can
+still race between that check and child startup; this is not an atomic cwd binding
+or an OS sandbox.
 
 The public Responses `/models` catalog does not advertise a default chat model
 or supported reasoning efforts. With `provider = "responses"`, set an explicit
@@ -142,13 +202,14 @@ Session and part histories are local durable data. The default data directory is
 `$env:LOCALAPPDATA\kuru` on Windows. If `LOCALAPPDATA` is unset, Windows falls
 back to `$env:USERPROFILE\AppData\Local\kuru`. Each canonical project has a Dolt
 database under `memory/<project-hash>/`.
-`--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. On Windows,
-memory and engine caches require local volumes with persistent ACLs; UNC shares
-and device paths are not supported state locations. An OS
-writer lock prevents competing Kuru processes from overwriting the same
-project topology; session listing remains available without a writer lock. Restrict access to the user
-data directory as you would a chat transcript. They are not included in source
-control and should never be exposed as a tool root.
+`--data-dir` or `KURU_DATA_DIR` chooses a separate storage directory. Either may
+be relative; Kuru resolves relative values from the invocation directory. On
+Windows, memory and engine caches require local volumes with persistent ACLs;
+UNC shares and device paths are not supported state locations. An OS writer lock
+prevents competing Kuru processes from overwriting the same project topology;
+session listing remains available without a writer lock. Restrict access to the
+user data directory as you would a chat transcript. They are not included in
+source control and should never be exposed as a tool root.
 
 Kuru includes its pinned full-Dolt engine and licenses in the executable. First
 memory use verifies and extracts them locally; later runs reuse the verified
@@ -165,12 +226,14 @@ startup_timeout_secs = 30
 The default engine cache is `tools/dolt` inside the data directory. A fresh cache
 works offline without a separate engine installation. `offline` remains accepted
 for compatibility; bundled engine provisioning never uses HTTP, and this setting
-does not disable provider network calls. `dolt_binary` is an optional development
-override that must report the supported exact version. Corrupt existing caches
-fail without automatic repair. If activating a verified engine fails, the error
-reports the retained private staging directory for inspection; Kuru does not
-automatically retry that move. The startup timeout is 1–300 seconds. See
-[memory storage](memory.md) for migration, revision inspection and backups, or
+does not disable provider network calls. `cache_dir` and `dolt_binary` must be
+absolute native paths; Kuru does not resolve either relative to a configuration
+file. `dolt_binary` is an optional development override that must report the
+supported exact version. Corrupt existing caches fail without automatic repair.
+If activating a verified engine fails, the error reports the retained private
+staging directory for inspection; Kuru does not automatically retry that move.
+The startup timeout is 1–300 seconds. See [memory storage](memory.md) for
+migration, revision inspection and backups, or
 [development](development.md#bundled-engine-build-inputs) for build-input settings.
 
 Writes and shell execution require opt-in through config or the corresponding

@@ -32,6 +32,7 @@ sha2 = "=0.11.0"
 getrandom = "=0.4.3"
 tokio = { version = "=1.53.1", features = ["full"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
+httpdate = "=1.0.3"
 futures = "=0.3.34"
 axum = "=0.8.9"
 tower = { version = "=0.5.3", features = ["util"] }

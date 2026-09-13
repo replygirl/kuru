@@ -65,6 +65,29 @@ const PEER_INSTRUCTION: &str = "You are one equal, persistent peer in Kuru's com
     Treat reported feelings or state as modeled signals, not evidence of consciousness or a diagnosis. \
     Do not present this framework as clinical treatment. Be honest about uncertainty and tool results.";
 
+const PEER_TENDENCY_PREFIX: &str = "\n\nYour tendency: ";
+const DREAM_INSTRUCTION_LIMIT: usize = 8192;
+const DREAM_INSTRUCTION_ERROR: &str = "new part requires a short name and 1–8192 byte instruction";
+
+/// Construct the exact instruction persisted for a newly added peer.
+///
+/// The input limit applies before removing any leading canonical wrappers, so
+/// callers cannot turn an oversized persisted instruction into valid new input
+/// through normalization.
+pub fn canonical_peer_instruction(instruction: &str) -> Result<String> {
+    ensure!(
+        instruction.len() <= DREAM_INSTRUCTION_LIMIT,
+        "{DREAM_INSTRUCTION_ERROR}"
+    );
+    let prefix = format!("{PEER_INSTRUCTION}{PEER_TENDENCY_PREFIX}");
+    let mut tendency = instruction;
+    while let Some(remainder) = tendency.strip_prefix(&prefix) {
+        tendency = remainder;
+    }
+    ensure!(!tendency.trim().is_empty(), "{DREAM_INSTRUCTION_ERROR}");
+    Ok(format!("{prefix}{tendency}"))
+}
+
 impl Framework {
     /// Identity seeds are persisted API: changing a name or role here changes its ID.
     pub fn builtin(mode: Mode) -> Self {
@@ -178,7 +201,9 @@ impl Framework {
                 .to_string(),
                 name: (*name).into(),
                 role: (*role).into(),
-                instruction: format!("{PEER_INSTRUCTION}\n\nYour tendency: {tendency}"),
+                instruction: canonical_peer_instruction(tendency).expect(
+                    "built-in tendencies are nonblank and within the fixed instruction limit",
+                ),
                 active: true,
             })
             .collect();

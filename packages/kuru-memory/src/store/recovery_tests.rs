@@ -276,6 +276,548 @@ async fn promotion_receipt_keeps_base_target_and_refuses_divergent_history() {
     store.close().await.unwrap();
 }
 
+const SCHEMA_BOUNDARY_TABLE: &str = "schema_transaction_probe";
+const SCHEMA_BOUNDARY_NAMESPACE: &str = "schema-boundary-source";
+const CANDIDATE_NAMESPACE: &str = "schema-boundary-candidate";
+
+struct CandidateSnapshot {
+    view: MemoryStore,
+    branch: String,
+    revision: String,
+    history: Vec<Message>,
+}
+
+async fn preserved_candidate(store: &MemoryStore) -> CandidateSnapshot {
+    let candidate = store
+        .begin_candidate("schema transaction boundary")
+        .await
+        .unwrap();
+    let view = candidate.view().clone();
+    view.append(
+        CANDIDATE_NAMESPACE,
+        "assistant",
+        "candidate history retained",
+    )
+    .await
+    .unwrap();
+    let revision = view.revision().await.unwrap();
+    let history = view.history(CANDIDATE_NAMESPACE, 10).await.unwrap();
+    CandidateSnapshot {
+        branch: view.branch.clone(),
+        view,
+        revision,
+        history,
+    }
+}
+
+async fn staged_schema_transaction(
+    connection: &mut MySqlConnection,
+    receipt: &str,
+    commit: bool,
+) -> Result<()> {
+    sqlx::query("START TRANSACTION")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("CREATE TABLE schema_transaction_probe (id INT PRIMARY KEY, version INT NOT NULL)")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("UPDATE kuru_schema SET version = 2 WHERE id = 1")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
+        .bind(receipt)
+        .bind("schema transaction receipt")
+        .execute(&mut *connection)
+        .await?;
+    if commit {
+        sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
+            .bind(format!("schema transaction boundary [{receipt}]"))
+            .bind(AUTHOR)
+            .fetch_all(&mut *connection)
+            .await?;
+        sqlx::query("COMMIT").execute(&mut *connection).await?;
+    }
+    Ok(())
+}
+
+struct SchemaBranch {
+    view: MemoryStore,
+    base: String,
+}
+
+async fn exact_base_schema_branch(store: &MemoryStore) -> SchemaBranch {
+    let base = store.revision().await.unwrap();
+    let branch = format!("migration_schema_{}", Uuid::new_v4().simple());
+    sqlx::query("CALL DOLT_BRANCH(?, ?)")
+        .bind(&branch)
+        .bind(&base)
+        .fetch_all(store.pool.as_ref())
+        .await
+        .unwrap();
+    let pool = store.shared.server.pool(&branch).await.unwrap();
+    SchemaBranch {
+        view: MemoryStore {
+            shared: store.shared.clone(),
+            pool,
+            branch,
+        },
+        base,
+    }
+}
+
+async fn assert_clean_status(pool: &MySqlPool) {
+    let dirty: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dolt_status")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(dirty, 0, "fixture must not leave working-set changes");
+}
+
+async fn assert_candidate_unchanged(candidate: &CandidateSnapshot) {
+    let observed = observe_candidate(candidate).await;
+    assert_eq!(observed.branch, candidate.branch, "{observed:?}");
+    assert_eq!(observed.ref_hash, candidate.revision, "{observed:?}");
+    assert_eq!(observed.history, candidate.history, "{observed:?}");
+}
+
+#[derive(Debug)]
+struct CandidateObservation {
+    branch: String,
+    ref_hash: String,
+    history: Vec<Message>,
+}
+
+async fn observe_candidate(candidate: &CandidateSnapshot) -> CandidateObservation {
+    let branch: String = sqlx::query_scalar("SELECT name FROM dolt_branches WHERE name = ?")
+        .bind(&candidate.branch)
+        .fetch_one(candidate.view.pool.as_ref())
+        .await
+        .unwrap();
+    let branch_ref: String = sqlx::query_scalar("SELECT hash FROM dolt_branches WHERE name = ?")
+        .bind(&candidate.branch)
+        .fetch_one(candidate.view.pool.as_ref())
+        .await
+        .unwrap();
+    CandidateObservation {
+        branch,
+        ref_hash: branch_ref,
+        history: candidate
+            .view
+            .history(CANDIDATE_NAMESPACE, 10)
+            .await
+            .unwrap(),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeAtHead {
+    Rows(i64),
+    Error(String),
+}
+
+async fn probe_table_at_head(pool: &MySqlPool) -> ProbeAtHead {
+    match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_transaction_probe AS OF 'HEAD'")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(rows) => ProbeAtHead::Rows(rows),
+        Err(error) => ProbeAtHead::Error(error.to_string()),
+    }
+}
+
+async fn assert_committed_schema(
+    store: &MemoryStore,
+    before: &str,
+    source_history: &[Message],
+    candidate: &CandidateSnapshot,
+    receipt: &str,
+) {
+    assert_schema_commit(store, before, source_history, receipt).await;
+    assert_candidate_unchanged(candidate).await;
+}
+
+async fn assert_schema_commit(
+    view: &MemoryStore,
+    before: &str,
+    source_history: &[Message],
+    receipt: &str,
+) {
+    let head = view.revision().await.unwrap();
+    assert_ne!(head, before);
+    let parent: String = sqlx::query_scalar(
+        "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+    )
+    .bind(&head)
+    .fetch_one(view.pool.as_ref())
+    .await
+    .unwrap();
+    assert_eq!(
+        parent, before,
+        "the old main HEAD must be the new commit parent"
+    );
+    assert_eq!(
+        probe_table_at_head(view.pool.as_ref()).await,
+        ProbeAtHead::Rows(0),
+        "the committed schema table must be visible AS OF HEAD"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1")
+            .fetch_one(view.pool.as_ref())
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT label FROM operations AS OF 'HEAD' WHERE id = ?")
+            .bind(receipt)
+            .fetch_one(view.pool.as_ref())
+            .await
+            .unwrap(),
+        "schema transaction receipt"
+    );
+    let commits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dolt_log WHERE message = ?")
+        .bind(format!("schema transaction boundary [{receipt}]"))
+        .fetch_one(view.pool.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(commits, 1, "fixture must publish exactly one schema commit");
+    assert_eq!(
+        view.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap(),
+        source_history
+    );
+    assert_clean_status(view.pool.as_ref()).await;
+}
+
+#[tokio::test]
+async fn manual_dolt_commit_atomically_publishes_ddl_version_and_receipt() {
+    let store = MemoryStore::temporary().await.unwrap();
+    store
+        .append(SCHEMA_BOUNDARY_NAMESPACE, "user", "main history retained")
+        .await
+        .unwrap();
+    let before = store.revision().await.unwrap();
+    let source_history = store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap();
+    let candidate = preserved_candidate(&store).await;
+    let receipt = Uuid::new_v4().to_string();
+    let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
+    staged_schema_transaction(&mut connection, &receipt, true)
+        .await
+        .unwrap();
+    drop(connection);
+    await_session_end(&store.pool, id, TEST_DEADLINE)
+        .await
+        .unwrap();
+    assert_committed_schema(&store, &before, &source_history, &candidate, &receipt).await;
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_precommit_ddl_session_retains_dirty_working_ddl_outside_head() {
+    let store = MemoryStore::temporary().await.unwrap();
+    store
+        .append(SCHEMA_BOUNDARY_NAMESPACE, "user", "main history retained")
+        .await
+        .unwrap();
+    let before = store.revision().await.unwrap();
+    let source_history = store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap();
+    let candidate = preserved_candidate(&store).await;
+    let receipt = Uuid::new_v4().to_string();
+    let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
+    staged_schema_transaction(&mut connection, &receipt, false)
+        .await
+        .unwrap();
+    drop(connection);
+    await_session_end(&store.pool, id, TEST_DEADLINE)
+        .await
+        .unwrap();
+    let observation = PrecommitObservation {
+        before: before.clone(),
+        after: store.revision().await.unwrap(),
+        probe_at_head: probe_table_at_head(store.pool.as_ref()).await,
+        version_at_head: sqlx::query_scalar(
+            "SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1",
+        )
+        .fetch_one(store.pool.as_ref())
+        .await
+        .unwrap(),
+        receipt_at_head: sqlx::query_scalar(
+            "SELECT COUNT(*) FROM operations AS OF 'HEAD' WHERE id = ?",
+        )
+        .bind(&receipt)
+        .fetch_one(store.pool.as_ref())
+        .await
+        .unwrap(),
+        working_status: working_status(store.pool.as_ref()).await,
+        candidate: observe_candidate(&candidate).await,
+    };
+    assert_eq!(observation.after, observation.before, "{observation:?}");
+    assert!(
+        matches!(&observation.probe_at_head, ProbeAtHead::Error(error) if error.contains(SCHEMA_BOUNDARY_TABLE)),
+        "uncommitted schema must be absent AS OF HEAD: {observation:?}"
+    );
+    assert_eq!(
+        observation.version_at_head, 1,
+        "uncommitted schema-version update must be absent at HEAD: {observation:?}"
+    );
+    assert_eq!(
+        observation.receipt_at_head, 0,
+        "uncommitted receipt must be absent at HEAD: {observation:?}"
+    );
+    assert_eq!(
+        observation.working_status,
+        vec![(SCHEMA_BOUNDARY_TABLE.into(), 0, "new table".into())],
+        "pinned Dolt retains this uncommitted DDL row outside HEAD: {observation:?}"
+    );
+    assert_eq!(
+        store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap(),
+        source_history,
+        "{observation:?}"
+    );
+    assert_eq!(
+        observation.candidate.branch, candidate.branch,
+        "{observation:?}"
+    );
+    assert_eq!(
+        observation.candidate.ref_hash, candidate.revision,
+        "{observation:?}"
+    );
+    assert_eq!(
+        observation.candidate.history, candidate.history,
+        "{observation:?}"
+    );
+    store.close().await.unwrap();
+}
+
+#[derive(Debug)]
+struct PrecommitObservation {
+    before: String,
+    after: String,
+    probe_at_head: ProbeAtHead,
+    version_at_head: i64,
+    receipt_at_head: i64,
+    working_status: Vec<(String, i64, String)>,
+    candidate: CandidateObservation,
+}
+
+async fn working_status(pool: &MySqlPool) -> Vec<(String, i64, String)> {
+    sqlx::query("SELECT table_name, staged, status FROM dolt_status ORDER BY table_name")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            Ok::<_, sqlx::Error>((
+                row.try_get("table_name")?,
+                row.try_get("staged")?,
+                row.try_get("status")?,
+            ))
+        })
+        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+        .unwrap()
+}
+
+async fn assert_dirty_schema_branch(
+    branch: &SchemaBranch,
+    receipt: &str,
+    source_history: &[Message],
+) {
+    assert_eq!(branch.view.revision().await.unwrap(), branch.base);
+    assert!(
+        matches!(probe_table_at_head(branch.view.pool.as_ref()).await, ProbeAtHead::Error(error) if error.contains(SCHEMA_BOUNDARY_TABLE)),
+        "failed branch must retain the DDL outside its HEAD"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1")
+            .fetch_one(branch.view.pool.as_ref())
+            .await
+            .unwrap(),
+        1,
+        "failed branch must retain schema version 1 at HEAD"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM operations AS OF 'HEAD' WHERE id = ?")
+            .bind(receipt)
+            .fetch_one(branch.view.pool.as_ref())
+            .await
+            .unwrap(),
+        0,
+        "failed branch must retain no receipt at HEAD"
+    );
+    assert_eq!(
+        working_status(branch.view.pool.as_ref()).await,
+        vec![(SCHEMA_BOUNDARY_TABLE.into(), 0, "new table".into())],
+        "failed exact-base branch must preserve its dirty DDL"
+    );
+    assert_eq!(
+        branch
+            .view
+            .history(SCHEMA_BOUNDARY_NAMESPACE, 10)
+            .await
+            .unwrap(),
+        source_history
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT name FROM dolt_branches WHERE name = ?")
+            .bind(&branch.view.branch)
+            .fetch_one(branch.view.pool.as_ref())
+            .await
+            .unwrap(),
+        branch.view.branch
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT hash FROM dolt_branches WHERE name = ?")
+            .bind(&branch.view.branch)
+            .fetch_one(branch.view.pool.as_ref())
+            .await
+            .unwrap(),
+        branch.base
+    );
+}
+
+#[tokio::test]
+async fn lost_manual_dolt_commit_reply_reconciles_one_clean_schema_commit() {
+    let store = MemoryStore::temporary().await.unwrap();
+    store
+        .append(SCHEMA_BOUNDARY_NAMESPACE, "user", "main history retained")
+        .await
+        .unwrap();
+    let before = store.revision().await.unwrap();
+    let source_history = store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap();
+    let candidate = preserved_candidate(&store).await;
+    let receipt = Uuid::new_v4().to_string();
+    let proxy = AckDropProxy::start(store.pool.clone(), "CALL DOLT_COMMIT", before.clone()).await;
+    let affected = proxy.view(&store).await;
+    let (mut connection, id) = owned_connection(&affected.pool).await.unwrap();
+    let error = staged_schema_transaction(&mut connection, &receipt, true)
+        .await
+        .unwrap_err();
+    assert!(
+        proxy.discarded.load(Ordering::Acquire),
+        "fixture must discard an actual durable DOLT_COMMIT reply: {error:#}"
+    );
+    drop(connection);
+    await_session_end(&store.pool, id, TEST_DEADLINE)
+        .await
+        .unwrap();
+    assert_committed_schema(&store, &before, &source_history, &candidate, &receipt).await;
+    affected.pool.close().await;
+    proxy.close().await;
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward_reply() {
+    let store = MemoryStore::temporary().await.unwrap();
+    store
+        .append(SCHEMA_BOUNDARY_NAMESPACE, "user", "main history retained")
+        .await
+        .unwrap();
+    let base = store.revision().await.unwrap();
+    let source_history = store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap();
+    let candidate = preserved_candidate(&store).await;
+
+    let failed = exact_base_schema_branch(&store).await;
+    assert_eq!(failed.base, base);
+    let failed_receipt = Uuid::new_v4().to_string();
+    let (mut failed_connection, failed_id) = owned_connection(&failed.view.pool).await.unwrap();
+    staged_schema_transaction(&mut failed_connection, &failed_receipt, false)
+        .await
+        .unwrap();
+    drop(failed_connection);
+    await_session_end(&store.pool, failed_id, TEST_DEADLINE)
+        .await
+        .unwrap();
+
+    assert_eq!(store.revision().await.unwrap(), base);
+    assert_clean_status(store.pool.as_ref()).await;
+    assert!(
+        matches!(probe_table_at_head(store.pool.as_ref()).await, ProbeAtHead::Error(error) if error.contains(SCHEMA_BOUNDARY_TABLE)),
+        "main must not expose a failed branch table at HEAD"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1")
+            .fetch_one(store.pool.as_ref())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_dirty_schema_branch(&failed, &failed_receipt, &source_history).await;
+    assert_candidate_unchanged(&candidate).await;
+
+    let fresh = exact_base_schema_branch(&store).await;
+    assert_eq!(fresh.base, base);
+    let receipt = Uuid::new_v4().to_string();
+    let (mut fresh_connection, fresh_id) = owned_connection(&fresh.view.pool).await.unwrap();
+    staged_schema_transaction(&mut fresh_connection, &receipt, true)
+        .await
+        .unwrap();
+    drop(fresh_connection);
+    await_session_end(&store.pool, fresh_id, TEST_DEADLINE)
+        .await
+        .unwrap();
+    assert_schema_commit(&fresh.view, &base, &source_history, &receipt).await;
+    let target = fresh.view.revision().await.unwrap();
+    assert_eq!(store.revision().await.unwrap(), base);
+    assert_clean_status(store.pool.as_ref()).await;
+    assert!(
+        matches!(probe_table_at_head(store.pool.as_ref()).await, ProbeAtHead::Error(error) if error.contains(SCHEMA_BOUNDARY_TABLE)),
+        "main must remain at the exact base until fast-forward publication"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1")
+            .fetch_one(store.pool.as_ref())
+            .await
+            .unwrap(),
+        1,
+        "main must retain schema version 1 until publication"
+    );
+
+    let proxy = AckDropProxy::start(store.pool.clone(), "CALL DOLT_MERGE", base.clone()).await;
+    let affected = proxy.view(&store).await;
+    let (mut merge_connection, merge_id) = owned_connection(&affected.pool).await.unwrap();
+    *affected.shared.uncertain.lock().unwrap() = Some(Pending {
+        pool: affected.pool.clone(),
+        connection: merge_id,
+        receipt: Receipt::Promotion {
+            base: base.clone(),
+            target: target.clone(),
+        },
+    });
+    let merge_error = sqlx::query("CALL DOLT_MERGE(?, '--ff-only')")
+        .bind(&fresh.view.branch)
+        .fetch_all(&mut merge_connection)
+        .await
+        .unwrap_err();
+    assert!(
+        proxy.discarded.load(Ordering::Acquire),
+        "fixture must discard an actual durable DOLT_MERGE fast-forward reply: {merge_error:#}"
+    );
+    drop(merge_connection);
+    await_session_end(&store.pool, merge_id, TEST_DEADLINE)
+        .await
+        .unwrap();
+    assert_eq!(affected.resolve_uncertain().await.unwrap(), Some(true));
+    assert!(affected.shared.uncertain.lock().unwrap().is_none());
+    assert_eq!(store.revision().await.unwrap(), target);
+    assert_schema_commit(&store, &base, &source_history, &receipt).await;
+    assert_eq!(affected.resolve_uncertain().await.unwrap(), None);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_log WHERE commit_hash = ?")
+            .bind(&target)
+            .fetch_one(store.pool.as_ref())
+            .await
+            .unwrap(),
+        1,
+        "main must reconcile to the target only once"
+    );
+    assert_dirty_schema_branch(&failed, &failed_receipt, &source_history).await;
+    assert_candidate_unchanged(&candidate).await;
+
+    affected.pool.close().await;
+    proxy.close().await;
+    store.close().await.unwrap();
+}
+
 struct AckDropProxy {
     port: u16,
     discarded: Arc<AtomicBool>,

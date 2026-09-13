@@ -357,7 +357,8 @@ impl Installation {
         );
         let diagnostic = String::from_utf8_lossy(&rejected.stderr);
         ensure!(
-            diagnostic.contains("provider errors: HTTP request failed: 403"),
+            diagnostic
+                .contains("provider errors: Responses completion access was denied (HTTP 403)"),
             "native CLI hid the OpenAI failure: {diagnostic}"
         );
         ensure!(

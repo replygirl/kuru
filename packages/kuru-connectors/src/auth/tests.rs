@@ -176,6 +176,33 @@ async fn callback_request(port: u16, target: &str, method: &str, host: &str) -> 
     response
 }
 
+async fn clean_up_refresh_after_gate_timeout(
+    task: tokio::task::JoinHandle<Result<RequestCredentials>>,
+    manager: &AuthManager,
+) -> String {
+    task.abort();
+    let task = match task.await {
+        Err(error) if error.is_cancelled() => "caller cancelled",
+        Err(_) => "caller join failed",
+        Ok(Ok(_)) => "caller unexpectedly succeeded",
+        Ok(Err(_)) => "caller returned an error",
+    };
+    let owner = match manager
+        .inner
+        .store
+        .lease(false, Duration::from_secs(10))
+        .await
+    {
+        Ok(Some(lease)) => {
+            drop(lease);
+            "owner released its lease"
+        }
+        Ok(None) => "credential store disappeared",
+        Err(_) => "owner did not release its lease",
+    };
+    format!("{task}; {owner}")
+}
+
 #[tokio::test]
 async fn native_auth_status_and_api_key_have_no_fresh_store_effects() {
     let fixture = Fixture::new(vec![]).await;
@@ -525,6 +552,52 @@ async fn native_auth_concurrent_refresh_uses_one_rotation_and_rejects_old_sessio
 }
 
 #[tokio::test]
+async fn durable_newer_generation_reuse_consumes_the_logical_rotation() {
+    let fixture = Fixture::new(vec![]).await;
+    fixture.seed().await;
+    let observed = fixture.manager.credentials_snapshot().await.unwrap();
+    {
+        let lease = fixture
+            .manager
+            .inner
+            .store
+            .lease(false, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut record = lease.read().unwrap().unwrap();
+        let session = record.session.as_mut().unwrap();
+        session.generation = 1;
+        session.access_token = "new-access".into();
+        record.revision = random(32).unwrap();
+        lease.write(&record).unwrap();
+    }
+    let budget = OperationBudget::new(Duration::from_secs(5));
+    let current = fixture
+        .manager
+        .resolve_for_operation(&observed, &budget)
+        .await
+        .unwrap();
+    assert_eq!(current.generation(), Some(1));
+    assert_eq!(current.bearer(), "new-access");
+    assert_eq!(fixture.count(), 0);
+    assert!(budget.begin_rotation(Duration::from_secs(5)).is_err());
+
+    let next_budget = OperationBudget::new(Duration::from_secs(5));
+    let next_start = fixture.manager.credentials_snapshot().await.unwrap();
+    assert_eq!(
+        fixture
+            .manager
+            .resolve_for_operation(&next_start, &next_budget)
+            .await
+            .unwrap()
+            .generation(),
+        Some(1)
+    );
+    assert!(next_budget.begin_rotation(Duration::from_secs(5)).is_ok());
+}
+
+#[tokio::test]
 async fn native_auth_refresh_rejection_and_account_change_never_retry_or_echo_tokens() {
     for reply in [
         Reply {
@@ -558,6 +631,404 @@ async fn native_auth_refresh_rejection_and_account_change_never_retry_or_echo_to
                 .contains("old-refresh")
         );
     }
+}
+
+#[tokio::test]
+async fn refresh_preparation_failure_and_connect_refusal_preserve_credentials() {
+    let mut preparation = Fixture::new(vec![]).await;
+    preparation.seed().await;
+    let original = preparation.bytes();
+    preparation.manager.fail_refresh_preparation();
+    let observed = preparation.manager.credentials_snapshot().await.unwrap();
+    let error = preparation
+        .manager
+        .refresh_rejected(&observed)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("prepare replayable"),
+        "{error:#}"
+    );
+    assert_eq!(preparation.manager.refresh_attempts(), 0);
+    assert_eq!(preparation.count(), 0);
+    assert_eq!(preparation.bytes(), original);
+
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let manager = AuthManager::test_issuer(temp.path().join("data"), project, &issuer).unwrap();
+    manager
+        .seed_test_session("old-access", "old-refresh", "account-one")
+        .await
+        .unwrap();
+    let observed = manager.credentials_snapshot().await.unwrap();
+    let error = manager.refresh_rejected(&observed).await.err().unwrap();
+    assert!(
+        error.to_string().contains("before token dispatch"),
+        "{error:#}"
+    );
+    assert_eq!(manager.refresh_attempts(), 2);
+    let record = manager.inner.store.read().unwrap().unwrap();
+    let session = record.session.unwrap();
+    assert!(!session.refresh_pending);
+    assert_eq!(session.access_token, "old-access");
+    assert_eq!(session.refresh_token, "old-refresh");
+    assert_eq!(session.generation, 0);
+}
+
+#[tokio::test]
+async fn caller_loss_during_proved_unsent_backoff_rolls_back_before_lease_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let mut manager = AuthManager::test_issuer(temp.path().join("data"), project, &issuer).unwrap();
+    let gate = manager.pause_refresh(RefreshPhase::BeforeSecond);
+    manager
+        .seed_test_session("old-access", "old-refresh", "account-one")
+        .await
+        .unwrap();
+    let observed = manager.credentials_snapshot().await.unwrap();
+    let caller = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.refresh_rejected(&observed).await })
+    };
+    if tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+        .await
+        .is_err()
+    {
+        let cleanup = clean_up_refresh_after_gate_timeout(caller, &manager).await;
+        panic!("refresh did not reach the proved-unsent retry gate; {cleanup}");
+    }
+    caller.abort();
+    match caller.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("refresh caller survived cancellation"),
+    }
+    let lease = manager
+        .inner
+        .store
+        .lease(false, Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap();
+    let session = lease.read().unwrap().unwrap().session.unwrap();
+    assert!(!session.refresh_pending);
+    assert_eq!(session.access_token, "old-access");
+    assert_eq!(session.generation, 0);
+    assert_eq!(manager.refresh_attempts(), 1);
+}
+
+#[tokio::test]
+async fn owned_refresh_gate_retries_once_after_safe_refusal_and_publishes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let issuer = format!("http://{address}");
+    drop(listener);
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut manager = AuthManager::test_issuer(temp.path().join("data"), project, &issuer).unwrap();
+    let gate = manager.pause_refresh(RefreshPhase::BeforeSecond);
+    manager
+        .seed_test_session("old-access", "old-refresh", "account-one")
+        .await
+        .unwrap();
+    let observed = manager.credentials_snapshot().await.unwrap();
+    let mut refresh = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.refresh_rejected(&observed).await })
+    };
+    if tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+        .await
+        .is_err()
+    {
+        let cleanup = clean_up_refresh_after_gate_timeout(refresh, &manager).await;
+        panic!("refresh did not reach the retry gate; {cleanup}");
+    }
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let mut server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 2048];
+        loop {
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert_ne!(count, 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            assert!(bytes.len() <= 16 * 1024);
+            let text = String::from_utf8_lossy(&bytes);
+            let Some(header_end) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let length = text[..header_end]
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::to_owned)
+                })
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            if bytes.len() >= header_end + 4 + length {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("POST /oauth/token HTTP/1.1\r\n"));
+        let body = tokens("account-one").to_string();
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        bytes
+    });
+    gate.release.notify_one();
+    let refresh_result = match tokio::time::timeout(Duration::from_secs(15), &mut refresh).await {
+        Ok(result) => result,
+        Err(_) => {
+            server.abort();
+            let _ = server.await;
+            let cleanup = clean_up_refresh_after_gate_timeout(refresh, &manager).await;
+            panic!("refresh did not finish after the retry gate; {cleanup}");
+        }
+    };
+    let refreshed = match refresh_result {
+        Ok(Ok(credentials)) => credentials,
+        Ok(Err(error)) => {
+            server.abort();
+            let _ = server.await;
+            panic!("refresh failed after the retry gate: {error:#}");
+        }
+        Err(error) => {
+            server.abort();
+            let _ = server.await;
+            panic!("refresh task failed after the retry gate: {error}");
+        }
+    };
+    assert_eq!(refreshed.generation(), Some(1));
+    let captured = match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            server.abort();
+            let _ = server.await;
+            panic!("refresh endpoint did not finish")
+        }
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&captured)
+            .matches("POST /oauth/token")
+            .count(),
+        1
+    );
+    assert_eq!(manager.refresh_attempts(), 2);
+    let session = manager
+        .inner
+        .store
+        .read()
+        .unwrap()
+        .unwrap()
+        .session
+        .unwrap();
+    assert_eq!(session.generation, 1);
+    assert!(!session.refresh_pending);
+}
+
+#[tokio::test]
+async fn owner_gate_caller_loss_and_expired_grant_stop_before_first_post() {
+    for expire in [false, true] {
+        let fixture = Fixture::new(vec![]).await;
+        fixture.seed().await;
+        let mut manager = AuthManager::test_issuer(
+            fixture.temp.path().join("data"),
+            fixture.temp.path().join("project"),
+            &fixture.manager.inner.issuer,
+        )
+        .unwrap();
+        if expire {
+            Arc::get_mut(&mut manager.inner).unwrap().http_timeout = Duration::from_secs(2);
+        }
+        let gate = manager.pause_refresh(RefreshPhase::BeforeFirst);
+        let before_record = manager.inner.store.read().unwrap().unwrap();
+        let before_revision = before_record.revision.clone();
+        let before = before_record.session.unwrap();
+        let observed = manager.credentials_snapshot().await.unwrap();
+        let caller = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.refresh_rejected(&observed).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
+            .await
+            .unwrap();
+        if expire {
+            assert!(caller.await.unwrap().is_err());
+        } else {
+            caller.abort();
+            match caller.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("refresh caller survived cancellation"),
+            }
+        }
+        let lease = manager
+            .inner
+            .store
+            .lease(false, Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let after_record = lease.read().unwrap().unwrap();
+        assert_ne!(after_record.revision, before_revision);
+        assert!(after_record.session.unwrap() == before);
+        assert_eq!(manager.refresh_attempts(), 0);
+        assert_eq!(fixture.count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn expired_allowance_before_start_and_at_second_gate_never_dispatch_late() {
+    let fixture = Fixture::new(vec![]).await;
+    fixture.seed().await;
+    let original = fixture.bytes();
+    let observed = fixture.manager.credentials_snapshot().await.unwrap();
+    let budget = OperationBudget::new(Duration::from_secs(5));
+    let expired = budget.begin_rotation(Duration::ZERO).unwrap();
+    assert!(
+        fixture
+            .manager
+            .refresh_with_allowance(&observed, expired)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.bytes(), original);
+    assert_eq!(fixture.count(), 0);
+
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let mut manager = AuthManager::test_issuer(temp.path().join("data"), project, &issuer).unwrap();
+    let gate = manager.pause_refresh(RefreshPhase::BeforeSecond);
+    manager
+        .seed_test_session("old-access", "old-refresh", "account-one")
+        .await
+        .unwrap();
+    let before = manager.inner.store.read().unwrap().unwrap();
+    let observed = manager.credentials_snapshot().await.unwrap();
+    let budget = OperationBudget::new(Duration::from_secs(15));
+    let allowance = budget.begin_rotation(Duration::from_secs(10)).unwrap();
+    let mut refresh = {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.refresh_with_allowance(&observed, allowance).await })
+    };
+    if tokio::time::timeout(Duration::from_secs(12), gate.reached.notified())
+        .await
+        .is_err()
+    {
+        let cleanup = clean_up_refresh_after_gate_timeout(refresh, &manager).await;
+        panic!("refresh did not reach the second-request gate; {cleanup}");
+    }
+    let result = match tokio::time::timeout(Duration::from_secs(12), &mut refresh).await {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            let cleanup = clean_up_refresh_after_gate_timeout(refresh, &manager).await;
+            panic!("expired refresh did not finish; {cleanup}");
+        }
+    };
+    assert!(result.is_err());
+    let lease = manager
+        .inner
+        .store
+        .lease(false, Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap();
+    let after = lease.read().unwrap().unwrap();
+    assert_ne!(after.revision, before.revision);
+    assert!(after.session == before.session);
+    assert_eq!(manager.refresh_attempts(), 1);
+}
+
+#[tokio::test]
+async fn native_proxy_connect_is_counted_separately_from_token_posts() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let transcripts = Arc::new(Mutex::new(Vec::new()));
+    let observed = transcripts.clone();
+    let mut server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                assert!(bytes.len() <= 8 * 1024);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            observed.lock().unwrap().push(bytes);
+            socket
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut manager = AuthManager::new(temp.path().join("data"), project, None).unwrap();
+    manager.use_refresh_proxy("https://auth.invalid", proxy);
+    manager
+        .seed_test_session("old-access", "old-refresh", "account-one")
+        .await
+        .unwrap();
+    let observed = manager.credentials_snapshot().await.unwrap();
+    let error = manager.refresh_rejected(&observed).await.err().unwrap();
+    assert!(
+        error.to_string().contains("before token dispatch"),
+        "{error:#}"
+    );
+    match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            server.abort();
+            let _ = server.await;
+            panic!("proxy fixture did not finish")
+        }
+    }
+    let transcripts = transcripts.lock().unwrap();
+    assert_eq!(transcripts.len(), 2);
+    assert!(transcripts.iter().all(|bytes| {
+        let text = String::from_utf8_lossy(bytes);
+        text.lines().next() == Some("CONNECT auth.invalid:443 HTTP/1.1")
+            && !text.contains("oauth/token")
+    }));
+    let session = manager
+        .inner
+        .store
+        .read()
+        .unwrap()
+        .unwrap()
+        .session
+        .unwrap();
+    assert!(!session.refresh_pending);
+    assert_eq!(session.generation, 0);
 }
 
 #[tokio::test]
@@ -638,6 +1109,61 @@ async fn native_auth_refresh_survives_caller_runtime_destruction_and_persists_ro
     assert!(!session.refresh_pending);
     assert_eq!(session.refresh_token, "synthetic-refresh");
     assert_eq!(fixture.count(), 1);
+}
+
+#[tokio::test]
+async fn refresh_publication_reply_loss_and_read_failure_reconcile_exact_state() {
+    for write in [1, 2] {
+        let fixture = Fixture::new(vec![Reply::json(tokens("account-one"))]).await;
+        fixture.seed().await;
+        let observed = fixture.manager.credentials_snapshot().await.unwrap();
+        fixture
+            .manager
+            .inner
+            .store
+            .fail_after_publish_on_write(write);
+        let refreshed = fixture.manager.refresh_rejected(&observed).await.unwrap();
+        assert_eq!(refreshed.generation(), Some(1));
+        assert_eq!(fixture.count(), 1);
+        let session = fixture
+            .manager
+            .inner
+            .store
+            .read()
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        assert_eq!(session.generation, 1);
+        assert!(!session.refresh_pending);
+    }
+
+    let fixture = Fixture::new(vec![Reply::json(tokens("account-one"))]).await;
+    fixture.seed().await;
+    let observed = fixture.manager.credentials_snapshot().await.unwrap();
+    fixture.manager.inner.store.fail_on_read(3);
+    let error = fixture
+        .manager
+        .refresh_rejected(&observed)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "authentication rotation state is unknown; run kuru login"
+    );
+    assert_eq!(fixture.count(), 1);
+    let session = fixture
+        .manager
+        .inner
+        .store
+        .read()
+        .unwrap()
+        .unwrap()
+        .session
+        .unwrap();
+    assert_eq!(session.generation, 1);
+    assert!(!session.refresh_pending);
 }
 
 #[tokio::test]

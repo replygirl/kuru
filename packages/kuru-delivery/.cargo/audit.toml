@@ -1,0 +1,11 @@
+[advisories]
+ignore = []
+informational_warnings = []
+
+[database]
+fetch = false
+stale = false
+
+[yanked]
+enabled = false
+update_index = false

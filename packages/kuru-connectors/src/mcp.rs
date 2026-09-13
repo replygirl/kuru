@@ -1,11 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::path::Path;
+
 use anyhow::{Context, Result, bail, ensure};
 use kuru_core::{McpConfig, ToolSpec};
+use kuru_platform::fs::Directory;
+#[cfg(test)]
+use kuru_platform::fs::{NameRetention, Privacy};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 
@@ -20,7 +26,23 @@ pub(crate) struct McpHosts {
 }
 
 impl McpHosts {
+    #[cfg(test)]
     pub fn new(root: &Path, configs: &BTreeMap<String, McpConfig>) -> Result<Self> {
+        let root = root.canonicalize().context("MCP root does not exist")?;
+        let root = Arc::new(Directory::open(
+            &root,
+            Privacy::Inherited,
+            NameRetention::Pinned,
+        )?);
+        Self::with_retained_root(root, configs)
+    }
+
+    pub(crate) fn with_retained_root(
+        root_guard: Arc<Directory>,
+        configs: &BTreeMap<String, McpConfig>,
+    ) -> Result<Self> {
+        root_guard.revalidate()?;
+        let root = root_guard.path().to_path_buf();
         let mut clients = BTreeMap::new();
         for (name, config) in configs {
             ensure!(
@@ -34,7 +56,8 @@ impl McpHosts {
                 name.clone(),
                 Arc::new(McpClient {
                     config: config.clone(),
-                    root: root.into(),
+                    root: root.clone(),
+                    root_guard: root_guard.clone(),
                     transport: Mutex::new(None),
                 }),
             );
@@ -124,6 +147,7 @@ impl McpHosts {
 struct McpClient {
     config: McpConfig,
     root: PathBuf,
+    root_guard: Arc<Directory>,
     transport: Mutex<Option<Transport>>,
 }
 
@@ -138,6 +162,7 @@ impl McpClient {
                 next_id: 0,
             })
         } else {
+            self.root_guard.revalidate()?;
             Transport::Stdio(Box::new(
                 Rpc::spawn(
                     self.config
@@ -404,7 +429,11 @@ impl Sse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::test_support::drain_bounded;
     use crate::test_support::{HttpFixture, Reply, StdioFixture, Step};
+    #[cfg(unix)]
+    use tokio::time::{Duration, timeout};
 
     fn http_config(url: &str) -> BTreeMap<String, McpConfig> {
         [(
@@ -522,6 +551,158 @@ mod tests {
         assert_eq!(requests[4]["params"]["name"], "counter");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_stdio_mcp_keeps_inherited_environment_and_configured_override() {
+        const CHILD: &str = "KURU_MCP_ENVIRONMENT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let script = StdioFixture::new([
+                Step::Read,
+                Step::Write(
+                    json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":VERSION,"capabilities":{"tools":{}}}}),
+                ),
+                Step::Read,
+                Step::Read,
+                Step::Write(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})),
+                Step::Read,
+                Step::Eof,
+            ]);
+            let root = tempfile::tempdir().unwrap();
+            let config = [(
+                "stdio".into(),
+                McpConfig {
+                    command: Some(script.command().into()),
+                    env: BTreeMap::from([(
+                        "KURU_MCP_CONFIGURED_SENTINEL".into(),
+                        "configured".into(),
+                    )]),
+                    ..Default::default()
+                },
+            )]
+            .into();
+            let hosts = McpHosts::new(root.path(), &config).unwrap();
+            let specs = hosts.specs().await;
+            let shutdown = hosts.shutdown().await;
+            assert!(specs.unwrap().is_empty());
+            shutdown.unwrap();
+            assert_eq!(
+                script.environment_observations(),
+                vec!["inherited=true\noverride=true\n"]
+            );
+            return;
+        }
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        let path = std::env::var_os("PATH").expect("test runner PATH is required for rustc");
+        child
+            .arg("--exact")
+            .arg("mcp::tests::isolated_stdio_mcp_keeps_inherited_environment_and_configured_override")
+            .arg("--nocapture")
+            .env_clear()
+            // The real stdio peer is compiled in the isolated child. Preserve
+            // only its executable-discovery input; the observed MCP values are
+            // controlled fake sentinels below, never dumped by the fixture.
+            .env("PATH", path)
+            .env("KURU_MCP_INHERITED_SENTINEL", "inherited")
+            .env("KURU_MCP_CONFIGURED_SENTINEL", "parent-value")
+            .env(CHILD, "1")
+            .kill_on_drop(true);
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            child.env("LLVM_PROFILE_FILE", profile);
+        }
+        child.stdout(std::process::Stdio::piped());
+        child.stderr(std::process::Stdio::piped());
+        let mut child = child.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let result = timeout(Duration::from_secs(15), async {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let (stdout_truncated, stderr_truncated, status) = tokio::join!(
+                drain_bounded(&mut stdout, &mut out),
+                drain_bounded(&mut stderr, &mut err),
+                child.wait(),
+            );
+            if stdout_truncated? || stderr_truncated? {
+                return Err(std::io::Error::other(
+                    "isolated MCP fixture output exceeds 2 MiB",
+                ));
+            }
+            Ok::<_, std::io::Error>((status?, out, err))
+        })
+        .await;
+        let (status, out, err) = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                let requested = child.start_kill();
+                let (stdout_drain, stderr_drain, reap) = tokio::join!(
+                    timeout(Duration::from_secs(5), async {
+                        let mut discarded = Vec::new();
+                        drain_bounded(&mut stdout, &mut discarded).await
+                    }),
+                    timeout(Duration::from_secs(5), async {
+                        let mut discarded = Vec::new();
+                        drain_bounded(&mut stderr, &mut discarded).await
+                    }),
+                    timeout(Duration::from_secs(5), child.wait()),
+                );
+                panic!(
+                    "isolated MCP environment fixture failed: {error}; kill={requested:?}; stdout-drain={stdout_drain:?}; stderr-drain={stderr_drain:?}; reap={reap:?}"
+                );
+            }
+            Err(_) => {
+                let requested = child.start_kill();
+                let (stdout_drain, stderr_drain, reap) = tokio::join!(
+                    timeout(Duration::from_secs(5), async {
+                        let mut discarded = Vec::new();
+                        drain_bounded(&mut stdout, &mut discarded).await
+                    }),
+                    timeout(Duration::from_secs(5), async {
+                        let mut discarded = Vec::new();
+                        drain_bounded(&mut stderr, &mut discarded).await
+                    }),
+                    timeout(Duration::from_secs(5), child.wait()),
+                );
+                panic!(
+                    "isolated MCP environment fixture timed out; kill={requested:?}; stdout-drain={stdout_drain:?}; stderr-drain={stderr_drain:?}; reap={reap:?}"
+                );
+            }
+        };
+        assert!(
+            status.success(),
+            "isolated MCP environment fixture failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&err)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_root_replacement_blocks_stdio_discovery_before_child_spawn() {
+        let script = StdioFixture::new([Step::Read, Step::Eof]);
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let retained =
+            Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Pinned).unwrap());
+        let config = [(
+            "stdio".into(),
+            McpConfig {
+                command: Some(script.command().into()),
+                args: vec![],
+                url: None,
+                env: BTreeMap::new(),
+            },
+        )]
+        .into();
+        let hosts = McpHosts::with_retained_root(retained, &config).unwrap();
+        std::fs::rename(&root, parent.path().join("replaced")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let error = hosts.specs().await.unwrap_err();
+        assert!(format!("{error:#}").contains("identity changed"));
+        assert!(script.conversations().is_empty());
+    }
+
     #[tokio::test]
     async fn discovery_rejects_incompatible_version_duplicates_and_stalled_pagination() {
         for (reply, expected) in [
@@ -536,9 +717,15 @@ mod tests {
             (json!({}), "protocolVersion"),
         ] {
             let peer = HttpFixture::new(vec![Reply::rpc(reply)]).await;
+            let workspace = tempfile::tempdir().unwrap();
+            let root = Arc::new(
+                Directory::open(workspace.path(), Privacy::Inherited, NameRetention::Pinned)
+                    .unwrap(),
+            );
             let client = McpClient {
                 config: http_config(&peer.url).remove("test").unwrap(),
-                root: PathBuf::from("."),
+                root: root.path().to_path_buf(),
+                root_guard: root,
                 transport: Mutex::new(None),
             };
             assert!(

@@ -6,7 +6,7 @@ mod engine;
 pub mod server;
 
 pub use bus::PeerMessage;
-pub use dream::{DreamProposal, DreamReport};
+pub use dream::{DreamProposal, DreamReport, undo_dream};
 pub use engine::{Event, Harness, Session, StateReport, Topology, TurnOutput, project_scope};
 
 #[cfg(test)]

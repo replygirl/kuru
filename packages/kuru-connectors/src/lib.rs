@@ -8,6 +8,7 @@ mod mcp;
 #[cfg(windows)]
 mod process;
 mod providers;
+mod retry;
 mod rpc;
 mod tools;
 

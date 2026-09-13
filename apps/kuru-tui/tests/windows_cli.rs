@@ -50,16 +50,30 @@ fn shell_marker(path: &Path, limit: u64) -> std::io::Result<String> {
     String::from_utf8(bytes).map_err(|_| std::io::Error::other("shell marker is not UTF-8"))
 }
 
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn stock_shell_source(progress: &Path, input: &Path, sentinel: &str) -> String {
+    let progress = powershell_literal(&progress.to_string_lossy());
+    let input = powershell_literal(&input.to_string_lossy());
+    let sentinel = powershell_literal(sentinel);
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
+[IO.File]::WriteAllText({progress}, "entered`n")
+if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {{ throw 'expected stock PowerShell 5.1' }}
+[IO.File]::AppendAllText({progress}, "version-checked`nhash-started`n")
+$hash = (Get-FileHash -LiteralPath {input} -Algorithm SHA256).Hash
+[IO.File]::AppendAllText({progress}, "hashed`n")
+[Console]::Write($hash + '|' + {sentinel})
+[IO.File]::AppendAllText({progress}, "completed`n")
+"#
+    )
+}
+
 // A failed acceptance remains failed. This one diagnostic uses -Command rather
 // than Kuru's -EncodedCommand, and never supplies replacement acceptance evidence.
-fn shell_timeout_trace(
-    root: &Path,
-    project: &Path,
-    input: &Path,
-    sentinel: &str,
-    progress: &Path,
-    source: &str,
-) -> String {
+fn shell_timeout_trace(root: &Path, project: &Path, progress: &Path, source: &str) -> String {
     use kuru_platform::windows::{
         pipe::Pipe,
         process::{Stdio, configured_command, system_directory},
@@ -93,15 +107,7 @@ fn shell_timeout_trace(
 
     let execute = async {
         let powershell = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
-        let mut environment = fixture_environment(root);
-        environment.extend([
-            ("KURU_HASH_INPUT".into(), input.as_os_str().to_owned()),
-            ("KURU_SHELL_SENTINEL".into(), sentinel.into()),
-            (
-                "KURU_SHELL_PROGRESS".into(),
-                progress.as_os_str().to_owned(),
-            ),
-        ]);
+        let environment = fixture_environment(root);
         // Match the product's UTF-8 prelude and sanitized environment. Core
         // Trace 1 prints script lines, not values. No redirection is used: 5>
         // invokes Out-File and could preload the very Utility module at issue.
@@ -366,7 +372,15 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("workspace 日本語");
     let modules = root.path().join("incompatible modules");
-    for directory in [&project, &modules, &root.path().join("tools")] {
+    let control_config = root.path().join("control config");
+    let control_local = root.path().join("control local");
+    for directory in [
+        &project,
+        &modules,
+        &root.path().join("tools"),
+        &control_config,
+        &control_local,
+    ] {
         fs::create_dir(directory).unwrap();
     }
     let incompatible = modules.join("Microsoft.PowerShell.Utility");
@@ -397,31 +411,26 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     let kuru_progress = root.path().join("kuru-progress");
     let trace_progress = root.path().join("trace-progress");
     let sentinel = "retained & literal 日本語";
-    let original_source = r#"$ErrorActionPreference = 'Stop'
-[IO.File]::WriteAllText($env:KURU_SHELL_PROGRESS, "entered`n")
-if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'expected stock PowerShell 5.1' }
-[IO.File]::AppendAllText($env:KURU_SHELL_PROGRESS, "version-checked`nhash-started`n")
-$hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
-[IO.File]::AppendAllText($env:KURU_SHELL_PROGRESS, "hashed`n")
-[Console]::Write($hash + '|' + $env:KURU_SHELL_SENTINEL)
-[IO.File]::AppendAllText($env:KURU_SHELL_PROGRESS, "completed`n")
-"#;
+    let control_source = stock_shell_source(&control_progress, &input, sentinel);
+    let kuru_source = stock_shell_source(&kuru_progress, &input, sentinel);
     let child = |binary: &Path| {
         let mut child = command(root.path(), binary);
         child
             // This incompatible manifest precedes the system-module fallback
             // that lets stock 5.1 find commands through an empty module path.
             // Mixed casing exercises Windows environment-key comparison.
-            .env("pSmOdUlEpAtH", &modules)
-            .env("KURU_HASH_INPUT", &input)
-            .env("KURU_SHELL_SENTINEL", sentinel);
+            .env("pSmOdUlEpAtH", &modules);
         child
     };
     let powershell = kuru_platform::windows::process::system_directory()
         .unwrap()
         .join("WindowsPowerShell/v1.0/powershell.exe");
     let control = child(&powershell)
-        .env("KURU_SHELL_PROGRESS", &control_progress)
+        // Command discovery writes a cache below LOCALAPPDATA. Keep this
+        // deliberately incompatible control from changing the authoritative
+        // Kuru invocation's cache before its first stock-module lookup.
+        .env("APPDATA", &control_config)
+        .env("LOCALAPPDATA", &control_local)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -429,7 +438,7 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
             "-OutputFormat",
             "Text",
             "-Command",
-            original_source,
+            &control_source,
         ])
         .output();
     let control_stages = shell_marker(&control_progress, 256);
@@ -459,11 +468,10 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
         Some("entered\nversion-checked\nhash-started\n"),
         "control must stop at the actual hash command: {control_stages:?}"
     );
-    // The first Kuru request must exercise the original source. Observation
+    // The first Kuru request must exercise the unwrapped source. Observation
     // wrappers can alter discovery; a diagnostic retry cannot establish a pass.
-    let arguments = serde_json::json!({ "command": original_source }).to_string();
+    let arguments = serde_json::json!({ "command": kuru_source }).to_string();
     let output = child(Path::new(env!("CARGO_BIN_EXE_kuru")))
-        .env("KURU_SHELL_PROGRESS", &kuru_progress)
         .arg("-C")
         .arg(&project)
         .args(["--allow-shell", "tool", "shell", "--args", &arguments])
@@ -474,14 +482,8 @@ $hash = (Get-FileHash -LiteralPath $env:KURU_HASH_INPUT -Algorithm SHA256).Hash
     let trace = if !output.status.success()
         && String::from_utf8_lossy(&output.stderr).contains("shell timed out")
     {
-        shell_timeout_trace(
-            root.path(),
-            &project,
-            &input,
-            sentinel,
-            &trace_progress,
-            original_source,
-        )
+        let trace_source = stock_shell_source(&trace_progress, &input, sentinel);
+        shell_timeout_trace(root.path(), &project, &trace_progress, &trace_source)
     } else {
         "trace not run (no original shell timeout)".to_owned()
     };

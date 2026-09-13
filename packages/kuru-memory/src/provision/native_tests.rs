@@ -5,6 +5,24 @@ use kuru_platform::fs::regular_file_info;
 const EXE: &[u8] = b"MZ fixture bytes, deliberately never executed";
 const NOTICES: &[u8] = b"exact upstream notice fixture";
 
+#[tokio::test]
+async fn invalid_memory_config_fails_before_provision_creates_cache() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache-not-created");
+    let config = MemoryConfig {
+        cache_dir: Some("relative-cache".into()),
+        ..MemoryConfig::default()
+    };
+
+    let error = provision(&config, &cache).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("memory.cache_dir must be an absolute path")
+    );
+    assert!(!cache.exists());
+}
+
 #[test]
 fn official_windows_archive_decodes_exact_pinned_payloads_on_every_host() {
     let asset = crate::catalog::ASSETS

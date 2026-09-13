@@ -25,7 +25,8 @@ required-features = ["test-support"]
 kuru-delivery.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-crossterm.workspace = true
+crossterm = { workspace = true, features = ["event-stream", "use-dev-tty"] }
+futures.workspace = true
 kuru-core.workspace = true
 kuru-platform.workspace = true
 kuru-memory.workspace = true
@@ -41,6 +42,7 @@ sha2.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 axum.workspace = true
 reqwest.workspace = true
@@ -48,6 +50,7 @@ rusqlite.workspace = true
 sqlx.workspace = true
 tar.workspace = true
 flate2.workspace = true
+portable-pty.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 nix.workspace = true
@@ -55,7 +58,6 @@ rustix.workspace = true
 vt100.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
-portable-pty.workspace = true
 vt100.workspace = true
 
 [lints]

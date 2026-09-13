@@ -7,7 +7,7 @@ use std::{
 };
 
 use kuru_connectors::DemoProvider;
-use kuru_core::{Config, Mode};
+use kuru_core::{Config, Mode, ProjectPreferences};
 use kuru_runtime::Harness;
 
 #[path = "support/memory.rs"]
@@ -61,6 +61,21 @@ impl Sandbox {
         .unwrap()
     }
 
+    async fn preferences(&self) -> ProjectPreferences {
+        let mut options = kuru_memory::test_support::open_options(
+            self.data.clone(),
+            kuru_runtime::project_scope(&self.project).unwrap(),
+        )
+        .unwrap();
+        options.read_only = true;
+        let memory = MemoryStore::open(options).await.unwrap();
+        let preferences = Harness::load_preferences(&memory, &self.project)
+            .await
+            .unwrap();
+        memory.close().await.unwrap();
+        preferences
+    }
+
     async fn remember(&self) -> String {
         let options = kuru_memory::test_support::open_options(
             self.data.clone(),
@@ -107,10 +122,14 @@ async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_sel
     let shared = sandbox.project.join(".kuru/config.toml");
     let shared_contents = "mode='ifs'\nmodel='team-model'\neffort='low'\n";
     std::fs::write(&shared, shared_contents).unwrap();
-    let saved = sandbox.config(&[]);
-    assert_eq!(saved.mode, Mode::Jungian);
-    assert_eq!(saved.model, "saved-model");
-    assert_eq!(saved.effort.as_deref(), Some("ultra"));
+    let configured = sandbox.config(&[]);
+    assert_eq!(configured.mode, Mode::Ifs);
+    assert_eq!(configured.model, "team-model");
+    assert_eq!(configured.effort.as_deref(), Some("low"));
+    let saved = sandbox.preferences().await;
+    assert_eq!(saved.mode, Some(Mode::Jungian));
+    assert_eq!(saved.providers["demo"].model, "saved-model");
+    assert_eq!(saved.providers["demo"].effort.as_deref(), Some("ultra"));
 
     let temporary = sandbox.config(&[
         "--mode",
@@ -125,7 +144,7 @@ async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_sel
     assert_eq!(temporary.effort.as_deref(), Some("high"));
     let changed_model = sandbox.config(&["--model", "temporary"]);
     assert_eq!(changed_model.effort.as_deref(), Some("low"));
-    assert_eq!(sandbox.config(&[]), saved);
+    assert_eq!(sandbox.preferences().await, saved);
 
     let local = sandbox.root.path().join("invocation.toml");
     std::fs::write(
@@ -144,6 +163,7 @@ async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_sel
         "run",
         "local invocation",
     ]);
+    sandbox.run(&["run", "saved preference invocation"]);
     sandbox.run(&[
         "--resume",
         &saved_session,
@@ -152,7 +172,7 @@ async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_sel
         "run",
         "resume own framework",
     ]);
-    assert_eq!(sandbox.config(&[]), saved);
+    assert_eq!(sandbox.preferences().await, saved);
     let sessions: Vec<kuru_runtime::Session> =
         serde_json::from_str(&sandbox.run(&["sessions"])).unwrap();
     assert!(
@@ -164,6 +184,10 @@ async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_sel
         sessions
             .iter()
             .any(|session| session.mode == Mode::Polyvagal && session.label == "local invocation")
+    );
+    assert!(
+        sessions.iter().any(|session| session.mode == Mode::Jungian
+            && session.label == "saved preference invocation")
     );
     assert!(sessions.iter().any(|session| session.id == saved_session
         && session.mode == Mode::Jungian
@@ -206,12 +230,12 @@ async fn invocation_overrides_resume_and_other_projects_do_not_replace_saved_sel
                 .unwrap(),
         ))
         .unwrap();
-        assert_eq!(alias_config, saved);
+        assert_eq!(alias_config, configured);
     }
 }
 
 #[tokio::test]
-async fn configuration_inspection_does_not_create_a_store_but_rejects_existing_tool_root_storage() {
+async fn configuration_inspection_ignores_tool_root_storage_but_activation_rejects_it() {
     let sandbox = Sandbox::new();
     assert_eq!(sandbox.config(&[]).mode, Mode::Ifs);
     assert!(!sandbox.data.exists());
@@ -221,6 +245,17 @@ async fn configuration_inspection_does_not_create_a_store_but_rejects_existing_t
     let output = sandbox
         .command_for(&sandbox.project, &nested, "demo")
         .arg("config")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    toml::from_slice::<toml::Value>(&output.stdout).unwrap();
+    let output = sandbox
+        .command_for(&sandbox.project, &nested, "demo")
+        .arg("sessions")
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -252,5 +287,5 @@ async fn an_explicit_framework_override_is_validated_against_its_own_part_budget
         "run",
         "Use the smaller pool",
     ]);
-    assert_eq!(sandbox.config(&[]).mode, Mode::Jungian);
+    assert_eq!(sandbox.preferences().await.mode, Some(Mode::Jungian));
 }

@@ -21,7 +21,7 @@ The welcome portrait shows the selected framework. Type a prompt and press <kbd>
 
 Try `/parts` to inspect the active peers and relationships. The starting IFS pool includes Self, two managers, two firefighters, and two exiles. Each role offers a different tendency; Self has no supervisory authority over the others.
 
-The wide layout shows peer activity and relationship membership alongside the conversation. A narrow pane keeps the conversation and editor central. Activity reports describe routing and phases without exposing private peer messages.
+The wide layout shows peer activity and relationship membership alongside the conversation. A narrow pane keeps the conversation and editor central. Each completed reply shows the returned speaker or relationship and its input/output token counts beneath the reply. If the returned turn is limited, Kuru shows a generic limited-result marker without guessing why. Activity reports describe routing and phases without exposing private peer messages; they do not determine the final reply.
 
 ## Make it yours
 

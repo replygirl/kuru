@@ -202,10 +202,7 @@ impl MemoryStore {
         permit: Option<OwnedSemaphorePermit>,
         mut marker_pause: Option<marker_fixture::ReadyMarkerPause>,
     ) -> Result<Self> {
-        ensure!(
-            (1..=300).contains(&options.config.startup_timeout_secs),
-            "memory startup timeout must be 1..=300 seconds"
-        );
+        options.config.validate()?;
         let directory = project_directory(&options.data_dir, &options.project_scope)?;
         private_dir(&options.data_dir)?;
         let parent = directory.parent().context("project store has no parent")?;
@@ -997,6 +994,40 @@ pub(crate) fn test_supervisor() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn open_rejects_invalid_memory_config_before_creating_store_state() {
+        for (field, config) in [
+            (
+                "cache_dir",
+                MemoryConfig {
+                    cache_dir: Some("relative-cache".into()),
+                    ..MemoryConfig::default()
+                },
+            ),
+            (
+                "dolt_binary",
+                MemoryConfig {
+                    dolt_binary: Some("relative-dolt".into()),
+                    ..MemoryConfig::default()
+                },
+            ),
+        ] {
+            let root = crate::test_support::tempdir().unwrap();
+            let data_dir = root.path().join(field).join("not-created");
+            let mut options =
+                OpenOptions::new(data_dir.clone(), format!("project/{}", "0".repeat(64)));
+            options.config = config;
+
+            let error = MemoryStore::open(options).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("memory.{field} must be an absolute path"))
+            );
+            assert!(!data_dir.exists());
+        }
+    }
 
     #[tokio::test]
     async fn failed_database_batch_rolls_back_and_committed_receipt_reconciles() {

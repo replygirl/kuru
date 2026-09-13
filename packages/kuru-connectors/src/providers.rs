@@ -14,14 +14,16 @@ use tokio::sync::Mutex;
 use crate::{
     auth::{AuthManager, AuthRoute, RequestCredentials},
     http,
+    retry::{self, OperationBudget, RetryDecision},
 };
 
+mod diagnostics;
 mod sse;
 #[cfg(test)]
 mod subscription_tests;
 
 const SUBSCRIPTION_BASE: &str = "https://chatgpt.com/backend-api/codex";
-const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(600);
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
 // This describes the audited catalog wire contract, not Kuru's identity.
 const CATALOG_COMPATIBILITY: &str = "0.154.0";
 
@@ -36,7 +38,7 @@ pub async fn provider(config: &Config, cwd: &Path, data_dir: &Path) -> Result<Ar
         "demo" => Ok(Arc::new(DemoProvider)),
         "codex" => {
             let manager = AuthManager::new(data_dir.to_owned(), cwd.to_owned(), None)?;
-            let initial = manager.credentials(AuthRoute::Chatgpt).await?;
+            let initial = manager.credentials_snapshot().await?;
             Ok(Arc::new(ResponsesProvider::subscription(manager, initial)?))
         }
         "responses" => Ok(Arc::new(ResponsesProvider::new(
@@ -121,6 +123,7 @@ pub struct ResponsesProvider {
     base: String,
     auth: Authentication,
     client: reqwest::Client,
+    completion_timeout: Duration,
     actors: Mutex<BTreeMap<String, Arc<Mutex<Option<Pending>>>>>,
 }
 
@@ -134,11 +137,12 @@ enum Authentication {
 
 impl ResponsesProvider {
     pub fn new(base: &str, key_env: &str) -> Result<Self> {
-        http::endpoint(base)?;
+        http::endpoint(base).map_err(|_| diagnostics::invalid_endpoint())?;
         Ok(Self {
             base: base.trim_end_matches('/').into(),
             auth: Authentication::Environment(key_env.into()),
-            client: http::client()?,
+            client: provider_client(COMPLETION_TIMEOUT)?,
+            completion_timeout: COMPLETION_TIMEOUT,
             actors: Mutex::new(BTreeMap::new()),
         })
     }
@@ -153,9 +157,12 @@ impl ResponsesProvider {
             auth: Authentication::Subscription { manager, initial },
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(SUBSCRIPTION_TIMEOUT)
+                .timeout(COMPLETION_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+                .retry(reqwest::retry::never())
+                .build()
+                .map_err(|_| diagnostics::client())?,
+            completion_timeout: COMPLETION_TIMEOUT,
             actors: Mutex::new(BTreeMap::new()),
         })
     }
@@ -164,46 +171,92 @@ impl ResponsesProvider {
         matches!(self.auth, Authentication::Subscription { .. })
     }
 
-    async fn send(&self, builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        match &self.auth {
-            Authentication::Environment(key_env) => {
-                let builder = if key_env.is_empty() {
-                    builder
-                } else {
-                    let key = std::env::var(key_env).with_context(|| {
-                        format!("set {key_env} for Responses API authentication")
-                    })?;
-                    ensure!(!key.trim().is_empty(), "{key_env} is empty");
-                    builder.bearer_auth(key)
-                };
-                Ok(builder.send().await?)
+    fn operation(&self, catalog: bool) -> diagnostics::Operation {
+        match (self.is_subscription(), catalog) {
+            (false, false) => diagnostics::Operation::ResponsesCompletion,
+            (false, true) => diagnostics::Operation::ResponsesCatalog,
+            (true, false) => diagnostics::Operation::ChatgptCompletion,
+            (true, true) => diagnostics::Operation::ChatgptCatalog,
+        }
+    }
+
+    async fn send(
+        &self,
+        builder: reqwest::RequestBuilder,
+        operation: diagnostics::Operation,
+        budget: &OperationBudget,
+    ) -> Result<reqwest::Response> {
+        let environment = match &self.auth {
+            Authentication::Environment(key_env) if !key_env.is_empty() => {
+                Some(environment_value(environment_key(key_env)?)?)
             }
+            _ => None,
+        };
+        let mut credentials = match &self.auth {
             Authentication::Subscription { manager, initial } => {
-                let credentials = manager.credentials(AuthRoute::Chatgpt).await?;
-                same_session(initial, &credentials)?;
-                let builder = builder
-                    .header(
-                        reqwest::header::USER_AGENT,
-                        concat!("Kuru/", env!("CARGO_PKG_VERSION")),
-                    )
-                    .header("originator", "kuru");
-                let first = subscription_headers(
-                    builder
-                        .try_clone()
-                        .context("subscription request is not replayable")?,
-                    &credentials,
-                )?
+                let observed = manager.credentials_snapshot().await?;
+                same_session(initial, &observed)?;
+                let current = manager.resolve_for_operation(&observed, budget).await?;
+                Some(current)
+            }
+            Authentication::Environment(_) => None,
+        };
+        let template = builder
+            .try_clone()
+            .context("provider request is not replayable")?;
+        let mut rotated = false;
+        loop {
+            budget.take_provider_send()?;
+            let mut request = template
+                .try_clone()
+                .context("provider request is not replayable")?;
+            if let Some(key) = &environment {
+                request = request.bearer_auth(key);
+            }
+            if let Some(current) = &credentials {
+                request = subscription_headers(
+                    request
+                        .header(
+                            reqwest::header::USER_AGENT,
+                            concat!("Kuru/", env!("CARGO_PKG_VERSION")),
+                        )
+                        .header("originator", "kuru"),
+                    current,
+                )?;
+            }
+            let response = request
                 .send()
-                .await?;
-                if first.status() != reqwest::StatusCode::UNAUTHORIZED {
-                    return Ok(first);
-                }
-                // Only a rejected HTTP response, before reading any stream, can
-                // rotate and resend once. Never retry an uncertain partial turn.
-                drop(first);
-                let refreshed = manager.refresh_rejected(&credentials).await?;
+                .await
+                .map_err(|error| diagnostics::transport(operation, error))?;
+            if response.status().is_success() {
+                return Ok(response);
+            }
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && credentials.is_some()
+                && !rotated
+            {
+                let current = credentials.as_ref().unwrap();
+                let Authentication::Subscription { manager, initial } = &self.auth else {
+                    unreachable!();
+                };
+                drop(response);
+                let allowance = budget.begin_rotation(crate::IO_TIMEOUT)?;
+                let refreshed = manager.refresh_with_allowance(current, allowance).await?;
                 same_session(initial, &refreshed)?;
-                Ok(subscription_headers(builder, &refreshed)?.send().await?)
+                credentials = Some(refreshed);
+                rotated = true;
+                continue;
+            }
+            let retry_after = retry::retry_after(response.headers());
+            let rejected = diagnostics::rejected(response, operation).await;
+            if !rejected.retryable {
+                return Err(rejected.error);
+            }
+            match budget.retry_delay(retry_after.as_ref(), std::time::SystemTime::now()) {
+                RetryDecision::Delay(delay) => tokio::time::sleep(delay).await,
+                RetryDecision::Exhausted => {
+                    return Err(retry::exhausted(operation, budget.provider_attempts()));
+                }
             }
         }
     }
@@ -218,6 +271,39 @@ impl ResponsesProvider {
             .entry(name.into())
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone())
+    }
+}
+
+fn provider_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(|_| diagnostics::client())
+}
+
+fn environment_key(name: &str) -> Result<String> {
+    std::env::var(name).map_err(environment_error)
+}
+
+fn environment_value(key: String) -> Result<String> {
+    ensure!(
+        !key.trim().is_empty(),
+        "Responses API authentication environment variable is empty"
+    );
+    Ok(key)
+}
+
+fn environment_error(error: std::env::VarError) -> anyhow::Error {
+    match error {
+        std::env::VarError::NotPresent => {
+            anyhow::Error::msg("Responses API authentication environment variable is not set")
+        }
+        std::env::VarError::NotUnicode(_) => anyhow::Error::msg(
+            "Responses API authentication environment variable is not valid Unicode",
+        ),
     }
 }
 
@@ -313,19 +399,8 @@ fn input_items(messages: &[Message], pending: Option<&Pending>) -> Result<Vec<Va
     Ok(input)
 }
 
-fn completion(value: &Value) -> Result<Completion> {
-    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
-        bail!(
-            "Responses API error: {}",
-            error["message"].as_str().unwrap_or("request failed")
-        );
-    }
-    if let Some(status) = value["status"].as_str() {
-        ensure!(
-            status == "completed",
-            "Responses API returned {status}; response was not completed"
-        );
-    }
+fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Completion> {
+    diagnostics::envelope(value, operation)?;
     let output = value["output"]
         .as_array()
         .context("Responses response lacks output array")?;
@@ -356,7 +431,7 @@ fn completion(value: &Value) -> Result<Completion> {
                         .as_str()
                         .context("function call lacks arguments")?,
                 )
-                .context("invalid function arguments JSON")?;
+                .map_err(|_| diagnostics::function_arguments(operation))?;
                 calls.push(ToolCall {
                     id: id.into(),
                     name: name.into(),
@@ -377,14 +452,18 @@ fn completion(value: &Value) -> Result<Completion> {
 #[async_trait]
 impl Provider for ResponsesProvider {
     async fn models(&self) -> Result<Vec<ModelInfo>> {
+        let budget = OperationBudget::new(crate::IO_TIMEOUT);
         tokio::time::timeout(crate::IO_TIMEOUT, async {
-            let mut url = reqwest::Url::parse(&format!("{}/models", self.base))?;
+            let operation = self.operation(true);
+            let mut url = reqwest::Url::parse(&format!("{}/models", self.base))
+                .map_err(|_| diagnostics::invalid_endpoint())?;
             if self.is_subscription() {
                 url.query_pairs_mut()
                     .append_pair("client_version", CATALOG_COMPATIBILITY);
             }
             let builder = self.client.get(url).timeout(crate::IO_TIMEOUT);
-            let value = http::json(self.send(builder).await?).await?;
+            let value =
+                diagnostics::json(self.send(builder, operation, &budget).await?, operation).await?;
             if self.is_subscription() {
                 return subscription_models(&value);
             }
@@ -410,12 +489,13 @@ impl Provider for ResponsesProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
-        if self.is_subscription() {
-            return tokio::time::timeout(SUBSCRIPTION_TIMEOUT, self.complete_request(request))
-                .await
-                .context("ChatGPT request exceeded 600-second total limit")?;
-        }
-        self.complete_request(request).await
+        let budget = OperationBudget::new(self.completion_timeout);
+        tokio::time::timeout(
+            self.completion_timeout,
+            self.complete_request(request, &budget),
+        )
+        .await
+        .context("Responses request exceeded 600-second total limit")?
     }
 }
 
@@ -461,7 +541,11 @@ fn subscription_models(value: &Value) -> Result<Vec<ModelInfo>> {
 }
 
 impl ResponsesProvider {
-    async fn complete_request(&self, request: CompletionRequest) -> Result<Completion> {
+    async fn complete_request(
+        &self,
+        request: CompletionRequest,
+        budget: &OperationBudget,
+    ) -> Result<Completion> {
         ensure!(
             request.model != "auto",
             "select an explicit model for the Responses provider"
@@ -485,17 +569,19 @@ impl ResponsesProvider {
         let mut builder = self
             .client
             .post(format!("{}/responses", self.base))
+            .timeout(self.completion_timeout)
             .json(&body);
         if self.is_subscription() {
             builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
         }
-        let response = self.send(builder).await?;
+        let operation = self.operation(false);
+        let response = self.send(builder, operation, budget).await?;
         let value = if self.is_subscription() {
-            sse::response(response, crate::IO_TIMEOUT).await?
+            sse::response(response, crate::IO_TIMEOUT, operation).await?
         } else {
-            http::json(response).await?
+            diagnostics::json(response, operation).await?
         };
-        let result = completion(&value)?;
+        let result = completion(&value, operation)?;
         *pending = if result.calls.is_empty() {
             None
         } else {
@@ -599,6 +685,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_key_completion_uses_its_operation_deadline() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let mut provider = ResponsesProvider::new(&url, "").unwrap();
+        provider.completion_timeout = Duration::from_millis(80);
+        let error = tokio::time::timeout(Duration::from_secs(1), provider.complete(request()))
+            .await
+            .unwrap()
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("transport timed out")
+                || diagnostic.contains("Responses request exceeded 600-second total limit"),
+            "{diagnostic}"
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_key_completion_overrides_shorter_generic_client_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 81\r\nConnection: close\r\n\r\n{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"text\":\"later\"}]}]}",
+                )
+                .await
+                .unwrap();
+        });
+        let mut provider = ResponsesProvider::new(&url, "").unwrap();
+        provider.client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_millis(80))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        provider.completion_timeout = Duration::from_secs(2);
+        let completion = tokio::time::timeout(Duration::from_secs(3), provider.complete(request()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completion.text, "later");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_key_catalog_keeps_its_separate_http_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"data\":[{\"id\":\"future-model\"}]}",
+                )
+                .await
+                .unwrap();
+        });
+        let mut provider = ResponsesProvider::new(&url, "").unwrap();
+        provider.completion_timeout = Duration::from_millis(80);
+        let models = tokio::time::timeout(Duration::from_secs(1), provider.models())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(models[0].id, "future-model");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn provider_factory_and_demo_remain_offline() {
         let config = Config {
             provider: "demo".into(),
@@ -665,7 +849,7 @@ mod tests {
                 .await
                 .unwrap_err()
                 .to_string()
-                .contains("set KURU_")
+                .contains("authentication environment variable is not set")
         );
         let mut auto = request();
         auto.model = "auto".into();
@@ -689,7 +873,10 @@ mod tests {
             json!({"output":[{"type":"function_call","call_id":"a","name":"x","arguments":"not-json"}]}),
             json!({"output":[{"type":"function_call","call_id":"a","name":"x","arguments":"{}"},{"type":"function_call","call_id":"a","name":"x","arguments":"{}"}]}),
         ] {
-            assert!(completion(&value).is_err(), "{value}");
+            assert!(
+                completion(&value, diagnostics::Operation::ResponsesCompletion).is_err(),
+                "{value}"
+            );
         }
         let pending = Pending {
             input: vec![],
@@ -719,6 +906,319 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_envelopes_do_not_render_remote_values() {
+        let peer = HttpFixture::new(vec![
+            json!({"error":{"message":"http-200-message-secret","code":"unknown-code","type":"unknown-type"}}),
+            json!({"status":"unexpected-status-secret","output":[]}),
+        ]
+        .into_iter()
+        .map(Reply::json)
+        .collect())
+        .await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        for _ in 0..2 {
+            let error = provider.complete(request()).await.unwrap_err();
+            let display = format!("{error:#}");
+            let debug = format!("{error:?}");
+            for secret in [
+                "http-200-message-secret",
+                "unknown-code",
+                "unknown-type",
+                "unexpected-status-secret",
+            ] {
+                assert!(
+                    !display.contains(secret) && !debug.contains(secret),
+                    "remote value escaped: {display} / {debug}"
+                );
+            }
+        }
+        assert_eq!(peer.requests.lock().await.len(), 2);
+    }
+
+    #[test]
+    fn provider_parser_and_environment_errors_do_not_retain_values() {
+        let value = json!({"output":[{"type":"function_call","call_id":"call","name":"tool","arguments":"{arguments-secret"}]});
+        let error = completion(&value, diagnostics::Operation::ResponsesCompletion).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Responses completion contained invalid function arguments"
+        );
+        assert!(!format!("{error:#}").contains("arguments-secret"));
+        assert!(!format!("{error:?}").contains("arguments-secret"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let error = environment_error(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from_vec(b"environment-value-secret\xff".to_vec()),
+            ));
+            assert_eq!(
+                error.to_string(),
+                "Responses API authentication environment variable is not valid Unicode"
+            );
+            assert!(!format!("{error:#}").contains("environment-value-secret"));
+            assert!(!format!("{error:?}").contains("environment-value-secret"));
+
+            let error = environment_key("configured-name-secret\0").unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Responses API authentication environment variable is not set"
+            );
+            assert!(!format!("{error:#}").contains("configured-name-secret"));
+            assert!(!format!("{error:?}").contains("configured-name-secret"));
+        }
+
+        let error = environment_value(" \t".into()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Responses API authentication environment variable is empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_http_diagnostics_are_finite_and_redacted() {
+        let mut model =
+            Reply::json(json!({"error":{"message":"model-body-secret","code":"model_not_found"}}));
+        model.status = reqwest::StatusCode::BAD_REQUEST;
+        let mut quota = Reply::json(
+            json!({"error":{"message":"billing-body-secret","type":"insufficient_quota"}}),
+        );
+        quota.status = reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let mut oversized = Reply::json(
+            json!({"error":{"message":"oversized-body-secret","padding":"x".repeat(9 * 1024)}}),
+        );
+        oversized.status = reqwest::StatusCode::BAD_GATEWAY;
+        let peer = HttpFixture::new(vec![model, quota, oversized]).await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        for expected in [
+            "selected model is unavailable or access is denied (HTTP 400)",
+            "quota or billing limit (HTTP 429)",
+            "service failed (HTTP 502)",
+        ] {
+            let error = provider.complete(request()).await.unwrap_err();
+            let display = format!("{error:#}");
+            let debug = format!("{error:?}");
+            assert!(display.contains(expected), "{display}");
+            for secret in [
+                "model-body-secret",
+                "billing-body-secret",
+                "oversized-body-secret",
+            ] {
+                assert!(
+                    !display.contains(secret) && !debug.contains(secret),
+                    "remote body escaped: {display} / {debug}"
+                );
+            }
+        }
+        assert_eq!(peer.requests.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn response_catalog_diagnostics_use_the_catalog_operation_and_redact_bodies() {
+        let mut reply = Reply::json(
+            json!({"error":{"message":"catalog-body-secret","code":"model_not_found"}}),
+        );
+        reply.status = reqwest::StatusCode::NOT_FOUND;
+        let peer = HttpFixture::new(vec![reply]).await;
+        let error = ResponsesProvider::new(&peer.url, "")
+            .unwrap()
+            .models()
+            .await
+            .unwrap_err();
+        let display = format!("{error:#}");
+        let debug = format!("{error:?}");
+        assert!(
+            display.contains(
+                "Responses model catalog selected model is unavailable or access is denied (HTTP 404)"
+            ),
+            "{display}"
+        );
+        assert!(
+            !display.contains("catalog-body-secret") && !debug.contains("catalog-body-secret"),
+            "catalog body escaped: {display} / {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_error_body_falls_back_without_quota_classification() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            let body = json!({"error":{"type":"insufficient_quota","message":"chunked-quota-secret","padding":"x".repeat(9 * 1024)}}).to_string();
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket
+                .write_all(format!("{:x}\r\n", body.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        });
+        let error = ResponsesProvider::new(&url, "")
+            .unwrap()
+            .complete(request())
+            .await
+            .unwrap_err();
+        let display = format!("{error:#}");
+        let debug = format!("{error:?}");
+        assert!(display.contains("service failed (HTTP 502)"), "{display}");
+        assert!(
+            !display.contains("quota or billing")
+                && !display.contains("chunked-quota-secret")
+                && !debug.contains("chunked-quota-secret"),
+            "chunked diagnostic body escaped or was classified: {display} / {debug}"
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_error_body_uses_status_fallback_inside_operation_budget() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\n{\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let provider = ResponsesProvider::new(&url, "").unwrap();
+        let started = std::time::Instant::now();
+        let error = provider.complete(request()).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "diagnostic body read exceeded its bounded fallback"
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("service failed (HTTP 502)"),
+            "{diagnostic}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn dribbling_error_body_uses_one_total_diagnostic_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for _ in 0..4 {
+                if socket.write_all(b"1\r\n{\r\n").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = ResponsesProvider::new(&url, "")
+            .unwrap()
+            .complete(request())
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(2600),
+            "diagnostic deadline restarted after a body chunk"
+        );
+        assert!(
+            format!("{error:#}").contains("service failed (HTTP 502)"),
+            "{error:#}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn enclosing_completion_deadline_preempts_diagnostic_body_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\n{\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let mut provider = ResponsesProvider::new(&url, "").unwrap();
+        provider.completion_timeout = Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let error = provider.complete(request()).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "diagnostic reader extended the enclosing completion budget"
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("Responses request exceeded 600-second total limit")
+                || diagnostic.contains("service failed (HTTP 502)"),
+            "{diagnostic}"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn provider_transport_errors_do_not_retain_endpoint_queries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/?configured-query-secret=untrusted",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+        let error = ResponsesProvider::new(&endpoint, "")
+            .unwrap()
+            .complete(request())
+            .await
+            .unwrap_err();
+        let display = format!("{error:#}");
+        let debug = format!("{error:?}");
+        assert!(display.contains("transport connection failed"), "{display}");
+        assert!(
+            !display.contains("configured-query-secret")
+                && !debug.contains("configured-query-secret"),
+            "endpoint query escaped: {display} / {debug}"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_round_trip_can_be_retried_without_losing_pending_output() {
         let peer = HttpFixture::new(vec![
             Reply::json(json!({"output":[{"type":"function_call","call_id":"a","name":"file_read","arguments":"{}"}]})),
@@ -741,5 +1241,222 @@ mod tests {
             sent[2].body["input"].as_array().unwrap().last().unwrap()["type"],
             "function_call_output"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_provider_status_retries_identical_request_within_shared_budget() {
+        let mut unavailable = Reply::json(json!({"error":{"message":"retry-secret"}}));
+        unavailable.status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
+        let peer = HttpFixture::new(vec![
+            unavailable,
+            Reply::json(json!({"status":"completed","output":[]})),
+        ])
+        .await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        provider.complete(request()).await.unwrap();
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].body, sent[1].body);
+        assert_eq!(sent[0].method, sent[1].method);
+
+        let mut first = Reply::json(json!({"error":{"message":"catalog-retry-secret"}}));
+        first.status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
+        let peer = HttpFixture::new(vec![
+            first,
+            Reply::json(json!({"data":[{"id":"future-model"}]})),
+        ])
+        .await;
+        assert_eq!(
+            ResponsesProvider::new(&peer.url, "")
+                .unwrap()
+                .models()
+                .await
+                .unwrap()[0]
+                .id,
+            "future-model"
+        );
+        assert_eq!(peer.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn api_key_completion_and_catalog_retry_only_explicit_statuses() {
+        for status in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let mut rejected = Reply::json(json!({"error":{"message":"remote-secret"}}));
+            rejected.status = status;
+            let peer = HttpFixture::new(vec![
+                rejected,
+                Reply::json(json!({"status":"completed","output":[]})),
+            ])
+            .await;
+            ResponsesProvider::new(&peer.url, "")
+                .unwrap()
+                .complete(request())
+                .await
+                .unwrap();
+            let sent = peer.requests.lock().await;
+            assert_eq!(sent.len(), 2, "status {status}");
+            assert_eq!(sent[0].body, sent[1].body);
+
+            let mut rejected = Reply::json(json!({"error":{"message":"remote-secret"}}));
+            rejected.status = status;
+            let peer = HttpFixture::new(vec![
+                rejected,
+                Reply::json(json!({"data":[{"id":"future-model"}]})),
+            ])
+            .await;
+            ResponsesProvider::new(&peer.url, "")
+                .unwrap()
+                .models()
+                .await
+                .unwrap();
+            let sent = peer.requests.lock().await;
+            assert_eq!(sent.len(), 2, "catalog status {status}");
+            assert_eq!(sent[0].method, reqwest::Method::GET);
+            assert_eq!(sent[1].method, reqwest::Method::GET);
+        }
+
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let mut rejected = Reply::json(json!({"error":{"message":"terminal-secret"}}));
+            rejected.status = status;
+            let peer = HttpFixture::new(vec![rejected]).await;
+            let error = ResponsesProvider::new(&peer.url, "")
+                .unwrap()
+                .complete(request())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(peer.requests.lock().await.len(), 1, "status {status}");
+            assert!(!format!("{error:#}").contains("terminal-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_and_backoff_cancellation_never_send_late() {
+        let replies = (0..3)
+            .map(|_| {
+                let mut reply = Reply::json(json!({"error":{"message":"bounded-secret"}}));
+                reply.status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
+                reply
+            })
+            .collect();
+        let peer = HttpFixture::new(replies).await;
+        let error = ResponsesProvider::new(&peer.url, "")
+            .unwrap()
+            .complete(request())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Responses completion retry budget exhausted after 3 provider attempts"
+        );
+        assert_eq!(peer.requests.lock().await.len(), 3);
+        assert!(!format!("{error:?}").contains("bounded-secret"));
+
+        let mut unavailable = Reply::json(json!({"error":{}}));
+        unavailable.status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
+        let peer = HttpFixture::new(vec![
+            Reply::json(json!({"status":"completed","output":[{"type":"function_call","call_id":"pending-call","name":"file_read","arguments":"{}"}]})),
+            unavailable,
+            Reply::json(json!({"status":"completed","output":[]})),
+        ])
+        .await;
+        let provider = Arc::new(ResponsesProvider::new(&peer.url, "").unwrap());
+        let mut continuation = request();
+        provider.complete(continuation.clone()).await.unwrap();
+        continuation.messages.push(Message {
+            role: "tool".into(),
+            content: json!({"call_id":"pending-call","output":"preserved"}).to_string(),
+        });
+        let task = {
+            let provider = provider.clone();
+            let continuation = continuation.clone();
+            tokio::spawn(async move { provider.complete(continuation).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if peer.requests.lock().await.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(peer.requests.lock().await.len(), 2);
+        provider.complete(continuation).await.unwrap();
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[1].body, sent[2].body);
+    }
+
+    #[tokio::test]
+    async fn accepted_transport_disconnect_is_never_replayed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = accepted.clone();
+        let mut server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0, "request ended before its complete body");
+                bytes.extend_from_slice(&chunk[..count]);
+                let text = String::from_utf8_lossy(&bytes);
+                let Some(header_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let length = text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                if bytes.len() >= header_end + 4 + length {
+                    break;
+                }
+            }
+            socket.shutdown().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                    .await
+                    .is_err(),
+                "ambiguous provider request was replayed"
+            );
+        });
+        let error = ResponsesProvider::new(&url, "")
+            .unwrap()
+            .complete(request())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("transport"));
+        match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("ambiguous transport peer did not finish")
+            }
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

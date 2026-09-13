@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use kuru_core::{
-    Config, McpConfig, Mode, ModelPreference, ProjectPreferences, SelectionOverrides,
-    load_instructions,
+    AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, McpConfig, Mode,
+    ModelPreference, ProjectPreferences, SelectionOverrides, load_instructions,
 };
 use tempfile::TempDir;
 
@@ -16,6 +16,17 @@ fn load_text(text: &str) -> anyhow::Result<Config> {
     let dir = TempDir::new().unwrap();
     write(dir.path().join(".kuru/config.toml"), text);
     Config::load(None, dir.path(), None)
+}
+
+fn escaped_source(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap()
+        .as_os_str()
+        .to_string_lossy()
+        .chars()
+        .flat_map(char::escape_default)
+        .take(160)
+        .collect()
 }
 
 #[test]
@@ -34,6 +45,306 @@ fn defaults_are_usable_and_preserve_explicit_permission_boundaries() {
     assert_eq!(config.dream_every, 8);
     assert!(config.dream_on_exit);
     assert!(config.effort.is_none());
+}
+
+#[test]
+fn snapshot_keeps_only_effective_ancestor_authority_and_redacts_inspection() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    write(
+        dir.path().join(".kuru/config.toml"),
+        "provider='responses'\napi_base='https://api.example.test/v1'\napi_key_env='PENDING_SECRET'\nallow_shell=true\n[mcp.build]\ncommand='runner'\nargs=['--public']\n[mcp.build.env]\nTOKEN='mcp-env-secret'",
+    );
+    let snapshot =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert!(
+        snapshot
+            .manifest()
+            .claims()
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::Shell)
+    );
+    assert!(
+        snapshot
+            .manifest()
+            .claims()
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::McpStdio)
+    );
+    assert!(
+        snapshot
+            .manifest()
+            .claims()
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::ResponsesRoute)
+    );
+    let preview = snapshot.snapshot_toml().unwrap();
+    assert!(preview.contains("[redacted]"));
+    assert!(!preview.contains("mcp-env-secret"));
+    assert_eq!(
+        snapshot.responses_route().unwrap().unwrap().api_key_env(),
+        "PENDING_SECRET"
+    );
+
+    let overridden = ConfigSnapshot::parse(
+        None,
+        &project,
+        None,
+        InvocationOverrides {
+            provider: Some("demo".into()),
+            ..InvocationOverrides::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !overridden
+            .manifest()
+            .claims()
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::ResponsesRoute)
+    );
+}
+
+#[test]
+fn snapshot_sanitizes_parser_text_but_keeps_position_and_defers_framework_validation() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join(".kuru/config.toml");
+    write(&config, "# secret=do-not-print\n[\n");
+    let error = ConfigSnapshot::parse(None, dir.path(), None, InvocationOverrides::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("parse error"));
+    assert!(error.contains("line 2"));
+    assert!(!error.contains("do-not-print"));
+    fs::write(&config, "max_parts=3").unwrap();
+    let snapshot =
+        ConfigSnapshot::parse(None, dir.path(), None, InvocationOverrides::default()).unwrap();
+    assert!(snapshot.snapshot_toml().unwrap().contains("max_parts = 3"));
+    assert!(snapshot.finalize(&ProjectPreferences::default()).is_err());
+    assert!(
+        snapshot
+            .finalize(&ProjectPreferences {
+                mode: Some(Mode::Freudian),
+                ..ProjectPreferences::default()
+            })
+            .is_ok()
+    );
+}
+
+#[test]
+fn snapshot_freezes_files_and_keeps_cli_and_remaining_ancestor_claims_distinct() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let config = dir.path().join(".kuru/config.toml");
+    write(
+        &config,
+        "allow_write=true\nallow_shell=true\n[mcp.build]\ncommand='ancestor-runner'\nargs=['--inherited']\n[mcp.build.env]\nTOKEN='inherited-secret'",
+    );
+    let overrides = InvocationOverrides {
+        allow_write: true,
+        allow_shell: true,
+        ..InvocationOverrides::default()
+    };
+    let snapshot = ConfigSnapshot::parse(None, &project, None, overrides).unwrap();
+    let categories = snapshot
+        .manifest()
+        .claims()
+        .iter()
+        .map(|claim| claim.category())
+        .collect::<Vec<_>>();
+    assert!(!categories.contains(&AuthorityClaimCategory::WorkspaceWrite));
+    assert!(!categories.contains(&AuthorityClaimCategory::Shell));
+    assert!(categories.contains(&AuthorityClaimCategory::McpStdio));
+    let digest = snapshot.manifest().full_digest();
+    write(
+        &config,
+        "allow_write=true\nallow_shell=true\n[mcp.build]\ncommand='changed-runner'\nargs=['--changed']\n[mcp.build.env]\nTOKEN='changed-secret'",
+    );
+    assert_eq!(snapshot.manifest().full_digest(), digest);
+    assert_eq!(
+        snapshot
+            .finalize(&ProjectPreferences::default())
+            .unwrap()
+            .mcp["build"]
+            .command
+            .as_deref(),
+        Some("ancestor-runner")
+    );
+    let changed =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_ne!(changed.manifest().full_digest(), digest);
+    write(
+        &config,
+        "allow_write=true\nallow_shell=true\n[memory]\nstartup_timeout_secs=99\n[mcp.build]\ncommand='changed-runner'\nargs=['--changed']\n[mcp.build.env]\nTOKEN='changed-secret'",
+    );
+    let ordinary_change =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_eq!(
+        ordinary_change.manifest().full_digest(),
+        changed.manifest().full_digest()
+    );
+}
+
+#[test]
+fn manifest_binds_active_transports_and_safely_reports_every_automatic_source() {
+    let dir = TempDir::new().unwrap();
+    let parent = dir.path().join("parent");
+    let project = parent.join("project");
+    write(
+        parent.join(".kuru/config.toml"),
+        "[mcp.shared]\ncommand='outer-runner'",
+    );
+    write(
+        project.join(".kuru/config.toml"),
+        "[mcp.shared.env]\nTOKEN='inherited'\n[mcp.\"bad\\u001bname\"]\nurl='https://first.example.test/mcp'",
+    );
+    let first =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_eq!(first.manifest().sources().len(), 2);
+    assert_eq!(
+        first
+            .manifest()
+            .claims()
+            .iter()
+            .find(|claim| claim.category() == AuthorityClaimCategory::McpStdio)
+            .unwrap()
+            .sources()
+            .len(),
+        2
+    );
+    assert!(
+        first
+            .manifest()
+            .sources()
+            .iter()
+            .all(|source| !source.as_str().contains('\u{1b}'))
+    );
+    assert!(
+        first
+            .manifest()
+            .claims()
+            .iter()
+            .all(|claim| !claim.display().as_str().contains('\u{1b}'))
+    );
+    let first_http = first
+        .manifest()
+        .claims()
+        .iter()
+        .find(|claim| claim.category() == AuthorityClaimCategory::McpHttp)
+        .unwrap()
+        .digest();
+    write(
+        project.join(".kuru/config.toml"),
+        "[mcp.shared.env]\nTOKEN='inherited'\n[mcp.\"bad\\u001bname\"]\nurl='https://second.example.test/mcp'",
+    );
+    let changed =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let changed_http = changed
+        .manifest()
+        .claims()
+        .iter()
+        .find(|claim| claim.category() == AuthorityClaimCategory::McpHttp)
+        .unwrap()
+        .digest();
+    assert_ne!(first_http, changed_http);
+
+    let ordinary = TempDir::new().unwrap();
+    write(ordinary.path().join(".kuru/config.toml"), "max_rounds=4");
+    assert!(
+        ConfigSnapshot::parse(None, ordinary.path(), None, InvocationOverrides::default())
+            .unwrap()
+            .manifest()
+            .sources()
+            .is_empty()
+    );
+
+    let provenance = TempDir::new().unwrap();
+    let provenance_project = provenance.path().join("project");
+    fs::create_dir_all(&provenance_project).unwrap();
+    write(
+        provenance.path().join(".kuru/config.toml"),
+        "allow_shell=true",
+    );
+    let parent_claim = ConfigSnapshot::parse(
+        None,
+        &provenance_project,
+        None,
+        InvocationOverrides::default(),
+    )
+    .unwrap()
+    .manifest()
+    .full_digest();
+    fs::remove_file(provenance.path().join(".kuru/config.toml")).unwrap();
+    write(
+        provenance_project.join(".kuru/config.toml"),
+        "allow_shell=true",
+    );
+    let child_claim = ConfigSnapshot::parse(
+        None,
+        &provenance_project,
+        None,
+        InvocationOverrides::default(),
+    )
+    .unwrap()
+    .manifest()
+    .full_digest();
+    assert_ne!(parent_claim, child_claim);
+}
+
+#[test]
+fn external_agent_claims_follow_effective_automatic_values_and_provenance() {
+    let dir = TempDir::new().unwrap();
+    let parent = dir.path().join("parent");
+    let project = parent.join("project");
+    let local = dir.path().join("local.toml");
+    fs::create_dir_all(&project).unwrap();
+    write(
+        parent.join(".kuru/config.toml"),
+        "[external_agents]\nreview='https://review.example.test/a2a'\nretained='https://retained.example.test/a2a'",
+    );
+    write(
+        &local,
+        "[external_agents]\nreview='https://local.example.test/a2a'",
+    );
+
+    let first = ConfigSnapshot::parse(None, &project, Some(&local), InvocationOverrides::default())
+        .unwrap();
+    let claims = first
+        .manifest()
+        .claims()
+        .iter()
+        .filter(|claim| claim.category() == AuthorityClaimCategory::ExternalAgent)
+        .collect::<Vec<_>>();
+    assert_eq!(claims.len(), 1, "the local review URL is explicit");
+    assert!(claims[0].display().as_str().contains("retained"));
+    assert_eq!(claims[0].sources().len(), 1);
+    assert_eq!(
+        claims[0].sources()[0].as_str(),
+        escaped_source(&parent.join(".kuru/config.toml")),
+    );
+    let first_digest = first.manifest().full_digest();
+
+    write(
+        project.join(".kuru/config.toml"),
+        "[external_agents]\nretained='https://retained.example.test/a2a'",
+    );
+    let moved = ConfigSnapshot::parse(None, &project, Some(&local), InvocationOverrides::default())
+        .unwrap();
+    assert_ne!(moved.manifest().full_digest(), first_digest);
+
+    write(
+        project.join(".kuru/config.toml"),
+        "[external_agents]\nretained='https://changed.example.test/a2a'",
+    );
+    let changed =
+        ConfigSnapshot::parse(None, &project, Some(&local), InvocationOverrides::default())
+            .unwrap();
+    assert_ne!(
+        changed.manifest().full_digest(),
+        moved.manifest().full_digest()
+    );
 }
 
 #[test]
@@ -101,6 +412,39 @@ fn invalid_types_or_unknown_keys_cannot_be_hidden_by_a_later_layer() {
 }
 
 #[test]
+fn invalid_local_types_cannot_be_hidden_by_command_line_overrides() {
+    let dir = TempDir::new().unwrap();
+    let local = dir.path().join("local.toml");
+    for (text, overrides, private_value) in [
+        (
+            "allow_shell='secret-shell-value'",
+            InvocationOverrides {
+                allow_shell: true,
+                ..InvocationOverrides::default()
+            },
+            "secret-shell-value",
+        ),
+        (
+            "model=3",
+            InvocationOverrides {
+                model: Some("command-line-model".into()),
+                ..InvocationOverrides::default()
+            },
+            "command-line-model",
+        ),
+    ] {
+        write(&local, text);
+        let error = ConfigSnapshot::parse(None, dir.path(), Some(&local), overrides).unwrap_err();
+        assert!(
+            error.to_string().contains("configuration type error"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("local.toml"), "{error:#}");
+        assert!(!error.to_string().contains(private_value), "{error:#}");
+    }
+}
+
+#[test]
 fn malformed_toml_unknown_keys_and_type_errors_have_actionable_context() {
     for text in [
         "[",
@@ -135,13 +479,24 @@ fn bounded_regular_utf8_files_prevent_unlimited_or_malformed_instruction_loading
     let dir = TempDir::new().unwrap();
     let config = dir.path().join(".kuru/config.toml");
     write(&config, [0xff, 0xfe]);
-    assert!(format!("{:#}", Config::load(None, dir.path(), None).unwrap_err()).contains("UTF-8"));
+    let error = Config::load(None, dir.path(), None).unwrap_err();
+    assert!(
+        error.to_string().contains("configuration read error"),
+        "{error:#}"
+    );
     write(&config, "#".repeat(256 * 1024 + 1));
-    assert!(format!("{:#}", Config::load(None, dir.path(), None).unwrap_err()).contains("256 KiB"));
+    let error = Config::load(None, dir.path(), None).unwrap_err();
+    assert!(
+        error.to_string().contains("configuration read error"),
+        "{error:#}"
+    );
     fs::remove_file(&config).unwrap();
     fs::create_dir(&config).unwrap();
     let error = Config::load(None, dir.path(), None).unwrap_err();
-    assert!(format!("{error:#}").contains("regular file"), "{error:#}");
+    assert!(
+        error.to_string().contains("configuration read error"),
+        "{error:#}"
+    );
     write(dir.path().join("AGENTS.md"), [0xff]);
     assert!(load_instructions(dir.path()).is_err());
     write(dir.path().join("AGENTS.md"), "x".repeat(256 * 1024 + 1));
@@ -175,7 +530,7 @@ fn combined_limits_apply_across_many_individually_valid_files() {
         Config::load(None, &path, None)
             .unwrap_err()
             .to_string()
-            .contains("1 MiB")
+            .contains("configuration read error")
     );
 }
 
@@ -246,9 +601,10 @@ fn bounds_and_required_values_fail_without_restricting_future_model_efforts() {
         ("api_key_env", "api_key_env='HAS-DASH'"),
         ("api_base", "api_base='ftp://example.test'"),
     ] {
+        let error = load_text(text).unwrap_err();
         assert!(
-            format!("{:#}", load_text(text).unwrap_err()).contains(name),
-            "{text}"
+            error.to_string().contains("configuration validation error"),
+            "{name}: {error:#}"
         );
     }
     let valid = load_text("provider='responses'\neffort='adaptive-2028'\napi_key_env='_CUSTOM_KEY_2'\nmode='freudian'\nmax_parts=3\nmax_parallel=64\nmax_rounds=64\nmax_tool_calls=1024").unwrap();

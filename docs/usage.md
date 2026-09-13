@@ -112,7 +112,14 @@ authorization. `auth` prints redacted local authentication status as JSON, and
 private auth store without a Codex executable or another application's tokens.
 See [authentication configuration](configuration.md#authentication) for storage
 and API-key provider selection.
-`config` prints merged configuration, redacting MCP environment values.
+`config` prints configured values and CLI overrides, redacting MCP environment
+values and omitting saved project selections without opening memory. Automatic
+ancestor configuration that grants process, mutation, executable, credential-route
+or endpoint authority is reviewed for the exact canonical workspace before it is
+activated. Use `trust status`, `trust approve`, `trust revoke`, or the
+non-persistent `--trust-workspace-once` flag; see
+[workspace trust](configuration.md#workspace-trust) for command-specific behavior
+and its process-authority limits.
 `serve` exposes the authenticated local A2A subset; see [protocols](protocols.md).
 `update` installs an explicit verified release or rebuilds a chosen source
 checkout; see [installation](install.md).

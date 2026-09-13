@@ -271,6 +271,123 @@ async fn rejected_subscription_rotates_once_without_changing_account_or_route() 
 }
 
 #[tokio::test]
+async fn rejected_503_then_401_shares_one_finite_rotation_budget() {
+    let mut unavailable = Reply::json(json!({"error":{"message":"subscription-transient-secret"}}));
+    unavailable.status = StatusCode::SERVICE_UNAVAILABLE;
+    let rotated = crate::auth::test_future_jwt("account-one");
+    let peer = Peer::new(vec![
+        unavailable,
+        unauthorized(),
+        Reply::json(
+            json!({"access_token":rotated,"refresh_token":"rotated-refresh","expires_in":3600}),
+        ),
+        message("bounded rotation"),
+        message("later operation"),
+    ])
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    assert_eq!(
+        provider.complete(request()).await.unwrap().text,
+        "bounded rotation"
+    );
+    assert_eq!(
+        provider.complete(request()).await.unwrap().text,
+        "later operation"
+    );
+    let sent = peer.requests.lock().await;
+    assert_eq!(sent.len(), 5);
+    assert_eq!(sent[0].uri.path(), "/responses");
+    assert_eq!(sent[1].uri.path(), "/responses");
+    assert_eq!(sent[2].uri.path(), "/oauth/token");
+    assert_eq!(sent[3].uri.path(), "/responses");
+    assert_eq!(sent[4].uri.path(), "/responses");
+    assert_eq!(sent[0].body, sent[1].body);
+    assert_eq!(sent[1].body, sent[3].body);
+    assert_eq!(
+        sent[0].headers["authorization"],
+        "Bearer subscription-access"
+    );
+    assert_eq!(
+        sent[1].headers["authorization"],
+        "Bearer subscription-access"
+    );
+    assert_eq!(
+        sent[3].headers["authorization"],
+        format!("Bearer {rotated}")
+    );
+    assert_eq!(
+        sent[4].headers["authorization"],
+        format!("Bearer {rotated}")
+    );
+}
+
+#[tokio::test]
+async fn subscription_completion_and_catalog_retry_explicit_rejections() {
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let mut rejected = Reply::json(json!({"error":{"message":"native-retry-secret"}}));
+        rejected.status = status;
+        let peer = Peer::new(vec![rejected, message("retried")]).await;
+        let (provider, _manager, _directory) = subscription(&peer).await;
+        assert_eq!(provider.complete(request()).await.unwrap().text, "retried");
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent.len(), 2, "completion status {status}");
+        assert_eq!(sent[0].body, sent[1].body);
+        assert_eq!(
+            sent[0].headers["authorization"],
+            sent[1].headers["authorization"]
+        );
+
+        let mut rejected = Reply::json(json!({"error":{"message":"native-retry-secret"}}));
+        rejected.status = status;
+        let peer = Peer::new(vec![
+            rejected,
+            Reply::json(json!({"models":[{"slug":"future-model"}]})),
+        ])
+        .await;
+        let (provider, _manager, _directory) = subscription(&peer).await;
+        assert_eq!(provider.models().await.unwrap()[0].id, "future-model");
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent.len(), 2, "catalog status {status}");
+        assert_eq!(sent[0].method, Method::GET);
+        assert_eq!(sent[1].method, Method::GET);
+        assert_eq!(
+            sent[0].headers["authorization"],
+            sent[1].headers["authorization"]
+        );
+    }
+
+    let peer = Peer::new(
+        (0..3)
+            .map(|_| {
+                let mut reply = Reply::json(json!({
+                    "error": {
+                        "type": "insufficient_quota",
+                        "code": "project_spend_limit_exceeded",
+                        "message": "subscription-secret"
+                    }
+                }));
+                reply.status = StatusCode::TOO_MANY_REQUESTS;
+                reply
+            })
+            .collect(),
+    )
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    let error = provider.complete(request()).await.err().unwrap();
+    assert_eq!(peer.requests.lock().await.len(), 3);
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("retry budget exhausted"),
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains("billing") && !diagnostic.contains("subscription-secret"));
+}
+
+#[tokio::test]
 async fn repeated_401_and_partial_stream_errors_do_not_retry_or_leak_tokens() {
     let peer = Peer::new(vec![
         unauthorized(),
@@ -296,6 +413,48 @@ async fn repeated_401_and_partial_stream_errors_do_not_retry_or_leak_tokens() {
     assert_eq!(peer.requests.lock().await.len(), 1);
     assert_eq!(provider.complete(request()).await.unwrap().text, "next");
     assert_eq!(peer.requests.lock().await.len(), 2);
+}
+
+#[tokio::test]
+async fn native_failed_events_and_initial_statuses_use_fixed_diagnostics() {
+    let mut initial = Reply::json(
+        json!({"error":{"message":"native-status-secret","code":"model_not_found","type":"insufficient_quota"}}),
+    );
+    initial.status = StatusCode::FORBIDDEN;
+    let peer = Peer::new(vec![
+        stream(vec![json!({"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"native-known-secret"}}})]),
+        stream(vec![json!({"type":"response.failed","response":{"error":{"code":"future-native-code","type":"future-native-type","message":"native-unknown-secret"}}})]),
+        initial,
+    ])
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    for expected in [
+        "ChatGPT service is overloaded",
+        "ChatGPT completion stream failed before completion",
+        "ChatGPT completion access was denied (HTTP 403)",
+    ] {
+        let error = provider.complete(request()).await.unwrap_err();
+        let display = format!("{error:#}");
+        let debug = format!("{error:?}");
+        assert!(display.contains(expected), "{display}");
+        for secret in [
+            "native-status-secret",
+            "native-known-secret",
+            "native-unknown-secret",
+            "future-native-code",
+            "future-native-type",
+        ] {
+            assert!(
+                !display.contains(secret) && !debug.contains(secret),
+                "native value escaped: {display} / {debug}"
+            );
+        }
+    }
+    assert_eq!(
+        peer.requests.lock().await.len(),
+        3,
+        "failed streams were replayed"
+    );
 }
 
 #[tokio::test]
@@ -331,7 +490,7 @@ async fn malformed_incomplete_and_oversized_subscription_responses_are_errors() 
     let mut malformed = stream(vec![]);
     malformed.body = "data: not-json\n\n".into();
     let mut oversized = stream(vec![]);
-    oversized.body = "x".repeat(crate::MAX_BYTES + 1);
+    oversized.body = "x".repeat(crate::MAX_BYTES * 32 + 1);
     let peer = Peer::new(vec![
         malformed,
         stream(vec![json!({"type":"response.incomplete"})]),
@@ -345,8 +504,8 @@ async fn malformed_incomplete_and_oversized_subscription_responses_are_errors() 
     .await;
     let (provider, _manager, _directory) = subscription(&peer).await;
     for expected in [
-        "JSON",
-        "incomplete",
+        "invalid protocol",
+        "stream failed before completion",
         "before response.completed",
         "limit",
         "event stream",
@@ -492,9 +651,13 @@ async fn real_idle_stream_is_bounded_and_dropped() {
     });
     let _abort = AbortOnDrop(server.abort_handle());
     let response = http::client().unwrap().get(url).send().await.unwrap();
-    let error = sse::response(response, Duration::from_millis(100))
-        .await
-        .unwrap_err();
+    let error = sse::response(
+        response,
+        Duration::from_millis(100),
+        diagnostics::Operation::ChatgptCompletion,
+    )
+    .await
+    .unwrap_err();
     assert!(error.to_string().contains("idle timeout"));
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
@@ -508,7 +671,16 @@ async fn raw_subscription_stream(
     body: String,
     content_type: Option<&str>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    raw_subscription_stream_with_chunks(body, content_type, 1).await
+}
+
+async fn raw_subscription_stream_with_chunks(
+    body: String,
+    content_type: Option<&str>,
+    chunk_bytes: usize,
+) -> (String, tokio::task::JoinHandle<()>) {
     use tokio::io::AsyncWriteExt;
+    assert_ne!(chunk_bytes, 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let content_type = content_type
@@ -522,9 +694,15 @@ async fn raw_subscription_stream(
                 "HTTP/1.1 200 OK\r\n{content_type}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
             );
             socket.write_all(headers.as_bytes()).await.unwrap();
-            for byte in body.bytes() {
+            for bytes in body.as_bytes().chunks(chunk_bytes) {
                 // Invalid content can be rejected before the server finishes.
-                if socket.write_all(&[b'1', b'\r', b'\n', byte, b'\r', b'\n']).await.is_err() {
+                if socket
+                    .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                    .await
+                    .is_err()
+                    || socket.write_all(bytes).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
                     return;
                 }
             }
@@ -532,6 +710,26 @@ async fn raw_subscription_stream(
         }).await.expect("raw subscription fixture exceeded its bound");
     });
     (base, task)
+}
+
+#[tokio::test]
+async fn fragmented_discarded_subscription_sse_does_not_exhaust_retained_output_budget() {
+    let peer = Peer::new(vec![]).await;
+    let (mut provider, _manager, _directory) = subscription(&peer).await;
+    let discarded = ": ignored framing\n".repeat(crate::MAX_BYTES / 17 + 1);
+    let body = format!("{discarded}\n{}", message("small completion").body);
+    let (base, server) = raw_subscription_stream_with_chunks(body, None, 1024).await;
+    let _abort = AbortOnDrop(server.abort_handle());
+    provider.base = base;
+    let result = tokio::time::timeout(Duration::from_secs(5), provider.complete(request()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.text, "small completion");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -572,7 +770,11 @@ async fn missing_content_type_still_rejects_malformed_and_truncated_streams() {
         done(1, json!({"type":"function_call","id":"partial-item","call_id":"partial-call","name":"file_read","arguments":"{}"})),
     ]).body;
     for (body, content_type, expected) in [
-        (format!("{partial}data: not-json\n\n"), None, "JSON"),
+        (
+            format!("{partial}data: not-json\n\n"),
+            None,
+            "invalid protocol",
+        ),
         (partial, None, "before response.completed"),
         (
             json!({"output":[],"status":"completed"}).to_string(),

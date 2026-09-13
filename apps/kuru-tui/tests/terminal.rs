@@ -10,7 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -19,7 +19,7 @@ use axum::{
     extract::State,
     routing::{get, post},
 };
-use kuru_core::{Config, Mode};
+use kuru_core::{Config, Mode, SelectionOverrides};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{
@@ -89,6 +89,29 @@ impl Sandbox {
         Ok(toml::from_str(&String::from_utf8(output.stdout)?)?)
     }
 
+    async fn preferences(&self) -> Result<kuru_core::ProjectPreferences> {
+        let mut options = memory_options(self)?;
+        options.read_only = true;
+        let memory = MemoryStore::open(options).await?;
+        let preferences = kuru_runtime::Harness::load_preferences(&memory, &self.project).await?;
+        memory.close().await?;
+        Ok(preferences)
+    }
+
+    async fn effective_config(&self) -> Result<Config> {
+        let preferences = self.preferences().await?;
+        Config::load_with_preferences(
+            Some(&self.root.path().join("config/kuru/config.toml")),
+            &self.project,
+            None,
+            &preferences,
+            SelectionOverrides {
+                provider: Some("demo"),
+                ..SelectionOverrides::default()
+            },
+        )
+    }
+
     fn sessions(&self) -> Result<Vec<kuru_runtime::Session>> {
         let output = self.command("demo").arg("sessions").output()?;
         ensure!(
@@ -119,6 +142,18 @@ fn terminal_fixture_process() -> Result<()> {
             std::io::stdout().flush()?;
             std::thread::sleep(Duration::from_secs(30));
         }
+        "dimensions" => {
+            let (cols, rows) = crossterm::terminal::size()?;
+            println!("SIZE:{cols}x{rows}");
+            std::io::stdout().flush()?;
+        }
+        "nested-dimensions" => {
+            let mut terminal = fixture_with_size("dimensions", 35, 120)?;
+            terminal.wait_text(&["SIZE:120x35"], &[])?;
+            terminal.wait_exit(EXIT_TIMEOUT)?;
+            println!("INNER_SIZE_OK");
+            std::io::stdout().flush()?;
+        }
         "fragmented-frame" => {
             crossterm::terminal::enable_raw_mode()?;
             let mut input = std::io::stdin().lock();
@@ -141,12 +176,104 @@ fn terminal_fixture_process() -> Result<()> {
             input.read_exact(&mut acknowledgment)?;
             crossterm::terminal::disable_raw_mode()?;
         }
+        "error-unwind" => {
+            let report = std::path::PathBuf::from(std::env::var("KURU_TERMINAL_ERROR_REPORT")?);
+            let mut session = kuru::ui::TerminalSession::enter(&mut std::io::stdout())?;
+            // The parent waits for this completed frame before sending the
+            // key below. The fixture owns one real EventStream until that
+            // input is observed, then drops it before restoration.
+            std::io::stdout().write_all(b"\x1b[2J\x1b[HEVENTSTREAM_READY\x1b[?25h\x1b[1;18H")?;
+            std::io::stdout().flush()?;
+            let observed = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()?
+                .block_on(async {
+                    use futures::StreamExt as _;
+
+                    let mut input = crossterm::event::EventStream::new();
+                    let event = tokio::time::timeout(Duration::from_secs(5), input.next())
+                        .await
+                        .context("timed out waiting for native EventStream input")?;
+                    match event {
+                        Some(Ok(crossterm::event::Event::Key(key)))
+                            if key.code == crossterm::event::KeyCode::Char('x') =>
+                        {
+                            Ok(())
+                        }
+                        Some(Ok(event)) => {
+                            anyhow::bail!("unexpected native EventStream event: {event:?}")
+                        }
+                        Some(Err(error)) => Err(error.into()),
+                        None => anyhow::bail!("native EventStream closed before the test key"),
+                    }
+                });
+            let original = match &observed {
+                Ok(()) => anyhow::anyhow!("injected native terminal input failure"),
+                Err(error) => anyhow::anyhow!("{error:#}"),
+            };
+            // Mirror `ui::run`: restoration is explicit after a loop error,
+            // before the original error is returned to the caller.
+            let restore = session.restore();
+            std::fs::write(
+                report,
+                format!("event: {observed:?}\noriginal: {original:#}\nrestore: {restore:?}"),
+            )?;
+        }
+        "co-ready-events" => {
+            let mut session = kuru::ui::TerminalSession::enter(&mut std::io::stdout())?;
+            let observed = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()?
+                .block_on(async {
+                    use futures::{Stream as _, StreamExt as _};
+                    use std::{future::poll_fn, pin::Pin, task::Poll};
+
+                    let mut input = crossterm::event::EventStream::new();
+                    let prematurely_ready = poll_fn(|context| {
+                        Poll::Ready(match Pin::new(&mut input).poll_next(context) {
+                            Poll::Pending => None,
+                            Poll::Ready(event) => Some(event),
+                        })
+                    })
+                    .await;
+                    ensure!(
+                        prematurely_ready.is_none(),
+                        "EventStream was ready before the co-ready probe: {prematurely_ready:?}"
+                    );
+                    std::io::stdout()
+                        .write_all(b"\x1b[2J\x1b[HCO_READY_EVENTSTREAM\x1b[?25h\x1b[1;21H")?;
+                    std::io::stdout().flush()?;
+                    nix::sys::signal::kill(
+                        nix::unistd::Pid::this(),
+                        nix::sys::signal::Signal::SIGSTOP,
+                    )?;
+
+                    let first = tokio::time::timeout(Duration::from_secs(5), input.next())
+                        .await
+                        .context("timed out waiting for the first co-ready terminal event")?
+                        .context("native EventStream closed before the first co-ready event")??;
+                    let second = tokio::time::timeout(Duration::from_secs(5), input.next())
+                        .await
+                        .context("timed out waiting for the second co-ready terminal event")?
+                        .context("native EventStream closed before the second co-ready event")??;
+                    Ok::<_, anyhow::Error>((first, second))
+                });
+            let restore = session.restore();
+            let (first, second) = observed?;
+            println!("CO_READY_EVENTS:{first:?}|{second:?}");
+            std::io::stdout().flush()?;
+            restore?;
+        }
         other => anyhow::bail!("unknown fixture mode {other}"),
     }
     Ok(())
 }
 
 fn fixture(mode: &str) -> Result<Terminal> {
+    fixture_with_size(mode, 35, 120)
+}
+
+fn fixture_with_size(mode: &str, rows: u16, cols: u16) -> Result<Terminal> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args([
@@ -157,6 +284,21 @@ fn fixture(mode: &str) -> Result<Terminal> {
             "--test-threads=1",
         ])
         .env("KURU_TERMINAL_FIXTURE", mode);
+    Terminal::spawn(command, rows, cols)
+}
+
+fn error_unwind_fixture(report: &std::path::Path) -> Result<Terminal> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--exact",
+            "terminal_fixture_process",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("KURU_TERMINAL_FIXTURE", "error-unwind")
+        .env("KURU_TERMINAL_ERROR_REPORT", report);
     Terminal::spawn(command, 35, 120)
 }
 
@@ -187,6 +329,32 @@ fn terminal_driver_drains_backpressure_and_bounds_stalled_processes() -> Result<
         "{error}"
     );
     assert!(error.to_string().contains("STALLED"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn terminal_fixture_uses_its_requested_controlling_dimensions() -> Result<()> {
+    // The outer fixture deliberately owns a terminal too small to satisfy the
+    // inner assertion. The inner spawn must establish its own controlling PTY
+    // instead of inheriting these dimensions through `/dev/tty`.
+    let mut outer = fixture_with_size("nested-dimensions", 7, 19)?;
+    outer.wait(
+        "nested terminal reports its own size",
+        READY_TIMEOUT,
+        |terminal| {
+            Ok(terminal
+                .output
+                .windows(b"INNER_SIZE_OK".len())
+                .any(|bytes| bytes == b"INNER_SIZE_OK"))
+        },
+    )?;
+    outer.wait_exit(EXIT_TIMEOUT)
+}
+
+#[test]
+fn terminal_reader_cleanup_is_bounded_while_its_source_remains_open() -> Result<()> {
+    let elapsed = terminal::bounded_reader_cleanup_probe(Duration::from_millis(100))?;
+    assert!(elapsed < Duration::from_secs(1));
     Ok(())
 }
 
@@ -233,6 +401,42 @@ fn terminal_driver_waits_for_complete_frames_before_checking_quiescence() -> Res
     );
     terminal.send(b"q")?;
     terminal.wait_exit(EXIT_TIMEOUT)
+}
+
+#[test]
+fn real_pty_error_unwind_restores_terminal_and_reports_the_original_error() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let report = directory.path().join("error.txt");
+    let mut terminal = error_unwind_fixture(&report)?;
+    terminal.wait_composer_frame(&["EVENTSTREAM_READY"], READY_TIMEOUT)?;
+    terminal.send(b"x")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    let report = std::fs::read_to_string(report)?;
+    assert!(report.contains("event: Ok(())"), "{report}");
+    assert!(
+        report.contains("injected native terminal input failure"),
+        "{report}"
+    );
+    assert!(report.contains("restore: Ok(())"), "{report}");
+    terminal.assert_restored()
+}
+
+#[test]
+fn real_event_stream_preserves_co_ready_resize_and_paste() -> Result<()> {
+    for attempt in 0..32 {
+        let mut terminal = fixture("co-ready-events")?;
+        terminal.wait_text(&["CO_READY_EVENTSTREAM"], &[])?;
+        terminal.wait_stopped(READY_TIMEOUT)?;
+        terminal.resize(20, 65)?;
+        terminal.send(b"\x1b[200~pasted text\x1b[201~")?;
+        terminal.resume()?;
+        terminal
+            .wait_text(&["Resize(65, 20)", "Paste(\"pasted text\")"], &[])
+            .with_context(|| format!("co-ready EventStream attempt {attempt}"))?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        terminal.assert_restored()?;
+    }
+    Ok(())
 }
 
 fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {
@@ -337,7 +541,7 @@ async fn complete(State(mut state): State<ProviderState>, Json(_): Json<Value>) 
         "status":"completed", "output":[{"type":"message", "content":[{
             "type":"output_text", "text": if delayed { "LATE_RESPONSE_MUST_STAY_ABSENT" }
             else { "FRESH_RESPONSE_MARKER" }
-        }]}]
+        }]}], "usage":{"input_tokens":8,"output_tokens":5}
     }))
 }
 
@@ -394,7 +598,24 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     terminal.wait_text(&["Cancelled", "Next thought", "enter send"], &[])?;
     release.send(true)?;
     terminal.send(b"\r")?;
-    terminal.wait_text(&["FRESH_RESPONSE_MARKER"], &[])?;
+    terminal.wait_text(
+        &[
+            "FRESH_RESPONSE_MARKER",
+            "32 input tokens",
+            "20 output tokens",
+        ],
+        &[],
+    )?;
+    terminal.resize(35, 65)?;
+    terminal.wait_text(
+        &[
+            "FRESH_RESPONSE_MARKER",
+            "32 input tokens",
+            "20 output tokens",
+            "enter send",
+        ],
+        &[],
+    )?;
     assert!(!String::from_utf8_lossy(&terminal.output).contains("LATE_RESPONSE_MUST_STAY_ABSENT"));
     terminal.wait_idle()?;
     terminal.send(b"/quit\r")?;
@@ -584,22 +805,29 @@ async fn preferences_session(
             terminal.wait_text(&["Esc back"], &[])?;
             terminal.close_picker(&selection.keys[3..])?;
         }
-        terminal.wait(
-            "selection persisted and rendered",
-            READY_TIMEOUT,
-            |terminal| {
-                let actual = sandbox.config()?;
-                let screen = terminal.screen();
-                Ok(actual.mode == selection.mode
-                    && actual.model == selection.model
-                    && actual.effort.as_deref() == selection.effort
-                    && screen.contains("enter send")
-                    && (!reject
-                        || "invalid saved session index"
-                            .split_whitespace()
-                            .all(|word| screen.contains(word))))
-            },
-        )?;
+        terminal.wait("selection rendered", READY_TIMEOUT, |terminal| {
+            let screen = terminal.screen();
+            Ok(screen.contains("enter send")
+                && (!reject
+                    || "invalid saved session index"
+                        .split_whitespace()
+                        .all(|word| screen.contains(word))))
+        })?;
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            let actual = sandbox.effective_config().await?;
+            if actual.mode == selection.mode
+                && actual.model == selection.model
+                && actual.effort.as_deref() == selection.effort
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "selection was rendered but its saved preference did not match"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     if let Some(fault) = rejected_index {
         fault.restore().await?;
@@ -640,7 +868,7 @@ async fn terminal_selections_survive_restarts_picker_changes_and_failed_database
         false,
     )
     .await?;
-    assert_eq!(sandbox.config()?.mode, Mode::Jungian);
+    assert_eq!(sandbox.effective_config().await?.mode, Mode::Jungian);
     preferences_session(
         &sandbox,
         &["persistent-demo", "jungian", "high"],
@@ -674,9 +902,13 @@ async fn terminal_selections_survive_restarts_picker_changes_and_failed_database
     )
     .await?;
     preferences_session(&sandbox, &["demo", "freudian", "default"], &[], false).await?;
-    let current = sandbox.config()?;
+    let current = sandbox.effective_config().await?;
     assert_eq!(
-        (current.mode, current.model.as_str(), current.effort),
+        (
+            current.mode,
+            current.model.as_str(),
+            current.effort.as_deref()
+        ),
         (Mode::Freudian, "demo", None)
     );
     preferences_session(
@@ -691,7 +923,7 @@ async fn terminal_selections_survive_restarts_picker_changes_and_failed_database
         true,
     )
     .await?;
-    assert_eq!(sandbox.config()?.mode, Mode::Freudian);
+    assert_eq!(sandbox.effective_config().await?.mode, Mode::Freudian);
     let sessions = sandbox.sessions()?;
     assert_eq!(sessions.len(), 4);
     assert!(sessions.iter().all(|session| session.turns == 0));

@@ -125,6 +125,14 @@ impl Actor {
         });
         Self { tx, task }
     }
+
+    pub(crate) fn abort(&self) {
+        self.task.abort();
+    }
+
+    pub(crate) async fn wait(&mut self) {
+        let _ = (&mut self.task).await;
+    }
 }
 
 /// Retain UTF-8 boundaries and make content loss visible without exceeding the cap.

@@ -334,7 +334,13 @@ impl Directory {
         native::private_chain(&files)
     }
 
-    fn revalidate(&self) -> io::Result<()> {
+    /// Reopen each retained pathname and verify that it still resolves to the
+    /// native objects held by this capability.
+    ///
+    /// This detects a replacement observed at this check. It does not bind a
+    /// later pathname-based child working directory atomically to the retained
+    /// directory, and it is not a sandbox or authorization decision.
+    pub fn revalidate(&self) -> io::Result<()> {
         let mut parent = None;
         for held in &self.anchors {
             let current = native::open_directory(parent.as_ref(), &held.path, self.retention)?;

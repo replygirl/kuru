@@ -1,18 +1,24 @@
 use std::{
     fs::File,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use kuru_connectors::{Provider, ToolHost, provider};
-use kuru_core::{Config, Mode, ModelInfo, ProjectPreferences, SelectionOverrides};
+use kuru_core::{
+    AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
+    ProjectPreferences, SafeManifest,
+};
 use kuru_memory::{MemoryStore, OpenOptions as MemoryOptions};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_runtime::Harness;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+
+use crate::trust::{ApprovalState, ApprovalStore};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,6 +53,12 @@ pub struct Cli {
     pub allow_shell: bool,
     #[arg(long, global = true)]
     pub no_dream: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Authorize this command's reviewed workspace authority without saving approval"
+    )]
+    pub trust_workspace_once: bool,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -107,6 +119,25 @@ pub enum Command {
         #[arg(long)]
         source: Option<PathBuf>,
     },
+    /// Inspect or change approval for automatic workspace configuration.
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TrustCommand {
+    /// Show current automatic workspace authority and approval state.
+    Status,
+    /// Review and persist approval for the complete current authority manifest.
+    Approve {
+        /// Approve noninteractively after printing the complete redacted manifest.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove this exact workspace's saved approval.
+    Revoke,
 }
 
 #[derive(Debug, Subcommand)]
@@ -169,36 +200,16 @@ fn native_data_directory() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
 }
 
-pub fn effective_config(
-    cli: &Cli,
-    cwd: &Path,
-    user: Option<&Path>,
-    preferences: &ProjectPreferences,
-) -> Result<Config> {
-    let mut config = Config::load_with_preferences(
-        user,
-        cwd,
-        cli.config.as_deref(),
-        preferences,
-        SelectionOverrides {
-            mode: cli.mode,
-            provider: cli.provider.as_deref(),
-            model: cli.model.as_deref(),
-            effort: cli.effort.as_deref(),
-        },
-    )?;
-    if cli.allow_write {
-        config.allow_write = true;
+fn invocation_overrides(cli: &Cli) -> InvocationOverrides {
+    InvocationOverrides {
+        mode: cli.mode,
+        provider: cli.provider.clone(),
+        model: cli.model.clone(),
+        effort: cli.effort.clone(),
+        allow_write: cli.allow_write,
+        allow_shell: cli.allow_shell,
+        no_dream: cli.no_dream,
     }
-    if cli.allow_shell {
-        config.allow_shell = true;
-    }
-    if cli.no_dream {
-        config.dream_every = 0;
-        config.dream_on_exit = false;
-    }
-    config.validate()?;
-    Ok(config)
 }
 
 pub async fn select_model(
@@ -254,23 +265,120 @@ pub async fn execute(cli: Cli) -> Result<()> {
         .await;
     }
     let (cwd, data, user) = paths(&cli)?;
-    if matches!(
-        cli.command,
-        Some(Command::Login { .. } | Command::Logout | Command::Auth)
-    ) {
-        let config = Config::load(user.as_deref(), &cwd, cli.config.as_deref())?;
+    let root = Arc::new(
+        Directory::open(&cwd, Privacy::Inherited, NameRetention::Pinned)
+            .context("workspace directory could not be retained safely")?,
+    );
+    let cwd = root.path().to_path_buf();
+
+    // Login and logout are fixed ChatGPT account operations. In particular,
+    // they neither parse workspace-selected Responses configuration nor read
+    // its environment variable.
+    if matches!(cli.command, Some(Command::Login { .. } | Command::Logout)) {
         return crate::authentication::run(
             cli.command
                 .as_ref()
                 .expect("matched authentication command"),
-            &config,
+            None,
             &data,
             &cwd,
         )
         .await;
     }
+
+    // Revocation must remain possible when current configuration is malformed.
+    if matches!(
+        cli.command,
+        Some(Command::Trust {
+            command: TrustCommand::Revoke
+        })
+    ) {
+        let removed = ApprovalStore::new(&data, &root).revoke()?;
+        println!(
+            "{}",
+            if removed {
+                "Workspace approval revoked."
+            } else {
+                "No workspace approval was stored."
+            }
+        );
+        return Ok(());
+    }
+
+    let snapshot = ConfigSnapshot::parse(
+        user.as_deref(),
+        &cwd,
+        cli.config.as_deref(),
+        invocation_overrides(&cli),
+    )?;
+    root.revalidate()
+        .context("workspace changed while configuration was being reviewed")?;
+    let approval_store = ApprovalStore::new(&data, &root);
+
+    if let Some(Command::Trust { command }) = &cli.command {
+        match command {
+            TrustCommand::Status => {
+                show_manifest(
+                    &root,
+                    &snapshot.manifest().filtered(&all_claim_categories()),
+                    Some(approval_store.inspect(snapshot.manifest())),
+                );
+            }
+            TrustCommand::Approve { yes } => {
+                let complete = snapshot.manifest().filtered(&all_claim_categories());
+                show_manifest(&root, &complete, None);
+                if !yes && !confirm("Approve this complete workspace authority manifest? [y/N] ")? {
+                    bail!("workspace approval cancelled");
+                }
+                root.revalidate()
+                    .context("workspace changed before approval was recorded")?;
+                approval_store.approve_command(snapshot.manifest())?;
+                println!("Complete workspace authority manifest approved.");
+            }
+            TrustCommand::Revoke => {
+                unreachable!("revocation returned before configuration parsing")
+            }
+        }
+        return Ok(());
+    }
+
+    if matches!(cli.command, Some(Command::Config)) {
+        println!("{}", snapshot.snapshot_toml()?);
+        eprintln!(
+            "note: saved project mode, model, and effort preferences are omitted; memory was not opened"
+        );
+        return Ok(());
+    }
+
+    if cli.command.is_none() && !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        bail!("interactive mode requires a terminal; use kuru run PROMPT");
+    }
+
+    preflight(&cli, &root, &data, &snapshot)?;
+    root.revalidate()
+        .context("workspace changed after trust preflight")?;
+
+    if matches!(cli.command, Some(Command::Auth)) {
+        let route = snapshot.responses_route()?;
+        let result = crate::authentication::run(
+            cli.command
+                .as_ref()
+                .expect("matched authentication command"),
+            route.as_ref().map(|route| route.api_key_env()),
+            &data,
+            &cwd,
+        )
+        .await;
+        if route.is_none() {
+            eprintln!(
+                "note: Responses API-key availability was not checked; select --provider responses to inspect that route"
+            );
+        }
+        return result;
+    }
+
     let scope = kuru_runtime::project_scope(&cwd)?;
-    let memory_config = Config::load_memory(user.as_deref(), &cwd, cli.config.as_deref())?;
+    let memory_config = snapshot.memory_config().clone();
     let writer = matches!(
         cli.command,
         None | Some(
@@ -313,18 +421,8 @@ pub async fn execute(cli: Cli) -> Result<()> {
         } else {
             ProjectPreferences::default()
         };
-        let mut config = effective_config(&cli, &cwd, user.as_deref(), &preferences)?;
+        let mut config = snapshot.finalize(&preferences)?;
         match &cli.command {
-            Some(Command::Config) => {
-                let mut visible = config.clone();
-                for server in visible.mcp.values_mut() {
-                    for value in server.env.values_mut() {
-                        *value = "[redacted]".into();
-                    }
-                }
-                println!("{}", toml::to_string_pretty(&visible)?);
-                return Ok(());
-            }
             Some(Command::Sessions) => {
                 let sessions = if let Some(memory) = &existing_memory {
                     Harness::list_sessions(memory, &cwd).await?
@@ -356,7 +454,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             Some(Command::Tool { name, args }) => {
-                let host = ToolHost::new(&cwd, &config)?;
+                let host = ToolHost::with_retained_root(root.clone(), &config)?;
                 let result = async {
                     let arguments = serde_json::from_str(args)?;
                     host.specs().await?;
@@ -369,7 +467,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             Some(Command::Tools) => {
-                let host = ToolHost::new(&cwd, &config)?;
+                let host = ToolHost::with_retained_root(root.clone(), &config)?;
                 let specs = host.specs().await;
                 let cleanup = host.shutdown().await;
                 println!("{}", serde_json::to_string_pretty(&specs?)?);
@@ -377,6 +475,14 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             _ => {}
+        }
+        if matches!(cli.command, Some(Command::UndoDream)) {
+            let memory = existing_memory
+                .as_ref()
+                .context("this project has no memory yet; start a conversation first")?;
+            kuru_runtime::undo_dream(&config, &scope, memory, cli.resume.as_deref()).await?;
+            println!("Previous membership restored.");
+            return Ok(());
         }
         let provider = provider(&config, &cwd, &data).await?;
         if matches!(cli.command, Some(Command::Models)) {
@@ -386,11 +492,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             );
             return Ok(());
         }
-        let models = if matches!(cli.command, Some(Command::UndoDream)) {
-            vec![]
-        } else {
-            select_model(&mut config, &provider).await?
-        };
+        let models = select_model(&mut config, &provider).await?;
         std::fs::create_dir_all(&data)?;
         let data = data.canonicalize()?;
         ensure!(
@@ -406,7 +508,16 @@ pub async fn execute(cli: Cli) -> Result<()> {
             }
         };
         memory_to_close = Some(memory.clone());
-        let mut harness = Harness::new(config, &cwd, memory, provider, cli.resume.as_deref()).await?;
+        let tools = ToolHost::with_retained_root(root.clone(), &config)?;
+        let mut harness = Harness::with_tool_host(
+            config,
+            &cwd,
+            memory,
+            provider,
+            cli.resume.as_deref(),
+            tools,
+        )
+        .await?;
         match cli.command {
             Some(Command::Run { prompt, json }) => {
                 let mut events = harness.subscribe();
@@ -442,13 +553,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result?)?);
                 cleanup?;
             }
-            Some(Command::UndoDream) => {
-                let result = harness.undo_dream().await;
-                let cleanup = harness.shutdown(false).await;
-                result?;
-                cleanup?;
-                println!("Previous membership restored.");
-            }
+            Some(Command::UndoDream) => unreachable!("undo returned before provider construction"),
             Some(Command::Serve { bind, token_env }) => {
                 ensure!(
                     bind.ip().is_loopback(),
@@ -479,6 +584,185 @@ pub async fn execute(cli: Cli) -> Result<()> {
     };
     result?;
     cleanup
+}
+
+fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClaimCategory> {
+    use AuthorityClaimCategory as Category;
+    [
+        Category::WorkspaceWrite,
+        Category::Shell,
+        Category::McpStdio,
+        Category::McpHttp,
+        Category::MemoryDoltBinary,
+        Category::MemoryCacheDir,
+        Category::ResponsesRoute,
+        Category::ExternalAgent,
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn command_claim_categories(
+    command: Option<&Command>,
+) -> std::collections::BTreeSet<AuthorityClaimCategory> {
+    use AuthorityClaimCategory as Category;
+    let categories: &[Category] = match command {
+        Some(Command::Auth) => &[Category::ResponsesRoute],
+        Some(Command::Sessions | Command::Memory { .. } | Command::UndoDream) => {
+            &[Category::MemoryDoltBinary, Category::MemoryCacheDir]
+        }
+        Some(Command::Models) => &[
+            Category::MemoryDoltBinary,
+            Category::MemoryCacheDir,
+            Category::ResponsesRoute,
+        ],
+        Some(Command::Tool { .. } | Command::Tools) => &[
+            Category::WorkspaceWrite,
+            Category::Shell,
+            Category::McpStdio,
+            Category::McpHttp,
+            Category::MemoryDoltBinary,
+            Category::MemoryCacheDir,
+        ],
+        None | Some(Command::Run { .. } | Command::Dream | Command::Serve { .. }) => &[
+            Category::WorkspaceWrite,
+            Category::Shell,
+            Category::McpStdio,
+            Category::McpHttp,
+            Category::MemoryDoltBinary,
+            Category::MemoryCacheDir,
+            Category::ResponsesRoute,
+            Category::ExternalAgent,
+        ],
+        Some(
+            Command::Login { .. }
+            | Command::Logout
+            | Command::Config
+            | Command::Update { .. }
+            | Command::Trust { .. },
+        ) => &[],
+    };
+    categories.iter().copied().collect()
+}
+
+fn preflight(cli: &Cli, root: &Directory, data: &Path, snapshot: &ConfigSnapshot) -> Result<()> {
+    let applicable = snapshot
+        .manifest()
+        .filtered(&command_claim_categories(cli.command.as_ref()));
+    if applicable.claims().is_empty() {
+        return Ok(());
+    }
+    let store = ApprovalStore::new(data, root);
+    if store.inspect(snapshot.manifest()) == ApprovalState::Matching || cli.trust_workspace_once {
+        return Ok(());
+    }
+    if cli.command.is_none() {
+        let complete = snapshot.manifest().filtered(&all_claim_categories());
+        show_manifest(root, &complete, Some(store.inspect(snapshot.manifest())));
+        eprintln!(
+            "This launch needs {} of the {} reviewed authority claims shown above.",
+            applicable.claims().len(),
+            complete.claims().len()
+        );
+        eprintln!("[1] Continue once  [2] Approve this complete configuration  [3] Cancel");
+        eprint!("Choice [3]: ");
+        io::stderr().flush()?;
+        let mut choice = String::new();
+        if io::stdin().read_line(&mut choice)? == 0 {
+            bail!("workspace trust was not granted");
+        }
+        return match choice.trim() {
+            "1" => Ok(()),
+            "2" => {
+                root.revalidate()
+                    .context("workspace changed before approval was recorded")?;
+                store.approve_tui(snapshot.manifest())
+            }
+            _ => bail!("workspace trust was not granted"),
+        };
+    }
+    bail!(
+        "workspace authority is not approved for this command\n{}\nRun `kuru trust approve` with the same `-C` directory, or repeat this command with `--trust-workspace-once` after review.",
+        manifest_text(root, &applicable, Some(store.inspect(snapshot.manifest()))),
+    )
+}
+
+fn show_manifest(root: &Directory, manifest: &SafeManifest, state: Option<ApprovalState>) {
+    println!("{}", manifest_text(root, manifest, state));
+}
+
+fn manifest_text(
+    root: &Directory,
+    manifest: &SafeManifest,
+    state: Option<ApprovalState>,
+) -> String {
+    let mut text = format!(
+        "Workspace: {}\nManifest: v{} {}",
+        safe_path(root.path()),
+        manifest.schema_version(),
+        manifest.digest()
+    );
+    if let Some(state) = state {
+        let label = match state {
+            ApprovalState::Absent => "not approved",
+            ApprovalState::Matching => "approved",
+            ApprovalState::Stale => "approval does not match the current manifest",
+            ApprovalState::Invalid => "approval state is invalid or unsafe",
+        };
+        text.push_str(&format!("\nStatus: {label}"));
+    }
+    if manifest.sources().is_empty() {
+        text.push_str("\nAutomatic ancestor sources: none");
+    } else {
+        text.push_str("\nAutomatic ancestor sources:");
+        for source in manifest.sources() {
+            text.push_str(&format!("\n  - {source}"));
+        }
+    }
+    if manifest.claims().is_empty() {
+        text.push_str("\nAuthority claims: none");
+    } else {
+        text.push_str("\nAuthority claims:");
+        for claim in manifest.claims() {
+            text.push_str(&format!(
+                "\n  - {}: {} (source {})",
+                claim.category().label(),
+                claim.display(),
+                claim.source()
+            ));
+        }
+    }
+    text
+}
+
+fn confirm(prompt: &str) -> Result<bool> {
+    ensure!(
+        io::stdin().is_terminal() && io::stderr().is_terminal(),
+        "confirmation requires a terminal; use --yes after reviewing the manifest"
+    );
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0 {
+        return Ok(false);
+    }
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn safe_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    let mut safe = String::new();
+    for character in value.chars() {
+        if safe.len() >= 512 {
+            safe.push('…');
+            break;
+        }
+        safe.extend(character.escape_default());
+    }
+    safe
 }
 
 /// Advisory OS locks release when the process exits, including crashes. Keep the

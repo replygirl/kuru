@@ -85,6 +85,8 @@ pub struct Harness {
     events: broadcast::Sender<Event>,
     trace: Vec<Event>,
     pub(crate) pending_publication: Option<PendingPublication>,
+    #[cfg(test)]
+    publication_pause: Option<PublicationPause>,
 }
 
 pub(crate) struct PendingPublication {
@@ -92,6 +94,12 @@ pub(crate) struct PendingPublication {
     pub topology: Topology,
     pub session: Session,
     pub updates: Vec<(String, Value)>,
+}
+
+#[cfg(test)]
+struct PublicationPause {
+    reached: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
 }
 
 impl Harness {
@@ -102,8 +110,27 @@ impl Harness {
         provider: Arc<dyn Provider>,
         resume: Option<&str>,
     ) -> Result<Self> {
+        let cwd = cwd.canonicalize()?;
+        let tools = ToolHost::new(&cwd, &config)?;
+        Self::with_tool_host(config, &cwd, memory, provider, resume, tools).await
+    }
+
+    /// Construct a harness with a caller-retained tool host. The runtime keeps
+    /// no platform dependency; callers retain and validate workspace authority.
+    pub async fn with_tool_host(
+        config: Config,
+        cwd: &Path,
+        memory: MemoryStore,
+        provider: Arc<dyn Provider>,
+        resume: Option<&str>,
+        tools: ToolHost,
+    ) -> Result<Self> {
         config.validate()?;
         let cwd = cwd.canonicalize()?;
+        ensure!(
+            tools.root() == cwd,
+            "injected tool host root does not match the canonical workspace"
+        );
         let scope = project_scope(&cwd)?;
         let session = if let Some(id) = resume {
             serde_json::from_value(
@@ -125,8 +152,10 @@ impl Harness {
         config.validate()?;
         let topology = read_topology(&memory, &scope, config.mode).await?;
         validate_topology(&topology, &config)?;
-        let tools = ToolHost::new(&cwd, &config)?;
         let instructions = load_instructions(&cwd)?;
+        // Instruction reads are pathname based. Recheck the caller-retained
+        // workspace before this constructor can publish its initial state.
+        tools.revalidate_root()?;
         let (events, _) = broadcast::channel(256);
         let mut harness = Self {
             permits: Arc::new(Semaphore::new(config.max_parallel)),
@@ -143,6 +172,8 @@ impl Harness {
             events,
             trace: vec![],
             pending_publication: None,
+            #[cfg(test)]
+            publication_pause: None,
         };
         harness.sync_actors();
         harness.save().await?;
@@ -161,7 +192,13 @@ impl Harness {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        self.actors.clear();
+        let mut actors = std::mem::take(&mut self.actors);
+        for actor in actors.values() {
+            actor.abort();
+        }
+        for actor in actors.values_mut() {
+            actor.wait().await;
+        }
         let cleanup = self.tools.shutdown().await;
         result?;
         cleanup
@@ -332,7 +369,42 @@ impl Harness {
             updates: updates.clone(),
         });
         self.memory.put_many(&updates).await?;
+        #[cfg(test)]
+        self.pause_after_memory_write().await?;
         self.publish_pending();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_memory_write(
+        &mut self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, observed) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        assert!(
+            self.publication_pause.is_none(),
+            "publication pause is active"
+        );
+        self.publication_pause = Some(PublicationPause {
+            reached,
+            release: wait,
+        });
+        (observed, release)
+    }
+
+    #[cfg(test)]
+    async fn pause_after_memory_write(&mut self) -> Result<()> {
+        let Some(pause) = self.publication_pause.take() else {
+            return Ok(());
+        };
+        pause
+            .reached
+            .send(())
+            .map_err(|_| anyhow::anyhow!("publication observer disappeared before checkpoint"))?;
+        pause
+            .release
+            .await
+            .context("publication checkpoint release channel closed")?;
         Ok(())
     }
 
@@ -1046,7 +1118,11 @@ fn is_cognitive(name: &str) -> bool {
         "peer_send" | "relate" | "state_report" | "remember" | "a2a_send"
     )
 }
-async fn read_topology(memory: &MemoryStore, scope: &str, mode: Mode) -> Result<Topology> {
+pub(crate) async fn read_topology(
+    memory: &MemoryStore,
+    scope: &str,
+    mode: Mode,
+) -> Result<Topology> {
     memory
         .get(&format!("{scope}/{mode}/topology"))
         .await?

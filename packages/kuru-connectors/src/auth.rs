@@ -8,6 +8,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::retry::{OperationBudget, RefreshAllowance};
+
 mod http;
 mod login;
 mod store;
@@ -32,6 +34,7 @@ pub struct AuthStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthRoute {
+    #[cfg(test)]
     ApiKey,
     Chatgpt,
 }
@@ -76,6 +79,28 @@ struct Settings {
     http_timeout: Duration,
     login_timeout: Duration,
     callback_port: u16,
+    #[cfg(test)]
+    fail_refresh_preparation: bool,
+    #[cfg(test)]
+    refresh_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    refresh_proxy: Option<String>,
+    #[cfg(test)]
+    refresh_gate: Option<Arc<RefreshGate>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefreshPhase {
+    BeforeFirst,
+    BeforeSecond,
+}
+
+#[cfg(test)]
+struct RefreshGate {
+    phase: RefreshPhase,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl AuthManager {
@@ -93,6 +118,14 @@ impl AuthManager {
                 http_timeout: crate::IO_TIMEOUT,
                 login_timeout: LOGIN_TIMEOUT,
                 callback_port: 1455,
+                #[cfg(test)]
+                fail_refresh_preparation: false,
+                #[cfg(test)]
+                refresh_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                #[cfg(test)]
+                refresh_proxy: None,
+                #[cfg(test)]
+                refresh_gate: None,
             }),
         })
     }
@@ -131,6 +164,7 @@ impl AuthManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn credentials(&self, route: AuthRoute) -> Result<RequestCredentials> {
         if route == AuthRoute::ApiKey {
             return Ok(RequestCredentials {
@@ -151,15 +185,70 @@ impl AuthManager {
             .context("ChatGPT is not authenticated; run kuru login")?;
         let credentials = session.credentials();
         if session.refresh_pending || session.expires_at <= now()?.saturating_add(REFRESH_SKEW) {
-            self.refresh_rejected(&credentials).await
+            let budget = OperationBudget::new(self.inner.http_timeout);
+            let allowance = budget.begin_rotation(self.inner.http_timeout)?;
+            self.refresh_with_allowance(&credentials, allowance).await
         } else {
             Ok(credentials)
         }
     }
 
+    pub(crate) async fn credentials_snapshot(&self) -> Result<RequestCredentials> {
+        self.inner
+            .store
+            .read()?
+            .and_then(|record| record.session)
+            .context("ChatGPT is not authenticated; run kuru login")
+            .map(|session| session.credentials())
+    }
+
+    pub(crate) async fn resolve_for_operation(
+        &self,
+        observed: &RequestCredentials,
+        budget: &OperationBudget,
+    ) -> Result<RequestCredentials> {
+        let record = self
+            .inner
+            .store
+            .read()?
+            .and_then(|record| record.session)
+            .context("ChatGPT is not authenticated; run kuru login")?;
+        let current = record.credentials();
+        ensure!(
+            current.session_id() == observed.session_id()
+                && current.account_id() == observed.account_id(),
+            "ChatGPT account or login session changed; start a new Kuru session"
+        );
+        let newer_generation = current.generation() != observed.generation();
+        if newer_generation
+            || record.refresh_pending
+            || record.expires_at <= now()?.saturating_add(REFRESH_SKEW)
+        {
+            let allowance = budget.begin_rotation(self.inner.http_timeout)?;
+            self.refresh_with_allowance(
+                if newer_generation { observed } else { &current },
+                allowance,
+            )
+            .await
+        } else {
+            Ok(current)
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) async fn refresh_rejected(
         &self,
         observed: &RequestCredentials,
+    ) -> Result<RequestCredentials> {
+        let budget = OperationBudget::new(self.inner.http_timeout);
+        let allowance = budget.begin_rotation(self.inner.http_timeout)?;
+        self.refresh_with_allowance(observed, allowance).await
+    }
+
+    pub(crate) async fn refresh_with_allowance(
+        &self,
+        observed: &RequestCredentials,
+        allowance: RefreshAllowance,
     ) -> Result<RequestCredentials> {
         ensure!(
             observed.route == AuthRoute::Chatgpt,
@@ -170,18 +259,27 @@ impl AuthManager {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         // A refresh can rotate its token after the caller disappears. The same
         // bounded worker owns its reactor, lease, response and durable write.
-        std::thread::Builder::new().name("kuru-auth-refresh".into()).spawn(move || {
-            let result = (|| -> Result<_> {
-                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
-                    .context("create authentication refresh runtime")?;
-                runtime.block_on(async {
-                    tokio::time::timeout(manager.inner.http_timeout, manager.refresh_owned(observed, &sender))
-                        .await.context("ChatGPT refresh deadline exceeded; run kuru login if rotation is uncertain")?
-                })
-            })();
-            let _ = sender.send(result);
-        }).context("start authentication refresh worker")?;
-        tokio::time::timeout(self.inner.http_timeout, receiver)
+        let deadline = allowance.deadline();
+        std::thread::Builder::new()
+            .name("kuru-auth-refresh".into())
+            .spawn(move || {
+                let mut sender = sender;
+                let result = (|| -> Result<_> {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("create authentication refresh runtime")?;
+                    runtime.block_on(async {
+                        manager
+                            .refresh_owned(observed, allowance, &mut sender)
+                            .await
+                    })
+                })();
+                let _ = sender.send(result);
+            })
+            .context("start authentication refresh worker")?;
+        let remaining = allowance_wait(self.inner.http_timeout, deadline);
+        tokio::time::timeout(remaining, receiver)
             .await
             .context("ChatGPT refresh deadline exceeded; completion remains owned")?
             .context("authentication refresh worker stopped")?
@@ -190,20 +288,23 @@ impl AuthManager {
     async fn refresh_owned(
         &self,
         observed: RequestCredentials,
-        sender: &tokio::sync::oneshot::Sender<Result<RequestCredentials>>,
+        allowance: RefreshAllowance,
+        sender: &mut tokio::sync::oneshot::Sender<Result<RequestCredentials>>,
     ) -> Result<RequestCredentials> {
         let lease = self
             .inner
             .store
-            .lease(false, self.inner.http_timeout)
+            .lease(
+                false,
+                allowance_wait(self.inner.http_timeout, allowance.deadline()),
+            )
             .await?
             .context("ChatGPT session was removed; run kuru login")?;
-        if sender.is_closed() {
-            bail!("authentication refresh was cancelled before dispatch");
-        }
+        allowance.check_dispatch(sender.is_closed())?;
         let mut record = lease
             .read()?
             .context("ChatGPT session was removed; run kuru login")?;
+        let original = record.clone();
         let session = record
             .session
             .as_mut()
@@ -224,24 +325,175 @@ impl AuthManager {
             );
             return Ok(session.credentials());
         }
-        session.refresh_pending = true;
         let previous = session.clone();
+        let prepared = http::PreparedRefresh::new(self, &previous.refresh_token)?;
+        session.refresh_pending = true;
         record.revision = random(32)?;
-        lease.write(&record)?;
-        let response = http::refresh(self, &previous.refresh_token).await?;
-        let mut refreshed = response.session(Some(&previous))?;
-        ensure!(
-            refreshed.account_id == previous.account_id,
-            "ChatGPT refresh changed the account; run kuru login again"
-        );
+        let pending = record.clone();
+        let pending_write = lease.write(&pending);
+        let installed = lease.read().map_err(|_| {
+            anyhow::anyhow!("authentication pending publication is uncertain; run kuru login")
+        })?;
+        if installed.as_ref() != Some(&pending) {
+            if installed.as_ref() == Some(&original) {
+                pending_write?;
+                bail!("authentication pending publication failed")
+            }
+            bail!("authentication pending publication is uncertain; run kuru login")
+        }
+        if let Err(error) = allowance.check_dispatch(sender.is_closed()) {
+            rollback_refresh(&lease, &pending, &previous)?;
+            return Err(error);
+        }
+        #[cfg(test)]
+        if let Err(error) =
+            wait_refresh_gate(self, RefreshPhase::BeforeFirst, sender, &allowance).await
+        {
+            rollback_refresh(&lease, &pending, &previous)?;
+            return Err(error);
+        }
+        allowance.check_dispatch(sender.is_closed()).map_err(|error| {
+            if rollback_refresh(&lease, &pending, &previous).is_err() {
+                anyhow::anyhow!(
+                    "authentication refresh stopped before dispatch and rollback state is unknown; run kuru login"
+                )
+            } else {
+                error
+            }
+        })?;
+        if let Err(error) = allowance.take_refresh_send(true) {
+            rollback_refresh(&lease, &pending, &previous)?;
+            return Err(error);
+        }
+        let response = match prepared.send(allowance.deadline()).await {
+            Ok(response) => response,
+            Err(http::RefreshFailure::NotDispatched) if allowance.can_repeat_refresh() => {
+                match allowance.retry_delay() {
+                    crate::retry::RetryDecision::Delay(delay) => {
+                        if let Err(error) = wait_refresh_backoff(sender, &allowance, delay).await {
+                            if rollback_refresh(&lease, &pending, &previous).is_err() {
+                                bail!(
+                                    "authentication refresh stopped before dispatch and rollback state is unknown; run kuru login"
+                                )
+                            }
+                            return Err(error);
+                        }
+                    }
+                    crate::retry::RetryDecision::Exhausted => {
+                        rollback_refresh(&lease, &pending, &previous)?;
+                        bail!("ChatGPT refresh retry budget exhausted")
+                    }
+                }
+                if let Err(error) = allowance.check_dispatch(sender.is_closed()) {
+                    rollback_refresh(&lease, &pending, &previous)?;
+                    return Err(error);
+                }
+                #[cfg(test)]
+                if let Err(error) =
+                    wait_refresh_gate(self, RefreshPhase::BeforeSecond, sender, &allowance).await
+                {
+                    rollback_refresh(&lease, &pending, &previous)?;
+                    return Err(error);
+                }
+                allowance.check_dispatch(sender.is_closed()).map_err(|error| {
+                    if rollback_refresh(&lease, &pending, &previous).is_err() {
+                        anyhow::anyhow!(
+                            "authentication refresh stopped before dispatch and rollback state is unknown; run kuru login"
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+                if let Err(error) = allowance.take_refresh_send(true) {
+                    rollback_refresh(&lease, &pending, &previous)?;
+                    return Err(error);
+                }
+                match prepared.send(allowance.deadline()).await {
+                    Ok(response) => response,
+                    Err(http::RefreshFailure::NotDispatched) => {
+                        rollback_refresh(&lease, &pending, &previous)?;
+                        bail!("OpenAI authentication connection failed before token dispatch")
+                    }
+                    Err(http::RefreshFailure::PossiblyDispatched) => {
+                        ensure_pending(&lease, &pending)?;
+                        bail!("OpenAI authentication request outcome is uncertain; run kuru login")
+                    }
+                }
+            }
+            Err(http::RefreshFailure::NotDispatched) => {
+                rollback_refresh(&lease, &pending, &previous)?;
+                bail!("OpenAI authentication connection failed before token dispatch")
+            }
+            Err(http::RefreshFailure::PossiblyDispatched) => {
+                ensure_pending(&lease, &pending)?;
+                bail!("OpenAI authentication request outcome is uncertain; run kuru login")
+            }
+        };
+        let Some(response_time) = allowance
+            .deadline()
+            .checked_duration_since(std::time::Instant::now())
+        else {
+            ensure_pending(&lease, &pending)?;
+            bail!("OpenAI authentication request outcome is uncertain; run kuru login")
+        };
+        let response =
+            match tokio::time::timeout(response_time, http::json_response(response)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    ensure_pending(&lease, &pending)?;
+                    return Err(error);
+                }
+                Err(_) => {
+                    ensure_pending(&lease, &pending)?;
+                    bail!("OpenAI authentication request outcome is uncertain; run kuru login")
+                }
+            };
+        let response: http::Tokens = match serde_json::from_value(response) {
+            Ok(response) => response,
+            Err(_) => {
+                ensure_pending(&lease, &pending)?;
+                bail!("invalid refresh response fields")
+            }
+        };
+        let mut refreshed = match response.session(Some(&previous)) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                ensure_pending(&lease, &pending)?;
+                return Err(error);
+            }
+        };
+        if refreshed.account_id != previous.account_id {
+            ensure_pending(&lease, &pending)?;
+            bail!("ChatGPT refresh changed the account; run kuru login again")
+        }
         refreshed.session_id = previous.session_id;
-        refreshed.generation = previous
-            .generation
-            .checked_add(1)
-            .context("authentication generation exhausted")?;
+        refreshed.generation = match previous.generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                ensure_pending(&lease, &pending)?;
+                bail!("authentication generation exhausted")
+            }
+        };
         let credentials = refreshed.credentials();
-        lease.write(&store::Record::new(Some(refreshed))?)?;
-        Ok(credentials)
+        let published = match store::Record::new(Some(refreshed)) {
+            Ok(published) => published,
+            Err(error) => {
+                ensure_pending(&lease, &pending)?;
+                return Err(error);
+            }
+        };
+        let write = lease.write(&published);
+        let observed_record = lease.read().map_err(|_| {
+            anyhow::anyhow!("authentication rotation state is unknown; run kuru login")
+        })?;
+        if observed_record.as_ref() == Some(&published) {
+            return Ok(credentials);
+        }
+        if let Err(error) = write {
+            return Err(error)
+                .context("authentication rotation publication is uncertain; run kuru login");
+        }
+        bail!("authentication rotation publication is uncertain; run kuru login")
     }
 
     async fn activate(
@@ -306,6 +558,143 @@ impl AuthManager {
             .await?
             .unwrap();
         lease.write(&store::Record::new(Some(session))?)
+    }
+
+    #[cfg(test)]
+    fn fail_refresh_preparation(&mut self) {
+        Arc::get_mut(&mut self.inner)
+            .expect("test manager must be uniquely owned")
+            .fail_refresh_preparation = true;
+    }
+
+    #[cfg(test)]
+    fn refresh_attempts(&self) -> usize {
+        self.inner
+            .refresh_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn use_refresh_proxy(&mut self, issuer: &str, proxy: String) {
+        let settings = Arc::get_mut(&mut self.inner).expect("test manager must be uniquely owned");
+        settings.issuer = issuer.into();
+        settings.refresh_proxy = Some(proxy);
+    }
+
+    #[cfg(test)]
+    fn pause_refresh(&mut self, phase: RefreshPhase) -> Arc<RefreshGate> {
+        let gate = Arc::new(RefreshGate {
+            phase,
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        Arc::get_mut(&mut self.inner)
+            .expect("test manager must be uniquely owned")
+            .refresh_gate = Some(gate.clone());
+        gate
+    }
+}
+
+fn allowance_wait(limit: Duration, deadline: std::time::Instant) -> Duration {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .unwrap_or(Duration::ZERO)
+        .min(limit)
+}
+
+fn rollback_refresh(
+    lease: &store::Lease,
+    pending: &store::Record,
+    previous: &store::Session,
+) -> Result<()> {
+    let current = lease
+        .read()
+        .map_err(|_| anyhow::anyhow!("authentication rollback state is unknown; run kuru login"))?;
+    ensure!(
+        current.as_ref() == Some(pending),
+        "authentication rollback state is unknown; run kuru login"
+    );
+    let rollback = store::Record::new(Some(previous.clone()))
+        .map_err(|_| anyhow::anyhow!("authentication rollback state is unknown; run kuru login"))?;
+    let write = lease.write(&rollback);
+    let observed = lease
+        .read()
+        .map_err(|_| anyhow::anyhow!("authentication rollback state is unknown; run kuru login"))?;
+    if observed.as_ref() == Some(&rollback) {
+        return Ok(());
+    }
+    if let Err(error) = write {
+        return Err(error).context("authentication rollback state is unknown; run kuru login");
+    }
+    bail!("authentication rollback state is unknown; run kuru login")
+}
+
+fn ensure_pending(lease: &store::Lease, pending: &store::Record) -> Result<()> {
+    ensure!(
+        lease
+            .read()
+            .map_err(|_| anyhow::anyhow!(
+                "authentication refresh state is unknown; run kuru login"
+            ))?
+            .as_ref()
+            == Some(pending),
+        "authentication refresh state is unknown; run kuru login"
+    );
+    Ok(())
+}
+
+async fn wait_refresh_backoff(
+    sender: &mut tokio::sync::oneshot::Sender<Result<RequestCredentials>>,
+    allowance: &RefreshAllowance,
+    delay: Duration,
+) -> Result<()> {
+    let Some(remaining) = allowance
+        .deadline()
+        .checked_duration_since(std::time::Instant::now())
+    else {
+        bail!("authentication refresh was cancelled before dispatch")
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => Ok(()),
+        _ = tokio::time::sleep(remaining) => {
+            bail!("authentication refresh was cancelled before dispatch")
+        }
+        _ = sender.closed() => {
+            bail!("authentication refresh was cancelled before dispatch")
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_refresh_gate(
+    manager: &AuthManager,
+    phase: RefreshPhase,
+    sender: &mut tokio::sync::oneshot::Sender<Result<RequestCredentials>>,
+    allowance: &RefreshAllowance,
+) -> Result<()> {
+    let Some(gate) = manager
+        .inner
+        .refresh_gate
+        .as_ref()
+        .filter(|gate| gate.phase == phase)
+    else {
+        return Ok(());
+    };
+    gate.reached.notify_one();
+    let Some(remaining) = allowance
+        .deadline()
+        .checked_duration_since(std::time::Instant::now())
+    else {
+        bail!("authentication refresh was cancelled before dispatch")
+    };
+    tokio::select! {
+        _ = gate.release.notified() => Ok(()),
+        _ = tokio::time::sleep(remaining) => {
+            bail!("authentication refresh was cancelled before dispatch")
+        }
+        _ = sender.closed() => {
+            bail!("authentication refresh was cancelled before dispatch")
+        }
     }
 }
 

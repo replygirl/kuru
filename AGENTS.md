@@ -48,6 +48,15 @@ runtime, not a model acting as a permanent supervisor. Frameworks are switchable
 profiles; provider, authentication and protocol additions belong behind their
 existing boundaries.
 
+Automatic ancestor configuration must pass exact-root workspace trust preflight
+before its configured memory, provider, tool or protocol authority activates.
+Capture all invocation overrides in one immutable configuration snapshot with
+final-leaf provenance; retain the reviewed directory through configured launches.
+Persistent approval binds the complete authority manifest, while a one-invocation
+grant covers only that command's applicable claims. Keep pure inspection and
+fixed account operations independent of unrelated authority. See
+[workspace trust](docs/configuration.md#workspace-trust).
+
 Full Dolt is the live memory backend. Keep its pinned runtime, provisioning and
 actual database fixtures in `kuru-memory`; SQLite is only a read-only migration
 dependency. Preserve original legacy data and validate imports before activation.

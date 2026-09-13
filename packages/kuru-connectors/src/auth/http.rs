@@ -1,7 +1,7 @@
 use super::{AuthManager, CLIENT_ID, now, random, store::Session, validate_secret};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Request, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -87,13 +87,84 @@ fn claims(token: &str) -> Result<Value> {
 }
 
 pub(super) fn client(manager: &AuthManager) -> Result<Client> {
-    Client::builder()
+    client_builder(manager)
+        .build()
+        .context("create authentication HTTP client")
+}
+
+fn client_builder(manager: &AuthManager) -> reqwest::ClientBuilder {
+    let builder = Client::builder()
         .timeout(manager.inner.http_timeout)
         .connect_timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("Kuru/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("create authentication HTTP client")
+        .user_agent(concat!("Kuru/", env!("CARGO_PKG_VERSION")));
+    #[cfg(test)]
+    if let Some(proxy) = &manager.inner.refresh_proxy {
+        return builder.proxy(reqwest::Proxy::all(proxy).expect("valid test proxy"));
+    }
+    builder
+}
+
+pub(super) struct PreparedRefresh {
+    client: Client,
+    request: Request,
+    #[cfg(test)]
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub(super) enum RefreshFailure {
+    NotDispatched,
+    PossiblyDispatched,
+}
+
+impl PreparedRefresh {
+    pub(super) fn new(manager: &AuthManager, refresh_token: &str) -> Result<Self> {
+        #[cfg(test)]
+        ensure!(
+            !manager.inner.fail_refresh_preparation,
+            "prepare replayable OpenAI authentication request"
+        );
+        let client = client_builder(manager)
+            .retry(reqwest::retry::never())
+            .build()
+            .context("create authentication refresh HTTP client")?;
+        let request = client
+            .post(format!("{}/oauth/token", manager.inner.issuer))
+            .header("originator", "kuru")
+            .json(&json!({"grant_type":"refresh_token", "client_id":CLIENT_ID,"refresh_token":refresh_token}))
+            .build()
+            .map_err(|_| anyhow::anyhow!("prepare OpenAI authentication request"))?;
+        ensure!(
+            request.try_clone().is_some(),
+            "prepare replayable OpenAI authentication request"
+        );
+        Ok(Self {
+            client,
+            request,
+            #[cfg(test)]
+            attempts: manager.inner.refresh_attempts.clone(),
+        })
+    }
+
+    pub(super) async fn send(
+        &self,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<Response, RefreshFailure> {
+        #[cfg(test)]
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let Some(request) = self.request.try_clone() else {
+            return Err(RefreshFailure::PossiblyDispatched);
+        };
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Err(RefreshFailure::PossiblyDispatched);
+        };
+        match tokio::time::timeout(remaining, self.client.execute(request)).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) if error.is_connect() => Err(RefreshFailure::NotDispatched),
+            Ok(Err(_)) | Err(_) => Err(RefreshFailure::PossiblyDispatched),
+        }
+    }
 }
 
 pub(super) async fn json_response(mut response: Response) -> Result<Value> {
@@ -157,17 +228,6 @@ pub(super) async fn exchange(
         .map_err(|_| anyhow::anyhow!("OpenAI token exchange request failed"))?;
     serde_json::from_value(json_response(response).await?)
         .map_err(|_| anyhow::anyhow!("invalid token response fields"))
-}
-
-pub(super) async fn refresh(manager: &AuthManager, refresh_token: &str) -> Result<Tokens> {
-    let response = post_json(
-        manager,
-        "/oauth/token",
-        &json!({"grant_type":"refresh_token", "client_id":CLIENT_ID,"refresh_token":refresh_token}),
-    )
-    .await?;
-    serde_json::from_value(json_response(response).await?)
-        .map_err(|_| anyhow::anyhow!("invalid refresh response fields"))
 }
 
 pub(super) fn pending(status: StatusCode) -> bool {

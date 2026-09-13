@@ -24,8 +24,12 @@ the existing lines over 24 seconds, independently of typing; composition does no
 trigger decoration or restart the ambient clock. The composer separator is static.
 Ornament does not represent sentience, inferred work or invented communication.
 Thinking, tools, speaking identities, relationship membership and message endpoints
-come from runtime events. Private peer messages and state notes stay out of the
-activity feed. Numbered nodes map to the adjacent roster in compact sidebars.
+come from runtime events while work is in progress. A completed response instead
+uses its returned turn result: its text appears once with the returned speaker or
+relationship and a subdued input/output token line. A generic “limited result”
+marker appears when that returned result is limited; it does not diagnose why.
+Private peer messages and state notes stay out of the activity feed. Numbered
+nodes map to the adjacent roster in compact sidebars.
 
 The welcome scene uses the full canvas. During conversation, wide panes show a
 smaller scene and the live roster alongside messages; narrow panes preserve chat,

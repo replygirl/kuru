@@ -71,6 +71,22 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
             "--json",
         ]))
         .unwrap();
+        assert_eq!(result.as_object().unwrap().len(), 8);
+        for field in [
+            "session",
+            "speaker",
+            "text",
+            "relationship",
+            "input_tokens",
+            "output_tokens",
+            "limited",
+            "events",
+        ] {
+            assert!(
+                result.get(field).is_some(),
+                "missing TurnOutput field {field}"
+            );
+        }
         assert!(result["text"].as_str().unwrap().contains("demo"));
         let session = result["session"].as_str().unwrap();
         let resumed: Value =
@@ -377,7 +393,7 @@ async fn sequential_commands_reap_owned_memory_before_returning_on_success_or_er
         .unwrap();
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("provider must be"),
+        String::from_utf8_lossy(&output.stderr).contains("configuration validation error"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -393,8 +409,9 @@ async fn sequential_commands_reap_owned_memory_before_returning_on_success_or_er
         .unwrap();
     memory.close().await.unwrap();
     let output = env.run(&["config"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("preferences"));
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("preferences are omitted"));
+    toml::from_str::<toml::Value>(&String::from_utf8(output.stdout).unwrap()).unwrap();
     stopped();
     let memory = MemoryStore::open(options).await.unwrap();
     memory
@@ -411,8 +428,16 @@ async fn sequential_commands_reap_owned_memory_before_returning_on_success_or_er
         .arg("config")
         .output()
         .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("preferences are omitted"));
+    let output = env
+        .command()
+        .arg("--config")
+        .arg(&invalid_config)
+        .args(["run", "invalid effective topology"])
+        .output()
+        .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("parts"));
     stopped();
     env.success(&["run", "The next command still works"]);
     stopped();

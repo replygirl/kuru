@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, ensure};
-use kuru_core::{Config, Mode};
+use kuru_core::Config;
 use kuru_delivery::command::BlockingCommand;
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde_json::{Value, json};
@@ -211,10 +211,6 @@ impl Sandbox {
         );
         Ok(String::from_utf8(output.stdout)?)
     }
-
-    fn config(&self) -> Result<Config> {
-        Ok(toml::from_str(&self.output("config")?)?)
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -307,11 +303,6 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
     let report = terminal.finish(EXIT)?;
     assert_eq!(report["status"], 0);
     drop(terminal);
-    let saved = sandbox.config()?;
-    assert_eq!(
-        (saved.mode, saved.model.as_str(), saved.effort.as_deref()),
-        (Mode::Jungian, "demo", None)
-    );
     let sessions: Vec<kuru_runtime::Session> = serde_json::from_str(&sandbox.output("sessions")?)?;
     ensure!(
         sessions
@@ -320,6 +311,8 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
         "chat was not durably saved"
     );
 
+    // Reopening memory is the authoritative persistence check. The storage-free
+    // config snapshot intentionally omits project preferences.
     let mut reopened = sandbox.start("reopened", "app", &[], true, "demo", &[])?;
     reopened.text(
         &["demo", "Jungian", "default", "enter send"],
@@ -333,6 +326,91 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
     )?;
     reopened.send(b"\x03")?;
     assert_eq!(reopened.finish(EXIT)?["status"], 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_conpty_trust_refusal_and_persistent_choice_precede_the_alternate_screen()
+-> Result<()> {
+    let _serial = SERIAL.lock().await;
+
+    let sandbox = Sandbox::new()?;
+    std::fs::create_dir(sandbox.root.join(".kuru"))?;
+    std::fs::write(
+        sandbox.root.join(".kuru/config.toml"),
+        "allow_shell = true\nprovider = 'responses'\nmodel = 'fixture-model'\napi_key_env = 'KURU_ABSENT_CONPTY_KEY'\n",
+    )?;
+    let mut terminal = sandbox.start("trust-refusal", "app", &[], true, "responses", &[])?;
+    terminal.text(
+        &["Continue once", "Approve this complete configuration"],
+        READY,
+    )?;
+    ensure!(
+        !sandbox.data.exists(),
+        "trust refusal created memory before a choice"
+    );
+    terminal.send(b"3\r")?;
+    let error = terminal
+        .wait("trust refusal exits before the TUI", READY, |_| false)
+        .unwrap_err();
+    ensure!(error.to_string().contains("child exited"), "{error:#}");
+    ensure!(
+        !terminal
+            .output
+            .windows(8)
+            .any(|bytes| bytes == b"\x1b[?1049h"),
+        "trust refusal entered the alternate screen"
+    );
+    ensure!(
+        !sandbox.data.exists(),
+        "trust refusal created memory after the declined choice"
+    );
+
+    let sandbox = Sandbox::new()?;
+    std::fs::create_dir(sandbox.root.join(".kuru"))?;
+    std::fs::write(
+        sandbox.root.join(".kuru/config.toml"),
+        "allow_shell = true\nprovider = 'responses'\nmodel = 'fixture-model'\napi_key_env = 'KURU_ABSENT_CONPTY_KEY'\n",
+    )?;
+    let mut terminal = sandbox.start("trust-persistent", "app", &[], true, "responses", &[])?;
+    terminal.text(
+        &["Continue once", "Approve this complete configuration"],
+        READY,
+    )?;
+    terminal.send(b"2\r")?;
+    let error = terminal
+        .wait(
+            "missing responses route exits before the TUI",
+            READY,
+            |_| false,
+        )
+        .unwrap_err();
+    ensure!(error.to_string().contains("child exited"), "{error:#}");
+    ensure!(
+        !terminal
+            .output
+            .windows(8)
+            .any(|bytes| bytes == b"\x1b[?1049h"),
+        "persistent trust choice entered the alternate screen"
+    );
+
+    let status = BlockingCommand::new(env!("CARGO_BIN_EXE_kuru"))
+        .args(sandbox.args("responses"))
+        .arg("trust")
+        .arg("status")
+        .env_clear()
+        .envs(&sandbox.environment)
+        .output()?;
+    ensure!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    ensure!(
+        String::from_utf8_lossy(&status.stdout).contains("Status: approved"),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
     Ok(())
 }
 

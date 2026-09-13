@@ -1,5 +1,3 @@
-#[cfg(test)]
-use kuru_memory::MemoryStore;
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal},
@@ -7,14 +5,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use crossterm::{
-    event::{self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures::{Stream, StreamExt};
 use kuru_core::{Mode, ModelInfo, Relationship};
-use kuru_runtime::{Event, Harness};
+use kuru_runtime::{Event, Harness, TurnOutput};
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
@@ -23,16 +24,20 @@ use ratatui::{
 use tokio::{
     sync::{Mutex, broadcast, mpsc},
     task::JoinHandle,
+    time::{Instant as TokioInstant, sleep_until},
 };
 use unicode_width::UnicodeWidthChar;
 
 use crate::cli::validate_effort;
 
 mod render;
+#[cfg(test)]
+mod runtime_tests;
 mod scene;
 pub use render::draw;
 
 const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /dream · /undo-dream · /quit\n/memory-status · /memory-history\nModel, effort and mode selections are remembered for this project.";
+const ACTIVITY_DRAIN_CAP: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Picker {
@@ -41,9 +46,36 @@ pub enum Picker {
     Modes,
 }
 
+#[derive(Debug)]
+pub(crate) enum DispatchOutcome {
+    Command(String),
+    Turn(TurnOutput),
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeSnapshot {
+    pub turns: usize,
+    pub mode: String,
+    pub model: String,
+    pub effort: String,
+    pub parts: Vec<(String, String)>,
+    pub relationships: Vec<Relationship>,
+    pub focus: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InitialViewData {
+    pub transcript: Vec<(String, String)>,
+    pub session: String,
+    pub project: String,
+    pub motion: bool,
+    pub runtime: RuntimeSnapshot,
+}
+
 #[derive(Debug, Clone)]
 pub struct View {
     pub transcript: Vec<(String, String)>,
+    completion_metadata: BTreeMap<usize, String>,
     pub input: String,
     pub cursor: usize,
     pub mode: String,
@@ -77,36 +109,29 @@ pub struct View {
     last_frame_ms: u64,
     operation_start: Option<u64>,
     notice_until: u64,
+    completion_locked: bool,
 }
 
 impl View {
-    pub async fn new(harness: &Harness, models: Vec<ModelInfo>) -> Result<Self> {
-        let transcript: Vec<_> = harness
-            .history()
-            .await?
-            .into_iter()
-            .map(|m| (m.role, m.content))
-            .collect();
+    pub fn from_initial(initial: InitialViewData, models: Vec<ModelInfo>) -> Self {
+        let InitialViewData {
+            transcript,
+            session,
+            project,
+            motion,
+            runtime,
+        } = initial;
         let show_scene = transcript.is_empty();
-        Ok(Self {
+        Self {
+            completion_metadata: BTreeMap::new(),
             transcript,
             input: String::new(),
             cursor: 0,
-            mode: harness.config.mode.to_string(),
-            model: harness.config.model.clone(),
-            effort: harness
-                .config
-                .effort
-                .clone()
-                .unwrap_or_else(|| "default".into()),
-            session: harness.session.id.clone(),
-            parts: harness
-                .topology
-                .parts
-                .iter()
-                .filter(|p| p.active)
-                .map(|p| (p.id.clone(), format!("{} · {}", p.name, p.role)))
-                .collect(),
+            mode: runtime.mode,
+            model: runtime.model,
+            effort: runtime.effort,
+            session,
+            parts: runtime.parts,
             activity: vec![],
             busy: false,
             status: "Ready · /help for commands".into(),
@@ -116,19 +141,14 @@ impl View {
             models,
             scroll: 0,
             frame: 0,
-            motion: !reduced_motion(std::env::var("KURU_REDUCED_MOTION").ok().as_deref()),
+            motion,
             part_activity: BTreeMap::new(),
-            relationships: live_relationships(harness),
-            focus: harness.topology.focus.as_ref().map(|f| f.id.clone()),
+            relationships: runtime.relationships,
+            focus: runtime.focus,
             speaker_id: String::new(),
             routes: vec![],
-            project: harness
-                .cwd()
-                .file_name()
-                .unwrap_or(harness.cwd().as_os_str())
-                .to_string_lossy()
-                .into_owned(),
-            turns: harness.session.turns,
+            project,
+            turns: runtime.turns,
             focused: true,
             show_scene,
             query: String::new(),
@@ -138,7 +158,8 @@ impl View {
             last_frame_ms: 0,
             operation_start: None,
             notice_until: 0,
-        })
+            completion_locked: false,
+        }
     }
 
     /// Ambient frames are slower than busy indicators; all motion uses this
@@ -172,29 +193,20 @@ impl View {
 
     fn begin_operation(&mut self) {
         self.busy = true;
+        self.completion_locked = false;
         self.notice = None;
         self.operation_start = Some(self.clock_ms);
         self.operation_ms = 0;
     }
 
-    fn refresh(&mut self, harness: &Harness) {
-        self.turns = harness.session.turns;
-        self.mode = harness.config.mode.to_string();
-        self.model = harness.config.model.clone();
-        self.effort = harness
-            .config
-            .effort
-            .clone()
-            .unwrap_or_else(|| "default".into());
-        self.parts = harness
-            .topology
-            .parts
-            .iter()
-            .filter(|p| p.active)
-            .map(|p| (p.id.clone(), format!("{} · {}", p.name, p.role)))
-            .collect();
-        self.relationships = live_relationships(harness);
-        self.focus = harness.topology.focus.as_ref().map(|f| f.id.clone());
+    pub fn apply_runtime(&mut self, runtime: RuntimeSnapshot) {
+        self.turns = runtime.turns;
+        self.mode = runtime.mode;
+        self.model = runtime.model;
+        self.effort = runtime.effort;
+        self.parts = runtime.parts;
+        self.relationships = runtime.relationships;
+        self.focus = runtime.focus;
         self.part_activity
             .retain(|id, _| self.parts.iter().any(|(part, _)| part == id));
         self.routes.retain(|(from, to)| {
@@ -317,7 +329,7 @@ impl View {
         } else if event.kind == "state" {
             detail = "modeled state updated".into();
         }
-        if event.kind == "speaker" {
+        if event.kind == "speaker" && !self.completion_locked {
             self.speaker_id = event.actor.clone();
             self.speaker = self
                 .parts
@@ -333,19 +345,64 @@ impl View {
                 });
         }
         if event.kind == "response" {
-            self.transcript.push((self.speaker.clone(), event.detail));
-        } else {
-            self.status = format!("{} · {}", event.kind, self.actor_name(&event.actor));
-            let detail: String = detail
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(140)
-                .collect();
-            self.activity.push(format!("{} · {}", self.status, detail));
-            if self.activity.len() > 100 {
-                self.activity.remove(0);
-            }
+            detail = "response activity".into();
         }
+        let activity_status = format!("{} · {}", event.kind, self.actor_name(&event.actor));
+        if !self.completion_locked {
+            self.status = activity_status.clone();
+        }
+        let detail: String = detail
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(140)
+            .collect();
+        self.activity.push(format!("{activity_status} · {detail}"));
+        if self.activity.len() > 100 {
+            self.activity.remove(0);
+        }
+    }
+
+    pub fn complete_turn(&mut self, output: TurnOutput) {
+        let speaker = output
+            .relationship
+            .as_ref()
+            .map(|relationship| {
+                let members = relationship
+                    .members
+                    .iter()
+                    .map(|id| self.actor_name(id))
+                    .collect::<Vec<_>>();
+                if members.is_empty() {
+                    relationship.kind.to_string()
+                } else {
+                    format!("{} · {}", relationship.kind, members.join(" + "))
+                }
+            })
+            .unwrap_or_else(|| self.actor_name(&output.speaker));
+        self.speaker_id = output.speaker;
+        self.speaker = speaker.clone();
+        let index = self.transcript.len();
+        self.transcript.push((speaker, output.text));
+        let limited = if output.limited {
+            " · limited result"
+        } else {
+            ""
+        };
+        self.completion_metadata.insert(
+            index,
+            format!(
+                "{} input tokens · {} output tokens{limited}",
+                output.input_tokens, output.output_tokens
+            ),
+        );
+        self.show_scene = false;
+        self.status = if output.limited {
+            "Complete · limited result"
+        } else {
+            "Complete"
+        }
+        .into();
+        self.completion_locked = true;
     }
 
     pub fn terminal_event(&mut self, event: TerminalEvent) -> (bool, Option<String>) {
@@ -492,6 +549,56 @@ fn reduced_motion(value: Option<&str>) -> bool {
     value.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
+/// Read the initial TUI presentation from the runtime at the adapter boundary.
+/// `View` itself remains a synchronous owned value.
+pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> {
+    let transcript = harness
+        .history()
+        .await?
+        .into_iter()
+        .map(|message| (message.role, message.content))
+        .collect();
+    Ok(InitialViewData {
+        transcript,
+        session: harness.session.id.clone(),
+        project: harness
+            .cwd()
+            .file_name()
+            .unwrap_or(harness.cwd().as_os_str())
+            .to_string_lossy()
+            .into_owned(),
+        motion: !reduced_motion(std::env::var("KURU_REDUCED_MOTION").ok().as_deref()),
+        runtime: project_runtime_snapshot(harness),
+    })
+}
+
+/// Project mutable runtime state without letting the renderer access a Harness.
+pub fn project_runtime_snapshot(harness: &Harness) -> RuntimeSnapshot {
+    RuntimeSnapshot {
+        turns: harness.session.turns,
+        mode: harness.config.mode.to_string(),
+        model: harness.config.model.clone(),
+        effort: harness
+            .config
+            .effort
+            .clone()
+            .unwrap_or_else(|| "default".into()),
+        parts: harness
+            .topology
+            .parts
+            .iter()
+            .filter(|part| part.active)
+            .map(|part| (part.id.clone(), format!("{} · {}", part.name, part.role)))
+            .collect(),
+        relationships: live_relationships(harness),
+        focus: harness
+            .topology
+            .focus
+            .as_ref()
+            .map(|focus| focus.id.clone()),
+    }
+}
+
 fn live_relationships(harness: &Harness) -> Vec<Relationship> {
     harness
         .topology
@@ -627,177 +734,487 @@ async fn run_loop<B: Backend>(
 where
     B::Error: Send + Sync + 'static,
 {
-    let mut view = View::new(&harness, models).await?;
+    run_loop_with_stream(terminal, harness, models, EventStream::new()).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeSource {
+    Terminal,
+    Completion,
+    Activity,
+    Animation,
+}
+
+impl WakeSource {
+    fn following(self) -> Self {
+        match self {
+            Self::Terminal => Self::Completion,
+            Self::Completion => Self::Activity,
+            Self::Activity => Self::Animation,
+            Self::Animation => Self::Terminal,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Wake {
+    Terminal(Option<io::Result<TerminalEvent>>),
+    Completion(Option<(u64, Result<DispatchOutcome>)>),
+    Activity(Result<Event, broadcast::error::RecvError>),
+    Animation,
+}
+
+struct Scheduler {
+    first: WakeSource,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WakeAvailability {
+    input: bool,
+    completion: bool,
+    activity: bool,
+}
+
+async fn next_wake<S>(
+    scheduler: &Scheduler,
+    input: &mut S,
+    rx: &mut mpsc::Receiver<(u64, Result<DispatchOutcome>)>,
+    events: &mut broadcast::Receiver<Event>,
+    available: WakeAvailability,
+    animation_at: TokioInstant,
+) -> Wake
+where
+    S: Stream<Item = io::Result<TerminalEvent>> + Unpin,
+{
+    // Every ready-source pass cooperates with sibling Tokio work before the
+    // biased source rotation chooses the next wake.
+    tokio::task::yield_now().await;
+    match scheduler.first {
+        WakeSource::Terminal => tokio::select! {
+            biased;
+            event = input.next(), if available.input => Wake::Terminal(event),
+            completion = rx.recv(), if available.completion => Wake::Completion(completion),
+            activity = events.recv(), if available.activity => Wake::Activity(activity),
+            _ = sleep_until(animation_at) => Wake::Animation,
+        },
+        WakeSource::Completion => tokio::select! {
+            biased;
+            completion = rx.recv(), if available.completion => Wake::Completion(completion),
+            activity = events.recv(), if available.activity => Wake::Activity(activity),
+            _ = sleep_until(animation_at) => Wake::Animation,
+            event = input.next(), if available.input => Wake::Terminal(event),
+        },
+        WakeSource::Activity => tokio::select! {
+            biased;
+            activity = events.recv(), if available.activity => Wake::Activity(activity),
+            _ = sleep_until(animation_at) => Wake::Animation,
+            event = input.next(), if available.input => Wake::Terminal(event),
+            completion = rx.recv(), if available.completion => Wake::Completion(completion),
+        },
+        WakeSource::Animation => tokio::select! {
+            biased;
+            _ = sleep_until(animation_at) => Wake::Animation,
+            event = input.next(), if available.input => Wake::Terminal(event),
+            completion = rx.recv(), if available.completion => Wake::Completion(completion),
+            activity = events.recv(), if available.activity => Wake::Activity(activity),
+        },
+    }
+}
+
+fn activity_still_open(open: bool, closed: bool) -> bool {
+    open && !closed
+}
+
+impl Scheduler {
+    fn new() -> Self {
+        Self {
+            first: WakeSource::Terminal,
+        }
+    }
+
+    fn served(&mut self, source: WakeSource) {
+        self.first = source.following();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivityDrain {
+    dirty: bool,
+    closed: bool,
+}
+
+fn drain_activity(
+    events: &mut broadcast::Receiver<Event>,
+    view: &mut View,
+    maximum: usize,
+) -> ActivityDrain {
+    let mut drain = ActivityDrain {
+        dirty: false,
+        closed: false,
+    };
+    let queued = events.len().min(maximum);
+    for _ in 0..queued {
+        match events.try_recv() {
+            Ok(event) => {
+                view.event(event);
+                drain.dirty = true;
+            }
+            Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                view.activity
+                    .push(format!("{count} activity events omitted"));
+                drain.dirty = true;
+            }
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Closed) => {
+                drain.closed = true;
+                break;
+            }
+        }
+    }
+    if events.is_closed() && events.is_empty() {
+        drain.closed = true;
+    }
+    drain
+}
+
+async fn project_runtime(harness: &Arc<Mutex<Harness>>) -> RuntimeSnapshot {
+    let harness = harness.lock().await;
+    project_runtime_snapshot(&harness)
+}
+
+async fn abort_and_fence(job: &mut Option<JoinHandle<()>>, generation: &mut u64) {
+    *generation = generation.wrapping_add(1);
+    if let Some(job) = job.take() {
+        job.abort();
+        let _ = job.await;
+    }
+}
+
+async fn finish_loop(
+    result: Result<()>,
+    job: &mut Option<JoinHandle<()>>,
+    generation: &mut u64,
+    harness: &Arc<Mutex<Harness>>,
+) -> Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    abort_and_fence(job, generation).await;
+    match harness.lock().await.shutdown(false).await {
+        Ok(()) => Err(error),
+        Err(cleanup) => Err(error).context(format!("TUI runtime cleanup also failed: {cleanup:#}")),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionState {
+    Stale,
+    Settled { quit: bool, activity_closed: bool },
+}
+
+async fn apply_completion(
+    completion: (u64, Result<DispatchOutcome>),
+    generation: u64,
+    events: &mut broadcast::Receiver<Event>,
+    view: &mut View,
+    harness: &Arc<Mutex<Harness>>,
+    job: &mut Option<JoinHandle<()>>,
+    quit_pending: bool,
+) -> Result<CompletionState> {
+    let (completed_generation, message) = completion;
+    if completed_generation != generation {
+        return Ok(CompletionState::Stale);
+    }
+
+    let activity = drain_activity(events, view, ACTIVITY_DRAIN_CAP);
+    view.busy = false;
+    *job = None;
+    if quit_pending {
+        message?;
+        return Ok(CompletionState::Settled {
+            quit: true,
+            activity_closed: activity.closed,
+        });
+    }
+    match message {
+        Ok(DispatchOutcome::Command(text)) => {
+            if text.starts_with("Mode:")
+                || text.starts_with("Model:")
+                || text.starts_with("Effort:")
+            {
+                view.notify(format!("{text} · saved for this project"));
+            } else if !text.is_empty() {
+                view.transcript.push(("kuru".into(), text));
+                view.show_scene = false;
+            }
+            view.status = "Complete".into();
+            view.completion_locked = true;
+        }
+        Ok(DispatchOutcome::Turn(output)) => view.complete_turn(output),
+        Err(error) => {
+            view.transcript.push(("error".into(), format!("{error:#}")));
+            view.show_scene = false;
+            view.status = "Failed · details in conversation".into();
+            view.completion_locked = true;
+        }
+    }
+    view.apply_runtime(project_runtime(harness).await);
+    view.settle();
+    Ok(CompletionState::Settled {
+        quit: false,
+        activity_closed: activity.closed,
+    })
+}
+
+async fn cancel_operation(
+    events: &mut broadcast::Receiver<Event>,
+    view: &mut View,
+    harness: &Arc<Mutex<Harness>>,
+    job: &mut Option<JoinHandle<()>>,
+    generation: &mut u64,
+    quit_pending: &mut bool,
+) -> bool {
+    if let Some(job) = job.take() {
+        job.abort();
+        let _ = job.await;
+    }
+    let activity = drain_activity(events, view, ACTIVITY_DRAIN_CAP);
+    *generation = generation.wrapping_add(1);
+    *quit_pending = false;
+    view.busy = false;
+    view.settle();
+    view.apply_runtime(project_runtime(harness).await);
+    view.notice = None;
+    view.status = "Cancelled · turn interrupted".into();
+    view.completion_locked = true;
+    activity.closed
+}
+
+async fn run_loop_with_stream<B, S>(
+    terminal: &mut Terminal<B>,
+    harness: Harness,
+    models: Vec<ModelInfo>,
+    mut input: S,
+) -> Result<()>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+    S: Stream<Item = io::Result<TerminalEvent>> + Unpin,
+{
+    let initial = project_initial_view(&harness).await?;
+    let mut view = View::from_initial(initial, models);
     let mut events = harness.subscribe();
     let harness = Arc::new(Mutex::new(harness));
-    let (tx, mut rx) = mpsc::channel::<(u64, Result<String>)>(8);
+    let (tx, mut rx) = mpsc::channel::<(u64, Result<DispatchOutcome>)>(8);
     let mut job: Option<JoinHandle<()>> = None;
     let mut quit_pending = false;
     let mut generation = 0u64;
     let started = Instant::now();
     let mut dirty = true;
-    loop {
+    let mut scheduler = Scheduler::new();
+    let mut input_open = true;
+    let mut completion_open = true;
+    let mut activity_open = true;
+    let mut animation_at = TokioInstant::now();
+
+    let result: Result<()> = async {
         loop {
-            match events.try_recv() {
-                Ok(event) => {
+            if dirty {
+                terminal
+                    .draw(|frame| draw(frame, &view))
+                    .map_err(|error| anyhow::anyhow!("terminal draw: {error}"))?;
+                dirty = false;
+            }
+
+            let wake = next_wake(
+                &scheduler,
+                &mut input,
+                &mut rx,
+                &mut events,
+                WakeAvailability {
+                    input: input_open,
+                    completion: completion_open,
+                    activity: activity_open,
+                },
+                animation_at,
+            )
+            .await;
+
+            match wake {
+                Wake::Terminal(Some(Ok(event))) => {
+                    scheduler.served(WakeSource::Terminal);
+                    let (redraw, command) = view.terminal_event(event);
+                    dirty |= redraw;
+                    if let Some(command) = command {
+                        if command == "/cancel" {
+                            activity_open = activity_still_open(
+                                activity_open,
+                                cancel_operation(
+                                    &mut events,
+                                    &mut view,
+                                    &harness,
+                                    &mut job,
+                                    &mut generation,
+                                    &mut quit_pending,
+                                )
+                                .await,
+                            );
+                            dirty = true;
+                        } else if command == "/quit" {
+                            if let Some(job) = job.take() {
+                                job.abort();
+                                let _ = job.await;
+                            }
+                            view.begin_operation();
+                            view.part_activity.clear();
+                            view.routes.clear();
+                            view.status = "Closing session".into();
+                            quit_pending = true;
+                            generation = generation.wrapping_add(1);
+                            let harness = harness.clone();
+                            let tx = tx.clone();
+                            job = Some(tokio::spawn(async move {
+                                let result = harness
+                                    .lock()
+                                    .await
+                                    .shutdown(true)
+                                    .await
+                                    .map(|()| DispatchOutcome::Command(String::new()));
+                                let _ = tx.send((generation, result)).await;
+                            }));
+                        } else if command == "/help" {
+                            view.transcript.push(("help".into(), HELP.into()));
+                            view.show_scene = false;
+                        } else if !view.busy {
+                            if command == "/model" {
+                                view.open_picker(Picker::Models);
+                                continue;
+                            }
+                            if command == "/effort" {
+                                view.open_picker(Picker::Efforts);
+                                continue;
+                            }
+                            if command == "/mode" {
+                                view.open_picker(Picker::Modes);
+                                continue;
+                            }
+                            if !command.starts_with('/') {
+                                view.transcript.push(("user".into(), command.clone()));
+                                view.show_scene = false;
+                                view.scroll = 0;
+                            }
+                            view.begin_operation();
+                            view.status = if command.starts_with('/') {
+                                "Updating session"
+                            } else {
+                                "Listening to the parts"
+                            }
+                            .into();
+                            view.part_activity.clear();
+                            view.routes.clear();
+                            generation = generation.wrapping_add(1);
+                            let harness = harness.clone();
+                            let tx = tx.clone();
+                            let models = view.models.clone();
+                            job = Some(tokio::spawn(async move {
+                                let result =
+                                    dispatch(&mut *harness.lock().await, &models, &command).await;
+                                let _ = tx.send((generation, result)).await;
+                            }));
+                        }
+                    }
+                }
+                Wake::Terminal(Some(Err(error))) => {
+                    scheduler.served(WakeSource::Terminal);
+                    return Err(error).context("terminal input");
+                }
+                Wake::Terminal(None) => {
+                    scheduler.served(WakeSource::Terminal);
+                    input_open = false;
+                    anyhow::bail!("terminal input closed");
+                }
+                Wake::Completion(Some(completion)) => {
+                    scheduler.served(WakeSource::Completion);
+                    match apply_completion(
+                        completion,
+                        generation,
+                        &mut events,
+                        &mut view,
+                        &harness,
+                        &mut job,
+                        quit_pending,
+                    )
+                    .await?
+                    {
+                        CompletionState::Stale => {}
+                        CompletionState::Settled {
+                            quit: true,
+                            activity_closed,
+                        } => {
+                            activity_open = activity_still_open(activity_open, activity_closed);
+                            return Ok(());
+                        }
+                        CompletionState::Settled {
+                            quit: false,
+                            activity_closed,
+                        } => {
+                            activity_open = activity_still_open(activity_open, activity_closed);
+                            dirty = true;
+                        }
+                    }
+                }
+                Wake::Completion(None) => {
+                    scheduler.served(WakeSource::Completion);
+                    completion_open = false;
+                    if job.is_some() {
+                        anyhow::bail!("TUI dispatch completion channel closed");
+                    }
+                }
+                Wake::Activity(Ok(event)) => {
+                    scheduler.served(WakeSource::Activity);
                     view.event(event);
                     dirty = true;
                 }
-                Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    view.activity.push(format!("{n} activity events omitted"));
+                Wake::Activity(Err(broadcast::error::RecvError::Lagged(count))) => {
+                    scheduler.served(WakeSource::Activity);
+                    view.activity
+                        .push(format!("{count} activity events omitted"));
                     dirty = true;
                 }
-                Err(_) => break,
-            }
-        }
-        while let Ok((completed_generation, message)) = rx.try_recv() {
-            if completed_generation != generation {
-                continue;
-            }
-            while let Ok(event) = events.try_recv() {
-                view.event(event);
-            }
-            view.busy = false;
-            dirty = true;
-            job = None;
-            if quit_pending {
-                message?;
-                return Ok(());
-            }
-            match message {
-                Ok(text) => {
-                    if text.starts_with("Mode:")
-                        || text.starts_with("Model:")
-                        || text.starts_with("Effort:")
-                    {
-                        view.notify(format!("{text} · saved for this project"));
-                    } else if !text.is_empty() {
-                        view.transcript.push(("kuru".into(), text));
-                        view.show_scene = false;
-                    }
-                    view.status = "Complete".into();
+                Wake::Activity(Err(broadcast::error::RecvError::Closed)) => {
+                    scheduler.served(WakeSource::Activity);
+                    activity_open = false;
                 }
-                Err(error) => {
-                    view.transcript.push(("error".into(), format!("{error:#}")));
-                    view.show_scene = false;
-                    view.status = "Failed · details in conversation".into();
-                }
-            }
-            let h = harness.lock().await;
-            view.refresh(&h);
-            view.settle();
-        }
-        dirty |= view.advance_animation(started.elapsed());
-        if dirty {
-            terminal
-                .draw(|frame| draw(frame, &view))
-                .map_err(|e| anyhow::anyhow!("terminal draw: {e}"))?;
-            dirty = false;
-        }
-        let wait = if view.busy {
-            Duration::from_millis(25)
-        } else {
-            Duration::from_millis(100)
-        };
-        if event::poll(wait)? {
-            let (redraw, command) = view.terminal_event(event::read()?);
-            dirty |= redraw;
-            if let Some(command) = command {
-                if command == "/cancel" {
-                    if let Some(job) = job.take() {
-                        job.abort();
-                        let _ = job.await;
-                    }
-                    while let Ok(event) = events.try_recv() {
-                        view.event(event);
-                    }
-                    generation += 1;
-                    quit_pending = false;
-                    view.busy = false;
-                    view.settle();
-                    view.refresh(&*harness.lock().await);
-                    view.notice = None;
-                    view.status = "Cancelled".into();
-                } else if command == "/quit" {
-                    if let Some(job) = job.take() {
-                        job.abort();
-                        let _ = job.await;
-                    }
-                    view.begin_operation();
-                    view.part_activity.clear();
-                    view.routes.clear();
-                    view.status = "Closing session".into();
-                    quit_pending = true;
-                    generation += 1;
-                    let harness = harness.clone();
-                    let tx = tx.clone();
-                    job = Some(tokio::spawn(async move {
-                        let result = harness
-                            .lock()
-                            .await
-                            .shutdown(true)
-                            .await
-                            .map(|()| String::new());
-                        let _ = tx.send((generation, result)).await;
-                    }));
-                } else if command == "/help" {
-                    view.transcript.push(("help".into(), HELP.into()));
-                    view.show_scene = false;
-                } else if !view.busy {
-                    if command == "/model" {
-                        view.open_picker(Picker::Models);
-                        continue;
-                    }
-                    if command == "/effort" {
-                        view.open_picker(Picker::Efforts);
-                        continue;
-                    }
-                    if command == "/mode" {
-                        view.open_picker(Picker::Modes);
-                        continue;
-                    }
-                    if !command.starts_with('/') {
-                        view.transcript.push(("user".into(), command.clone()));
-                        view.show_scene = false;
-                        view.scroll = 0;
-                    }
-                    view.begin_operation();
-                    view.status = if command.starts_with('/') {
-                        "Updating session"
+                Wake::Animation => {
+                    scheduler.served(WakeSource::Animation);
+                    dirty |= view.advance_animation(started.elapsed());
+                    let delay = if view.busy {
+                        Duration::from_millis(25)
                     } else {
-                        "Listening to the parts"
-                    }
-                    .into();
-                    view.part_activity.clear();
-                    view.routes.clear();
-                    generation += 1;
-                    let harness = harness.clone();
-                    let tx = tx.clone();
-                    let models = view.models.clone();
-                    job = Some(tokio::spawn(async move {
-                        let result = dispatch(&mut *harness.lock().await, &models, &command).await;
-                        let _ = tx.send((generation, result)).await;
-                    }));
+                        Duration::from_millis(100)
+                    };
+                    animation_at = TokioInstant::now() + delay;
                 }
             }
         }
-        tokio::task::yield_now().await;
     }
+    .await;
+    finish_loop(result, &mut job, &mut generation, &harness).await
 }
 
-pub async fn dispatch(
+pub(crate) async fn dispatch(
     harness: &mut Harness,
     models: &[ModelInfo],
     command: &str,
-) -> Result<String> {
+) -> Result<DispatchOutcome> {
     harness.reconcile().await?;
     let (name, args) = command.split_once(' ').unwrap_or((command, ""));
     let args = args.trim();
-    match name {
-        "/parts" => Ok(serde_json::to_string_pretty(&harness.topology)?),
+    let feedback = match name {
+        "/parts" => serde_json::to_string_pretty(&harness.topology)?,
         "/mode" => {
             harness.set_mode(args.parse::<Mode>()?).await?;
-            Ok(format!("Mode: {args}"))
+            format!("Mode: {args}")
         }
         "/model" => {
             ensure!(!args.is_empty(), "model ID required");
@@ -806,7 +1223,7 @@ pub async fn dispatch(
                 .find(|m| m.id == args)
                 .and_then(|m| m.default_effort.clone());
             harness.set_model(args, effort).await?;
-            Ok(format!("Model: {args}"))
+            format!("Model: {args}")
         }
         "/effort" => {
             let effort = if args == "default" {
@@ -817,13 +1234,13 @@ pub async fn dispatch(
             };
             validate_effort(models, &harness.config.model, effort)?;
             harness.set_effort(effort.map(str::to_owned)).await?;
-            Ok(format!("Effort: {args}"))
+            format!("Effort: {args}")
         }
         "/focus" => {
             harness
                 .focus(if args == "auto" { None } else { Some(args) })
                 .await?;
-            Ok(format!("Speaking focus: {args}"))
+            format!("Speaking focus: {args}")
         }
         "/relate" => {
             let (kind, members) = args
@@ -835,75 +1252,338 @@ pub async fn dispatch(
                     members.split(',').map(|m| m.trim().to_owned()).collect(),
                 )
                 .await?;
-            Ok(format!("Activated {} · {}", relation.kind, relation.id))
+            format!("Activated {} · {}", relation.kind, relation.id)
         }
-        "/memory" => Ok(serde_json::to_string_pretty(
-            &harness.memory_for(args).await?,
-        )?),
-        "/memory-status" => Ok(serde_json::to_string_pretty(
-            &harness.memory_status().await?,
-        )?),
-        "/memory-history" => Ok(serde_json::to_string_pretty(
-            &harness.memory_revisions(20).await?,
-        )?),
-        "/dream" => Ok(serde_json::to_string_pretty(&harness.dream().await?)?),
+        "/memory" => serde_json::to_string_pretty(&harness.memory_for(args).await?)?,
+        "/memory-status" => serde_json::to_string_pretty(&harness.memory_status().await?)?,
+        "/memory-history" => serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?,
+        "/dream" => serde_json::to_string_pretty(&harness.dream().await?)?,
         "/undo-dream" => {
             harness.undo_dream().await?;
-            Ok("Previous membership restored.".into())
+            "Previous membership restored.".into()
         }
         _ if command.starts_with('/') => anyhow::bail!("unknown command; use /help"),
-        _ => {
-            harness.run(command).await?;
-            Ok(String::new())
-        }
-    }
+        _ => return Ok(DispatchOutcome::Turn(harness.run(command).await?)),
+    };
+    Ok(DispatchOutcome::Command(feedback))
 }
-
-use anyhow::Context;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuru_connectors::DemoProvider;
-    use kuru_core::Config;
+    use kuru_core::{Framework, RelationshipKind};
     use ratatui::backend::TestBackend;
 
-    async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
-        let dir = tempfile::tempdir().unwrap();
-        let config = Config {
-            provider: "demo".into(),
+    fn runtime_snapshot() -> RuntimeSnapshot {
+        let framework = Framework::builtin(Mode::Ifs);
+        RuntimeSnapshot {
+            turns: 2,
+            mode: "ifs".into(),
             model: "demo".into(),
-            dream_every: 0,
-            dream_on_exit: false,
-            ..Config::default()
-        };
-        let h = Harness::new(
-            config,
-            dir.path(),
-            MemoryStore::temporary().await.unwrap(),
-            Arc::new(DemoProvider),
-            None,
+            effort: "default".into(),
+            parts: framework
+                .parts
+                .into_iter()
+                .map(|part| (part.id, format!("{} · {}", part.name, part.role)))
+                .collect(),
+            relationships: vec![],
+            focus: None,
+        }
+    }
+
+    fn fixture() -> View {
+        View::from_initial(
+            InitialViewData {
+                transcript: vec![],
+                session: "plain-session".into(),
+                project: "plain-project".into(),
+                motion: true,
+                runtime: runtime_snapshot(),
+            },
+            vec![ModelInfo {
+                id: "demo".into(),
+                name: "Demo".into(),
+                efforts: vec!["low".into(), "high".into()],
+                default_effort: Some("low".into()),
+            }],
         )
-        .await
-        .unwrap();
-        let models = vec![ModelInfo {
-            id: "demo".into(),
-            name: "Demo".into(),
-            efforts: vec!["low".into(), "high".into()],
-            default_effort: Some("low".into()),
-        }];
-        (dir, h, models)
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduler_rotates_ready_sources_and_yields_to_siblings() {
+        use futures::stream;
+
+        let mut input = stream::repeat_with(|| Ok(TerminalEvent::Resize(80, 24)));
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        completion_tx
+            .send((7, Ok(DispatchOutcome::Command("completed".into()))))
+            .await
+            .unwrap();
+        let (activity_tx, mut activity_rx) = broadcast::channel(4);
+        activity_tx
+            .send(Event {
+                kind: "active".into(),
+                actor: "part".into(),
+                detail: "ready".into(),
+            })
+            .unwrap();
+        let mut scheduler = Scheduler::new();
+        let deadline = TokioInstant::now() - Duration::from_millis(1);
+        let (progress_tx, mut progress_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            progress_tx.send(()).await.unwrap();
+        });
+
+        let wake = next_wake(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            WakeAvailability {
+                input: true,
+                completion: true,
+                activity: true,
+            },
+            deadline,
+        )
+        .await;
+        assert!(matches!(
+            wake,
+            Wake::Terminal(Some(Ok(TerminalEvent::Resize(80, 24))))
+        ));
+        assert!(
+            progress_rx.try_recv().is_ok(),
+            "production next_wake did not yield to a ready sibling"
+        );
+        scheduler.served(WakeSource::Terminal);
+
+        let wake = next_wake(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            WakeAvailability {
+                input: true,
+                completion: true,
+                activity: true,
+            },
+            deadline,
+        )
+        .await;
+        assert!(matches!(
+            wake,
+            Wake::Completion(Some((7, Ok(DispatchOutcome::Command(_)))))
+        ));
+        scheduler.served(WakeSource::Completion);
+
+        let wake = next_wake(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            WakeAvailability {
+                input: true,
+                completion: true,
+                activity: true,
+            },
+            deadline,
+        )
+        .await;
+        assert!(matches!(wake, Wake::Activity(Ok(Event { .. }))));
+        scheduler.served(WakeSource::Activity);
+
+        let wake = next_wake(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            WakeAvailability {
+                input: true,
+                completion: true,
+                activity: true,
+            },
+            deadline,
+        )
+        .await;
+        assert!(matches!(wake, Wake::Animation));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_completion_wakes_without_waiting_for_the_animation_deadline() {
+        use futures::stream;
+
+        let mut input = stream::pending();
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        completion_tx
+            .send((3, Ok(DispatchOutcome::Command("ready".into()))))
+            .await
+            .unwrap();
+        let (_activity_tx, mut activity_rx) = broadcast::channel(1);
+        let scheduler = Scheduler::new();
+        let wake = next_wake(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            WakeAvailability {
+                input: true,
+                completion: true,
+                activity: true,
+            },
+            TokioInstant::now() + Duration::from_secs(60),
+        )
+        .await;
+        assert!(matches!(
+            wake,
+            Wake::Completion(Some((3, Ok(DispatchOutcome::Command(_)))))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_activity_keeps_completion_and_terminal_input_usable() {
+        use futures::stream;
+
+        let mut input = stream::iter([Ok(TerminalEvent::Resize(80, 24))]);
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        completion_tx
+            .send((8, Ok(DispatchOutcome::Command("ready".into()))))
+            .await
+            .unwrap();
+        let (activity_tx, mut activity_rx) = broadcast::channel(1);
+        drop(activity_tx);
+        let mut scheduler = Scheduler {
+            first: WakeSource::Activity,
+        };
+        let animation_at = TokioInstant::now() + Duration::from_secs(60);
+
+        let wake = next_wake(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            WakeAvailability {
+                input: true,
+                completion: true,
+                activity: true,
+            },
+            animation_at,
+        )
+        .await;
+        assert!(matches!(
+            wake,
+            Wake::Activity(Err(broadcast::error::RecvError::Closed))
+        ));
+        scheduler.served(WakeSource::Activity);
+        let activity_open = activity_still_open(true, true);
+        assert!(!activity_open);
+
+        let wake = next_wake(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            WakeAvailability {
+                input: true,
+                completion: true,
+                activity: activity_open,
+            },
+            animation_at,
+        )
+        .await;
+        assert!(matches!(
+            wake,
+            Wake::Terminal(Some(Ok(TerminalEvent::Resize(80, 24))))
+        ));
+        scheduler.served(WakeSource::Terminal);
+
+        let wake = next_wake(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            WakeAvailability {
+                input: true,
+                completion: true,
+                activity: activity_open,
+            },
+            animation_at,
+        )
+        .await;
+        assert!(matches!(
+            wake,
+            Wake::Completion(Some((8, Ok(DispatchOutcome::Command(_)))))
+        ));
+    }
+
+    #[test]
+    fn activity_drain_is_capped_and_closure_never_reopens() {
+        let mut view = fixture();
+        let (activity_tx, mut activity_rx) = broadcast::channel(512);
+        for index in 0..(ACTIVITY_DRAIN_CAP + 44) {
+            activity_tx
+                .send(Event {
+                    kind: "tool".into(),
+                    actor: "part".into(),
+                    detail: format!("work-{index}"),
+                })
+                .unwrap();
+        }
+        let drained = drain_activity(&mut activity_rx, &mut view, ACTIVITY_DRAIN_CAP);
+        assert!(drained.dirty);
+        assert!(!drained.closed);
+        assert_eq!(activity_rx.len(), 44);
+
+        drop(activity_tx);
+        let drained = drain_activity(&mut activity_rx, &mut view, ACTIVITY_DRAIN_CAP);
+        assert!(drained.closed);
+        let activity_open = activity_still_open(false, drained.closed);
+        assert!(
+            !activity_open,
+            "a closed activity receiver must stay disabled"
+        );
+        assert!(
+            !activity_still_open(activity_open, false),
+            "a later completion or cancellation drain must not reopen activity"
+        );
+    }
+
     #[tokio::test]
-    async fn terminal_dispatch_ignores_releases_without_losing_input_or_animation() {
+    async fn abort_fence_awaits_owned_dispatch_cancellation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed = dropped.clone();
+        let (ready, entered) = tokio::sync::oneshot::channel();
+        let mut job = Some(tokio::spawn(async move {
+            let _drop = OnDrop(observed);
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        entered.await.unwrap();
+        let mut generation = 9;
+        abort_and_fence(&mut job, &mut generation).await;
+        assert_eq!(generation, 10);
+        assert!(job.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn terminal_dispatch_ignores_releases_without_losing_input_or_animation() {
         use crossterm::event::{MouseEvent, MouseEventKind};
 
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+        let mut view = fixture();
         view.motion = true;
         assert!(view.advance_animation(Duration::from_millis(250)));
         let clock = (view.frame, view.clock_ms, view.last_frame_ms);
@@ -995,10 +1675,9 @@ mod tests {
         assert!(view.advance_animation(Duration::from_millis(751)));
     }
 
-    #[tokio::test]
-    async fn ambient_clock_ignores_editing_and_preserves_busy_focus_and_static_behavior() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn ambient_clock_ignores_editing_and_preserves_busy_focus_and_static_behavior() {
+        let mut view = fixture();
         view.motion = true;
         assert!(!view.advance_animation(Duration::from_millis(249)));
         assert!(view.advance_animation(Duration::from_millis(250)));
@@ -1039,12 +1718,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn activity_summarizes_routing_without_disclosing_peer_contents_or_state_notes() {
-        let (_dir, mut h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
-        let from = h.topology.parts[0].id.clone();
-        let to = h.topology.parts[1].id.clone();
+    #[test]
+    fn activity_summarizes_routing_without_disclosing_peer_contents_or_state_notes() {
+        let mut view = fixture();
+        let from = view.parts[0].0.clone();
+        let to = view.parts[1].0.clone();
         let envelope =
             kuru_runtime::PeerMessage::new(&from, &to, "session", "PRIVATE MESSAGE").unwrap();
         for _ in 0..8 {
@@ -1061,13 +1739,8 @@ mod tests {
             actor: to.clone(),
             detail: "{\"activation\":0.9,\"note\":\"PRIVATE NOTE\"}".into(),
         });
-        let relation = h
-            .relate(
-                kuru_core::RelationshipKind::Alliance,
-                vec![from.clone(), to.clone()],
-            )
-            .await
-            .unwrap();
+        let relation =
+            Relationship::new(RelationshipKind::Alliance, vec![from.clone(), to.clone()]).unwrap();
         view.event(Event {
             kind: "relationship".into(),
             actor: from.clone(),
@@ -1083,7 +1756,7 @@ mod tests {
         assert_eq!(view.speaker_id, relation.id);
         let activity = view.activity.join("\n");
         assert!(!activity.contains("PRIVATE"));
-        assert!(activity.contains(&h.topology.parts[1].name));
+        assert!(activity.contains(view.parts[1].1.split_once(" · ").unwrap().0));
         view.event(Event {
             kind: "peer".into(),
             actor: to.clone(),
@@ -1097,17 +1770,132 @@ mod tests {
         });
         view.settle();
         assert_eq!(view.part_activity[&to], "idle");
-        h.topology.parts[0].active = false;
-        view.refresh(&h);
+        let mut next = runtime_snapshot();
+        next.parts.retain(|(id, _)| id != &from);
+        view.apply_runtime(next);
         assert!(view.relationships.is_empty());
         assert!(view.routes.is_empty());
         assert!(!view.parts.iter().any(|(id, _)| id == &from));
     }
 
-    #[tokio::test]
-    async fn unicode_editor_supports_midline_editing_navigation_newlines_and_send() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn response_activity_never_becomes_transcript_content() {
+        let mut view = fixture();
+        view.event(Event {
+            kind: "response".into(),
+            actor: "misleading-speaker".into(),
+            detail: "BROADCAST_RESPONSE_MUST_NOT_BE_A_FINAL_ANSWER".into(),
+        });
+
+        assert!(view.transcript.is_empty());
+        assert!(
+            !view
+                .activity
+                .join("\n")
+                .contains("BROADCAST_RESPONSE_MUST_NOT_BE_A_FINAL_ANSWER")
+        );
+    }
+
+    #[test]
+    fn completed_turn_keeps_returned_facts_when_activity_arrives_late() {
+        let mut view = fixture();
+        let members = view.parts[..2]
+            .iter()
+            .map(|part| part.0.clone())
+            .collect::<Vec<_>>();
+        let relation = Relationship::new(RelationshipKind::Alliance, members).unwrap();
+        view.complete_turn(TurnOutput {
+            session: view.session.clone(),
+            speaker: relation.id.clone(),
+            text: "AUTHORITATIVE_RESPONSE".into(),
+            relationship: Some(relation.clone()),
+            input_tokens: 13,
+            output_tokens: 29,
+            limited: true,
+            events: vec![],
+        });
+        view.event(Event {
+            kind: "speaker".into(),
+            actor: "misleading-speaker".into(),
+            detail: "misleading speaker".into(),
+        });
+        view.event(Event {
+            kind: "response".into(),
+            actor: "misleading-speaker".into(),
+            detail: "DUPLICATE_RESPONSE_MUST_STAY_ACTIVITY".into(),
+        });
+
+        assert_eq!(view.speaker_id, relation.id);
+        assert!(view.speaker.starts_with("alliance · "));
+        assert_eq!(
+            view.transcript
+                .iter()
+                .filter(|(_, text)| text == "AUTHORITATIVE_RESPONSE")
+                .count(),
+            1
+        );
+        assert_eq!(
+            view.completion_metadata,
+            BTreeMap::from([(
+                0,
+                "13 input tokens · 29 output tokens · limited result".into()
+            )])
+        );
+        assert!(
+            !view
+                .transcript
+                .iter()
+                .any(|(_, text)| text == "DUPLICATE_RESPONSE_MUST_STAY_ACTIVITY")
+        );
+        assert!(
+            view.activity
+                .last()
+                .is_some_and(|activity| activity.starts_with("response · "))
+        );
+        assert_eq!(view.status, "Complete · limited result");
+    }
+
+    #[test]
+    fn completion_metadata_stays_with_its_answer_at_wide_and_narrow_sizes() {
+        let mut view = fixture();
+        view.complete_turn(TurnOutput {
+            session: view.session.clone(),
+            speaker: view.parts[0].0.clone(),
+            text: "COMPLETION_TEXT".into(),
+            relationship: None,
+            input_tokens: 8,
+            output_tokens: 5,
+            limited: true,
+            events: vec![],
+        });
+
+        for size in [(120, 35), (60, 20)] {
+            let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+            terminal.draw(|frame| draw(frame, &view)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            for expected in [
+                "COMPLETION_TEXT",
+                "8 input tokens",
+                "5 output tokens",
+                "limited result",
+            ] {
+                assert!(
+                    screen.contains(expected),
+                    "{size:?} omitted {expected}:\n{screen}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_editor_supports_midline_editing_navigation_newlines_and_send() {
+        let mut view = fixture();
         for c in "a猫🌿".chars() {
             view.key(key(KeyCode::Char(c)));
         }
@@ -1157,10 +1945,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn pickers_select_models_efforts_modes_and_handle_empty_catalogs() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn pickers_select_models_efforts_modes_and_handle_empty_catalogs() {
+        let mut view = fixture();
         for (function, expected) in [
             (2, "/model demo"),
             (3, "/effort low"),
@@ -1185,10 +1972,9 @@ mod tests {
         assert_eq!(view.key(key(KeyCode::Enter)).unwrap(), "/effort default");
     }
 
-    #[tokio::test]
-    async fn picker_search_and_paste_preserve_drafts_and_busy_settings_are_explained() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn picker_search_and_paste_preserve_drafts_and_busy_settings_are_explained() {
+        let mut view = fixture();
         view.paste("An unsent 猫 draft");
         let draft = view.input.clone();
         view.key(key(KeyCode::F(4)));
@@ -1212,10 +1998,9 @@ mod tests {
         assert_eq!(view.input, draft);
     }
 
-    #[tokio::test]
-    async fn rendering_handles_small_terminals_long_chats_activity_and_popups() {
-        let (_dir, h, models) = fixture().await;
-        let mut view = View::new(&h, models).await.unwrap();
+    #[test]
+    fn rendering_handles_small_terminals_long_chats_activity_and_popups() {
+        let mut view = fixture();
         for size in [(120, 35), (60, 20), (10, 5), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
             terminal.draw(|f| draw(f, &view)).unwrap();
@@ -1233,10 +2018,15 @@ mod tests {
             });
         }
         assert_eq!(view.activity.len(), 100);
-        view.event(Event {
-            kind: "response".into(),
-            actor: "speaker".into(),
-            detail: "Completed task".into(),
+        view.complete_turn(TurnOutput {
+            session: view.session.clone(),
+            speaker: "speaker".into(),
+            text: "Completed task".into(),
+            relationship: None,
+            input_tokens: 8,
+            output_tokens: 5,
+            limited: true,
+            events: vec![],
         });
         assert_eq!(view.transcript.last().unwrap().1, "Completed task");
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
@@ -1250,6 +2040,8 @@ mod tests {
         assert!(text.contains("KURU"));
         assert!(text.contains("PARTS /"));
         assert!(text.contains("Completed task"));
+        assert!(text.contains("8 input tokens"));
+        assert!(text.contains("limited result"));
         view.picker = Some(Picker::Models);
         terminal.draw(|f| draw(f, &view)).unwrap();
         let text = terminal
@@ -1263,88 +2055,64 @@ mod tests {
         assert!(text.contains("Enter selects"));
     }
 
-    #[tokio::test]
-    async fn slash_commands_change_real_runtime_state_and_validate_errors() {
-        let (_dir, mut h, models) = fixture().await;
-        assert!(
-            dispatch(&mut h, &models, "/parts")
-                .await
-                .unwrap()
-                .contains("manager")
+    #[test]
+    fn applying_runtime_snapshot_preserves_initial_editor_and_completion_state() {
+        let initial_runtime = runtime_snapshot();
+        let original_parts = initial_runtime.parts.clone();
+        let mut view = View::from_initial(
+            InitialViewData {
+                transcript: vec![("user".into(), "initial transcript".into())],
+                session: "initial-session".into(),
+                project: "initial-project".into(),
+                motion: true,
+                runtime: initial_runtime,
+            },
+            vec![],
         );
-        dispatch(&mut h, &models, "/mode freudian").await.unwrap();
-        assert_eq!(h.config.mode, Mode::Freudian);
-        dispatch(&mut h, &models, "/model demo").await.unwrap();
-        assert_eq!(h.config.effort.as_deref(), Some("low"));
-        dispatch(&mut h, &models, "/effort high").await.unwrap();
-        assert_eq!(h.config.effort.as_deref(), Some("high"));
-        assert!(
-            dispatch(&mut h, &models, "/effort impossible")
-                .await
-                .is_err()
+        view.input = "editor draft".into();
+        view.cursor = view.input.len();
+        view.complete_turn(TurnOutput {
+            session: "initial-session".into(),
+            speaker: original_parts[0].0.clone(),
+            text: "typed completion".into(),
+            relationship: None,
+            input_tokens: 3,
+            output_tokens: 5,
+            limited: false,
+            events: vec![],
+        });
+        let next_framework = Framework::builtin(Mode::Freudian);
+        view.apply_runtime(RuntimeSnapshot {
+            turns: 9,
+            mode: "freudian".into(),
+            model: "next-model".into(),
+            effort: "high".into(),
+            parts: next_framework
+                .parts
+                .into_iter()
+                .map(|part| (part.id, format!("{} · {}", part.name, part.role)))
+                .collect(),
+            relationships: vec![],
+            focus: None,
+        });
+        assert_eq!(
+            view.transcript[0],
+            ("user".into(), "initial transcript".into())
         );
-        dispatch(&mut h, &models, "/effort default").await.unwrap();
-        assert!(h.config.effort.is_none());
-        let ids = h.topology.parts[..2]
-            .iter()
-            .map(|p| p.id.clone())
-            .collect::<Vec<_>>();
-        dispatch(&mut h, &models, &format!("/focus {}", ids[0]))
-            .await
-            .unwrap();
-        assert!(h.topology.focus.is_some());
-        dispatch(&mut h, &models, "/focus auto").await.unwrap();
-        assert!(h.topology.focus.is_none());
-        dispatch(
-            &mut h,
-            &models,
-            &format!("/relate alliance {},{}", ids[0], ids[1]),
-        )
-        .await
-        .unwrap();
-        assert_eq!(h.topology.relationships.len(), 1);
-        dispatch(&mut h, &models, "hello").await.unwrap();
-        assert!(
-            dispatch(&mut h, &models, &format!("/memory {}", ids[0]))
-                .await
-                .unwrap()
-                .contains("hello")
+        assert_eq!(view.transcript[1].1, "typed completion");
+        assert_eq!(view.session, "initial-session");
+        assert_eq!(view.project, "initial-project");
+        assert!(view.motion);
+        assert_eq!(view.input, "editor draft");
+        assert_eq!(view.cursor, "editor draft".len());
+        assert_eq!(
+            view.completion_metadata[&1],
+            "3 input tokens · 5 output tokens"
         );
-        assert!(
-            dispatch(&mut h, &models, "/dream")
-                .await
-                .unwrap()
-                .contains("summaries")
-        );
-        h.apply_dream(vec![kuru_runtime::DreamProposal::Add {
-            name: "Extra".into(),
-            role: h.topology.parts[0].role.clone(),
-            instruction: "Complement".into(),
-        }])
-        .await
-        .unwrap();
-        dispatch(&mut h, &models, "/undo-dream").await.unwrap();
-        let status: serde_json::Value =
-            serde_json::from_str(&dispatch(&mut h, &models, "/memory-status").await.unwrap())
-                .unwrap();
-        assert_eq!(status["engine"], "dolt");
-        let revisions: serde_json::Value =
-            serde_json::from_str(&dispatch(&mut h, &models, "/memory-history").await.unwrap())
-                .unwrap();
-        assert!(
-            revisions
-                .as_array()
-                .is_some_and(|revisions| !revisions.is_empty())
-        );
-        for bad in [
-            "/unknown",
-            "/relate",
-            "/mode unknown",
-            "/model",
-            "/effort",
-            "/memory missing",
-        ] {
-            assert!(dispatch(&mut h, &models, bad).await.is_err(), "{bad}");
-        }
+        assert_eq!(view.mode, "freudian");
+        assert_eq!(view.model, "next-model");
+        assert_eq!(view.effort, "high");
+        assert_eq!(view.turns, 9);
+        assert_ne!(view.parts, original_parts);
     }
 }

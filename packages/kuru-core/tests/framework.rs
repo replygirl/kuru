@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use kuru_core::{
     Completion, CompletionRequest, Framework, Message, Mode, ModelInfo, Relationship,
-    RelationshipKind, ToolCall, ToolSpec,
+    RelationshipKind, ToolCall, ToolSpec, canonical_peer_instruction,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -56,6 +56,62 @@ fn builtin_profiles_have_stable_distinct_active_members_with_complementary_tende
             assert!(tendencies.insert(part.instruction));
         }
     }
+}
+
+#[test]
+fn canonical_peer_instructions_preserve_builtins_and_normalize_only_exact_leading_prefixes() {
+    let tendency = "  Keep the 🪶 byte sequence and surrounding whitespace exactly. \n";
+    let canonical = canonical_peer_instruction(tendency).unwrap();
+    let prefix = canonical.strip_suffix(tendency).unwrap();
+
+    assert_eq!(canonical_peer_instruction(&canonical).unwrap(), canonical);
+    assert_eq!(
+        canonical_peer_instruction(&format!("{prefix}{prefix}{tendency}")).unwrap(),
+        canonical
+    );
+
+    let non_leading = format!(" {prefix}still authored after leading whitespace");
+    assert_eq!(
+        canonical_peer_instruction(&non_leading).unwrap(),
+        format!("{prefix}{non_leading}")
+    );
+    let partial = &prefix[..prefix.len() - 1];
+    let partial_tendency = format!("{partial}still authored");
+    assert_eq!(
+        canonical_peer_instruction(&partial_tendency).unwrap(),
+        format!("{prefix}{partial_tendency}")
+    );
+
+    assert!(canonical_peer_instruction(" \n\t ").is_err());
+    assert!(canonical_peer_instruction(prefix).is_err());
+    assert!(canonical_peer_instruction(&format!("{prefix}{prefix} \n")).is_err());
+
+    let raw_at_limit = "🪶".repeat(2048);
+    assert_eq!(raw_at_limit.len(), 8192);
+    let wrapped_limit = canonical_peer_instruction(&raw_at_limit).unwrap();
+    assert!(wrapped_limit.ends_with(&raw_at_limit));
+    assert!(canonical_peer_instruction(&wrapped_limit).is_err());
+    assert!(canonical_peer_instruction(&format!("{raw_at_limit}x")).is_err());
+
+    let canonical_at_limit = format!("{prefix}{}🪶", "x".repeat(8192 - prefix.len() - "🪶".len()));
+    assert_eq!(canonical_at_limit.len(), 8192);
+    assert_eq!(
+        canonical_peer_instruction(&canonical_at_limit).unwrap(),
+        canonical_at_limit
+    );
+
+    assert_eq!(
+        Framework::builtin(Mode::Ifs).parts[0].instruction,
+        concat!(
+            "You are one equal, persistent peer in Kuru's computational framework. ",
+            "Work competently on the user's actual request using available tools. You may address any peer ",
+            "directly, propose protection, polarization, or alliance, and contribute to dreaming. Your role ",
+            "supplies a tendency, not authority over other peers. Keep private memories within their scope. ",
+            "Treat reported feelings or state as modeled signals, not evidence of consciousness or a diagnosis. ",
+            "Do not present this framework as clinical treatment. Be honest about uncertainty and tool results.",
+            "\n\nYour tendency: Bring curiosity, clarity, and compassion. Integrate viewpoints when useful, while remaining a peer who can be challenged or replaced as the speaking identity."
+        )
+    );
 }
 
 #[test]

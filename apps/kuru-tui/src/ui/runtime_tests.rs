@@ -1,0 +1,725 @@
+use std::{
+    collections::VecDeque,
+    convert::Infallible,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::Poll,
+    thread,
+    time::Duration,
+};
+
+use futures::{Stream, stream};
+use kuru_connectors::{DemoProvider, Provider};
+use kuru_core::{Completion, CompletionRequest, Config, Mode, ModelInfo};
+use kuru_memory::MemoryStore;
+use kuru_runtime::{Harness, TurnOutput};
+use ratatui::{
+    Terminal,
+    backend::{Backend, ClearType, TestBackend, WindowSize},
+    buffer::Cell,
+    layout::{Position, Size},
+};
+use tokio::{
+    sync::{Notify, broadcast, mpsc},
+    time::Instant as TokioInstant,
+};
+
+use super::{
+    ACTIVITY_DRAIN_CAP, CompletionState, DispatchOutcome, Scheduler, TerminalEvent, View, Wake,
+    WakeAvailability, apply_completion, dispatch, next_wake, project_initial_view,
+    project_runtime_snapshot, run_loop_with_stream,
+};
+
+async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::new(
+        Config {
+            provider: "demo".into(),
+            model: "demo".into(),
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        },
+        directory.path(),
+        MemoryStore::temporary().await.unwrap(),
+        Arc::new(DemoProvider),
+        None,
+    )
+    .await
+    .unwrap();
+    let models = vec![ModelInfo {
+        id: "demo".into(),
+        name: "Demo".into(),
+        efforts: vec!["low".into(), "high".into()],
+        default_effort: Some("low".into()),
+    }];
+    (directory, harness, models)
+}
+
+fn command_text(outcome: DispatchOutcome) -> String {
+    match outcome {
+        DispatchOutcome::Command(text) => text,
+        DispatchOutcome::Turn(_) => panic!("expected command feedback"),
+    }
+}
+
+fn seed_stale_runtime(view: &mut View) {
+    view.turns = usize::MAX;
+    view.mode = "stale-mode".into();
+    view.model = "stale-model".into();
+    view.effort = "stale-effort".into();
+    view.parts = vec![("stale-part".into(), "Stale · role".into())];
+    view.relationships.clear();
+    view.focus = Some("stale-focus".into());
+    view.part_activity
+        .insert("stale-part".into(), "active".into());
+    view.routes.push(("stale-part".into(), "missing".into()));
+}
+
+async fn assert_runtime_projection(view: &View, harness: &Arc<tokio::sync::Mutex<Harness>>) {
+    let runtime = {
+        let harness = harness.lock().await;
+        project_runtime_snapshot(&harness)
+    };
+    assert_eq!(view.turns, runtime.turns);
+    assert_eq!(view.mode, runtime.mode);
+    assert_eq!(view.model, runtime.model);
+    assert_eq!(view.effort, runtime.effort);
+    assert_eq!(view.parts, runtime.parts);
+    assert_eq!(view.relationships, runtime.relationships);
+    assert_eq!(view.focus, runtime.focus);
+    assert!(view.part_activity.is_empty());
+    assert!(view.routes.is_empty());
+}
+
+#[tokio::test]
+async fn slash_commands_change_real_runtime_state_and_validate_errors() {
+    let (_dir, mut h, models) = fixture().await;
+    assert!(command_text(dispatch(&mut h, &models, "/parts").await.unwrap()).contains("manager"));
+    dispatch(&mut h, &models, "/mode freudian").await.unwrap();
+    assert_eq!(h.config.mode, Mode::Freudian);
+    dispatch(&mut h, &models, "/model demo").await.unwrap();
+    assert_eq!(h.config.effort.as_deref(), Some("low"));
+    dispatch(&mut h, &models, "/effort high").await.unwrap();
+    assert_eq!(h.config.effort.as_deref(), Some("high"));
+    assert!(
+        dispatch(&mut h, &models, "/effort impossible")
+            .await
+            .is_err()
+    );
+    dispatch(&mut h, &models, "/effort default").await.unwrap();
+    assert!(h.config.effort.is_none());
+    let ids = h.topology.parts[..2]
+        .iter()
+        .map(|p| p.id.clone())
+        .collect::<Vec<_>>();
+    dispatch(&mut h, &models, &format!("/focus {}", ids[0]))
+        .await
+        .unwrap();
+    assert!(h.topology.focus.is_some());
+    dispatch(&mut h, &models, "/focus auto").await.unwrap();
+    assert!(h.topology.focus.is_none());
+    dispatch(
+        &mut h,
+        &models,
+        &format!("/relate alliance {},{}", ids[0], ids[1]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.topology.relationships.len(), 1);
+    assert!(matches!(
+        dispatch(&mut h, &models, "hello").await.unwrap(),
+        DispatchOutcome::Turn(_)
+    ));
+    assert!(
+        command_text(
+            dispatch(&mut h, &models, &format!("/memory {}", ids[0]))
+                .await
+                .unwrap()
+        )
+        .contains("hello")
+    );
+    assert!(command_text(dispatch(&mut h, &models, "/dream").await.unwrap()).contains("summaries"));
+    h.apply_dream(vec![kuru_runtime::DreamProposal::Add {
+        name: "Extra".into(),
+        role: h.topology.parts[0].role.clone(),
+        instruction: "Complement".into(),
+    }])
+    .await
+    .unwrap();
+    dispatch(&mut h, &models, "/undo-dream").await.unwrap();
+    let status: serde_json::Value = serde_json::from_str(&command_text(
+        dispatch(&mut h, &models, "/memory-status").await.unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(status["engine"], "dolt");
+    let revisions: serde_json::Value = serde_json::from_str(&command_text(
+        dispatch(&mut h, &models, "/memory-history").await.unwrap(),
+    ))
+    .unwrap();
+    assert!(
+        revisions
+            .as_array()
+            .is_some_and(|revisions| !revisions.is_empty())
+    );
+    for bad in [
+        "/unknown",
+        "/relate",
+        "/mode unknown",
+        "/model",
+        "/effort",
+        "/memory missing",
+    ] {
+        assert!(dispatch(&mut h, &models, bad).await.is_err(), "{bad}");
+    }
+}
+
+struct BlockingProvider {
+    started: AtomicUsize,
+    dropped: AtomicUsize,
+    wake: Notify,
+}
+
+impl BlockingProvider {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+            wake: Notify::new(),
+        })
+    }
+
+    async fn wait_started(&self) -> io::Result<()> {
+        let notified = self.wake.notified();
+        if self.started.load(Ordering::SeqCst) > 0 {
+            return Ok(());
+        }
+        tokio::time::timeout(Duration::from_secs(5), notified)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "provider did not start"))?;
+        if self.started.load(Ordering::SeqCst) == 0 {
+            return Err(io::Error::other("provider start notification was spurious"));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for BlockingProvider {
+    async fn models(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, _: CompletionRequest) -> anyhow::Result<Completion> {
+        struct Dropped<'a>(&'a AtomicUsize);
+        impl Drop for Dropped<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let _dropped = Dropped(&self.dropped);
+        self.started.fetch_add(1, Ordering::SeqCst);
+        self.wake.notify_one();
+        std::future::pending::<anyhow::Result<Completion>>().await
+    }
+}
+
+async fn blocking_fixture(provider: Arc<BlockingProvider>) -> (tempfile::TempDir, Harness) {
+    let directory = tempfile::tempdir().unwrap();
+    let harness = Harness::new(
+        Config {
+            provider: "demo".into(),
+            model: "demo".into(),
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        },
+        directory.path(),
+        MemoryStore::temporary().await.unwrap(),
+        provider,
+        None,
+    )
+    .await
+    .unwrap();
+    (directory, harness)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Failure {
+    Eof,
+    Read,
+    Draw,
+}
+
+fn controlled_input(
+    provider: Arc<BlockingProvider>,
+    failure: Failure,
+) -> impl Stream<Item = io::Result<TerminalEvent>> + Unpin {
+    let mut events = VecDeque::from([
+        TerminalEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        )),
+        TerminalEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    ]);
+    Box::pin(stream::unfold(
+        (provider, failure, false),
+        move |(provider, failure, released)| {
+            let event = events.pop_front();
+            async move {
+                if let Some(event) = event {
+                    return Some((Ok(event), (provider, failure, released)));
+                }
+                if released {
+                    return None;
+                }
+                if let Err(error) = provider.wait_started().await {
+                    return Some((Err(error), (provider, failure, true)));
+                }
+                match failure {
+                    Failure::Eof => None,
+                    Failure::Read => Some((
+                        Err(io::Error::other("injected terminal read failure")),
+                        (provider, failure, true),
+                    )),
+                    Failure::Draw => {
+                        Some((Ok(TerminalEvent::Resize(80, 24)), (provider, failure, true)))
+                    }
+                }
+            }
+        },
+    ))
+}
+
+struct FailingBackend {
+    inner: TestBackend,
+    provider: Arc<BlockingProvider>,
+}
+
+impl FailingBackend {
+    fn new(provider: Arc<BlockingProvider>) -> Self {
+        Self {
+            inner: TestBackend::new(80, 24),
+            provider,
+        }
+    }
+}
+
+fn backend_result<T>(result: std::result::Result<T, Infallible>) -> io::Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(never) => match never {},
+    }
+}
+
+impl Backend for FailingBackend {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        if self.provider.started.load(Ordering::SeqCst) > 0 {
+            return Err(io::Error::other("injected backend failure"));
+        }
+        backend_result(self.inner.draw(content))
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        backend_result(self.inner.hide_cursor())
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        backend_result(self.inner.show_cursor())
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        backend_result(self.inner.get_cursor_position())
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        backend_result(self.inner.set_cursor_position(position))
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        backend_result(self.inner.clear())
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        backend_result(self.inner.clear_region(clear_type))
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        backend_result(self.inner.size())
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        backend_result(self.inner.window_size())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        backend_result(self.inner.flush())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_loop_eof_read_and_draw_failures_abort_the_owned_provider_before_returning() {
+    for failure in [Failure::Eof, Failure::Read, Failure::Draw] {
+        let provider = BlockingProvider::new();
+        let (_directory, harness) = blocking_fixture(provider.clone()).await;
+        let input = controlled_input(provider.clone(), failure);
+        let error = tokio::time::timeout(Duration::from_secs(15), async {
+            match failure {
+                Failure::Eof | Failure::Read => {
+                    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                    run_loop_with_stream(&mut terminal, harness, vec![], input).await
+                }
+                Failure::Draw => {
+                    let mut terminal =
+                        Terminal::new(FailingBackend::new(provider.clone())).unwrap();
+                    run_loop_with_stream(&mut terminal, harness, vec![], input).await
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{failure:?} loop timeout: provider started={}, dropped={}",
+                provider.started.load(Ordering::SeqCst),
+                provider.dropped.load(Ordering::SeqCst)
+            )
+        })
+        .unwrap_err();
+        let expected = match failure {
+            Failure::Eof => "terminal input closed",
+            Failure::Read => "terminal input: injected terminal read failure",
+            Failure::Draw => "terminal draw: injected backend failure",
+        };
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        let started = provider.started.load(Ordering::SeqCst);
+        let dropped = provider.dropped.load(Ordering::SeqCst);
+        assert!(started > 0, "{expected} returned before provider entry");
+        assert!(
+            dropped >= started,
+            "{expected} returned before every active provider future dropped: started={started}, dropped={dropped}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations() {
+    let (_directory, harness, _) = fixture().await;
+    let mut events = harness.subscribe();
+    let harness = Arc::new(tokio::sync::Mutex::new(harness));
+    let initial = {
+        let harness = harness.lock().await;
+        project_initial_view(&harness).await.unwrap()
+    };
+    let mut view = View::from_initial(initial, vec![]);
+    let mut job = None;
+
+    seed_stale_runtime(&mut view);
+    view.begin_operation();
+    let session = view.session.clone();
+    let outcome = apply_completion(
+        (
+            4,
+            Ok(DispatchOutcome::Turn(TurnOutput {
+                session,
+                speaker: view.parts[0].0.clone(),
+                text: "authoritative completion".into(),
+                relationship: None,
+                input_tokens: 11,
+                output_tokens: 7,
+                limited: false,
+                events: vec![],
+            })),
+        ),
+        4,
+        &mut events,
+        &mut view,
+        &harness,
+        &mut job,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        CompletionState::Settled { quit: false, .. }
+    ));
+    assert_eq!(
+        view.transcript.last().unwrap().1,
+        "authoritative completion"
+    );
+    assert_eq!(view.status, "Complete");
+    assert!(!view.busy);
+    assert!(view.operation_start.is_none());
+    assert_eq!(
+        view.completion_metadata[&0],
+        "11 input tokens · 7 output tokens"
+    );
+    assert_runtime_projection(&view, &harness).await;
+
+    seed_stale_runtime(&mut view);
+    view.begin_operation();
+    let outcome = apply_completion(
+        (5, Ok(DispatchOutcome::Command("Mode: freudian".into()))),
+        5,
+        &mut events,
+        &mut view,
+        &harness,
+        &mut job,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        CompletionState::Settled { quit: false, .. }
+    ));
+    assert_eq!(view.status, "Complete");
+    assert!(
+        view.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("saved for this project"))
+    );
+    assert!(view.operation_start.is_none());
+    assert_runtime_projection(&view, &harness).await;
+
+    seed_stale_runtime(&mut view);
+    view.begin_operation();
+    let outcome = apply_completion(
+        (6, Err(anyhow::anyhow!("controlled dispatch failure"))),
+        6,
+        &mut events,
+        &mut view,
+        &harness,
+        &mut job,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        CompletionState::Settled { quit: false, .. }
+    ));
+    assert_eq!(view.status, "Failed · details in conversation");
+    assert!(view.transcript.last().is_some_and(
+        |(role, text)| role == "error" && text.contains("controlled dispatch failure")
+    ));
+    assert!(view.operation_start.is_none());
+    assert_runtime_projection(&view, &harness).await;
+
+    seed_stale_runtime(&mut view);
+    view.begin_operation();
+    view.completion_locked = true;
+    job = Some(tokio::spawn(std::future::pending()));
+    let before = (
+        view.transcript.clone(),
+        view.status.clone(),
+        view.busy,
+        view.operation_start,
+        view.turns,
+        view.mode.clone(),
+        view.model.clone(),
+        view.effort.clone(),
+        view.parts.clone(),
+        view.relationships.clone(),
+        view.focus.clone(),
+        view.completion_locked,
+    );
+    let outcome = apply_completion(
+        (6, Ok(DispatchOutcome::Command("STALE".into()))),
+        7,
+        &mut events,
+        &mut view,
+        &harness,
+        &mut job,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, CompletionState::Stale);
+    assert_eq!(
+        (
+            view.transcript,
+            view.status,
+            view.busy,
+            view.operation_start,
+            view.turns,
+            view.mode,
+            view.model,
+            view.effort,
+            view.parts,
+            view.relationships,
+            view.focus,
+            view.completion_locked,
+        ),
+        before
+    );
+    assert!(
+        job.is_some(),
+        "a stale completion must not clear the live job"
+    );
+    job.take().unwrap().abort();
+}
+
+#[tokio::test]
+async fn queued_completion_wakes_before_a_future_animation_deadline_and_reaches_completion() {
+    let (_directory, harness, _) = fixture().await;
+    let harness = Arc::new(tokio::sync::Mutex::new(harness));
+    let initial = {
+        let harness = harness.lock().await;
+        project_initial_view(&harness).await.unwrap()
+    };
+    let mut view = View::from_initial(initial, vec![]);
+    let mut input = stream::pending();
+    let (completion_tx, mut completion_rx) = mpsc::channel(1);
+    let (_activity_tx, mut events) = broadcast::channel(1);
+    let deadline = TokioInstant::now() + Duration::from_secs(60);
+    let frame = view.frame;
+    view.begin_operation();
+    let scheduler = Scheduler::new();
+
+    let mut wake = Box::pin(next_wake(
+        &scheduler,
+        &mut input,
+        &mut completion_rx,
+        &mut events,
+        WakeAvailability {
+            input: true,
+            completion: true,
+            activity: true,
+        },
+        deadline,
+    ));
+    for stage in ["cooperative yield", "all-pending select"] {
+        futures::future::poll_fn(|context| {
+            assert!(
+                matches!(wake.as_mut().poll(context), Poll::Pending),
+                "scheduler unexpectedly resolved while reaching {stage}"
+            );
+            Poll::Ready(())
+        })
+        .await;
+    }
+    completion_tx
+        .send((
+            3,
+            Ok(DispatchOutcome::Command("scheduler completion".into())),
+        ))
+        .await
+        .unwrap();
+    let wake = wake.await;
+    let Wake::Completion(Some(completion)) = wake else {
+        panic!("completion should wake before the future animation deadline");
+    };
+    let mut job = None;
+    let result = apply_completion(
+        completion,
+        3,
+        &mut events,
+        &mut view,
+        &harness,
+        &mut job,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        result,
+        CompletionState::Settled { quit: false, .. }
+    ));
+    assert_eq!(view.frame, frame, "completion must not advance motion time");
+    assert_eq!(
+        view.transcript.last(),
+        Some(&(String::from("kuru"), String::from("scheduler completion")))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completion_caps_activity_while_a_concurrent_sender_continues_producing() {
+    let (_directory, harness, _) = fixture().await;
+    let harness = Arc::new(tokio::sync::Mutex::new(harness));
+    let initial = {
+        let harness = harness.lock().await;
+        project_initial_view(&harness).await.unwrap()
+    };
+    let mut view = View::from_initial(initial, vec![]);
+    let (activity_tx, mut events) = broadcast::channel(1024);
+    for index in 0..(ACTIVITY_DRAIN_CAP + 44) {
+        activity_tx
+            .send(kuru_runtime::Event {
+                kind: "tool".into(),
+                actor: "part".into(),
+                detail: format!("queued-{index}"),
+            })
+            .unwrap();
+    }
+    let producer = {
+        let activity_tx = activity_tx.clone();
+        thread::spawn(move || {
+            for index in 0..128 {
+                activity_tx
+                    .send(kuru_runtime::Event {
+                        kind: "tool".into(),
+                        actor: "part".into(),
+                        detail: format!("concurrent-{index}"),
+                    })
+                    .unwrap();
+                thread::yield_now();
+            }
+        })
+    };
+
+    view.begin_operation();
+    let mut job = None;
+    let result = apply_completion(
+        (
+            9,
+            Ok(DispatchOutcome::Command("completed after activity".into())),
+        ),
+        9,
+        &mut events,
+        &mut view,
+        &harness,
+        &mut job,
+        false,
+    )
+    .await
+    .unwrap();
+    producer.join().unwrap();
+
+    assert!(matches!(
+        result,
+        CompletionState::Settled { quit: false, .. }
+    ));
+    assert_eq!(
+        view.activity.len(),
+        100,
+        "the view keeps its documented tail"
+    );
+    assert_eq!(
+        events.len(),
+        44 + 128,
+        "completion drains one captured cap while the sender keeps later activity queued"
+    );
+    assert_eq!(
+        view.transcript.last(),
+        Some(&(
+            String::from("kuru"),
+            String::from("completed after activity")
+        ))
+    );
+    assert!(!view.busy);
+    assert!(view.operation_start.is_none());
+    assert_runtime_projection(&view, &harness).await;
+}

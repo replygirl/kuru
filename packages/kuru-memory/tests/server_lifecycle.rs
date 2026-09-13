@@ -87,6 +87,13 @@ async fn configured_startup_budget_is_not_preempted_by_a_shorter_query_timer() -
     let root = tempfile::tempdir()?;
     let writer = open(options(root.path(), engine().await?)).await?;
     let pool = writer.pool("main").await?;
+    let auto_gc_enabled: i64 = sqlx::query_scalar("SELECT @@GLOBAL.dolt_auto_gc_enabled")
+        .fetch_one(pool.as_ref())
+        .await?;
+    ensure!(
+        auto_gc_enabled == 0,
+        "pinned Dolt server enabled automatic GC despite generated configuration"
+    );
     // Dolt uses the listener read timeout while executing a result iterator,
     // including bootstrap DDL. A valid query inside our 20-second budget must
     // not inherit an unrelated five-second server cancellation timer.
