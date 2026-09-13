@@ -14,9 +14,23 @@ use std::{
 };
 
 fn main() -> io::Result<()> {
+    let mut arguments = std::env::args_os();
+    let invocation = arguments.next();
+    if arguments
+        .next()
+        .is_some_and(|value| value == "--hold-stderr")
+    {
+        let milliseconds = arguments
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| io::Error::other("missing hold duration"))?;
+        thread::sleep(Duration::from_millis(milliseconds));
+        return Ok(());
+    }
     // The harness supplies an absolute argv[0] for the fixture's own plan.
     // Executable discovery describes shared code, not this invocation's data.
-    let executable = PathBuf::from(std::env::args_os().next().ok_or_else(|| {
+    let executable = PathBuf::from(invocation.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "missing fixture invocation path",
@@ -30,8 +44,8 @@ fn main() -> io::Result<()> {
     }
     let result = run(&executable);
     if let Err(error) = &result {
-        // RPC intentionally suppresses child stderr. Keep unexpected fixture
-        // failures beside its transcript so the owning test can report them.
+        // Keep unexpected fixture failures beside its transcript so the
+        // owning test can distinguish them from deliberate stderr steps.
         let _ = fs::write(
             executable
                 .parent()
@@ -73,6 +87,8 @@ fn run(executable: &Path) -> io::Result<()> {
     let mut input = stdin.lock();
     let stdout = io::stdout();
     let mut output = stdout.lock();
+    let stderr = io::stderr();
+    let mut errors = stderr.lock();
     for step in plan.lines() {
         let (operation, argument) = step.split_once(' ').unwrap_or((step, ""));
         match operation {
@@ -98,6 +114,29 @@ fn run(executable: &Path) -> io::Result<()> {
                 output.write_all(&vec![b'x'; count])?;
                 output.write_all(b"\n")?;
                 output.flush()?;
+            }
+            "stderr" => {
+                writeln!(errors, "{argument}")?;
+                errors.flush()?;
+            }
+            "stderr-repeat" => {
+                let count = argument.parse::<usize>().expect("stderr repeat count");
+                errors.write_all(&vec![b'x'; count])?;
+                errors.write_all(b"\n")?;
+                errors.flush()?;
+            }
+            "stderr-invalid" => {
+                errors.write_all(&[0xff])?;
+                errors.flush()?;
+            }
+            "hold-stderr" => {
+                let milliseconds = argument.parse::<u64>().expect("hold duration");
+                process::Command::new(std::env::current_exe()?)
+                    .arg("--hold-stderr")
+                    .arg(milliseconds.to_string())
+                    .stdin(process::Stdio::null())
+                    .stdout(process::Stdio::null())
+                    .spawn()?;
             }
             "sleep" => {
                 thread::sleep(Duration::from_millis(

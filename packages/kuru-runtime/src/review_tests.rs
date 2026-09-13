@@ -5,7 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use kuru_connectors::Provider;
 use kuru_core::{
-    Completion, CompletionRequest, Config, Mode, ModelInfo, RelationshipKind, ToolCall,
+    Completion, CompletionRequest, Config, McpConfig, Mode, ModelInfo, RelationshipKind, ToolCall,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -119,6 +119,108 @@ async fn tool_only_deliberation_proceeds_to_a_useful_speaking_turn() {
             .iter()
             .any(|request| request.instructions.contains("Phase: speak"))
     );
+}
+
+#[tokio::test]
+async fn unavailable_mcp_status_stays_out_of_provider_input_and_memory() {
+    const COMMAND: &str = "/definitely/not/a/kuru-mcp-command-sentinel";
+    const SECRET: &str = "sk-proj-mcp-environment-sentinel0123456789";
+    use axum::{Json, Router, routing::post};
+
+    let app = Router::new().route(
+        "/",
+        post(|Json(request): Json<Value>| async move {
+            let result = match request["method"].as_str() {
+                Some("initialize") => {
+                    json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}}})
+                }
+                Some("tools/list") => json!({"tools":[{
+                    "name":"usable",
+                    "description":"healthy runtime fixture",
+                    "inputSchema":{"type":"object"}
+                }]}),
+                _ => json!({}),
+            };
+            Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let provider = RecordingProvider::new(|_| reply("Healthy tools remain usable"));
+    let mut config = config(Mode::Freudian);
+    config.mcp.insert(
+        "failed-fixture".into(),
+        McpConfig {
+            command: Some(COMMAND.into()),
+            env: [("MCP_TEST_SECRET".into(), SECRET.into())].into(),
+            ..McpConfig::default()
+        },
+    );
+    config.mcp.insert(
+        "healthy-fixture".into(),
+        McpConfig {
+            url: Some(endpoint.clone()),
+            ..McpConfig::default()
+        },
+    );
+    let workspace = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let options = kuru_memory::test_support::open_options(
+        data.path().join("private"),
+        format!("project/{}", "a".repeat(64)),
+    )
+    .unwrap();
+    let memory = MemoryStore::open(options.clone()).await.unwrap();
+    let mut harness = Harness::new(config, workspace.path(), memory, provider.clone(), None)
+        .await
+        .unwrap();
+    let output = harness.run("Continue with available tools").await.unwrap();
+    assert!(output.events.iter().any(|event| {
+        event.kind == "mcp"
+            && event.actor == "failed-fixture"
+            && event.detail == "configured server unavailable"
+    }));
+    let requests = serde_json::to_string(&*provider.requests.lock().unwrap()).unwrap();
+    assert!(!requests.contains(COMMAND));
+    assert!(!requests.contains(SECRET));
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.instructions.contains("Phase: speak"))
+            .flat_map(|request| &request.tools)
+            .any(|tool| tool.name == "file_read")
+    );
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.instructions.contains("Phase: speak"))
+            .flat_map(|request| &request.tools)
+            .any(|tool| tool.description.contains("MCP healthy-fixture/usable"))
+    );
+    assert!(!requests.contains(&endpoint));
+    let history = serde_json::to_string(&harness.history().await.unwrap()).unwrap();
+    assert!(!history.contains(COMMAND));
+    assert!(!history.contains(SECRET));
+    assert!(!history.contains("configured server unavailable"));
+    harness.shutdown(false).await.unwrap();
+    harness.memory.clone().close().await.unwrap();
+    drop(harness);
+    let reopened = MemoryStore::open(options).await.unwrap();
+    let reopened_history =
+        serde_json::to_string(&reopened.history("conversation", 100).await.unwrap()).unwrap();
+    assert!(!reopened_history.contains(COMMAND));
+    assert!(!reopened_history.contains(SECRET));
+    assert!(!reopened_history.contains(&endpoint));
+    assert!(!reopened_history.contains("configured server unavailable"));
+    reopened.close().await.unwrap();
+    server.abort();
 }
 
 #[tokio::test]

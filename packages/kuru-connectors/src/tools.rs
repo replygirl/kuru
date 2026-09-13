@@ -165,7 +165,7 @@ fn windows_shell_environment(
 
 use crate::{
     MAX_BYTES,
-    mcp::{McpExecution, McpHosts},
+    mcp::{McpExecution, McpHosts, McpStatus},
     redaction,
     tool_output::{ProjectedToolError, ToolContent, ToolExecution, ToolFailure, ToolFailureKind},
 };
@@ -181,6 +181,25 @@ pub struct ToolHost {
     mcp: McpHosts,
     #[cfg(unix)]
     shells: ShellRegistry,
+}
+
+pub struct ToolCatalog {
+    tools: Vec<ToolSpec>,
+    mcp: Vec<McpStatus>,
+}
+
+impl ToolCatalog {
+    pub fn tools(&self) -> &[ToolSpec] {
+        &self.tools
+    }
+
+    pub fn mcp(&self) -> &[McpStatus] {
+        &self.mcp
+    }
+
+    pub fn into_tools(self) -> Vec<ToolSpec> {
+        self.tools
+    }
 }
 
 impl ToolHost {
@@ -224,6 +243,10 @@ impl ToolHost {
     }
 
     pub async fn specs(&self) -> Result<Vec<ToolSpec>> {
+        Ok(self.catalog().await?.into_tools())
+    }
+
+    pub async fn catalog(&self) -> Result<ToolCatalog> {
         let mut specs = vec![
             spec(
                 "file_read",
@@ -258,8 +281,12 @@ impl ToolHost {
                 json!({"type":"integer","minimum":1,"maximum":120000});
             specs.push(shell);
         }
-        specs.extend(self.mcp.specs().await?);
-        Ok(specs)
+        let mcp = self.mcp.catalog().await?;
+        specs.extend(mcp.tools);
+        Ok(ToolCatalog {
+            tools: specs,
+            mcp: mcp.statuses,
+        })
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> Result<String> {
@@ -1156,13 +1183,34 @@ mod tests {
         assert!(success.contains("[REDACTED:recognized-secret]"));
         assert!(!success.contains(SECRET));
         let failure = host.execute(&name, json!({})).await.unwrap_err();
-        assert!(failure.to_string().contains("MCP tool call failed"));
-        assert!(failure.to_string().contains("failed"));
-        assert!(failure.to_string().contains("[REDACTED:recognized-secret]"));
+        assert_eq!(
+            failure.to_string(),
+            "MCP tool call failed: configured MCP server fixture is unavailable"
+        );
         assert!(!format!("{failure:#} {failure:?}").contains(SECRET));
         assert_eq!(failure.chain().count(), 1);
         host.shutdown().await.unwrap();
-        peer.assert_completed(1);
+        assert_eq!(
+            peer.conversations(),
+            vec![vec![
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":1,
+                    "method":"initialize",
+                    "params":{
+                        "protocolVersion":"2025-11-25",
+                        "capabilities":{},
+                        "clientInfo":{"name":"kuru","version":env!("CARGO_PKG_VERSION")},
+                    },
+                }),
+                json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+                json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remote","arguments":{}}}),
+                json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"remote","arguments":{}}}),
+                json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"remote","arguments":{}}}),
+            ]],
+            "the protocol-error cleanup may terminate the peer before its planned EOF, but it must not skip or replay a request"
+        );
     }
 
     #[tokio::test]
@@ -1232,8 +1280,7 @@ mod tests {
             format!("{failure:#}"),
             format!("{failure:?}"),
         ] {
-            assert!(rendered.contains("failed"));
-            assert!(rendered.contains("[REDACTED:recognized-secret]"));
+            assert!(rendered.contains("configured MCP server http is unavailable"));
             assert!(!rendered.contains(SECRET));
         }
         assert_eq!(failure.chain().count(), 1);

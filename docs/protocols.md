@@ -161,8 +161,10 @@ does not inspect credential stores or enumerate environment values, alter tool
 arguments or file writes, rewrite source files or earlier history, or impose a
 new combined result limit. Unknown, encoded, split, transformed, or future
 credential formats can remain visible, and ordinary source text can be matched
-by a documented form; tool results are not byte-exact backups. MCP stderr is
-not captured by this projection.
+by a documented form; tool results are not byte-exact backups. Stdio MCP stderr
+uses the same finite scanner before Kuru retains a bounded, terminal-escaped
+tail for direct human diagnostics. Ordinary server-authored text can remain;
+the tail is not sent to models, runtime events, or memory.
 
 ## MCP
 
@@ -171,14 +173,19 @@ Both stdio and Streamable HTTP transports initialize the server, send
 The preferred protocol version is `2025-11-25`; the adapter also accepts
 `2025-06-18`, `2025-03-26` and `2024-11-05`. HTTP sessions preserve the negotiated
 session ID and version headers and are closed when possible. Stdio subprocesses
-are terminated during shutdown.
+have an independent native owner which continuously drains stderr and retains
+process and pipe ownership through bounded cleanup.
 
 Each tool receives a stable namespaced identifier derived from the configured
 server alias and original tool name. Its description retains both names. This
 prevents collisions with built-ins and between servers. A server must advertise
 tools capability and valid input schemas. Calls are bounded to 60 seconds and
 2 MiB; pagination is bounded and repeated cursors are rejected. Tool mutations
-are not retried automatically after transport failure.
+are not retried automatically after transport failure. Discovery validates and
+publishes each configured alias separately, so one failed server does not hide
+built-in tools or tools from healthy servers. Failed aliases report fixed status
+and their prior routes dispatch nothing. A later explicit discovery can recover
+an alias after its complete catalog validates.
 
 The adapter is a tools client. It does not implement every optional MCP surface,
 such as prompts/resources UI, elicitation, sampling, or a remote OAuth login

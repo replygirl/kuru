@@ -658,10 +658,13 @@ impl Scanner {
             .written_bytes
             .checked_add(bytes.len())
             .ok_or(ProjectionError::SizeBound)?;
-        ensure_within(written, self.output_limit()?)?;
-        if let Some(_requested_capacity) =
-            reserve_for_append(output, written, self.output_limit()?)?
-        {
+        let output_limit = self.output_limit()?;
+        ensure_within(written, output_limit)?;
+        let buffered = output
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(ProjectionError::SizeBound)?;
+        if let Some(_requested_capacity) = reserve_for_append(output, buffered, output_limit)? {
             #[cfg(test)]
             {
                 self.reservation_events += 1;
@@ -1431,6 +1434,21 @@ mod tests {
         assert!(writer.reservation_events <= 32);
         assert!(writer.requested_capacity <= limit);
         assert!(writer.bytes.len() <= limit);
+    }
+
+    #[test]
+    fn cleared_stream_buffer_keeps_current_capacity_and_cumulative_bounds() {
+        let mut scanner = Scanner::new();
+        let mut current = Vec::new();
+        let mut maximum_capacity = 0;
+        for _ in 0..32_768 {
+            scanner.push(b"password=x;", &mut current).unwrap();
+            maximum_capacity = maximum_capacity.max(current.capacity());
+            current.clear();
+        }
+        scanner.finish(&mut current).unwrap();
+        assert!(maximum_capacity <= relative_bound(b"password=x;".len()).unwrap());
+        assert_eq!(current, Vec::<u8>::new());
     }
 
     #[test]

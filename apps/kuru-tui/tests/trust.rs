@@ -496,6 +496,101 @@ async fn stdio_and_http_mcp_require_cli_approval_before_activation() {
     assert!(!sandbox.data.join("trust").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn direct_tools_keeps_stdout_json_and_reports_filtered_failed_stdio() {
+    const SECRET: &str = "sk-proj-mcp-stderr-sentinel0123456789";
+    let failed = NativeMcpFixture::new();
+    std::fs::write(
+        PathBuf::from(&failed.command).with_extension("plan"),
+        format!("stderr api_key={SECRET} \u{1b}[31m\nread\nwrite not JSON\n"),
+    )
+    .unwrap();
+    let config = toml::to_string(&BTreeMap::from([(
+        "mcp",
+        BTreeMap::from([(
+            "failed",
+            McpConfig {
+                command: Some(failed.command.clone()),
+                ..McpConfig::default()
+            },
+        )]),
+    )]))
+    .unwrap();
+    let sandbox = Sandbox::new(&config);
+    let output = sandbox.success(&["--trust-workspace-once", "tools"]);
+    let tools: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "file_read")
+    );
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("MCP failed: configured server unavailable"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("[REDACTED:recognized-secret]"), "{stderr}");
+    assert!(stderr.contains("\\x1b"), "{stderr}");
+    assert!(!stderr.contains(SECRET));
+    assert!(!stderr.contains(&failed.command));
+
+    let builtin = sandbox.success(&[
+        "--trust-workspace-once",
+        "tool",
+        "file_list",
+        "--args",
+        "{}",
+    ]);
+    assert!(
+        serde_json::from_slice::<Value>(&builtin.stdout)
+            .unwrap()
+            .is_object()
+    );
+    let builtin_stderr = text(&builtin.stderr);
+    assert!(builtin_stderr.contains("MCP failed: configured server unavailable"));
+    assert!(builtin_stderr.contains("[REDACTED:recognized-secret]"));
+    assert!(!builtin_stderr.contains(SECRET));
+    assert!(!builtin_stderr.contains(&failed.command));
+
+    let plain = sandbox.success(&[
+        "--trust-workspace-once",
+        "--provider",
+        "demo",
+        "run",
+        "plain MCP degradation",
+    ]);
+    assert!(text(&plain.stdout).contains("demo"));
+    assert!(!text(&plain.stdout).contains(SECRET));
+    assert!(!text(&plain.stderr).contains(SECRET));
+    assert!(!text(&plain.stderr).contains(&failed.command));
+
+    let json_output = sandbox.success(&[
+        "--trust-workspace-once",
+        "--provider",
+        "demo",
+        "run",
+        "JSON MCP degradation",
+        "--json",
+    ]);
+    let turn: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert!(turn["text"].as_str().is_some());
+    assert!(turn["events"].as_array().unwrap().iter().any(|event| {
+        event["kind"] == "mcp"
+            && event["actor"] == "failed"
+            && event["detail"] == "configured server unavailable"
+    }));
+    for output in [&plain, &json_output] {
+        let projected = format!("{}{}", text(&output.stdout), text(&output.stderr));
+        assert!(!projected.contains(SECRET));
+        assert!(!projected.contains(&failed.command));
+        assert!(!projected.contains("[REDACTED:recognized-secret]"));
+    }
+    assert_eq!(failed.completed(), 4);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_cli_mcp_tool_results_are_projected_before_stdout() {
     const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
