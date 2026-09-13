@@ -59,6 +59,13 @@ native executable, exercise real memory and verify the packaged offline runtime.
 Windows primitives retain a separate native coverage job for early feedback.
 The required `ci-gate` accepts only success from every branch of this graph.
 
+Ubuntu's coverage step disables Rust test-profile debug information so its
+instrumented Kuru executable remains a valid input to the same production
+release-archive bound exercised by the packaged-runtime fixture. Coverage maps,
+the full test graph, and the 90% line threshold remain enabled. Panic text is
+retained, but Ubuntu coverage backtraces may omit source file and line details;
+use a focused local run or another native job when those details are needed.
+
 CI installs only each job's tools before task activation, disables automatic
 installation of unrelated root tools, and uses `MISE_NO_HOOKS=1` because validation jobs do not create Git
 commits. Local Git hooks and maintainer setup retain hk. Archive-only Intel macOS

@@ -615,7 +615,17 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
     let install_dir = root.join("installed bin");
     fs::create_dir(&project)?;
     let version = env!("CARGO_PKG_VERSION");
-    let archive_path = archive::package(&binary, target, version, &releases)?;
+    let executable_bytes = fs::metadata(&binary)?.len();
+    eprintln!(
+        "embedded runtime packaging input: target={target} executable_bytes={executable_bytes} expanded_limit_bytes={}",
+        archive::MAX_ARCHIVE_BYTES
+    );
+    let archive_path = archive::package(&binary, target, version, &releases).with_context(|| {
+        format!(
+            "package embedded runtime: target={target} executable_bytes={executable_bytes} expanded_limit_bytes={}",
+            archive::MAX_ARCHIVE_BYTES
+        )
+    })?;
     let name = archive_path
         .file_name()
         .and_then(OsStr::to_str)

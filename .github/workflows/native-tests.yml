@@ -77,6 +77,10 @@ jobs:
           cache-bin: false
           shared-key: native-coverage
       - name: Run instrumented native tests and require 90% coverage
+        env:
+          # Coverage maps remain available without test-profile debug info. Keep
+          # the genuine packaged Kuru input below its production archive bound.
+          CARGO_PROFILE_TEST_DEBUG: ${{ inputs.os == 'ubuntu-24.04' && '0' || 'line-tables-only' }}
         run: mise run coverage
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
