@@ -1,0 +1,4 @@
+## 1. Native Windows shell fixture
+
+- [x] 1.1 Restore the product-preserved Windows machine roots in `apps/kuru-tui/tests/windows_cli.rs` and verify the cold stock-shell test retains hostile `PSModulePath`, isolated cache roots, unchanged deadlines and bounded stage evidence.
+- [x] 1.2 Run granular formatting and static checks, then verify the exact integrated head with the native Windows shell acceptance and source-install steps in hosted CI. Observed at `7f00bc65fed9909b966c9da7d7efb67d0273998f`: the normal pre-push hook completed all eight categories with workspace coverage `26,267/27,518 = 95.4539%`; hosted CI run `34751144913`, Windows job `103707785480`, completed successfully with the instrumented native suite, native source install, offline Cargo input-failure checks, installed offline runtime and shipping DLL inspection.
