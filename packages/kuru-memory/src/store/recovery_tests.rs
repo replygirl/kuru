@@ -1257,6 +1257,7 @@ async fn lost_promotion_reply_reconciles_target_once_and_keeps_later_writes() {
         live: affected.clone(),
         view: candidate.view(),
         base: candidate.base,
+        promoted: Arc::new(StdMutex::new(None)),
     };
     assert_eq!(
         tokio::time::timeout(TEST_DEADLINE, candidate.promote())
@@ -1376,6 +1377,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
             read_only: false,
             write: Arc::new(Mutex::new(())),
             uncertain: StdMutex::new(None),
+            candidate_recovery_pause: None,
             _permit: None,
         }),
         pool,

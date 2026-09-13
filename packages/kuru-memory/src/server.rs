@@ -518,6 +518,23 @@ impl Server {
         Ok(pool)
     }
 
+    pub(crate) async fn retire_pool(&self, branch: &str) -> Result<()> {
+        validate_branch(branch)?;
+        let pool = self
+            .0
+            .pools
+            .lock()
+            .await
+            .remove(branch)
+            .and_then(|pool| pool.upgrade());
+        if let Some(pool) = pool {
+            timeout(CLOSE_GRACE, pool.close())
+                .await
+                .context("memory branch pool close deadline exceeded")?;
+        }
+        Ok(())
+    }
+
     pub async fn close(&self) -> Result<()> {
         // The owner mutex also makes concurrent close callers wait for reaping.
         let mut owner = self.0.owner.lock().await;
@@ -1408,7 +1425,7 @@ fn server_yaml(directory: &Path, port: u16, startup_timeout: Duration) -> Result
     // read-only SQL variable from the same canonical path for identity probes.
     let quoted = |name: &str| serde_json::to_string(&directory.join(name));
     Ok(format!(
-        "log_level: warning\nlog_format: text\nbehavior:\n  autocommit: true\n  dolt_transaction_commit: false\n  event_scheduler: \"OFF\"\n  auto_gc_behavior:\n    enable: false\nlistener:\n  host: 127.0.0.1\n  port: {port}\n  max_connections: 32\n  max_connections_timeout_millis: 1000\n  read_timeout_millis: {read_timeout}\n  write_timeout_millis: 5000\n  allow_cleartext_passwords: false\ndata_dir: {}\ncfg_dir: {}\nprivilege_file: {}\nbranch_control_file: {}\nsystem_variables:\n  datadir: {}\n  secure_file_priv: {}\n",
+        "log_level: warning\nlog_format: text\nbehavior:\n  autocommit: true\n  dolt_transaction_commit: false\n  event_scheduler: \"OFF\"\n  auto_gc_behavior:\n    enable: true\nlistener:\n  host: 127.0.0.1\n  port: {port}\n  max_connections: 32\n  max_connections_timeout_millis: 1000\n  read_timeout_millis: {read_timeout}\n  write_timeout_millis: 5000\n  allow_cleartext_passwords: false\ndata_dir: {}\ncfg_dir: {}\nprivilege_file: {}\nbranch_control_file: {}\nsystem_variables:\n  datadir: {}\n  secure_file_priv: {}\n",
         quoted("data")?,
         quoted("config")?,
         quoted("config/privileges.db")?,

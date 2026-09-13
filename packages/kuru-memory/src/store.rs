@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
@@ -32,9 +32,16 @@ mod recovery_tests;
 #[cfg(test)]
 #[path = "store/migration_lifecycle_tests.rs"]
 mod migration_lifecycle_tests;
+#[cfg(test)]
+#[path = "store/operational_gc_tests.rs"]
+mod operational_gc_tests;
 
 pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTHOR: &str = "Kuru <memory@kuru.local>";
+const CANDIDATE_PREFIX: &str = "candidate_";
+const PROMOTING_PREFIX: &str = "kuru_candidate_promoting_";
+const ABANDONED_PREFIX: &str = "kuru_candidate_abandoned_";
+const CANDIDATE_RECOVERY_BATCH: i64 = 16;
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -45,6 +52,8 @@ pub struct OpenOptions {
     pub supervisor: Option<PathBuf>,
     #[cfg(test)]
     migration_hooks: Option<Arc<migrations::MigrationRunnerHooks>>,
+    #[cfg(test)]
+    candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
 }
 impl OpenOptions {
     pub fn new(data_dir: PathBuf, project_scope: String) -> Self {
@@ -56,6 +65,8 @@ impl OpenOptions {
             supervisor: None,
             #[cfg(test)]
             migration_hooks: None,
+            #[cfg(test)]
+            candidate_recovery_pause: None,
         }
     }
 }
@@ -68,7 +79,16 @@ struct Shared {
     read_only: bool,
     write: Arc<Mutex<()>>,
     uncertain: StdMutex<Option<Pending>>,
+    #[cfg(test)]
+    candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
     _permit: Option<OwnedSemaphorePermit>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct CandidateRecoveryPause {
+    reached: Arc<Semaphore>,
+    resume: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +101,23 @@ struct Pending {
 #[derive(Clone, Debug)]
 enum Receipt {
     Operation(String),
-    Promotion { base: String, target: String },
+    Promotion {
+        base: String,
+        target: String,
+    },
+    CandidateTransition {
+        source: String,
+        status: String,
+        expected: String,
+    },
+    CandidateDeletion {
+        branch: String,
+        expected: String,
+    },
+    CandidateExclusion {
+        branch: String,
+        expected: String,
+    },
 }
 
 /// A cloneable view whose SQL connections always select the same Dolt branch.
@@ -110,6 +146,7 @@ pub struct Candidate {
     live: MemoryStore,
     view: MemoryStore,
     base: String,
+    promoted: Arc<StdMutex<Option<String>>>,
 }
 impl Candidate {
     pub fn view(&self) -> MemoryStore {
@@ -119,19 +156,51 @@ impl Candidate {
         &self.base
     }
     pub async fn promote(&self) -> Result<String> {
+        if let Some(target) = self.promoted.lock().expect("candidate result lock").clone() {
+            return Ok(target);
+        }
         self.live.writable()?;
         let guard = self.live.shared.write.clone().lock_owned().await;
         self.live.resolve_uncertain().await?;
+        if let Some(target) = self.promoted.lock().expect("candidate result lock").clone() {
+            return Ok(target);
+        }
         let live = self.live.clone();
-        let view = self.view.clone();
         let base = self.base.clone();
+        let promoted = self.promoted.clone();
+        let names = CandidateNames::from_open(&self.view.branch)?;
         // Keep accepted promotion alive if the UI cancels while awaiting its reply.
         tokio::spawn(async move {
             let _guard = guard;
-            let target = view.revision().await?;
+            let before = candidate_heads(&live.pool, &names).await?;
+            ensure!(
+                !before.contains_key(&names.abandoned),
+                "dream candidate was already abandoned"
+            );
             let current = live.revision().await?;
+            let target = match before.get(&names.promoting) {
+                Some(target) => {
+                    validate_candidate_pair(&before, &names.open, &names.promoting, target)?;
+                    target.clone()
+                }
+                None => {
+                    let target = before
+                        .get(&names.open)
+                        .context("dream candidate ref is missing")?
+                        .clone();
+                    ensure!(
+                        current == base,
+                        "dream candidate is stale: live memory changed since its base"
+                    );
+                    ensure_branch_clean(&live, &names.open).await?;
+                    transition_candidate(&live, &names.open, &names.promoting, &target).await?;
+                    target
+                }
+            };
             if current == target {
-                return Ok(current);
+                *promoted.lock().expect("candidate result lock") = Some(target.clone());
+                let _ = cleanup_promoted_candidate(&live, &names, &target).await;
+                return Ok(target);
             }
             ensure!(
                 current == base,
@@ -149,22 +218,389 @@ impl Candidate {
             let result = tokio::time::timeout(
                 QUERY_TIMEOUT,
                 sqlx::query("CALL DOLT_MERGE(?, '--ff-only')")
-                    .bind(&view.branch)
+                    .bind(&names.promoting)
                     .fetch_all(&mut connection),
             )
             .await;
-            // Drop the actual socket, then wait for server-side session teardown.
-            // An absent receipt is not a rollback while that session can commit.
             drop(connection);
-            if live.resolve_uncertain().await? == Some(true) {
-                return Ok(target);
+            let committed = live.resolve_uncertain().await? == Some(true);
+            if !committed {
+                result.context("Dolt promotion deadline exceeded")??;
+                bail!("Dolt did not fast-forward to the candidate revision");
             }
-            result.context("Dolt promotion deadline exceeded")??;
-            bail!("Dolt did not fast-forward to the candidate revision")
+            *promoted.lock().expect("candidate result lock") = Some(target.clone());
+            let _ = cleanup_promoted_candidate(&live, &names, &target).await;
+            Ok(target)
         })
         .await
         .context("memory promotion worker failed")?
     }
+
+    pub async fn abandon(&self) -> Result<()> {
+        if self
+            .promoted
+            .lock()
+            .expect("candidate result lock")
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.live.writable()?;
+        let live = self.live.clone();
+        let promoted = self.promoted.clone();
+        let names = CandidateNames::from_open(&self.view.branch)?;
+        tokio::spawn(async move {
+            let guard = live.shared.write.clone().lock_owned().await;
+            let _guard = guard;
+            live.resolve_uncertain().await?;
+            if promoted.lock().expect("candidate result lock").is_some() {
+                return Ok(());
+            }
+            abandon_candidate(&live, &names).await
+        })
+        .await
+        .context("memory candidate abandonment worker failed")?
+    }
+}
+
+#[derive(Debug)]
+struct CandidateNames {
+    open: String,
+    promoting: String,
+    abandoned: String,
+}
+
+impl CandidateNames {
+    fn from_open(open: &str) -> Result<Self> {
+        let suffix = open
+            .strip_prefix(CANDIDATE_PREFIX)
+            .context("candidate branch has an invalid name")?;
+        let id = Uuid::parse_str(suffix).context("candidate branch has an invalid identity")?;
+        ensure!(
+            id.simple().to_string() == suffix,
+            "candidate branch identity is not canonical"
+        );
+        Ok(Self {
+            open: open.to_owned(),
+            promoting: format!("{PROMOTING_PREFIX}{suffix}"),
+            abandoned: format!("{ABANDONED_PREFIX}{suffix}"),
+        })
+    }
+
+    fn from_status(status: &str) -> Result<Self> {
+        let suffix = status
+            .strip_prefix(PROMOTING_PREFIX)
+            .or_else(|| status.strip_prefix(ABANDONED_PREFIX))
+            .context("candidate status branch has an invalid name")?;
+        Self::from_open(&format!("{CANDIDATE_PREFIX}{suffix}"))
+    }
+
+    fn from_status_or_open(branch: &str) -> Result<Self> {
+        if branch.starts_with(CANDIDATE_PREFIX) {
+            Self::from_open(branch)
+        } else {
+            Self::from_status(branch)
+        }
+    }
+}
+
+async fn candidate_heads(
+    pool: &MySqlPool,
+    names: &CandidateNames,
+) -> Result<BTreeMap<String, String>> {
+    let rows: Vec<(String, String)> = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_as(
+            "SELECT name, hash FROM dolt_branches WHERE BINARY name = BINARY ? OR BINARY name = BINARY ? OR BINARY name = BINARY ? ORDER BY BINARY name LIMIT 4",
+        )
+        .bind(&names.open)
+        .bind(&names.promoting)
+        .bind(&names.abandoned)
+        .fetch_all(pool),
+    )
+    .await
+    .context("candidate branch observation deadline exceeded")??;
+    ensure!(rows.len() <= 3, "candidate branch observation is ambiguous");
+    Ok(rows.into_iter().collect())
+}
+
+fn validate_candidate_pair(
+    heads: &BTreeMap<String, String>,
+    first: &str,
+    status: &str,
+    expected: &str,
+) -> Result<()> {
+    ensure!(
+        heads.get(status).is_some_and(|head| head == expected),
+        "candidate status branch does not retain its expected head"
+    );
+    if let Some(head) = heads.get(first) {
+        ensure!(
+            head == expected,
+            "candidate transition retained divergent source and status refs"
+        );
+    }
+    Ok(())
+}
+
+async fn candidate_branch_is_clean(store: &MemoryStore, branch: &str) -> Result<bool> {
+    let pool = store.shared.server.pool(branch).await?;
+    let result = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_status").fetch_one(pool.as_ref()),
+    )
+    .await
+    .context("candidate working-set inspection deadline exceeded")?;
+    let cleanup = store.shared.server.retire_pool(branch).await;
+    match (result, cleanup) {
+        (Ok(dirty), Ok(())) => Ok(dirty == 0),
+        (Err(error), Ok(())) => Err(error.into()),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(anyhow::Error::from(error)
+            .context(format!("candidate pool cleanup also failed: {cleanup:#}"))),
+    }
+}
+
+async fn ensure_branch_clean(store: &MemoryStore, branch: &str) -> Result<()> {
+    ensure!(
+        candidate_branch_is_clean(store, branch).await?,
+        "candidate working set is not clean"
+    );
+    Ok(())
+}
+
+async fn preserve_resolved_cleanup(
+    store: &MemoryStore,
+    names: &CandidateNames,
+    authority: &str,
+    expected: &str,
+    error: anyhow::Error,
+) -> Result<()> {
+    if store
+        .shared
+        .uncertain
+        .lock()
+        .expect("uncertain lock")
+        .is_some()
+    {
+        return Err(error);
+    }
+    let heads = candidate_heads(&store.pool, names).await?;
+    for head in heads.values() {
+        ensure!(
+            head == expected,
+            "candidate cleanup retained divergent refs"
+        );
+    }
+    ensure!(
+        heads.is_empty() || heads.contains_key(authority),
+        "candidate cleanup lost its durable status authority"
+    );
+    Ok(())
+}
+
+async fn transition_candidate(
+    store: &MemoryStore,
+    source: &str,
+    status: &str,
+    expected: &str,
+) -> Result<()> {
+    store.shared.server.retire_pool(source).await?;
+    let (mut connection, id) = owned_connection(&store.pool).await?;
+    *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
+        pool: store.pool.clone(),
+        connection: id,
+        receipt: Receipt::CandidateTransition {
+            source: source.to_owned(),
+            status: status.to_owned(),
+            expected: expected.to_owned(),
+        },
+    });
+    let result = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
+            .bind(source)
+            .bind(status)
+            .fetch_all(&mut connection),
+    )
+    .await;
+    drop(connection);
+    let settled = store.resolve_uncertain().await? == Some(true);
+    let names = CandidateNames::from_status(status)?;
+    let heads = candidate_heads(&store.pool, &names).await?;
+    if settled {
+        for branch in [source, status] {
+            if heads.contains_key(branch) {
+                ensure_branch_clean(store, branch).await?;
+            }
+        }
+        return Ok(());
+    }
+    if let Some(head) = heads.get(source) {
+        ensure!(
+            head == expected,
+            "candidate transition changed the source ref unexpectedly"
+        );
+    }
+    result.context("candidate status transition deadline exceeded")??;
+    bail!("candidate status transition did not retain its durable ref")
+}
+
+async fn delete_candidate_ref(
+    store: &MemoryStore,
+    branch: &str,
+    expected: &str,
+    force: bool,
+) -> Result<()> {
+    let before =
+        candidate_heads(&store.pool, &CandidateNames::from_status_or_open(branch)?).await?;
+    let Some(head) = before.get(branch) else {
+        return Ok(());
+    };
+    ensure!(
+        head == expected,
+        "candidate cleanup found an unexpected ref head"
+    );
+    store.shared.server.retire_pool(branch).await?;
+    if force {
+        confirm_no_live_candidate_session(store, branch, expected).await?;
+    }
+    let (mut connection, id) = owned_connection(&store.pool).await?;
+    *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
+        pool: store.pool.clone(),
+        connection: id,
+        receipt: Receipt::CandidateDeletion {
+            branch: branch.to_owned(),
+            expected: expected.to_owned(),
+        },
+    });
+    let flag = if force { "-D" } else { "-d" };
+    let result = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            .bind(flag)
+            .bind(branch)
+            .fetch_all(&mut connection),
+    )
+    .await;
+    drop(connection);
+    let settled = store.resolve_uncertain().await? == Some(true);
+    let after = candidate_heads(&store.pool, &CandidateNames::from_status_or_open(branch)?).await?;
+    if settled {
+        return Ok(());
+    }
+    ensure!(
+        after.get(branch).is_some_and(|head| head == expected),
+        "candidate cleanup changed the ref unexpectedly"
+    );
+    result.context("candidate deletion deadline exceeded")??;
+    bail!("Dolt did not delete the resolved candidate branch")
+}
+
+async fn confirm_no_live_candidate_session(
+    store: &MemoryStore,
+    branch: &str,
+    expected: &str,
+) -> Result<()> {
+    let (mut connection, id) = owned_connection(&store.pool).await?;
+    *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
+        pool: store.pool.clone(),
+        connection: id,
+        receipt: Receipt::CandidateExclusion {
+            branch: branch.to_owned(),
+            expected: expected.to_owned(),
+        },
+    });
+    let result = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("CALL DOLT_BRANCH('-m', ?, ?)")
+            .bind(branch)
+            .bind(branch)
+            .fetch_all(&mut connection),
+    )
+    .await;
+    drop(connection);
+    let settled = store.resolve_uncertain().await? == Some(true);
+    result.context("candidate session exclusion deadline exceeded")??;
+    ensure!(settled, "candidate session exclusion was not confirmed");
+    let heads = candidate_heads(&store.pool, &CandidateNames::from_status_or_open(branch)?).await?;
+    ensure!(
+        heads.get(branch).is_some_and(|head| head == expected),
+        "candidate session exclusion changed the resolved ref"
+    );
+    Ok(())
+}
+
+async fn cleanup_promoted_candidate(
+    store: &MemoryStore,
+    names: &CandidateNames,
+    target: &str,
+) -> Result<()> {
+    let heads = candidate_heads(&store.pool, names).await?;
+    ensure!(
+        !heads.contains_key(&names.abandoned),
+        "promoted candidate also has an abandoned ref"
+    );
+    validate_candidate_pair(&heads, &names.open, &names.promoting, target)?;
+    for branch in [&names.open, &names.promoting] {
+        if heads.contains_key(branch) {
+            ensure_branch_clean(store, branch).await?;
+        }
+    }
+    if heads.contains_key(&names.open) {
+        delete_candidate_ref(store, &names.open, target, false).await?;
+    }
+    delete_candidate_ref(store, &names.promoting, target, false).await
+}
+
+async fn cleanup_abandoned_candidate(
+    store: &MemoryStore,
+    names: &CandidateNames,
+    target: &str,
+    heads: &BTreeMap<String, String>,
+) -> Result<()> {
+    ensure!(
+        heads
+            .get(&names.abandoned)
+            .is_some_and(|head| head == target),
+        "abandoned candidate did not retain its durable status ref"
+    );
+    for branch in [&names.open, &names.promoting, &names.abandoned] {
+        if let Some(head) = heads.get(branch) {
+            ensure!(head == target, "abandoned candidate refs diverged");
+            ensure_branch_clean(store, branch).await?;
+        }
+    }
+    // Delete duplicates before the status authority so any partial cleanup
+    // remains explicitly recoverable.
+    for branch in [&names.open, &names.promoting, &names.abandoned] {
+        if heads.contains_key(branch) {
+            delete_candidate_ref(store, branch, target, true).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn abandon_candidate(store: &MemoryStore, names: &CandidateNames) -> Result<()> {
+    let mut heads = candidate_heads(&store.pool, names).await?;
+    let target = if let Some(target) = heads.get(&names.abandoned) {
+        target.clone()
+    } else if let Some(target) = heads.get(&names.promoting) {
+        validate_candidate_pair(&heads, &names.open, &names.promoting, target)?;
+        let target = target.clone();
+        transition_candidate(store, &names.promoting, &names.abandoned, &target).await?;
+        target
+    } else {
+        let target = heads
+            .get(&names.open)
+            .context("dream candidate ref is missing")?
+            .clone();
+        ensure_branch_clean(store, &names.open).await?;
+        transition_candidate(store, &names.open, &names.abandoned, &target).await?;
+        target
+    };
+    heads = candidate_heads(&store.pool, names).await?;
+    cleanup_abandoned_candidate(store, names, &target, &heads).await
 }
 
 #[derive(Debug, Serialize)]
@@ -515,8 +951,6 @@ impl MemoryStore {
         } else {
             migrations::validate_active(&server, &pool).await?;
         }
-        let lock: File = server.take_reap_guard();
-        drop(lock);
         let shared = Arc::new(Shared {
             server,
             directory,
@@ -524,6 +958,8 @@ impl MemoryStore {
             read_only: options.read_only,
             write: Arc::new(Mutex::new(())),
             uncertain: StdMutex::new(None),
+            #[cfg(test)]
+            candidate_recovery_pause: options.candidate_recovery_pause,
             _permit: permit,
         });
         let store = Self {
@@ -531,6 +967,12 @@ impl MemoryStore {
             pool,
             branch: "main".into(),
         };
+        if !options.read_only {
+            run_candidate_recovery_worker(&store).await?;
+        } else {
+            let lock: File = store.shared.server.take_reap_guard();
+            drop(lock);
+        }
         progress.report(MemoryOpenStage::Ready);
         Ok(store)
     }
@@ -763,6 +1205,51 @@ impl MemoryStore {
                     );
                     observed == target
                 }
+                Receipt::CandidateTransition {
+                    source,
+                    status,
+                    expected,
+                } => {
+                    let names = CandidateNames::from_status(&status)?;
+                    let heads = candidate_heads(&pending.pool, &names).await?;
+                    for head in heads.values() {
+                        ensure!(
+                            head == &expected,
+                            "candidate transition retained divergent refs"
+                        );
+                    }
+                    if heads.contains_key(&status) {
+                        true
+                    } else {
+                        ensure!(
+                            heads.contains_key(&source),
+                            "candidate transition lost both source and status refs"
+                        );
+                        false
+                    }
+                }
+                Receipt::CandidateDeletion { branch, expected } => {
+                    let names = CandidateNames::from_status_or_open(&branch)?;
+                    let heads = candidate_heads(&pending.pool, &names).await?;
+                    if let Some(head) = heads.get(&branch) {
+                        ensure!(
+                            head == &expected,
+                            "candidate deletion changed the ref unexpectedly"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Receipt::CandidateExclusion { branch, expected } => {
+                    let names = CandidateNames::from_status_or_open(&branch)?;
+                    let heads = candidate_heads(&pending.pool, &names).await?;
+                    ensure!(
+                        heads.get(&branch).is_some_and(|head| head == &expected),
+                        "candidate session exclusion changed the resolved ref"
+                    );
+                    true
+                }
             };
             *self.shared.uncertain.lock().expect("uncertain lock") = None;
             return Ok(Some(committed));
@@ -802,7 +1289,107 @@ impl MemoryStore {
             live: self.clone(),
             view,
             base,
+            promoted: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    async fn recover_candidates(&self) -> Result<()> {
+        let _guard = self.shared.write.lock().await;
+        self.resolve_uncertain().await?;
+        let rows: Vec<(String, String)> = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_as(
+                "SELECT name, hash FROM dolt_branches WHERE LEFT(BINARY name, ?) = BINARY ? OR LEFT(BINARY name, ?) = BINARY ? ORDER BY BINARY name LIMIT ?",
+            )
+            .bind(PROMOTING_PREFIX.len() as i64)
+            .bind(PROMOTING_PREFIX)
+            .bind(ABANDONED_PREFIX.len() as i64)
+            .bind(ABANDONED_PREFIX)
+            .bind(CANDIDATE_RECOVERY_BATCH)
+            .fetch_all(self.pool.as_ref()),
+        )
+        .await
+        .context("candidate recovery inventory deadline exceeded")??;
+        #[cfg(test)]
+        if let Some(pause) = &self.shared.candidate_recovery_pause {
+            pause.reached.add_permits(1);
+            pause
+                .resume
+                .acquire()
+                .await
+                .context("candidate recovery fixture release channel closed")?
+                .forget();
+        }
+        for (status, target) in rows {
+            let names = CandidateNames::from_status(&status)?;
+            let heads = candidate_heads(&self.pool, &names).await?;
+            ensure!(
+                heads.get(&status).is_some_and(|head| head == &target),
+                "candidate recovery inventory changed during inspection"
+            );
+            if status == names.promoting {
+                ensure!(
+                    !heads.contains_key(&names.abandoned),
+                    "candidate has both promoting and abandoned status refs"
+                );
+                if validate_candidate_pair(&heads, &names.open, &names.promoting, &target).is_err()
+                {
+                    continue;
+                }
+                let mut clean = true;
+                for branch in [&names.open, &names.promoting] {
+                    if heads.contains_key(branch)
+                        && !candidate_branch_is_clean(self, branch).await?
+                    {
+                        clean = false;
+                        break;
+                    }
+                }
+                if !clean {
+                    continue;
+                }
+                let current = self.revision().await?;
+                let merge_base: String = tokio::time::timeout(
+                    QUERY_TIMEOUT,
+                    sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
+                        .bind(&target)
+                        .bind(&current)
+                        .fetch_one(self.pool.as_ref()),
+                )
+                .await
+                .context("candidate ancestry inspection deadline exceeded")??;
+                if merge_base != target {
+                    continue;
+                }
+                if let Err(error) = cleanup_promoted_candidate(self, &names, &target).await {
+                    preserve_resolved_cleanup(self, &names, &names.promoting, &target, error)
+                        .await?;
+                }
+            } else {
+                let mut eligible = true;
+                for branch in [&names.open, &names.promoting, &names.abandoned] {
+                    if let Some(head) = heads.get(branch) {
+                        if head != &target {
+                            eligible = false;
+                            break;
+                        }
+                        if !candidate_branch_is_clean(self, branch).await? {
+                            eligible = false;
+                            break;
+                        }
+                    }
+                }
+                if !eligible {
+                    continue;
+                }
+                if let Err(error) = cleanup_abandoned_candidate(self, &names, &target, &heads).await
+                {
+                    preserve_resolved_cleanup(self, &names, &names.abandoned, &target, error)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
     }
     pub async fn revision(&self) -> Result<String> {
         self.readable()?;
@@ -892,6 +1479,51 @@ async fn run_migration_worker(
     waiting
         .await
         .context("memory migration worker stopped before cleanup")?
+}
+
+async fn run_candidate_recovery_worker(store: &MemoryStore) -> Result<()> {
+    let worker_store = store.clone();
+    let (result, waiting) = tokio::sync::oneshot::channel();
+    let (accepted, delivery) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        match worker_store.recover_candidates().await {
+            Ok(()) => {
+                if result.send(Ok(())).is_err() || delivery.await.is_err() {
+                    let _ = close_candidate_recovery_worker(worker_store).await;
+                }
+            }
+            Err(error) => {
+                let cleanup = close_candidate_recovery_worker(worker_store).await;
+                let outcome = match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!(
+                        "candidate recovery cleanup also failed: {cleanup:#}"
+                    ))),
+                };
+                let _ = result.send(outcome);
+            }
+        }
+    });
+    waiting
+        .await
+        .context("candidate recovery worker stopped before cleanup")??;
+    // This acknowledgement and guard release contain no cancellation point.
+    // A cancelled opener instead closes `delivery`, so the worker settles the
+    // server before its installed startup guard can be released.
+    accepted
+        .send(())
+        .map_err(|_| anyhow::anyhow!("candidate recovery worker stopped before handoff"))?;
+    let lock: File = store.shared.server.take_reap_guard();
+    drop(lock);
+    Ok(())
+}
+
+async fn close_candidate_recovery_worker(store: MemoryStore) -> Result<()> {
+    let stopped = store.shared.server.close_installed_guard().await;
+    drop(store);
+    let lock = stopped?;
+    drop(lock);
+    Ok(())
 }
 
 async fn close_migration_worker(server: Server, _pool: Arc<MySqlPool>) -> Result<File> {
@@ -992,6 +1624,12 @@ async fn apply(
             );
         }
     }
+    // The serialized caller has reconciled the previous receipt before this
+    // transaction. Replace only active operational receipts; historical Dolt
+    // revisions and all user messages, notes and journal state remain intact.
+    sqlx::query("DELETE FROM operations")
+        .execute(&mut *transaction)
+        .await?;
     sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
         .bind(operation)
         .bind(label)
@@ -1952,8 +2590,18 @@ mod tests {
             live: store.clone(),
             view: old.clone(),
             base,
+            promoted: Arc::new(StdMutex::new(None)),
         };
         assert!(stale.promote().await.is_err());
+        assert_eq!(revision(&old_pool).await?, candidate_head);
+        assert_eq!(inspection_snapshot(&old_pool).await?, old_before);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT hash FROM dolt_branches WHERE name = ?")
+                .bind(&branch)
+                .fetch_one(store.pool.as_ref())
+                .await?,
+            candidate_head
+        );
         let fresh = store.begin_candidate("current").await?;
         fresh
             .view()
@@ -2307,6 +2955,7 @@ mod tests {
                 read_only: true,
                 write: Arc::new(Mutex::new(())),
                 uncertain: StdMutex::new(None),
+                candidate_recovery_pause: None,
                 _permit: None,
             }),
             pool: pool.clone(),
@@ -2495,12 +3144,13 @@ mod tests {
         .await
         .unwrap();
         let before = store.revision().await.unwrap();
-        // Duplicate operation identity fails AFTER the row update, proving SQL rollback.
+        // The overlong receipt label fails AFTER the row update, proving SQL rollback.
+        let rejected_operation = Uuid::new_v4().to_string();
         assert!(
             apply(
                 &mut connection,
-                &operation,
-                "duplicate",
+                &rejected_operation,
+                &"x".repeat(129),
                 Mutation::Checkpoint {
                     namespace: "turn".into(),
                     messages: vec![("assistant".into(), "duplicate".into())],

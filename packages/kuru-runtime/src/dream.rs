@@ -46,101 +46,106 @@ impl Harness {
         self.reconcile().await?;
         cancellation.check()?;
         let candidate = self.memory.begin_candidate("dream").await?;
-        cancellation.check()?;
-        let memory = candidate.view();
-        self.emit(
-            "dream",
-            "pool",
-            "parts are consolidating their own memories",
-        );
-        let ids = self
-            .topology
-            .parts
-            .iter()
-            .filter(|p| p.active)
-            .map(|p| p.id.clone())
-            .collect::<Vec<_>>();
-        let replies = join_all(ids.iter().map(|id| self.ask_in_controlled(&memory, id,
-            vec![user("Review your own history. Write a concise durable memory summary of useful facts and unresolved concerns. You may suggest a new complementary member of an existing role or retire yourself if your role is redundantly covered. A suggestion is optional; do not manufacture changes. No other tools are available during dreaming.")],
-            "dream: consolidate your own memory, optionally propose membership changes", vec![dream_tool()], cancellation))).await;
-        let mut report = DreamReport::default();
-        let mut proposals = vec![];
-        for (id, reply) in ids.into_iter().zip(replies) {
-            match reply {
-                Err(error) if error.is::<crate::actor::MemoryFailure>() => return Err(error),
-                Err(error) if turn_was_cancelled(&error) => return Err(error),
-                Err(error) => report.rejected.push(format!("{id}: {error:#}")),
-                Ok(reply) => {
-                    if !reply.text.trim().is_empty() {
-                        cancellation.check()?;
-                        memory
-                            .append(
-                                &format!("{}/notes", self.namespace(&id)),
-                                "dream",
-                                &crate::actor::truncate_text(&reply.text, 8192),
-                            )
-                            .await?;
-                        cancellation.check()?;
-                        report.summaries += 1;
-                    }
-                    for (index, call) in reply.calls.into_iter().enumerate() {
-                        let result = if index >= 2 {
-                            Err(anyhow::anyhow!(
-                                "at most two dream proposals are accepted per part"
-                            ))
-                        } else if call.name != "dream_suggest" {
-                            Err(anyhow::anyhow!("only dream_suggest is available"))
-                        } else {
-                            serde_json::from_value::<DreamProposal>(call.arguments.clone())
-                                .map_err(Into::into)
-                        };
-                        let outcome = match result {
-                            Ok(proposal) => {
-                                if matches!(&proposal, DreamProposal::Retire { id: target } if target != &id)
-                                {
-                                    let error = format!("{id}: parts may only retire themselves");
+        let outcome = async {
+            cancellation.check()?;
+            let memory = candidate.view();
+            self.emit(
+                "dream",
+                "pool",
+                "parts are consolidating their own memories",
+            );
+            let ids = self
+                .topology
+                .parts
+                .iter()
+                .filter(|p| p.active)
+                .map(|p| p.id.clone())
+                .collect::<Vec<_>>();
+            let replies = join_all(ids.iter().map(|id| self.ask_in_controlled(&memory, id,
+                vec![user("Review your own history. Write a concise durable memory summary of useful facts and unresolved concerns. You may suggest a new complementary member of an existing role or retire yourself if your role is redundantly covered. A suggestion is optional; do not manufacture changes. No other tools are available during dreaming.")],
+                "dream: consolidate your own memory, optionally propose membership changes", vec![dream_tool()], cancellation))).await;
+            let mut report = DreamReport::default();
+            let mut proposals = vec![];
+            for (id, reply) in ids.into_iter().zip(replies) {
+                match reply {
+                    Err(error) if error.is::<crate::actor::MemoryFailure>() => return Err(error),
+                    Err(error) if turn_was_cancelled(&error) => return Err(error),
+                    Err(error) => report.rejected.push(format!("{id}: {error:#}")),
+                    Ok(reply) => {
+                        if !reply.text.trim().is_empty() {
+                            cancellation.check()?;
+                            memory
+                                .append(
+                                    &format!("{}/notes", self.namespace(&id)),
+                                    "dream",
+                                    &crate::actor::truncate_text(&reply.text, 8192),
+                                )
+                                .await?;
+                            cancellation.check()?;
+                            report.summaries += 1;
+                        }
+                        for (index, call) in reply.calls.into_iter().enumerate() {
+                            let result = if index >= 2 {
+                                Err(anyhow::anyhow!(
+                                    "at most two dream proposals are accepted per part"
+                                ))
+                            } else if call.name != "dream_suggest" {
+                                Err(anyhow::anyhow!("only dream_suggest is available"))
+                            } else {
+                                serde_json::from_value::<DreamProposal>(call.arguments.clone())
+                                    .map_err(Into::into)
+                            };
+                            let outcome = match result {
+                                Ok(proposal) => {
+                                    if matches!(&proposal, DreamProposal::Retire { id: target } if target != &id)
+                                    {
+                                        let error =
+                                            format!("{id}: parts may only retire themselves");
+                                        report.rejected.push(error.clone());
+                                        error
+                                    } else {
+                                        proposals.push(proposal);
+                                        "proposal submitted for validation".to_string()
+                                    }
+                                }
+                                Err(error) => {
+                                    let error = format!("{id}: {error}");
                                     report.rejected.push(error.clone());
                                     error
-                                } else {
-                                    proposals.push(proposal);
-                                    "proposal submitted for validation".to_string()
                                 }
-                            }
-                            Err(error) => {
-                                let error = format!("{id}: {error}");
-                                report.rejected.push(error.clone());
-                                error
-                            }
-                        };
-                        cancellation.check()?;
-                        memory
-                            .append(
-                                &self.namespace(&id),
-                                "tool",
-                                &json!({"call_id":call.id,"output":outcome}).to_string(),
-                            )
-                            .await?;
-                        cancellation.check()?;
+                            };
+                            cancellation.check()?;
+                            memory
+                                .append(
+                                    &self.namespace(&id),
+                                    "tool",
+                                    &json!({"call_id":call.id,"output":outcome}).to_string(),
+                                )
+                                .await?;
+                            cancellation.check()?;
+                        }
                     }
                 }
             }
+            let (topology, changes) = self.plan_dream(proposals)?;
+            report.accepted = changes.accepted;
+            report.rejected.extend(changes.rejected);
+            self.finish_dream(&candidate, topology, &report, cancellation)
+                .await?;
+            self.emit(
+                "dream",
+                "pool",
+                format!(
+                    "{} summaries, {} changes, {} rejected proposals",
+                    report.summaries,
+                    report.accepted.len(),
+                    report.rejected.len()
+                ),
+            );
+            Ok(report)
         }
-        let (topology, changes) = self.plan_dream(proposals)?;
-        report.accepted = changes.accepted;
-        report.rejected.extend(changes.rejected);
-        self.finish_dream(&candidate, topology, &report, cancellation)
-            .await?;
-        self.emit(
-            "dream",
-            "pool",
-            format!(
-                "{} summaries, {} changes, {} rejected proposals",
-                report.summaries,
-                report.accepted.len(),
-                report.rejected.len()
-            ),
-        );
-        Ok(report)
+        .await;
+        resolve_candidate_outcome(&candidate, outcome).await
     }
 
     pub async fn apply_dream(&mut self, proposals: Vec<DreamProposal>) -> Result<DreamReport> {
@@ -148,9 +153,13 @@ impl Harness {
         let (topology, report) = self.plan_dream(proposals)?;
         let candidate = self.memory.begin_candidate("dream").await?;
         let cancellation = CancellationToken::new();
-        self.finish_dream(&candidate, topology, &report, &cancellation)
-            .await?;
-        Ok(report)
+        let outcome = async {
+            self.finish_dream(&candidate, topology, &report, &cancellation)
+                .await?;
+            Ok(report)
+        }
+        .await;
+        resolve_candidate_outcome(&candidate, outcome).await
     }
 
     async fn finish_dream(
@@ -375,6 +384,21 @@ fn restore_topology(mut previous: Topology, current: &Topology) -> Topology {
     previous
 }
 
+async fn resolve_candidate_outcome(
+    candidate: &Candidate,
+    outcome: Result<DreamReport>,
+) -> Result<DreamReport> {
+    match outcome {
+        Ok(report) => Ok(report),
+        Err(error) => match candidate.abandon().await {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "dream candidate abandonment also failed: {cleanup:#}"
+            ))),
+        },
+    }
+}
+
 fn dream_tool() -> ToolSpec {
     // oneOf allows providers to preserve validation rather than using prose-only JSON.
     let mut tool = spec(
@@ -527,7 +551,8 @@ mod cancellation_tests {
                 .unwrap();
         result.unwrap();
         assert_eq!(memory.revision().await.unwrap(), accepted);
-        assert_eq!(candidate.view().revision().await.unwrap(), accepted);
+        assert!(candidate.view().revision().await.is_err());
+        assert_eq!(candidate.promote().await.unwrap(), accepted);
         assert_eq!(serde_json::to_value(&harness.topology).unwrap(), expected);
         assert_eq!(
             serde_json::to_value(

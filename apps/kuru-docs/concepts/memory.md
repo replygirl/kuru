@@ -86,6 +86,13 @@ reconciles an interrupted write against its durable receipt before it continues,
 so it can distinguish no pending operation, a completed operation, and one that
 did not commit.
 
+Kuru replaces internal operation receipts and reclaims a dream candidate only
+after its promotion or explicit abandonment is durably resolved. Unresolved
+candidates, conversations, notes and reachable revisions do not expire
+automatically. The bundled engine performs bounded, growth-triggered storage
+maintenance while Kuru owns it, but retained history can continue to grow. This
+maintenance is not secure erasure.
+
 An operating-system writer lock prevents two Kuru processes from overwriting the same project's topology. Read-only session listing remains available.
 
 ## Migration and backups

@@ -123,6 +123,13 @@ topology changes become active together after validation. A candidate based on a
 outdated live revision cannot overwrite newer conversations. Undo records a new
 revision restoring prior membership, while preserving later chats and preferences.
 
+Kuru replaces internal write receipts and reclaims a dream candidate only after
+its promotion or explicit abandonment is durably resolved. Unresolved candidates,
+conversations, notes and reachable Dolt revisions do not expire automatically.
+The bundled engine performs bounded, growth-triggered storage maintenance while
+Kuru owns it, but retained history can continue to grow. This maintenance is not
+secure erasure.
+
 ## Backup and recovery
 
 Revision history is stored on the same disk as the database. To make a local

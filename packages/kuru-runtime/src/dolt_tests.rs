@@ -116,7 +116,7 @@ async fn explicit_cancellation_keeps_live_dream_state_and_private_histories_isol
     let project = tempfile::tempdir().unwrap();
     let memory = MemoryStore::temporary().await.unwrap();
     let (started, mut requests) = mpsc::unbounded_channel();
-    let harness = Harness::new(
+    let mut harness = Harness::new(
         config(),
         project.path(),
         memory.clone(),
@@ -143,6 +143,15 @@ async fn explicit_cancellation_keeps_live_dream_state_and_private_histories_isol
     }
     let before_revision = memory.revision().await.unwrap();
     let before_topology = serde_json::to_value(&harness.topology).unwrap();
+    let before_dispatch = CancellationToken::new();
+    before_dispatch.cancel();
+    assert!(turn_was_cancelled(
+        &harness
+            .dream_controlled(&before_dispatch)
+            .await
+            .unwrap_err()
+    ));
+    assert_eq!(memory.revision().await.unwrap(), before_revision);
     let harness = Arc::new(Mutex::new(harness));
     let cancellation = CancellationToken::new();
     let running = tokio::spawn({
@@ -416,6 +425,8 @@ async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effect
             .unwrap()
             .is_none()
     );
+    let output = harness.run("Continue after failed dream").await.unwrap();
+    assert_eq!(output.text, "Another candidate summary");
     harness.shutdown(false).await.unwrap();
 }
 
