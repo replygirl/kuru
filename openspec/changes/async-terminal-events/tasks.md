@@ -2,6 +2,7 @@
 
 - [x] 1.1 Enable crossterm 0.29.0 `event-stream` only on the TUI dependency, add inherited futures 0.3.34 and the existing async-trait dev dependency for controlled provider fixtures, update the lockfile without version drift, and verify the locked feature graph and all TUI targets compile.
 - [x] 1.2 Replace the interactive path's synchronous poll/read pair with exactly one `EventStream` behind a private generic stream seam, and verify event, error and EOF are represented without a second terminal reader or event buffer.
+- [x] 1.3 Select Crossterm's supported level-polled Unix TTY event source and verify one real stream retains both a co-ready resize and bracketed paste without unrelated later input.
 
 ## 2. Fair scheduler and ordered state
 

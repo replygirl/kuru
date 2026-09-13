@@ -13,6 +13,7 @@ use nix::{
     unistd::Pid,
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
+use rustix::process::{Pid as RustixPid, WaitId, WaitIdOptions, waitid};
 
 const TICK: Duration = Duration::from_millis(20);
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -369,6 +370,34 @@ impl Terminal {
             std::thread::sleep(duration);
             let _ = kill(pid, Signal::SIGCONT);
         }))))
+    }
+
+    pub fn resume(&self) -> Result<()> {
+        let pid = Pid::from_raw(self.child_id()?.try_into()?);
+        kill(pid, Signal::SIGCONT)?;
+        Ok(())
+    }
+
+    pub fn wait_stopped(&self, timeout: Duration) -> Result<()> {
+        let raw_pid = self.child_id()?.try_into()?;
+        let pid =
+            RustixPid::from_raw(raw_pid).context("terminal child has an invalid process ID")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::STOPPED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )? {
+                Some(status) if status.stopped() => return Ok(()),
+                Some(status) => bail!("terminal child {pid} entered unexpected state {status:?}"),
+                None => {}
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "terminal child {pid} did not enter stopped state within {timeout:?}"
+            );
+            std::thread::sleep(TICK);
+        }
     }
 
     pub fn wait_exit(&mut self, timeout: Duration) -> Result<()> {

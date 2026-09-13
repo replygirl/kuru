@@ -37,12 +37,16 @@ runtime cancellation policy unchanged.
 
 ### One private async terminal reader
 
-Enable crossterm 0.29.0's `event-stream` feature on the TUI's inherited
-dependency and add the workspace-pinned futures 0.3.34 dependency for
-`StreamExt`. `EventStream` is a `Stream<Item = io::Result<Event>>`; its feature
-adds `futures-core` and preserves crossterm's existing event support. The lockfile
-already contains futures 0.3.34, so this changes feature edges without selecting a
-new version.
+Enable crossterm 0.29.0's `event-stream` and `use-dev-tty` features on the TUI's
+inherited dependency and add the workspace-pinned futures 0.3.34 dependency for
+`StreamExt`. `EventStream` is a `Stream<Item = io::Result<Event>>`; its features
+add `futures-core` and select Crossterm's level-polled Unix TTY source. The
+default Mio source can return after either TTY input or SIGWINCH from one
+edge-triggered readiness batch, leaving the other ready source unread without a
+new edge. The level-polled source observes that unread source on the following
+stream poll. The lockfile already contains futures 0.3.34 and the transitive
+feature dependencies, so this changes feature edges without selecting a new
+version.
 
 Real-loop failure fixtures implement the existing macro-based Provider trait.
 They use the already pinned workspace async-trait package as an app dev
@@ -112,7 +116,10 @@ stream item distinguishes event, `io::Error`, and end-of-stream. Its implementat
 owns one native input helper thread and wakes that thread during `Drop`. Kuru owns
 one stream for the terminal session and relies only on this documented stream
 contract. Native PTY and ConPTY tests remain the authority for completed-frame,
-EOF/error cleanup and actual console restoration behavior.
+EOF/error cleanup and actual console restoration behavior. A Unix PTY regression
+must make resize and bracketed-paste input ready together while the child cannot
+consume either event, then verify the same EventStream reports both without
+requiring unrelated later input.
 
 ## Operational surface
 
@@ -139,3 +146,6 @@ each supported OS.
 - **EventStream uses an internal helper thread.** Construct and drop exactly one
   inside the terminal session, never mix readers, and verify process exit and
   terminal restoration after stream failure.
+- **Unix resize and input may become ready in one native poll cycle.** Use
+  Crossterm's supported level-polled TTY source and require a real PTY regression
+  to observe both events without timing separation or a later wakeup.

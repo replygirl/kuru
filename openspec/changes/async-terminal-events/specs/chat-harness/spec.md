@@ -6,7 +6,9 @@ The interactive TUI SHALL consume native terminal input through one asynchronous
 event stream and MUST NOT combine that stream with synchronous terminal polling
 or reads. Terminal input, typed dispatch completion, bounded runtime activity and
 the animation deadline SHALL wake the loop independently and receive bounded fair
-service. Runtime activity MAY decorate presentation but MUST NOT complete a turn,
+service. Native resize and terminal input that become ready together MUST both be
+consumed without requiring a later unrelated terminal event. Runtime activity MAY
+decorate presentation but MUST NOT complete a turn,
 replace a typed result, or indefinitely extend the activity drain performed before
 typed completion.
 
@@ -25,6 +27,11 @@ create a busy loop.
 
 - **WHEN** terminal input or runtime activity remains continuously ready while a typed completion or elapsed animation deadline is also ready
 - **THEN** the completion or deadline is serviced within one bounded scheduler rotation, and pre-completion activity receives are capped by a bounded snapshot of the queue length, including lag notifications.
+
+#### Scenario: Resize and pasted input arrive together
+
+- **WHEN** a native terminal resize and bracketed-paste input become ready in the same poll cycle
+- **THEN** the sole asynchronous terminal stream reports both events without requiring a subsequent key, resize, or timer event.
 
 #### Scenario: Stale and decorative events cannot complete a turn
 

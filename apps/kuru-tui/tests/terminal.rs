@@ -219,6 +219,51 @@ fn terminal_fixture_process() -> Result<()> {
                 format!("event: {observed:?}\noriginal: {original:#}\nrestore: {restore:?}"),
             )?;
         }
+        "co-ready-events" => {
+            let mut session = kuru::ui::TerminalSession::enter(&mut std::io::stdout())?;
+            let observed = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()?
+                .block_on(async {
+                    use futures::{Stream as _, StreamExt as _};
+                    use std::{future::poll_fn, pin::Pin, task::Poll};
+
+                    let mut input = crossterm::event::EventStream::new();
+                    let prematurely_ready = poll_fn(|context| {
+                        Poll::Ready(match Pin::new(&mut input).poll_next(context) {
+                            Poll::Pending => None,
+                            Poll::Ready(event) => Some(event),
+                        })
+                    })
+                    .await;
+                    ensure!(
+                        prematurely_ready.is_none(),
+                        "EventStream was ready before the co-ready probe: {prematurely_ready:?}"
+                    );
+                    std::io::stdout()
+                        .write_all(b"\x1b[2J\x1b[HCO_READY_EVENTSTREAM\x1b[?25h\x1b[1;21H")?;
+                    std::io::stdout().flush()?;
+                    nix::sys::signal::kill(
+                        nix::unistd::Pid::this(),
+                        nix::sys::signal::Signal::SIGSTOP,
+                    )?;
+
+                    let first = tokio::time::timeout(Duration::from_secs(5), input.next())
+                        .await
+                        .context("timed out waiting for the first co-ready terminal event")?
+                        .context("native EventStream closed before the first co-ready event")??;
+                    let second = tokio::time::timeout(Duration::from_secs(5), input.next())
+                        .await
+                        .context("timed out waiting for the second co-ready terminal event")?
+                        .context("native EventStream closed before the second co-ready event")??;
+                    Ok::<_, anyhow::Error>((first, second))
+                });
+            let restore = session.restore();
+            let (first, second) = observed?;
+            println!("CO_READY_EVENTS:{first:?}|{second:?}");
+            std::io::stdout().flush()?;
+            restore?;
+        }
         other => anyhow::bail!("unknown fixture mode {other}"),
     }
     Ok(())
@@ -374,6 +419,24 @@ fn real_pty_error_unwind_restores_terminal_and_reports_the_original_error() -> R
     );
     assert!(report.contains("restore: Ok(())"), "{report}");
     terminal.assert_restored()
+}
+
+#[test]
+fn real_event_stream_preserves_co_ready_resize_and_paste() -> Result<()> {
+    for attempt in 0..32 {
+        let mut terminal = fixture("co-ready-events")?;
+        terminal.wait_text(&["CO_READY_EVENTSTREAM"], &[])?;
+        terminal.wait_stopped(READY_TIMEOUT)?;
+        terminal.resize(20, 65)?;
+        terminal.send(b"\x1b[200~pasted text\x1b[201~")?;
+        terminal.resume()?;
+        terminal
+            .wait_text(&["Resize(65, 20)", "Paste(\"pasted text\")"], &[])
+            .with_context(|| format!("co-ready EventStream attempt {attempt}"))?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        terminal.assert_restored()?;
+    }
+    Ok(())
 }
 
 fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {

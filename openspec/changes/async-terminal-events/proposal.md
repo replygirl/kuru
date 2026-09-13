@@ -14,8 +14,10 @@ contracts.
 
 ## What Changes
 
-- Enable crossterm 0.29.0's `event-stream` feature only in the TUI and consume it
-  with the already pinned workspace futures package.
+- Enable crossterm 0.29.0's `event-stream` and Unix `use-dev-tty` features only
+  in the TUI and consume the stream with the already pinned workspace futures
+  package. The level-polled Unix source must preserve terminal input that becomes
+  ready in the same native poll cycle as a resize.
 - Replace synchronous terminal `poll`/`read` with one async terminal stream and
   select it alongside typed completion, bounded runtime activity and a persistent
   animation deadline.
@@ -43,7 +45,7 @@ The implementation is limited to `apps/kuru-tui` dependency declarations,
 focused scheduler and native terminal tests. Public `TurnOutput`, JSON, Harness,
 provider, memory, authentication, shutdown-dreaming and plain `View` interfaces
 do not change. Dependency versions remain pinned; dependency edges add the
-app-owned crossterm feature, inherited futures, and the existing workspace
+app-owned crossterm features, inherited futures, and the existing workspace
 async-trait package as a dev dependency for controlled provider fixtures.
 
 ## Surfaces

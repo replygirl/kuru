@@ -25,7 +25,7 @@ required-features = ["test-support"]
 kuru-delivery.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-crossterm = { workspace = true, features = ["event-stream"] }
+crossterm = { workspace = true, features = ["event-stream", "use-dev-tty"] }
 futures.workspace = true
 kuru-core.workspace = true
 kuru-platform.workspace = true
