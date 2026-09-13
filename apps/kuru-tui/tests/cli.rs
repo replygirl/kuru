@@ -110,6 +110,9 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
 
 #[test]
 fn cli_file_crud_and_shell_require_real_capabilities() {
+    const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
+    const ORDINARY_CONTROL: &str = "ordinary-control-remains-exact";
+    const MARKER: &str = "[REDACTED:recognized-secret]";
     let env = Sandbox::new();
     let tools: Value = serde_json::from_str(&env.success(&["tools"])).unwrap();
     let shell_args = if cfg!(windows) {
@@ -138,6 +141,34 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
     assert!(
         env.success(&["tool", "file_read", "--args", r#"{"path":"notes.txt"}"#])
             .contains("A real note")
+    );
+    let projected_source = format!("openai_api_key={TOOL_TOKEN}\n{ORDINARY_CONTROL}");
+    let projected_path = env.project.join("projection.txt");
+    std::fs::write(&projected_path, &projected_source).unwrap();
+    let projected_identity =
+        kuru_platform::fs::regular_file_info(&std::fs::File::open(&projected_path).unwrap())
+            .unwrap()
+            .identity;
+    let projected = env.success(&[
+        "tool",
+        "file_read",
+        "--args",
+        r#"{"path":"projection.txt"}"#,
+    ]);
+    assert_eq!(
+        projected,
+        format!("openai_api_key={MARKER}\n{ORDINARY_CONTROL}\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&projected_path).unwrap(),
+        projected_source
+    );
+    assert_eq!(
+        kuru_platform::fs::regular_file_info(&std::fs::File::open(&projected_path).unwrap())
+            .unwrap()
+            .identity,
+        projected_identity,
+        "file_read replaced the source object"
     );
     assert!(
         env.success(&["tool", "file_list", "--args", r#"{"path":"."}"#])
@@ -189,6 +220,37 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
     assert_eq!(result["exit_code"], 0, "{diagnostic}");
     assert_eq!(result["stdout"], "shell-ok", "{diagnostic}");
     assert_eq!(result["stderr"], "", "{diagnostic}");
+    let projected_shell_command = if cfg!(windows) {
+        format!("[Console]::Write('{ORDINARY_CONTROL} openai_api_key={TOOL_TOKEN}')")
+    } else {
+        format!("printf '{ORDINARY_CONTROL} openai_api_key={TOOL_TOKEN}'")
+    };
+    let projected_shell_args = serde_json::json!({"command": projected_shell_command}).to_string();
+    let projected_shell = env.run(&[
+        "--allow-shell",
+        "tool",
+        "shell",
+        "--args",
+        &projected_shell_args,
+    ]);
+    let projected_diagnostic = format!(
+        "status {}; stdout {:?}; stderr {:?}",
+        projected_shell.status,
+        String::from_utf8_lossy(&projected_shell.stdout[..projected_shell.stdout.len().min(4096)]),
+        String::from_utf8_lossy(&projected_shell.stderr[..projected_shell.stderr.len().min(4096)]),
+    );
+    assert!(projected_shell.status.success(), "{projected_diagnostic}");
+    assert!(projected_shell.stderr.is_empty(), "{projected_diagnostic}");
+    let projected_shell: Value = serde_json::from_slice(&projected_shell.stdout).unwrap();
+    let stdout = projected_shell["stdout"].as_str().unwrap();
+    assert_eq!(projected_shell["success"], true, "{projected_diagnostic}");
+    assert_eq!(projected_shell["exit_code"], 0, "{projected_diagnostic}");
+    assert_eq!(projected_shell["stderr"], "", "{projected_diagnostic}");
+    assert_eq!(
+        stdout,
+        format!("{ORDINARY_CONTROL} openai_api_key={MARKER}"),
+        "{projected_diagnostic}"
+    );
     #[cfg(windows)]
     {
         assert_eq!(markers[0].as_deref().unwrap(), b"entered");

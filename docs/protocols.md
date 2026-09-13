@@ -128,6 +128,32 @@ variable disclosure; it does not contain the shell's filesystem, process, or
 network authority. Configured stdio MCP servers keep their own inherited
 environment and explicit configuration overrides.
 
+Before a built-in file, shell, or MCP result crosses into the CLI or runtime,
+Kuru projects a finite set of recognizable credential forms to
+`[REDACTED:recognized-secret]`. It recognizes Basic/Bearer Authorization and
+Proxy-Authorization values; OpenAI `sk-svcacct-`, `sk-proj-`, then `sk-`
+prefixes, longest first, with at least 16 token bytes after that prefix;
+GitHub (`ghp_`, `github_pat_`, `gho_`, `ghu_`, `ghs_`, `ghr_`)
+forms with at least 8 following token bytes, and exact-length AWS
+(`AKIA`/`ASIA` plus exactly 16 uppercase-alphanumeric bytes) token shapes;
+supported PEM private-key blocks; and exact
+contextual sensitive field names such as `api_key`, `password`, and
+`refresh_token`. Those local OpenAI and GitHub floors reduce accidental matches;
+they do not validate a credential. Exact sensitive JSON fields have their whole
+value replaced, including non-string values, while other JSON strings and plain
+text retain unmatched bytes. AWS matching uses its uppercase-alphanumeric token
+alphabet for the trailing boundary, so a following lowercase byte is outside that
+token shape.
+
+This projects returned results, actionable MCP application errors and outward
+tool-failure details, including error formatting and source chains. It
+does not inspect credential stores or enumerate environment values, alter tool
+arguments or file writes, rewrite source files or earlier history, or impose a
+new combined result limit. Unknown, encoded, split, transformed, or future
+credential formats can remain visible, and ordinary source text can be matched
+by a documented form; tool results are not byte-exact backups. MCP stderr is
+not captured by this projection.
+
 ## MCP
 
 Both stdio and Streamable HTTP transports initialize the server, send

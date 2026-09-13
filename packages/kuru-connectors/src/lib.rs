@@ -8,8 +8,10 @@ mod mcp;
 #[cfg(windows)]
 mod process;
 mod providers;
+mod redaction;
 mod retry;
 mod rpc;
+mod tool_output;
 mod tools;
 #[cfg(unix)]
 mod unix_shell;
@@ -20,6 +22,7 @@ mod test_support;
 pub use a2a::a2a_send;
 pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
 pub use providers::{DemoProvider, Provider, ResponsesProvider, provider};
+pub use redaction::truncate_tool_output;
 pub use tools::ToolHost;
 
 /// Maximum protocol message/body size; limits also apply to chunked responses.

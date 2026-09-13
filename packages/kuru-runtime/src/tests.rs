@@ -2,7 +2,7 @@ use kuru_memory::MemoryStore;
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -262,14 +262,24 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
 
 #[tokio::test]
 async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
-    let fake = Fake::new(|r| {
+    const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
+    const PRIOR_TOKEN: &str = "sk-proj-priorhistory0123456789";
+    const ORDINARY_CONTROL: &str = "ordinary-control-remains-exact";
+    const MARKER: &str = "[REDACTED:recognized-secret]";
+    let resumed_phase = Arc::new(AtomicBool::new(false));
+    let provider_phase = resumed_phase.clone();
+    let fake = Fake::new(move |r| {
         let mut reply = answer("Draft");
         if r.instructions.contains("Phase: speak") {
-            if r.messages
-                .iter()
-                .any(|m| m.role == "tool" && m.content.contains("unique-file-content"))
-            {
-                reply.text = "Read unique-file-content from actual tool".into();
+            if r.messages.iter().any(|m| {
+                m.role == "tool"
+                    && m.content.contains(MARKER)
+                    && m.content.contains(ORDINARY_CONTROL)
+                    && !m.content.contains(TOOL_TOKEN)
+            }) {
+                reply.text = format!("Read {ORDINARY_CONTROL} from actual tool");
+            } else if provider_phase.load(Ordering::SeqCst) {
+                reply.text = "The resumed context omitted its persisted tool receipt".into();
             } else {
                 reply
                     .calls
@@ -278,17 +288,134 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
         }
         reply
     });
-    let (dir, mut harness) = fixture(Mode::Freudian, fake.clone()).await;
-    std::fs::write(dir.path().join("sample.txt"), "unique-file-content").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let data = kuru_memory::test_support::tempdir().unwrap();
+    let config = Config {
+        mode: Mode::Freudian,
+        provider: "demo".into(),
+        model: "demo".into(),
+        dream_every: 0,
+        dream_on_exit: false,
+        ..Config::default()
+    };
+    let options = kuru_memory::test_support::open_options(
+        data.path().to_owned(),
+        crate::project_scope(dir.path()).unwrap(),
+    )
+    .unwrap();
+    let memory = MemoryStore::open(options.clone()).await.unwrap();
+    let mut harness = Harness::new(
+        config.clone(),
+        dir.path(),
+        memory.clone(),
+        fake.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let prior_owner = harness.topology.parts[0].id.clone();
+    harness.focus(Some(&prior_owner)).await.unwrap();
+    let prior_history = format!("preexisting history openai_api_key={PRIOR_TOKEN}");
+    harness
+        .memory
+        .append(
+            &harness.namespace(&prior_owner),
+            "assistant",
+            &prior_history,
+        )
+        .await
+        .unwrap();
+    let source = format!("openai_api_key={TOOL_TOKEN}\n{ORDINARY_CONTROL}");
+    let source_path = dir.path().join("sample.txt");
+    std::fs::write(&source_path, &source).unwrap();
     let result = harness.run("Read sample.txt").await.unwrap();
-    assert!(result.text.contains("unique-file-content"));
+    assert!(result.text.contains(ORDINARY_CONTROL));
     let tool_event = result.events.iter().find(|e| e.kind == "tool").unwrap();
     assert_eq!(tool_event.detail, "file_read");
-    assert!(fake.requests.lock().unwrap().iter().any(|r| {
-        r.messages
-            .iter()
-            .any(|m| m.role == "tool" && m.content.contains("unique-file-content"))
+    assert!(!tool_event.detail.contains(TOOL_TOKEN));
+
+    let speaker = result.speaker.clone();
+    assert_eq!(speaker, prior_owner);
+    let session = harness.session.id.clone();
+    let stored = harness.memory_for(&speaker).await.unwrap();
+    let receipt = stored.iter().find(|m| m.role == "tool").unwrap();
+    let receipt: Value = serde_json::from_str(&receipt.content).unwrap();
+    let call_id = receipt["call_id"].as_str().unwrap().to_owned();
+    let output = receipt["output"].as_str().unwrap();
+    assert_eq!(
+        output,
+        format!("openai_api_key={MARKER}\n{ORDINARY_CONTROL}")
+    );
+    assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
+
+    let requests_before_reopen = fake.requests.lock().unwrap().len();
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+    drop(harness);
+    drop(memory);
+    let memory = MemoryStore::open(options).await.unwrap();
+    let mut reopened = Harness::new(
+        config,
+        dir.path(),
+        memory.clone(),
+        fake.clone(),
+        Some(&session),
+    )
+    .await
+    .unwrap();
+    reopened.focus(Some(&speaker)).await.unwrap();
+    let persisted = reopened.memory_for(&speaker).await.unwrap();
+    assert!(persisted.iter().any(|message| {
+        message.role == "tool"
+            && message.content.contains(MARKER)
+            && message.content.contains(ORDINARY_CONTROL)
+            && !message.content.contains(TOOL_TOKEN)
     }));
+    assert!(
+        reopened
+            .memory_for(&prior_owner)
+            .await
+            .unwrap()
+            .iter()
+            .any(|message| message.role == "assistant" && message.content == prior_history)
+    );
+    resumed_phase.store(true, Ordering::SeqCst);
+    let continued = reopened.run("Continue from the tool result").await.unwrap();
+    assert!(continued.text.contains(ORDINARY_CONTROL));
+    {
+        let requests = fake.requests.lock().unwrap();
+        let resumed_request = requests[requests_before_reopen..]
+            .iter()
+            .find(|request| request.actor.ends_with(&speaker))
+            .unwrap();
+        assert!(resumed_request.messages.iter().any(|message| {
+            message.role == "tool"
+                && serde_json::from_str::<Value>(&message.content)
+                    .ok()
+                    .is_some_and(|receipt| receipt["call_id"] == call_id)
+                && message.content.contains(MARKER)
+                && message.content.contains(ORDINARY_CONTROL)
+                && !message.content.contains(TOOL_TOKEN)
+        }));
+        for request in requests
+            .iter()
+            .filter(|request| !request.actor.ends_with(&speaker))
+        {
+            assert!(
+                !request
+                    .messages
+                    .iter()
+                    .any(|message| message.role == "tool"),
+                "tool receipt crossed private peer boundary: {}",
+                request.actor
+            );
+        }
+    }
+    assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
+    reopened.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+    drop(reopened);
+    drop(memory);
 }
 
 #[tokio::test]

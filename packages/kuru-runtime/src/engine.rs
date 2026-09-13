@@ -1030,7 +1030,7 @@ fn tool_result(call: &ToolCall, result: Result<String>) -> Message {
         Ok(output) => output,
         Err(error) => format!("ERROR: {error:#}"),
     };
-    let output = crate::actor::truncate_text(&output, 8192);
+    let output = kuru_connectors::truncate_tool_output(&output, 8192);
     Message {
         role: "tool".into(),
         content: json!({"call_id":call.id,"output":output}).to_string(),
@@ -1357,5 +1357,53 @@ mod publication_tests {
             assert!(harness.pending_publication.is_none());
         }
         harness.shutdown(false).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tool_result_tests {
+    use super::*;
+
+    const REDACTION_MARKER: &str = "[REDACTED:recognized-secret]";
+    const TRUNCATED: &str = "[truncated]";
+
+    fn assert_complete_markers(text: &str) {
+        let mut rest = text;
+        while let Some(index) = rest.find('[') {
+            let suffix = &rest[index..];
+            assert!(
+                suffix.starts_with(REDACTION_MARKER) || suffix.starts_with(TRUNCATED),
+                "partial redaction marker in {text:?}"
+            );
+            rest = &suffix[1..];
+        }
+    }
+
+    #[test]
+    fn fixed_runtime_tool_limit_keeps_redaction_markers_whole() {
+        let call = ToolCall {
+            id: "fixed-runtime-limit".into(),
+            name: "file_read".into(),
+            arguments: Value::Null,
+        };
+        for cut in 1..REDACTION_MARKER.len() {
+            let ordinary_prefix = "x".repeat(8192 - TRUNCATED.len() - cut);
+            let output = format!("{ordinary_prefix}{}{}", REDACTION_MARKER, "tail".repeat(32));
+            let receipt = tool_result(&call, Ok(output));
+            let value: Value = serde_json::from_str(&receipt.content).unwrap();
+            assert_eq!(value["call_id"], call.id);
+            let output = value["output"].as_str().unwrap();
+            assert!(output.len() <= 8192);
+            assert_eq!(
+                output,
+                format!(
+                    "{}{}{}",
+                    "x".repeat(8192 - REDACTION_MARKER.len() - TRUNCATED.len()),
+                    REDACTION_MARKER,
+                    TRUNCATED,
+                )
+            );
+            assert_complete_markers(output);
+        }
     }
 }
