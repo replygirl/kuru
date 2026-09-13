@@ -105,7 +105,7 @@ fn stock_shell_source(progress: &Path, input: &Path, sentinel: &str) -> String {
 if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {{ throw 'expected stock PowerShell 5.1' }}
 if ([string]::IsNullOrWhiteSpace($env:ProgramData) -or [string]::IsNullOrWhiteSpace($env:ProgramFiles) -or [string]::IsNullOrWhiteSpace(${{env:ProgramFiles(x86)}}) -or [string]::IsNullOrWhiteSpace($env:ProgramW6432) -or [string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITECTURE)) {{ throw 'expected stock Windows machine environment' }}
 [IO.File]::AppendAllText({progress}, "version-checked`nmachine-environment-checked`nhash-started`n")
-$hash = (Get-FileHash -LiteralPath {input} -Algorithm SHA256).Hash
+$hash = (Microsoft.PowerShell.Utility\Get-FileHash -LiteralPath {input} -Algorithm SHA256).Hash
 [IO.File]::AppendAllText({progress}, "hashed`n")
 [Console]::Write($hash + '|' + {sentinel})
 [IO.File]::AppendAllText({progress}, "completed`n")
@@ -427,8 +427,9 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     }
     let incompatible = modules.join("Microsoft.PowerShell.Utility");
     fs::create_dir(&incompatible).unwrap();
-    // Discovery reads these explicit exports before import checks the minimum
-    // engine version. No cmdlet, script module or DLL implements the command.
+    // Qualified auto-loading selects this same-name module before import checks
+    // the minimum engine version. No cmdlet, script module or DLL implements
+    // the command.
     fs::write(
         incompatible.join("Microsoft.PowerShell.Utility.psd1"),
         r#"@{
@@ -500,7 +501,7 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     );
     assert!(
         diagnostic.contains("Get-FileHash")
-            && diagnostic.contains("CouldNotAutoloadMatchingModule")
+            && diagnostic.contains("CouldNotAutoLoadModule")
             && diagnostic.contains("Microsoft.PowerShell.Utility"),
         "control must reach the incompatible module's autoload failure: {:?}; stages={control_stages:?}; machine_environment={machine_environment}",
         preview(&control.stderr)
