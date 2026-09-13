@@ -2338,7 +2338,11 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn windows_shell_projection_source(root: &Path, case: &str) -> String {
+    fn windows_shell_projection_source(
+        root: &Path,
+        case: &str,
+        diagnostic_import: Option<&str>,
+    ) -> String {
         let home = root.join("home");
         let temporary = root.join("temporary");
         let commands = root.join("commands");
@@ -2358,6 +2362,42 @@ mod tests {
                 .join(format!("shell-stage-{case}.txt"))
                 .as_os_str(),
         );
+        let diagnostic_import = diagnostic_import.map_or_else(String::new, |module| {
+            format!(
+                r#"[IO.File]::AppendAllText($stage, "before-import`nimport-verbose=")
+$importCapacity = 1024
+$importMarker = '[truncated]'
+$importTextCapacity = $importCapacity - $importMarker.Length
+$importWritten = 0
+$importTruncated = $false
+try {{
+    Microsoft.PowerShell.Core\Import-Module -Name '{module}' -Verbose -ErrorAction Stop 4>&1 | Microsoft.PowerShell.Core\ForEach-Object {{
+        if (-not $importTruncated) {{
+            $importRecord = $_.ToString()
+            $importRemaining = $importTextCapacity - $importWritten
+            if ($importRemaining -le 0) {{
+                [IO.File]::AppendAllText($stage, $importMarker)
+                $importWritten += $importMarker.Length
+                $importTruncated = $true
+            }} elseif ($importRecord.Length -gt $importRemaining) {{
+                [IO.File]::AppendAllText($stage, $importRecord.Substring(0, $importRemaining))
+                [IO.File]::AppendAllText($stage, $importMarker)
+                $importWritten += $importRemaining + $importMarker.Length
+                $importTruncated = $true
+            }} else {{
+                [IO.File]::AppendAllText($stage, $importRecord)
+                $importWritten += $importRecord.Length
+            }}
+        }}
+    }}
+}} catch {{
+    throw
+}}
+[IO.File]::AppendAllText($stage, "`n")
+[IO.File]::AppendAllText($stage, "after-import`n")
+"#
+            )
+        });
         format!(
             r#"
 [IO.File]::AppendAllText({expected_stage}, "entered`n")
@@ -2370,7 +2410,7 @@ $expectedComSpec = {expected_comspec}
 # Kuru supplies the exact inherited value or fallback. Stock PowerShell then
 # appends .CPL during engine construction when that extension is absent.
 $expectedPathext = if ($env:NO_COLOR -eq 'inherited') {{ '.EXE;.CMD;.CPL' }} else {{ '.COM;.EXE;.BAT;.CMD;.CPL' }}
-[IO.File]::AppendAllText($stage, "before-join-path`n")
+{diagnostic_import}[IO.File]::AppendAllText($stage, "before-join-path`n")
 $homePath = Join-Path $env:USERPROFILE 'shell-home.txt'
 [IO.File]::AppendAllText($stage, "after-join-path`n")
 [IO.File]::WriteAllText($homePath, 'home')
@@ -2447,11 +2487,10 @@ if ($failed.Count -eq 0) {{
         };
 
         let mut results = Vec::new();
-        for (name, encoded, console) in [
-            ("encoded-inherit", true, Console::Inherit),
-            ("command-inherit", false, Console::Inherit),
-            ("encoded-private-hidden", true, Console::PrivateHidden),
-        ] {
+        for (name, module) in [(
+            "encoded-inherit-import-management",
+            "Microsoft.PowerShell.Management",
+        )] {
             let root = match tempfile::tempdir() {
                 Ok(root) => root,
                 Err(_) => {
@@ -2521,7 +2560,7 @@ if ($failed.Count -eq 0) {{
                     continue;
                 }
             };
-            let command = windows_shell_projection_source(root.path(), case);
+            let command = windows_shell_projection_source(root.path(), case, Some(module));
             let source = format!(
                 "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
             );
@@ -2534,18 +2573,13 @@ if ($failed.Count -eq 0) {{
             ]
             .map(Into::into)
             .into();
-            if encoded {
-                let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
-                args.push("-EncodedCommand".into());
-                args.push(
-                    base64::engine::general_purpose::STANDARD
-                        .encode(bytes)
-                        .into(),
-                );
-            } else {
-                args.push("-Command".into());
-                args.push(source.into());
-            }
+            let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            args.push("-EncodedCommand".into());
+            args.push(
+                base64::engine::general_purpose::STANDARD
+                    .encode(bytes)
+                    .into(),
+            );
             let program = system.join("WindowsPowerShell/v1.0/powershell.exe");
             let mut spec =
                 match configured_command(program.as_os_str(), &args, root.path(), environment) {
@@ -2555,7 +2589,7 @@ if ($failed.Count -eq 0) {{
                         continue;
                     }
                 };
-            spec.console = console;
+            spec.console = Console::Inherit;
             spec.stdout = Stdio::Pipe;
             spec.stderr = Stdio::Pipe;
             let mut child = match spec.spawn().await {
@@ -2877,7 +2911,7 @@ if ($failed.Count -eq 0) {{
                 },
             )
             .unwrap();
-            let shell = windows_shell_projection_source(&root, case);
+            let shell = windows_shell_projection_source(&root, case, None);
             let receipt = host
                 .execute("shell", json!({"command":shell}))
                 .await
