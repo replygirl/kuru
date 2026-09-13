@@ -1,0 +1,17 @@
+## 1. Safe runtime observations [critical]
+
+- [x] 1.1 @integration (agent) drive a fake-provider retry with actor and external tool success/failure through a real CLI child -> correlated turn/actor/tool/retry records contain only typed safe fields and no fake sentinel in every rotated file. Observed: `/private/tmp/kuru-tracing-cli-provider-tool-test-final5.log` and `/private/tmp/kuru-tracing-cli-failing-shell-test-final2.log` exit 0; the focused four-slot layer test exercises rotation with a fake sentinel.
+- [x] 1.2 @runtime (agent) cancel an asynchronous turn after actor/tool work begins -> relevant spans close and no entered span is retained across awaits. Observed: `/private/tmp/kuru-tracing-pty-cancellation-test-final.log` exits 0; actual debug PTY cancellation observes `cancelled` and `span_close`, followed by a successful next turn and terminal restoration. The admitted-turn future is heap-pinned only at `Harness::run_controlled`'s caller boundary; `/private/tmp/kuru-pr18-stack-runtime-cancellation.log` exits 0 for the existing real-Dolt provider-cancellation/actor-permit regression after that change. Hosted PR18 `ba4a3b7` Windows full-application job `103756331991` later passed the native suite in row 3.2.
+
+## 2. Bounded private diagnostic ring [critical]
+
+- [x] 2.1 @e2e (agent) run a runtime-owning CLI command until fixed byte/count rotation -> observed: `/private/tmp/kuru-tracing-cli-ring-rotation-final.log` exits 0. A real debug CLI child uses the existing `max_tool_calls=768` configuration to receive one bounded unknown-tool batch through the fake Responses provider, completes the turn, and leaves exactly one scope with all four nonempty trace files at or below 64 KiB. Focused layer tests separately prove restart-oldest selection, replacement refusal, and late-write disarm.
+- [x] 2.2 @integration (agent) force diagnostic setup and write failure through the app boundary -> observed: `/private/tmp/kuru-tracing-diagnostic-setup-refusal.log` exits 0 for an unsafe private diagnostics-path refusal before provider work; `/private/tmp/kuru-tracing-diagnostic-write-failure.log` exits 0 after replacing the held trace name while a fake provider is gated, with the completed JSON turn authoritative and only a bounded stderr cleanup notice.
+
+## 3. Presentation and native evidence
+
+- [x] 3.1 @e2e (agent) compare normal and `--debug` `kuru run --json` plus a real PTY -> JSON stdout and terminal rendering remain unchanged and neither mode emits unsolicited diagnostics. Observed: `/private/tmp/kuru-tracing-cli-provider-tool-test-final5.log` compares JSON except generated session identity with empty stderr; `/private/tmp/kuru-tracing-pty-cancellation-test-final.log` proves debug PTY restoration and no trace rows in the transcript.
+- [x] 3.2 @integration (agent) run native Windows ring/privacy/rotation fixtures -> hosted PR18 `ba4a3b7` Windows application job `103756331991` passed the native suite.
+- [x] 3.3 @integration (agent) run coordinated workspace coverage -> PR18's coordinated normal hook passed all eight categories at `32886/35006 = 93.9439%` (`ba4a3b7`).
+
+- 2026-09-13 hosted PR18 `ba4a3b7` run `34769483594`: Ubuntu, macOS, Windows platform, and Windows full-application jobs all passed; application job `103756331991` supplies the required native application evidence.

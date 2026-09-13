@@ -1,6 +1,8 @@
 use super::*;
-use rustix::fs::{Mode, OFlags, RenameFlags, mkdirat, openat, renameat, renameat_with};
-use std::os::unix::fs::MetadataExt;
+use rustix::fs::{
+    AtFlags, Dir, Mode, OFlags, RenameFlags, mkdirat, openat, renameat, renameat_with, unlinkat,
+};
+use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
 pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
     // macOS exposes these OS-owned aliases to tempfile and ordinary callers.
@@ -156,6 +158,143 @@ pub(super) fn remove(
     parent
         .sync_all()
         .map_err(|error| (PublicationPhase::Uncertain, error))
+}
+
+const MAX_TREE_DEPTH: usize = 128;
+
+pub(super) fn remove_tree(
+    parent: &File,
+    _: &[(&Path, FileIdentity)],
+    _: &Path,
+    name: &std::ffi::OsStr,
+    held: File,
+    expected: FileIdentity,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    let mut removed = false;
+    verify_named(parent, name, expected, &mut removed)?;
+    remove_children(&held, &mut removed, 0)?;
+    verify_named(parent, name, expected, &mut removed)?;
+    unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(|error| (phase(removed), error.into()))?;
+    drop(held);
+    verify_absent(parent, name, &mut removed)?;
+    parent
+        .sync_all()
+        .map_err(|error| (PublicationPhase::Uncertain, error))
+}
+
+fn phase(removed: bool) -> PublicationPhase {
+    if removed {
+        PublicationPhase::Uncertain
+    } else {
+        PublicationPhase::Rejected
+    }
+}
+
+fn verify_named(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    expected: FileIdentity,
+    removed: &mut bool,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    let current = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| (phase(*removed), error.into()))?;
+    let current = File::from(current);
+    let actual = info(&current).map_err(|error| (phase(*removed), error))?;
+    if actual.file.identity != expected {
+        return Err((
+            phase(*removed),
+            denied("directory entry no longer identifies the held object"),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_absent(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    _: &mut bool,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Err(error) if error == rustix::io::Errno::NOENT => Ok(()),
+        Err(error) => Err((PublicationPhase::Uncertain, error.into())),
+        Ok(_) => Err((
+            PublicationPhase::Uncertain,
+            denied("removed directory name is still occupied"),
+        )),
+    }
+}
+
+fn remove_children(
+    directory: &File,
+    removed: &mut bool,
+    depth: usize,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    if depth >= MAX_TREE_DEPTH {
+        return Err((
+            phase(*removed),
+            invalid("checked tree removal depth exceeded"),
+        ));
+    }
+    let mut entries = Dir::read_from(directory).map_err(|error| (phase(*removed), error.into()))?;
+    while let Some(entry) = entries.read() {
+        let entry = entry.map_err(|error| (phase(*removed), error.into()))?;
+        let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+        if matches!(name.as_bytes(), b"." | b"..") {
+            continue;
+        }
+        let child = openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        );
+        match child {
+            Ok(child) => {
+                let child = File::from(child);
+                let info = info(&child).map_err(|error| (phase(*removed), error))?;
+                if !info.directory {
+                    return Err((phase(*removed), denied("expected a regular directory")));
+                }
+                remove_children(&child, removed, depth + 1)?;
+                verify_named(directory, name, info.file.identity, removed)?;
+                unlinkat(directory, name, AtFlags::REMOVEDIR)
+                    .map_err(|error| (phase(*removed), error.into()))?;
+                drop(child);
+                *removed = true;
+            }
+            Err(error) if error == rustix::io::Errno::NOTDIR => {
+                let child = openat(
+                    directory,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .map_err(|error| (phase(*removed), error.into()))?;
+                let child = File::from(child);
+                let info = info(&child).map_err(|error| (phase(*removed), error))?;
+                if info.directory {
+                    return Err((phase(*removed), denied("expected a regular file")));
+                }
+                verify_named(directory, name, info.file.identity, removed)?;
+                unlinkat(directory, name, AtFlags::empty())
+                    .map_err(|error| (phase(*removed), error.into()))?;
+                drop(child);
+                *removed = true;
+            }
+            Err(error) => return Err((phase(*removed), error.into())),
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn publish(

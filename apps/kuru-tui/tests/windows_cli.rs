@@ -1,10 +1,11 @@
 #![cfg(windows)]
 
+use base64::Engine;
 use kuru_delivery::command::BlockingCommand as Command;
 use kuru_platform::fs::regular_file_info;
 use sha2::{Digest, Sha256};
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File},
     path::Path,
 };
@@ -113,113 +114,277 @@ $hash = (Microsoft.PowerShell.Utility\Get-FileHash -LiteralPath {input} -Algorit
     )
 }
 
-// A failed acceptance remains failed. This one diagnostic uses -Command rather
-// than Kuru's -EncodedCommand, and never supplies replacement acceptance evidence.
-fn shell_timeout_trace(root: &Path, project: &Path, progress: &Path, source: &str) -> String {
-    use kuru_platform::windows::{
-        pipe::Pipe,
-        process::{Stdio, configured_command, system_directory},
-    };
-    use std::{io, time::Duration};
+fn product_shell_environment(
+    root: &Path,
+    private: &Path,
+    hostile_modules: &Path,
+) -> std::io::Result<Vec<(OsString, OsString)>> {
+    use kuru_platform::windows::process::{environment_key_eq, system_directory};
+
+    const ALLOWED: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "USERNAME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_ARCHITEW6432",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_COLLATE",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "TZ",
+        "NO_COLOR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "PATHEXT",
+    ];
+    let mut supplied = fixture_environment(root);
+    for (name, value) in [
+        ("USERPROFILE", private.join("home")),
+        ("APPDATA", private.join("appdata")),
+        ("LOCALAPPDATA", private.join("localappdata")),
+        ("TMP", private.join("tmp")),
+        ("TEMP", private.join("temp")),
+    ] {
+        let (_, existing) = supplied
+            .iter_mut()
+            .find(|(key, _)| environment_key_eq(key, OsStr::new(name)))
+            .expect("fixture supplies each private Windows user path");
+        *existing = value.into_os_string();
+    }
+    // Supply only fake hostile/sensitive names so filtering them can be
+    // asserted without observing a runner's real process environment.
+    supplied.extend([
+        ("pSmOdUlEpAtH".into(), hostile_modules.as_os_str().into()),
+        ("OPENAI_API_KEY".into(), "sk-fixture-not-a-real-key".into()),
+    ]);
+    let mut projected: Vec<_> = supplied
+        .into_iter()
+        .filter(|(key, _)| {
+            ALLOWED
+                .iter()
+                .any(|name| environment_key_eq(key, OsStr::new(name)))
+        })
+        .collect();
+    assert!(
+        !projected
+            .iter()
+            .any(|(key, _)| environment_key_eq(key, OsStr::new("PSModulePath")))
+    );
+    assert!(!projected.iter().any(|(key, _)| {
+        environment_key_eq(key, OsStr::new("OPENAI_API_KEY"))
+            || environment_key_eq(key, OsStr::new("KURU_CLI_FIXTURE_LOG"))
+            || environment_key_eq(key, OsStr::new("LLVM_PROFILE_FILE"))
+    }));
+    for name in ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMP", "TEMP"] {
+        assert!(
+            projected
+                .iter()
+                .any(|(key, _)| environment_key_eq(key, OsStr::new(name))),
+            "product-shaped control retains {name}"
+        );
+    }
+    if !projected
+        .iter()
+        .any(|(key, _)| environment_key_eq(key, OsStr::new("PATHEXT")))
+    {
+        projected.push(("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()));
+    }
+    let system = system_directory()?;
+    let windows = system
+        .parent()
+        .ok_or_else(|| std::io::Error::other("native system directory lacks Windows parent"))?;
+    projected.extend([
+        ("SystemRoot".into(), windows.as_os_str().into()),
+        ("WINDIR".into(), windows.as_os_str().into()),
+        ("ComSpec".into(), system.join("cmd.exe").into()),
+    ]);
+    for name in ["SystemRoot", "WINDIR", "ComSpec", "PATHEXT"] {
+        assert!(
+            projected
+                .iter()
+                .any(|(key, _)| environment_key_eq(key, OsStr::new(name))),
+            "product-shaped control injects {name}"
+        );
+    }
+    Ok(projected)
+}
+
+async fn drain_shell_control(
+    pipe: &mut kuru_platform::windows::pipe::Pipe,
+    tail: &mut Vec<u8>,
+    total: &mut usize,
+    eof: &mut bool,
+) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt;
 
-    async fn drain(
-        pipe: &mut Pipe,
-        tail: &mut Vec<u8>,
-        total: &mut usize,
-        eof: &mut bool,
-    ) -> io::Result<()> {
-        let mut buffer = [0; 2048];
-        loop {
-            let length = pipe.read(&mut buffer).await?;
-            if length == 0 {
-                *eof = true;
-                return Ok(());
-            }
-            *total += length;
-            tail.extend_from_slice(&buffer[..length]);
-            if tail.len() > 4096 {
-                tail.drain(..tail.len() - 4096);
-            }
-            if *total > 2 * 1024 * 1024 {
-                return Err(io::Error::other("shell trace exceeds 2 MiB on one stream"));
-            }
+    let mut buffer = [0; 2048];
+    loop {
+        let length = pipe.read(&mut buffer).await?;
+        if length == 0 {
+            *eof = true;
+            return Ok(());
+        }
+        *total += length;
+        tail.extend_from_slice(&buffer[..length]);
+        if tail.len() > 4096 {
+            tail.drain(..tail.len() - 4096);
+        }
+        if *total > 2 * 1024 * 1024 {
+            return Err(std::io::Error::other(
+                "shell control exceeds 2 MiB on one stream",
+            ));
         }
     }
+}
+
+// A failed acceptance remains failed. These controls retain the source and
+// product-shaped environment while varying exactly one launch property.
+async fn shell_failure_control(
+    (label, encoded, console): (&str, bool, kuru_platform::windows::process::Console),
+    root: &Path,
+    project: &Path,
+    hostile_modules: &Path,
+    input: &Path,
+    sentinel: &str,
+) -> std::io::Result<String> {
+    use kuru_platform::windows::process::{Stdio, configured_command, system_directory};
+    use std::{io, time::Duration};
+    let private = root.join(format!("failure-control-{label}"));
+    fs::create_dir(&private)?;
+    for leaf in ["home", "appdata", "localappdata", "tmp", "temp"] {
+        fs::create_dir(private.join(leaf))?;
+    }
+    let progress = private.join("progress");
+    let source = format!(
+        "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{}",
+        stock_shell_source(&progress, input, sentinel)
+    );
+    let mut args: Vec<OsString> = [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-OutputFormat",
+        "Text",
+        if encoded {
+            "-EncodedCommand"
+        } else {
+            "-Command"
+        },
+    ]
+    .map(Into::into)
+    .into();
+    args.push(if encoded {
+        let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        base64::engine::general_purpose::STANDARD
+            .encode(bytes)
+            .into()
+    } else {
+        source.into()
+    });
+    let powershell = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
+    let environment = product_shell_environment(root, &private, hostile_modules)?;
+    let mut spec = configured_command(powershell.as_os_str(), &args, project, environment)?;
+    spec.console = console;
+    spec.stdout = Stdio::Pipe;
+    spec.stderr = Stdio::Pipe;
+    let mut child = spec.spawn().await?;
+    let mut stdout = child.take_stdout();
+    let mut stderr = child.take_stderr();
+    let (mut stdout_tail, mut stderr_tail) = (Vec::new(), Vec::new());
+    let (mut stdout_bytes, mut stderr_bytes) = (0, 0);
+    let (mut stdout_eof, mut stderr_eof) = (false, false);
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let (stdout, stderr) = stdout
+            .as_mut()
+            .zip(stderr.as_mut())
+            .ok_or_else(|| io::Error::other("shell control lacks requested output pipes"))?;
+        tokio::try_join!(
+            drain_shell_control(stdout, &mut stdout_tail, &mut stdout_bytes, &mut stdout_eof),
+            drain_shell_control(stderr, &mut stderr_tail, &mut stderr_bytes, &mut stderr_eof),
+        )?;
+        child.wait(Duration::from_secs(30)).await
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "shell control timed out after 30 seconds",
+        ))
+    });
+    // No early return after creation: request termination, await ownership, and
+    // cancel both native pipes even if the diagnostic's operation failed.
+    let terminate = child.terminate();
+    let stopped = child.wait(Duration::from_secs(5)).await;
+    let mut closed = Vec::new();
+    for (stream, pipe) in [("stdout", &mut stdout), ("stderr", &mut stderr)] {
+        if let Some(pipe) = pipe {
+            closed.push((stream, pipe.close(Duration::from_secs(5)).await));
+        }
+    }
+    Ok(format!(
+        "{label}: result={result:?}; stdout_bytes={stdout_bytes} stdout_eof={stdout_eof} stdout_tail={:?}; stderr_bytes={stderr_bytes} stderr_eof={stderr_eof} stderr_tail={:?}; terminate={terminate:?} stopped={stopped:?} closed={closed:?}; stages={:?}",
+        String::from_utf8_lossy(&stdout_tail),
+        String::from_utf8_lossy(&stderr_tail),
+        shell_marker(&progress, 256),
+    ))
+}
+
+fn shell_timeout_controls(
+    root: &Path,
+    project: &Path,
+    hostile_modules: &Path,
+    input: &Path,
+    sentinel: &str,
+) -> String {
+    use kuru_platform::windows::process::Console;
 
     let execute = async {
-        let powershell = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
-        let environment = fixture_environment(root);
-        // Match the product's UTF-8 prelude and sanitized environment. Core
-        // Trace 1 prints script lines, not values. No redirection is used: 5>
-        // invokes Out-File and could preload the very Utility module at issue.
-        let traced_source = format!(
-            "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\nMicrosoft.PowerShell.Core\\Set-PSDebug -Trace 1\ntry {{\n{source}\n}} finally {{ Microsoft.PowerShell.Core\\Set-PSDebug -Off }}\n"
-        );
-        let args: Vec<OsString> = [
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-OutputFormat",
-            "Text",
-            "-Command",
-            &traced_source,
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
-        let mut spec = configured_command(powershell.as_os_str(), &args, project, environment)?;
-        spec.stdout = Stdio::Pipe;
-        spec.stderr = Stdio::Pipe;
-        let mut child = spec.spawn().await?;
-        let mut stdout = child.take_stdout();
-        let mut stderr = child.take_stderr();
-        let (mut stdout_tail, mut stderr_tail) = (Vec::new(), Vec::new());
-        let (mut stdout_bytes, mut stderr_bytes) = (0, 0);
-        let (mut stdout_eof, mut stderr_eof) = (false, false);
-        // Both drains and whole-tree completion share this single budget.
-        let result = tokio::time::timeout(Duration::from_secs(30), async {
-            let (stdout, stderr) = stdout
-                .as_mut()
-                .zip(stderr.as_mut())
-                .ok_or_else(|| io::Error::other("shell trace lacks requested output pipes"))?;
-            tokio::try_join!(
-                drain(stdout, &mut stdout_tail, &mut stdout_bytes, &mut stdout_eof),
-                drain(stderr, &mut stderr_tail, &mut stderr_bytes, &mut stderr_eof),
-            )?;
-            child.wait(Duration::from_secs(30)).await
-        })
-        .await
-        .unwrap_or_else(|_| {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "shell trace timed out after 30 seconds",
-            ))
-        });
-        // No early return after creation: request termination, await ownership,
-        // and cancel both native pipes even if an earlier cleanup step fails.
-        let terminate = child.terminate();
-        let stopped = child.wait(Duration::from_secs(5)).await;
-        let mut closed = Vec::new();
-        for (label, pipe) in [("stdout", &mut stdout), ("stderr", &mut stderr)] {
-            if let Some(pipe) = pipe {
-                closed.push((label, pipe.close(Duration::from_secs(5)).await));
-            }
+        let mut controls = Vec::new();
+        for (label, encoded, console) in [
+            ("encoded-inherit", true, Console::Inherit),
+            ("command-inherit", false, Console::Inherit),
+            ("encoded-private-hidden", true, Console::PrivateHidden),
+        ] {
+            controls.push(
+                shell_failure_control(
+                    (label, encoded, console),
+                    root,
+                    project,
+                    hostile_modules,
+                    input,
+                    sentinel,
+                )
+                .await,
+            );
         }
-        Ok::<_, io::Error>(format!(
-            "result={result:?}; stdout_bytes={stdout_bytes} stdout_eof={stdout_eof} stdout_tail={:?}; stderr_bytes={stderr_bytes} stderr_eof={stderr_eof} stderr_tail={:?}; terminate={terminate:?} stopped={stopped:?} closed={closed:?}",
-            String::from_utf8_lossy(&stdout_tail),
-            String::from_utf8_lossy(&stderr_tail),
-        ))
+        Ok::<_, std::io::Error>(format!("{controls:#?}"))
     };
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .and_then(|runtime| runtime.block_on(execute));
-    format!(
-        "direct stock PowerShell -Command diagnostic (acceptance uses -EncodedCommand): {result:?}; stages={:?}",
-        shell_marker(progress, 256),
-    )
+    format!("failure-only stock PowerShell controls: {result:?}")
 }
 
 fn success(command: &mut Command) {
@@ -452,7 +617,6 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     // control must never supply evidence that Kuru's own shell entered source.
     let control_progress = root.path().join("control-progress");
     let kuru_progress = root.path().join("kuru-progress");
-    let trace_progress = root.path().join("trace-progress");
     let sentinel = "retained & literal 日本語";
     let machine_environment = machine_environment_diagnostic();
     let control_source = stock_shell_source(&control_progress, &input, sentinel);
@@ -526,8 +690,7 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     let trace = if !output.status.success()
         && String::from_utf8_lossy(&output.stderr).contains("shell timed out")
     {
-        let trace_source = stock_shell_source(&trace_progress, &input, sentinel);
-        shell_timeout_trace(root.path(), &project, &trace_progress, &trace_source)
+        shell_timeout_controls(root.path(), &project, &modules, &input, sentinel)
     } else {
         "trace not run (no original shell timeout)".to_owned()
     };

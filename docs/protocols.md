@@ -107,9 +107,11 @@ traversal and symlinks are rejected; capability-relative filesystem operations
 provide containment beyond string-prefix checks. Sensitive directories such as
 `.git`, `.kuru`, `.codex`, `.agents`, `.claude`, `.ssh` and credential/config
 files are protected. Instruction files may be read but are protected from
-mutation. Files and protocol/output payloads have 2 MiB bounds. Shell execution
-defaults to a 30-second timeout; an optional `timeout_ms` argument accepts
-1–120000 milliseconds. Stdout and stderr are each bounded to 2 MiB. On Unix,
+mutation. Built-in UTF-8 file reads and shell streams retain a marked 2 MiB
+head-and-tail excerpt after credential projection; shell stdout and stderr keep
+independent budgets. MCP protocol records remain hard-bounded at 2 MiB. Shell
+execution defaults to a 30-second timeout; an optional `timeout_ms` argument
+accepts 1–120000 milliseconds. On Unix,
 a registered owner retains the standard root, its fresh process group,
 both pipes, and the checked workspace capability through cleanup. It signals the
 remaining original group before reaping that root, then confirms group absence
@@ -198,6 +200,15 @@ use `messageId`, `contextId`, `ROLE_USER` and text parts. Responses contain eith
 a message or a task; terminal task text is extracted from status messages and
 artifacts. The adapter sends `A2A-Version: 1.0`. Protocol errors, malformed
 responses, response-size excess and timeouts become observable call errors.
+
+For inbound messages, `messageId` is the durable turn ID within the current
+project session. Repeating the same ID and exact request returns the stored answer
+without another model or tool call. Reusing it with changed text or target fails,
+and an interrupted request that may have dispatched external work must use a new
+ID. The same ID remains independent in another session. IDs contain 1–256 bytes.
+Ingress allows a turn up to 10 minutes. On timeout it signals cancellation and
+allows up to 35 more seconds for accepted memory work and the answer race to
+settle; that allowance does not prove cleanup of an owned subprocess.
 
 Internal actors use typed peer envelopes and Tokio mailboxes. They do not issue
 loopback HTTP calls to each other. A2A at the external boundary preserves peer

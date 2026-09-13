@@ -1,5 +1,8 @@
 use kuru_memory::MemoryStore;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -10,7 +13,7 @@ use kuru_core::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use crate::{DreamProposal, Harness};
+use crate::{CancellationToken, DreamProposal, Harness, turn_was_cancelled};
 
 type Response = dyn Fn(&CompletionRequest) -> Result<Completion> + Send + Sync;
 struct RecordingProvider {
@@ -82,6 +85,940 @@ async fn fixture(config: Config, provider: Arc<dyn Provider>) -> (TempDir, Harne
     .await
     .unwrap();
     (dir, harness)
+}
+
+struct OneToolProvider {
+    tool: Mutex<Option<ToolCall>>,
+    receipt: Mutex<Option<tokio::sync::oneshot::Sender<CompletionRequest>>>,
+    issued: AtomicUsize,
+}
+
+impl OneToolProvider {
+    fn new(tool: ToolCall) -> (Arc<Self>, tokio::sync::oneshot::Receiver<CompletionRequest>) {
+        let (receipt, observed) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                tool: Mutex::new(Some(tool)),
+                receipt: Mutex::new(Some(receipt)),
+                issued: AtomicUsize::new(0),
+            }),
+            observed,
+        )
+    }
+}
+
+#[async_trait]
+impl Provider for OneToolProvider {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        if request.instructions.contains("Phase: deliberate") {
+            return Ok(reply("ready to use the requested tool"));
+        }
+        let has_tool_receipt = request
+            .messages
+            .iter()
+            .any(|message| message.role == "tool");
+        if has_tool_receipt {
+            let receipt = self.receipt.lock().unwrap().take();
+            if let Some(receipt) = receipt {
+                let _ = receipt.send(request);
+                std::future::pending().await
+            }
+        }
+        if let Some(tool) = self.tool.lock().unwrap().take() {
+            self.issued.fetch_add(1, Ordering::SeqCst);
+            return Ok(Completion {
+                calls: vec![tool],
+                ..Completion::default()
+            });
+        }
+        Ok(reply("the later turn completed"))
+    }
+}
+
+struct HeldBeforeToolProvider {
+    ready: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl Provider for HeldBeforeToolProvider {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        if request.instructions.contains("Phase: deliberate") {
+            return Ok(reply("ready to write"));
+        }
+        if let Some(ready) = self.ready.lock().unwrap().take() {
+            let _ = ready.send(());
+        }
+        if let Some(release) = self.release.lock().await.take() {
+            let _ = release.await;
+        }
+        Ok(Completion {
+            calls: vec![call(
+                "cancelled-file-write",
+                "file_write",
+                json!({"path":"not-created.txt","content":"must not be written"}),
+            )],
+            ..Completion::default()
+        })
+    }
+}
+
+#[derive(Clone)]
+struct HeldHttpMcp {
+    requests: Arc<tokio::sync::Mutex<Vec<(axum::http::Method, Value)>>>,
+    call_seen: Arc<tokio::sync::Notify>,
+    fail_delete: bool,
+}
+
+async fn held_http_mcp(
+    axum::extract::State(state): axum::extract::State<HeldHttpMcp>,
+    method: axum::http::Method,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    state
+        .requests
+        .lock()
+        .await
+        .push((method.clone(), body.clone()));
+    if method == axum::http::Method::DELETE {
+        state.call_seen.notify_one();
+        if state.fail_delete {
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        return axum::Json(json!({})).into_response();
+    }
+    let result = match body["method"].as_str() {
+        Some("initialize") => {
+            let mut response = axum::Json(json!({
+                "jsonrpc":"2.0",
+                "id":body["id"],
+                "result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}
+            }))
+            .into_response();
+            response
+                .headers_mut()
+                .insert("mcp-session-id", "journal-fixture".parse().unwrap());
+            return response;
+        }
+        Some("tools/list") => json!({
+            "jsonrpc":"2.0",
+            "id":body["id"],
+            "result":{"tools":[{
+                "name":"mutate",
+                "description":"accepted mutation fixture",
+                "inputSchema":{"type":"object"}
+            }]}
+        }),
+        Some("tools/call") => {
+            state.call_seen.notify_one();
+            return std::future::pending().await;
+        }
+        _ => json!({}),
+    };
+    axum::Json(result).into_response()
+}
+
+struct McpToolProvider {
+    issued: AtomicBool,
+}
+
+#[async_trait]
+impl Provider for McpToolProvider {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        if request.instructions.contains("Phase: deliberate") {
+            return Ok(reply("ready to call the configured server"));
+        }
+        if !self.issued.swap(true, Ordering::SeqCst) {
+            let tool = request
+                .tools
+                .iter()
+                .find(|tool| tool.description.contains("MCP accepted/mutate"))
+                .expect("configured MCP tool must reach the speaking request");
+            return Ok(Completion {
+                calls: vec![call(
+                    "accepted-mcp-call",
+                    &tool.name,
+                    json!({"write":"once"}),
+                )],
+                ..Completion::default()
+            });
+        }
+        Ok(reply("the later turn completed"))
+    }
+}
+
+#[tokio::test]
+async fn cancellation_before_shared_tool_dispatch_runs_no_file_mutation() {
+    let (ready, entered) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    let provider = Arc::new(HeldBeforeToolProvider {
+        ready: Mutex::new(Some(ready)),
+        release: tokio::sync::Mutex::new(Some(held)),
+    });
+    let (project, mut harness) = fixture(
+        Config {
+            allow_write: true,
+            ..config(Mode::Freudian)
+        },
+        provider,
+    )
+    .await;
+    let target = harness.topology.parts[0].id.clone();
+    let cancellation = CancellationToken::new();
+    let controlled = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let result = harness
+            .run_controlled(
+                "cancel before the tool",
+                Some(&target),
+                "before-tool",
+                &controlled,
+            )
+            .await;
+        (harness, result)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered)
+        .await
+        .expect("speaking provider did not reach the held tool response")
+        .unwrap();
+    cancellation.cancel();
+    let _ = release.send(());
+    let (mut harness, result) = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("cancelled pre-dispatch turn did not settle")
+        .unwrap();
+    assert!(turn_was_cancelled(&result.unwrap_err()));
+    assert!(!project.path().join("not-created.txt").exists());
+    let history = harness.history().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].role, "user");
+    assert_eq!(history[0].content, "cancel before the tool");
+    let retry = harness
+        .run_controlled(
+            "cancel before the tool",
+            Some(&harness.topology.parts[0].id.clone()),
+            "before-tool",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(retry.to_string().contains("may have reached external work"));
+    assert!(!project.path().join("not-created.txt").exists());
+    harness.shutdown(false).await.unwrap();
+    harness.memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn accepted_file_mutation_survives_cancellation_without_replay() {
+    let (provider, receipt) = OneToolProvider::new(call(
+        "accepted-file-write",
+        "file_write",
+        json!({"path":"accepted.txt","content":"one durable write"}),
+    ));
+    let (project, mut harness) = fixture(
+        Config {
+            allow_write: true,
+            ..config(Mode::Freudian)
+        },
+        provider.clone(),
+    )
+    .await;
+    let target = harness.topology.parts[0].id.clone();
+    let cancellation = CancellationToken::new();
+    let controlled = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let result = harness
+            .run_controlled(
+                "publish one file",
+                Some(&target),
+                "accepted-file",
+                &controlled,
+            )
+            .await;
+        (harness, result, target)
+    });
+    let receipt = tokio::time::timeout(std::time::Duration::from_secs(30), receipt)
+        .await
+        .expect("provider did not observe the accepted file receipt")
+        .unwrap();
+    assert!(
+        receipt.messages.iter().any(|message| {
+            message.role == "tool" && message.content.contains("Wrote 17 bytes")
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("accepted.txt")).unwrap(),
+        "one durable write"
+    );
+    cancellation.cancel();
+    let (mut harness, result, target) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("cancelled post-file turn did not settle")
+            .unwrap();
+    assert!(turn_was_cancelled(&result.unwrap_err()));
+    assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
+    let retry = harness
+        .run_controlled(
+            "publish one file",
+            Some(&target),
+            "accepted-file",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(retry.to_string().contains("may have reached external work"));
+    assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("accepted.txt")).unwrap(),
+        "one durable write"
+    );
+    let later = harness
+        .run_controlled(
+            "continue after accepted file",
+            Some(&target),
+            "after-file",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(later.text, "the later turn completed");
+    harness.shutdown(false).await.unwrap();
+    harness.memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work() {
+    let identities = Arc::new(Mutex::new(Vec::<String>::new()));
+    let configured = identities.clone();
+    let issued = Arc::new(AtomicBool::new(false));
+    let provider_issued = issued.clone();
+    let provider = RecordingProvider::new(move |request| {
+        if request.instructions.contains("Phase: deliberate")
+            && !provider_issued.swap(true, Ordering::SeqCst)
+        {
+            let identities = configured.lock().unwrap();
+            return Completion {
+                calls: vec![
+                    call(
+                        "accepted-note",
+                        "remember",
+                        json!({"text":"retain this accepted note once"}),
+                    ),
+                    call(
+                        "accepted-state",
+                        "state_report",
+                        json!({"activation":0.75,"note":"accepted before cancellation"}),
+                    ),
+                    call(
+                        "blocked-peer",
+                        "peer_send",
+                        json!({"to":identities[1],"message":"must not be delivered"}),
+                    ),
+                ],
+                ..reply("cognitive work")
+            };
+        }
+        reply("the later cognitive turn completed")
+    });
+    let (_project, mut harness) = fixture(config(Mode::Freudian), provider).await;
+    *identities.lock().unwrap() = harness
+        .topology
+        .parts
+        .iter()
+        .map(|part| part.id.clone())
+        .collect();
+    let target = harness.topology.parts[0].id.clone();
+    let mut events = harness.subscribe();
+    let (written, release) = harness.pause_after_next_memory_write();
+    let cancellation = CancellationToken::new();
+    let controlled = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let result = harness
+            .run_controlled(
+                "accept cognitive writes",
+                Some(&target),
+                "accepted-cognitive",
+                &controlled,
+            )
+            .await;
+        (harness, result, target)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), written)
+        .await
+        .expect("accepted state write did not reach publication")
+        .unwrap();
+    cancellation.cancel();
+    release.send(()).unwrap();
+    let (mut harness, result, target) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("cancelled cognitive turn did not settle")
+            .unwrap();
+    assert!(turn_was_cancelled(&result.unwrap_err()));
+    assert_eq!(harness.topology.states[&target].activation, 0.75);
+    assert_eq!(
+        harness
+            .memory
+            .history(&format!("{}/notes", harness.namespace(&target)), 10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|message| message.content == "retain this accepted note once")
+            .count(),
+        1
+    );
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok()).all(|event| event.kind != "peer"),
+        "cognitive calls after observed cancellation must not start"
+    );
+    let retry = harness
+        .run_controlled(
+            "accept cognitive writes",
+            Some(&target),
+            "accepted-cognitive",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(retry.to_string().contains("may have reached external work"));
+    assert_eq!(
+        harness
+            .memory
+            .history(&format!("{}/notes", harness.namespace(&target)), 10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|message| message.content == "retain this accepted note once")
+            .count(),
+        1
+    );
+    harness.set_effort(Some("high".into())).await.unwrap();
+    let later = harness
+        .run_controlled(
+            "continue cognitive work",
+            Some(&target),
+            "after-cognitive",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(later.text, "the later cognitive turn completed");
+    harness.shutdown(false).await.unwrap();
+    harness.memory.close().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() {
+    use nix::{errno::Errno, sys::signal, unistd::Pid};
+
+    let (provider, _unused_receipt) = OneToolProvider::new(call(
+        "held-shell",
+        "shell",
+        json!({
+            "command":"printf '%s' \"$$\" > shell-owner.pid; exec /bin/sleep 120",
+            "timeout_ms":120000
+        }),
+    ));
+    let (project, mut harness) = fixture(
+        Config {
+            allow_shell: true,
+            ..config(Mode::Freudian)
+        },
+        provider.clone(),
+    )
+    .await;
+    let target = harness.topology.parts[0].id.clone();
+    let cancellation = CancellationToken::new();
+    let controlled = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let result = harness
+            .run_controlled(
+                "start one owned shell",
+                Some(&target),
+                "owned-shell",
+                &controlled,
+            )
+            .await;
+        (harness, result, target)
+    });
+    let pid_path = project.path().join("shell-owner.pid");
+    let pid = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Ok(value) = std::fs::read_to_string(&pid_path)
+                && let Ok(pid) = value.parse::<i32>()
+                && pid > 0
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shell never published its admitted process identity");
+    cancellation.cancel();
+    let (mut harness, result, target) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("cancelled shell turn did not settle")
+            .unwrap();
+    assert!(turn_was_cancelled(&result.unwrap_err()));
+    let retry = harness
+        .run_controlled(
+            "start one owned shell",
+            Some(&target),
+            "owned-shell",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(retry.to_string().contains("may have reached external work"));
+    assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(10), harness.shutdown(false))
+        .await
+        .expect("owned shell cleanup exceeded the shutdown bound")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match signal::kill(Pid::from_raw(pid), None) {
+                Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                Err(Errno::ESRCH) => break,
+                Err(error) => panic!("cannot inspect owned shell PID {pid}: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("owned shell PID {pid} remained live after successful shutdown"));
+    harness.memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_http_mcp_mutation_is_received_once_and_session_is_closed() {
+    use axum::{Router, routing::any};
+
+    let state = HeldHttpMcp {
+        requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        call_seen: Arc::new(tokio::sync::Notify::new()),
+        fail_delete: false,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(any(held_http_mcp))
+                .with_state(server_state),
+        )
+        .await
+        .unwrap();
+    });
+    let provider = Arc::new(McpToolProvider {
+        issued: AtomicBool::new(false),
+    });
+    let mut settings = config(Mode::Freudian);
+    settings.mcp.insert(
+        "accepted".into(),
+        McpConfig {
+            url: Some(endpoint),
+            ..McpConfig::default()
+        },
+    );
+    let (_project, mut harness) = fixture(settings, provider.clone()).await;
+    let target = harness.topology.parts[0].id.clone();
+    let call_seen = state.call_seen.notified();
+    tokio::pin!(call_seen);
+    let cancellation = CancellationToken::new();
+    let controlled = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let result = harness
+            .run_controlled(
+                "send one MCP mutation",
+                Some(&target),
+                "accepted-http-mcp",
+                &controlled,
+            )
+            .await;
+        (harness, result, target)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), &mut call_seen)
+        .await
+        .expect("HTTP MCP fixture did not receive the mutation");
+    cancellation.cancel();
+    let (mut harness, result, target) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("cancelled HTTP MCP turn did not settle")
+            .unwrap();
+    assert!(turn_was_cancelled(&result.unwrap_err()));
+    let retry = harness
+        .run_controlled(
+            "send one MCP mutation",
+            Some(&target),
+            "accepted-http-mcp",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(retry.to_string().contains("may have reached external work"));
+    assert!(provider.issued.load(Ordering::SeqCst));
+    assert_eq!(
+        state
+            .requests
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, body)| body["method"] == "tools/call")
+            .count(),
+        1
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), harness.shutdown(false))
+        .await
+        .expect("HTTP MCP session cleanup exceeded the shutdown bound")
+        .unwrap();
+    let requests = state.requests.lock().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(method, _)| *method == axum::http::Method::DELETE)
+            .count(),
+        1
+    );
+    drop(requests);
+    harness.memory.close().await.unwrap();
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+struct HeldShutdownDream {
+    started: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Provider for HeldShutdownDream {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        if request.instructions.contains("Phase: dream") {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+        Ok(reply("answer before shutdown"))
+    }
+}
+
+struct HeldPeerConsultation {
+    recipient: Mutex<String>,
+    issued: AtomicBool,
+    calls: AtomicUsize,
+    started: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Provider for HeldPeerConsultation {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        if request.instructions.contains("Phase: peer consultation") {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+        if request.instructions.contains("Phase: speak")
+            && !self.issued.swap(true, Ordering::SeqCst)
+        {
+            return Ok(Completion {
+                calls: vec![call(
+                    "accepted-peer",
+                    "peer_send",
+                    json!({
+                        "to":self.recipient.lock().unwrap().clone(),
+                        "message":"consult exactly once"
+                    }),
+                )],
+                ..reply("request peer input")
+            });
+        }
+        Ok(reply("the later peer turn completed"))
+    }
+}
+
+#[tokio::test]
+async fn cancelled_admitted_peer_consultation_is_not_replayed() {
+    let provider = Arc::new(HeldPeerConsultation {
+        recipient: Mutex::new(String::new()),
+        issued: AtomicBool::new(false),
+        calls: AtomicUsize::new(0),
+        started: tokio::sync::Notify::new(),
+    });
+    let (_project, mut harness) = fixture(config(Mode::Freudian), provider.clone()).await;
+    let target = harness.topology.parts[0].id.clone();
+    *provider.recipient.lock().unwrap() = harness.topology.parts[1].id.clone();
+    let consultation = provider.started.notified();
+    tokio::pin!(consultation);
+    let cancellation = CancellationToken::new();
+    let controlled = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let result = harness
+            .run_controlled(
+                "consult one peer",
+                Some(&target),
+                "accepted-peer",
+                &controlled,
+            )
+            .await;
+        (harness, result, target)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), &mut consultation)
+        .await
+        .expect("peer consultation was not admitted");
+    cancellation.cancel();
+    let (mut harness, result, target) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("cancelled peer consultation did not settle")
+            .unwrap();
+    assert!(turn_was_cancelled(&result.unwrap_err()));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let retry = harness
+        .run_controlled(
+            "consult one peer",
+            Some(&target),
+            "accepted-peer",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(retry.to_string().contains("may have reached external work"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let later = harness
+        .run_controlled(
+            "continue after peer cancellation",
+            Some(&target),
+            "after-peer",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(later.text, "the later peer turn completed");
+    harness.shutdown(false).await.unwrap();
+    harness.memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_reports_dream_deadline_and_mcp_cleanup_failure_together() {
+    use axum::{Router, routing::any};
+
+    let state = HeldHttpMcp {
+        requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        call_seen: Arc::new(tokio::sync::Notify::new()),
+        fail_delete: true,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(any(held_http_mcp))
+                .with_state(server_state),
+        )
+        .await
+        .unwrap();
+    });
+    let provider = Arc::new(HeldShutdownDream {
+        started: tokio::sync::Notify::new(),
+    });
+    let mut settings = config(Mode::Freudian);
+    settings.dream_on_exit = true;
+    settings.mcp.insert(
+        "cleanup-fails".into(),
+        McpConfig {
+            url: Some(endpoint),
+            ..McpConfig::default()
+        },
+    );
+    let (_project, mut harness) = fixture(settings, provider.clone()).await;
+    let target = harness.topology.parts[0].id.clone();
+    harness
+        .run_controlled(
+            "complete before shutdown",
+            Some(&target),
+            "before-shutdown",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let dream_started = provider.started.notified();
+    tokio::pin!(dream_started);
+    let cleanup_seen = state.call_seen.notified();
+    tokio::pin!(cleanup_seen);
+    let task = tokio::spawn(async move {
+        let result = harness.shutdown(true).await;
+        (harness, result)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), dream_started)
+        .await
+        .expect("shutdown dream did not start");
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    tokio::time::resume();
+    tokio::time::timeout(std::time::Duration::from_secs(10), cleanup_seen)
+        .await
+        .expect("ToolHost cleanup did not attempt the negotiated MCP DELETE");
+    let (harness, result) = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("aggregate shutdown did not settle after MCP cleanup failure")
+        .unwrap();
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains("shutdown dream exceeded 30 seconds"),
+        "{error}"
+    );
+    assert!(error.contains("tool cleanup failed"), "{error}");
+    assert!(
+        error.contains("MCP session DELETE failed: 500 Internal Server Error"),
+        "{error}"
+    );
+    assert_eq!(
+        state
+            .requests
+            .lock()
+            .await
+            .iter()
+            .filter(|(method, _)| *method == axum::http::Method::DELETE)
+            .count(),
+        1
+    );
+    harness.memory.close().await.unwrap();
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn cancelled_outbound_a2a_request_is_received_once_without_replay() {
+    use axum::{Json, Router, routing::post};
+
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let observed = Arc::new(tokio::sync::Notify::new());
+    let server_requests = requests.clone();
+    let server_observed = observed.clone();
+    let app = Router::new().route(
+        "/",
+        post(move |Json(request): Json<Value>| {
+            let requests = server_requests.clone();
+            let observed = server_observed.clone();
+            async move {
+                requests.lock().await.push(request);
+                observed.notify_one();
+                std::future::pending::<Json<Value>>().await
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let issued = Arc::new(AtomicBool::new(false));
+    let provider_issued = issued.clone();
+    let provider = RecordingProvider::new(move |request| {
+        if request.instructions.contains("Phase: speak")
+            && !provider_issued.swap(true, Ordering::SeqCst)
+        {
+            return Completion {
+                calls: vec![call(
+                    "accepted-a2a",
+                    "a2a_send",
+                    json!({"agent":"held","message":"perform this once"}),
+                )],
+                ..reply("sending once")
+            };
+        }
+        reply("the later outbound turn completed")
+    });
+    let mut settings = config(Mode::Freudian);
+    settings.external_agents.insert("held".into(), endpoint);
+    let (_project, mut harness) = fixture(settings, provider).await;
+    let target = harness.topology.parts[0].id.clone();
+    let request_seen = observed.notified();
+    tokio::pin!(request_seen);
+    let cancellation = CancellationToken::new();
+    let controlled = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let result = harness
+            .run_controlled(
+                "send one external request",
+                Some(&target),
+                "accepted-a2a",
+                &controlled,
+            )
+            .await;
+        (harness, result, target)
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(30), &mut request_seen)
+        .await
+        .expect("outbound A2A fixture did not receive the request");
+    cancellation.cancel();
+    let (mut harness, result, target) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("cancelled outbound A2A turn did not settle")
+            .unwrap();
+    assert!(turn_was_cancelled(&result.unwrap_err()));
+    let retry = harness
+        .run_controlled(
+            "send one external request",
+            Some(&target),
+            "accepted-a2a",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(retry.to_string().contains("may have reached external work"));
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "SendMessage");
+    assert_eq!(
+        requests[0]["params"]["message"]["parts"][0]["text"],
+        "perform this once"
+    );
+    drop(requests);
+    let later = harness
+        .run_controlled(
+            "continue outbound work",
+            Some(&target),
+            "after-a2a",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(later.text, "the later outbound turn completed");
+    assert!(issued.load(Ordering::SeqCst));
+    harness.shutdown(false).await.unwrap();
+    harness.memory.close().await.unwrap();
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

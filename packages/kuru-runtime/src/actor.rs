@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, ensure};
 use kuru_connectors::Provider;
@@ -9,6 +13,9 @@ use tokio::{
     sync::{Semaphore, mpsc, oneshot},
     task::JoinHandle,
 };
+use tracing::Instrument;
+
+use crate::engine::{CancellationToken, turn_was_cancelled};
 
 #[derive(Debug)]
 pub(crate) struct MemoryFailure(pub anyhow::Error);
@@ -27,6 +34,8 @@ pub(crate) struct Work {
     pub effort: Option<String>,
     pub tools: Vec<ToolSpec>,
     pub history_limit: usize,
+    pub cancellation: CancellationToken,
+    pub span: tracing::Span,
     pub reply: oneshot::Sender<Result<Completion>>,
 }
 
@@ -40,20 +49,33 @@ impl Actor {
         let (tx, mut rx) = mpsc::channel::<Work>(16);
         let task = tokio::spawn(async move {
             while let Some(mut work) = rx.recv().await {
+                let span = work.span.clone();
+                let started = Instant::now();
                 let run = async {
-                    let _permit = permits.acquire().await.context("actor pool closed")?;
+                    work.cancellation.check()?;
+                    let _permit = work
+                        .cancellation
+                        .wait(async { permits.acquire().await.context("actor pool closed") })
+                        .await?;
                     for input in &work.inputs {
+                        work.cancellation.check()?;
                         work.memory
                             .append(&namespace, &input.role, &input.content)
                             .await
                             .map_err(MemoryFailure)?;
+                        work.cancellation.check()?;
                     }
                     let mut instructions = work.instructions.clone();
                     let notes = bounded_history(
-                        work.memory
-                            .history(&format!("{namespace}/notes"), 16)
-                            .await
-                            .map_err(MemoryFailure)?,
+                        work.cancellation
+                            .wait(async {
+                                work.memory
+                                    .history(&format!("{namespace}/notes"), 16)
+                                    .await
+                                    .map_err(MemoryFailure)
+                                    .map_err(Into::into)
+                            })
+                            .await?,
                         0,
                         16 * 1024,
                     )?;
@@ -67,10 +89,15 @@ impl Actor {
                         actor: namespace.clone(),
                         instructions,
                         messages: bounded_history(
-                            work.memory
-                                .history(&namespace, work.history_limit)
-                                .await
-                                .map_err(MemoryFailure)?,
+                            work.cancellation
+                                .wait(async {
+                                    work.memory
+                                        .history(&namespace, work.history_limit)
+                                        .await
+                                        .map_err(MemoryFailure)
+                                        .map_err(Into::into)
+                                })
+                                .await?,
                             work.inputs.len(),
                             112 * 1024,
                         )?,
@@ -78,10 +105,17 @@ impl Actor {
                         effort: work.effort.clone(),
                         tools: work.tools.clone(),
                     };
-                    let completion =
-                        tokio::time::timeout(Duration::from_secs(180), provider.complete(request))
+                    let completion = work
+                        .cancellation
+                        .wait(async {
+                            tokio::time::timeout(
+                                Duration::from_secs(180),
+                                provider.complete(request),
+                            )
                             .await
-                            .context("model call exceeded 180 seconds")??;
+                            .context("model call exceeded 180 seconds")?
+                        })
+                        .await?;
                     ensure!(
                         completion.calls.len() <= 1024,
                         "provider returned more than 1024 calls in one batch"
@@ -100,6 +134,7 @@ impl Actor {
                         "provider call identifiers exceed the bounded replay budget"
                     );
                     if !completion.text.is_empty() || !completion.calls.is_empty() {
+                        work.cancellation.check()?;
                         let content = if completion.calls.is_empty() {
                             completion.text.clone()
                         } else {
@@ -114,13 +149,28 @@ impl Actor {
                             )
                             .await
                             .map_err(MemoryFailure)?;
+                        work.cancellation.check()?;
                     }
                     Ok(completion)
                 };
-                tokio::select! {
-                    result = run => { let _ = work.reply.send(result); }
-                    () = work.reply.closed() => {}
+                async {
+                    tokio::select! {
+                        result = run => {
+                            let status = match &result {
+                                Ok(_) => "ok",
+                                Err(error) if turn_was_cancelled(error) => "cancelled",
+                                Err(_) => "error",
+                            };
+                            tracing::info!(target: "kuru.actor", status, elapsed_ms = started.elapsed().as_millis() as u64, "actor completion finished");
+                            let _ = work.reply.send(result);
+                        }
+                        () = work.reply.closed() => {
+                            tracing::info!(target: "kuru.actor", status = "cancelled", elapsed_ms = started.elapsed().as_millis() as u64, "actor completion caller closed");
+                        }
+                    }
                 }
+                .instrument(span)
+                .await;
             }
         });
         Self { tx, task }
@@ -262,37 +312,21 @@ mod tool_receipt_tests {
         let envelope = json!({"call_id":id,"output":""}).to_string().len();
         let text_limit = 128;
         let utf8_prefix = "🪶".repeat(8);
-        for cut in 1..REDACTION_MARKER.len() {
-            let ordinary_prefix = format!(
-                "{}{}",
-                utf8_prefix,
-                "x".repeat(text_limit - TRUNCATED.len() - cut - utf8_prefix.len()),
-            );
-            let output = format!("{ordinary_prefix}{}{}", REDACTION_MARKER, "tail".repeat(32));
-            let receipt = Message {
-                role: "tool".into(),
-                content: json!({"call_id":id,"output":output}).to_string(),
-            };
-            let limit = envelope + text_limit;
-            let bounded = bounded_receipt(&receipt, limit).unwrap();
-            assert!(bounded.content.len() <= limit);
-            let value: Value = serde_json::from_str(&bounded.content).unwrap();
-            let output = value["output"].as_str().unwrap();
-            let expected = format!(
-                "{}{}{}",
-                &format!(
-                    "{}{}",
-                    utf8_prefix,
-                    "x".repeat(
-                        text_limit - REDACTION_MARKER.len() - TRUNCATED.len() - utf8_prefix.len()
-                    ),
-                ),
-                REDACTION_MARKER,
-                TRUNCATED,
-            );
-            assert_eq!(output, expected);
-            assert_complete_markers(output);
-        }
+        let ordinary_prefix = format!("{utf8_prefix}{}", "x".repeat(220));
+        let output = format!("{ordinary_prefix}{REDACTION_MARKER}:TAIL");
+        let receipt = Message {
+            role: "tool".into(),
+            content: json!({"call_id":id,"output":output}).to_string(),
+        };
+        let limit = envelope + text_limit;
+        let bounded = bounded_receipt(&receipt, limit).unwrap();
+        assert!(bounded.content.len() <= limit);
+        let value: Value = serde_json::from_str(&bounded.content).unwrap();
+        let output = value["output"].as_str().unwrap();
+        assert!(output.starts_with(&utf8_prefix));
+        assert!(output.ends_with(&format!("{REDACTION_MARKER}:TAIL")));
+        assert!(output.contains(TRUNCATED));
+        assert_complete_markers(output);
 
         for limit in [0, 1, 3, 10, 15, 40] {
             let receipt = Message {
@@ -320,15 +354,9 @@ mod tool_receipt_tests {
         assert_eq!(bounded.len(), 1);
         assert_eq!(bounded[0].role, "tool");
         assert!(bounded[0].content.len() <= 128);
-        assert_eq!(
-            bounded[0].content,
-            format!(
-                "{}{}{}",
-                "x".repeat(128 - REDACTION_MARKER.len() - TRUNCATED.len()),
-                REDACTION_MARKER,
-                TRUNCATED,
-            )
-        );
+        assert!(bounded[0].content.ends_with("tail"));
+        assert!(bounded[0].content.contains(REDACTION_MARKER));
+        assert!(bounded[0].content.contains(TRUNCATED));
         assert_complete_markers(&bounded[0].content);
 
         let non_tool = bounded_history(

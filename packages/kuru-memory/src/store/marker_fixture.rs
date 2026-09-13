@@ -77,11 +77,10 @@ pub(crate) fn prepare(
         reached,
         release: wait,
     };
-    (
-        observation,
-        release,
-        MemoryStore::open_inner(options, None, None, Some(pause)),
-    )
+    (observation, release, {
+        let mut progress = crate::progress::ProgressReporter::silent();
+        async move { MemoryStore::open_inner(options, None, None, Some(pause), &mut progress).await }
+    })
 }
 
 #[cfg(test)]

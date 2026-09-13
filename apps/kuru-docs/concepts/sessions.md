@@ -46,6 +46,11 @@ Every dream writes to an isolated Dolt candidate branch. Its histories, summarie
 
 Dreaming uses provider calls and can add to the cost of a session. It is a bounded consolidation operation, not an unbounded background process.
 
+A turn's answer is durable before periodic dreaming starts. Its returned event
+trace ends at that response; later dream events remain visible as maintenance
+activity and cannot suppress the answer. Session-end dreaming has a finite
+30-second deadline, after which Kuru still attempts normal actor and tool cleanup.
+
 ## Choose the triggers
 
 Three triggers share the same validation path:

@@ -595,7 +595,11 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
         )
         .await
         .unwrap();
-    let source = format!("openai_api_key={TOOL_TOKEN}\n{ORDINARY_CONTROL}");
+    let source = format!(
+        "openai_api_key={TOOL_TOKEN}\n{}{}:TAIL",
+        "x".repeat(2 * 1024 * 1024),
+        ORDINARY_CONTROL,
+    );
     let source_path = dir.path().join("sample.txt");
     std::fs::write(&source_path, &source).unwrap();
     let result = harness.run("Read sample.txt").await.unwrap();
@@ -612,10 +616,11 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     let receipt: Value = serde_json::from_str(&receipt.content).unwrap();
     let call_id = receipt["call_id"].as_str().unwrap().to_owned();
     let output = receipt["output"].as_str().unwrap();
-    assert_eq!(
-        output,
-        format!("openai_api_key={MARKER}\n{ORDINARY_CONTROL}")
-    );
+    assert!(output.len() <= 8192);
+    assert!(output.starts_with(&format!("openai_api_key={MARKER}\n")));
+    assert!(output.ends_with(&format!("{ORDINARY_CONTROL}:TAIL")));
+    assert!(output.contains("[truncated]"));
+    assert!(!output.contains(TOOL_TOKEN));
     assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
 
     let requests_before_reopen = fake.requests.lock().unwrap().len();
@@ -1016,11 +1021,15 @@ async fn dreaming_uses_isolated_actor_histories_and_runs_periodically() {
     });
     let (_dir, mut harness) = fixture(Mode::Polyvagal, fake.clone()).await;
     harness.config.dream_every = 1;
+    let mut events = harness.subscribe();
     let output = harness.run("one turn").await.unwrap();
     assert!(
-        output
-            .events
-            .iter()
+        !output.events.iter().any(|event| event.kind == "dream"),
+        "returned turn output freezes before maintenance dreaming"
+    );
+    assert_eq!(output.events.last().unwrap().kind, "response");
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok())
             .any(|e| e.kind == "dream" && e.detail.contains("3 summaries"))
     );
     for part in &harness.topology.parts {
@@ -1194,7 +1203,8 @@ async fn rpc(app: axum::Router, body: Value, token: &str, version: &str) -> (u16
 
 #[tokio::test]
 async fn a2a_server_enforces_auth_validates_protocol_and_returns_peer_output() {
-    let (_dir, h) = fixture(Mode::Freudian, Fake::new(|_| answer("real A2A answer"))).await;
+    let provider = Fake::new(|_| answer("real A2A answer"));
+    let (_dir, h) = fixture(Mode::Freudian, provider.clone()).await;
     let shared = Arc::new(tokio::sync::Mutex::new(h));
     assert!(crate::server::router(shared.clone(), "http://localhost", "short").is_err());
     let app = crate::server::router(shared, "http://localhost", "test-token-123456").unwrap();
@@ -1229,6 +1239,33 @@ async fn a2a_server_enforces_auth_validates_protocol_and_returns_peer_output() {
         "real A2A answer"
     );
     assert_eq!(response["result"]["message"]["contextId"], "c1");
+    let sends = provider.requests.lock().unwrap().len();
+    let duplicate = rpc(
+        app.clone(),
+        valid.clone(),
+        "Bearer test-token-123456",
+        "1.0",
+    )
+    .await
+    .1;
+    assert_eq!(
+        duplicate["result"]["message"]["parts"][0]["text"],
+        "real A2A answer"
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), sends);
+    let mut changed = valid.clone();
+    changed["params"]["message"]["parts"][0]["text"] = json!("changed");
+    let changed = rpc(app.clone(), changed, "Bearer test-token-123456", "1.0")
+        .await
+        .1;
+    assert_eq!(changed["error"]["code"], -32603);
+    assert!(
+        changed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("different request")
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), sends);
     let mut malformed = valid.clone();
     malformed["method"] = json!("GetTask");
     assert_eq!(
@@ -1247,6 +1284,14 @@ async fn a2a_server_enforces_auth_validates_protocol_and_returns_peer_output() {
             -32602
         );
     }
+    let mut oversized_id = valid.clone();
+    oversized_id["params"]["message"]["messageId"] = json!("x".repeat(257));
+    assert_eq!(
+        rpc(app.clone(), oversized_id, "Bearer test-token-123456", "1.0")
+            .await
+            .1["error"]["code"],
+        -32602
+    );
     let card = app
         .oneshot(
             Request::builder()

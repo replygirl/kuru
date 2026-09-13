@@ -51,6 +51,18 @@ impl Sandbox {
     }
 }
 
+fn warm_memory_progress() -> &'static str {
+    concat!(
+        "Memory: waiting for project ownership…\n",
+        "Memory: waiting for verified runtime cache…\n",
+        "Memory: verifying cached runtime…\n",
+        "Memory: checking runtime version…\n",
+        "Memory: preparing database…\n",
+        "Memory: opening database…\n",
+        "Memory: ready.\n",
+    )
+}
+
 #[test]
 fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     let env = Sandbox::new();
@@ -106,6 +118,209 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     );
     assert!(!env.run(&["undo-dream"]).status.success());
     assert!(env.success(&["run", "plain answer"]).contains("demo"));
+}
+
+#[test]
+fn cli_requires_explicit_project_purge_confirmation_and_removes_its_diagnostics_ring() {
+    let env = Sandbox::new();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let hash = scope.strip_prefix("project/").unwrap();
+    env.success(&["--debug", "run", "create managed project memory"]);
+    let ring = env.data.join("diagnostics").join(hash);
+    assert!(ring.is_dir(), "debug run did not create the project ring");
+
+    let mut help_command = env.command_for("responses");
+    let help = help_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "purge", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--yes"));
+    assert!(help.contains("history"));
+    assert!(help.contains("legacy SQLite"));
+    assert!(help.contains("exports"));
+    assert!(help.contains("diagnostics"));
+    assert!(help.contains("recorded remaining identities"));
+    let mut refusal_command = env.command_for("responses");
+    let refusal = refusal_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "purge"])
+        .output()
+        .unwrap();
+    assert!(!refusal.status.success());
+    assert!(refusal.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&refusal.stderr).contains("--yes"));
+    assert!(ring.is_dir(), "refusal changed the diagnostics ring");
+
+    let mut purge_command = env.command_for("responses");
+    let output = purge_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "purge", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["project"], scope);
+    assert_eq!(result["legacy_import_suppressed"], true);
+    assert!(!ring.exists());
+
+    let reopened = env.run(&["run", "fresh memory after purge", "--json"]);
+    assert!(
+        reopened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert!(serde_json::from_slice::<Value>(&reopened.stdout).is_ok());
+    assert!(
+        String::from_utf8_lossy(&reopened.stderr).contains("Memory is ready at"),
+        "{}",
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+}
+
+#[tokio::test]
+async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_project() {
+    use kuru_memory::MemoryStore;
+    use std::io::Write;
+
+    let env = Sandbox::new();
+    let other_project = env.root.path().join("other-project");
+    std::fs::create_dir(&other_project).unwrap();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let other_scope = kuru_runtime::project_scope(&other_project).unwrap();
+
+    kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
+    let legacy_path = env.data.join("memory.sqlite3");
+    let legacy = rusqlite::Connection::open(&legacy_path).unwrap();
+    legacy
+        .execute_batch(
+            "PRAGMA application_id=1263882837;
+             PRAGMA user_version=1;
+             CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+             CREATE TABLE state (`key` TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+        )
+        .unwrap();
+    let selected_key = format!("{scope}/purge-acceptance");
+    let other_key = format!("{other_scope}/purge-acceptance");
+    legacy
+        .execute(
+            "INSERT INTO state VALUES (?1, ?2)",
+            rusqlite::params![selected_key, r#"{"owner":"selected"}"#],
+        )
+        .unwrap();
+    legacy
+        .execute(
+            "INSERT INTO state VALUES (?1, ?2)",
+            rusqlite::params![other_key, r#"{"owner":"other"}"#],
+        )
+        .unwrap();
+    drop(legacy);
+    let legacy_before = std::fs::read(&legacy_path).unwrap();
+
+    let selected_options =
+        kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let selected = MemoryStore::open(selected_options.clone()).await.unwrap();
+    assert_eq!(
+        selected.get(&selected_key).await.unwrap(),
+        Some(serde_json::json!({"owner":"selected"}))
+    );
+    selected.close().await.unwrap();
+    let other_options =
+        kuru_memory::test_support::open_options(env.data.clone(), other_scope.clone()).unwrap();
+    let other = MemoryStore::open(other_options.clone()).await.unwrap();
+    assert_eq!(
+        other.get(&other_key).await.unwrap(),
+        Some(serde_json::json!({"owner":"other"}))
+    );
+    other.close().await.unwrap();
+
+    let snapshots = env.data.join("memory/legacy");
+    let mut snapshot_before: Vec<_> = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), std::fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    snapshot_before.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(snapshot_before.len(), 1, "legacy import snapshot drifted");
+
+    let export_path = env.root.path().join("selected-memory.json");
+    let mut export_command = env.command_for("responses");
+    let export = export_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "export", "--output", "../selected-memory.json"])
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(export.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&export.stderr),
+        warm_memory_progress()
+    );
+    let export_before = std::fs::read(&export_path).unwrap();
+
+    let engine =
+        kuru_platform::fs::Directory::ensure_private(&env.data.join("tools/dolt")).unwrap();
+    engine
+        .create_new(std::ffi::OsStr::new("purge-sentinel"))
+        .unwrap()
+        .write_all(b"shared engine cache survives")
+        .unwrap();
+    drop(engine);
+
+    let mut purge_command = env.command_for("responses");
+    let output = purge_command
+        .env_remove("OPENAI_API_KEY")
+        .args(["memory", "purge", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["project"], scope);
+    assert_eq!(result["legacy_import_suppressed"], true);
+
+    assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+    let mut snapshot_after: Vec<_> = std::fs::read_dir(&snapshots)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), std::fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    snapshot_after.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(snapshot_after, snapshot_before);
+    assert_eq!(std::fs::read(&export_path).unwrap(), export_before);
+    assert_eq!(
+        std::fs::read(env.data.join("tools/dolt/purge-sentinel")).unwrap(),
+        b"shared engine cache survives"
+    );
+
+    let other = MemoryStore::open(other_options).await.unwrap();
+    assert_eq!(
+        other.get(&other_key).await.unwrap(),
+        Some(serde_json::json!({"owner":"other"}))
+    );
+    other.close().await.unwrap();
+    let fresh = MemoryStore::open(selected_options).await.unwrap();
+    assert_eq!(fresh.get(&selected_key).await.unwrap(), None);
+    fresh.close().await.unwrap();
 }
 
 #[test]
@@ -169,6 +384,40 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
             .identity,
         projected_identity,
         "file_read replaced the source object"
+    );
+    let oversized_path = env.project.join("oversized-projection.txt");
+    let oversized_source = format!(
+        "HEAD openai_api_key={TOOL_TOKEN}\n{}:TAIL",
+        "x".repeat(2 * 1024 * 1024),
+    );
+    std::fs::write(&oversized_path, &oversized_source).unwrap();
+    let oversized_identity =
+        kuru_platform::fs::regular_file_info(&std::fs::File::open(&oversized_path).unwrap())
+            .unwrap()
+            .identity;
+    let oversized = env.success(&[
+        "tool",
+        "file_read",
+        "--args",
+        r#"{"path":"oversized-projection.txt"}"#,
+    ]);
+    let oversized = oversized.strip_suffix('\n').unwrap();
+    let expected_head = format!("HEAD openai_api_key={MARKER}\n");
+    assert!(oversized.len() <= 2 * 1024 * 1024);
+    assert!(oversized.starts_with(&expected_head));
+    assert!(oversized.ends_with(":TAIL"));
+    assert!(oversized.contains("[truncated]"));
+    assert!(!oversized.contains(TOOL_TOKEN));
+    assert_eq!(
+        std::fs::read_to_string(&oversized_path).unwrap(),
+        oversized_source
+    );
+    assert_eq!(
+        kuru_platform::fs::regular_file_info(&std::fs::File::open(&oversized_path).unwrap())
+            .unwrap()
+            .identity,
+        oversized_identity,
+        "oversized file_read replaced the source object"
     );
     assert!(
         env.success(&["tool", "file_list", "--args", r#"{"path":"."}"#])
@@ -414,7 +663,10 @@ async fn memory_export_is_provider_free_and_publishes_one_committed_snapshot() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        warm_memory_progress()
+    );
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["manifest"]["snapshot"], "committed active main");
     assert_eq!(json["manifest"]["provenance"]["revision"], revision);
@@ -456,7 +708,10 @@ async fn memory_export_is_provider_free_and_publishes_one_committed_snapshot() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        warm_memory_progress()
+    );
     let markdown = std::fs::read_to_string(&output_path).unwrap();
     assert!(markdown.contains("# Kuru committed memory export"));
     assert!(markdown.contains("committed active main"));
@@ -719,6 +974,231 @@ fn a_dangling_legacy_link_is_rejected_instead_of_treated_as_fresh_memory() {
     assert!(!output.status.success());
     assert_eq!(std::fs::read_link(&legacy).unwrap(), missing);
     assert!(output.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_refuses_an_unsafe_legacy_directory_before_import() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = Sandbox::new();
+    let data = env.root.path().join("unsafe legacy data; literal-dollar");
+    kuru_platform::fs::Directory::ensure_private(&data).unwrap();
+    let source = data.join("memory.sqlite3");
+    let original = b"legacy source remains untouched";
+    std::fs::write(&source, original).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+    command
+        .arg("-C")
+        .arg(&env.project)
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["--provider", "demo", "--no-dream", "sessions"])
+        .env("XDG_CONFIG_HOME", env.root.path().join("config"));
+    let output = command.output().unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("legacy memory directory"), "{stderr}");
+    assert!(stderr.contains("mode 0700"), "{stderr}");
+    assert!(stderr.contains(&format!("{data:?}")), "{stderr}");
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    assert!(!data.join("memory").exists());
+}
+
+#[test]
+fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
+    let env = Sandbox::new();
+    let cache = env.root.path().join("fresh verified runtime cache");
+    let memory = kuru_core::MemoryConfig {
+        cache_dir: Some(cache),
+        offline: true,
+        ..Default::default()
+    };
+    std::fs::write(
+        env.root.path().join("config/kuru/config.toml"),
+        toml::to_string(&std::collections::BTreeMap::from([("memory", memory)])).unwrap(),
+    )
+    .unwrap();
+
+    let cold_started = std::time::Instant::now();
+    let cold = env.run(&["run", "cold memory", "--json"]);
+    let cold_elapsed = cold_started.elapsed();
+    assert!(
+        cold.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    let cold_json: Value = serde_json::from_slice(&cold.stdout).unwrap();
+    assert!(cold_json["text"].as_str().unwrap().contains("demo"));
+    let cold_stderr = String::from_utf8_lossy(&cold.stderr);
+    assert!(
+        cold_stderr.starts_with(concat!(
+            "Memory: waiting for project ownership…\n",
+            "Memory: waiting for verified runtime cache…\n",
+            "Memory: extracting embedded runtime…\n",
+            "Memory: checking runtime version…\n",
+            "Memory: preparing database…\n",
+            "Memory: opening database…\n",
+            "Memory: ready.\n",
+        )),
+        "{cold_stderr}"
+    );
+    assert!(cold_stderr.contains("Memory is ready at"), "{cold_stderr}");
+    assert!(
+        cold_stderr.contains("kuru memory notes ID"),
+        "{cold_stderr}"
+    );
+
+    let warm_started = std::time::Instant::now();
+    let warm = env.run(&["run", "warm memory", "--json"]);
+    let warm_elapsed = warm_started.elapsed();
+    assert!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    let warm_json: Value = serde_json::from_slice(&warm.stdout).unwrap();
+    assert!(warm_json["text"].as_str().unwrap().contains("demo"));
+    assert_eq!(
+        String::from_utf8_lossy(&warm.stderr),
+        warm_memory_progress()
+    );
+    eprintln!(
+        "observed isolated CLI startup wall time: cold={cold_elapsed:?}; warm={warm_elapsed:?}; no optimization claim"
+    );
+}
+
+#[tokio::test]
+async fn cli_undo_dream_shows_one_notice_without_constructing_a_provider() {
+    use kuru_memory::MemoryStore;
+
+    let env = Sandbox::new();
+    kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    MemoryStore::open(options.clone())
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+
+    let mut first = env.command_for("responses");
+    let first = first
+        .env_remove("OPENAI_API_KEY")
+        .args(["undo-dream"])
+        .output()
+        .unwrap();
+    assert!(
+        !first.status.success(),
+        "undo without a dream must still fail"
+    );
+    assert!(first.stdout.is_empty());
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first_stderr.contains("Memory is ready at"),
+        "{first_stderr}"
+    );
+    assert!(
+        !first_stderr.contains("OPENAI_API_KEY"),
+        "undo-dream attempted provider setup: {first_stderr}"
+    );
+
+    let reopened = MemoryStore::open(options.clone()).await.unwrap();
+    assert_eq!(
+        reopened
+            .get(&format!("{scope}/notice/memory-storage"))
+            .await
+            .unwrap(),
+        Some(serde_json::json!({"version": 1}))
+    );
+    reopened.close().await.unwrap();
+
+    let mut second = env.command_for("responses");
+    let second = second
+        .env_remove("OPENAI_API_KEY")
+        .args(["undo-dream"])
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(
+        !String::from_utf8_lossy(&second.stderr).contains("Memory is ready at"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+#[test]
+fn cli_imports_a_real_legacy_wal_without_changing_its_layout() {
+    let env = Sandbox::new();
+    kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
+    let legacy_path = env.data.join("memory.sqlite3");
+    let connection = rusqlite::Connection::open(&legacy_path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA application_id=1263882837;
+             PRAGMA user_version=1;
+             CREATE TABLE messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL);
+             CREATE TABLE state (`key` TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+        )
+        .unwrap();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    connection
+        .execute(
+            "INSERT INTO messages (namespace, role, content) VALUES (?1, 'user', 'committed WAL message')",
+            [format!("{scope}/transcript/legacy")],
+        )
+        .unwrap();
+    let original_main = std::fs::read(&legacy_path).unwrap();
+    let wal_path = env.data.join("memory.sqlite3-wal");
+    let original_wal = std::fs::read(&wal_path).unwrap();
+    assert!(env.data.join("memory.sqlite3-shm").is_file());
+
+    let output = env.run(&["sessions"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&output.stdout)
+            .unwrap()
+            .is_array()
+    );
+    assert_eq!(std::fs::read(&legacy_path).unwrap(), original_main);
+    assert_eq!(std::fs::read(&wal_path).unwrap(), original_wal);
+    assert!(env.data.join("memory.sqlite3-shm").is_file());
+    let snapshots = env.data.join("memory/legacy");
+    assert_eq!(
+        std::fs::read_dir(snapshots)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "sqlite3"))
+            .count(),
+        1
+    );
+    let exported = env.run(&["memory", "export"]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let records = serde_json::from_slice::<Value>(&exported.stdout).unwrap();
+    assert!(records["records"].as_array().unwrap().iter().any(|record| {
+        record["kind"] == "message"
+            && record["namespace"] == format!("{scope}/transcript/legacy")
+            && record["role"] == "user"
+            && record["content"] == "committed WAL message"
+    }));
+    drop(connection);
 }
 
 #[tokio::test]

@@ -91,8 +91,8 @@ async fn configured_startup_budget_is_not_preempted_by_a_shorter_query_timer() -
         .fetch_one(pool.as_ref())
         .await?;
     ensure!(
-        auto_gc_enabled == 0,
-        "pinned Dolt server enabled automatic GC despite generated configuration"
+        auto_gc_enabled == 1,
+        "pinned Dolt server did not enable automatic GC from generated configuration"
     );
     // Dolt uses the listener read timeout while executing a result iterator,
     // including bootstrap DDL. A valid query inside our 20-second budget must

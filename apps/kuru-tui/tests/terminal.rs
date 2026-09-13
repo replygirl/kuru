@@ -123,6 +123,21 @@ impl Sandbox {
     }
 }
 
+fn diagnostics(data: &std::path::Path) -> Result<String> {
+    std::fs::read_dir(data.join("diagnostics"))
+        .context("read PTY diagnostics root")?
+        .flatten()
+        .map(|entry| entry.path())
+        .flat_map(|scope| {
+            std::fs::read_dir(scope)
+                .into_iter()
+                .flat_map(|entries| entries.flatten())
+        })
+        .map(|entry| std::fs::read_to_string(entry.path()))
+        .collect::<std::io::Result<String>>()
+        .map_err(Into::into)
+}
+
 // Re-executed by the terminal driver tests, with an explicit mode. Keeping this
 // subprocess entry in the test binary avoids shipping a fixture executable.
 #[test]
@@ -439,14 +454,50 @@ fn real_event_stream_preserves_co_ready_resize_and_paste() -> Result<()> {
     Ok(())
 }
 
-fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {
+fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> Result<()> {
     let mut command = sandbox.command("demo");
     command.args(["--mode", "freudian"]);
     if reduced {
         command.env("KURU_REDUCED_MOTION", "1");
     }
     let mut terminal = Terminal::spawn(command, 35, 120)?;
-    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    let expected = if expect_notice {
+        vec!["KURU", "enter send", "Memory is ready at"]
+    } else {
+        vec!["KURU", "enter send"]
+    };
+    terminal.wait_text_with_timeout(
+        &expected,
+        if expect_notice {
+            &[]
+        } else {
+            &["Memory is ready at"]
+        },
+        sandbox.startup_timeout,
+    )?;
+    terminal.wait_composer_frame(&expected, READY_TIMEOUT)?;
+    let alternate = terminal
+        .output
+        .windows(b"\x1b[?1049h".len())
+        .position(|bytes| bytes == b"\x1b[?1049h")
+        .context("terminal did not enter its alternate screen")?;
+    let startup = &terminal.output[..alternate];
+    let mut previous = 0;
+    for stage in [
+        b"Memory: waiting for project ownership".as_slice(),
+        b"Memory: waiting for verified runtime cache",
+        b"Memory: verifying cached runtime",
+        b"Memory: checking runtime version",
+        b"Memory: preparing database",
+        b"Memory: opening database",
+        b"Memory: ready.",
+    ] {
+        let offset = startup[previous..]
+            .windows(stage.len())
+            .position(|bytes| bytes == stage)
+            .context("memory startup progress did not precede the first completed TUI frame")?;
+        previous += offset + stage.len();
+    }
     assert!(
         terminal
             .output
@@ -508,8 +559,8 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool) -> Result<()> {
 #[test]
 fn real_pty_accepts_chat_navigation_commands_and_restores_terminal() -> Result<()> {
     let sandbox = Sandbox::new()?;
-    smoke(&sandbox, false, true)?;
-    smoke(&sandbox, true, false)?;
+    smoke(&sandbox, false, true, true)?;
+    smoke(&sandbox, true, false, false)?;
     assert!(
         sandbox
             .sessions()?
@@ -581,7 +632,9 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     }));
     let mut command = sandbox.command("responses");
     command
-        .args(["--model", "fixture", "--mode", "freudian", "--config"])
+        .args([
+            "--debug", "--model", "fixture", "--mode", "freudian", "--config",
+        ])
         .arg(config)
         .env("KURU_FIXTURE_KEY", "fixture")
         .env("KURU_REDUCED_MOTION", "1");
@@ -621,6 +674,18 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     terminal.send(b"/quit\r")?;
     terminal.wait_exit(EXIT_TIMEOUT)?;
     terminal.assert_restored()?;
+    let transcript = String::from_utf8_lossy(&terminal.output);
+    ensure!(
+        !transcript.contains("span_open") && !transcript.contains("diagnostics"),
+        "debug diagnostics leaked to the PTY transcript: {transcript}"
+    );
+    let logs = diagnostics(&sandbox.data)?;
+    ensure!(logs.contains("\"target\":\"kuru.actor\""));
+    ensure!(logs.contains("\"status\":\"cancelled\""));
+    ensure!(
+        logs.contains("span_close"),
+        "cancelled spans were not closed"
+    );
 
     let sessions = sandbox.sessions()?;
     assert_eq!(sessions.len(), 1);
@@ -637,6 +702,11 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     )
     .await?;
     let history = harness.history().await?;
+    assert!(
+        history
+            .iter()
+            .any(|message| message.role == "user" && message.content == "Slow request")
+    );
     assert!(
         history
             .iter()

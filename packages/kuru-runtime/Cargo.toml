@@ -16,13 +16,18 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 kuru-memory = { workspace = true, features = ["test-support"] }
 async-trait.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+nix.workspace = true
 
 [lints]
 workspace = true

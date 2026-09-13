@@ -52,6 +52,21 @@ If `XDG_DATA_HOME` is unset, the data directory is `~/.local/share/kuru` on macO
 
 Kuru includes its verified native Dolt engine and license notices in the executable. First memory use extracts them locally, including when offline; later runs verify and reuse the cache at `tools/dolt` inside the data directory. No separate engine installation or runtime download is needed. `memory.cache_dir` selects another extraction directory. Corrupt existing caches fail explicitly and remain preserved.
 
+Before memory opens, Kuru shows a small fixed progress sequence on standard
+error for current local work such as acquiring ownership, checking or extracting
+the runtime, and opening the database. It is not a timer or proof that a stage
+succeeded. Command output, including JSON, remains on standard output.
+
+The first conversation/runtime command (`kuru run`, `kuru dream`, `kuru
+undo-dream`, the TUI, or `kuru serve`) that opens a writable project store also
+shows one short local storage notice after the store is actually ready. It names the escaped managed directory and
+links the available controls: `kuru memory notes ID`, `kuru memory export
+--format json --output PATH`, `kuru memory forget ID --note SEQUENCE`, and
+`kuru memory purge --help`. Kuru records that the notice was shown only after
+stderr or the first TUI frame completes. It is not provider input or peer chat.
+Memory and chat do not expire automatically; selected-note forgetting changes
+current memory while retaining earlier Dolt revisions.
+
 The authenticated SQL sidecar runs only while its owning Kuru process needs it. Existing SQLite data is imported from a consistent snapshot; the original and snapshot remain preserved.
 
 Use `kuru memory status` to inspect the store and current revision, `kuru memory
@@ -68,6 +83,17 @@ notes row and commits that change as a new revision. It does not alter a
 conversation, other notes, or earlier revisions. This is active-memory control,
 not secure erasure, and Kuru does not expose a history-recovery command.
 
+Use `kuru memory purge --yes` only when you intend to remove one project's
+managed local Dolt memory and revision history. It also removes recognised
+managed recovery copies and suppresses that project's automatic legacy SQLite
+re-import. It retains original/shared legacy SQLite inputs and migration
+snapshots, exports and backups, other projects, engine cache, and lock objects.
+It refuses a live owner, never kills another process, and does not promise secure
+erasure or rewrite copies outside the managed project store. After memory is
+gone, it removes that project's bounded diagnostics ring. An incomplete purge is
+resumed only by rerunning the same explicit command against its recorded
+identities.
+
 `kuru memory export` reads every application message and state row from one
 captured committed `main` revision. The JSON default and Markdown option preserve
 the same rows and a manifest with revision, schema and row counts. Previous
@@ -81,11 +107,24 @@ reconciles an interrupted write against its durable receipt before it continues,
 so it can distinguish no pending operation, a completed operation, and one that
 did not commit.
 
+Kuru replaces internal operation receipts and reclaims a dream candidate only
+after its promotion or explicit abandonment is durably resolved. Unresolved
+candidates, conversations, notes and reachable revisions do not expire
+automatically. The bundled engine performs bounded, growth-triggered storage
+maintenance while Kuru owns it, but retained history can continue to grow. This
+maintenance is not secure erasure.
+
 An operating-system writer lock prevents two Kuru processes from overwriting the same project's topology. Read-only session listing remains available.
 
 ## Migration and backups
 
 Close older Kuru sessions before the first launch with Dolt. Kuru imports the current project's rows from `memory.sqlite3`, verifies them, and preserves the original plus a complete snapshot under `memory/legacy/`. Other projects are imported when opened. After migration, older Kuru versions write only to the old SQLite store, so avoid using them with the same data directory.
+
+The legacy data directory must be private. On macOS and Linux, Kuru names an
+unsafe directory and asks you to run `chmod 700` on it; it never changes access
+modes automatically. On Windows, correct the directory's owner-only access in
+native file security settings before retrying. Kuru refuses before import, so
+the original SQLite files remain untouched.
 
 An interrupted import can resume after validation. Partial imports are stopped and preserved under `memory/interrupted/`; a failed import never becomes the active store. Keep the original and snapshots until you have checked every project you want to retain.
 

@@ -263,6 +263,7 @@ fn private_layout_and_branch_validation_are_strict() -> Result<()> {
     )?;
     assert!(yaml.contains("host: 127.0.0.1"));
     assert!(yaml.contains("event_scheduler: \"OFF\""));
+    assert!(yaml.contains("auto_gc_behavior:\n    enable: true"));
     assert!(yaml.contains("\\\"quoted\\\""));
     assert!(!yaml.contains("password:"));
     assert!(yaml.contains("read_timeout_millis: 30000"));

@@ -31,6 +31,15 @@ The service requires a loopback bind and authenticated requests. Use an authenti
 
 Requests use `messageId`, `contextId`, `ROLE_USER`, and text parts, with the `A2A-Version: 1.0` header. Responses may contain a message or a task. Terminal task text is extracted from status messages and artifacts.
 
+An inbound `messageId` of 1–256 bytes identifies a turn within the current
+project session. Retrying the exact completed request returns its stored answer
+without another provider or tool call. Changed reuse fails. If an interrupted
+request may have reached external work, Kuru refuses automatic replay and the
+caller must choose a new ID. Another session may use the same ID independently.
+Ingress allows a turn up to 10 minutes. After that it signals cancellation and
+allows up to 35 more seconds for accepted memory work or a winning answer to
+settle. This settlement allowance is not proof of native subprocess cleanup.
+
 Protocol errors, malformed responses, excessive payloads, and timeouts become visible call errors.
 
 ## Current scope

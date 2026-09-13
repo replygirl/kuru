@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::Harness;
+use crate::{CancellationToken, Harness};
 
 pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> Result<()> {
     axum::serve(listener, app)
@@ -138,7 +138,9 @@ async fn dispatch(
     }
     let message = &request["params"]["message"];
     if !matches!(message["role"].as_str(), Some("ROLE_USER" | "ROLE_AGENT"))
-        || message["messageId"].as_str().is_none_or(|s| s.is_empty())
+        || message["messageId"]
+            .as_str()
+            .is_none_or(|value| value.is_empty() || value.len() > 256)
     {
         return error(id, -32602, "messageId and valid role are required");
     }
@@ -176,17 +178,35 @@ async fn dispatch(
     if context.len() > 256 {
         return error(id, -32602, "contextId too long");
     }
+    let message_id = message["messageId"].as_str().unwrap().to_owned();
+    let cancellation = CancellationToken::new();
     let run = async {
         let mut harness = service.harness.lock().await;
-        harness.run_for(&prompt, identity.as_deref()).await
+        harness
+            .run_controlled(&prompt, identity.as_deref(), &message_id, &cancellation)
+            .await
     };
-    match tokio::time::timeout(Duration::from_secs(600), run).await {
-        Ok(Ok(output)) => Json(json!({"jsonrpc":"2.0","id":id,"result":{"message":{
-            "messageId":Uuid::new_v4().to_string(),"contextId":context,"role":"ROLE_AGENT","parts":[{"text":output.text}],"metadata":{"speaker":output.speaker}
-        }}})).into_response(),
+    tokio::pin!(run);
+    match tokio::time::timeout(Duration::from_secs(600), &mut run).await {
+        Ok(Ok(output)) => answer(id, &context, output),
         Ok(Err(error_value)) => error(id, -32603, &format!("{error_value:#}")),
-        Err(_) => error(id, -32603, "agent request timed out"),
+        Err(_) => {
+            cancellation.cancel();
+            // This is a settlement allowance for accepted memory work and the
+            // completion race. It is not evidence that a native child cleaned.
+            match tokio::time::timeout(Duration::from_secs(35), &mut run).await {
+                Ok(Ok(output)) => answer(id, &context, output),
+                Ok(Err(_)) | Err(_) => error(id, -32603, "agent request timed out"),
+            }
+        }
     }
+}
+
+fn answer(id: Value, context: &str, output: crate::TurnOutput) -> Response {
+    Json(json!({"jsonrpc":"2.0","id":id,"result":{"message":{
+        "messageId":Uuid::new_v4().to_string(),"contextId":context,"role":"ROLE_AGENT","parts":[{"text":output.text}],"metadata":{"speaker":output.speaker}
+    }}}))
+    .into_response()
 }
 
 fn error(id: Value, code: i64, message: &str) -> Response {

@@ -37,6 +37,11 @@ Type in a picker to filter, use the arrow keys to move, and press <kbd>Enter</kb
 
 Use <kbd>Alt</kbd>+<kbd>Enter</kbd> for a newline. <kbd>Page Up</kbd> and <kbd>Page Down</kbd> scroll the transcript. During work, <kbd>Escape</kbd> or <kbd>Ctrl</kbd>+<kbd>C</kbd> cancels the operation. While idle, <kbd>Ctrl</kbd>+<kbd>C</kbd> quits.
 
+Cancellation waits for the active operation to settle and keeps your submitted
+prompt in the transcript. If an answer completed first, Kuru shows it. Otherwise
+the turn is marked interrupted and you can send the next prompt. Kuru will not
+silently retry an external call that may already have been received.
+
 Settings cannot change during active work. Cancel or wait for the turn to finish before choosing another model or framework.
 
 ## Work with files

@@ -15,7 +15,7 @@ use crossterm::{
 };
 use futures::{Stream, StreamExt};
 use kuru_core::{Mode, ModelInfo, Relationship};
-use kuru_runtime::{Event, Harness, TurnOutput};
+use kuru_runtime::{CancellationToken, Event, Harness, TurnOutput, turn_was_cancelled};
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
@@ -28,7 +28,7 @@ use tokio::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::cli::validate_effort;
+use crate::{cli::validate_effort, memory_notice::MemoryNotice};
 
 mod render;
 #[cfg(test)]
@@ -709,13 +709,23 @@ impl Drop for TerminalSession {
 }
 
 pub async fn run(harness: Harness, models: Vec<ModelInfo>) -> Result<()> {
+    run_with_notice(harness, models, None).await
+}
+
+/// App-private notice delivery keeps the public UI adapter independent of
+/// durable presentation state.
+pub(crate) async fn run_with_notice(
+    harness: Harness,
+    models: Vec<ModelInfo>,
+    notice: Option<MemoryNotice>,
+) -> Result<()> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "interactive mode requires a terminal; use kuru run PROMPT"
     );
     let mut guard = TerminalSession::enter(&mut io::stdout())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run_loop(&mut terminal, harness, models).await;
+    let result = run_loop_with_notice(&mut terminal, harness, models, notice).await;
     // Ratatui's Drop may show its cursor. Finish that while terminal output
     // processing is still active, before restoring the caller's console modes.
     drop(terminal);
@@ -726,15 +736,16 @@ pub async fn run(harness: Harness, models: Vec<ModelInfo>) -> Result<()> {
     }
 }
 
-async fn run_loop<B: Backend>(
+async fn run_loop_with_notice<B: Backend>(
     terminal: &mut Terminal<B>,
     harness: Harness,
     models: Vec<ModelInfo>,
+    notice: Option<MemoryNotice>,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
 {
-    run_loop_with_stream(terminal, harness, models, EventStream::new()).await
+    run_loop_with_stream_and_notice(terminal, harness, models, EventStream::new(), notice).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -893,13 +904,22 @@ async fn abort_and_fence(job: &mut Option<JoinHandle<()>>, generation: &mut u64)
 async fn finish_loop(
     result: Result<()>,
     job: &mut Option<JoinHandle<()>>,
+    cancellation: &mut Option<CancellationToken>,
     generation: &mut u64,
     harness: &Arc<Mutex<Harness>>,
 ) -> Result<()> {
     let Err(error) = result else {
         return Ok(());
     };
-    abort_and_fence(job, generation).await;
+    if let Some(cancellation) = cancellation.take() {
+        cancellation.cancel();
+        *generation = generation.wrapping_add(1);
+        if let Some(job) = job.take() {
+            let _ = job.await;
+        }
+    } else {
+        abort_and_fence(job, generation).await;
+    }
     match harness.lock().await.shutdown(false).await {
         Ok(()) => Err(error),
         Err(cleanup) => Err(error).context(format!("TUI runtime cleanup also failed: {cleanup:#}")),
@@ -951,6 +971,10 @@ async fn apply_completion(
             view.completion_locked = true;
         }
         Ok(DispatchOutcome::Turn(output)) => view.complete_turn(output),
+        Err(error) if turn_was_cancelled(&error) => {
+            view.status = "Cancelled · turn interrupted".into();
+            view.completion_locked = true;
+        }
         Err(error) => {
             view.transcript.push(("error".into(), format!("{error:#}")));
             view.show_scene = false;
@@ -966,17 +990,41 @@ async fn apply_completion(
     })
 }
 
+// Keep the event loop's individually borrowed state visible here instead of
+// introducing a second owner for terminal, runtime, and task lifetimes.
+#[allow(clippy::too_many_arguments)]
 async fn cancel_operation(
+    completions: &mut mpsc::Receiver<(u64, Result<DispatchOutcome>)>,
     events: &mut broadcast::Receiver<Event>,
     view: &mut View,
     harness: &Arc<Mutex<Harness>>,
     job: &mut Option<JoinHandle<()>>,
+    cancellation: &mut Option<CancellationToken>,
     generation: &mut u64,
     quit_pending: &mut bool,
-) -> bool {
-    if let Some(job) = job.take() {
-        job.abort();
-        let _ = job.await;
+) -> Result<bool> {
+    if let Some(cancellation) = cancellation.take() {
+        cancellation.cancel();
+    }
+    if let Some(active_job) = job.take() {
+        active_job
+            .await
+            .context("cancelled TUI dispatch task failed")?;
+        let completion = completions
+            .recv()
+            .await
+            .context("cancelled TUI job did not publish its settled result")?;
+        let state =
+            apply_completion(completion, *generation, events, view, harness, job, false).await?;
+        *generation = generation.wrapping_add(1);
+        *quit_pending = false;
+        return Ok(matches!(
+            state,
+            CompletionState::Settled {
+                activity_closed: true,
+                ..
+            }
+        ));
     }
     let activity = drain_activity(events, view, ACTIVITY_DRAIN_CAP);
     *generation = generation.wrapping_add(1);
@@ -987,14 +1035,30 @@ async fn cancel_operation(
     view.notice = None;
     view.status = "Cancelled · turn interrupted".into();
     view.completion_locked = true;
-    activity.closed
+    Ok(activity.closed)
 }
 
+#[cfg(test)]
 async fn run_loop_with_stream<B, S>(
     terminal: &mut Terminal<B>,
     harness: Harness,
     models: Vec<ModelInfo>,
+    input: S,
+) -> Result<()>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+    S: Stream<Item = io::Result<TerminalEvent>> + Unpin,
+{
+    run_loop_with_stream_and_notice(terminal, harness, models, input, None).await
+}
+
+async fn run_loop_with_stream_and_notice<B, S>(
+    terminal: &mut Terminal<B>,
+    harness: Harness,
+    models: Vec<ModelInfo>,
     mut input: S,
+    mut notice: Option<MemoryNotice>,
 ) -> Result<()>
 where
     B: Backend,
@@ -1003,10 +1067,16 @@ where
 {
     let initial = project_initial_view(&harness).await?;
     let mut view = View::from_initial(initial, models);
+    if let Some(notice) = &notice {
+        view.transcript
+            .push(("system".into(), notice.text().into()));
+        view.show_scene = false;
+    }
     let mut events = harness.subscribe();
     let harness = Arc::new(Mutex::new(harness));
     let (tx, mut rx) = mpsc::channel::<(u64, Result<DispatchOutcome>)>(8);
     let mut job: Option<JoinHandle<()>> = None;
+    let mut cancellation: Option<CancellationToken> = None;
     let mut quit_pending = false;
     let mut generation = 0u64;
     let started = Instant::now();
@@ -1024,6 +1094,11 @@ where
                     .draw(|frame| draw(frame, &view))
                     .map_err(|error| anyhow::anyhow!("terminal draw: {error}"))?;
                 dirty = false;
+                if let Some(notice) = notice.take() {
+                    // This frame contains the system transcript entry. Persist
+                    // only after it completed and before input is admitted.
+                    notice.record().await?;
+                }
             }
 
             let wake = next_wake(
@@ -1050,19 +1125,23 @@ where
                             activity_open = activity_still_open(
                                 activity_open,
                                 cancel_operation(
+                                    &mut rx,
                                     &mut events,
                                     &mut view,
                                     &harness,
                                     &mut job,
+                                    &mut cancellation,
                                     &mut generation,
                                     &mut quit_pending,
                                 )
-                                .await,
+                                .await?,
                             );
                             dirty = true;
                         } else if command == "/quit" {
+                            if let Some(cancellation) = cancellation.take() {
+                                cancellation.cancel();
+                            }
                             if let Some(job) = job.take() {
-                                job.abort();
                                 let _ = job.await;
                             }
                             view.begin_operation();
@@ -1116,9 +1195,16 @@ where
                             let harness = harness.clone();
                             let tx = tx.clone();
                             let models = view.models.clone();
+                            let operation_cancellation = CancellationToken::new();
+                            cancellation = Some(operation_cancellation.clone());
                             job = Some(tokio::spawn(async move {
-                                let result =
-                                    dispatch(&mut *harness.lock().await, &models, &command).await;
+                                let result = dispatch_controlled(
+                                    &mut *harness.lock().await,
+                                    &models,
+                                    &command,
+                                    &operation_cancellation,
+                                )
+                                .await;
                                 let _ = tx.send((generation, result)).await;
                             }));
                         }
@@ -1135,6 +1221,9 @@ where
                 }
                 Wake::Completion(Some(completion)) => {
                     scheduler.served(WakeSource::Completion);
+                    if completion.0 == generation {
+                        cancellation = None;
+                    }
                     match apply_completion(
                         completion,
                         generation,
@@ -1199,13 +1288,31 @@ where
         }
     }
     .await;
-    finish_loop(result, &mut job, &mut generation, &harness).await
+    finish_loop(
+        result,
+        &mut job,
+        &mut cancellation,
+        &mut generation,
+        &harness,
+    )
+    .await
 }
 
+#[cfg(test)]
 pub(crate) async fn dispatch(
     harness: &mut Harness,
     models: &[ModelInfo],
     command: &str,
+) -> Result<DispatchOutcome> {
+    let cancellation = CancellationToken::new();
+    dispatch_controlled(harness, models, command, &cancellation).await
+}
+
+async fn dispatch_controlled(
+    harness: &mut Harness,
+    models: &[ModelInfo],
+    command: &str,
+    cancellation: &CancellationToken,
 ) -> Result<DispatchOutcome> {
     harness.reconcile().await?;
     let (name, args) = command.split_once(' ').unwrap_or((command, ""));
@@ -1258,13 +1365,17 @@ pub(crate) async fn dispatch(
         "/notes" => serde_json::to_string_pretty(&harness.notes_for(args, 100).await?)?,
         "/memory-status" => serde_json::to_string_pretty(&harness.memory_status().await?)?,
         "/memory-history" => serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?,
-        "/dream" => serde_json::to_string_pretty(&harness.dream().await?)?,
+        "/dream" => serde_json::to_string_pretty(&harness.dream_controlled(cancellation).await?)?,
         "/undo-dream" => {
             harness.undo_dream().await?;
             "Previous membership restored.".into()
         }
         _ if command.starts_with('/') => anyhow::bail!("unknown command; use /help"),
-        _ => return Ok(DispatchOutcome::Turn(harness.run(command).await?)),
+        _ => {
+            return Ok(DispatchOutcome::Turn(
+                harness.run_cancellable(command, None, cancellation).await?,
+            ));
+        }
     };
     Ok(DispatchOutcome::Command(feedback))
 }

@@ -16,6 +16,22 @@ mod memory;
 
 struct Server(Child);
 
+const MAX_STARTUP_LINES: usize = 16;
+
+fn expected_startup_line(line: &str) -> bool {
+    matches!(
+        line.trim_end(),
+        "Memory: waiting for project ownership…"
+            | "Memory: waiting for verified runtime cache…"
+            | "Memory: verifying cached runtime…"
+            | "Memory: extracting embedded runtime…"
+            | "Memory: checking runtime version…"
+            | "Memory: preparing database…"
+            | "Memory: opening database…"
+            | "Memory: ready."
+    ) || line.starts_with("Memory is ready at ")
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -60,8 +76,23 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
         let stderr = child.0.stderr.take().context("server stderr missing")?;
         let (sender, receiver) = mpsc::channel();
         let reader = std::thread::spawn(move || {
-            let mut line = String::new();
-            let result = BufReader::new(stderr).read_line(&mut line).map(|_| line);
+            let result = (|| -> Result<String> {
+                let mut reader = BufReader::new(stderr);
+                for _ in 0..MAX_STARTUP_LINES {
+                    let mut line = String::new();
+                    reader.read_line(&mut line)?;
+                    if line.starts_with("Kuru A2A listening on ") {
+                        return Ok(line);
+                    }
+                    ensure!(
+                        expected_startup_line(&line),
+                        "unexpected server startup frame: {line:?}"
+                    );
+                }
+                anyhow::bail!(
+                    "server did not publish a listening line within {MAX_STARTUP_LINES} startup frames"
+                );
+            })();
             let _ = sender.send(result);
         });
         let line = receiver.recv_timeout(Duration::from_secs(10))??;
@@ -115,8 +146,24 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
         let mut child = Server(spec.spawn().await?);
         let stderr = child.0.take_stderr().context("server stderr missing")?;
         let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(80), reader.read_line(&mut line)).await??;
+        let line = tokio::time::timeout(Duration::from_secs(80), async {
+            for _ in 0..MAX_STARTUP_LINES {
+                let mut line = String::new();
+                reader.read_line(&mut line).await?;
+                if line.starts_with("Kuru A2A listening on ") {
+                    return Ok::<_, std::io::Error>(line);
+                }
+                if !expected_startup_line(&line) {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected server startup frame: {line:?}"
+                    )));
+                }
+            }
+            Err(std::io::Error::other(format!(
+                "server did not publish a listening line within {MAX_STARTUP_LINES} startup frames"
+            )))
+        })
+        .await??;
         // The server only publishes one readiness line. Retain no unobserved
         // pipe operation after completing that frame.
         reader.into_inner().close(Duration::from_secs(5)).await?;

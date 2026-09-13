@@ -11,5 +11,5 @@ async fn main() -> anyhow::Result<()> {
     {
         return kuru_memory::server::supervisor_entry().await;
     }
-    kuru::cli::run().await
+    kuru::cli::run_with_diagnostics().await
 }

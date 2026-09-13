@@ -3,7 +3,7 @@ use std::{
     convert::Infallible,
     io,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     task::Poll,
@@ -14,13 +14,13 @@ use std::{
 use futures::{Stream, stream};
 use kuru_connectors::{DemoProvider, Provider};
 use kuru_core::{Completion, CompletionRequest, Config, Mode, ModelInfo};
-use kuru_memory::MemoryStore;
-use kuru_runtime::{Harness, TurnOutput};
+use kuru_memory::{MemoryStore, StorageRecord, test_support::open_options};
+use kuru_runtime::{CancellationToken, Harness, TurnOutput};
 use ratatui::{
     Terminal,
     backend::{Backend, ClearType, TestBackend, WindowSize},
     buffer::Cell,
-    layout::{Position, Size},
+    layout::{Constraint, Layout, Position, Size},
 };
 use tokio::{
     sync::{Notify, broadcast, mpsc},
@@ -29,11 +29,24 @@ use tokio::{
 
 use super::{
     ACTIVITY_DRAIN_CAP, CompletionState, DispatchOutcome, Scheduler, TerminalEvent, View, Wake,
-    WakeAvailability, apply_completion, dispatch, next_wake, project_initial_view,
-    project_runtime_snapshot, run_loop_with_stream,
+    WakeAvailability, apply_completion, cancel_operation, dispatch, next_wake,
+    project_initial_view, project_runtime_snapshot, run_loop_with_stream,
+    run_loop_with_stream_and_notice,
 };
+use crate::memory_notice::MemoryNotice;
 
 async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
+    fixture_with_memory(MemoryStore::temporary().await.unwrap()).await
+}
+
+async fn fixture_with_memory(memory: MemoryStore) -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
+    harness_with_provider(memory, Arc::new(DemoProvider)).await
+}
+
+async fn harness_with_provider(
+    memory: MemoryStore,
+    provider: Arc<dyn Provider>,
+) -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
     let directory = tempfile::tempdir().unwrap();
     let harness = Harness::new(
         Config {
@@ -44,8 +57,8 @@ async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
             ..Config::default()
         },
         directory.path(),
-        MemoryStore::temporary().await.unwrap(),
-        Arc::new(DemoProvider),
+        memory,
+        provider,
         None,
     )
     .await
@@ -57,6 +70,49 @@ async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
         default_effort: Some("low".into()),
     }];
     (directory, harness, models)
+}
+
+struct CapturingProvider {
+    requests: Mutex<Vec<CompletionRequest>>,
+    started: Notify,
+}
+
+impl CapturingProvider {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            requests: Mutex::new(vec![]),
+            started: Notify::new(),
+        })
+    }
+
+    async fn wait_for_request(&self) {
+        let notified = self.started.notified();
+        if self.requests.lock().unwrap().is_empty() {
+            tokio::time::timeout(Duration::from_secs(10), notified)
+                .await
+                .expect("provider did not receive the TUI turn");
+        }
+    }
+
+    fn requests(&self) -> Vec<CompletionRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for CapturingProvider {
+    async fn models(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> anyhow::Result<Completion> {
+        self.requests.lock().unwrap().push(request);
+        self.started.notify_waiters();
+        Ok(Completion {
+            text: "captured response".into(),
+            ..Completion::default()
+        })
+    }
 }
 
 fn command_text(outcome: DispatchOutcome) -> String {
@@ -316,6 +372,7 @@ fn controlled_input(
 struct FailingBackend {
     inner: TestBackend,
     provider: Arc<BlockingProvider>,
+    fail_initial_draw: bool,
 }
 
 impl FailingBackend {
@@ -323,6 +380,15 @@ impl FailingBackend {
         Self {
             inner: TestBackend::new(80, 24),
             provider,
+            fail_initial_draw: false,
+        }
+    }
+
+    fn initially_failing(provider: Arc<BlockingProvider>) -> Self {
+        Self {
+            inner: TestBackend::new(80, 24),
+            provider,
+            fail_initial_draw: true,
         }
     }
 }
@@ -341,7 +407,7 @@ impl Backend for FailingBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        if self.provider.started.load(Ordering::SeqCst) > 0 {
+        if self.fail_initial_draw || self.provider.started.load(Ordering::SeqCst) > 0 {
             return Err(io::Error::other("injected backend failure"));
         }
         backend_result(self.inner.draw(content))
@@ -382,6 +448,203 @@ impl Backend for FailingBackend {
     fn flush(&mut self) -> io::Result<()> {
         backend_result(self.inner.flush())
     }
+}
+
+async fn persistent_store() -> (tempfile::TempDir, kuru_memory::OpenOptions, MemoryStore) {
+    let root = tempfile::tempdir().unwrap();
+    let options = open_options(
+        root.path().join("data"),
+        format!("project/{}", "1".repeat(64)),
+    )
+    .unwrap();
+    let store = MemoryStore::open(options.clone()).await.unwrap();
+    (root, options, store)
+}
+
+async fn reopen_store(options: kuru_memory::OpenOptions) -> MemoryStore {
+    MemoryStore::open(options).await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_history() {
+    let (data_root, options, store) = persistent_store().await;
+    let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
+    let (project, harness, models) = fixture_with_memory(store.clone()).await;
+    assert!(harness.history().await.unwrap().is_empty());
+
+    let (input_tx, input_rx) = mpsc::channel(1);
+    let input = Box::pin(stream::unfold(input_rx, |mut input_rx| async move {
+        input_rx.recv().await.map(|event| (Ok(event), input_rx))
+    }));
+    let loop_task = tokio::spawn(async move {
+        let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
+        let result =
+            run_loop_with_stream_and_notice(&mut terminal, harness, models, input, Some(notice))
+                .await;
+        let buffer = terminal.backend().buffer();
+        let screen = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let rows = Layout::vertical([
+            Constraint::Length(if buffer.area.height >= 16 { 2 } else { 1 }),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(5), // Empty editor: two input rows, one control row, and borders.
+            Constraint::Length(1),
+        ])
+        .split(buffer.area);
+        let transcript =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(34)]).split(rows[1])[0];
+        let transcript_text = (transcript.y..transcript.bottom())
+            .map(|y| {
+                (transcript.x..transcript.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (result, screen, transcript_text)
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if MemoryNotice::pending(store.clone())
+                .await
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("notice was not recorded after a completed initial frame");
+    input_tx
+        .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+    let (result, screen, transcript_text) =
+        tokio::time::timeout(Duration::from_secs(10), loop_task)
+            .await
+            .expect("notice loop did not exit")
+            .expect("notice loop task panicked");
+    result.unwrap();
+    assert!(screen.contains("Memory is ready at"), "{screen}");
+    let transcript_text = transcript_text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        transcript_text.contains("Read notes with kuru memory notes ID;"),
+        "{transcript_text}"
+    );
+
+    drop(store);
+    let reopened = reopen_store(options).await;
+    assert!(
+        MemoryNotice::pending(reopened.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let snapshot = reopened.begin_active_export().await.unwrap();
+    let page = snapshot.page(None).await.unwrap();
+    assert!(page.records.iter().all(|record| match record {
+        StorageRecord::Message { content, .. } => !content.contains("Memory is ready at"),
+        StorageRecord::State { .. } => true,
+    }));
+    reopened.close().await.unwrap();
+    drop(project);
+    drop(data_root);
+}
+
+#[tokio::test]
+async fn failed_initial_tui_draw_never_marks_the_notice_shown() {
+    let (data_root, options, store) = persistent_store().await;
+    let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
+    let provider = BlockingProvider::new();
+    let (project, harness, models) = fixture_with_memory(store.clone()).await;
+    let mut terminal = Terminal::new(FailingBackend::initially_failing(provider)).unwrap();
+    let input = Box::pin(stream::empty());
+    let error =
+        run_loop_with_stream_and_notice(&mut terminal, harness, models, input, Some(notice))
+            .await
+            .unwrap_err();
+    assert!(format!("{error:#}").contains("injected backend failure"));
+
+    drop(store);
+    let reopened = reopen_store(options).await;
+    assert!(
+        MemoryNotice::pending(reopened.clone())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    reopened.close().await.unwrap();
+    drop(project);
+    drop(data_root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
+    let (data_root, _options, store) = persistent_store().await;
+    let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
+    let provider = CapturingProvider::new();
+    let (project, harness, models) = harness_with_provider(store, provider.clone()).await;
+    let (input_tx, input_rx) = mpsc::channel(8);
+    let input = Box::pin(stream::unfold(input_rx, |mut input_rx| async move {
+        input_rx.recv().await.map(|event| (Ok(event), input_rx))
+    }));
+    let loop_task = tokio::spawn(async move {
+        let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
+        run_loop_with_stream_and_notice(&mut terminal, harness, models, input, Some(notice)).await
+    });
+    for character in "turn reaches provider".chars() {
+        input_tx
+            .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )))
+            .await
+            .unwrap();
+    }
+    input_tx
+        .send(TerminalEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )))
+        .await
+        .unwrap();
+    provider.wait_for_request().await;
+    let requests = provider.requests();
+    assert!(requests.iter().any(|request| {
+        request
+            .messages
+            .iter()
+            .any(|message| message.content == "turn reaches provider")
+    }));
+    assert!(requests.iter().all(|request| {
+        request
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("Memory is ready at"))
+    }));
+
+    drop(input_tx);
+    let error = tokio::time::timeout(Duration::from_secs(10), loop_task)
+        .await
+        .expect("TUI loop did not clean up after input closure")
+        .expect("TUI loop task panicked")
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("terminal input closed"));
+    drop(project);
+    drop(data_root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -585,6 +848,63 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
         "a stale completion must not clear the live job"
     );
     job.take().unwrap().abort();
+}
+
+#[tokio::test]
+async fn cancellation_consumes_an_answer_that_won_the_completion_race() {
+    let (_directory, harness, _) = fixture().await;
+    let mut events = harness.subscribe();
+    let harness = Arc::new(tokio::sync::Mutex::new(harness));
+    let initial = {
+        let harness = harness.lock().await;
+        project_initial_view(&harness).await.unwrap()
+    };
+    let mut view = View::from_initial(initial, vec![]);
+    view.begin_operation();
+    let output = TurnOutput {
+        session: view.session.clone(),
+        speaker: view.parts[0].0.clone(),
+        text: "answer won cancellation".into(),
+        relationship: None,
+        input_tokens: 5,
+        output_tokens: 3,
+        limited: false,
+        events: vec![],
+    };
+    let (tx, mut completions) = mpsc::channel(1);
+    let token = CancellationToken::new();
+    let worker_token = token.clone();
+    let mut job = Some(tokio::spawn(async move {
+        while !worker_token.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+        tx.send((7, Ok(DispatchOutcome::Turn(output))))
+            .await
+            .unwrap();
+    }));
+    let mut cancellation = Some(token);
+    let mut generation = 7;
+    let mut quit_pending = false;
+    assert!(
+        !cancel_operation(
+            &mut completions,
+            &mut events,
+            &mut view,
+            &harness,
+            &mut job,
+            &mut cancellation,
+            &mut generation,
+            &mut quit_pending,
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(view.status, "Complete");
+    assert_eq!(view.transcript.last().unwrap().1, "answer won cancellation");
+    assert!(job.is_none());
+    assert!(cancellation.is_none());
+    assert_eq!(generation, 8);
+    harness.lock().await.shutdown(false).await.unwrap();
 }
 
 #[tokio::test]

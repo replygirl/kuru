@@ -322,6 +322,257 @@ pub(super) fn remove(
     Ok(())
 }
 
+const MAX_TREE_DEPTH: usize = 128;
+
+pub(super) fn remove_tree(
+    _: &File,
+    ancestors: &[(&Path, FileIdentity)],
+    path: &Path,
+    _: &std::ffi::OsStr,
+    held: File,
+    expected: FileIdentity,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    let mut removed = false;
+    let _ancestors = pin_ancestors(ancestors, &mut removed)?;
+    let root_pin = pin_directory(path, expected, &mut removed)?;
+    remove_children(path, root_pin, &mut removed, 0)?;
+    remove_empty_directory(path, held, expected).map_err(|(failure, error)| {
+        (
+            if removed {
+                PublicationPhase::Uncertain
+            } else {
+                failure
+            },
+            error,
+        )
+    })?;
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err((PublicationPhase::Uncertain, error)),
+        Ok(_) => {
+            return Err((
+                PublicationPhase::Uncertain,
+                denied("removed directory name is still occupied"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn phase(removed: bool) -> PublicationPhase {
+    if removed {
+        PublicationPhase::Uncertain
+    } else {
+        PublicationPhase::Rejected
+    }
+}
+
+fn pin_ancestors(
+    ancestors: &[(&Path, FileIdentity)],
+    removed: &mut bool,
+) -> Result<Vec<File>, (PublicationPhase, io::Error)> {
+    ancestors
+        .iter()
+        .map(|(path, expected)| pin_directory(path, *expected, removed))
+        .collect()
+}
+
+fn pin_directory(
+    path: &Path,
+    expected: FileIdentity,
+    removed: &mut bool,
+) -> Result<File, (PublicationPhase, io::Error)> {
+    let current = open(
+        path,
+        FILE_READ_ATTRIBUTES | READ_CONTROL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NameRetention::Pinned,
+        None,
+    )
+    .map_err(|error| (phase(*removed), error))?;
+    let actual = info(&current).map_err(|error| (phase(*removed), error))?;
+    if !actual.directory || actual.file.identity != expected {
+        return Err((
+            phase(*removed),
+            denied("directory entry no longer identifies the held object"),
+        ));
+    }
+    Ok(current)
+}
+
+fn remove_children(
+    directory: &Path,
+    pin: File,
+    removed: &mut bool,
+    depth: usize,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    if depth >= MAX_TREE_DEPTH {
+        return Err((
+            phase(*removed),
+            invalid("checked tree removal depth exceeded"),
+        ));
+    }
+    for entry in std::fs::read_dir(directory).map_err(|error| (phase(*removed), error))? {
+        let entry = entry.map_err(|error| (phase(*removed), error))?;
+        let name = entry.file_name();
+        component(&name).map_err(|error| (phase(*removed), error))?;
+        let path = entry.path();
+        let child_pin = open(
+            &path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Pinned,
+            None,
+        )
+        .map_err(|error| (phase(*removed), error))?;
+        let child_info = info(&child_pin).map_err(|error| (phase(*removed), error))?;
+        let held = open(
+            &path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .map_err(|error| (phase(*removed), error))?;
+        let held_info = info(&held).map_err(|error| (phase(*removed), error))?;
+        if held_info.file.identity != child_info.file.identity
+            || held_info.directory != child_info.directory
+        {
+            return Err((
+                phase(*removed),
+                denied("directory entry changed while opening checked removal handle"),
+            ));
+        }
+        if child_info.directory {
+            remove_children(&path, child_pin, removed, depth + 1)?;
+            remove_empty_directory(&path, held, child_info.file.identity).map_err(
+                |(failure, error)| {
+                    (
+                        if *removed {
+                            PublicationPhase::Uncertain
+                        } else {
+                            failure
+                        },
+                        error,
+                    )
+                },
+            )?;
+        } else {
+            drop(child_pin);
+            remove_regular(&path, held, child_info.file.identity).map_err(|(failure, error)| {
+                (
+                    if *removed {
+                        PublicationPhase::Uncertain
+                    } else {
+                        failure
+                    },
+                    error,
+                )
+            })?;
+        }
+        *removed = true;
+    }
+    drop(pin);
+    Ok(())
+}
+
+fn remove_empty_directory(
+    path: &Path,
+    held: File,
+    expected: FileIdentity,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    let held_info = info(&held).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if !held_info.directory || held_info.file.identity != expected {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("retained directory no longer has the expected identity"),
+        ));
+    }
+    let deletion = open(
+        path,
+        DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NameRetention::Movable,
+        None,
+    )
+    .map_err(|error| (PublicationPhase::Rejected, error))?;
+    let actual = info(&deletion).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if !actual.directory || actual.file.identity != held_info.file.identity {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("directory name no longer identifies the held object"),
+        ));
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the DELETE-capable handle was opened for this checked directory
+    // and compared to the retained full identity before deletion is requested.
+    let status = unsafe {
+        SetFileInformationByHandle(
+            deletion.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if status == 0 {
+        return Err((PublicationPhase::Uncertain, io::Error::last_os_error()));
+    }
+    drop(deletion);
+    drop(held);
+    Ok(())
+}
+
+fn remove_regular(
+    path: &Path,
+    held: File,
+    expected: FileIdentity,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    let held_info = info(&held).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if held_info.directory || held_info.file.identity != expected {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("retained file no longer has the expected identity"),
+        ));
+    }
+    let deletion = open(
+        path,
+        DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NameRetention::Movable,
+        None,
+    )
+    .map_err(|error| (PublicationPhase::Rejected, error))?;
+    let actual = info(&deletion).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if actual.directory || actual.file.identity != held_info.file.identity {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("file name no longer identifies the held object"),
+        ));
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the DELETE-capable checked regular-file handle remains live for
+    // this synchronous disposition request.
+    let status = unsafe {
+        SetFileInformationByHandle(
+            deletion.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if status == 0 {
+        return Err((PublicationPhase::Uncertain, io::Error::last_os_error()));
+    }
+    drop(deletion);
+    drop(held);
+    Ok(())
+}
+
 pub(super) fn publish(
     _: &File,
     source: &Path,
@@ -352,6 +603,7 @@ pub(super) fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
@@ -461,6 +713,197 @@ mod tests {
         );
         std::fs::remove_dir(&alias).unwrap();
         assert!(outside.path().join("sentinel").is_file());
+    }
+
+    #[test]
+    fn checked_tree_removal_rejects_a_junction_without_touching_its_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root_path = temporary.path().join("root");
+        let root = Directory::ensure_private(&root_path).unwrap();
+        let outside = Directory::ensure_private(&temporary.path().join("outside")).unwrap();
+        outside
+            .create_new(OsStr::new("sentinel"))
+            .unwrap()
+            .write_all(b"outside bytes")
+            .unwrap();
+        let alias = root_path.join("junction");
+        junction(&alias, outside.path());
+
+        let error = root.remove_tree().unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Rejected);
+        assert!(alias.exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"outside bytes"
+        );
+
+        std::fs::remove_dir(&alias).unwrap();
+        Directory::open(&root_path, Privacy::OwnerOnly, NameRetention::Movable)
+            .unwrap()
+            .remove_tree()
+            .unwrap();
+    }
+
+    #[test]
+    fn checked_tree_removal_reports_uncertain_after_a_held_root_blocks_final_unlink() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root_path = temporary.path().join("root");
+        let root = Directory::ensure_private(&root_path).unwrap();
+        root.create_new(OsStr::new("removed-first"))
+            .unwrap()
+            .write_all(b"removed before the final directory unlink")
+            .unwrap();
+        let pinned =
+            Directory::open(&root_path, Privacy::OwnerOnly, NameRetention::Pinned).unwrap();
+
+        let error = root.remove_tree().unwrap_err();
+        assert_eq!(error.phase, PublicationPhase::Uncertain);
+        assert!(root_path.exists());
+        assert!(
+            !root_path.join("removed-first").exists(),
+            "a native final-unlink failure after child removal is uncertain, not retry-safe"
+        );
+
+        drop(pinned);
+        match Directory::open(&root_path, Privacy::OwnerOnly, NameRetention::Movable) {
+            Ok(root) => root.remove_tree().unwrap(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("held root had an unexpected cleanup result: {error}"),
+        }
+        assert_eq!(
+            std::fs::symlink_metadata(&root_path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn checked_removal_rejects_rebound_names_without_touching_either_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+
+        let mut file = directory.create_new(OsStr::new("file")).unwrap();
+        file.write_all(b"original file").unwrap();
+        drop(file);
+        let file_path = directory.path().join("file");
+        let held_file = open(
+            &file_path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let file_identity = info(&held_file).unwrap().file.identity;
+        let parked_file = directory.path().join("parked-file");
+        fs::rename(&file_path, &parked_file).unwrap();
+        directory
+            .create_new(OsStr::new("file"))
+            .unwrap()
+            .write_all(b"replacement file")
+            .unwrap();
+        let error = remove_regular(&file_path, held_file, file_identity).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Rejected);
+        assert_eq!(fs::read(&parked_file).unwrap(), b"original file");
+        assert_eq!(fs::read(&file_path).unwrap(), b"replacement file");
+
+        let dir_path = directory.path().join("child");
+        let child = Directory::ensure_private(&dir_path).unwrap();
+        child
+            .create_new(OsStr::new("original"))
+            .unwrap()
+            .write_all(b"original directory")
+            .unwrap();
+        drop(child);
+        let held_dir = open(
+            &dir_path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let dir_identity = info(&held_dir).unwrap().file.identity;
+        let parked_dir = directory.path().join("parked-child");
+        fs::rename(&dir_path, &parked_dir).unwrap();
+        let replacement = Directory::ensure_private(&dir_path).unwrap();
+        replacement
+            .create_new(OsStr::new("replacement"))
+            .unwrap()
+            .write_all(b"replacement directory")
+            .unwrap();
+        drop(replacement);
+        let error = remove_empty_directory(&dir_path, held_dir, dir_identity).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Rejected);
+        assert_eq!(
+            fs::read(parked_dir.join("original")).unwrap(),
+            b"original directory"
+        );
+        assert_eq!(
+            fs::read(dir_path.join("replacement")).unwrap(),
+            b"replacement directory"
+        );
+
+        let mut removed = false;
+        let error = pin_directory(&dir_path, dir_identity, &mut removed).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Rejected);
+        assert!(!removed);
+
+        directory.remove_tree().unwrap();
+    }
+
+    #[test]
+    fn checked_removal_marks_real_late_refusals_uncertain_and_preserves_contents() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let mut file = directory.create_new(OsStr::new("readonly")).unwrap();
+        file.write_all(b"readonly bytes").unwrap();
+        drop(file);
+        let file_path = directory.path().join("readonly");
+        let mut permissions = fs::metadata(&file_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file_path, permissions).unwrap();
+        let held_file = open(
+            &file_path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let file_identity = info(&held_file).unwrap().file.identity;
+        let error = remove_regular(&file_path, held_file, file_identity).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Uncertain);
+        assert_eq!(fs::read(&file_path).unwrap(), b"readonly bytes");
+        assert!(fs::metadata(&file_path).unwrap().permissions().readonly());
+
+        let child_path = directory.path().join("nonempty");
+        let child = Directory::ensure_private(&child_path).unwrap();
+        drop(child);
+        let held_dir = open(
+            &child_path,
+            FILE_READ_ATTRIBUTES | READ_CONTROL,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let child_identity = info(&held_dir).unwrap().file.identity;
+        fs::write(child_path.join("retained"), b"child bytes").unwrap();
+        let error = remove_empty_directory(&child_path, held_dir, child_identity).unwrap_err();
+        assert_eq!(error.0, PublicationPhase::Uncertain);
+        assert_eq!(
+            fs::read(child_path.join("retained")).unwrap(),
+            b"child bytes"
+        );
+
+        let mut permissions = fs::metadata(&file_path).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&file_path, permissions).unwrap();
+        directory.remove_tree().unwrap();
     }
 
     #[test]

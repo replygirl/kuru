@@ -5,8 +5,14 @@ use serde_json::Value;
 
 /// A producer result before the single ToolHost projection boundary.
 pub(crate) enum ToolExecution {
+    /// Producer text that has not crossed ToolHost's redaction boundary.
     Text(String),
+    /// Producer JSON that has not crossed ToolHost's redaction boundary.
     Json(Value),
+    /// Built-in output that was projected incrementally before bounded retention.
+    ProjectedText(String),
+    /// Built-in structured output whose string fields were projected incrementally.
+    ProjectedJson(Value),
     ApplicationError {
         kind: ToolFailureKind,
         content: ToolContent,

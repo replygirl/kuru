@@ -750,8 +750,8 @@ async fn read_until_terminal(
     deadline: Instant,
     #[cfg(test)] test_hooks: &TestHooks,
 ) -> Result<(Capture, Capture)> {
-    let mut out = Capture::default();
-    let mut err = Capture::default();
+    let mut out = Capture::new();
+    let mut err = Capture::new();
     {
         let out_read = out.read(stdout);
         let err_read = err.read(stderr);
@@ -793,6 +793,8 @@ async fn read_until_terminal(
             }
         }
     }
+    out.finish()?;
+    err.finish()?;
     Ok((out, err))
 }
 
@@ -821,8 +823,8 @@ fn finish_with_cleanup(
                 json!({
                     "exit_code": status.code(),
                     "success": status.success(),
-                    "stdout": String::from_utf8_lossy(&out.bytes),
-                    "stderr": String::from_utf8_lossy(&err.bytes),
+                    "stdout": out.text,
+                    "stderr": err.text,
                 })
                 .to_string()
             });
@@ -941,12 +943,19 @@ fn remove(registry: &RegistryInner, id: u64) {
         .remove(&id);
 }
 
-#[derive(Default)]
 struct Capture {
-    bytes: Vec<u8>,
+    output: Option<crate::redaction::StreamingProjection>,
+    text: String,
 }
 
 impl Capture {
+    fn new() -> Self {
+        Self {
+            output: Some(crate::redaction::StreamingProjection::new(MAX_BYTES)),
+            text: String::new(),
+        }
+    }
+
     async fn read(&mut self, reader: &mut (impl AsyncRead + Unpin)) -> Result<()> {
         let mut buffer = [0; 8192];
         loop {
@@ -954,13 +963,20 @@ impl Capture {
             if count == 0 {
                 return Ok(());
             }
-            let keep = count.min((MAX_BYTES + 1).saturating_sub(self.bytes.len()));
-            self.bytes.extend_from_slice(&buffer[..keep]);
-            ensure!(
-                self.bytes.len() <= MAX_BYTES,
-                "shell output exceeds 2 MiB limit"
-            );
+            self.output
+                .as_mut()
+                .expect("shell capture was already finished")
+                .push(&buffer[..count])?;
         }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.text = self
+            .output
+            .take()
+            .expect("shell capture was already finished")
+            .finish()?;
+        Ok(())
     }
 }
 

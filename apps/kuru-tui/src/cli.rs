@@ -12,7 +12,7 @@ use kuru_core::{
     AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
     ProjectPreferences, SafeManifest,
 };
-use kuru_memory::{MemoryStore, OpenOptions as MemoryOptions};
+use kuru_memory::{MemoryOpenStage, MemoryStore, OpenOptions as MemoryOptions};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_runtime::{Harness, forget_note, read_notes};
 use sha2::{Digest, Sha256};
@@ -56,6 +56,12 @@ pub struct Cli {
     pub allow_shell: bool,
     #[arg(long, global = true)]
     pub no_dream: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Record additional bounded local operational diagnostics"
+    )]
+    pub debug: bool,
     #[arg(
         long,
         global = true,
@@ -177,6 +183,18 @@ pub enum MemoryCommand {
         #[arg(long)]
         note: i64,
     },
+    /// Explicitly remove this project's managed Dolt memory and history.
+    ///
+    /// Original/shared legacy SQLite inputs and migration snapshots, exports,
+    /// backups, other projects, engine cache, and stable locks remain. The
+    /// selected project's diagnostics ring is removed after its memory. If a
+    /// prior purge stopped after recording its intent, rerun this command to
+    /// remove only its recorded remaining identities.
+    Purge {
+        /// Confirm removal of this project's local current memory and all managed revisions.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 pub fn paths(cli: &Cli) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
@@ -274,11 +292,166 @@ pub fn validate_effort(models: &[ModelInfo], model: &str, effort: Option<&str>) 
     Ok(())
 }
 
+struct MemoryProgressOutput {
+    terminal: bool,
+    enabled: bool,
+    width: usize,
+}
+
+impl MemoryProgressOutput {
+    fn new() -> Self {
+        Self {
+            terminal: io::stderr().is_terminal(),
+            enabled: true,
+            width: 0,
+        }
+    }
+
+    fn stage(&mut self, stage: MemoryOpenStage) {
+        if !self.enabled || stage == MemoryOpenStage::Ready {
+            return;
+        }
+        let text = memory_open_label(stage);
+        let mut stderr = io::stderr().lock();
+        let result = if self.terminal {
+            let padding = " ".repeat(self.width.saturating_sub(text.len()));
+            write!(stderr, "\r{text}{padding}").and_then(|()| stderr.flush())
+        } else {
+            writeln!(stderr, "{text}").and_then(|()| stderr.flush())
+        };
+        if result.is_err() {
+            self.enabled = false;
+        } else {
+            self.width = self.width.max(text.len());
+        }
+    }
+
+    fn complete(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let text = memory_open_label(MemoryOpenStage::Ready);
+        let mut stderr = io::stderr().lock();
+        let result = if self.terminal {
+            let padding = " ".repeat(self.width.saturating_sub(text.len()));
+            writeln!(stderr, "\r{text}{padding}")
+        } else {
+            writeln!(stderr, "{text}")
+        }
+        .and_then(|()| stderr.flush());
+        if result.is_err() {
+            self.enabled = false;
+        }
+    }
+
+    fn abandon(&mut self) {
+        if !self.enabled || !self.terminal || self.width == 0 {
+            return;
+        }
+        let mut stderr = io::stderr().lock();
+        if write!(stderr, "\r{}\r", " ".repeat(self.width))
+            .and_then(|()| stderr.flush())
+            .is_err()
+        {
+            self.enabled = false;
+        }
+    }
+}
+
+fn memory_open_label(stage: MemoryOpenStage) -> &'static str {
+    match stage {
+        MemoryOpenStage::WaitingForProjectOwnership => "Memory: waiting for project ownership…",
+        MemoryOpenStage::WaitingForRuntimeCache => "Memory: waiting for verified runtime cache…",
+        MemoryOpenStage::VerifyingRuntimeCache => "Memory: verifying cached runtime…",
+        MemoryOpenStage::ExtractingEmbeddedRuntime => "Memory: extracting embedded runtime…",
+        MemoryOpenStage::CheckingRuntimeVersion => "Memory: checking runtime version…",
+        MemoryOpenStage::PreparingDatabase => "Memory: preparing database…",
+        MemoryOpenStage::OpeningDatabase => "Memory: opening database…",
+        MemoryOpenStage::Ready => "Memory: ready.",
+        _ => "Memory: preparing database…",
+    }
+}
+
+async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
+    let (mut progress, opening) = MemoryStore::open_observed(options);
+    let mut opening = Box::pin(opening);
+    let mut output = MemoryProgressOutput::new();
+    let mut observed_ready = false;
+    let mut progress_open = true;
+    let result = loop {
+        tokio::select! {
+            result = &mut opening => break result,
+            stage = progress.recv(), if progress_open => match stage {
+                Some(MemoryOpenStage::Ready) => observed_ready = true,
+                Some(stage) => output.stage(stage),
+                None => progress_open = false,
+            },
+        }
+    };
+    drop(opening);
+    while let Some(stage) = progress.recv().await {
+        if stage == MemoryOpenStage::Ready {
+            observed_ready = true;
+        } else {
+            output.stage(stage);
+        }
+    }
+    match result {
+        Ok(store) => {
+            // Ready is emitted only with a completed usable store. Keeping this
+            // check makes a future memory stage addition unable to create a
+            // synthetic success line by itself.
+            debug_assert!(observed_ready, "successful observed open must report ready");
+            output.complete();
+            Ok(store)
+        }
+        Err(error) => {
+            output.abandon();
+            Err(error)
+        }
+    }
+}
+
+fn legacy_data_directory_error(data: &Path, error: std::io::Error) -> anyhow::Error {
+    #[cfg(unix)]
+    if error.kind() == io::ErrorKind::PermissionDenied
+        && let (Ok(directory), Ok(source)) = (
+            std::fs::symlink_metadata(data),
+            std::fs::symlink_metadata(data.join("memory.sqlite3")),
+        )
+        && directory.is_dir()
+        && source.is_file()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if directory.permissions().mode() & 0o077 != 0 {
+            return anyhow::Error::from(error).context(format!(
+                "legacy memory directory {data:?} is not owner-private; restrict this exact directory to mode 0700 (for example with chmod, using shell quoting) and retry"
+            ));
+        }
+    }
+    #[cfg(windows)]
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        return anyhow::Error::from(error).context(format!(
+            "legacy memory directory {data:?} is not owner-private; correct this directory's owner-only access with Windows file security settings and retry"
+        ));
+    }
+    error.into()
+}
+
 pub async fn run() -> Result<()> {
     execute(Cli::parse()).await
 }
 
+/// Binary-only entrypoint. Library callers remain subscriber-neutral.
+pub async fn run_with_diagnostics() -> Result<()> {
+    execute_inner(Cli::parse(), true).await
+}
+
 pub async fn execute(cli: Cli) -> Result<()> {
+    execute_inner(cli, false).await
+}
+
+async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     if let Some(Command::Update {
         version,
         release_base,
@@ -415,11 +588,35 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 | Command::UndoDream
                 | Command::Serve { .. }
                 | Command::Memory {
-                    command: MemoryCommand::Forget { .. }
+                    command: MemoryCommand::Forget { .. } | MemoryCommand::Purge { .. }
                 }
         )
     );
-    let exists = MemoryStore::exists(&data, &scope)?;
+    let runtime_owner = matches!(
+        cli.command,
+        None | Some(
+            Command::Run { .. } | Command::Dream | Command::UndoDream | Command::Serve { .. }
+        )
+    );
+    let purge = matches!(
+        cli.command,
+        Some(Command::Memory {
+            command: MemoryCommand::Purge { .. }
+        })
+    );
+    if let Some(Command::Memory {
+        command: MemoryCommand::Purge { yes: false },
+    }) = &cli.command
+    {
+        bail!(
+            "memory purge removes this project's local Dolt history and current memory; rerun with --yes after reviewing the retained-history boundary"
+        );
+    }
+    let exists = if purge {
+        false
+    } else {
+        MemoryStore::exists(&data, &scope)?
+    };
     let memory_control = matches!(
         cli.command,
         Some(Command::Memory {
@@ -439,23 +636,58 @@ pub async fn execute(cli: Cli) -> Result<()> {
     };
     let migrate = legacy && !exists;
     let _lease = if writer || migrate {
-        Directory::ensure_private(&data)?;
+        if let Err(error) = Directory::ensure_private(&data) {
+            if migrate {
+                return Err(legacy_data_directory_error(&data, error));
+            }
+            return Err(error.into());
+        }
         ensure_outside_workspace(&data, &cwd)?;
         Some(project_lease(&data, &cwd)?)
+    } else {
+        None
+    };
+    if purge {
+        let mut options = MemoryOptions::new(data.clone(), scope.clone());
+        options.config = memory_config;
+        let outcome = MemoryStore::purge(options).await?;
+        crate::diagnostics::purge(&data, &scope)
+            .context("project memory was removed but project diagnostics cleanup failed")?;
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+        return Ok(());
+    }
+    let mut diagnostics = if install_diagnostics && runtime_owner {
+        crate::diagnostics::install(&data, &scope, cli.debug)?
     } else {
         None
     };
     // A new installation can inspect configuration without creating state. An
     // existing store supplies only this project's interactive choices, never a
     // resumed transcript. Refuse tool-root storage before opening its database.
-    let existing_memory = if exists || legacy {
+    let existing_memory = match async {
+        if !exists && !legacy {
+            return Ok::<Option<MemoryStore>, anyhow::Error>(None);
+        }
         ensure_outside_workspace(&data, &cwd)?;
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config.clone();
         options.read_only = !writer && !migrate;
-        Some(MemoryStore::open(options).await?)
-    } else {
-        None
+        Ok(Some(open_memory(options).await?))
+    }
+    .await
+    {
+        Ok(memory) => memory,
+        Err(error) => {
+            if let Some(diagnostics) = diagnostics.take()
+                && let Err(finish) = diagnostics.finish()
+            {
+                let _ = finish;
+                return Err(
+                    error.context("diagnostic cleanup also failed; diagnostics may be incomplete")
+                );
+            }
+            return Err(error);
+        }
     };
     // Keep cleanup outside every command/error return and retain the project
     // lease until the owned supervisor has reaped Dolt.
@@ -514,6 +746,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
                             )?
                         );
                     }
+                    MemoryCommand::Purge { .. } => {
+                        unreachable!("purge returned before opening memory")
+                    }
                 }
                 return Ok(());
             }
@@ -547,6 +782,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
             let memory = existing_memory
                 .as_ref()
                 .context("this project has no memory yet; start a conversation first")?;
+            if let Some(notice) = crate::memory_notice::MemoryNotice::pending(memory.clone()).await? {
+                notice.announce().await?;
+            }
             kuru_runtime::undo_dream(&config, &scope, memory, cli.resume.as_deref()).await?;
             println!("Previous membership restored.");
             return Ok(());
@@ -571,10 +809,18 @@ pub async fn execute(cli: Cli) -> Result<()> {
             None => {
                 let mut options = MemoryOptions::new(data, scope);
                 options.config = memory_config;
-                MemoryStore::open(options).await?
+                open_memory(options).await?
             }
         };
         memory_to_close = Some(memory.clone());
+        let notice = crate::memory_notice::MemoryNotice::pending(memory.clone()).await?;
+        if matches!(
+            cli.command,
+            Some(Command::Run { .. } | Command::Dream | Command::Serve { .. })
+        ) && let Some(notice) = &notice
+        {
+            notice.announce().await?;
+        }
         let tools = ToolHost::with_retained_root(root.clone(), &config)?;
         let mut harness = Harness::with_tool_host(
             config,
@@ -638,7 +884,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 kuru_runtime::server::serve(listener, app).await?;
                 harness.lock().await.shutdown(false).await?;
             }
-            None => crate::ui::run(harness, models).await?,
+            None => crate::ui::run_with_notice(harness, models, notice).await?,
             _ => unreachable!("early-return commands handled above"),
         }
         Ok::<_, anyhow::Error>(())
@@ -649,8 +895,25 @@ pub async fn execute(cli: Cli) -> Result<()> {
     } else {
         Ok(())
     };
-    result?;
-    cleanup
+    let diagnostic_cleanup = match diagnostics {
+        Some(diagnostics) => diagnostics.finish(),
+        None => Ok(()),
+    };
+    match (result, cleanup, diagnostic_cleanup) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(()), Err(_)) => {
+            eprintln!("diagnostic cleanup failed; diagnostics may be incomplete");
+            Ok(())
+        }
+        (Err(primary), _, Err(_)) => {
+            Err(primary.context("diagnostic cleanup also failed; diagnostics may be incomplete"))
+        }
+        (Err(primary), _, Ok(())) => Err(primary),
+        (Ok(()), Err(error), Err(_)) => {
+            Err(error.context("diagnostic cleanup also failed; diagnostics may be incomplete"))
+        }
+        (Ok(()), Err(error), Ok(())) => Err(error),
+    }
 }
 
 fn report_mcp_statuses(statuses: &[McpStatus]) {

@@ -7,7 +7,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::engine::{
-    Harness, PendingPublication, Session, Topology, read_topology, spec, user, validate_topology,
+    CancellationToken, Harness, PendingPublication, Session, Topology, read_topology, spec,
+    turn_was_cancelled, user, validate_topology,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,104 +33,133 @@ pub struct DreamReport {
 
 impl Harness {
     pub async fn dream(&mut self) -> Result<DreamReport> {
+        let cancellation = CancellationToken::new();
+        self.dream_controlled(&cancellation).await
+    }
+
+    /// Run dreaming while observing an explicit foreground cancellation signal.
+    pub async fn dream_controlled(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<DreamReport> {
+        cancellation.check()?;
         self.reconcile().await?;
+        cancellation.check()?;
         let candidate = self.memory.begin_candidate("dream").await?;
-        let memory = candidate.view();
-        self.emit(
-            "dream",
-            "pool",
-            "parts are consolidating their own memories",
-        );
-        let ids = self
-            .topology
-            .parts
-            .iter()
-            .filter(|p| p.active)
-            .map(|p| p.id.clone())
-            .collect::<Vec<_>>();
-        let replies = join_all(ids.iter().map(|id| self.ask_in(&memory, id,
-            vec![user("Review your own history. Write a concise durable memory summary of useful facts and unresolved concerns. You may suggest a new complementary member of an existing role or retire yourself if your role is redundantly covered. A suggestion is optional; do not manufacture changes. No other tools are available during dreaming.")],
-            "dream: consolidate your own memory, optionally propose membership changes", vec![dream_tool()]))).await;
-        let mut report = DreamReport::default();
-        let mut proposals = vec![];
-        for (id, reply) in ids.into_iter().zip(replies) {
-            match reply {
-                Err(error) if error.is::<crate::actor::MemoryFailure>() => return Err(error),
-                Err(error) => report.rejected.push(format!("{id}: {error:#}")),
-                Ok(reply) => {
-                    if !reply.text.trim().is_empty() {
-                        memory
-                            .append(
-                                &format!("{}/notes", self.namespace(&id)),
-                                "dream",
-                                &crate::actor::truncate_text(&reply.text, 8192),
-                            )
-                            .await?;
-                        report.summaries += 1;
-                    }
-                    for (index, call) in reply.calls.into_iter().enumerate() {
-                        let result = if index >= 2 {
-                            Err(anyhow::anyhow!(
-                                "at most two dream proposals are accepted per part"
-                            ))
-                        } else if call.name != "dream_suggest" {
-                            Err(anyhow::anyhow!("only dream_suggest is available"))
-                        } else {
-                            serde_json::from_value::<DreamProposal>(call.arguments.clone())
-                                .map_err(Into::into)
-                        };
-                        let outcome = match result {
-                            Ok(proposal) => {
-                                if matches!(&proposal, DreamProposal::Retire { id: target } if target != &id)
-                                {
-                                    let error = format!("{id}: parts may only retire themselves");
+        let outcome = async {
+            cancellation.check()?;
+            let memory = candidate.view();
+            self.emit(
+                "dream",
+                "pool",
+                "parts are consolidating their own memories",
+            );
+            let ids = self
+                .topology
+                .parts
+                .iter()
+                .filter(|p| p.active)
+                .map(|p| p.id.clone())
+                .collect::<Vec<_>>();
+            let replies = join_all(ids.iter().map(|id| self.ask_in_controlled(&memory, id,
+                vec![user("Review your own history. Write a concise durable memory summary of useful facts and unresolved concerns. You may suggest a new complementary member of an existing role or retire yourself if your role is redundantly covered. A suggestion is optional; do not manufacture changes. No other tools are available during dreaming.")],
+                "dream: consolidate your own memory, optionally propose membership changes", vec![dream_tool()], cancellation))).await;
+            let mut report = DreamReport::default();
+            let mut proposals = vec![];
+            for (id, reply) in ids.into_iter().zip(replies) {
+                match reply {
+                    Err(error) if error.is::<crate::actor::MemoryFailure>() => return Err(error),
+                    Err(error) if turn_was_cancelled(&error) => return Err(error),
+                    Err(error) => report.rejected.push(format!("{id}: {error:#}")),
+                    Ok(reply) => {
+                        if !reply.text.trim().is_empty() {
+                            cancellation.check()?;
+                            memory
+                                .append(
+                                    &format!("{}/notes", self.namespace(&id)),
+                                    "dream",
+                                    &crate::actor::truncate_text(&reply.text, 8192),
+                                )
+                                .await?;
+                            cancellation.check()?;
+                            report.summaries += 1;
+                        }
+                        for (index, call) in reply.calls.into_iter().enumerate() {
+                            let result = if index >= 2 {
+                                Err(anyhow::anyhow!(
+                                    "at most two dream proposals are accepted per part"
+                                ))
+                            } else if call.name != "dream_suggest" {
+                                Err(anyhow::anyhow!("only dream_suggest is available"))
+                            } else {
+                                serde_json::from_value::<DreamProposal>(call.arguments.clone())
+                                    .map_err(Into::into)
+                            };
+                            let outcome = match result {
+                                Ok(proposal) => {
+                                    if matches!(&proposal, DreamProposal::Retire { id: target } if target != &id)
+                                    {
+                                        let error =
+                                            format!("{id}: parts may only retire themselves");
+                                        report.rejected.push(error.clone());
+                                        error
+                                    } else {
+                                        proposals.push(proposal);
+                                        "proposal submitted for validation".to_string()
+                                    }
+                                }
+                                Err(error) => {
+                                    let error = format!("{id}: {error}");
                                     report.rejected.push(error.clone());
                                     error
-                                } else {
-                                    proposals.push(proposal);
-                                    "proposal submitted for validation".to_string()
                                 }
-                            }
-                            Err(error) => {
-                                let error = format!("{id}: {error}");
-                                report.rejected.push(error.clone());
-                                error
-                            }
-                        };
-                        memory
-                            .append(
-                                &self.namespace(&id),
-                                "tool",
-                                &json!({"call_id":call.id,"output":outcome}).to_string(),
-                            )
-                            .await?;
+                            };
+                            cancellation.check()?;
+                            memory
+                                .append(
+                                    &self.namespace(&id),
+                                    "tool",
+                                    &json!({"call_id":call.id,"output":outcome}).to_string(),
+                                )
+                                .await?;
+                            cancellation.check()?;
+                        }
                     }
                 }
             }
+            let (topology, changes) = self.plan_dream(proposals)?;
+            report.accepted = changes.accepted;
+            report.rejected.extend(changes.rejected);
+            self.finish_dream(&candidate, topology, &report, cancellation)
+                .await?;
+            self.emit(
+                "dream",
+                "pool",
+                format!(
+                    "{} summaries, {} changes, {} rejected proposals",
+                    report.summaries,
+                    report.accepted.len(),
+                    report.rejected.len()
+                ),
+            );
+            Ok(report)
         }
-        let (topology, changes) = self.plan_dream(proposals)?;
-        report.accepted = changes.accepted;
-        report.rejected.extend(changes.rejected);
-        self.finish_dream(&candidate, topology, &report).await?;
-        self.emit(
-            "dream",
-            "pool",
-            format!(
-                "{} summaries, {} changes, {} rejected proposals",
-                report.summaries,
-                report.accepted.len(),
-                report.rejected.len()
-            ),
-        );
-        Ok(report)
+        .await;
+        resolve_candidate_outcome(&candidate, outcome).await
     }
 
     pub async fn apply_dream(&mut self, proposals: Vec<DreamProposal>) -> Result<DreamReport> {
         self.reconcile().await?;
         let (topology, report) = self.plan_dream(proposals)?;
         let candidate = self.memory.begin_candidate("dream").await?;
-        self.finish_dream(&candidate, topology, &report).await?;
-        Ok(report)
+        let cancellation = CancellationToken::new();
+        let outcome = async {
+            self.finish_dream(&candidate, topology, &report, &cancellation)
+                .await?;
+            Ok(report)
+        }
+        .await;
+        resolve_candidate_outcome(&candidate, outcome).await
     }
 
     async fn finish_dream(
@@ -137,7 +167,9 @@ impl Harness {
         candidate: &Candidate,
         topology: Topology,
         report: &DreamReport,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
+        cancellation.check()?;
         let memory = candidate.view();
         let mut extra = vec![(
             format!("{}/{}/last-dream", self.scope, self.config.mode),
@@ -152,7 +184,9 @@ impl Harness {
         let updates = self
             .state_updates(&memory, &topology, &self.session, extra)
             .await?;
+        cancellation.check()?;
         memory.put_many(&updates).await?;
+        cancellation.check()?;
         memory
             .append(
                 &format!("{}/{}/dream-log", self.scope, self.config.mode),
@@ -160,6 +194,7 @@ impl Harness {
                 &serde_json::to_string(report)?,
             )
             .await?;
+        cancellation.check()?;
         self.pending_publication = Some(PendingPublication {
             config: self.config.clone(),
             topology,
@@ -167,6 +202,8 @@ impl Harness {
             updates,
         });
         candidate.promote().await?;
+        #[cfg(test)]
+        self.pause_after_memory_write().await?;
         self.publish_pending();
         Ok(())
     }
@@ -347,6 +384,21 @@ fn restore_topology(mut previous: Topology, current: &Topology) -> Topology {
     previous
 }
 
+async fn resolve_candidate_outcome(
+    candidate: &Candidate,
+    outcome: Result<DreamReport>,
+) -> Result<DreamReport> {
+    match outcome {
+        Ok(report) => Ok(report),
+        Err(error) => match candidate.abandon().await {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "dream candidate abandonment also failed: {cleanup:#}"
+            ))),
+        },
+    }
+}
+
 fn dream_tool() -> ToolSpec {
     // oneOf allows providers to preserve validation rather than using prose-only JSON.
     let mut tool = spec(
@@ -360,4 +412,164 @@ fn dream_tool() -> ToolSpec {
         {"type":"object","properties":{"action":{"const":"retire","type":"string"},"id":{"type":"string"}},"required":["action","id"],"additionalProperties":false}
     ]});
     tool
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use std::sync::Arc;
+
+    use kuru_connectors::DemoProvider;
+    use kuru_core::{Config, Mode};
+    use kuru_memory::MemoryStore;
+
+    use super::*;
+
+    fn config() -> Config {
+        Config {
+            mode: Mode::Freudian,
+            provider: "demo".into(),
+            model: "demo".into(),
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_dream_keeps_an_accepted_candidate_write_isolated() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            config(),
+            project.path(),
+            memory.clone(),
+            Arc::new(DemoProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let live_revision = memory.revision().await.unwrap();
+        let candidate = memory
+            .begin_candidate("cancelled dream write")
+            .await
+            .unwrap();
+        candidate
+            .view()
+            .append("candidate-proof", "dream", "accepted candidate only")
+            .await
+            .unwrap();
+        let candidate_revision = candidate.view().revision().await.unwrap();
+        assert_ne!(candidate_revision, live_revision);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = harness
+            .finish_dream(
+                &candidate,
+                harness.topology.clone(),
+                &DreamReport::default(),
+                &cancellation,
+            )
+            .await
+            .unwrap_err();
+        assert!(turn_was_cancelled(&error));
+        assert_eq!(memory.revision().await.unwrap(), live_revision);
+        assert!(
+            memory
+                .history("candidate-proof", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            candidate
+                .view()
+                .history("candidate-proof", 10)
+                .await
+                .unwrap()[0]
+                .content,
+            "accepted candidate only"
+        );
+        assert_eq!(
+            candidate.view().revision().await.unwrap(),
+            candidate_revision
+        );
+        drop(candidate);
+        harness
+            .run("continue after candidate cancellation")
+            .await
+            .unwrap();
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_dream_promotion_wins_cancellation_and_publishes_exactly() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            config(),
+            project.path(),
+            memory.clone(),
+            Arc::new(DemoProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let scope = harness.scope.clone();
+        let role = harness.topology.parts[0].role.clone();
+        let (topology, report) = harness
+            .plan_dream(vec![DreamProposal::Add {
+                name: "Accepted promotion".into(),
+                role,
+                instruction: "Remain durable when cancellation loses the promotion race".into(),
+            }])
+            .unwrap();
+        let expected = serde_json::to_value(&topology).unwrap();
+        let before = memory.revision().await.unwrap();
+        let candidate = memory.begin_candidate("accepted promotion").await.unwrap();
+        let (promoted, release) = harness.pause_after_next_memory_write();
+        let cancellation = CancellationToken::new();
+        let controlled = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let result = harness
+                .finish_dream(&candidate, topology, &report, &controlled)
+                .await;
+            (harness, candidate, result)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), promoted)
+            .await
+            .expect("dream promotion did not reach accepted publication")
+            .unwrap();
+        let accepted = memory.revision().await.unwrap();
+        assert_ne!(accepted, before);
+        cancellation.cancel();
+        release.send(()).unwrap();
+        let (mut harness, candidate, result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .expect("accepted dream promotion did not settle")
+                .unwrap();
+        result.unwrap();
+        assert_eq!(memory.revision().await.unwrap(), accepted);
+        assert!(candidate.view().revision().await.is_err());
+        assert_eq!(candidate.promote().await.unwrap(), accepted);
+        assert_eq!(serde_json::to_value(&harness.topology).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(
+                read_topology(&memory, &scope, Mode::Freudian)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            expected
+        );
+        assert!(harness.pending_publication.is_none());
+        drop(candidate);
+        harness
+            .run("continue after accepted promotion")
+            .await
+            .unwrap();
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
 }

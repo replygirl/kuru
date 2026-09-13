@@ -495,6 +495,171 @@ async fn concurrent_cold_offline_extraction_activates_once_and_preserves_notices
     assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 1);
 }
 
+async fn observed_stages(progress: &mut crate::MemoryOpenProgress) -> Vec<MemoryOpenStage> {
+    let mut stages = Vec::new();
+    while let Some(stage) = progress.recv().await {
+        stages.push(stage);
+    }
+    stages
+}
+
+#[tokio::test]
+async fn observed_provision_reports_actual_cold_warm_and_failure_stages() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    let cold_cache = root.path().join("cold");
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let cold = provision_managed_observed(
+        &config,
+        &cold_cache,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+        &mut reporter,
+    )
+    .await;
+    drop(reporter);
+    assert!(cold.is_ok());
+    assert_eq!(
+        observed_stages(&mut progress).await,
+        [
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::ExtractingEmbeddedRuntime,
+            MemoryOpenStage::CheckingRuntimeVersion,
+        ]
+    );
+
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let warm = provision_managed_observed(
+        &config,
+        &cold_cache,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+        &mut reporter,
+    )
+    .await;
+    drop(reporter);
+    assert!(warm.is_ok());
+    assert_eq!(
+        observed_stages(&mut progress).await,
+        [
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::VerifyingRuntimeCache,
+            MemoryOpenStage::CheckingRuntimeVersion,
+        ]
+    );
+
+    let corrupt_cached_entry = root.path().join("corrupt-cached-entry");
+    let binary = provision_managed(
+        &config,
+        &corrupt_cached_entry,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+    )
+    .await
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut corrupted = SCRIPT.to_vec();
+    corrupted[0] = b'!';
+    executable(&binary, &corrupted);
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let corrupt = provision_managed_observed(
+        &config,
+        &corrupt_cached_entry,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+        &mut reporter,
+    )
+    .await;
+    drop(reporter);
+    assert!(
+        corrupt
+            .unwrap_err()
+            .to_string()
+            .contains("cache is invalid")
+    );
+    assert_eq!(
+        observed_stages(&mut progress).await,
+        [
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::VerifyingRuntimeCache,
+        ]
+    );
+
+    let corrupt_cache = root.path().join("corrupt");
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let corrupt = provision_managed_observed(
+        &config,
+        &corrupt_cache,
+        fixture.spec(),
+        Cow::Owned(vec![b'!'; fixture.bytes.len()]),
+        &mut reporter,
+    )
+    .await;
+    drop(reporter);
+    assert!(corrupt.is_err());
+    assert_eq!(
+        observed_stages(&mut progress).await,
+        [
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::ExtractingEmbeddedRuntime,
+        ]
+    );
+
+    let mismatch_cache = root.path().join("mismatch");
+    static MISMATCH: std::sync::LazyLock<Fixture> = std::sync::LazyLock::new(|| {
+        let version = b"#!/bin/sh\nprintf 'dolt version 2.3.2\\n'\n";
+        let mut fixture = Fixture::new(|entries| entries[2].3 = version.to_vec());
+        fixture.binary_digest = digest(version);
+        fixture.binary_bytes = version.len() as u64;
+        fixture
+    });
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let mismatch = provision_managed_observed(
+        &config,
+        &mismatch_cache,
+        MISMATCH.spec(),
+        Cow::Borrowed(&MISMATCH.bytes),
+        &mut reporter,
+    )
+    .await;
+    drop(reporter);
+    assert!(mismatch.is_err());
+    assert_eq!(
+        observed_stages(&mut progress).await,
+        [
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::ExtractingEmbeddedRuntime,
+            MemoryOpenStage::CheckingRuntimeVersion,
+        ]
+    );
+
+    let explicit = root.path().join("explicit-dolt");
+    executable(&explicit, SCRIPT);
+    let explicit_config = MemoryConfig {
+        dolt_binary: Some(explicit.clone()),
+        ..config.clone()
+    };
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    assert_eq!(
+        provision_observed(&explicit_config, root.path(), &mut reporter)
+            .await
+            .expect("explicit binary should pass the version probe"),
+        explicit
+            .canonicalize()
+            .expect("explicit binary should have a canonical path")
+    );
+    drop(reporter);
+    assert_eq!(
+        observed_stages(&mut progress).await,
+        [MemoryOpenStage::CheckingRuntimeVersion]
+    );
+}
+
 #[tokio::test]
 async fn corrupt_embedded_bytes_never_activate_and_valid_retry_succeeds() {
     let temporary = tempfile::tempdir().unwrap();

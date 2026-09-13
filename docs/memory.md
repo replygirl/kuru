@@ -10,6 +10,7 @@ kuru memory status
 kuru memory history
 kuru memory notes ID --limit 100
 kuru memory forget ID --note SEQUENCE
+kuru memory purge --yes
 kuru memory export --format json --output committed-memory.json
 ```
 
@@ -32,6 +33,18 @@ one row from the selected identity's active notes namespace and records a new
 Dolt revision. It does not remove conversations, other notes, or older revisions;
 it is not secure erasure and does not provide a history-recovery command.
 
+`kuru memory purge --yes` is the explicit destructive control for one canonical
+project. It removes that project's managed current Dolt store, revision history,
+and recognised managed recovery trees, then prevents that project from being
+automatically re-imported from a shared legacy SQLite source. It refuses an
+active owner and never kills it. It retains original/shared legacy SQLite inputs
+and migration snapshots, user exports and backups, other projects, engine cache,
+and stable lock files. After memory removal, it removes that project's bounded
+diagnostics ring. If an earlier purge records an incomplete operation, rerun the
+same `kuru memory purge --yes` command: it removes only the recorded remaining
+identities. It is not secure erasure and does not rewrite copies outside Kuru's
+managed project store.
+
 `kuru memory export` writes every application message and state record from one
 captured, committed `main` revision. It uses JSON by default; `--format markdown`
 renders the same records as JSON fenced blocks. Without `--output PATH`, JSON is
@@ -51,6 +64,23 @@ network, compiler or separate engine installation. The cache is `tools/dolt`
 inside the Kuru data directory; `memory.cache_dir` selects another location.
 Subsequent runs verify and reuse the extracted engine. Corrupt existing caches
 fail explicitly and remain preserved for inspection.
+
+Before an application command opens memory, Kuru may print bounded progress on
+standard error for the current work: waiting for private ownership, checking or
+extracting the verified runtime, preparing and opening the database, then ready.
+These messages do not estimate time or prove a stage succeeded; the command's
+ordinary result remains authoritative. JSON and other command output stay on
+standard output, and library callers do not receive progress messages.
+
+After the first conversation/runtime command (`kuru run`, `kuru dream`,
+`kuru undo-dream`, the TUI, or `kuru serve`) opens a writable project store, the
+application shows one informational local notice. It names the escaped managed directory and points to
+`kuru memory notes ID`, `kuru memory export --format json --output PATH`,
+`kuru memory forget ID --note SEQUENCE`, and `kuru memory purge --help`. The
+notice records only that this project/version was displayed, after stderr is
+flushed or the TUI frame is complete. It is not sent to a provider or added to a
+peer conversation. Memory and chat do not expire automatically; forgetting a
+selected active note retains prior Dolt revisions.
 
 `memory.offline` remains accepted for configuration compatibility; bundled engine
 provisioning always works offline. An explicit `memory.dolt_binary` is an optional
@@ -83,6 +113,13 @@ partial or superseded imports are stopped and preserved under `memory/interrupte
 before retry. Unknown data fails explicitly. Correct the reported error and retry;
 do not delete the source or bypass identity checks to force an import.
 
+The legacy data directory must remain private. On macOS and Linux, if Kuru finds
+group or other access, it names that directory and asks you to run `chmod 700`
+on it before retrying; Kuru never changes the mode automatically. On Windows,
+correct the data directory's owner-only access using native file security
+settings and retry. These checks occur before Kuru imports or modifies legacy
+data.
+
 ## Schema upgrades
 
 Writable opens apply compatible Dolt schema upgrades in order before making a
@@ -108,6 +145,13 @@ Dreams use an isolated candidate branch. Their notes, histories, reports and
 topology changes become active together after validation. A candidate based on an
 outdated live revision cannot overwrite newer conversations. Undo records a new
 revision restoring prior membership, while preserving later chats and preferences.
+
+Kuru replaces internal write receipts and reclaims a dream candidate only after
+its promotion or explicit abandonment is durably resolved. Unresolved candidates,
+conversations, notes and reachable Dolt revisions do not expire automatically.
+The bundled engine performs bounded, growth-triggered storage maintenance while
+Kuru owns it, but retained history can continue to grow. This maintenance is not
+secure erasure.
 
 ## Backup and recovery
 

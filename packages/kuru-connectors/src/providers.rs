@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -186,6 +186,7 @@ impl ResponsesProvider {
         operation: diagnostics::Operation,
         budget: &OperationBudget,
     ) -> Result<reqwest::Response> {
+        let started = Instant::now();
         let environment = match &self.auth {
             Authentication::Environment(key_env) if !key_env.is_empty() => {
                 Some(environment_value(environment_key(key_env)?)?)
@@ -248,13 +249,19 @@ impl ResponsesProvider {
                 continue;
             }
             let retry_after = retry::retry_after(response.headers());
+            let status = response.status().as_u16();
             let rejected = diagnostics::rejected(response, operation).await;
             if !rejected.retryable {
+                tracing::info!(target: "kuru.provider", operation = operation.tracing_label(), attempt = budget.provider_attempts(), status = status, elapsed_ms = started.elapsed().as_millis() as u64, "provider retry terminal");
                 return Err(rejected.error);
             }
             match budget.retry_delay(retry_after.as_ref(), std::time::SystemTime::now()) {
-                RetryDecision::Delay(delay) => tokio::time::sleep(delay).await,
+                RetryDecision::Delay(delay) => {
+                    tracing::info!(target: "kuru.provider", operation = operation.tracing_label(), attempt = budget.provider_attempts(), status = status, delay_ms = delay.as_millis() as u64, elapsed_ms = started.elapsed().as_millis() as u64, "provider retry scheduled");
+                    tokio::time::sleep(delay).await
+                }
                 RetryDecision::Exhausted => {
+                    tracing::info!(target: "kuru.provider", operation = operation.tracing_label(), attempt = budget.provider_attempts(), status = status, elapsed_ms = started.elapsed().as_millis() as u64, "provider retry exhausted");
                     return Err(retry::exhausted(operation, budget.provider_attempts()));
                 }
             }

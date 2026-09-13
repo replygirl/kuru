@@ -1,7 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -15,13 +20,17 @@ use kuru_memory::{MemoryStatus, MemoryStore, Revision, StoredNote};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Semaphore, broadcast, oneshot};
+use tokio::sync::{Notify, Semaphore, broadcast, oneshot};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
     actor::{Actor, Work},
     bus::PeerMessage,
 };
+
+const SHUTDOWN_DREAM_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TURN_TRANSITIONS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReport {
@@ -70,6 +79,145 @@ pub struct TurnOutput {
     pub output_tokens: u64,
     pub limited: bool,
     pub events: Vec<Event>,
+}
+
+#[derive(Clone, Default)]
+/// A cloneable signal used to settle one foreground operation explicitly.
+pub struct CancellationToken {
+    inner: Arc<CancellationState>,
+}
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    changed: Notify,
+}
+
+#[derive(Debug)]
+struct TurnCancelled;
+
+impl std::fmt::Display for TurnCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("turn cancelled")
+    }
+}
+
+impl std::error::Error for TurnCancelled {}
+
+impl CancellationToken {
+    /// Create an uncancelled signal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Signal cancellation to every clone.
+    pub fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            self.inner.changed.notify_waiters();
+        }
+    }
+
+    /// Report whether cancellation has been signalled.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            return Err(TurnCancelled.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            if self.is_cancelled() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) async fn wait<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::select! {
+            biased;
+            () = self.cancelled() => Err(TurnCancelled.into()),
+            result = future => result,
+        }
+    }
+}
+
+/// Identify the runtime's typed cancellation result through `anyhow` context.
+pub fn turn_was_cancelled(error: &anyhow::Error) -> bool {
+    error.is::<TurnCancelled>()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TurnTransition {
+    Started,
+    Resumed,
+    PossibleDispatch,
+    Interrupted,
+    Ended,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnJournal {
+    format: u32,
+    id: String,
+    prompt: String,
+    target: Option<String>,
+    transitions: Vec<TurnTransition>,
+    possible_dispatch: bool,
+    output: Option<TurnOutput>,
+}
+
+impl TurnJournal {
+    fn validate(&self, id: &str) -> Result<()> {
+        ensure!(self.format == 1, "unsupported turn journal format");
+        ensure!(self.id == id, "stored turn journal identity mismatch");
+        ensure!(
+            !self.transitions.is_empty()
+                && self.transitions.len() <= MAX_TURN_TRANSITIONS
+                && matches!(self.transitions.first(), Some(TurnTransition::Started)),
+            "stored turn journal transition history is invalid"
+        );
+        ensure!(
+            self.possible_dispatch
+                == self
+                    .transitions
+                    .iter()
+                    .any(|transition| matches!(transition, TurnTransition::PossibleDispatch)),
+            "stored turn journal dispatch state is invalid"
+        );
+        ensure!(
+            self.output.is_some() == matches!(self.transitions.last(), Some(TurnTransition::Ended)),
+            "stored turn journal completion state is invalid"
+        );
+        Ok(())
+    }
+
+    fn push(&mut self, transition: TurnTransition) -> Result<()> {
+        ensure!(
+            self.transitions.len() < MAX_TURN_TRANSITIONS,
+            "turn journal transition limit reached; use a new turn ID"
+        );
+        self.transitions.push(transition);
+        Ok(())
+    }
+}
+
+enum TurnAdmission {
+    Reuse(TurnOutput),
+    Run {
+        key: String,
+        journal: TurnJournal,
+        resolved_target: Option<String>,
+    },
 }
 
 /// A bounded, current-mode projection of one identity's durable notes.
@@ -206,10 +354,22 @@ impl Harness {
         self.events.subscribe()
     }
     pub async fn shutdown(&mut self, dream: bool) -> Result<()> {
+        let cancellation = CancellationToken::new();
         let result = async {
             self.reconcile().await?;
             if dream && self.config.dream_on_exit && self.session.turns > 0 {
-                self.dream().await?;
+                match tokio::time::timeout(
+                    SHUTDOWN_DREAM_TIMEOUT,
+                    self.dream_controlled(&cancellation),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        cancellation.cancel();
+                        bail!("shutdown dream exceeded 30 seconds");
+                    }
+                };
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -221,9 +381,24 @@ impl Harness {
         for actor in actors.values_mut() {
             actor.wait().await;
         }
-        let cleanup = self.tools.shutdown().await;
-        result?;
-        cleanup
+        let memory_cleanup = self.reconcile().await;
+        let tool_cleanup = self.tools.shutdown().await;
+        match (result, memory_cleanup, tool_cleanup) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (primary, memory, tools) => {
+                let mut failures = Vec::new();
+                if let Err(error) = primary {
+                    failures.push(format!("{error:#}"));
+                }
+                if let Err(error) = memory {
+                    failures.push(format!("memory cleanup failed: {error:#}"));
+                }
+                if let Err(error) = tools {
+                    failures.push(format!("tool cleanup failed: {error:#}"));
+                }
+                bail!(failures.join("; "))
+            }
+        }
     }
     pub fn cwd(&self) -> &Path {
         &self.cwd
@@ -270,6 +445,156 @@ impl Harness {
     }
     fn transcript_key(&self) -> String {
         format!("{}/transcript/{}", self.scope, self.session.id)
+    }
+
+    fn turn_journal_key(&self, id: &str) -> String {
+        format!(
+            "{}/session/{}/turn/{}",
+            self.scope,
+            self.session.id,
+            self.turn_correlation(id)
+        )
+    }
+
+    fn turn_correlation(&self, id: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"kuru.turn-journal.v1\0");
+        digest.update(id.as_bytes());
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn actor_correlation(&self, id: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"kuru.actor-trace.v1\0");
+        digest.update(id.as_bytes());
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    async fn admit_turn(
+        &self,
+        prompt: &str,
+        target: Option<&str>,
+        id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<TurnAdmission> {
+        ensure!(
+            !id.is_empty() && id.len() <= 256,
+            "turn ID must contain 1–256 bytes"
+        );
+        let key = self.turn_journal_key(id);
+        if let Some(value) = self.memory.get(&key).await? {
+            let mut journal: TurnJournal =
+                serde_json::from_value(value).context("stored turn journal is invalid")?;
+            journal.validate(id)?;
+            ensure!(
+                journal.prompt == prompt && journal.target.as_deref() == target,
+                "turn ID is already associated with a different request in this session"
+            );
+            if let Some(output) = journal.output {
+                return Ok(TurnAdmission::Reuse(output));
+            }
+            ensure!(
+                !journal.possible_dispatch,
+                "turn may have reached external work; use a new turn ID"
+            );
+            let resolved_target = target.map(|value| self.resolve(value)).transpose()?;
+            cancellation.check()?;
+            journal.push(TurnTransition::Resumed)?;
+            self.memory
+                .put(&key, &serde_json::to_value(&journal)?)
+                .await?;
+            return Ok(TurnAdmission::Run {
+                key,
+                journal,
+                resolved_target,
+            });
+        }
+        let resolved_target = target.map(|value| self.resolve(value)).transpose()?;
+        cancellation.check()?;
+        let journal = TurnJournal {
+            format: 1,
+            id: id.into(),
+            prompt: prompt.into(),
+            target: target.map(str::to_owned),
+            transitions: vec![TurnTransition::Started],
+            possible_dispatch: false,
+            output: None,
+        };
+        self.memory
+            .checkpoint(
+                &self.transcript_key(),
+                &[user(prompt)],
+                &[(key.clone(), serde_json::to_value(&journal)?)],
+            )
+            .await?;
+        Ok(TurnAdmission::Run {
+            key,
+            journal,
+            resolved_target,
+        })
+    }
+
+    async fn mark_possible_dispatch(
+        &self,
+        key: &str,
+        journal: &mut TurnJournal,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        cancellation.check()?;
+        ensure!(
+            journal.transitions.len() + 2 <= MAX_TURN_TRANSITIONS,
+            "turn journal transition limit reached; use a new turn ID"
+        );
+        journal.possible_dispatch = true;
+        journal.push(TurnTransition::PossibleDispatch)?;
+        self.memory
+            .put(key, &serde_json::to_value(&*journal)?)
+            .await?;
+        cancellation.check()
+    }
+
+    async fn record_interruption(
+        &mut self,
+        key: &str,
+        mut journal: TurnJournal,
+    ) -> Result<Option<TurnOutput>> {
+        let recovering_completion = self.pending_publication.is_some() && journal.output.is_some();
+        self.reconcile().await?;
+        let id = journal.id.clone();
+        journal = serde_json::from_value(
+            self.memory
+                .get(key)
+                .await?
+                .context("admitted turn journal disappeared")?,
+        )
+        .context("stored turn journal is invalid")?;
+        journal.validate(&id)?;
+        if let Some(output) = journal.output {
+            if recovering_completion {
+                let response = output
+                    .events
+                    .last()
+                    .filter(|event| event.kind == "response")
+                    .context("completed turn journal lacks its response event")?
+                    .clone();
+                let _ = self.events.send(response.clone());
+                self.trace.push(response);
+            }
+            return Ok(Some(output));
+        }
+        journal.push(TurnTransition::Interrupted)?;
+        self.memory
+            .put(key, &serde_json::to_value(journal)?)
+            .await?;
+        Ok(None)
     }
 
     pub(crate) fn emit(&mut self, kind: &str, actor: &str, detail: impl Into<String>) {
@@ -406,7 +731,7 @@ impl Harness {
     }
 
     #[cfg(test)]
-    async fn pause_after_memory_write(&mut self) -> Result<()> {
+    pub(crate) async fn pause_after_memory_write(&mut self) -> Result<()> {
         let Some(pause) = self.publication_pause.take() else {
             return Ok(());
         };
@@ -626,6 +951,7 @@ impl Harness {
         Ok(serde_json::to_string(&recent)?)
     }
 
+    #[cfg(test)]
     pub(crate) async fn ask(
         &self,
         id: &str,
@@ -633,17 +959,33 @@ impl Harness {
         phase: &str,
         tools: Vec<ToolSpec>,
     ) -> Result<Completion> {
-        self.ask_in(&self.memory, id, inputs, phase, tools).await
+        let cancellation = CancellationToken::new();
+        self.ask_controlled(id, inputs, phase, tools, &cancellation)
+            .await
     }
 
-    pub(crate) async fn ask_in(
+    async fn ask_controlled(
+        &self,
+        id: &str,
+        inputs: Vec<Message>,
+        phase: &str,
+        tools: Vec<ToolSpec>,
+        cancellation: &CancellationToken,
+    ) -> Result<Completion> {
+        self.ask_in_controlled(&self.memory, id, inputs, phase, tools, cancellation)
+            .await
+    }
+
+    pub(crate) async fn ask_in_controlled(
         &self,
         memory: &MemoryStore,
         id: &str,
         inputs: Vec<Message>,
         phase: &str,
         tools: Vec<ToolSpec>,
+        cancellation: &CancellationToken,
     ) -> Result<Completion> {
+        cancellation.check()?;
         let actor = self.actors.get(id).context("actor is inactive")?;
         let (reply, rx) = oneshot::channel();
         let history_limit = self
@@ -651,38 +993,118 @@ impl Harness {
             .max_tool_calls
             .max(inputs.len())
             .saturating_add(64);
-        actor
-            .tx
-            .send(Work {
-                memory: memory.clone(),
-                inputs,
-                instructions: self.instruction(memory, id, phase).await?,
-                model: self.config.model.clone(),
-                effort: self.config.effort.clone(),
-                tools,
-                history_limit,
-                reply,
+        let work = Work {
+            memory: memory.clone(),
+            inputs,
+            instructions: cancellation
+                .wait(self.instruction(memory, id, phase))
+                .await?,
+            model: self.config.model.clone(),
+            effort: self.config.effort.clone(),
+            tools,
+            history_limit,
+            cancellation: cancellation.clone(),
+            span: tracing::info_span!(target: "kuru.actor", "actor", actor = self.actor_correlation(id), operation = "completion"),
+            reply,
+        };
+        cancellation
+            .wait(async {
+                actor.tx.send(work).await.context("actor stopped")?;
+                Ok(())
             })
-            .await
-            .context("actor stopped")?;
+            .await?;
         rx.await.context("actor response channel closed")?
     }
 
     pub async fn run(&mut self, prompt: &str) -> Result<TurnOutput> {
-        self.run_for(prompt, None).await
+        let cancellation = CancellationToken::new();
+        self.run_controlled(prompt, None, &Uuid::new_v4().to_string(), &cancellation)
+            .await
     }
 
     pub async fn run_for(&mut self, prompt: &str, target: Option<&str>) -> Result<TurnOutput> {
+        let cancellation = CancellationToken::new();
+        self.run_cancellable(prompt, target, &cancellation).await
+    }
+
+    pub async fn run_cancellable(
+        &mut self,
+        prompt: &str,
+        target: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<TurnOutput> {
+        self.run_controlled(prompt, target, &Uuid::new_v4().to_string(), cancellation)
+            .await
+    }
+
+    /// Run a session-scoped, durably identified turn with explicit cancellation.
+    ///
+    /// An exact completed retry returns its stored output. A changed request or
+    /// an incomplete turn that may have dispatched work fails without replay.
+    pub async fn run_controlled(
+        &mut self,
+        prompt: &str,
+        target: Option<&str>,
+        turn_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<TurnOutput> {
         self.reconcile().await?;
         ensure!(
             !prompt.trim().is_empty() && prompt.len() <= 131_072,
             "prompt must contain 1–131072 bytes"
         );
-        let target = target.map(|t| self.resolve(t)).transpose()?;
+        cancellation.check()?;
+        let (key, mut journal, resolved_target) = match self
+            .admit_turn(prompt, target, turn_id, cancellation)
+            .await?
+        {
+            TurnAdmission::Reuse(output) => return Ok(output),
+            TurnAdmission::Run {
+                key,
+                journal,
+                resolved_target,
+            } => (key, journal, resolved_target),
+        };
+        let turn = self.turn_correlation(turn_id);
+        let span = tracing::info_span!(
+            target: "kuru.runtime",
+            "turn",
+            session = self.session.id.as_str(),
+            turn = turn.as_str(),
+            operation = "turn"
+        );
+        let started = std::time::Instant::now();
+        let result = Box::pin(
+            self.run_admitted(prompt, resolved_target, &key, &mut journal, cancellation)
+                .instrument(span.clone()),
+        )
+        .await;
+        match result {
+            Err(error) => {
+                if let Some(output) = self.record_interruption(&key, journal).await? {
+                    tracing::info!(target: "kuru.runtime", parent: &span, status = "interrupted", elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
+                    Ok(output)
+                } else {
+                    tracing::info!(target: "kuru.runtime", parent: &span, status = if turn_was_cancelled(&error) { "cancelled" } else { "error" }, elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
+                    Err(error)
+                }
+            }
+            Ok(output) => {
+                tracing::info!(target: "kuru.runtime", parent: &span, status = "ok", elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
+                Ok(output)
+            }
+        }
+    }
+
+    async fn run_admitted(
+        &mut self,
+        prompt: &str,
+        target: Option<String>,
+        journal_key: &str,
+        journal: &mut TurnJournal,
+        cancellation: &CancellationToken,
+    ) -> Result<TurnOutput> {
         self.trace.clear();
-        self.memory
-            .append(&self.transcript_key(), "user", prompt)
-            .await?;
         let mut pending: BTreeMap<String, Vec<Message>> = if let Some(id) = &target {
             [(id.clone(), vec![user(prompt)])].into()
         } else {
@@ -693,6 +1115,8 @@ impl Harness {
                 .map(|p| (p.id.clone(), vec![user(prompt)]))
                 .collect()
         };
+        self.mark_possible_dispatch(journal_key, journal, cancellation)
+            .await?;
         let mut drafts = BTreeMap::new();
         let mut used = 0;
         let mut input_tokens: u64 = 0;
@@ -706,11 +1130,12 @@ impl Harness {
             for id in batch.keys() {
                 self.emit("active", id, format!("peer round {}", round + 1));
             }
-            let results = join_all(batch.iter().map(|(id, inputs)| self.ask(id, inputs.clone(),
-                "deliberate: form a concise useful contribution; explicitly send any needed peer messages. The selected speaking identity will execute workspace tools next.", cognition_tools()))).await;
+            let results = join_all(batch.iter().map(|(id, inputs)| self.ask_controlled(id, inputs.clone(),
+                "deliberate: form a concise useful contribution; explicitly send any needed peer messages. The selected speaking identity will execute workspace tools next.", cognition_tools(), cancellation))).await;
             for ((id, _), result) in batch.into_iter().zip(results) {
                 let completion = match result {
                     Ok(c) => c,
+                    Err(error) if turn_was_cancelled(&error) => return Err(error),
                     Err(error) => {
                         self.emit("error", &id, format!("{error:#}"));
                         continue;
@@ -731,7 +1156,12 @@ impl Harness {
                         Err(anyhow::anyhow!("turn tool budget exhausted"))
                     } else {
                         used += 1;
-                        self.cognitive_call(&id, &call, &mut pending).await
+                        self.cognitive_call(&id, &call, &mut pending, cancellation)
+                            .await
+                    };
+                    let result = match result {
+                        Err(error) if turn_was_cancelled(&error) => return Err(error),
+                        result => result,
                     };
                     let output = tool_result(&call, result);
                     pending.entry(id.clone()).or_default().push(output);
@@ -747,9 +1177,11 @@ impl Harness {
             );
             for (id, messages) in pending {
                 for message in messages {
+                    cancellation.check()?;
                     self.memory
                         .append(&self.namespace(&id), &message.role, &message.content)
                         .await?;
+                    cancellation.check()?;
                 }
             }
         }
@@ -791,7 +1223,7 @@ impl Harness {
             serde_json::to_string(&shared)?
         ))];
         let mut tools = cognition_tools();
-        let catalog = self.tools.catalog().await?;
+        let catalog = cancellation.wait(self.tools.catalog()).await?;
         for status in catalog.mcp() {
             if !status.available() {
                 self.emit("mcp", status.alias(), "configured server unavailable");
@@ -809,11 +1241,12 @@ impl Harness {
                 vec![]
             };
             let completion = self
-                .ask(
+                .ask_controlled(
                     &speaker,
                     inputs,
                     "speak and act: you are the identity the user is talking to",
                     available,
+                    cancellation,
                 )
                 .await?;
             input_tokens = input_tokens.saturating_add(completion.input_tokens);
@@ -836,15 +1269,22 @@ impl Harness {
                     self.emit("tool", &speaker, call.name.clone());
                     if is_cognitive(&call.name) {
                         let mut mail = BTreeMap::new();
-                        let result = self.cognitive_call(&speaker, &call, &mut mail).await;
+                        let result = match self
+                            .cognitive_call(&speaker, &call, &mut mail, cancellation)
+                            .await
+                        {
+                            Err(error) if turn_was_cancelled(&error) => return Err(error),
+                            result => result,
+                        };
                         // Execute a direct peer request, not recursive delegation. Peer replies cannot spend more tools here.
                         for (id, messages) in mail {
                             match self
-                                .ask(
+                                .ask_controlled(
                                     &id,
                                     messages,
                                     "peer consultation: answer the sender briefly",
                                     vec![],
+                                    cancellation,
                                 )
                                 .await
                             {
@@ -855,6 +1295,7 @@ impl Harness {
                                     inputs
                                         .push(user(&format!("Peer {id} replied: {}", reply.text)));
                                 }
+                                Err(error) if turn_was_cancelled(&error) => return Err(error),
                                 Err(error) => {
                                     inputs.push(user(&format!("Peer {id} failed: {error}")))
                                 }
@@ -862,7 +1303,36 @@ impl Harness {
                         }
                         result
                     } else {
-                        self.tools.execute(&call.name, call.arguments.clone()).await
+                        let span = tracing::info_span!(
+                            target: "kuru.tool",
+                            "tool",
+                            tool = "external",
+                            operation = "external"
+                        );
+                        let started = std::time::Instant::now();
+                        let result = cancellation
+                            .wait(self.tools.execute(&call.name, call.arguments.clone()))
+                            .instrument(span.clone())
+                            .await;
+                        let status = match &result {
+                            Ok(output)
+                                if call.name == "shell"
+                                    && serde_json::from_str::<Value>(output)
+                                        .ok()
+                                        .and_then(|value| value["success"].as_bool())
+                                        == Some(false) =>
+                            {
+                                "error"
+                            }
+                            Ok(_) => "ok",
+                            Err(error) if turn_was_cancelled(error) => "cancelled",
+                            Err(_) => "error",
+                        };
+                        tracing::info!(target: "kuru.tool", parent: &span, status, elapsed_ms = started.elapsed().as_millis() as u64, "external tool finished");
+                        match result {
+                            Err(error) if turn_was_cancelled(&error) => return Err(error),
+                            result => result,
+                        }
                     }
                 };
                 inputs.push(tool_result(&call, result));
@@ -872,38 +1342,13 @@ impl Harness {
             text = "The turn ended without a text response. Review the activity trace and available tool budget.".into();
             limited = true;
         }
-        self.memory
-            .append(&self.transcript_key(), "assistant", &text)
-            .await?;
-        self.finish_turn(prompt, &speaker).await?;
-        self.emit("response", &speaker, &text);
-        if self.config.dream_every > 0 && self.session.turns.is_multiple_of(self.config.dream_every)
-        {
-            match self.dream().await {
-                Ok(_) => {}
-                Err(error) => self.emit("error", "dream", format!("{error:#}")),
-            }
-        }
-        Ok(TurnOutput {
-            session: self.session.id.clone(),
-            speaker,
-            text,
-            relationship: relation,
-            input_tokens,
-            output_tokens,
-            limited,
-            events: self.trace.clone(),
-        })
-    }
-
-    async fn finish_turn(&mut self, prompt: &str, speaker: &str) -> Result<()> {
-        self.reconcile().await?;
+        cancellation.check()?;
         let mut session = self.session.clone();
         session.turns += 1;
         if session.label.is_empty() {
             session.label = prompt.chars().take(80).collect();
         }
-        session.last_completed_speaker = Some(speaker.into());
+        session.last_completed_speaker = Some(speaker.clone());
         let mut topology = self.topology.clone();
         if let Some(focus) = &mut topology.focus {
             focus.remaining = focus.remaining.saturating_sub(1);
@@ -911,8 +1356,56 @@ impl Harness {
                 topology.focus = None;
             }
         }
-        self.persist_state(self.config.clone(), topology, session, vec![])
-            .await
+        let response = Event {
+            kind: "response".into(),
+            actor: speaker.clone(),
+            detail: text.clone(),
+        };
+        let mut events = self.trace.clone();
+        events.push(response.clone());
+        let output = TurnOutput {
+            session: session.id.clone(),
+            speaker: speaker.clone(),
+            text: text.clone(),
+            relationship: relation,
+            input_tokens,
+            output_tokens,
+            limited,
+            events,
+        };
+        journal.push(TurnTransition::Ended)?;
+        journal.output = Some(output.clone());
+        let mut updates = self
+            .state_updates(&self.memory, &topology, &session, vec![])
+            .await?;
+        updates.push((journal_key.into(), serde_json::to_value(&*journal)?));
+        ensure!(
+            self.pending_publication.is_none(),
+            "pending memory publication must be reconciled before turn completion"
+        );
+        self.pending_publication = Some(PendingPublication {
+            config: self.config.clone(),
+            topology,
+            session,
+            updates: updates.clone(),
+        });
+        self.memory
+            .checkpoint(&self.transcript_key(), &[assistant(&text)], &updates)
+            .await?;
+        #[cfg(test)]
+        self.pause_after_memory_write().await?;
+        self.publish_pending();
+        let _ = self.events.send(response.clone());
+        self.trace.push(response);
+        if self.config.dream_every > 0 && self.session.turns.is_multiple_of(self.config.dream_every)
+        {
+            match self.dream_controlled(cancellation).await {
+                Ok(_) => {}
+                Err(error) if turn_was_cancelled(&error) => {}
+                Err(error) => self.emit("error", "dream", format!("{error:#}")),
+            }
+        }
+        Ok(output)
     }
 
     fn select_speaker(&self, drafts: &BTreeMap<String, String>) -> (String, &'static str) {
@@ -961,8 +1454,44 @@ impl Harness {
         sender: &str,
         call: &ToolCall,
         pending: &mut BTreeMap<String, Vec<Message>>,
+        cancellation: &CancellationToken,
     ) -> Result<String> {
+        let span = tracing::info_span!(
+            target: "kuru.tool",
+            "tool",
+            tool = "cognitive",
+            operation = "cognitive"
+        );
+        let started = std::time::Instant::now();
+        let result = self
+            .cognitive_call_inner(sender, call, pending, cancellation)
+            .instrument(span.clone())
+            .await;
+        let status = match &result {
+            Ok(_) => "ok",
+            Err(error) if turn_was_cancelled(error) => "cancelled",
+            Err(_) => "error",
+        };
+        tracing::info!(
+            target: "kuru.tool",
+            parent: &span,
+            status,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "cognitive tool finished"
+        );
+        result
+    }
+
+    async fn cognitive_call_inner(
+        &mut self,
+        sender: &str,
+        call: &ToolCall,
+        pending: &mut BTreeMap<String, Vec<Message>>,
+        cancellation: &CancellationToken,
+    ) -> Result<String> {
+        cancellation.check()?;
         self.reconcile().await?;
+        cancellation.check()?;
         match call.name.as_str() {
             "peer_send" => {
                 let recipient = self.resolve(string_arg(&call.arguments, "to")?)?;
@@ -1003,6 +1532,7 @@ impl Harness {
                     "a part can only propose a relationship it participates in"
                 );
                 let relation = self.relate(kind, resolved).await?;
+                cancellation.check()?;
                 self.emit("relationship", sender, serde_json::to_string(&relation)?);
                 Ok(serde_json::to_string(&relation)?)
             }
@@ -1018,6 +1548,7 @@ impl Harness {
                 topology.states.insert(sender.into(), report.clone());
                 self.persist_state(self.config.clone(), topology, self.session.clone(), vec![])
                     .await?;
+                cancellation.check()?;
                 self.emit("state", sender, serde_json::to_string(&report)?);
                 Ok("modeled state updated".into())
             }
@@ -1027,6 +1558,7 @@ impl Harness {
                 self.memory
                     .append(&format!("{}/notes", self.namespace(sender)), "note", text)
                     .await?;
+                cancellation.check()?;
                 Ok("stored in your private durable notes".into())
             }
             "a2a_send" => {
@@ -1036,12 +1568,13 @@ impl Harness {
                     .external_agents
                     .get(alias)
                     .context("external agent alias is not configured")?;
-                a2a_send(
-                    url,
-                    string_arg(&call.arguments, "message")?,
-                    &format!("{}:{sender}", self.session.id),
-                )
-                .await
+                cancellation
+                    .wait(a2a_send(
+                        url,
+                        string_arg(&call.arguments, "message")?,
+                        &format!("{}:{sender}", self.session.id),
+                    ))
+                    .await
             }
             _ => bail!("tool {} is unavailable in this phase", call.name),
         }
@@ -1051,6 +1584,12 @@ impl Harness {
 pub(crate) fn user(text: &str) -> Message {
     Message {
         role: "user".into(),
+        content: text.into(),
+    }
+}
+fn assistant(text: &str) -> Message {
+    Message {
+        role: "assistant".into(),
         content: text.into(),
     }
 }
@@ -1324,6 +1863,546 @@ mod publication_tests {
     use kuru_connectors::DemoProvider;
 
     #[tokio::test]
+    async fn completed_turn_retry_is_exact_and_session_scoped() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(CountingProvider::default());
+        let config = Config {
+            mode: Mode::Ifs,
+            provider: "demo".into(),
+            model: "demo".into(),
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        };
+        let mut first = Harness::new(
+            config.clone(),
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = first.topology.parts[0].id.clone();
+        let cancellation = CancellationToken::new();
+        let output = first
+            .run_controlled(
+                "one durable request",
+                Some(&target),
+                "shared-external-id",
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let serialized = serde_json::to_string(&output).unwrap();
+        let sends = provider.calls.load(Ordering::SeqCst);
+        let retry = first
+            .run_controlled(
+                "one durable request",
+                Some(&target),
+                "shared-external-id",
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_string(&retry).unwrap(), serialized);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
+        assert_eq!(first.history().await.unwrap().len(), 2);
+        assert!(
+            first
+                .run_controlled(
+                    "changed request",
+                    Some(&target),
+                    "shared-external-id",
+                    &cancellation,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("different request")
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
+        assert_eq!(first.history().await.unwrap().len(), 2);
+
+        let mut second = Harness::new(
+            config,
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        second
+            .run_controlled(
+                "independent session request",
+                Some(&target),
+                "shared-external-id",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(provider.calls.load(Ordering::SeqCst) > sends);
+        assert_eq!(second.history().await.unwrap().len(), 2);
+        first.shutdown(false).await.unwrap();
+        second.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_started_turn_resumes_once_but_possible_turn_never_dispatches() {
+        let project = tempfile::tempdir().unwrap();
+        let data = kuru_memory::test_support::tempdir().unwrap();
+        let options = kuru_memory::test_support::open_options(
+            data.path().into(),
+            project_scope(project.path()).unwrap(),
+        )
+        .unwrap();
+        let memory = MemoryStore::open(options.clone()).await.unwrap();
+        let provider = Arc::new(CountingProvider::default());
+        let mut first = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let session = first.session.id.clone();
+        let target = first.topology.parts[0].id.clone();
+        let cancellation = CancellationToken::new();
+        let TurnAdmission::Run { .. } = first
+            .admit_turn("resume safely", Some(&target), "started", &cancellation)
+            .await
+            .unwrap()
+        else {
+            panic!("new journal must be runnable");
+        };
+        let TurnAdmission::Run {
+            key, mut journal, ..
+        } = first
+            .admit_turn("remain uncertain", Some(&target), "possible", &cancellation)
+            .await
+            .unwrap()
+        else {
+            panic!("new journal must be runnable");
+        };
+        first
+            .mark_possible_dispatch(&key, &mut journal, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        first.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+        drop(first);
+
+        let memory = MemoryStore::open(options).await.unwrap();
+        let mut resumed = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+        resumed
+            .run_controlled(
+                "resume safely",
+                Some(&target),
+                "started",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let sends = provider.calls.load(Ordering::SeqCst);
+        assert!(sends > 0);
+        let error = resumed
+            .run_controlled(
+                "remain uncertain",
+                Some(&target),
+                "possible",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("may have reached external work"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
+        assert_eq!(
+            resumed.history().await.unwrap(),
+            [
+                user("resume safely"),
+                user("remain uncertain"),
+                assistant("durable answer"),
+            ]
+        );
+        let private = resumed.memory_for(&target).await.unwrap();
+        assert_eq!(
+            private
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "assistant", "user", "assistant"]
+        );
+        let journal: TurnJournal = serde_json::from_value(
+            memory
+                .get(&resumed.turn_journal_key("started"))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            journal.transitions.as_slice(),
+            [
+                TurnTransition::Started,
+                TurnTransition::Resumed,
+                TurnTransition::PossibleDispatch,
+                TurnTransition::Ended
+            ]
+        ));
+        resumed.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[derive(Default)]
+    struct CountingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CountingProvider {
+        async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn complete(&self, _request: kuru_core::CompletionRequest) -> Result<Completion> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Completion {
+                text: "durable answer".into(),
+                input_tokens: 3,
+                output_tokens: 2,
+                ..Completion::default()
+            })
+        }
+    }
+
+    struct BlockingOnceProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        started: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BlockingOnceProvider {
+        async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn complete(&self, _request: kuru_core::CompletionRequest) -> Result<Completion> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_waiters();
+                std::future::pending().await
+            } else {
+                Ok(Completion {
+                    text: "later turn succeeds".into(),
+                    ..Completion::default()
+                })
+            }
+        }
+    }
+
+    struct FailingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for FailingProvider {
+        async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn complete(&self, _request: kuru_core::CompletionRequest) -> Result<Completion> {
+            bail!("ordinary provider failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_cancellation_is_durable_and_releases_the_actor_permit() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(BlockingOnceProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: Notify::new(),
+        });
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                max_parallel: 1,
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let cancelled_before_admission = CancellationToken::new();
+        cancelled_before_admission.cancel();
+        assert!(turn_was_cancelled(
+            &harness
+                .run_controlled(
+                    "never admitted",
+                    None,
+                    "pre-admission",
+                    &cancelled_before_admission,
+                )
+                .await
+                .unwrap_err()
+        ));
+        assert!(harness.history().await.unwrap().is_empty());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let started = provider.started.notified();
+        tokio::pin!(started);
+        let task = tokio::spawn(async move {
+            let mut harness = harness;
+            let result = harness
+                .run_controlled("interrupt me", None, "interrupted", &cancel)
+                .await;
+            (harness, result, target)
+        });
+        started.await;
+        cancellation.cancel();
+        let (mut harness, result, target) = task.await.unwrap();
+        assert!(turn_was_cancelled(&result.unwrap_err()));
+        assert_eq!(harness.history().await.unwrap(), [user("interrupt me")]);
+        let calls = provider.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            calls, 1,
+            "waiting peers must stop before provider admission"
+        );
+        let retry = harness
+            .run_controlled(
+                "interrupt me",
+                None,
+                "interrupted",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(retry.to_string().contains("may have reached external work"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+        harness
+            .run_controlled(
+                "next turn",
+                Some(&target),
+                "next",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(provider.calls.load(Ordering::SeqCst) > calls);
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_post_admission_failure_records_interruption_without_an_answer() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Freudian,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            Arc::new(FailingProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let error = harness
+            .run_controlled(
+                "retain failed prompt",
+                Some(&target),
+                "ordinary-failure",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("all peers failed"));
+        assert_eq!(
+            harness.history().await.unwrap(),
+            [user("retain failed prompt")]
+        );
+        let journal: TurnJournal = serde_json::from_value(
+            memory
+                .get(&harness.turn_journal_key("ordinary-failure"))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            journal.transitions.as_slice(),
+            [
+                TurnTransition::Started,
+                TurnTransition::PossibleDispatch,
+                TurnTransition::Interrupted
+            ]
+        ));
+        assert!(journal.output.is_none());
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_ended_checkpoint_wins_cancellation_and_publication_error() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Freudian,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            Arc::new(DemoProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let mut events = harness.subscribe();
+        let (written, release) = harness.pause_after_next_memory_write();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let output = harness
+                .run_controlled(
+                    "the committed answer wins",
+                    Some(&target),
+                    "completion-race",
+                    &task_cancellation,
+                )
+                .await;
+            (harness, output, target)
+        });
+        written.await.unwrap();
+        cancellation.cancel();
+        drop(release);
+        let (mut harness, output, target) = task.await.unwrap();
+        let output = output.unwrap();
+        assert_eq!(harness.session.turns, 1);
+        assert_eq!(
+            harness.history().await.unwrap(),
+            [user("the committed answer wins"), assistant(&output.text)]
+        );
+        let stored_journal: TurnJournal = serde_json::from_value(
+            memory
+                .get(&harness.turn_journal_key("completion-race"))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(stored_journal.output.as_ref().unwrap()).unwrap(),
+            serde_json::to_vec(&output).unwrap()
+        );
+        assert_eq!(
+            memory
+                .get(&format!(
+                    "{}/{}/topology",
+                    harness.scope, harness.session.mode
+                ))
+                .await
+                .unwrap()
+                .unwrap(),
+            serde_json::to_value(&harness.topology).unwrap()
+        );
+        assert_eq!(
+            memory
+                .get(&format!("{}/session/{}", harness.scope, harness.session.id))
+                .await
+                .unwrap()
+                .unwrap(),
+            serde_json::to_value(&harness.session).unwrap()
+        );
+        let sessions: Vec<Session> = serde_json::from_value(
+            memory
+                .get(&format!("{}/sessions", harness.scope))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|session| session.id == harness.session.id)
+                .count(),
+            1
+        );
+        let mut observed_response = false;
+        while let Ok(event) = events.try_recv() {
+            if event.kind == "response" {
+                assert_eq!(event.detail, output.text);
+                observed_response = true;
+                break;
+            }
+        }
+        assert!(observed_response);
+        let retry = harness
+            .run_controlled(
+                "the committed answer wins",
+                Some(&target),
+                "completion-race",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&retry).unwrap(),
+            serde_json::to_vec(&output).unwrap()
+        );
+        assert_eq!(harness.history().await.unwrap().len(), 2);
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn later_state_report_reconciles_prior_durable_publication() {
         pending_before_next_mutation(false).await;
     }
@@ -1395,7 +2474,7 @@ mod publication_tests {
             assert!(harness.pending_publication.is_some());
             if finalize {
                 harness
-                    .finish_turn("Keep the accepted modeled state", &second)
+                    .run_for("Keep the accepted modeled state", Some(&second))
                     .await
                     .unwrap();
                 assert_eq!(harness.session.turns, 1);
@@ -1409,6 +2488,7 @@ mod publication_tests {
                             arguments: json!({"activation":0.4,"note":"later peer report"}),
                         },
                         &mut BTreeMap::new(),
+                        &CancellationToken::new(),
                     )
                     .await
                     .unwrap();
@@ -1461,15 +2541,10 @@ mod tool_result_tests {
             assert_eq!(value["call_id"], call.id);
             let output = value["output"].as_str().unwrap();
             assert!(output.len() <= 8192);
-            assert_eq!(
-                output,
-                format!(
-                    "{}{}{}",
-                    "x".repeat(8192 - REDACTION_MARKER.len() - TRUNCATED.len()),
-                    REDACTION_MARKER,
-                    TRUNCATED,
-                )
-            );
+            assert!(output.starts_with(&"x".repeat((8192 - TRUNCATED.len()) / 2)));
+            assert!(output.ends_with("tailtailtailtail"));
+            assert!(output.contains(REDACTION_MARKER));
+            assert!(output.contains(TRUNCATED));
             assert_complete_markers(output);
         }
     }
