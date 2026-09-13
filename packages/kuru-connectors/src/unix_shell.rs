@@ -717,8 +717,11 @@ impl WorkerFinish {
     }
 
     fn complete(&self, result: Result<String>) {
-        self.report(result);
         self.confirmed.store(true, Ordering::Release);
+        if let Some(registry) = self.registry.upgrade() {
+            remove(&registry, self.id);
+        }
+        self.report(result);
     }
 
     fn confirm(&self) {
@@ -729,10 +732,10 @@ impl WorkerFinish {
 impl Drop for WorkerFinish {
     fn drop(&mut self) {
         if !self.spawned.load(Ordering::Acquire) && !self.confirmed.load(Ordering::Acquire) {
-            self.report(Err(anyhow::anyhow!(
+            self.complete(Err(anyhow::anyhow!(
                 "retained shell worker panicked before launch"
             )));
-            self.confirmed.store(true, Ordering::Release);
+            return;
         }
         if (!self.spawned.load(Ordering::Acquire) || self.confirmed.load(Ordering::Acquire))
             && let Some(registry) = self.registry.upgrade()
@@ -982,14 +985,105 @@ impl Capture {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::{
+        future::Future,
+        path::Path,
+        pin::Pin,
+        sync::{Arc, atomic::AtomicUsize},
+        task::{Context, Poll, Wake, Waker},
+    };
 
     use kuru_platform::fs::{NameRetention, Privacy};
+    use tokio::sync::oneshot;
 
     use super::*;
 
     fn retained_root(path: &Path) -> Arc<Directory> {
         Arc::new(Directory::open(path, Privacy::Inherited, NameRetention::Pinned).unwrap())
+    }
+
+    struct RegistryWake {
+        registry: Arc<RegistryInner>,
+        owner_count: AtomicUsize,
+    }
+
+    impl Wake for RegistryWake {
+        fn wake(self: Arc<Self>) {
+            let count = self
+                .registry
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .owners
+                .len();
+            assert_eq!(
+                self.owner_count.swap(count, Ordering::AcqRel),
+                usize::MAX,
+                "completion receiver woke more than once"
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_completion_removes_only_its_reservation_before_waking_receiver() {
+        let registry = ShellRegistry::new();
+        let (sender, mut receiver) = oneshot::channel();
+        let control = Arc::new(Control {
+            cancelled: AtomicBool::new(false),
+            result: Mutex::new(Some(sender)),
+            primary: Mutex::new(None),
+        });
+        let (other_sender, _other_receiver) = oneshot::channel();
+        let other = Arc::new(Control {
+            cancelled: AtomicBool::new(false),
+            result: Mutex::new(Some(other_sender)),
+            primary: Mutex::new(None),
+        });
+        const COMPLETED_ID: u64 = 41;
+        const OTHER_ID: u64 = 42;
+        {
+            let mut state = registry
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.owners.insert(COMPLETED_ID, control.clone());
+            state.owners.insert(OTHER_ID, other);
+        }
+
+        let wake = Arc::new(RegistryWake {
+            registry: registry.inner.clone(),
+            owner_count: AtomicUsize::new(usize::MAX),
+        });
+        let waker = Waker::from(wake.clone());
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut receiver).poll(&mut context),
+            Poll::Pending
+        ));
+
+        let finish = WorkerFinish {
+            registry: Arc::downgrade(&registry.inner),
+            id: COMPLETED_ID,
+            control,
+            confirmed: AtomicBool::new(false),
+            spawned: AtomicBool::new(true),
+        };
+        finish.complete(Ok("completed".into()));
+
+        assert_eq!(wake.owner_count.load(Ordering::Acquire), 1);
+        let received = match Pin::new(&mut receiver).poll(&mut context) {
+            Poll::Ready(Ok(result)) => result,
+            state => panic!("completion receiver did not resolve after wake: {state:?}"),
+        };
+        assert_eq!(received.unwrap(), "completed");
+        let state = registry
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!state.owners.contains_key(&COMPLETED_ID));
+        assert!(state.owners.contains_key(&OTHER_ID));
     }
 
     #[test]

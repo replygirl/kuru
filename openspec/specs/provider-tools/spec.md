@@ -98,6 +98,11 @@ and observe group absence before returning success. Timeout, overflow, read
 failure, caller loss, parent-runtime loss, and shutdown MUST enter the same
 owned cleanup path without replacing the primary failure.
 
+After confirmed cleanup, or after a worker terminates before spawning a child,
+the worker MUST remove only its own registry reservation before publishing its
+result to the caller. A spawned worker whose cleanup remains unconfirmed MUST
+remain registered until later confirmation.
+
 `ToolHost` shutdown MUST close shell registration, request cancellation, and
 await all registered owners within one bounded observation window while still
 running MCP cleanup. A bounded unconfirmed result MUST leave the independent
@@ -148,6 +153,12 @@ bounds remain separate protocol limits.
 #### Scenario: Unix worker is delayed before launch
 - **WHEN** a registered worker is delayed beyond the accepted operation deadline and cleanup allowance while no child has spawned
 - **THEN** the caller returns a fixed bounded cancellation or unconfirmed-cleanup result, and the later worker observes cancellation and starts no child.
+
+#### Scenario: Confirmed worker publication has no stale reservation
+- **WHEN** a confirmed Unix shell worker wakes its result receiver while another
+  shell owner remains registered
+- **THEN** its own reservation is already absent and the other owner remains
+  registered.
 
 #### Scenario: Unix ownership observation remains interrupted
 - **WHEN** repeated bounded `EINTR` leaves an owned root anchored beyond the caller's cleanup allowance
