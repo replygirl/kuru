@@ -917,7 +917,8 @@ mod tests {
             rpc.close().await.unwrap();
         }
 
-        let script = StdioFixture::new([Step::Sleep(5_000)]);
+        let ready = json!({"jsonrpc":"2.0","method":"fixture/ready","params":{}});
+        let script = StdioFixture::new([Step::Write(ready.clone()), Step::Read]);
         let mut rpc = Rpc::spawn(
             script.command(),
             &[],
@@ -928,9 +929,11 @@ mod tests {
         )
         .unwrap();
         rpc.ready().await.unwrap();
+        assert_eq!(rpc.read().await.unwrap(), ready);
         let error = rpc.send(json!({"text":"x".repeat(MAX_BYTES)})).await;
         assert!(error.unwrap_err().to_string().contains("dispatch failed"));
         rpc.close().await.unwrap();
+        assert_eq!(script.conversations(), vec![Vec::<Value>::new()]);
     }
 
     #[tokio::test]
