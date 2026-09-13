@@ -146,80 +146,37 @@ in the version commit.
 
 ## Verify published Windows installation
 
-The pre-merge gate uses the real mise GitHub
-backend with simulated release metadata and actual candidate package bytes;
-verify published GitHub installation separately using this procedure.
+The Release workflow runs `verify-published-windows` on `windows-2025` after the
+publish job. It checks out the exact prepared release commit and invokes the
+delivery package's `verify:published-windows` task with that commit and version.
+The task resolves the pinned native mise executable before clearing its child
+environment, then uses the ordinary `github:replygirl/kuru@VERSION` backend in
+fresh user, project, configuration, cache, data, state and temporary roots.
 
-After an authorized Release run publishes
-`kuru-VERSION-x86_64-pc-windows-msvc.zip`, perform this check on native Windows:
+Mise installation and publication provenance are checked independently. The
+verifier resolves the public tag to the expected commit, requires the complete
+release inventory, verifies `SHA256SUMS` and the Windows ZIP, and compares the
+ZIP's `kuru.exe` with the mise-installed executable. It then runs and resumes an
+offline demo conversation from empty Kuru and engine caches, checks memory
+status, history and sessions, and compares the extracted Dolt executable and
+licenses with `packages/kuru-memory/support/dolt-assets.json` at the released
+commit. The verifier receives no GitHub token, provider credential, proxy or
+custom endpoint. Informational application stderr is allowed; machine results
+remain JSON on stdout.
 
-1. Record the existing Release run URL, exact version and prepared commit SHA.
-   Confirm the published tag and complete five-target asset inventory, download
-   its Windows ZIP and `SHA256SUMS`, and verify the archive digest. Use that exact
-   version throughout; do not dispatch another release or use `latest`.
-2. Create an empty temporary root with separate project, home, config, data,
-   cache, state, system-config and temporary directories. Launch the pinned
-   native mise executable in a child process with an explicit environment.
-   Set `MISE_CONFIG_DIR`, `MISE_DATA_DIR`, `MISE_CACHE_DIR`, `MISE_STATE_DIR`,
-   `MISE_TMP_DIR`, `MISE_SYSTEM_CONFIG_DIR` and `MISE_SYSTEM_DATA_DIR` beneath
-   that root. Point `MISE_GLOBAL_CONFIG_FILE` and `MISE_SYSTEM_CONFIG_FILE` at
-   empty fixture files, set `MISE_CEILING_PATHS` to the root, and trust only the
-   isolated project with `MISE_TRUSTED_CONFIG_PATHS`. Also isolate HOME,
-   USERPROFILE, APPDATA, LOCALAPPDATA, TMP, TEMP and GH_CONFIG_DIR. Retain only
-   deliberate native system values and PATH prerequisites; no existing Kuru,
-   compiler, external Dolt, provider credentials or user tool shims.
-3. Start with no mise lockfile, token files, OAuth cache or inherited GitHub
-   token/proxy variables. In the isolated project's `mise.toml`, use the settings
-   below. Do not configure URL replacements, a custom API, asset pattern or direct
-   download URL. This check must contact ordinary GitHub endpoints and retain
-   default checksum/provenance verification.
+After all owned processes settle and the isolated root is removed, the job
+uploads `published-windows-verification.json`. This bounded receipt contains the
+release identity, hashes, command milestones, durable session observations and
+cleanup confirmation without child output or credentials. `build-docs` depends
+on this job, so neither documentation build nor deployment proceeds when the
+published package fails verification.
 
-   ```toml
-   [settings]
-   use_versions_host = false
-   use_versions_host_track = false
-   netrc = false
-
-   [settings.github]
-   gh_cli_tokens = false
-   use_git_credentials = false
-   credential_command = ""
-   oauth_client_id = ""
-   ```
-
-4. Confirm `mise config ls` lists only the intended temporary files, then run
-   `mise use github:replygirl/kuru@VERSION`, `mise which kuru` and
-   `mise exec -- kuru --version`. Require the selected executable to live under
-   the isolated mise install directory and match both the release version and
-   the `kuru.exe` digest from the verified ZIP. A preexisting executable or a
-   successful local package test cannot satisfy this check. Do not use `-g`.
-5. Set the child process's `KURU_DATA_DIR` to an absolute `kuru-data` path beneath
-   the temporary root. In the project, create `.kuru/config.toml` with the settings
-   below, replacing the example cache path with an absolute path beneath that
-   same root. Neither Kuru's data nor engine-cache directory may already exist. Run
-   `mise exec -- kuru --provider demo --no-dream run "Published Windows check" --json`,
-   retain its `session`, and run
-   `mise exec -- kuru --provider demo --no-dream --resume SESSION run "Continue the saved conversation" --json`.
-   Require the same session and nonempty responses. Use `mise exec -- kuru memory status`,
-   `mise exec -- kuru memory history --limit 100` and `mise exec -- kuru sessions`
-   to verify the full Dolt version, durable revisions and session after reopening;
-   compare extracted engine/LICENSES hashes with the manifest at the released SHA.
-
-   ```toml
-   [memory]
-   cache_dir = 'C:\Temp\CHECK\kuru-engine-cache'
-   offline = true
-   ```
-
-Record the runner/OS, mise version, release/run URLs, version/commit, archive and
-installed executable digests, configuration isolation, command exit statuses,
-session/revision results and logs in the change's verification record.
-Offline configuration and absent external tools prove the bundled-runtime path;
-record any separately enforced network restriction accurately. Preserve failure
-diagnostics without replacing published assets to repair the check.
-Observe owned process shutdown before deleting the temporary root. This procedure
-performs read-only release retrieval and isolated local installation; it does not
-publish a release or documentation and adds no workflow entrypoint.
+If verification is interrupted or fails after publication, rerun the failed
+`Verify published Windows release` job in the same Release run. It reads the
+existing immutable tag and assets selected by that run; do not dispatch another
+release or replace published files to repair the check. An actual successful
+published run and any recovery rerun remain operational evidence and must not be
+inferred from the pre-publication simulated-metadata fixture.
 
 ## Notes model and configuration
 

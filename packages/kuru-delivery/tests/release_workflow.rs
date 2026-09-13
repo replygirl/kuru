@@ -26,6 +26,56 @@ const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
 fn v(input: &str) -> Version {
     input.parse().unwrap()
 }
+
+#[test]
+fn published_windows_verifier_is_post_publish_exact_sha_and_gates_docs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workflow = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    let verifier = workflow
+        .split("  verify-published-windows:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n  build-docs:\n")
+        .next()
+        .unwrap();
+    for required in [
+        "needs: [plan, bump, publish]",
+        "runs-on: windows-2025",
+        "ref: ${{ needs.bump.outputs.sha }}",
+        "version: 2026.9.4",
+        "RELEASE_VERSION: ${{ needs.plan.outputs.version }}",
+        "RELEASE_SHA: ${{ needs.bump.outputs.sha }}",
+        "mise run //packages/kuru-delivery:verify:published-windows",
+        "name: published-windows-verification",
+    ] {
+        assert!(verifier.contains(required), "missing {required}");
+    }
+    let execution = verifier
+        .split("- name: Verify the exact published package")
+        .nth(1)
+        .unwrap();
+    assert!(!execution.contains("GITHUB_TOKEN"));
+    assert!(!execution.contains("GH_TOKEN"));
+
+    let docs = workflow.split("\n  build-docs:\n").nth(1).unwrap();
+    assert!(docs.contains("needs: [bump, publish, verify-published-windows]"));
+
+    let task = fs::read_to_string(root.join("packages/kuru-delivery/mise.toml")).unwrap();
+    let task = task
+        .split("[tasks.\"verify:published-windows\"]")
+        .nth(1)
+        .unwrap();
+    let resolve = task
+        .find("Get-Command mise -CommandType Application")
+        .unwrap();
+    let clear = task.find("verify-published-windows --mise").unwrap();
+    assert!(
+        resolve < clear,
+        "native mise must be resolved before verifier env clearing"
+    );
+    assert!(!task.contains("kuru-memory"));
+    assert!(!task.contains("kuru-tui"));
+}
 struct Repo {
     temp: TempDir,
 }

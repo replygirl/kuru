@@ -391,3 +391,46 @@ fn package_cli_rejects_input_output_aliases_without_modifying_the_executable() {
     failure(&output, "must not replace its input");
     assert_eq!(fs::read(fixture.archive()).unwrap(), before);
 }
+
+#[test]
+fn published_windows_cli_is_explicit_and_native_only() {
+    let fixture = Fixture::new();
+    let help = fixture
+        .command()
+        .args(["verify-published-windows", "--help"])
+        .output()
+        .unwrap();
+    let help = success(&help);
+    for option in [
+        "--version",
+        "--expected-sha",
+        "--mise",
+        "--manifest",
+        "--evidence",
+        "--run-url",
+    ] {
+        assert!(help.contains(option), "missing {option}: {help}");
+    }
+
+    #[cfg(not(windows))]
+    {
+        let output = fixture
+            .command()
+            .args([
+                "verify-published-windows",
+                "--version",
+                "1.2.3",
+                "--expected-sha",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--mise",
+                "/missing/mise",
+                "--evidence",
+                "receipt.json",
+                "--run-url",
+                "https://github.com/replygirl/kuru/actions/runs/42",
+            ])
+            .output()
+            .unwrap();
+        failure(&output, "requires native Windows");
+    }
+}

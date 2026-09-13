@@ -16,7 +16,7 @@ use kuru_delivery::{
     targets,
 };
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
-use kuru_platform::windows::process::{configured_command, system_directory};
+use kuru_platform::windows::process::configured_command;
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -26,6 +26,9 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[path = "../../src/mise_isolation.rs"]
+mod mise_isolation;
 
 const DEADLINE: Duration = Duration::from_secs(180);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -273,56 +276,7 @@ impl Installation {
         let root = temporary.path().to_owned();
         let project = root.join("project");
         fs::create_dir(&project)?;
-        let mut env = Vec::new();
-        for (name, relative) in [
-            ("HOME", "home"),
-            ("USERPROFILE", "home"),
-            ("APPDATA", "appdata"),
-            ("LOCALAPPDATA", "local"),
-            ("TMP", "tmp"),
-            ("TEMP", "tmp"),
-            ("MISE_CONFIG_DIR", "mise-config"),
-            ("MISE_DATA_DIR", "mise-data"),
-            ("MISE_CACHE_DIR", "mise-cache"),
-            ("MISE_STATE_DIR", "mise-state"),
-            ("MISE_TMP_DIR", "mise-tmp"),
-            ("MISE_SYSTEM_CONFIG_DIR", "system-config"),
-            ("MISE_SYSTEM_DATA_DIR", "system-data"),
-            ("GH_CONFIG_DIR", "gh"),
-            ("XDG_CONFIG_HOME", "appdata"),
-            ("XDG_CACHE_HOME", "xdg-cache"),
-            ("XDG_DATA_HOME", "xdg-data"),
-        ] {
-            let path = root.join(relative);
-            fs::create_dir_all(&path)?;
-            env.push((name.into(), path.into()));
-        }
-        for (name, relative) in [
-            ("MISE_GLOBAL_CONFIG_FILE", "global.toml"),
-            ("MISE_SYSTEM_CONFIG_FILE", "system.toml"),
-        ] {
-            let path = root.join(relative);
-            fs::write(&path, b"")?;
-            env.push((name.into(), path.into()));
-        }
-        let system = system_directory()?;
-        env.push((
-            "SystemRoot".into(),
-            system
-                .parent()
-                .context("system directory has no parent")?
-                .as_os_str()
-                .to_owned(),
-        ));
-        env.push(("PATH".into(), system.into()));
-        // The real Windows resolver uses PATHEXT to expand `kuru` to
-        // `kuru.exe`. Keep conventional OS command lookup in this otherwise
-        // empty environment without importing user-defined extensions.
-        env.push(("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into()));
-        env.push(("MISE_CEILING_PATHS".into(), root.clone().into()));
-        env.push(("MISE_TRUSTED_CONFIG_PATHS".into(), project.clone().into()));
-        env.push(("MISE_YES".into(), "1".into()));
-        env.push(("MISE_COLOR".into(), "0".into()));
+        let mut env = mise_isolation::prepare(&root, &project)?;
         // This affects diagnostics only; it does not change installation policy.
         if let Some(path) = std::env::var_os("LLVM_PROFILE_FILE") {
             env.push(("LLVM_PROFILE_FILE".into(), path));

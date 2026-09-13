@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use kuru_delivery::{advisory, archive, bundle, docs, repo};
+use kuru_delivery::{advisory, archive, bundle, docs, published_windows, repo};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -52,6 +52,21 @@ enum Command {
         version: String,
         #[arg(long, default_value = "dist")]
         output: PathBuf,
+    },
+    /// Verify one exact published Windows release through ordinary mise.
+    VerifyPublishedWindows {
+        #[arg(long, env = "RELEASE_VERSION")]
+        version: String,
+        #[arg(long, env = "RELEASE_SHA")]
+        expected_sha: String,
+        #[arg(long)]
+        mise: PathBuf,
+        #[arg(long, default_value = "packages/kuru-memory/support/dolt-assets.json")]
+        manifest: PathBuf,
+        #[arg(long, env = "KURU_PUBLISHED_WINDOWS_RECEIPT")]
+        evidence: PathBuf,
+        #[arg(long, env = "RELEASE_RUN_URL")]
+        run_url: String,
     },
     /// Check public artifacts, base paths, links, anchors and sitemap.
     Docs {
@@ -164,6 +179,24 @@ async fn main() -> Result<()> {
                 "{}",
                 archive::package(&binary, &target, &version, &output)?.display()
             );
+        }
+        Command::VerifyPublishedWindows {
+            version,
+            expected_sha,
+            mise,
+            manifest,
+            evidence,
+            run_url,
+        } => {
+            published_windows::run(published_windows::Options {
+                version,
+                expected_sha,
+                mise,
+                manifest,
+                evidence,
+                run_url,
+            })
+            .await?;
         }
         Command::InstallLocal {
             binary,

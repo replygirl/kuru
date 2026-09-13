@@ -83,3 +83,9 @@ run = [
   "cargo test -p kuru-delivery --all-features --locked archive::tests",
   "cargo test -p kuru-delivery --all-features --locked --test bootstrap_install",
 ]
+
+[tasks."verify:published-windows"]
+description = "Verify the exact published Windows release through ordinary mise"
+dir = "{{config_root}}/../.."
+run = "echo 'verify:published-windows requires native Windows' >&2; exit 1"
+run_windows = "$misePath = (Get-Command mise -CommandType Application).Source; cargo run -p kuru-delivery --features tooling --locked --bin kuru-delivery -- verify-published-windows --mise \"$misePath\" --version \"$env:RELEASE_VERSION\" --expected-sha \"$env:RELEASE_SHA\" --run-url \"$env:RELEASE_RUN_URL\" --evidence \"$env:KURU_PUBLISHED_WINDOWS_RECEIPT\""
