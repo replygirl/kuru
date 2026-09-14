@@ -25,6 +25,9 @@
   debugger commands or inspecting stores or unrelated processes. Exclude the
   target command line and debugger prompt-command echoes, and report explicitly
   when no projected output remains.
+- [x] 2.4 Remove the native-incompatible detach-on-exit option while preserving
+  noninvasive attachment, the fixed command file's explicit `qd`, bounded CDB
+  cleanup, and every existing authoritative test outcome and deadline.
 
 ## 3. Evidence
 
@@ -47,3 +50,13 @@
   explicit empty output, and the combined 4 KiB bound. Connector typecheck,
   connector clippy with warnings denied, workspace formatting, and diff checks
   passed. Strict validation and the apply gate passed after this evidence update.
+- [x] 3.4 Pass the focused CDB parser/projection checks, connector typecheck and
+  clippy, formatter, strict Cospec validation, and actual apply gate after the
+  detach-on-exit correction. The preceding native run remains failure evidence:
+  CDB emitted `The system does not support detach on exit`, no fixed marker or
+  known-sleep capture was accepted, the authoritative ToolHost still timed out
+  before `Join-Path`, and no connector receipt was emitted.
+  After removing only `-pd`, the two focused CDB library tests, connector
+  typecheck, connector clippy with warnings denied, workspace formatting, and
+  diff checks passed. Strict validation and the apply gate passed after this
+  evidence update; native capture and the checked shard receipt remain task 3.2.

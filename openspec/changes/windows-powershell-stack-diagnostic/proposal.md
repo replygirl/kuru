@@ -19,6 +19,10 @@ existing failure without changing shell behavior, deadlines, or pass criteria.
   attach or command failure without inspecting stores or arbitrary processes.
   Exclude the target command line and debugger prompt-command echoes, and state
   explicitly when projection leaves no output.
+- Remove the detach-on-exit option after native CDB rejected that option with
+  `The system does not support detach on exit` before executing the fixed
+  command file. Keep noninvasive attachment, the explicit `qd` command, and all
+  existing capture, cleanup, and acceptance bounds unchanged.
 - Keep the original ToolHost result authoritative and require bounded debugger
   and target cleanup regardless of capture outcome.
 

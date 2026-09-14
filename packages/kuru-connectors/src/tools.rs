@@ -2918,7 +2918,6 @@ if ($failed.Count -eq 0) {{
         let mut spec = NativeSpawnSpec::new(cdb_path.to_path_buf(), root.to_path_buf());
         spec.args = vec![
             "-pv".into(),
-            "-pd".into(),
             "-sins".into(),
             "-cf".into(),
             command_file.as_os_str().to_owned(),
