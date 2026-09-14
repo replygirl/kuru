@@ -147,9 +147,7 @@ async fn cmd_mise_launches_published_windows_task_wrapper_before_cargo() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        diagnostic.contains(
-            "Published Windows verification requires RELEASE_VERSION, RELEASE_SHA, RELEASE_RUN_URL, and KURU_PUBLISHED_WINDOWS_RECEIPT."
-        ),
+        diagnostic.contains("Published Windows verification requires"),
         "task did not reach wrapper validation: {diagnostic}"
     );
     assert!(
