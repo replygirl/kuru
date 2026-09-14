@@ -862,7 +862,8 @@ mod tests {
 
     #[tokio::test]
     async fn close_closes_admission_before_publishing_confirmed_completion() {
-        let script = StdioFixture::new([Step::Eof]);
+        let ready = json!({"ready":true});
+        let script = StdioFixture::new([Step::Write(ready.clone()), Step::Eof]);
         let mut rpc = Rpc::spawn(
             script.command(),
             &[],
@@ -873,6 +874,7 @@ mod tests {
         )
         .unwrap();
         rpc.ready().await.unwrap();
+        assert_eq!(rpc.read().await.unwrap(), ready);
 
         let (reply, result) = oneshot::channel();
         let mut result = Box::pin(result);

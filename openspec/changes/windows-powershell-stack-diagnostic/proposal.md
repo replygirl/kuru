@@ -13,6 +13,12 @@ existing failure without changing shell behavior, deadlines, or pass criteria.
   the authoritative shell source and outcome unchanged.
 - Prepare the exact Microsoft Debugging Tools input only for the Windows
   connectors/core/platform coverage shard and validate its workflow boundary.
+- Align the fixed CDB option order with the documented command-file-before-PID
+  form and retain at most 4 KiB of terminal-safe, redacted failure output when
+  capture validation rejects, so the exact isolated fake fixture can expose the
+  attach or command failure without inspecting stores or arbitrary processes.
+  Exclude the target command line and debugger prompt-command echoes, and state
+  explicitly when projection leaves no output.
 - Keep the original ToolHost result authoritative and require bounded debugger
   and target cleanup regardless of capture outcome.
 

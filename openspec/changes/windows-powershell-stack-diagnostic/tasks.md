@@ -19,6 +19,12 @@
 - [x] 2.2 Add an owned known-sleep proof that runs once after the authoritative shell
   cases whenever CDB is configured, preserving the original 30-second outcome
   and limiting the selected parent watchdog to 75 seconds.
+- [x] 2.3 Place the fixed CDB command-file option before the retained target PID
+  and project capture-rejection output through the existing terminal-safe
+  redaction boundary with a 4 KiB cap and explicit truncation, without adding
+  debugger commands or inspecting stores or unrelated processes. Exclude the
+  target command line and debugger prompt-command echoes, and report explicitly
+  when no projected output remains.
 
 ## 3. Evidence
 
@@ -30,5 +36,14 @@
   MSVC SDK headers, so it does not establish native behavior.
 - [ ] 3.2 On native Windows, verify the pinned installer and observed CDB
   identity, known-sleep native and managed stacks, bounded cleanup, unchanged
-  authoritative fixture outcome, and the connector shard's ordinary coverage
-  receipt without treating diagnostic capture as a pass.
+  authoritative fixture outcome, bounded projected rejection evidence, and the
+  connector shard's ordinary coverage receipt without treating diagnostic
+  capture as a pass.
+- [x] 3.3 Pass the focused CDB parser/projection checks, connector typecheck and
+  clippy, formatter, strict Cospec validation, and actual apply gate after the
+  option-order and rejection-diagnostic refinement.
+  The focused CDB library filters passed 2/2 and exercise accepted stack text,
+  incomplete and unsafe output, projected failure text, redaction, exclusions,
+  explicit empty output, and the combined 4 KiB bound. Connector typecheck,
+  connector clippy with warnings denied, workspace formatting, and diff checks
+  passed. Strict validation and the apply gate passed after this evidence update.

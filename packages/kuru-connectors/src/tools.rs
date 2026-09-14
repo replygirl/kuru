@@ -2650,6 +2650,45 @@ if ($failed.Count -eq 0) {{
         })
     }
 
+    fn cdb_failure_output(stdout: &[u8], stderr: &[u8]) -> String {
+        const FAILURE_OUTPUT_LIMIT: usize = 4096;
+
+        let retain = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .filter(|line| {
+                    !cdb_command_echo(line)
+                        && !line
+                            .trim_start()
+                            .to_ascii_lowercase()
+                            .starts_with("commandline:")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let stdout = retain(stdout);
+        let stderr = retain(stderr);
+        if stdout.is_empty() && stderr.is_empty() {
+            return "no retained CDB stdout/stderr lines after command-line exclusions".into();
+        }
+        let raw = format!("CDB stdout:\n{stdout}\nCDB stderr:\n{stderr}");
+        let projected = match project_text(raw) {
+            Ok(projected) => projected,
+            Err(_) => return "CDB stdout/stderr projection was withheld".into(),
+        };
+        let mut terminal_safe = String::with_capacity(projected.len());
+        for character in projected.chars() {
+            match character {
+                '\n' | '\t' => terminal_safe.push(character),
+                character if character.is_control() => {
+                    terminal_safe.extend(character.escape_default());
+                }
+                character => terminal_safe.push(character),
+            }
+        }
+        redaction::truncate_tool_output(&terminal_safe, FAILURE_OUTPUT_LIMIT)
+    }
+
     #[test]
     fn cdb_stack_parser_rejects_incomplete_or_unsafe_output() {
         let valid = concat!(
@@ -2736,6 +2775,27 @@ if ($failed.Count -eq 0) {{
             b"subprocess tree terminated",
             b"ordinary failure"
         ));
+    }
+
+    #[test]
+    fn cdb_failure_output_is_projected_terminal_safe_and_bounded() {
+        let stdout = format!(
+            "CommandLine: powershell -EncodedCommand hidden\n0:000> .echo KURU_CDB_NATIVE_BEGIN\nerror api_key=synthetic-secret \u{1b}[31m{}",
+            "x".repeat(8192)
+        );
+        let output = cdb_failure_output(stdout.as_bytes(), b"attach failed");
+        assert!(output.len() <= 4096);
+        assert!(output.contains("[REDACTED:recognized-secret]"));
+        assert!(output.contains("[truncated]"));
+        assert!(output.contains("attach failed"));
+        assert!(!output.contains("CommandLine:"));
+        assert!(!output.contains(".echo KURU_CDB_NATIVE_BEGIN"));
+        assert!(!output.contains('\u{1b}'));
+        assert!(output.contains("\\u{1b}"));
+        assert_eq!(
+            cdb_failure_output(b"CommandLine: hidden", b"0:000> qd"),
+            "no retained CDB stdout/stderr lines after command-line exclusions"
+        );
     }
 
     #[cfg(windows)]
@@ -2860,10 +2920,10 @@ if ($failed.Count -eq 0) {{
             "-pv".into(),
             "-pd".into(),
             "-sins".into(),
-            "-p".into(),
-            pid.to_string().into(),
             "-cf".into(),
             command_file.as_os_str().to_owned(),
+            "-p".into(),
+            pid.to_string().into(),
         ];
         spec.environment = vec![
             ("SystemRoot".into(), windows.as_os_str().to_owned()),
@@ -2911,31 +2971,52 @@ if ($failed.Count -eq 0) {{
         };
 
         let outcome = timeout(CDB_CAPTURE_LIMIT, async {
-            let (stdout, stderr, status) = tokio::join!(
+            tokio::join!(
                 read_cdb_pipe(&mut stdout),
                 read_cdb_pipe(&mut stderr),
                 cdb.wait(CDB_CAPTURE_LIMIT),
-            );
-            let (stdout, stdout_overflow) = stdout?;
-            let (stderr, stderr_overflow) = stderr?;
-            ensure!(
-                !stdout_overflow && !stderr_overflow,
-                "CDB output exceeds its 512 KiB per-pipe limit"
-            );
-            let status = status?;
-            ensure!(status.success(), "CDB exited unsuccessfully");
-            Ok::<_, anyhow::Error>((stdout, stderr))
+            )
         })
         .await;
 
         match outcome {
-            Ok(Ok((stdout_bytes, stderr_bytes))) => {
-                let (stdout_close, stderr_close) = tokio::join!(
-                    stdout.close(CDB_CLEANUP_LIMIT),
-                    stderr.close(CDB_CLEANUP_LIMIT),
-                );
-                let cleanup_confirmed = stdout_close.is_ok() && stderr_close.is_ok();
-                match parse_cdb_stacks(&stdout_bytes) {
+            Ok((stdout_result, stderr_result, status_result)) => {
+                let stdout_bytes = stdout_result
+                    .as_ref()
+                    .map(|(bytes, _)| bytes.as_slice())
+                    .unwrap_or_default();
+                let stderr_bytes = stderr_result
+                    .as_ref()
+                    .map(|(bytes, _)| bytes.as_slice())
+                    .unwrap_or_default();
+                let failure_output = cdb_failure_output(stdout_bytes, stderr_bytes);
+                let stack_result = (|| {
+                    let (_, stdout_overflow) = stdout_result
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!("cannot read CDB stdout: {error}"))?;
+                    let (_, stderr_overflow) = stderr_result
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!("cannot read CDB stderr: {error}"))?;
+                    ensure!(
+                        !stdout_overflow && !stderr_overflow,
+                        "CDB output exceeds its 512 KiB per-pipe limit"
+                    );
+                    let status = status_result
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!("cannot wait for CDB: {error}"))?;
+                    ensure!(status.success(), "CDB exited unsuccessfully: {status:?}");
+                    parse_cdb_stacks(stdout_bytes)
+                })();
+                let cleanup_confirmed = if status_result.is_ok() {
+                    let (stdout_close, stderr_close) = tokio::join!(
+                        stdout.close(CDB_CLEANUP_LIMIT),
+                        stderr.close(CDB_CLEANUP_LIMIT),
+                    );
+                    stdout_close.is_ok() && stderr_close.is_ok()
+                } else {
+                    cleanup_cdb(&mut cdb, &mut stdout, &mut stderr).await
+                };
+                match stack_result {
                     Ok(parsed) => WindowsStackDiagnostic {
                         detail: format!(
                             "{}; CDB stderr={} bytes; managed-sleep={}",
@@ -2948,21 +3029,13 @@ if ($failed.Count -eq 0) {{
                     },
                     Err(error) => WindowsStackDiagnostic {
                         detail: format!(
-                            "unavailable: {error:#}; CDB stdout={} bytes; stderr={} bytes",
+                            "unavailable: {error:#}; CDB stdout={} bytes; stderr={} bytes; {failure_output}",
                             stdout_bytes.len(),
                             stderr_bytes.len()
                         ),
                         cleanup_confirmed,
                         command_file: Some(command_file),
                     },
-                }
-            }
-            Ok(Err(error)) => {
-                let cleanup_confirmed = cleanup_cdb(&mut cdb, &mut stdout, &mut stderr).await;
-                WindowsStackDiagnostic {
-                    detail: format!("unavailable: {error:#}"),
-                    cleanup_confirmed,
-                    command_file: Some(command_file),
                 }
             }
             Err(_) => {
