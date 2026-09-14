@@ -37,11 +37,26 @@
   typecheck, connector clippy, actionlint, and tooling checks passed. The local
   Windows cross-check stopped in `aws-lc-sys` because the macOS host lacks the
   MSVC SDK headers, so it does not establish native behavior.
-- [ ] 3.2 On native Windows, verify the pinned installer and observed CDB
+- [x] 3.2 On native Windows, verify the pinned installer and observed CDB
   identity, known-sleep native and managed stacks, bounded cleanup, unchanged
   authoritative fixture outcome, bounded projected rejection evidence, and the
   connector shard's ordinary coverage receipt without treating diagnostic
   capture as a pass.
+  Run `34801590851` captured accepted native and managed stack text from the
+  authoritative failing ToolHost fixture, passed the known-sleep control, and
+  preserved the original shell failure as decisive. Runs `34800141435` and
+  `34801590851` retained bounded projected startup rejection and successful
+  capture evidence without changing the authoritative outcome. Exact-head run
+  `34804953102`, job `103854899023`, verified the pinned installer and observed
+  CDB identity, passed the always-run known-sleep capture without cleanup
+  uncertainty, passed all 135 connector tests, and emitted artifact
+  `10332707571`. Its checked connector receipt has SHA-256
+  `027af5aa66504beb418ac32223abcfff91fcc35af8066413c2a41595e3fcc2c9`,
+  binds synthetic source `ca0b858f43cb4112199dd927e8332aa68aaae9c0`
+  to tree `a3eb835f1d009c364c2d1cc9c5e135d8528fca0f`, and records 15
+  selected executables successful, 49 omitted, and 58 profiles. The bootstrap
+  made the authoritative shell case pass in the final run, so failure capture
+  did not execute there and did not contribute to that pass.
 - [x] 3.3 Pass the focused CDB parser/projection checks, connector typecheck and
   clippy, formatter, strict Cospec validation, and actual apply gate after the
   option-order and rejection-diagnostic refinement.

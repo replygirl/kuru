@@ -8,5 +8,5 @@ None.
 
 - [ ] `parallelize-windows-native-ci` — supplies the checked Windows connector
   shard receipt and aggregate coverage gate used for native acceptance
-- [ ] `windows-powershell-stack-diagnostic` — supplies the bounded first-run CDB
+- [x] `windows-powershell-stack-diagnostic` — supplies the bounded first-run CDB *(archived 2026-09-14)*
   stack capture that distinguishes module bootstrap from another startup stall
