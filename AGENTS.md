@@ -179,9 +179,7 @@ Do not exclude application modules or
 lower the threshold to make coverage pass. Test observable state and contract
 failure modes, including live subprocess/HTTP fixture interactions.
 Keep fixtures isolated, drain subprocess output, and bound waits with useful
-failure diagnostics. Commands targeting a repository must clear inherited Git
-repository-selection variables before applying deliberate command overrides;
-changing the working directory alone does not isolate commands run from hooks.
+failure diagnostics.
 Test foreign-repository environments in child processes, never by changing the
 test runner's global environment. Verify terminal behavior with real PTYs and
 inspect visual changes at practical terminal/browser sizes. Synchronize terminal
