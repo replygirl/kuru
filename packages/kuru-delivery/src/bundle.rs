@@ -364,7 +364,18 @@ async fn download(
                 drop(response);
                 continue;
             }
-            let mut response = response.error_for_status()?;
+            let status = response.status();
+            let retry_after_present = response
+                .headers()
+                .contains_key(reqwest::header::RETRY_AFTER);
+            let mut response = response.error_for_status().with_context(|| {
+                format!(
+                    "bundle archive GET returned {status} for target {} on attempt {}/{} (Retry-After present: {retry_after_present})",
+                    asset.target,
+                    attempt + 1,
+                    delays.len() + 1
+                )
+            })?;
             ensure!(
                 response
                     .content_length()

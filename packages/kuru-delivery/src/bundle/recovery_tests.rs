@@ -207,7 +207,13 @@ async fn eligible_statuses_recover_on_the_third_get_and_persistent_errors_stop()
     )
     .await;
     identical_gets(&server.stop().await, 3);
-    assert!(format!("{:#}", result.unwrap().unwrap_err()).contains("503"));
+    let error = format!("{:#}", result.unwrap().unwrap_err());
+    assert!(error.contains("503"), "{error}");
+    assert!(
+        error.contains("for target test-target on attempt 3/3"),
+        "{error}"
+    );
+    assert!(error.contains("Retry-After present: false"), "{error}");
     assert_clean(&options.bundle_dir);
     retained_lock(&options, identity);
 }
@@ -236,7 +242,16 @@ async fn permanent_statuses_and_any_retry_after_are_not_retried() {
         )
         .await;
         identical_gets(&server.stop().await, 1);
-        assert!(format!("{:#}", result.unwrap().unwrap_err()).contains(&status.to_string()));
+        let error = format!("{:#}", result.unwrap().unwrap_err());
+        assert!(error.contains(&status.to_string()), "{error}");
+        assert!(
+            error.contains("for target test-target on attempt 1/3"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("Retry-After present: {}", !advice.is_empty())),
+            "{error}"
+        );
         assert_clean(&options.bundle_dir);
         retained_lock(&options, identity);
     }
