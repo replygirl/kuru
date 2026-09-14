@@ -12,7 +12,7 @@ use std::{
     collections::HashSet,
     ffi::OsStr,
     fs::{File, TryLockError},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -23,6 +23,8 @@ const MAX_EXPANDED: u64 = 128 * 1024 * 1024;
 const LOCK_NAME: &str = ".prepare.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 #[path = "bundle/recovery_tests.rs"]
@@ -282,6 +284,8 @@ async fn prepare_asset_with_budget(
     } else {
         let default_client = reqwest::Client::builder()
             .https_only(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_IDLE_TIMEOUT)
             .timeout(DOWNLOAD_TIMEOUT)
             .build()?;
         download(
@@ -326,9 +330,29 @@ async fn download(
 ) -> Result<()> {
     tokio::time::timeout(budget, async {
         let delays = [Duration::from_millis(250), Duration::from_secs(1)];
-        let mut attempt = 0;
-        let mut response = loop {
-            let response = client.get(&asset.url).send().await?;
+        for attempt in 0..=delays.len() {
+            if attempt != 0 {
+                output.set_len(0)?;
+                output.seek(SeekFrom::Start(0))?;
+                tokio::time::sleep(delays[attempt - 1]).await;
+            }
+
+            let response = match client.get(&asset.url).send().await {
+                Ok(response) => response,
+                Err(error) if attempt < delays.len() && retryable_send(&error) => {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "bundle archive GET failed for target {} on attempt {}/{}",
+                            asset.target,
+                            attempt + 1,
+                            delays.len() + 1
+                        )
+                    });
+                }
+            };
             if attempt < delays.len()
                 && matches!(response.status().as_u16(), 500 | 502 | 503 | 504)
                 && !response
@@ -338,35 +362,68 @@ async fn download(
                 // No error-body bytes enter staging, and no response or worker
                 // survives cancellation during the bounded backoff.
                 drop(response);
-                tokio::time::sleep(delays[attempt]).await;
-                attempt += 1;
                 continue;
             }
-            break response.error_for_status()?;
-        };
-        ensure!(
-            response
-                .content_length()
-                .is_none_or(|size| size == asset.compressed_bytes),
-            "bundle archive size mismatch"
-        );
-        let mut size = 0_u64;
-        let mut digest = Sha256::new();
-        while let Some(chunk) = response.chunk().await? {
-            size += chunk.len() as u64;
+            let mut response = response.error_for_status()?;
             ensure!(
-                size <= asset.compressed_bytes,
-                "bundle archive exceeds pinned size"
+                response
+                    .content_length()
+                    .is_none_or(|size| size == asset.compressed_bytes),
+                "bundle archive size mismatch"
             );
-            digest.update(&chunk);
-            // Synchronous bounded chunk writes have no worker that can outlive
-            // staging or lock when the surrounding future is cancelled.
-            output.write_all(&chunk)?;
+            let mut size = 0_u64;
+            let mut digest = Sha256::new();
+            let mut retry_body = false;
+            loop {
+                let chunk = match response.chunk().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    // This callsite has accepted a successful response. Reqwest
+                    // may wrap a transport body-frame error as Decode, so keep
+                    // this retry boundary narrower than a global Decode policy.
+                    Err(_) if attempt < delays.len() => {
+                        retry_body = true;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "bundle archive body read failed for target {} on attempt {}/{} after {size} bytes",
+                                asset.target,
+                                attempt + 1,
+                                delays.len() + 1
+                            )
+                        });
+                    }
+                };
+                size += chunk.len() as u64;
+                ensure!(
+                    size <= asset.compressed_bytes,
+                    "bundle archive exceeds pinned size"
+                );
+                digest.update(&chunk);
+                // Synchronous bounded chunk writes have no worker that can outlive
+                // staging or lock when the surrounding future is cancelled.
+                output.write_all(&chunk)?;
+            }
+            if retry_body {
+                // The next attempt truncates and rewinds the private stage, then
+                // starts a fresh digest before repeating the immutable GET.
+                continue;
+            }
+            verify_digest(size, &digest.finalize(), asset)?;
+            return Ok(());
         }
-        verify_digest(size, &digest.finalize(), asset)
+        unreachable!("the three-GET loop returns after its terminal attempt")
     })
     .await
     .context("bundle archive download timed out")?
+}
+
+fn retryable_send(error: &reqwest::Error) -> bool {
+    // Protocol decoding happens before a usable response exists. A body-frame
+    // error is handled only at `Response::chunk`, where retry is deliberate.
+    !error.is_decode() && (error.is_timeout() || error.is_connect())
 }
 
 fn verify_digest(size: u64, digest: &[u8], asset: &Asset) -> Result<()> {

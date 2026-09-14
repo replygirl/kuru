@@ -1017,30 +1017,46 @@ fn verify_profile(source: &Path, expected: &ProfileReceipt) -> Result<()> {
 }
 
 fn profile_sources(directory: &Path) -> Result<Vec<PathBuf>> {
-    let mut profiles = Vec::new();
+    let mut candidates = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         if entry.path().extension() == Some(OsStr::new("profraw")) {
-            profiles.push(entry.path());
+            candidates.push(entry.path());
         }
     }
-    profiles.sort();
+    candidates.sort();
     ensure!(
-        !profiles.is_empty(),
-        "coverage shard produced no raw profiles"
-    );
-    ensure!(
-        profiles.len() <= PROFILE_COUNT_LIMIT,
+        candidates.len() <= PROFILE_COUNT_LIMIT,
         "coverage shard produced too many profiles"
     );
-    let total = profiles.iter().try_fold(0_u64, |total, path| {
-        total
-            .checked_add(fs::symlink_metadata(path)?.len())
-            .context("profile total size overflow")
-    })?;
+    let mut profiles = Vec::new();
+    let mut total = 0_u64;
+    for path in candidates {
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "profile {} is not a regular file",
+            path.display()
+        );
+        ensure!(
+            metadata.len() <= PROFILE_LIMIT,
+            "profile {} is too large",
+            path.display()
+        );
+        total = total
+            .checked_add(metadata.len())
+            .context("profile total size overflow")?;
+        if metadata.len() > 0 {
+            profiles.push(path);
+        }
+    }
     ensure!(
         total <= PROFILE_TOTAL_LIMIT,
         "coverage shard profiles exceed total size limit"
+    );
+    ensure!(
+        !profiles.is_empty(),
+        "coverage shard produced no nonempty raw profiles"
     );
     Ok(profiles)
 }
@@ -1950,6 +1966,85 @@ mod tests {
                 sha256: "a".repeat(64),
             }])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn empty_profiles_are_omitted_only_after_candidate_bounds_and_type_checks() {
+        let mixed = TempDir::new().unwrap();
+        fs::write(mixed.path().join("empty.profraw"), []).unwrap();
+        fs::write(mixed.path().join("valid.profraw"), b"valid profile").unwrap();
+        let sources = profile_sources(mixed.path()).unwrap();
+        assert_eq!(sources, [mixed.path().join("valid.profraw")]);
+        let copied = mixed.path().join("copied.profraw");
+        let receipt = hash_copy(&sources[0], &copied).unwrap();
+        assert_eq!(receipt.bytes, 13);
+        assert_eq!(fs::read(copied).unwrap(), b"valid profile");
+
+        let empty = TempDir::new().unwrap();
+        fs::write(empty.path().join("empty.profraw"), []).unwrap();
+        assert!(
+            profile_sources(empty.path())
+                .unwrap_err()
+                .to_string()
+                .contains("no nonempty raw profiles")
+        );
+
+        let excess = TempDir::new().unwrap();
+        for index in 0..=PROFILE_COUNT_LIMIT {
+            fs::write(excess.path().join(format!("{index:04}.profraw")), []).unwrap();
+        }
+        assert!(
+            profile_sources(excess.path())
+                .unwrap_err()
+                .to_string()
+                .contains("too many profiles")
+        );
+
+        let oversized = TempDir::new().unwrap();
+        File::create(oversized.path().join("oversized.profraw"))
+            .unwrap()
+            .set_len(PROFILE_LIMIT + 1)
+            .unwrap();
+        assert!(
+            profile_sources(oversized.path())
+                .unwrap_err()
+                .to_string()
+                .contains("is too large")
+        );
+
+        let nonregular = TempDir::new().unwrap();
+        fs::create_dir(nonregular.path().join("directory.profraw")).unwrap();
+        assert!(
+            profile_sources(nonregular.path())
+                .unwrap_err()
+                .to_string()
+                .contains("is not a regular file")
+        );
+
+        let malformed = TempDir::new().unwrap();
+        let malformed_profile = malformed.path().join("malformed.profraw");
+        fs::write(&malformed_profile, b"not-a-profile").unwrap();
+        assert_eq!(
+            profile_sources(malformed.path()).unwrap(),
+            [malformed_profile]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_symlinks_are_rejected_before_empty_filtering() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("empty");
+        fs::write(&target, []).unwrap();
+        symlink(&target, temp.path().join("linked.profraw")).unwrap();
+        assert!(
+            profile_sources(temp.path())
+                .unwrap_err()
+                .to_string()
+                .contains("is not a regular file")
         );
     }
 

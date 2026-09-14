@@ -163,11 +163,13 @@ mise run //apps/kuru-tui:build:release
 ```
 
 Preparation can make up to three attempts for the same pinned archive after
-HTTP 500, 502, 503 or 504, with 250 ms and one-second delays inside the same
-120-second download deadline. Error responses with `Retry-After` remain errors so
-preparation does not shorten the server's requested delay. Permanent HTTP,
-transport, incomplete-body, size and checksum failures remain fatal; recovery
-never selects another version or publishes partially verified bytes.
+HTTP 500, 502, 503 or 504, a timed-out or failed connection, or an interrupted
+accepted response body. Each attempt has a 15-second connection and 30-second
+read-idle bound, with 250 ms and one-second delays inside the same 120-second
+total download deadline; steady progress never extends that total. Error
+responses with `Retry-After`, permanent HTTP, size and checksum failures, and
+local I/O failures remain fatal. Recovery restarts the immutable GET with a
+fresh private stage digest and never publishes partially verified bytes.
 
 The default cache is `target/kuru-bundles` at the workspace root. Each archive is
 named `<archive_sha256>.archive`. `KURU_DOLT_BUNDLE_DIR` selects another absolute
