@@ -120,6 +120,46 @@ fn windows_coverage_tasks_launch_pwsh_without_cmd_metacharacters() {
 
 #[cfg(windows)]
 #[tokio::test]
+async fn cmd_mise_launches_published_windows_task_wrapper_before_cargo() {
+    use std::time::Duration;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut child = kuru_delivery::command::rooted(&root, "mise");
+    child.args(["run", "//packages/kuru-delivery:verify:published-windows"]);
+    child.env("MISE_TASK_RUN_AUTO_INSTALL", "false");
+    child.env("MISE_WINDOWS_DEFAULT_INLINE_SHELL_ARGS", "cmd.exe /d /s /c");
+    for variable in [
+        "RELEASE_VERSION",
+        "RELEASE_SHA",
+        "RELEASE_RUN_URL",
+        "KURU_PUBLISHED_WINDOWS_RECEIPT",
+    ] {
+        child.env_remove(variable);
+    }
+    let output =
+        kuru_delivery::command::bounded_output(&mut child, Duration::from_secs(15), 16 * 1024)
+            .await
+            .unwrap();
+    assert!(!output.status.success());
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains(
+            "Published Windows verification requires RELEASE_VERSION, RELEASE_SHA, RELEASE_RUN_URL, and KURU_PUBLISHED_WINDOWS_RECEIPT."
+        ),
+        "task did not reach wrapper validation: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("is not recognized as an internal or external command"),
+        "task executed its PowerShell body through cmd: {diagnostic}"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn cmd_launches_the_exact_shard_task_and_reaches_script_validation() {
     use std::time::Duration;
 
