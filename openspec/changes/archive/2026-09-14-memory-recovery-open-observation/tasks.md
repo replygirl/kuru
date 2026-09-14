@@ -22,5 +22,13 @@
   seconds with its existing preservation, recovery, and cleanup assertions.
   Memory all-target/all-feature typecheck, package formatting, and diff checks
   passed. Strict validation and the actual apply gate passed before source work.
-- [ ] 2.2 Pass the corrected fixture under the native Windows instrumented
+- [x] 2.2 Pass the corrected fixture under the native Windows instrumented
   memory/runtime shard and emit its ordinary checked receipt.
+  Exact-head run `34807526553`, job `103862209833`, passed all 97 memory
+  tests and all 76 runtime tests, including the corrected process-loss fixture,
+  the new pre-DDL open-error regression, the unresolved-move diagnostic control,
+  and the stock-shell model-tool replay. Artifact `10333921680` contains receipt
+  SHA-256 `dc97191ce2e7b7f64ea2eb310d54fa3c1fb6602a341764ae746ae17b24db5121`,
+  which binds synthetic source `4d3c2d7b3775dc921646882a734a6c6062acc7fe`
+  to tree `6d4252b963d4aab00bc9f31b4481fd0fa61b8189` with 9 selected
+  executables successful, 55 omitted, and 576 profiles.

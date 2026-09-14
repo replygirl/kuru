@@ -28,9 +28,19 @@
   connector typecheck, connector clippy with warnings denied, workspace
   formatting, diff checks, documentation/content checks, strict validation,
   and actual apply gate passed.
-- [ ] 3.2 On native Windows, pass the fresh-state ToolHost fixture with both
+- [x] 3.2 On native Windows, pass the fresh-state ToolHost fixture with both
   exact modules loaded, unqualified stock cmdlets, known-sleep CDB proof,
   confirmed cleanup, and the ordinary connector shard receipt.
-- [ ] 3.3 Pass the exact-head native matrix, four-receipt Windows aggregate and
+  Run `34804953102`, job `103854899023`, passed all 135 connector tests,
+  including exact `$PSHOME` Management and Utility manifest paths at user entry,
+  unqualified `Join-Path` and `Get-FileHash`, the always-run known-sleep stack
+  control with confirmed cleanup, and the six Windows CLI stock-shell cases.
+  Its checked connector receipt SHA-256 is
+  `027af5aa66504beb418ac32223abcfff91fcc35af8066413c2a41595e3fcc2c9`.
+  After the temporary debugger was removed, final cleaned-source run
+  `34807526553`, job `103862209817`, passed the connector shard again and
+  emitted receipt SHA-256
+  `ae4579a12d5e6f7c8f9e357c5baf5a162d39a3e0717be3d7301d2939db6d2f59`.
+- [x] 3.3 Pass the exact-head native matrix, four-receipt Windows aggregate and
   90% workspace line-coverage gate, Windows installation/offline checks, both
   Unix native jobs, both native builds, and all repository quality checks.
