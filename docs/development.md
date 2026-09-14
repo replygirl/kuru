@@ -165,7 +165,7 @@ mise run //apps/kuru-tui:build:release
 Preparation can make up to three attempts for the same pinned archive after
 HTTP 500, 502, 503 or 504, a timed-out or failed connection, or an interrupted
 accepted response body. Each attempt has a 15-second connection and 30-second
-read-idle bound, with 250 ms and one-second delays inside the same 120-second
+read-idle bound, with five- and fifteen-second delays inside the same 120-second
 total download deadline; steady progress never extends that total. Error
 responses with `Retry-After`, permanent HTTP, size and checksum failures, and
 local I/O failures remain fatal. Recovery restarts the immutable GET with a

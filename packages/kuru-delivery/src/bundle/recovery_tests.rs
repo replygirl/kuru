@@ -11,6 +11,8 @@ use tokio::{
 };
 
 const EXPECTED: &[u8] = b"verified immutable archive";
+const TEST_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(50)];
+const DEADLINE_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 
 enum Reply {
     Bytes(Vec<u8>),
@@ -185,7 +187,13 @@ async fn eligible_statuses_recover_on_the_third_get_and_persistent_errors_stop()
         let (_root, options, asset, identity) = setup(&server).await;
         let result = tokio::time::timeout(
             Duration::from_secs(8),
-            prepare_asset(&options, &asset, Some(&client())),
+            prepare_asset_with_policy(
+                &options,
+                &asset,
+                Some(&client()),
+                Duration::from_secs(3),
+                &TEST_RETRY_DELAYS,
+            ),
         )
         .await;
         identical_gets(&server.stop().await, 3);
@@ -203,7 +211,13 @@ async fn eligible_statuses_recover_on_the_third_get_and_persistent_errors_stop()
     let (_root, options, asset, identity) = setup(&server).await;
     let result = tokio::time::timeout(
         Duration::from_secs(8),
-        prepare_asset(&options, &asset, Some(&client())),
+        prepare_asset_with_policy(
+            &options,
+            &asset,
+            Some(&client()),
+            Duration::from_secs(3),
+            &TEST_RETRY_DELAYS,
+        ),
     )
     .await;
     identical_gets(&server.stop().await, 3);
@@ -215,6 +229,28 @@ async fn eligible_statuses_recover_on_the_third_get_and_persistent_errors_stop()
     );
     assert!(error.contains("Retry-After present: false"), "{error}");
     assert_clean(&options.bundle_dir);
+    retained_lock(&options, identity);
+}
+
+#[tokio::test]
+async fn production_retry_waits_before_repeating_an_identical_get() {
+    let mut server = Server::start(vec![
+        response(500, "", b"retry"),
+        response(200, "", EXPECTED),
+    ])
+    .await;
+    let (_root, options, asset, identity) = setup(&server).await;
+    let started = std::time::Instant::now();
+    let published = tokio::time::timeout(
+        Duration::from_secs(12),
+        prepare_asset(&options, &asset, Some(&client())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    identical_gets(&server.stop().await, 2);
+    assert_eq!(std::fs::read(&published).unwrap(), EXPECTED);
     retained_lock(&options, identity);
 }
 
@@ -314,11 +350,12 @@ async fn timed_out_body_frame_retries_with_a_clean_stage() {
     let (_root, options, asset, identity) = setup(&server).await;
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        prepare_asset_with_budget(
+        prepare_asset_with_policy(
             &options,
             &asset,
             Some(&client_with_read_idle(Duration::from_millis(500))),
             Duration::from_secs(2),
+            &TEST_RETRY_DELAYS,
         ),
     )
     .await;
@@ -340,7 +377,13 @@ async fn interrupted_body_retries_only_three_times_and_releases_the_lock() {
     let (_root, options, asset, identity) = setup(&server).await;
     let result = tokio::time::timeout(
         Duration::from_secs(4),
-        prepare_asset_with_budget(&options, &asset, Some(&client()), Duration::from_secs(3)),
+        prepare_asset_with_policy(
+            &options,
+            &asset,
+            Some(&client()),
+            Duration::from_secs(3),
+            &TEST_RETRY_DELAYS,
+        ),
     )
     .await;
     identical_gets(&server.stop().await, 3);
@@ -375,7 +418,13 @@ async fn one_download_deadline_covers_all_backoffs_headers_and_body() {
         // The client's ten-second per-request timer cannot satisfy this test.
         let result = tokio::time::timeout(
             Duration::from_secs(4),
-            prepare_asset_with_budget(&options, &asset, Some(&client()), budget),
+            prepare_asset_with_policy(
+                &options,
+                &asset,
+                Some(&client()),
+                budget,
+                &DEADLINE_RETRY_DELAYS,
+            ),
         )
         .await;
         identical_gets(&server.stop().await, 2);
@@ -393,7 +442,13 @@ async fn cancellation_after_dropping_error_headers_releases_stage_and_stable_loc
     let mut server = Server::start(vec![Reply::ObserveErrorDrop]).await;
     let (_root, options, asset, identity) = setup(&server).await;
     let client = client();
-    let mut preparation = Box::pin(prepare_asset(&options, &asset, Some(&client)));
+    let mut preparation = Box::pin(prepare_asset_with_policy(
+        &options,
+        &asset,
+        Some(&client),
+        DOWNLOAD_TIMEOUT,
+        &DEADLINE_RETRY_DELAYS,
+    ));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             tokio::select! {
