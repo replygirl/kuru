@@ -1920,6 +1920,13 @@ mod tests {
         let catalog_hosts = hosts.clone();
         let pending = tokio::spawn(async move { catalog_hosts.catalog().await });
         launched.await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while script.conversations() != vec![Vec::<Value>::new()] {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled MCP peer did not create its empty transcript");
         pending.abort();
         match pending.await {
             Err(error) => assert!(error.is_cancelled()),
@@ -1931,7 +1938,10 @@ mod tests {
         assert!(recovered.statuses[0].available());
         hosts.shutdown().await.unwrap();
         let conversations = script.conversations();
-        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations.len(), 2);
+        let mut lengths = conversations.iter().map(Vec::len).collect::<Vec<_>>();
+        lengths.sort_unstable();
+        assert_eq!(lengths, [0, 3]);
         assert_eq!(conversations.iter().map(Vec::len).sum::<usize>(), 3);
     }
 
