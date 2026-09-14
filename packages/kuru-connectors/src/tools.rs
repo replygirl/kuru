@@ -759,8 +759,17 @@ async fn shell(
     // diagnostic: Windows PowerShell 5.1 serializes it onto redirected stderr.
     // Disable only progress before any cmdlet runs; preserve warning/error and
     // literal stderr bytes, including text which happens to resemble CLIXML.
+    // Load the two shipped modules used by Kuru's stock-shell contracts from
+    // their exact PSHOME manifests. This retains arbitrary module autoloading
+    // while avoiding generic cold command discovery for their first command.
     let source = format!(
-        "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{command}"
+        concat!(
+            "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n",
+            "$null = Microsoft.PowerShell.Core\\Import-Module -Name ([IO.Path]::Combine($PSHOME, 'Modules\\Microsoft.PowerShell.Management\\Microsoft.PowerShell.Management.psd1')) -ErrorAction Stop;\n",
+            "$null = Microsoft.PowerShell.Core\\Import-Module -Name ([IO.Path]::Combine($PSHOME, 'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop;\n",
+            "{command}"
+        ),
+        command = command
     );
     let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let mut args: Vec<std::ffi::OsString> = [
@@ -2381,6 +2390,7 @@ mod tests {
         let powershell_literal =
             |value: &OsStr| format!("'{}'", value.to_string_lossy().replace('\'', "''"));
         let expected_path = powershell_literal(&expected_path);
+        let expected_commands = powershell_literal(commands.as_os_str());
         let expected_home = powershell_literal(home.as_os_str());
         let expected_temporary = powershell_literal(temporary.as_os_str());
         let expected_windows = powershell_literal(windows.as_os_str());
@@ -2394,7 +2404,16 @@ mod tests {
             r#"
 [IO.File]::AppendAllText({expected_stage}, "entered`n")
 $stage = {expected_stage}
+$expectedManagementModule = [IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1')
+$expectedUtilityModule = [IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')
+$managementModules = @(Microsoft.PowerShell.Core\Get-Module -Name 'Microsoft.PowerShell.Management')
+$utilityModules = @(Microsoft.PowerShell.Core\Get-Module -Name 'Microsoft.PowerShell.Utility')
+$managementLoaded = $managementModules.Count -eq 1 -and [string]::Equals($managementModules[0].Path, $expectedManagementModule, [System.StringComparison]::OrdinalIgnoreCase)
+$utilityLoaded = $utilityModules.Count -eq 1 -and [string]::Equals($utilityModules[0].Path, $expectedUtilityModule, [System.StringComparison]::OrdinalIgnoreCase)
+if (-not $managementLoaded -or -not $utilityLoaded) {{ throw 'stock shell module bootstrap did not load the exact PSHOME manifests' }}
+[IO.File]::AppendAllText($stage, "stock-modules-loaded`n")
 $expectedPath = {expected_path}
+$expectedCommands = {expected_commands}
 $expectedHome = {expected_home}
 $expectedTemporary = {expected_temporary}
 $expectedWindows = {expected_windows}
@@ -2408,6 +2427,7 @@ $homePath = Join-Path $env:USERPROFILE 'shell-home.txt'
 [IO.File]::WriteAllText($homePath, 'home')
 $temporaryPath = Join-Path $env:TEMP 'shell-temp.txt'
 [IO.File]::WriteAllText($temporaryPath, 'temp')
+$probeHash = Get-FileHash -LiteralPath ([IO.Path]::Combine($expectedCommands, 'probe.cmd')) -Algorithm SHA256
 [IO.File]::AppendAllText($stage, "home-temp-written`n")
 [IO.File]::AppendAllText($stage, "before-where`n")
 $where = & where.exe cmd.exe
@@ -2432,6 +2452,9 @@ $checks = [ordered]@{{
     PSModulePath_hostile_absent = $env:PSModulePath -notlike '*fake-modules*'
     fixture_child_absent = -not (Test-Path Env:KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_CHILD)
     LLVM_PROFILE_FILE_absent = -not (Test-Path Env:LLVM_PROFILE_FILE)
+    join_path_source = (Get-Command Join-Path -ErrorAction Stop).ModuleName -eq 'Microsoft.PowerShell.Management'
+    stock_hash = $probeHash.Hash -eq '87FC3ECEAA19AC72D1A5B575708934E4A31DAEFC465A8A26CF01E4FC38D6B018'
+    file_hash_source = (Get-Command Get-FileHash -ErrorAction Stop).ModuleName -eq 'Microsoft.PowerShell.Utility'
     stock_cmdlet = (Get-Command Get-ChildItem -ErrorAction Stop).CommandType -eq 'Cmdlet'
     where_cmd = $whereOk
     probe_cmd = $probe -contains 'cmd-ok'
@@ -3446,7 +3469,7 @@ if ($failed.Count -eq 0) {{
             );
             assert_eq!(
                 stage_trace(),
-                "entered\nbefore-join-path\nafter-join-path\nhome-temp-written\nbefore-where\nafter-where\nbefore-probe\nafter-probe\nbefore-checks\nafter-checks\n"
+                "entered\nstock-modules-loaded\nbefore-join-path\nafter-join-path\nhome-temp-written\nbefore-where\nafter-where\nbefore-probe\nafter-probe\nbefore-checks\nafter-checks\n"
             );
             assert_eq!(
                 std::fs::read_to_string(home.join("shell-home.txt")).unwrap(),
