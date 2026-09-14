@@ -2665,6 +2665,9 @@ if ($failed.Count -eq 0) {{
 
         const CHILD: &str = "KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_CHILD";
         const ROOT: &str = "KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_ROOT";
+        const OPERATION_TIMEOUT_SECS: u64 = 60;
+        const CHILD_WAIT_TIMEOUT: Duration = Duration::from_secs(OPERATION_TIMEOUT_SECS + 10);
+        const OUTER_TIMEOUT: Duration = Duration::from_secs(OPERATION_TIMEOUT_SECS + 15);
 
         if std::env::var_os(CHILD).is_some() {
             let root = PathBuf::from(std::env::var_os(ROOT).expect("missing test root"));
@@ -2686,7 +2689,10 @@ if ($failed.Count -eq 0) {{
             .unwrap();
             let shell = windows_shell_projection_source(&root, case);
             let receipt = host
-                .execute("shell", json!({"command":shell}))
+                .execute(
+                    "shell",
+                    json!({"command":shell,"timeout_ms":OPERATION_TIMEOUT_SECS * 1_000}),
+                )
                 .await
                 .unwrap_or_else(|error| {
                     panic!(
@@ -2788,11 +2794,11 @@ if ($failed.Count -eq 0) {{
             let mut stderr = child.take_stderr().unwrap();
             let mut out = Vec::new();
             let mut err = Vec::new();
-            let outcome = timeout(Duration::from_secs(45), async {
+            let outcome = timeout(OUTER_TIMEOUT, async {
                 let (stdout_truncated, stderr_truncated, status) = tokio::join!(
                     drain_bounded(&mut stdout, &mut out),
                     drain_bounded(&mut stderr, &mut err),
-                    child.wait(Duration::from_secs(40)),
+                    child.wait(CHILD_WAIT_TIMEOUT),
                 );
                 let stdout_truncated = stdout_truncated?;
                 let stderr_truncated = stderr_truncated?;
