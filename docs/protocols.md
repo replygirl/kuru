@@ -137,8 +137,11 @@ authentication variables, proxy configuration, agent sockets, arbitrary
 stock system-shell paths and omits inherited `PSModulePath`, allowing stock
 PowerShell to reconstruct its standard module paths. This reduces accidental
 variable disclosure; it does not contain the shell's filesystem, process, or
-network authority. Configured stdio MCP servers keep their own inherited
-environment and explicit configuration overrides.
+network authority. Before its user command, this built-in ToolHost launch
+initializes the shipped `Microsoft.PowerShell.Management` and
+`Microsoft.PowerShell.Utility` modules from `$PSHOME`; ordinary module
+autoloading remains available. Configured stdio MCP servers keep their own
+inherited environment and explicit configuration overrides.
 
 Before a built-in file, shell, or MCP result crosses into the CLI or runtime,
 Kuru projects a finite set of recognizable credential forms to

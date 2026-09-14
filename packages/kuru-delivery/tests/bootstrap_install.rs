@@ -797,10 +797,21 @@ async fn checksum_missing_corrupt_ambiguous_and_malformed_inputs_preserve_the_in
     failure(&fixture.run(fixture.explicit()).await, "checksum mismatch");
     fixture.unchanged();
     fs::remove_file(fixture.archive()).unwrap();
-    failure(
-        &fixture.run(fixture.explicit()).await,
-        "local release asset failed",
+    let mut command = fixture.explicit();
+    command
+        .env("SHELLOPTS", "xtrace")
+        .env("PS4", "+root=$$ line=$LINENO ");
+    let output = fixture.run(command).await;
+    failure(&output, "local release asset failed");
+    let trace = String::from_utf8_lossy(&output.stderr);
+    assert!(trace.len() < 16 * 1024, "trace exceeded diagnostic excerpt");
+    assert!(
+        trace.contains("+root=") && trace.contains(" line="),
+        "{trace}"
     );
+    assert!(trace.contains("kuru_producer="), "{trace}");
+    assert!(trace.contains("kuru_consumer="), "{trace}");
+    assert!(trace.contains(" wait "), "{trace}");
     fixture.unchanged();
 }
 

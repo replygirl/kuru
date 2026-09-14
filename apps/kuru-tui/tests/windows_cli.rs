@@ -96,16 +96,57 @@ fn powershell_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn stock_shell_source(progress: &Path, input: &Path, sentinel: &str) -> String {
+fn stock_shell_source(
+    progress: &Path,
+    input: &Path,
+    sentinel: &str,
+    diagnostic_import: Option<&str>,
+) -> String {
     let progress = powershell_literal(&progress.to_string_lossy());
     let input = powershell_literal(&input.to_string_lossy());
     let sentinel = powershell_literal(sentinel);
+    let diagnostic_import = diagnostic_import.map_or_else(String::new, |module| {
+        format!(
+        r#"[IO.File]::AppendAllText({progress}, "before-import`nimport-verbose=")
+$importCapacity = 1024
+$importMarker = '[truncated]'
+$importTextCapacity = $importCapacity - $importMarker.Length
+$importWritten = 0
+$importTruncated = $false
+try {{
+    Microsoft.PowerShell.Core\Import-Module -Name '{module}' -Verbose -ErrorAction Stop 4>&1 | Microsoft.PowerShell.Core\ForEach-Object {{
+        if (-not $importTruncated) {{
+            $importRecord = $_.ToString()
+            $importRemaining = $importTextCapacity - $importWritten
+            if ($importRemaining -le 0) {{
+                [IO.File]::AppendAllText({progress}, $importMarker)
+                $importWritten += $importMarker.Length
+                $importTruncated = $true
+            }} elseif ($importRecord.Length -gt $importRemaining) {{
+                [IO.File]::AppendAllText({progress}, $importRecord.Substring(0, $importRemaining))
+                [IO.File]::AppendAllText({progress}, $importMarker)
+                $importWritten += $importRemaining + $importMarker.Length
+                $importTruncated = $true
+            }} else {{
+                [IO.File]::AppendAllText({progress}, $importRecord)
+                $importWritten += $importRecord.Length
+            }}
+        }}
+    }}
+}} catch {{
+    throw
+}}
+[IO.File]::AppendAllText({progress}, "`n")
+[IO.File]::AppendAllText({progress}, "after-import`n")
+"#
+        )
+    });
     format!(
         r#"$ErrorActionPreference = 'Stop'
 [IO.File]::WriteAllText({progress}, "entered`n")
 if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {{ throw 'expected stock PowerShell 5.1' }}
 if ([string]::IsNullOrWhiteSpace($env:ProgramData) -or [string]::IsNullOrWhiteSpace($env:ProgramFiles) -or [string]::IsNullOrWhiteSpace(${{env:ProgramFiles(x86)}}) -or [string]::IsNullOrWhiteSpace($env:ProgramW6432) -or [string]::IsNullOrWhiteSpace($env:PROCESSOR_ARCHITECTURE)) {{ throw 'expected stock Windows machine environment' }}
-[IO.File]::AppendAllText({progress}, "version-checked`nmachine-environment-checked`nhash-started`n")
+{diagnostic_import}[IO.File]::AppendAllText({progress}, "version-checked`nmachine-environment-checked`nhash-started`n")
 $hash = (Microsoft.PowerShell.Utility\Get-FileHash -LiteralPath {input} -Algorithm SHA256).Hash
 [IO.File]::AppendAllText({progress}, "hashed`n")
 [Console]::Write($hash + '|' + {sentinel})
@@ -258,10 +299,10 @@ async fn drain_shell_control(
     }
 }
 
-// A failed acceptance remains failed. These controls retain the source and
-// product-shaped environment while varying exactly one launch property.
+// A failed acceptance remains failed. This control retains the source and
+// product-shaped environment while explicitly importing the named module.
 async fn shell_failure_control(
-    (label, encoded, console): (&str, bool, kuru_platform::windows::process::Console),
+    label: &str,
     root: &Path,
     project: &Path,
     hostile_modules: &Path,
@@ -278,7 +319,12 @@ async fn shell_failure_control(
     let progress = private.join("progress");
     let source = format!(
         "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n{}",
-        stock_shell_source(&progress, input, sentinel)
+        stock_shell_source(
+            &progress,
+            input,
+            sentinel,
+            Some("Microsoft.PowerShell.Utility"),
+        )
     );
     let mut args: Vec<OsString> = [
         "-NoLogo",
@@ -286,26 +332,20 @@ async fn shell_failure_control(
         "-NonInteractive",
         "-OutputFormat",
         "Text",
-        if encoded {
-            "-EncodedCommand"
-        } else {
-            "-Command"
-        },
+        "-EncodedCommand",
     ]
     .map(Into::into)
     .into();
-    args.push(if encoded {
-        let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    args.push(
         base64::engine::general_purpose::STANDARD
             .encode(bytes)
-            .into()
-    } else {
-        source.into()
-    });
+            .into(),
+    );
     let powershell = system_directory()?.join("WindowsPowerShell/v1.0/powershell.exe");
     let environment = product_shell_environment(root, &private, hostile_modules)?;
     let mut spec = configured_command(powershell.as_os_str(), &args, project, environment)?;
-    spec.console = console;
+    spec.console = kuru_platform::windows::process::Console::Inherit;
     spec.stdout = Stdio::Pipe;
     spec.stderr = Stdio::Pipe;
     let mut child = spec.spawn().await?;
@@ -346,7 +386,7 @@ async fn shell_failure_control(
         "{label}: result={result:?}; stdout_bytes={stdout_bytes} stdout_eof={stdout_eof} stdout_tail={:?}; stderr_bytes={stderr_bytes} stderr_eof={stderr_eof} stderr_tail={:?}; terminate={terminate:?} stopped={stopped:?} closed={closed:?}; stages={:?}",
         String::from_utf8_lossy(&stdout_tail),
         String::from_utf8_lossy(&stderr_tail),
-        shell_marker(&progress, 256),
+        shell_marker(&progress, 4096),
     ))
 }
 
@@ -357,27 +397,19 @@ fn shell_timeout_controls(
     input: &Path,
     sentinel: &str,
 ) -> String {
-    use kuru_platform::windows::process::Console;
-
     let execute = async {
         let mut controls = Vec::new();
-        for (label, encoded, console) in [
-            ("encoded-inherit", true, Console::Inherit),
-            ("command-inherit", false, Console::Inherit),
-            ("encoded-private-hidden", true, Console::PrivateHidden),
-        ] {
-            controls.push(
-                shell_failure_control(
-                    (label, encoded, console),
-                    root,
-                    project,
-                    hostile_modules,
-                    input,
-                    sentinel,
-                )
-                .await,
-            );
-        }
+        controls.push(
+            shell_failure_control(
+                "encoded-inherit-import-utility",
+                root,
+                project,
+                hostile_modules,
+                input,
+                sentinel,
+            )
+            .await,
+        );
         Ok::<_, std::io::Error>(format!("{controls:#?}"))
     };
     let result = tokio::runtime::Builder::new_current_thread()
@@ -619,8 +651,8 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     let kuru_progress = root.path().join("kuru-progress");
     let sentinel = "retained & literal 日本語";
     let machine_environment = machine_environment_diagnostic();
-    let control_source = stock_shell_source(&control_progress, &input, sentinel);
-    let kuru_source = stock_shell_source(&kuru_progress, &input, sentinel);
+    let control_source = stock_shell_source(&control_progress, &input, sentinel, None);
+    let kuru_source = stock_shell_source(&kuru_progress, &input, sentinel, None);
     let child = |binary: &Path| {
         let mut child = command(root.path(), binary);
         child

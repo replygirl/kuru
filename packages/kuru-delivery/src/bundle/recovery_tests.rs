@@ -11,11 +11,14 @@ use tokio::{
 };
 
 const EXPECTED: &[u8] = b"verified immutable archive";
+const TEST_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(50)];
+const DEADLINE_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 
 enum Reply {
     Bytes(Vec<u8>),
     StallHeaders,
     StallBody,
+    DropBody,
     ObserveErrorDrop,
 }
 
@@ -73,9 +76,16 @@ impl Server {
                         Reply::Bytes(bytes) => { let _ = socket.write_all(&bytes).await; }
                         Reply::StallHeaders => std::future::pending::<()>().await,
                         Reply::StallBody => {
+                            // Wait until the client cancels this body read before
+                            // accepting the bounded retry on the same owned server.
                             let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\nveri", EXPECTED.len());
                             socket.write_all(header.as_bytes()).await.unwrap();
-                            std::future::pending::<()>().await;
+                            let mut byte = [0];
+                            let _ = socket.read(&mut byte).await;
+                        }
+                        Reply::DropBody => {
+                            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\nveri", EXPECTED.len());
+                            socket.write_all(header.as_bytes()).await.unwrap();
                         }
                         Reply::ObserveErrorDrop => {
                             // Never supply this unsuccessful response's body.
@@ -139,6 +149,16 @@ fn client() -> reqwest::Client {
         .unwrap()
 }
 
+fn client_with_read_idle(read_idle: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(1))
+        .read_timeout(read_idle)
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap()
+}
+
 fn retained_lock(options: &PrepareOptions, identity: FileIdentity) {
     let lock = File::options()
         .read(true)
@@ -167,7 +187,13 @@ async fn eligible_statuses_recover_on_the_third_get_and_persistent_errors_stop()
         let (_root, options, asset, identity) = setup(&server).await;
         let result = tokio::time::timeout(
             Duration::from_secs(8),
-            prepare_asset(&options, &asset, Some(&client())),
+            prepare_asset_with_policy(
+                &options,
+                &asset,
+                Some(&client()),
+                Duration::from_secs(3),
+                &TEST_RETRY_DELAYS,
+            ),
         )
         .await;
         identical_gets(&server.stop().await, 3);
@@ -185,12 +211,46 @@ async fn eligible_statuses_recover_on_the_third_get_and_persistent_errors_stop()
     let (_root, options, asset, identity) = setup(&server).await;
     let result = tokio::time::timeout(
         Duration::from_secs(8),
-        prepare_asset(&options, &asset, Some(&client())),
+        prepare_asset_with_policy(
+            &options,
+            &asset,
+            Some(&client()),
+            Duration::from_secs(3),
+            &TEST_RETRY_DELAYS,
+        ),
     )
     .await;
     identical_gets(&server.stop().await, 3);
-    assert!(format!("{:#}", result.unwrap().unwrap_err()).contains("503"));
+    let error = format!("{:#}", result.unwrap().unwrap_err());
+    assert!(error.contains("503"), "{error}");
+    assert!(
+        error.contains("for target test-target on attempt 3/3"),
+        "{error}"
+    );
+    assert!(error.contains("Retry-After present: false"), "{error}");
     assert_clean(&options.bundle_dir);
+    retained_lock(&options, identity);
+}
+
+#[tokio::test]
+async fn production_retry_waits_before_repeating_an_identical_get() {
+    let mut server = Server::start(vec![
+        response(500, "", b"retry"),
+        response(200, "", EXPECTED),
+    ])
+    .await;
+    let (_root, options, asset, identity) = setup(&server).await;
+    let started = std::time::Instant::now();
+    let published = tokio::time::timeout(
+        Duration::from_secs(12),
+        prepare_asset(&options, &asset, Some(&client())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    identical_gets(&server.stop().await, 2);
+    assert_eq!(std::fs::read(&published).unwrap(), EXPECTED);
     retained_lock(&options, identity);
 }
 
@@ -218,21 +278,25 @@ async fn permanent_statuses_and_any_retry_after_are_not_retried() {
         )
         .await;
         identical_gets(&server.stop().await, 1);
-        assert!(format!("{:#}", result.unwrap().unwrap_err()).contains(&status.to_string()));
+        let error = format!("{:#}", result.unwrap().unwrap_err());
+        assert!(error.contains(&status.to_string()), "{error}");
+        assert!(
+            error.contains("for target test-target on attempt 1/3"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("Retry-After present: {}", !advice.is_empty())),
+            "{error}"
+        );
         assert_clean(&options.bundle_dir);
         retained_lock(&options, identity);
     }
 }
 
 #[tokio::test]
-async fn transport_body_size_and_digest_failures_never_start_another_get() {
+async fn malformed_response_and_integrity_failures_never_start_another_get() {
     let mut corrupt = EXPECTED.to_vec();
     corrupt[0] ^= 1;
-    let truncated = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\nshort",
-        EXPECTED.len()
-    )
-    .into_bytes();
     let oversized = [EXPECTED, b"!"].concat();
     let mut chunked = format!(
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
@@ -241,22 +305,92 @@ async fn transport_body_size_and_digest_failures_never_start_another_get() {
     .into_bytes();
     chunked.extend_from_slice(&oversized);
     chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-    for reply in [
-        Reply::Bytes(b"this is not an HTTP response\r\n\r\n".to_vec()),
-        response(200, "", &corrupt),
-        response(200, "", b"short"),
-        Reply::Bytes(truncated),
-        Reply::Bytes(chunked),
-        Reply::Bytes(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nshort\r\n0\r\n\r\n".to_vec()),
+    for (label, reply) in [
+        ("malformed response", Reply::Bytes(b"this is not an HTTP response\r\n\r\n".to_vec())),
+        ("digest mismatch", response(200, "", &corrupt)),
+        ("declared short payload", response(200, "", b"short")),
+        ("oversized chunk", Reply::Bytes(chunked)),
+        ("chunked short payload", Reply::Bytes(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nshort\r\n0\r\n\r\n".to_vec())),
     ] {
         let mut server = Server::start(vec![reply]).await;
         let (_root, options, asset, identity) = setup(&server).await;
         let result = tokio::time::timeout(Duration::from_secs(4), prepare_asset(&options, &asset, Some(&client()))).await;
-        identical_gets(&server.stop().await, 1);
+        assert_eq!(server.stop().await.len(), 1, "unexpected retry for {label}");
         assert!(result.unwrap().is_err());
         assert_clean(&options.bundle_dir);
         retained_lock(&options, identity);
     }
+}
+
+#[tokio::test]
+async fn timed_out_body_frame_is_typed() {
+    let mut server = Server::start(vec![Reply::StallBody]).await;
+    let mut response = client_with_read_idle(Duration::from_millis(500))
+        .get(&server.url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.chunk().await.unwrap().unwrap(), b"veri".as_slice());
+    let error = response.chunk().await.unwrap_err();
+    assert!(
+        error.is_timeout(),
+        "body error was not typed as a timeout: {error}"
+    );
+    assert!(
+        error.is_decode(),
+        "body error was not a nested decode error: {error}"
+    );
+    drop(response);
+    identical_gets(&server.stop().await, 1);
+}
+
+#[tokio::test]
+async fn timed_out_body_frame_retries_with_a_clean_stage() {
+    let mut server = Server::start(vec![Reply::StallBody, response(200, "", EXPECTED)]).await;
+    let (_root, options, asset, identity) = setup(&server).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        prepare_asset_with_policy(
+            &options,
+            &asset,
+            Some(&client_with_read_idle(Duration::from_millis(500))),
+            Duration::from_secs(2),
+            &TEST_RETRY_DELAYS,
+        ),
+    )
+    .await;
+    identical_gets(&server.stop().await, 2);
+    let published = result.unwrap().unwrap();
+    assert_eq!(std::fs::read(&published).unwrap(), EXPECTED);
+    assert_eq!(std::fs::read_dir(&options.bundle_dir).unwrap().count(), 2);
+    retained_lock(&options, identity);
+}
+
+#[tokio::test]
+async fn interrupted_body_retries_only_three_times_and_releases_the_lock() {
+    let mut server = Server::start(vec![
+        response(503, "", b"unavailable"),
+        Reply::DropBody,
+        Reply::DropBody,
+    ])
+    .await;
+    let (_root, options, asset, identity) = setup(&server).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        prepare_asset_with_policy(
+            &options,
+            &asset,
+            Some(&client()),
+            Duration::from_secs(3),
+            &TEST_RETRY_DELAYS,
+        ),
+    )
+    .await;
+    identical_gets(&server.stop().await, 3);
+    let error = result.unwrap().unwrap_err();
+    assert!(format!("{error:#}").contains("body read failed"));
+    assert_clean(&options.bundle_dir);
+    retained_lock(&options, identity);
 }
 
 #[tokio::test]
@@ -284,7 +418,13 @@ async fn one_download_deadline_covers_all_backoffs_headers_and_body() {
         // The client's ten-second per-request timer cannot satisfy this test.
         let result = tokio::time::timeout(
             Duration::from_secs(4),
-            prepare_asset_with_budget(&options, &asset, Some(&client()), budget),
+            prepare_asset_with_policy(
+                &options,
+                &asset,
+                Some(&client()),
+                budget,
+                &DEADLINE_RETRY_DELAYS,
+            ),
         )
         .await;
         identical_gets(&server.stop().await, 2);
@@ -302,7 +442,13 @@ async fn cancellation_after_dropping_error_headers_releases_stage_and_stable_loc
     let mut server = Server::start(vec![Reply::ObserveErrorDrop]).await;
     let (_root, options, asset, identity) = setup(&server).await;
     let client = client();
-    let mut preparation = Box::pin(prepare_asset(&options, &asset, Some(&client)));
+    let mut preparation = Box::pin(prepare_asset_with_policy(
+        &options,
+        &asset,
+        Some(&client),
+        DOWNLOAD_TIMEOUT,
+        &DEADLINE_RETRY_DELAYS,
+    ));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             tokio::select! {

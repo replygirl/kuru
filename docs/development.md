@@ -45,13 +45,26 @@ require Communiqué or maintainer setup.
 
 CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
 managed-file checks and documentation as separate Ubuntu jobs. Native coverage
-runs on Linux x86_64, macOS arm64 and Windows x86_64, followed by source
-installation and actual installed offline runtime tests. Linux Clippy does not
+runs as one workspace suite on Linux x86_64 and macOS arm64. Windows x86_64
+runs four package shards in parallel, validates their exact source, toolchain,
+artifact inventory, Cargo-native runner ledger and raw-profile receipts, and
+then enforces one 90% workspace report. Each shard compiles the same full
+workspace/all-target/all-feature graph; its task-private runner executes only
+the assigned standard test targets while Cargo retains package cwd and runtime
+environment. Its source installation and installed offline-runtime checks run beside
+the coverage shards after independently preparing their locked inputs. Linux Clippy does not
 analyze platform-specific conditional code; the native suites compile and test
 those branches. Intel macOS and Linux arm64 additionally build and package the
 native executable, exercise real memory and verify the packaged offline runtime.
 Windows primitives retain a separate native coverage job for early feedback.
 The required `ci-gate` accepts only success from every branch of this graph.
+
+Ubuntu's coverage step disables Rust test-profile debug information so its
+instrumented Kuru executable remains a valid input to the same production
+release-archive bound exercised by the packaged-runtime fixture. Coverage maps,
+the full test graph, and the 90% line threshold remain enabled. Panic text is
+retained, but Ubuntu coverage backtraces may omit source file and line details;
+use a focused local run or another native job when those details are needed.
 
 CI installs only each job's tools before task activation, disables automatic
 installation of unrelated root tools, and uses `MISE_NO_HOOKS=1` because validation jobs do not create Git
@@ -150,11 +163,13 @@ mise run //apps/kuru-tui:build:release
 ```
 
 Preparation can make up to three attempts for the same pinned archive after
-HTTP 500, 502, 503 or 504, with 250 ms and one-second delays inside the same
-120-second download deadline. Error responses with `Retry-After` remain errors so
-preparation does not shorten the server's requested delay. Permanent HTTP,
-transport, incomplete-body, size and checksum failures remain fatal; recovery
-never selects another version or publishes partially verified bytes.
+HTTP 500, 502, 503 or 504, a timed-out or failed connection, or an interrupted
+accepted response body. Each attempt has a 15-second connection and 30-second
+read-idle bound, with five- and fifteen-second delays inside the same 120-second
+total download deadline; steady progress never extends that total. Error
+responses with `Retry-After`, permanent HTTP, size and checksum failures, and
+local I/O failures remain fatal. Recovery restarts the immutable GET with a
+fresh private stage digest and never publishes partially verified bytes.
 
 The default cache is `target/kuru-bundles` at the workspace root. Each archive is
 named `<archive_sha256>.archive`. `KURU_DOLT_BUNDLE_DIR` selects another absolute

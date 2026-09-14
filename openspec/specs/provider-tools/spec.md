@@ -98,6 +98,11 @@ and observe group absence before returning success. Timeout, overflow, read
 failure, caller loss, parent-runtime loss, and shutdown MUST enter the same
 owned cleanup path without replacing the primary failure.
 
+After confirmed cleanup, or after a worker terminates before spawning a child,
+the worker MUST remove only its own registry reservation before publishing its
+result to the caller. A spawned worker whose cleanup remains unconfirmed MUST
+remain registered until later confirmation.
+
 `ToolHost` shutdown MUST close shell registration, request cancellation, and
 await all registered owners within one bounded observation window while still
 running MCP cleanup. A bounded unconfirmed result MUST leave the independent
@@ -149,6 +154,12 @@ bounds remain separate protocol limits.
 - **WHEN** a registered worker is delayed beyond the accepted operation deadline and cleanup allowance while no child has spawned
 - **THEN** the caller returns a fixed bounded cancellation or unconfirmed-cleanup result, and the later worker observes cancellation and starts no child.
 
+#### Scenario: Confirmed worker publication has no stale reservation
+- **WHEN** a confirmed Unix shell worker wakes its result receiver while another
+  shell owner remains registered
+- **THEN** its own reservation is already absent and the other owner remains
+  registered.
+
 #### Scenario: Unix ownership observation remains interrupted
 - **WHEN** repeated bounded `EINTR` leaves an owned root anchored beyond the caller's cleanup allowance
 - **THEN** the caller receives a fixed unconfirmed result while the registered worker retains ownership, later makes its one destructive transition after a valid observation, and never signals again after that transition starts.
@@ -170,7 +181,9 @@ The application SHALL initialize and call MCP tools using stdio or Streamable
 HTTP, namespace tool names, and communicate with peers over a documented A2A
 JSON-RPC subset. Effective automatic-ancestor MCP transport and external-agent
 configuration MUST receive matching workspace approval before discovery,
-process creation, connection, advertisement or invocation.
+process creation, connection, advertisement or invocation. An MCP RPC close that
+confirms cleanup MUST close command admission before publishing that result, and
+later close calls MUST observe the same authoritative confirmed completion.
 
 #### Scenario: Unresponsive protocol peer
 - **WHEN** a protocol peer fails to respond
@@ -181,6 +194,12 @@ process creation, connection, advertisement or invocation.
   external agent without matching approval
 - **THEN** Kuru starts no stdio child, opens no configured connection, and does
   not advertise the external agent.
+
+#### Scenario: Repeated close after confirmed cleanup
+- **WHEN** confirmed MCP cleanup publishes its first close result and a caller
+  immediately requests close again
+- **THEN** command admission is already closed and the later call returns the
+  same confirmed completion without waiting for an abandoned command.
 
 ### Requirement: Bounded provider failure diagnostics
 

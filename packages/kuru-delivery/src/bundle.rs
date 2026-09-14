@@ -12,7 +12,7 @@ use std::{
     collections::HashSet,
     ffi::OsStr,
     fs::{File, TryLockError},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
@@ -23,6 +23,9 @@ const MAX_EXPANDED: u64 = 128 * 1024 * 1024;
 const LOCK_NAME: &str = ".prepare.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(15)];
 
 #[cfg(test)]
 #[path = "bundle/recovery_tests.rs"]
@@ -212,14 +215,15 @@ async fn prepare_asset(
     asset: &Asset,
     client: Option<&reqwest::Client>,
 ) -> Result<PathBuf> {
-    prepare_asset_with_budget(options, asset, client, DOWNLOAD_TIMEOUT).await
+    prepare_asset_with_policy(options, asset, client, DOWNLOAD_TIMEOUT, &RETRY_DELAYS).await
 }
 
-async fn prepare_asset_with_budget(
+async fn prepare_asset_with_policy(
     options: &PrepareOptions,
     asset: &Asset,
     client: Option<&reqwest::Client>,
     download_budget: Duration,
+    retry_delays: &[Duration; 2],
 ) -> Result<PathBuf> {
     let directory =
         Directory::open(&options.bundle_dir, true, true).context("open bundle cache directory")?;
@@ -282,6 +286,8 @@ async fn prepare_asset_with_budget(
     } else {
         let default_client = reqwest::Client::builder()
             .https_only(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_IDLE_TIMEOUT)
             .timeout(DOWNLOAD_TIMEOUT)
             .build()?;
         download(
@@ -289,6 +295,7 @@ async fn prepare_asset_with_budget(
             asset,
             &mut staging,
             download_budget,
+            retry_delays,
         )
         .await?;
     }
@@ -323,13 +330,33 @@ async fn download(
     asset: &Asset,
     output: &mut File,
     budget: Duration,
+    retry_delays: &[Duration; 2],
 ) -> Result<()> {
     tokio::time::timeout(budget, async {
-        let delays = [Duration::from_millis(250), Duration::from_secs(1)];
-        let mut attempt = 0;
-        let mut response = loop {
-            let response = client.get(&asset.url).send().await?;
-            if attempt < delays.len()
+        for attempt in 0..=retry_delays.len() {
+            if attempt != 0 {
+                output.set_len(0)?;
+                output.seek(SeekFrom::Start(0))?;
+                tokio::time::sleep(retry_delays[attempt - 1]).await;
+            }
+
+            let response = match client.get(&asset.url).send().await {
+                Ok(response) => response,
+                Err(error) if attempt < retry_delays.len() && retryable_send(&error) => {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "bundle archive GET failed for target {} on attempt {}/{}",
+                            asset.target,
+                            attempt + 1,
+                            retry_delays.len() + 1
+                        )
+                    });
+                }
+            };
+            if attempt < retry_delays.len()
                 && matches!(response.status().as_u16(), 500 | 502 | 503 | 504)
                 && !response
                     .headers()
@@ -338,35 +365,79 @@ async fn download(
                 // No error-body bytes enter staging, and no response or worker
                 // survives cancellation during the bounded backoff.
                 drop(response);
-                tokio::time::sleep(delays[attempt]).await;
-                attempt += 1;
                 continue;
             }
-            break response.error_for_status()?;
-        };
-        ensure!(
-            response
-                .content_length()
-                .is_none_or(|size| size == asset.compressed_bytes),
-            "bundle archive size mismatch"
-        );
-        let mut size = 0_u64;
-        let mut digest = Sha256::new();
-        while let Some(chunk) = response.chunk().await? {
-            size += chunk.len() as u64;
+            let status = response.status();
+            let retry_after_present = response
+                .headers()
+                .contains_key(reqwest::header::RETRY_AFTER);
+            let mut response = response.error_for_status().with_context(|| {
+                format!(
+                    "bundle archive GET returned {status} for target {} on attempt {}/{} (Retry-After present: {retry_after_present})",
+                            asset.target,
+                            attempt + 1,
+                            retry_delays.len() + 1
+                )
+            })?;
             ensure!(
-                size <= asset.compressed_bytes,
-                "bundle archive exceeds pinned size"
+                response
+                    .content_length()
+                    .is_none_or(|size| size == asset.compressed_bytes),
+                "bundle archive size mismatch"
             );
-            digest.update(&chunk);
-            // Synchronous bounded chunk writes have no worker that can outlive
-            // staging or lock when the surrounding future is cancelled.
-            output.write_all(&chunk)?;
+            let mut size = 0_u64;
+            let mut digest = Sha256::new();
+            let mut retry_body = false;
+            loop {
+                let chunk = match response.chunk().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    // This callsite has accepted a successful response. Reqwest
+                    // may wrap a transport body-frame error as Decode, so keep
+                    // this retry boundary narrower than a global Decode policy.
+                    Err(_) if attempt < retry_delays.len() => {
+                        retry_body = true;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "bundle archive body read failed for target {} on attempt {}/{} after {size} bytes",
+                                asset.target,
+                                attempt + 1,
+                                retry_delays.len() + 1
+                            )
+                        });
+                    }
+                };
+                size += chunk.len() as u64;
+                ensure!(
+                    size <= asset.compressed_bytes,
+                    "bundle archive exceeds pinned size"
+                );
+                digest.update(&chunk);
+                // Synchronous bounded chunk writes have no worker that can outlive
+                // staging or lock when the surrounding future is cancelled.
+                output.write_all(&chunk)?;
+            }
+            if retry_body {
+                // The next attempt truncates and rewinds the private stage, then
+                // starts a fresh digest before repeating the immutable GET.
+                continue;
+            }
+            verify_digest(size, &digest.finalize(), asset)?;
+            return Ok(());
         }
-        verify_digest(size, &digest.finalize(), asset)
+        unreachable!("the configured GET loop returns after its terminal attempt")
     })
     .await
     .context("bundle archive download timed out")?
+}
+
+fn retryable_send(error: &reqwest::Error) -> bool {
+    // Protocol decoding happens before a usable response exists. A body-frame
+    // error is handled only at `Response::chunk`, where retry is deliberate.
+    !error.is_decode() && (error.is_timeout() || error.is_connect())
 }
 
 fn verify_digest(size: u64, digest: &[u8], asset: &Asset) -> Result<()> {
@@ -518,7 +589,10 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(50)];
 
     pub(super) fn asset(bytes: &[u8]) -> Asset {
         Asset {
@@ -604,7 +678,13 @@ mod tests {
             .unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            prepare_asset(&options, &asset, Some(&client)),
+            prepare_asset_with_policy(
+                &options,
+                &asset,
+                Some(&client),
+                Duration::from_secs(3),
+                &TEST_RETRY_DELAYS,
+            ),
         )
         .await;
         server.abort();
@@ -660,7 +740,14 @@ mod tests {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap();
-            let result = prepare_asset(&options, &asset, Some(&client)).await;
+            let result = prepare_asset_with_policy(
+                &options,
+                &asset,
+                Some(&client),
+                Duration::from_secs(3),
+                &TEST_RETRY_DELAYS,
+            )
+            .await;
             server.abort();
             let _ = server.await;
             if succeeds {

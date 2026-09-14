@@ -42,6 +42,10 @@ const PROCESS_LOSS_TEST: &str =
 const PROCESS_LOSS_STAGE_TEST: &str =
     "store::recovery_tests::fresh_staging_process_loss_after_ddl_is_preserved_and_never_reused";
 
+fn migration_observation_deadline(options: &OpenOptions) -> Duration {
+    Duration::from_secs(options.config.startup_timeout_secs).saturating_add(QUERY_TIMEOUT)
+}
+
 #[cfg(any(unix, windows))]
 #[derive(Clone, Copy)]
 enum ProcessLossMode {
@@ -67,6 +71,7 @@ struct ProcessLossChild {
     active_directory: PathBuf,
     quiescence_directory: Option<PathBuf>,
     lifecycle_root: Option<PathBuf>,
+    readiness_deadline: Duration,
     retained_root: Option<Arc<crate::test_support::TempDir>>,
     descendants_quiescent: bool,
 }
@@ -176,6 +181,10 @@ impl ProcessLossChild {
             "process-loss retained root does not own the configured data directory"
         );
         let active_directory = project_directory(&options.data_dir, &options.project_scope)?;
+        // The parent allowance also covers child initialization before the
+        // child's own observation begins.
+        let readiness_deadline = migration_observation_deadline(options)
+            .saturating_add(Duration::from_secs(options.config.startup_timeout_secs));
         let child = spawn_process_loss_creator(
             retained_root.path(),
             &options.project_scope,
@@ -193,6 +202,7 @@ impl ProcessLossChild {
             quiescence_directory: matches!(mode, ProcessLossMode::Existing)
                 .then_some(active_directory),
             lifecycle_root: cfg!(windows).then(|| options.data_dir.join("memory/lifecycles")),
+            readiness_deadline,
             retained_root: Some(retained_root),
             descendants_quiescent: false,
         };
@@ -216,7 +226,7 @@ impl ProcessLossChild {
             .ready
             .take()
             .context("process-loss readiness was already observed")?;
-        tokio::time::timeout(Duration::from_secs(25), ready)
+        tokio::time::timeout(self.readiness_deadline, ready)
             .await
             .context("process-loss child readiness deadline exceeded")?
             .context("process-loss child did not reach accepted DDL")
@@ -443,16 +453,87 @@ fn bounded_fixture_text(path: &std::path::Path) -> String {
 #[cfg(any(unix, windows))]
 async fn paused_process_loss_child(root: &std::path::Path, scope: String) -> Result<()> {
     let mut options = crate::test_support::open_options(root.to_owned(), scope)?;
+    let observation_deadline = migration_observation_deadline(&options);
     let (hooks, control) =
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);
     options.migration_hooks = Some(Arc::new(hooks));
-    let _opening = tokio::spawn(MemoryStore::open(options));
-    tokio::time::timeout(TEST_DEADLINE, control.reached())
-        .await
-        .context("process-loss child did not reach accepted DDL")??;
+    let mut opening = tokio::spawn(MemoryStore::open(options));
+    observe_process_loss_ddl(&mut opening, &control, observation_deadline).await?;
     println!("{PROCESS_LOSS_READY}");
     std::io::stdout().flush()?;
     std::future::pending::<()>().await;
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+async fn observe_process_loss_ddl(
+    opening: &mut JoinHandle<Result<MemoryStore>>,
+    control: &migrations::MigrationPauseControl,
+    deadline: Duration,
+) -> Result<()> {
+    let completed = tokio::time::timeout(deadline, async {
+        tokio::select! {
+            biased;
+            opened = &mut *opening => match opened {
+                Ok(Ok(store)) => Ok(Some(store)),
+                Ok(Err(error)) => Err(error.context(
+                    "process-loss child open failed before accepted DDL",
+                )),
+                Err(error) => Err(anyhow::Error::new(error).context(
+                    "process-loss child open task failed before accepted DDL",
+                )),
+            },
+            reached = control.reached() => reached
+                .context("process-loss accepted-DDL observation failed")
+                .map(|()| None),
+        }
+    })
+    .await
+    .context("process-loss child did not reach accepted DDL")??;
+    let Some(store) = completed else {
+        return Ok(());
+    };
+
+    let cleanup = match tokio::time::timeout(TEST_DEADLINE, store.close()).await {
+        Ok(Ok(())) => "confirmed".to_owned(),
+        Ok(Err(error)) => format!("failed: {error:#}"),
+        Err(_) => "timed out".to_owned(),
+    };
+    anyhow::bail!(
+        "process-loss child open completed before accepted DDL; returned store cleanup {cleanup}"
+    )
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn process_loss_observer_surfaces_open_error_before_ddl_deadline() -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let mut options = OpenOptions::new(
+        root.path().to_owned(),
+        format!("project/{}", "e".repeat(64)),
+    );
+    options.config.startup_timeout_secs = 0;
+    let (hooks, control) =
+        migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);
+    options.migration_hooks = Some(Arc::new(hooks));
+    let mut opening = tokio::spawn(MemoryStore::open(options));
+
+    let error = observe_process_loss_ddl(&mut opening, &control, TEST_DEADLINE)
+        .await
+        .expect_err("invalid open must fail before reaching accepted DDL");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("process-loss child open failed before accepted DDL"),
+        "missing observer context: {rendered}"
+    );
+    assert!(
+        rendered.contains("memory.startup_timeout_secs must be between 1 and 300"),
+        "missing original open error: {rendered}"
+    );
+    assert!(
+        !rendered.contains("deadline has elapsed"),
+        "real open error was masked by the observer deadline: {rendered}"
+    );
     Ok(())
 }
 
@@ -1011,6 +1092,7 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
             .await?;
         source_pool.close().await;
         source.close().await?;
+        let completion_deadline = migration_observation_deadline(&options);
         let (hooks, control) = migrations::MigrationRunnerHooks::paused(boundary);
         options.migration_hooks = Some(Arc::new(hooks));
         let opening = tokio::spawn(MemoryStore::open(options.clone()));
@@ -1031,9 +1113,13 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
             "a competing opener acquired writer authority before the accepted worker reaped"
         );
         control.resume();
-        let store = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options))
+        let store = tokio::time::timeout(completion_deadline, MemoryStore::open(options))
             .await
-            .context("accepted migration worker did not finish after caller cancellation")??;
+            .with_context(|| {
+                format!(
+                    "accepted migration worker did not finish after caller cancellation at {boundary:?}"
+                )
+            })??;
         assert_eq!(migrations::version(&store.pool).await?, 2);
         assert_eq!(
             store.get("migration-source").await?,
