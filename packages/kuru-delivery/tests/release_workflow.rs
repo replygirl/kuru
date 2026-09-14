@@ -66,10 +66,17 @@ fn published_windows_verifier_is_post_publish_exact_sha_and_gates_docs() {
         .split("[tasks.\"verify:published-windows\"]")
         .nth(1)
         .unwrap();
-    let resolve = task
+    assert!(task.contains(
+        "run_windows = \"pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File packages/kuru-delivery/support/verify-published-windows.ps1\""
+    ));
+    let script = fs::read_to_string(
+        root.join("packages/kuru-delivery/support/verify-published-windows.ps1"),
+    )
+    .unwrap();
+    let resolve = script
         .find("Get-Command mise -CommandType Application")
         .unwrap();
-    let clear = task.find("verify-published-windows --mise").unwrap();
+    let clear = script.find("verify-published-windows --mise").unwrap();
     assert!(
         resolve < clear,
         "native mise must be resolved before verifier env clearing"
