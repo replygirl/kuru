@@ -1,0 +1,10 @@
+## 1. Bootstrap phase diagnostics
+
+- [x] 1.1 Add fixed, path-free `Write-Verbose` phase markers to `packages/kuru-delivery/support/install.ps1` at the major bootstrap boundaries, preserving the existing parameters, installation behavior, retry policy, ordinary output, and failure semantics. Independent review confirmed the frozen markers are fixed and path-free, and that the final cleanup marker follows all disposals.
+- [x] 1.2 Update the Windows path in `apps/kuru-tui/tests/embedded_runtime.rs` to pass `-Verbose` and verify that a successful genuine packaged installation emits every fixed phase marker in order without changing the existing 100-second command deadline, bounded output capture, cleanup, or installation assertions. Independent review confirmed the ordered assertion retains all original acceptance and cleanup behavior; native execution remains task 2.2.
+- [x] 1.3 Add a brief `docs/install.md` troubleshooting note that the existing PowerShell `-Verbose` switch reports bootstrap stages, without documenting fixture-only mechanics. `mise run docs:check` passed, including the VitePress build and public content, link, and anchor checks (`/private/tmp/kuru-bootstrap-diagnostics-docs.log`).
+
+## 2. Verification
+
+- [x] 2.1 Run the supported local `mise run //apps/kuru-tui:test:embedded-runtime` regression and relevant formatting and type checks; record actual outcomes without treating a non-Windows run as native marker evidence. The host embedded-runtime test passed 1/1 in 33.93 seconds (task 35.42 seconds), the app typecheck passed in 1.61 seconds, final `mise run format:check` and `git diff --check` passed, and the initial formatter failure was resolved by applying only its requested Rust wraps (`/private/tmp/kuru-bootstrap-stage-host-test.log`, `/private/tmp/kuru-bootstrap-stage-typecheck.log`, `/private/tmp/kuru-bootstrap-stage-format-final.log`).
+- [ ] 2.2 Run the native Windows packaged-runtime fixture in hosted CI and verify the fixed verbose markers appear in order on success; keep this task pending until that native evidence exists and do not claim the original stall cause is known or resolved.
