@@ -89,7 +89,9 @@ fn text(bytes: &[u8]) -> String {
 }
 
 fn safe_source_label(path: &std::path::Path) -> String {
-    path.as_os_str()
+    path.canonicalize()
+        .unwrap()
+        .as_os_str()
         .to_string_lossy()
         .chars()
         .flat_map(char::escape_default)
