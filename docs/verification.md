@@ -1,5 +1,46 @@
 # Verification record
 
+## Native CI and release candidates (2026-09-15)
+
+Hosted CI runs separate quality jobs for format, Rust lint, typechecking,
+repository/workflow tooling, Cospec validation, managed files, documentation,
+and RustSec advisories. The final CI gate requires both quality and every native
+verification category to succeed. Local reproduction and task ownership are
+documented in [development](development.md).
+
+Ubuntu x86-64 and macOS arm64 run instrumented native behavior with the 90%
+workspace line-coverage gate. ARM Linux and Intel macOS have additional native
+build, real-memory, packaging, and packaged offline-runtime checks. Windows
+runs four parallel coverage shards: delivery/archive, application, memory/runtime,
+and connectors/core/platform. Its aggregate requires all four checked results
+from the same run attempt and enforces the same 90% workspace threshold.
+Separate Windows jobs verify platform primitives and installation, including
+offline build-input failures, installed runtime behavior, and shipping DLLs.
+Native tests also cover terminal interaction, process cleanup, and self-update.
+
+The release workflow validates its source and selected version commit, builds
+all five native archives, and assembles one complete candidate. Native Windows
+then installs the exact staged ZIP through the pinned mise backend with isolated
+loopback release metadata, verifies its bundled engine, and exercises an offline
+conversation and durable reopen. This proves staged installation and runtime
+behavior; it is not a test of downloading the release from public GitHub.
+Documentation builds in parallel with staged acceptance. Documentation deployment
+must succeed before the final publication job. See [release operations](release.md)
+for the complete ordering and recovery contract.
+
+The following evidence applies to v0.3.2 at
+`5b952cf08f04ea115082b4200b38478dfbc115c5`:
+
+- [Merged-main CI](https://github.com/replygirl/kuru/actions/runs/34946268806)
+  passed all quality and native gates, including Windows shard aggregation.
+- [Release](https://github.com/replygirl/kuru/actions/runs/34948958911) passed
+  all five package builds, staged Windows acceptance, documentation deployment,
+  and final publication. The whole workflow completed successfully.
+
+Native code signing remains deferred. These checks establish neither macOS
+notarization nor Windows Authenticode, and older records below retain their
+original verification scope.
+
 ## Native OpenAI authentication (2026-09-11)
 
 Kuru completed a user-participating browser OAuth login, discovered eight
