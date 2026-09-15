@@ -9,6 +9,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+Write-Verbose 'Kuru bootstrap phase: entered'
 
 # This is the compiler-free entrypoint. Add-Type uses the compiler shipped with
 # stock Windows PowerShell/.NET, never a downloaded compiler or candidate exe.
@@ -18,6 +19,7 @@ Set-StrictMode -Version 2.0
 # https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-lockfileex
 # https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-movefileexw
 if (-not ('Kuru.Bootstrap.Native' -as [type])) {
+Write-Verbose 'Kuru bootstrap phase: loading native bridge'
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -504,6 +506,7 @@ public static class Native {
 }
 '@
 }
+Write-Verbose 'Kuru bootstrap phase: native bridge ready'
 
 function Read-KuruReceipt($State, $Parent) {
     $receiptPath = $State.Child('receipt.json')
@@ -543,6 +546,7 @@ try {
     $parent = [Kuru.Bootstrap.Native+DirectoryLease]::new($InstallDir, $true, $false)
     $state = [Kuru.Bootstrap.Native+DirectoryLease]::new($parent.Child('.kuru-update'), $true, $true)
     $lease = [Kuru.Bootstrap.Native]::Lock($state)
+    Write-Verbose 'Kuru bootstrap phase: installation state locked'
     $receipt = Read-KuruReceipt $state $parent
     if ($null -ne $receipt -and $receipt.phase -cnotin @('complete','rolled_back')) {
         $helperPath = [Kuru.Bootstrap.Native]::RecordedLaunchPath($receipt.helper)
@@ -588,6 +592,7 @@ try {
             if ($uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or $ReleaseBase -match '[\s\\]') { throw 'Release base must be HTTPS without credentials, whitespace, a query or fragment.' }
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         } else { $ReleaseBase = [Kuru.Bootstrap.Native]::PathName($ReleaseBase) }
+        Write-Verbose 'Kuru bootstrap phase: loading release manifest'
         $manifestBytes = [Kuru.Bootstrap.Native]::Fetch($ReleaseBase, 'SHA256SUMS', 65536)
         $manifest = [Text.UTF8Encoding]::new($false, $true).GetString($manifestBytes)
         if ($manifest.Contains([string][char]0)) { throw 'Checksum manifest contains NUL.' }
@@ -606,12 +611,16 @@ try {
         if ($chosen.Count -ne 1) { throw 'Checksum manifest must name the release archive exactly once.' }
         $Version = $chosen[0].version
         if ($defaultBase) { $ReleaseBase = "https://github.com/replygirl/kuru/releases/download/v$Version" }
+        Write-Verbose 'Kuru bootstrap phase: loading release archive'
         $archive = [Kuru.Bootstrap.Native]::Fetch($ReleaseBase, $chosen[0].name, [Kuru.Bootstrap.Native]::Limit)
         if ([Kuru.Bootstrap.Native]::Hash($archive) -cne $chosen[0].hash) { throw 'Release archive checksum mismatch; existing executable unchanged.' }
+        Write-Verbose 'Kuru bootstrap phase: release archive verified'
         Write-Output 'Verifying Kuru release archive.'
         $payload = [Kuru.Bootstrap.Native]::Executable($archive)
+        Write-Verbose 'Kuru bootstrap phase: release archive validated'
         $stage = [Kuru.Bootstrap.Native+DirectoryLease]::new($parent.Child(".kuru-install-$([Guid]::NewGuid().ToString('D'))"), $true, $true)
         [Kuru.Bootstrap.Native]::Publish($stage, $parent, $payload)
+        Write-Verbose 'Kuru bootstrap phase: installation published'
         Write-Output "Installed Kuru $Version at $($parent.Child('kuru.exe')); add $($parent.Path) to PATH."
     }
 } finally {
@@ -627,4 +636,5 @@ try {
         if ($null -ne $state) { $state.Dispose() }
         if ($null -ne $parent) { $parent.Dispose() }
     }
+    Write-Verbose 'Kuru bootstrap phase: cleanup complete'
 }

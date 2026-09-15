@@ -101,6 +101,9 @@ three regular members, and installs only `kuru.exe`. It never runs the downloade
 candidate to validate it. Reparse points, extra hardlinks, unsafe names and
 unexpected installation objects are refused.
 
+Add `-Verbose` when running the saved PowerShell script to see bootstrap stages
+while troubleshooting installation.
+
 ## Sign in after installation
 
 For ChatGPT subscription access with the default `codex` provider:

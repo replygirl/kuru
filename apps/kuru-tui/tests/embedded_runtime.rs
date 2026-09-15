@@ -30,6 +30,19 @@ const OUTPUT_LIMIT: u64 = 1024 * 1024;
 // 30-second bound, then includes their handshakes and bounded shutdowns.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(100);
 const MANIFEST: &str = include_str!("../../../packages/kuru-memory/support/dolt-assets.json");
+#[cfg(windows)]
+const BOOTSTRAP_PHASES: &[&str] = &[
+    "Kuru bootstrap phase: entered",
+    "Kuru bootstrap phase: loading native bridge",
+    "Kuru bootstrap phase: native bridge ready",
+    "Kuru bootstrap phase: installation state locked",
+    "Kuru bootstrap phase: loading release manifest",
+    "Kuru bootstrap phase: loading release archive",
+    "Kuru bootstrap phase: release archive verified",
+    "Kuru bootstrap phase: release archive validated",
+    "Kuru bootstrap phase: installation published",
+    "Kuru bootstrap phase: cleanup complete",
+];
 
 fn digest(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
@@ -106,6 +119,27 @@ async fn execute(command: &mut Command) -> Result<Output> {
         "fixture command exceeded output bound"
     );
     Ok(output)
+}
+
+#[cfg(windows)]
+fn assert_bootstrap_phases(output: &Output) -> Result<()> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let captured = format!("{stdout}\n{stderr}");
+    let mut offset = 0;
+    for phase in BOOTSTRAP_PHASES {
+        let Some(found) = captured[offset..].find(phase) else {
+            let stdout_preview =
+                String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(64 * 1024)]);
+            let stderr_preview =
+                String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(64 * 1024)]);
+            anyhow::bail!(
+                "stock PowerShell omitted bootstrap phase {phase:?}; stdout prefix: {stdout_preview:?}; stderr prefix: {stderr_preview:?}"
+            );
+        };
+        offset += found + phase.len();
+    }
+    Ok(())
 }
 
 struct Installation {
@@ -570,7 +604,8 @@ async fn install_packaged(
         .args(["-Version", version, "-Target", target, "-ReleaseBase"])
         .arg(releases)
         .arg("-InstallDir")
-        .arg(install_dir);
+        .arg(install_dir)
+        .arg("-Verbose");
     if let Some(value) = std::env::var_os("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", value);
     }
@@ -583,6 +618,7 @@ async fn install_packaged(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_bootstrap_phases(&output)?;
     ensure!(
         fs::read_dir(empty_path)?.next().is_none(),
         "bootstrap added a PATH dependency"
