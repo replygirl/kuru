@@ -219,12 +219,12 @@ async fn activation_source_open_failure_preserves_stage_before_releasing_cache_l
     assert!(format!("{error:#}").contains("preserved private stage at"));
     assert!(stage_path.is_dir());
     assert!(!destination.exists());
-    let contender = open_regular(&cache.join(".install.lock")).unwrap();
+    let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
     assert_eq!(
-        regular_file_info(&contender).unwrap().identity,
+        regular_file_info(&reacquired).unwrap().identity,
         lock_identity
     );
-    contender.try_lock().unwrap();
+    drop(reacquired);
 }
 
 #[cfg(windows)]
