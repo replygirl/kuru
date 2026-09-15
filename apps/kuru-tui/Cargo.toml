@@ -44,6 +44,9 @@ uuid.workspace = true
 sha2.workspace = true
 unicode-width.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 kuru-memory = { workspace = true, features = ["test-support"] }
 kuru-delivery = { workspace = true, features = ["tooling"] }
@@ -58,7 +61,6 @@ flate2.workspace = true
 portable-pty.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
-nix.workspace = true
 rustix.workspace = true
 vt100.workspace = true
 

@@ -1532,6 +1532,7 @@ name = "kuru-core"
 version = "0.3.2"
 dependencies = [
  "anyhow",
+ "kuru-platform",
  "serde",
  "serde_json",
  "sha2 0.11.0",

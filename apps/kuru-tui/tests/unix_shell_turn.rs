@@ -361,23 +361,25 @@ fn expected_receipt() -> String {
 fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
     let stderr = std::str::from_utf8(stderr).context("startup stderr is not UTF-8")?;
     let mut lines = stderr.lines();
-    for expected in [
-        "Memory: waiting for project ownership…",
-        "Memory: waiting for verified runtime cache…",
-    ] {
-        ensure!(
-            lines.next() == Some(expected),
-            "normal kuru run changed startup frame {expected:?}: {stderr:?}"
-        );
-    }
+    let expected = "Memory: waiting for project ownership…";
+    ensure!(
+        lines.next() == Some(expected),
+        "normal kuru run changed startup frame {expected:?}: {stderr:?}"
+    );
     let runtime = lines
         .next()
         .context("normal kuru run omitted runtime-version startup frame")?;
-    ensure!(
-        runtime == "Memory: verifying cached runtime…"
-            || runtime == "Memory: extracting embedded runtime…",
-        "normal kuru run changed cache startup frame: {stderr:?}"
-    );
+    if runtime == "Memory: waiting for verified runtime cache…" {
+        ensure!(
+            lines.next() == Some("Memory: extracting embedded runtime…"),
+            "cold kuru run changed extraction startup frame: {stderr:?}"
+        );
+    } else {
+        ensure!(
+            runtime == "Memory: verifying cached runtime…",
+            "warm kuru run changed verification startup frame: {stderr:?}"
+        );
+    }
     let next = lines
         .next()
         .context("normal kuru run omitted runtime-version startup frame")?;

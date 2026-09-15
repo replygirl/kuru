@@ -14,7 +14,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use crate::files;
 use crate::store::{identifier, private_dir, private_file};
@@ -197,7 +197,7 @@ struct SourcePins {
 }
 impl SourcePins {
     fn new(path: &Path) -> Result<Self> {
-        files::directory(path).map_err(|error| legacy_data_directory_error(path, error))?;
+        files::directory(path).map_err(|error| data_directory_error(path, error))?;
         let parent = Directory::open(path, Privacy::Inherited, NameRetention::Pinned)?;
         let mut pins = Self {
             parent,
@@ -251,20 +251,18 @@ impl SourcePins {
     }
 }
 
-pub(crate) fn legacy_data_directory_error(path: &Path, error: Error) -> Error {
+pub(crate) fn data_directory_error(path: &Path, error: Error) -> Error {
     #[cfg(unix)]
-    if let (Ok(directory), Ok(source)) = (
-        fs::symlink_metadata(path),
-        fs::symlink_metadata(path.join("memory.sqlite3")),
-    ) && error
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    if let Ok(directory) = fs::symlink_metadata(path)
+        && error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
         && directory.is_dir()
-        && source.is_file()
+        && directory.uid() == nix::unistd::geteuid().as_raw()
         && directory.permissions().mode() & 0o077 != 0
     {
         return error.context(format!(
-            "legacy memory directory {path:?} is not owner-private; restrict this exact directory to mode 0700 (for example with chmod, using shell quoting) and retry"
+            "memory data directory {path:?} is not owner-private; restrict this exact directory to mode 0700 (for example with chmod, using shell quoting) and retry"
         ));
     }
     #[cfg(windows)]
@@ -273,7 +271,7 @@ pub(crate) fn legacy_data_directory_error(path: &Path, error: Error) -> Error {
         .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
     {
         return error.context(format!(
-            "legacy memory directory {path:?} is not owner-private; correct this directory's owner-only access with Windows file security settings and retry"
+            "memory data directory {path:?} is not owner-private; correct this directory's owner-only access with Windows file security settings and retry"
         ));
     }
     error
@@ -325,10 +323,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = fixture();
-        files::write(&root.path().join("memory.sqlite3"), b"legacy source").unwrap();
+        let source = root.path().join("memory.sqlite3");
+        let original = b"legacy source";
+        files::write(&source, original).unwrap();
         let mode = fs::metadata(root.path()).unwrap().permissions().mode();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let result = SourcePins::new(root.path());
+        let rejected_mode = fs::metadata(root.path()).unwrap().permissions().mode();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(mode)).unwrap();
         let error = match result {
             Ok(_) => panic!("public legacy data directory must be rejected"),
@@ -338,6 +339,51 @@ mod tests {
         assert!(text.contains("is not owner-private"), "{text}");
         assert!(text.contains("mode 0700"), "{text}");
         assert!(text.contains(&format!("{:?}", root.path())), "{text}");
+        assert_eq!(rejected_mode & 0o777, 0o755);
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_owner_directory_without_legacy_gets_remedy_without_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = fixture();
+        let sentinel = root.path().join("keep.txt");
+        fs::write(&sentinel, b"leave owner data untouched").unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let before = fs::metadata(root.path()).unwrap().permissions().mode() & 0o777;
+        let error = files::directory(root.path()).unwrap_err();
+        let text = format!("{:#}", data_directory_error(root.path(), error));
+
+        assert!(text.contains("memory data directory"), "{text}");
+        assert!(text.contains("mode 0700"), "{text}");
+        assert!(text.contains(&format!("{:?}", root.path())), "{text}");
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            before
+        );
+        assert_eq!(fs::read(sentinel).unwrap(), b"leave owner data untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_and_foreign_directories_do_not_receive_mode_guidance() {
+        use std::os::unix::fs::symlink;
+
+        let root = fixture();
+        let link = root.path().with_extension("link");
+        symlink(root.path(), &link).unwrap();
+        let error = files::directory(&link).unwrap_err();
+        let text = format!("{:#}", data_directory_error(&link, error));
+        assert!(!text.contains("mode 0700"), "{text}");
+
+        let foreign = Path::new("/");
+        if fs::symlink_metadata(foreign).unwrap().uid() != nix::unistd::geteuid().as_raw() {
+            let error = files::directory(foreign).unwrap_err();
+            let text = format!("{:#}", data_directory_error(foreign, error));
+            assert!(!text.contains("mode 0700"), "{text}");
+        }
     }
 
     #[test]

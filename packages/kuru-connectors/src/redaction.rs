@@ -2,6 +2,7 @@
 
 use std::{collections::VecDeque, fmt, io};
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value, map::Entry};
 
 pub(crate) const MARKER: &str = "[REDACTED:recognized-secret]";
@@ -21,7 +22,9 @@ const CONTEXT_NAMES: &[&[u8]] = &[
     b"access_token",
     b"refresh_token",
     b"auth_token",
+    b"token",
     b"client_secret",
+    b"secret",
     b"password",
     b"passwd",
     b"private_key",
@@ -49,7 +52,7 @@ const PRIVATE_DELIMITERS: &[(&[u8], &[u8])] = &[
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProjectionError {
+pub enum ProjectionError {
     KeyCollision,
     SizeBound,
 }
@@ -69,19 +72,23 @@ impl std::error::Error for ProjectionError {}
 enum TokenKind {
     OpenAi,
     GitHub,
+    Slack,
+    GitLab,
 }
 
 impl TokenKind {
     fn alphabet(self, byte: u8) -> bool {
         match self {
-            Self::OpenAi => byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'),
+            Self::OpenAi | Self::Slack | Self::GitLab => {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+            }
             Self::GitHub => byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'),
         }
     }
 
     fn minimum(self) -> usize {
         match self {
-            Self::OpenAi => 16,
+            Self::OpenAi | Self::Slack | Self::GitLab => 16,
             Self::GitHub => 8,
         }
     }
@@ -99,6 +106,8 @@ enum PrefixKind {
     Aws,
     Assignment(AssignmentKind),
     Private(&'static [u8]),
+    Jwt,
+    Url,
 }
 
 #[derive(Clone, Copy)]
@@ -160,6 +169,7 @@ struct Prefix {
     openai_boundary: bool,
     github_boundary: bool,
     aws_boundary: bool,
+    jwt_boundary: bool,
     line_start: bool,
 }
 
@@ -214,7 +224,25 @@ enum State {
         end: &'static [u8],
         matched: usize,
     },
+    Jwt {
+        raw: Vec<u8>,
+        dots: u8,
+        segment_bytes: usize,
+    },
+    JwtSuppress,
+    Url {
+        userinfo: Vec<u8>,
+    },
+    UrlSuppress,
+    SchemeTail,
+    SchemeTailToken(Prefix),
+    SchemeSlashOne,
+    SchemeSlashTwo,
 }
+
+const JWT_MAX_BYTES: usize = 12 * 1024;
+const URL_USERINFO_MAX_BYTES: usize = 1024;
+const SCHEME_PENDING_MAX_BYTES: usize = 64;
 
 pub(crate) trait ProjectionSink {
     fn len(&self) -> usize;
@@ -528,6 +556,11 @@ impl Scanner {
             match state {
                 State::Normal
                 | State::TokenSuppress(_)
+                | State::JwtSuppress
+                | State::UrlSuppress
+                | State::SchemeTail
+                | State::SchemeSlashOne
+                | State::SchemeSlashTwo
                 | State::PrivateBlock { .. }
                 | State::Assignment {
                     phase:
@@ -548,6 +581,9 @@ impl Scanner {
                     }
                 }
                 State::TokenPending { raw, .. } => self.emit_raw(&raw, output)?,
+                State::Jwt { raw, .. } => self.emit_raw(&raw, output)?,
+                State::Url { userinfo } => self.project_url_authority(&userinfo, output)?,
+                State::SchemeTailToken(prefix) => self.emit_raw(&prefix.raw, output)?,
                 State::AwsPending { raw, body: 16 } => {
                     self.emit_marker(output)?;
                     self.consume_bytes(&raw);
@@ -573,6 +609,10 @@ impl Scanner {
             State::Normal => self.feed_normal(byte, output),
             State::Prefix(mut prefix) => {
                 prefix.raw.push(byte);
+                if prefix.name_boundary && is_scheme_complete(&prefix.raw) {
+                    self.start_prefix(PrefixKind::Url, prefix.raw, output)?;
+                    return Ok(());
+                }
                 if has_strict_prefix(&prefix) {
                     self.state = State::Prefix(prefix);
                     return Ok(());
@@ -582,6 +622,29 @@ impl Scanner {
                     self.start_prefix(found.kind, prefix.raw[..found.length].to_vec(), output)?;
                     for byte in suffix {
                         self.feed(byte, output)?;
+                    }
+                    return Ok(());
+                }
+                if let Some((offset, found)) = nested_token_prefix(&prefix.raw) {
+                    let leading = prefix.raw[..offset].to_vec();
+                    let suffix = prefix.raw[offset + found.length..].to_vec();
+                    self.emit_raw(&leading, output)?;
+                    self.start_prefix(
+                        found.kind,
+                        prefix.raw[offset..offset + found.length].to_vec(),
+                        output,
+                    )?;
+                    for byte in suffix {
+                        self.feed(byte, output)?;
+                    }
+                    return Ok(());
+                }
+                if prefix.name_boundary && is_scheme_prefix(&prefix.raw) {
+                    if prefix.raw.len() > SCHEME_PENDING_MAX_BYTES {
+                        self.emit_raw(&prefix.raw, output)?;
+                        self.state = State::SchemeTail;
+                    } else {
+                        self.state = State::Prefix(prefix);
                     }
                     return Ok(());
                 }
@@ -650,6 +713,44 @@ impl Scanner {
                 }
                 Ok(())
             }
+            State::Jwt {
+                mut raw,
+                dots,
+                mut segment_bytes,
+            } => self.feed_jwt(&mut raw, dots, &mut segment_bytes, byte, output),
+            State::JwtSuppress => {
+                if is_jwt_byte(byte) || byte == b'.' {
+                    self.consume_byte(byte);
+                    self.state = State::JwtSuppress;
+                    Ok(())
+                } else {
+                    self.feed(byte, output)
+                }
+            }
+            State::Url { mut userinfo } => self.feed_url(&mut userinfo, byte, output),
+            State::UrlSuppress => self.feed_url_suppress(byte, output),
+            State::SchemeTail => self.feed_scheme_tail(byte, output),
+            State::SchemeTailToken(prefix) => self.feed_scheme_tail_token(prefix, byte, output),
+            State::SchemeSlashOne => {
+                if byte == b'/' {
+                    self.emit_byte(byte, output)?;
+                    self.state = State::SchemeSlashTwo;
+                    Ok(())
+                } else {
+                    self.feed(byte, output)
+                }
+            }
+            State::SchemeSlashTwo => {
+                if byte == b'/' {
+                    self.emit_byte(byte, output)?;
+                    self.state = State::Url {
+                        userinfo: Vec::new(),
+                    };
+                    Ok(())
+                } else {
+                    self.feed(byte, output)
+                }
+            }
         }
     }
 
@@ -670,6 +771,7 @@ impl Scanner {
             aws_boundary: self.previous.is_none_or(|previous| {
                 !previous.is_ascii_uppercase() && !previous.is_ascii_digit()
             }),
+            jwt_boundary: self.previous.is_none_or(|previous| !is_jwt_byte(previous)),
             line_start: self.line_start,
         };
         if has_any_prefix(&prefix) {
@@ -705,7 +807,223 @@ impl Scanner {
                 self.consume_bytes(&raw);
                 self.state = State::PrivateBlock { end, matched: 0 };
             }
+            PrefixKind::Jwt => {
+                self.state = State::Jwt {
+                    segment_bytes: raw.len(),
+                    raw,
+                    dots: 0,
+                };
+            }
+            PrefixKind::Url => {
+                self.emit_raw(&raw, output)?;
+                self.state = State::Url {
+                    userinfo: Vec::new(),
+                };
+            }
         }
+        Ok(())
+    }
+
+    fn feed_jwt<S: ProjectionSink>(
+        &mut self,
+        raw: &mut Vec<u8>,
+        dots: u8,
+        segment_bytes: &mut usize,
+        byte: u8,
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        if is_jwt_byte(byte) {
+            raw.push(byte);
+            *segment_bytes += 1;
+            if raw.len() > JWT_MAX_BYTES {
+                self.emit_marker(output)?;
+                self.consume_bytes(raw);
+                self.state = State::JwtSuppress;
+                return Ok(());
+            }
+            if dots == 2 && *segment_bytes == 1 {
+                self.emit_marker(output)?;
+                self.consume_bytes(raw);
+                self.state = State::JwtSuppress;
+            } else {
+                self.state = State::Jwt {
+                    raw: std::mem::take(raw),
+                    dots,
+                    segment_bytes: *segment_bytes,
+                };
+            }
+            return Ok(());
+        }
+        if byte == b'.' && dots < 2 && *segment_bytes > 0 {
+            if dots == 0 && !is_jwt_header(raw) {
+                self.emit_raw(raw, output)?;
+                return self.feed(byte, output);
+            }
+            raw.push(byte);
+            if raw.len() > JWT_MAX_BYTES {
+                self.emit_marker(output)?;
+                self.consume_bytes(raw);
+                self.state = State::JwtSuppress;
+                return Ok(());
+            }
+            self.state = State::Jwt {
+                raw: std::mem::take(raw),
+                dots: dots + 1,
+                segment_bytes: 0,
+            };
+            return Ok(());
+        }
+        self.emit_raw(raw, output)?;
+        self.feed(byte, output)
+    }
+
+    fn feed_url<S: ProjectionSink>(
+        &mut self,
+        userinfo: &mut Vec<u8>,
+        byte: u8,
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        if byte == b'@' {
+            let valid = userinfo
+                .iter()
+                .position(|candidate| *candidate == b':')
+                .is_some_and(|colon| colon > 0 && colon + 1 < userinfo.len());
+            if valid {
+                self.emit_marker(output)?;
+                self.consume_bytes(userinfo);
+                self.consume_byte(byte);
+                self.state = State::Normal;
+                return Ok(());
+            }
+            self.project_url_authority(userinfo, output)?;
+            return self.feed(byte, output);
+        }
+        if userinfo.len() == URL_USERINFO_MAX_BYTES {
+            self.emit_marker(output)?;
+            self.consume_bytes(userinfo);
+            self.state = State::UrlSuppress;
+            return self.feed(byte, output);
+        }
+        if is_url_authority_delimiter(byte) {
+            self.project_url_authority(userinfo, output)?;
+            return self.feed(byte, output);
+        }
+        userinfo.push(byte);
+        self.state = State::Url {
+            userinfo: std::mem::take(userinfo),
+        };
+        Ok(())
+    }
+
+    fn feed_url_suppress<S: ProjectionSink>(
+        &mut self,
+        byte: u8,
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        if byte == b'@' {
+            self.consume_byte(byte);
+            self.state = State::Normal;
+        } else if is_url_authority_delimiter(byte) {
+            self.state = State::Normal;
+            self.feed(byte, output)?;
+        } else {
+            self.consume_byte(byte);
+            self.state = State::UrlSuppress;
+        }
+        Ok(())
+    }
+
+    fn feed_scheme_tail<S: ProjectionSink>(
+        &mut self,
+        byte: u8,
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        if is_scheme_byte(byte) {
+            let prefix = Prefix {
+                raw: vec![byte],
+                name_boundary: self.previous.is_none_or(|previous| !is_name_byte(previous)),
+                openai_boundary: self
+                    .previous
+                    .is_none_or(|previous| !TokenKind::OpenAi.alphabet(previous)),
+                github_boundary: self
+                    .previous
+                    .is_none_or(|previous| !TokenKind::GitHub.alphabet(previous)),
+                aws_boundary: self.previous.is_none_or(|previous| {
+                    !previous.is_ascii_uppercase() && !previous.is_ascii_digit()
+                }),
+                jwt_boundary: self.previous.is_none_or(|previous| !is_jwt_byte(previous)),
+                line_start: false,
+            };
+            if has_token_strict_prefix(&prefix) {
+                self.state = State::SchemeTailToken(prefix);
+            } else {
+                self.emit_byte(byte, output)?;
+                self.state = State::SchemeTail;
+            }
+        } else if byte == b':' {
+            self.emit_byte(byte, output)?;
+            self.state = State::SchemeSlashOne;
+        } else {
+            self.feed(byte, output)?;
+        }
+        Ok(())
+    }
+
+    fn feed_scheme_tail_token<S: ProjectionSink>(
+        &mut self,
+        mut prefix: Prefix,
+        byte: u8,
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        if !is_scheme_byte(byte) {
+            self.emit_raw(&prefix.raw, output)?;
+            self.state = State::SchemeTail;
+            return self.feed_scheme_tail(byte, output);
+        }
+        prefix.raw.push(byte);
+        if has_token_strict_prefix(&prefix) {
+            self.state = State::SchemeTailToken(prefix);
+            return Ok(());
+        }
+        if let Some(found) = best_completed_token_prefix(&prefix) {
+            let suffix = prefix.raw[found.length..].to_vec();
+            self.start_prefix(found.kind, prefix.raw[..found.length].to_vec(), output)?;
+            for byte in suffix {
+                self.feed(byte, output)?;
+            }
+            return Ok(());
+        }
+        self.emit_raw(&prefix.raw, output)?;
+        self.state = State::SchemeTail;
+        Ok(())
+    }
+
+    /// URL authority bytes are bounded before this path. Re-scan them in a
+    /// fresh finite scanner so an authority without usable userinfo cannot
+    /// bypass an already-recognized token detector; do not recursively feed the
+    /// same bytes back through this scanner.
+    fn project_url_authority<S: ProjectionSink>(
+        &mut self,
+        authority: &[u8],
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        let mut projected = Vec::new();
+        let mut scanner = Scanner::new();
+        scanner.push(authority, &mut projected)?;
+        scanner.finish(&mut projected)?;
+        let mut start = 0;
+        while let Some(offset) = projected[start..]
+            .windows(MARKER.len())
+            .position(|candidate| candidate == MARKER.as_bytes())
+        {
+            let marker = start + offset;
+            self.append(&projected[start..marker], output, false)?;
+            self.append(MARKER.as_bytes(), output, true)?;
+            start = marker + MARKER.len();
+        }
+        self.append(&projected[start..], output, false)?;
+        self.consume_bytes(authority);
+        self.last_was_marker = projected.ends_with(MARKER.as_bytes());
         Ok(())
     }
 
@@ -976,6 +1294,8 @@ impl Scanner {
             State::Prefix(prefix) => prefix.raw.len(),
             State::TokenPending { raw, .. }
             | State::AwsPending { raw, .. }
+            | State::Jwt { raw, .. }
+            | State::Url { userinfo: raw }
             | State::Assignment {
                 phase: AssignmentPhase::AuthorizationScheme { raw, .. },
                 ..
@@ -995,7 +1315,7 @@ impl Scanner {
     }
 }
 
-pub(crate) fn text(input: &str) -> Result<String, ProjectionError> {
+pub fn text(input: &str) -> Result<String, ProjectionError> {
     let mut output = Vec::new();
     output
         .try_reserve_exact(input.len())
@@ -1006,7 +1326,7 @@ pub(crate) fn text(input: &str) -> Result<String, ProjectionError> {
     String::from_utf8(output).map_err(|_| ProjectionError::SizeBound)
 }
 
-pub(crate) fn json(input: Value) -> Result<String, ProjectionError> {
+pub fn json(input: Value) -> Result<String, ProjectionError> {
     let mut original = CountingWriter::default();
     serde_json::to_writer(&mut original, &input).map_err(|_| ProjectionError::SizeBound)?;
     let limit = relative_bound(original.bytes)?;
@@ -1156,12 +1476,22 @@ fn sensitive_json_key(key: &str) -> bool {
 }
 
 fn has_any_prefix(prefix: &Prefix) -> bool {
-    has_strict_prefix(prefix) || best_completed_prefix(prefix).is_some()
+    has_strict_prefix(prefix)
+        || best_completed_prefix(prefix).is_some()
+        || (prefix.name_boundary && is_scheme_prefix(&prefix.raw))
 }
 
 fn has_strict_prefix(prefix: &Prefix) -> bool {
     for_each_prefix(prefix, |pattern, _, ascii_fold| {
         pattern.len() > prefix.raw.len() && pattern.starts_with(&prefix.raw, ascii_fold)
+    })
+}
+
+fn has_token_strict_prefix(prefix: &Prefix) -> bool {
+    for_each_prefix(prefix, |pattern, kind, ascii_fold| {
+        matches!(kind, PrefixKind::Token(_))
+            && pattern.len() > prefix.raw.len()
+            && pattern.starts_with(&prefix.raw, ascii_fold)
     })
 }
 
@@ -1182,17 +1512,59 @@ fn best_completed_prefix(prefix: &Prefix) -> Option<PrefixMatch> {
     best
 }
 
+fn best_completed_token_prefix(prefix: &Prefix) -> Option<PrefixMatch> {
+    let mut best = None;
+    for_each_prefix(prefix, |pattern, kind, ascii_fold| {
+        if matches!(kind, PrefixKind::Token(_))
+            && pattern.len() <= prefix.raw.len()
+            && pattern.starts_with(&prefix.raw[..pattern.len()], ascii_fold)
+            && best.is_none_or(|current: PrefixMatch| pattern.len() > current.length)
+        {
+            best = Some(PrefixMatch {
+                length: pattern.len(),
+                kind,
+            });
+        }
+        false
+    });
+    best
+}
+
+fn nested_token_prefix(raw: &[u8]) -> Option<(usize, PrefixMatch)> {
+    (1..raw.len()).find_map(|offset| {
+        let previous = raw[offset - 1];
+        let prefix = Prefix {
+            raw: raw[offset..].to_vec(),
+            name_boundary: !is_name_byte(previous),
+            openai_boundary: !TokenKind::OpenAi.alphabet(previous),
+            github_boundary: !TokenKind::GitHub.alphabet(previous),
+            aws_boundary: !previous.is_ascii_uppercase() && !previous.is_ascii_digit(),
+            jwt_boundary: !is_jwt_byte(previous),
+            line_start: false,
+        };
+        best_completed_prefix(&prefix).and_then(|found| {
+            matches!(
+                found.kind,
+                PrefixKind::Token(_) | PrefixKind::Aws | PrefixKind::Jwt
+            )
+            .then_some((offset, found))
+        })
+    })
+}
+
 fn for_each_prefix(
     prefix: &Prefix,
     mut visit: impl FnMut(Pattern, PrefixKind, bool) -> bool,
 ) -> bool {
     if prefix.openai_boundary {
-        for pattern in [b"sk-svcacct-".as_slice(), b"sk-proj-", b"sk-"] {
-            if visit(
-                Pattern::Plain(pattern),
-                PrefixKind::Token(TokenKind::OpenAi),
-                false,
-            ) {
+        for (pattern, kind) in [
+            (b"sk-svcacct-".as_slice(), TokenKind::OpenAi),
+            (b"sk-proj-", TokenKind::OpenAi),
+            (b"sk-", TokenKind::OpenAi),
+            (b"xox", TokenKind::Slack),
+            (b"glpat-", TokenKind::GitLab),
+        ] {
+            if visit(Pattern::Plain(pattern), PrefixKind::Token(kind), false) {
                 return true;
             }
         }
@@ -1218,6 +1590,13 @@ fn for_each_prefix(
     if prefix.aws_boundary {
         for pattern in [b"AKIA".as_slice(), b"ASIA"] {
             if visit(Pattern::Plain(pattern), PrefixKind::Aws, false) {
+                return true;
+            }
+        }
+    }
+    if prefix.jwt_boundary {
+        for pattern in [b"ey".as_slice(), b"ew"] {
+            if visit(Pattern::Plain(pattern), PrefixKind::Jwt, false) {
                 return true;
             }
         }
@@ -1286,6 +1665,53 @@ fn authorization_body_byte(scheme: AuthorizationScheme, byte: u8) -> bool {
 
 fn is_basic_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+}
+
+fn is_jwt_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+}
+
+fn is_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
+fn is_scheme_prefix(raw: &[u8]) -> bool {
+    let Some((&first, rest)) = raw.split_first() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    match rest.iter().position(|byte| *byte == b':') {
+        None => rest.iter().all(|byte| is_scheme_byte(*byte)),
+        Some(colon) => {
+            let (scheme, after_colon) = rest.split_at(colon);
+            scheme.iter().all(|byte| is_scheme_byte(*byte))
+                && matches!(after_colon, [b':'] | [b':', b'/'] | [b':', b'/', b'/'])
+        }
+    }
+}
+
+fn is_scheme_complete(raw: &[u8]) -> bool {
+    raw.ends_with(b"://") && is_scheme_prefix(raw)
+}
+
+fn is_jwt_header(raw: &[u8]) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(raw)
+        .ok()
+        .and_then(|header| serde_json::from_slice::<Value>(&header).ok())
+        .is_some_and(|header| {
+            header
+                .as_object()
+                .and_then(|object| object.get("alg"))
+                .and_then(Value::as_str)
+                .is_some_and(|algorithm| !algorithm.is_empty())
+        })
+}
+
+fn is_url_authority_delimiter(byte: u8) -> bool {
+    matches!(byte, b'/' | b'?' | b'#') || byte.is_ascii_whitespace()
 }
 
 fn is_bearer_byte(byte: u8) -> bool {
@@ -1362,11 +1788,13 @@ pub fn truncate_tool_output(text: &str, max_bytes: usize) -> String {
 mod tests {
     use std::io;
 
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::{Map, Value, json};
 
     use super::{
-        BoundedWriter, CountingWriter, MARKER, ProjectionError, Scanner, TRUNCATED, json,
-        project_value, relative_bound, text, truncate_tool_output,
+        BoundedWriter, CountingWriter, JWT_MAX_BYTES, MARKER, ProjectionError,
+        SCHEME_PENDING_MAX_BYTES, Scanner, TRUNCATED, URL_USERINFO_MAX_BYTES, json, project_value,
+        relative_bound, text, truncate_tool_output,
     };
 
     fn streamed(input: &[u8], splits: &[usize]) -> Result<Vec<u8>, ProjectionError> {
@@ -1415,7 +1843,33 @@ mod tests {
             ("sk-svcacct-abcdefghijklmnop", MARKER.into()),
             ("ghp_abcdefgh", MARKER.into()),
             ("github_pat_abcdefgh", MARKER.into()),
+            ("xoxb-abcdefghijklmnop", MARKER.into()),
+            ("glpat-abcdefghijklmnop", MARKER.into()),
             ("AKIA1234567890ABCDEF", MARKER.into()),
+            (
+                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                MARKER.into(),
+            ),
+            (
+                "https://user:password@example.test/kept",
+                format!("https://{MARKER}example.test/kept"),
+            ),
+            (
+                "ssh://user:password@example.test/kept",
+                format!("ssh://{MARKER}example.test/kept"),
+            ),
+            (
+                "postgres://user:password@example.test/database",
+                format!("postgres://{MARKER}example.test/database"),
+            ),
+            (
+                "git+ssh://user:password@example.test/repository",
+                format!("git+ssh://{MARKER}example.test/repository"),
+            ),
+            (
+                "CuStOm+V1://user:password@example.test/resource",
+                format!("CuStOm+V1://{MARKER}example.test/resource"),
+            ),
             (
                 "  -----BEGIN PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----\nafter",
                 format!("  {MARKER}\nafter"),
@@ -1429,6 +1883,11 @@ mod tests {
             let input = format!("{prefix}abcdefgh");
             assert_eq!(text(&input).unwrap(), MARKER, "prefix: {prefix}");
         }
+        for prefix in ["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"] {
+            let input = format!("{prefix}abcdefghijklmnop");
+            assert_eq!(text(&input).unwrap(), MARKER, "prefix: {prefix}");
+        }
+        assert_eq!(text("glpat-abcdefghijklmnop").unwrap(), MARKER);
         for prefix in ["AKIA", "ASIA"] {
             let input = format!("{prefix}1234567890ABCDEF");
             assert_eq!(text(&input).unwrap(), MARKER, "prefix: {prefix}");
@@ -1465,7 +1924,15 @@ mod tests {
             "before private_key=\"\nBEGIN\r\nbody\n\" after",
             "before sk-proj-abcdefghijklmnop after",
             "before github_pat_abcdefgh after",
+            "before xoxb-abcdefghijklmnop after",
+            "before glpat-abcdefghijklmnop after",
             "before AKIA1234567890ABCDEF after",
+            "before eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature after",
+            "before https://user:password@example.test/kept after",
+            "before ssh://user:password@example.test/kept after",
+            "before postgres://user:password@example.test/kept after",
+            "before git+ssh://user:password@example.test/kept after",
+            "before CuStOm+V1://user:password@example.test/kept after",
             "  -----BEGIN OPENSSH PRIVATE KEY-----\nbody\n-----END OPENSSH PRIVATE KEY-----\nafter",
         ];
         for input in cases {
@@ -1497,7 +1964,16 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "550e8400-e29b-41d4-a716-446655440000",
             "gpt-6.0-model",
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "eyJhbGciOiJIUzI1NiJ9.short",
+            "eyJmb28iOiJiYXIifQ.eyJzdWIiOiIxIn0.signature",
+            "not-a-jwt.part.signature",
+            "xoxb-abcdefghijklm",
+            "glpat-abcdefghijklmno",
+            "https://example.test/no-userinfo",
+            "https://user@example.test/no-password",
+            "custom+scheme://example.test/no-userinfo",
+            "tokenize=x",
+            "secretary=x",
             "-----BEGIN CERTIFICATE-----\nopaque\n-----END CERTIFICATE-----",
             "-----BEGIN PUBLIC KEY-----\nopaque\n-----END PUBLIC KEY-----",
             "prefix sk_new_format_abcdefghijklmnop",
@@ -1517,6 +1993,78 @@ mod tests {
     }
 
     #[test]
+    fn url_authority_passthrough_rechecks_recognized_tokens() {
+        let cases = vec![
+            (
+                "https://sk-abcdefghijklmnop.example/path".to_owned(),
+                format!("https://{MARKER}.example/path"),
+            ),
+            (
+                "https://glpat-abcdefghijklmnop@host.example/path".to_owned(),
+                format!("https://{MARKER}@host.example/path"),
+            ),
+            (
+                format!(
+                    "{}{}.glpat-abcdefghijklmnop://host.example/path",
+                    "a".repeat(SCHEME_PENDING_MAX_BYTES),
+                    "."
+                ),
+                format!(
+                    "{}{}.{}://host.example/path",
+                    "a".repeat(SCHEME_PENDING_MAX_BYTES),
+                    ".",
+                    MARKER
+                ),
+            ),
+            (
+                "custom+scheme://ordinary.example/path".to_owned(),
+                "custom+scheme://ordinary.example/path".to_owned(),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(text(&input).unwrap(), expected, "input: {input}");
+            assert_eq!(
+                streamed(input.as_bytes(), &(0..=input.len()).collect::<Vec<_>>()).unwrap(),
+                expected.as_bytes(),
+                "one-byte chunks: {input}"
+            );
+        }
+
+        let authority = "a".repeat(URL_USERINFO_MAX_BYTES + 64);
+        let input = format!("https://{authority}/path");
+        let expected = format!("https://{MARKER}/path");
+        assert_eq!(text(&input).unwrap(), expected);
+        assert_eq!(
+            streamed(input.as_bytes(), &(0..=input.len()).collect::<Vec<_>>()).unwrap(),
+            expected.as_bytes()
+        );
+
+        let limit = 96;
+        let head_cut = (limit - TRUNCATED.len()) / 2;
+        let input = format!(
+            "{}https://sk-abcdefghijklmnop.example/{}:TAIL",
+            "x".repeat(head_cut - 10),
+            "y".repeat(256)
+        );
+        let mut projection = super::StreamingProjection::new(limit);
+        for chunk in input.as_bytes().chunks(1) {
+            projection.push(chunk).unwrap();
+        }
+        let result = projection.finish().unwrap();
+        assert!(result.len() <= limit);
+        assert!(result.contains(TRUNCATED));
+        assert!(result.ends_with(":TAIL"));
+        for (index, _) in result.match_indices('[') {
+            let suffix = &result[index..];
+            assert!(
+                suffix.starts_with(MARKER) || suffix.starts_with(TRUNCATED),
+                "partial marker in {result:?}"
+            );
+        }
+        assert!(!result.contains("sk-abcdefghijklmnop"));
+    }
+
+    #[test]
     fn eof_flushes_only_unrecognized_candidates() {
         assert_eq!(text("sk-abcdefghijklmno").unwrap(), "sk-abcdefghijklmno");
         assert_eq!(text("AKIA1234567890ABCDEF").unwrap(), MARKER);
@@ -1529,6 +2077,33 @@ mod tests {
             text("-----BEGIN RSA PRIVATE KEY-----\nunfinished").unwrap(),
             MARKER
         );
+    }
+
+    #[test]
+    fn jose_headers_with_whitespace_and_overlong_candidates_fail_closed() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{ "alg": "HS256" }"#);
+        let whitespace_header = format!("{header}.eyJzdWIiOiIxIn0.signature");
+        assert_eq!(text(&whitespace_header).unwrap(), MARKER);
+
+        let overlong_jwt = format!(
+            "eyJhbGciOiJIUzI1NiJ9.{}.signature",
+            "a".repeat(JWT_MAX_BYTES)
+        );
+        let output = streamed(overlong_jwt.as_bytes(), &[24, JWT_MAX_BYTES + 24]).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, MARKER);
+        assert!(!output.contains(&"a".repeat(64)));
+
+        let password = "p".repeat(URL_USERINFO_MAX_BYTES + 64);
+        let url = format!("ssh://user:{password}@host.example/path");
+        let output = text(&url).unwrap();
+        assert_eq!(output, format!("ssh://{MARKER}host.example/path"));
+        assert!(!output.contains(&password));
+
+        let scheme = "a".repeat(SCHEME_PENDING_MAX_BYTES + 64);
+        let custom = format!("{scheme}://user:password@host.example/path");
+        let output = text(&custom).unwrap();
+        assert_eq!(output, format!("{scheme}://{MARKER}host.example/path"));
     }
 
     #[test]
@@ -1573,6 +2148,10 @@ mod tests {
             "refresh_token": {"unknown": [1, 2, 3]},
             "nested": {
                 "safe": "prefix sk-abcdefghijklmnop suffix",
+                "slack": "xoxb-abcdefghijklmnop",
+                "gitlab": "glpat-abcdefghijklmnop",
+                "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                "url": "https://user:password@example.test/kept",
                 "boolean": true,
                 "null": null,
                 "array": ["ghp_abcdefgh", 7]
@@ -1588,6 +2167,13 @@ mod tests {
         assert_eq!(
             projected["nested"]["safe"],
             format!("prefix {MARKER} suffix")
+        );
+        assert_eq!(projected["nested"]["slack"], MARKER);
+        assert_eq!(projected["nested"]["gitlab"], MARKER);
+        assert_eq!(projected["nested"]["jwt"], MARKER);
+        assert_eq!(
+            projected["nested"]["url"],
+            format!("https://{MARKER}example.test/kept")
         );
         assert_eq!(projected["nested"]["boolean"], true);
         assert!(projected["nested"]["null"].is_null());
@@ -1607,6 +2193,17 @@ mod tests {
             "prefix sk-qrstuvwxyzabcdef": 2
         }));
         assert_eq!(collision.unwrap_err(), ProjectionError::KeyCollision);
+
+        let projected: Value = serde_json::from_str(
+            &json(json!({
+                "xoxb-abcdefghijklmnop": "glpat-abcdefghijklmnop",
+                "https://user:password@example.test": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projected[MARKER], MARKER);
+        assert_eq!(projected[format!("https://{MARKER}example.test")], MARKER);
     }
 
     #[test]
@@ -1628,7 +2225,10 @@ mod tests {
         let mut scanner = Scanner::with_growth_bound(0, 0);
         let mut output = Vec::new();
         assert_eq!(
-            scanner.push(b"api_key=x", &mut output).unwrap_err(),
+            scanner
+                .push(b"sk-abcdefghijklmnop", &mut output)
+                .and_then(|_| scanner.finish(&mut output))
+                .unwrap_err(),
             ProjectionError::SizeBound
         );
         assert_eq!(
@@ -1648,7 +2248,7 @@ mod tests {
         let mut scanner = Scanner::new();
         scanner.written_bytes = usize::MAX;
         assert_eq!(
-            scanner.push(b"x", &mut Vec::new()),
+            scanner.push(b"!", &mut Vec::new()),
             Err(ProjectionError::SizeBound)
         );
 

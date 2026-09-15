@@ -86,6 +86,7 @@ pub enum AuthorityClaimCategory {
     MemoryCacheDir,
     ResponsesRoute,
     ExternalAgent,
+    ProjectInstructions,
 }
 
 impl AuthorityClaimCategory {
@@ -99,6 +100,7 @@ impl AuthorityClaimCategory {
             Self::MemoryCacheDir => "memory cache",
             Self::ResponsesRoute => "Responses route",
             Self::ExternalAgent => "external agent",
+            Self::ProjectInstructions => "project instructions",
         }
     }
 }
@@ -431,6 +433,7 @@ pub struct ConfigSnapshot {
     overrides: InvocationOverrides,
     manifest: AuthorityManifest,
     memory: MemoryConfig,
+    instructions: String,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +441,38 @@ struct LayerOrigin {
     source: SafeSource,
     source_digest: [u8; 32],
     automatic: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum InstructionSourceKind {
+    Agents,
+}
+
+impl InstructionSourceKind {
+    const fn prompt_name(self) -> &'static str {
+        match self {
+            Self::Agents => "AGENTS.md",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InstructionSource {
+    kind: InstructionSourceKind,
+    path: PathBuf,
+    safe_source: SafeSource,
+    path_digest: [u8; 32],
+    identity: [u8; 24],
+    content: String,
+}
+
+#[derive(Serialize)]
+struct InstructionClaimEntry<'a> {
+    kind: InstructionSourceKind,
+    path_digest: &'a [u8; 32],
+    identity: &'a [u8; 24],
+    content: &'a str,
 }
 
 impl ConfigSnapshot {
@@ -453,6 +488,8 @@ impl ConfigSnapshot {
         if !workspace.is_dir() {
             return Err(config_error("read", &workspace));
         }
+        let instruction_sources = capture_instruction_sources(&workspace)?;
+        let instructions = format_instructions(&instruction_sources);
         let mut merged =
             toml::Value::try_from(Config::default()).expect("default config serializes");
         let mut origins = BTreeMap::new();
@@ -520,6 +557,7 @@ impl ConfigSnapshot {
             overrides,
             manifest: empty_manifest(),
             memory: MemoryConfig::default(),
+            instructions,
         };
         let (value, value_origins) =
             provisional.value_with_preferences(&ProjectPreferences::default())?;
@@ -531,7 +569,7 @@ impl ConfigSnapshot {
             .memory
             .validate()
             .map_err(|_| config_error("validation", provisional.workspace()))?;
-        let manifest = derive_manifest(&config, &value_origins)?;
+        let manifest = derive_manifest(&config, &value_origins, &instruction_sources)?;
         Ok(Self {
             memory: config.memory.clone(),
             manifest,
@@ -547,6 +585,10 @@ impl ConfigSnapshot {
     }
     pub fn manifest(&self) -> &AuthorityManifest {
         &self.manifest
+    }
+    /// Exact automatic project-instruction bytes captured before workspace review.
+    pub fn instructions(&self) -> &str {
+        &self.instructions
     }
 
     /// Return an active Responses route without loading saved preferences or memory.
@@ -1041,6 +1083,7 @@ fn push_claim(
 fn derive_manifest(
     config: &Config,
     origins: &BTreeMap<String, LayerOrigin>,
+    instruction_sources: &[InstructionSource],
 ) -> Result<AuthorityManifest> {
     let mut claims = Vec::new();
     let write_origins = automatic_origins(origins, "allow_write");
@@ -1139,6 +1182,44 @@ fn derive_manifest(
             )?;
         }
     }
+    if !instruction_sources.is_empty() {
+        let entries = instruction_sources
+            .iter()
+            .map(|source| InstructionClaimEntry {
+                kind: source.kind,
+                path_digest: &source.path_digest,
+                identity: &source.identity,
+                content: &source.content,
+            })
+            .collect::<Vec<_>>();
+        let sources = instruction_sources
+            .iter()
+            .map(|source| source.safe_source.clone())
+            .collect::<Vec<_>>();
+        let source_digests = instruction_sources
+            .iter()
+            .map(|source| source_digest_with_identity(source.path_digest, source.identity))
+            .collect::<Vec<_>>();
+        claims.push(AuthorityClaim {
+            category: AuthorityClaimCategory::ProjectInstructions,
+            digest: claim_digest(AuthorityClaimCategory::ProjectInstructions, &entries)?,
+            source: sources
+                .first()
+                .expect("instruction claim has a source")
+                .clone(),
+            sources,
+            source_digests,
+            display: SafeClaimDisplay(format!(
+                "{} ordered automatic source{}",
+                instruction_sources.len(),
+                if instruction_sources.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )),
+        });
+    }
     claims.sort_by_key(|claim| (claim.category, claim.digest));
     let mut manifest = SafeManifest::new(1, claims).into_manifest();
     manifest.sources = manifest
@@ -1149,6 +1230,14 @@ fn derive_manifest(
         .into_iter()
         .collect();
     Ok(manifest)
+}
+
+fn source_digest_with_identity(path_digest: [u8; 32], identity: [u8; 24]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"kuru.workspace-trust.instruction-source\0");
+    hash.update(path_digest);
+    hash.update(identity);
+    hash.finalize().into()
 }
 
 fn safe_text(value: &str, max: usize) -> String {
@@ -1207,29 +1296,88 @@ fn read_bounded(path: &Path, required: bool) -> Result<Option<String>> {
         .with_context(|| format!("{} is not UTF-8", path.display()))
 }
 
-/// Include every ancestor AGENTS.md, clearly identifying increasingly local scope.
-/// Source order conveys precedence without attempting to reinterpret instructions.
-pub fn load_instructions(project: &Path) -> Result<String> {
-    let mut combined = String::new();
-    let mut total_bytes = 0;
+fn capture_instruction_sources(project: &Path) -> Result<Vec<InstructionSource>> {
+    let mut sources = Vec::new();
+    let mut total_bytes: usize = 0;
     for directory in ancestor_directories(project)? {
         let path = directory.join("AGENTS.md");
-        let Some(source) = read_bounded(&path, false)? else {
+        let Some((source, identity)) = read_instruction_bounded(&path)? else {
             continue;
         };
-        total_bytes += source.len();
+        total_bytes = total_bytes
+            .checked_add(source.len())
+            .ok_or_else(|| instruction_error("read", &path))?;
         ensure!(
             total_bytes <= MAX_COMBINED_BYTES,
             "combined AGENTS.md instructions exceed 1 MiB"
         );
-        if combined.is_empty() {
-            combined.push_str("Project instructions follow from outermost to most local. Where instructions conflict, the most local applicable AGENTS.md takes precedence; higher-priority conversation instructions still apply.\n");
-        }
-        combined.push_str(&format!("\n--- AGENTS.md: {} ---\n", path.display()));
-        combined.push_str(&source);
+        sources.push(InstructionSource {
+            kind: InstructionSourceKind::Agents,
+            path_digest: source_digest(path.as_os_str().as_encoded_bytes()),
+            safe_source: safe_source(&path),
+            path,
+            identity,
+            content: source,
+        });
+    }
+    Ok(sources)
+}
+
+fn read_instruction_bounded(path: &Path) -> Result<Option<(String, [u8; 24])>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(instruction_error("read", path)),
+    };
+    ensure!(
+        metadata.is_file(),
+        "{} must be a regular file",
+        safe_source(path)
+    );
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(instruction_error("read", path)),
+    };
+    let info =
+        kuru_platform::fs::regular_file_info(&file).map_err(|_| instruction_error("read", path))?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| instruction_error("read", path))?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(instruction_error("read", path));
+    }
+    let source = String::from_utf8(bytes).map_err(|_| instruction_error("encoding", path))?;
+    Ok(Some((source, info.identity.to_bytes())))
+}
+
+fn instruction_error(category: &str, path: &Path) -> anyhow::Error {
+    anyhow::anyhow!("instruction {category} error in {}", safe_source(path))
+}
+
+fn format_instructions(sources: &[InstructionSource]) -> String {
+    let mut combined = String::new();
+    if !sources.is_empty() {
+        combined.push_str("Project instructions follow from outermost to most local. Where instructions conflict, the most local applicable AGENTS.md takes precedence; higher-priority conversation instructions still apply.\n");
+    }
+    for source in sources {
+        combined.push_str(&format!(
+            "\n--- {}: {} ---\n",
+            source.kind.prompt_name(),
+            source.path.display()
+        ));
+        combined.push_str(&source.content);
         combined.push('\n');
     }
-    Ok(combined)
+    combined
+}
+
+/// Include every ancestor AGENTS.md, clearly identifying increasingly local scope.
+/// Source order conveys precedence without attempting to reinterpret instructions.
+pub fn load_instructions(project: &Path) -> Result<String> {
+    capture_instruction_sources(project).map(|sources| format_instructions(&sources))
 }
 
 #[cfg(test)]

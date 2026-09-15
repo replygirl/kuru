@@ -9,6 +9,7 @@ description = "Framework profiles, configuration, and shared contracts for Kuru"
 
 [dependencies]
 anyhow.workspace = true
+kuru-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

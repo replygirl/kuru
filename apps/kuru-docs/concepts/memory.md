@@ -50,7 +50,15 @@ $XDG_DATA_HOME/kuru/memory/<canonical-project-hash>/
 
 If `XDG_DATA_HOME` is unset, the data directory is `~/.local/share/kuru` on macOS/Linux or `$env:LOCALAPPDATA\kuru` on Windows, with `$env:USERPROFILE\AppData\Local\kuru` as its Windows fallback. `--data-dir` or `KURU_DATA_DIR` chooses a separate directory. Keep it outside the tool workspace and restrict access as you would any chat history.
 
-Kuru includes its verified native Dolt engine and license notices in the executable. First memory use extracts them locally, including when offline; later runs verify and reuse the cache at `tools/dolt` inside the data directory. No separate engine installation or runtime download is needed. `memory.cache_dir` selects another extraction directory. Corrupt existing caches fail explicitly and remain preserved.
+Kuru includes its verified native Dolt engine and license notices in the
+executable. First memory use extracts them locally, including when offline. Later
+runs read the complete cached payloads for their pinned digests, revalidate their
+checked names and identities, run the exact-version probe and reuse the cache at
+`tools/dolt` inside the data directory. Independent warm opens verify concurrently;
+the installation lock is reserved for missing-cache extraction and publication.
+No separate engine installation or runtime download is needed. `memory.cache_dir`
+selects another extraction directory. Corrupt existing caches fail before
+execution and remain preserved.
 
 Before memory opens, Kuru shows a small fixed progress sequence on standard
 error for current local work such as acquiring ownership, checking or extracting
@@ -120,11 +128,13 @@ An operating-system writer lock prevents two Kuru processes from overwriting the
 
 Close older Kuru sessions before the first launch with Dolt. Kuru imports the current project's rows from `memory.sqlite3`, verifies them, and preserves the original plus a complete snapshot under `memory/legacy/`. Other projects are imported when opened. After migration, older Kuru versions write only to the old SQLite store, so avoid using them with the same data directory.
 
-The legacy data directory must be private. On macOS and Linux, Kuru names an
-unsafe directory and asks you to run `chmod 700` on it; it never changes access
-modes automatically. On Windows, correct the directory's owner-only access in
-native file security settings before retrying. Kuru refuses before import, so
-the original SQLite files remain untouched.
+The data directory must be private. On macOS and Linux, Kuru names a rejected
+real current-user-owned directory with group or other access and asks you to
+restrict that exact path to mode 0700, whether or not legacy SQLite is present.
+It never changes access modes or offers that remedy for a link or foreign-owned
+path. On Windows, correct the directory's owner-only access in native file
+security settings before retrying. Kuru refuses before provisioning or import,
+so existing files remain untouched.
 
 An interrupted import can resume after validation. Partial imports are stopped and preserved under `memory/interrupted/`; a failed import never becomes the active store. Keep the original and snapshots until you have checked every project you want to retain.
 

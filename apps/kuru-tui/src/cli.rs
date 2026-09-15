@@ -412,27 +412,25 @@ async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
     }
 }
 
-fn legacy_data_directory_error(data: &Path, error: std::io::Error) -> anyhow::Error {
+fn data_directory_error(data: &Path, error: std::io::Error) -> anyhow::Error {
     #[cfg(unix)]
     if error.kind() == io::ErrorKind::PermissionDenied
-        && let (Ok(directory), Ok(source)) = (
-            std::fs::symlink_metadata(data),
-            std::fs::symlink_metadata(data.join("memory.sqlite3")),
-        )
-        && directory.is_dir()
-        && source.is_file()
+        && let Ok(directory) = std::fs::symlink_metadata(data)
+        && directory.file_type().is_dir()
     {
-        use std::os::unix::fs::PermissionsExt;
-        if directory.permissions().mode() & 0o077 != 0 {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if directory.uid() == nix::unistd::geteuid().as_raw()
+            && directory.permissions().mode() & 0o077 != 0
+        {
             return anyhow::Error::from(error).context(format!(
-                "legacy memory directory {data:?} is not owner-private; restrict this exact directory to mode 0700 (for example with chmod, using shell quoting) and retry"
+                "memory data directory {data:?} is not owner-private; restrict this exact directory to mode 0700 (for example with chmod, using shell quoting) and retry"
             ));
         }
     }
     #[cfg(windows)]
     if error.kind() == io::ErrorKind::PermissionDenied {
         return anyhow::Error::from(error).context(format!(
-            "legacy memory directory {data:?} is not owner-private; correct this directory's owner-only access with Windows file security settings and retry"
+            "memory data directory {data:?} is not owner-private; correct this directory's owner-only access with Windows file security settings and retry"
         ));
     }
     error.into()
@@ -637,10 +635,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     let migrate = legacy && !exists;
     let _lease = if writer || migrate {
         if let Err(error) = Directory::ensure_private(&data) {
-            if migrate {
-                return Err(legacy_data_directory_error(&data, error));
-            }
-            return Err(error.into());
+            return Err(data_directory_error(&data, error));
         }
         ensure_outside_workspace(&data, &cwd)?;
         Some(project_lease(&data, &cwd)?)
@@ -822,9 +817,10 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             notice.announce().await?;
         }
         let tools = ToolHost::with_retained_root(root.clone(), &config)?;
-        let mut harness = Harness::with_tool_host(
+        let mut harness = Harness::with_tool_host_and_instructions(
             config,
             &cwd,
+            snapshot.instructions().to_owned(),
             memory,
             provider,
             cli.resume.as_deref(),
@@ -939,6 +935,7 @@ fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClaimCategory> 
         Category::MemoryCacheDir,
         Category::ResponsesRoute,
         Category::ExternalAgent,
+        Category::ProjectInstructions,
     ]
     .into_iter()
     .collect()
@@ -975,6 +972,7 @@ fn command_claim_categories(
             Category::MemoryCacheDir,
             Category::ResponsesRoute,
             Category::ExternalAgent,
+            Category::ProjectInstructions,
         ],
         Some(
             Command::Login { .. }
@@ -1066,12 +1064,23 @@ fn manifest_text(
     } else {
         text.push_str("\nAuthority claims:");
         for claim in manifest.claims() {
-            text.push_str(&format!(
-                "\n  - {}: {} (source {})",
-                claim.category().label(),
-                claim.display(),
-                claim.source()
-            ));
+            if claim.category() == AuthorityClaimCategory::ProjectInstructions {
+                text.push_str(&format!(
+                    "\n  - {}: {}",
+                    claim.category().label(),
+                    claim.display()
+                ));
+                for (index, source) in claim.sources().iter().enumerate() {
+                    text.push_str(&format!("\n      {}. {source}", index + 1));
+                }
+            } else {
+                text.push_str(&format!(
+                    "\n  - {}: {} (source {})",
+                    claim.category().label(),
+                    claim.display(),
+                    claim.source()
+                ));
+            }
         }
     }
     text

@@ -23,7 +23,9 @@ pub use a2a::a2a_send;
 pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
 pub use mcp::McpStatus;
 pub use providers::{DemoProvider, Provider, ResponsesProvider, provider};
-pub use redaction::truncate_tool_output;
+pub use redaction::{
+    ProjectionError, json as project_json, text as project_text, truncate_tool_output,
+};
 pub use tools::{ToolCatalog, ToolHost};
 
 /// Maximum protocol message/body size; limits also apply to chunked responses.

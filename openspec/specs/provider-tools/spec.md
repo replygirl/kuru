@@ -87,29 +87,41 @@ authority, and an allowlisted name MUST NOT be treated as proof that its value
 is nonsecret. Configured stdio MCP inheritance and `McpConfig.env` overrides
 MUST remain unchanged.
 
-The built-in Unix shell MUST register an independent owner before launch and
-retain its root child, stdout/stderr readers, and exact workspace `Directory`
-through cleanup. Its public timeout MUST begin at invocation acceptance and its
-caller wait MUST end within that operation deadline plus one five-second
-cleanup-confirmation allowance. Natural completion MUST require both pipe EOFs
-and non-reaping root-exit observation, terminate remaining members of the
-original group before reaping the root, preserve that root's original status,
-and observe group absence before returning success. Timeout, overflow, read
-failure, caller loss, parent-runtime loss, and shutdown MUST enter the same
-owned cleanup path without replacing the primary failure.
+The built-in Unix shell MUST reserve one fixed process-wide retained-owner
+admission slot before it creates an OS worker or process; no registry, dropped
+registry, caller, or parent runtime may bypass that shared bound. Capacity
+exhaustion MUST fail immediately with fixed Kuru-authored text, without a queued
+waiter, worker, or process. That slot MUST follow the independent owner through
+its root child, stdout/stderr readers, exact workspace `Directory`, and every
+unconfirmed cleanup retry; it MUST release exactly once only after a worker
+terminates before spawning a child or confirmed root reap and group absence.
+
+Its public timeout MUST begin at invocation acceptance and its caller wait MUST
+end within that operation deadline plus one five-second cleanup-confirmation
+allowance. Natural completion MUST require both pipe EOFs and non-reaping
+root-exit observation, terminate remaining members of the original group before
+reaping the root, preserve that root's original status, and observe group
+absence before returning success. Timeout, overflow, read failure, caller loss,
+parent-runtime loss, and shutdown MUST enter the same owned cleanup path without
+replacing the primary failure.
 
 After confirmed cleanup, or after a worker terminates before spawning a child,
 the worker MUST remove only its own registry reservation before publishing its
 result to the caller. A spawned worker whose cleanup remains unconfirmed MUST
-remain registered until later confirmation.
+remain registered and retain its admission slot until later confirmation. Its
+indefinite retained cleanup MUST make one phase-safe existing cleanup
+observation, then use capped exponential retry intervals before its next actual
+platform observation; it MUST never abandon confirmed ownership, introduce a
+give-up deadline, or signal a numeric PID after the owned group’s phase no
+longer permits it.
 
 `ToolHost` shutdown MUST close shell registration, request cancellation, and
 await all registered owners within one bounded observation window while still
 running MCP cleanup. A bounded unconfirmed result MUST leave the independent
-worker holding its process, pipe, and workspace capability until later reap and
-absence confirmation; it MUST NOT claim synchronous cleanup. This ownership is
-limited to the built-in shell and MUST NOT claim control of escaped processes,
-the memory writer lease, or configured MCP lifecycles.
+worker holding its process, pipe, workspace capability, and admission slot until
+later reap and absence confirmation; it MUST NOT claim synchronous cleanup.
+This ownership is limited to the built-in shell and MUST NOT claim control of
+escaped processes, the memory writer lease, or configured MCP lifecycles.
 
 Built-in file-read and shell output that exceeds its retained-output budget MUST
 remain a bounded visible head-and-tail excerpt after recognized-secret projection,
@@ -118,6 +130,18 @@ UTF-8 boundaries and every visible recognized-secret marker whole. Model-facing
 tool receipts MUST retain the call ID and valid JSON while applying the same
 bounded excerpt rule. MCP stdio, HTTP JSON, and SSE framing/parser admission
 bounds remain separate protocol limits.
+
+#### Scenario: Unix shell admission is process-wide
+- **WHEN** independent shell registries retain owners until their shared fixed admission cap is occupied
+- **THEN** a later shell request receives the fixed capacity error before a worker or child starts, and no registry can exceed the shared cap.
+
+#### Scenario: Unconfirmed shell ownership retains its slot
+- **WHEN** a caller and its registry are dropped after an owned cleanup remains unconfirmed
+- **THEN** the retained worker keeps its admission slot and later releases it exactly once only after phase-safe reap and group-absence confirmation.
+
+#### Scenario: Retained shell observations are paced
+- **WHEN** cleanup remains unconfirmed beyond the caller’s five-second cleanup allowance
+- **THEN** the worker retains the owned group indefinitely but makes actual phase-safe cleanup observations at capped exponential intervals rather than repeatedly running a short polling window.
 
 #### Scenario: Symlink escape
 - **WHEN** a filesystem call follows a workspace symlink outside the root
@@ -128,17 +152,14 @@ bounds remain separate protocol limits.
 - **THEN** the tool host neither exposes nor executes that authority.
 
 #### Scenario: Authorized shell receives finite compatibility environment
-
 - **WHEN** an authorized built-in shell starts from a parent containing the documented compatibility entries plus fake provider, proxy, SSH-agent, Kuru, loader and startup-injection values
 - **THEN** the real child observes the exact applicable compatibility values and none of the other parent entries, while its ordinary cwd, command discovery, output, timeout and cleanup behavior remains available.
 
 #### Scenario: Stock Windows shell uses native baseline
-
 - **WHEN** the built-in shell starts native Windows PowerShell with case-varied environment names, an inherited `PATHEXT` or no `PATHEXT`, and hostile replacements for OS shell paths and `PSModulePath`
 - **THEN** it uses the native-derived system paths, preserves the sole inherited `PATHEXT` or the conventional fallback, rejects case-equivalent ambiguity, reconstructs stock modules and receives no `PSModulePath`.
 
 #### Scenario: Configured stdio MCP retains its environment contract
-
 - **WHEN** a configured stdio MCP starts after built-in shell minimization with one fake inherited non-allowlisted sentinel and one explicit `McpConfig.env` override
 - **THEN** the MCP child receives both under its existing contract rather than the built-in shell projection.
 
@@ -155,10 +176,8 @@ bounds remain separate protocol limits.
 - **THEN** the caller returns a fixed bounded cancellation or unconfirmed-cleanup result, and the later worker observes cancellation and starts no child.
 
 #### Scenario: Confirmed worker publication has no stale reservation
-- **WHEN** a confirmed Unix shell worker wakes its result receiver while another
-  shell owner remains registered
-- **THEN** its own reservation is already absent and the other owner remains
-  registered.
+- **WHEN** a confirmed Unix shell worker wakes its result receiver while another shell owner remains registered
+- **THEN** its own reservation is already absent and the other owner remains registered.
 
 #### Scenario: Unix ownership observation remains interrupted
 - **WHEN** repeated bounded `EINTR` leaves an owned root anchored beyond the caller's cleanup allowance
@@ -166,14 +185,11 @@ bounds remain separate protocol limits.
 
 #### Scenario: Oversized built-in shell streams
 - **WHEN** shell stdout or stderr exceeds its independent retained-output budget
-- **THEN** the completed tool result preserves a marked head and tail for that
-  stream, drains both streams through EOF within the existing operation and
-  cleanup authority, and does not combine their budgets or extend its deadline.
+- **THEN** the completed tool result preserves a marked head and tail for that stream, drains both streams through EOF within the existing operation and cleanup authority, and does not combine their budgets or extend its deadline.
 
 #### Scenario: Tail survives a model receipt boundary
 - **WHEN** a projected built-in tool result exceeds the model receipt budget
-- **THEN** the receipt remains valid JSON with its original call ID and contains
-  a marked head-and-tail excerpt without a partial recognized-secret marker.
+- **THEN** the receipt remains valid JSON with its original call ID and contains a marked head-and-tail excerpt without a partial recognized-secret marker.
 
 ### Requirement: Standard protocol adapters
 
@@ -382,34 +398,76 @@ It MUST NOT claim recognition of arbitrary, encoded, split, transformed or futur
 secret formats.
 
 The finite set MUST include Basic and Bearer Authorization and
-Proxy-Authorization values; bounded local OpenAI, GitHub and AWS token heuristics;
-supported private-key blocks; and exact contextual sensitive field names. In
-typed JSON, an exact contextual or Authorization key MUST replace its complete
-associated value even when that value is non-string, while other string keys and
-values replace only recognized spans. Typed JSON MUST remain valid and MUST fail
-safely rather than overwrite members if projected keys collide. Arbitrary text
-which happens to parse as JSON MUST remain text, while bare and matching-quoted
-contextual/header assignment syntax is still recognized.
+Proxy-Authorization values; bounded local OpenAI, GitHub, Slack, GitLab and AWS
+token heuristics; JWT-shaped three-segment values; URL userinfo for bounded
+RFC-style schemes; supported private-key blocks; and exact contextual sensitive
+field names, including bare `token` and `secret`. JWT recognition MUST require a
+base64url JSON-object header with a nonempty `alg` field and three bounded
+base64url segments; it is a detector, not credential validation. An overlong
+pending recognizable candidate MUST project fail-closed rather than return raw
+buffered text. In typed JSON, an exact contextual or Authorization
+key MUST replace its complete associated value even when that value is non-string,
+while other string keys and values replace only recognized spans. Typed JSON
+MUST remain valid and MUST fail safely rather than overwrite members if projected
+keys collide. Arbitrary text which happens to parse as JSON MUST remain text,
+while bare and matching-quoted contextual/header assignment syntax is still
+recognized.
+
+The connector SHALL expose its text and JSON projection operations as pure
+reusable APIs while preserving `ToolHost::execute`'s existing public
+`Result<String>` interface. The projection scanner MUST remain bounded across
+arbitrary byte chunking and replace a recognized span before retained truncation
+can expose a fragment.
 
 #### Scenario: Successful tool content is projected
 
-- **WHEN** an allowed file read, native shell result or successful stdio or HTTP MCP response contains a supported synthetic credential pattern
-- **THEN** `ToolHost::execute` returns the visible marker in place of that pattern and returns no raw match through another error or formatting path
+- **WHEN** an allowed file read, native shell or successful stdio or HTTP MCP
+  response contains a supported synthetic credential pattern
+- **THEN** `ToolHost::execute` returns the visible marker in place of that
+  pattern and returns no raw match through another error or formatting path
 
 #### Scenario: Sensitive typed field is projected
 
-- **WHEN** a typed JSON tool result contains an exact sensitive or Authorization key with a string, numeric, boolean, null, array or object value
-- **THEN** its whole associated value is the marker, all unrelated structure remains semantically unchanged and the serialization is valid JSON
+- **WHEN** a typed JSON tool result contains an exact sensitive or Authorization
+  key with a string, numeric, boolean, null, array or object value
+- **THEN** its whole associated value is the marker, all unrelated structure
+  remains semantically unchanged and the serialization is valid JSON
 
 #### Scenario: Quoted contextual text is projected without JSON coercion
 
-- **WHEN** arbitrary text contains a matching-quoted contextual or Authorization key and value in JSON-like syntax
-- **THEN** only its recognized value span is replaced and the surrounding text is not parsed, reordered or reserialized
+- **WHEN** arbitrary text contains a matching-quoted contextual or Authorization
+  key and value in JSON-like syntax
+- **THEN** only its recognized value span is replaced and the surrounding text
+  is not parsed, reordered or reserialized
 
 #### Scenario: Unrecognized ordinary output is preserved
 
-- **WHEN** tool output contains ordinary source text, hashes, UUIDs, model names, generic base64 or JWT-like values, certificates or provider-like strings below the documented local floors
-- **THEN** its unmatched bytes remain identical and Kuru makes no claim that an unknown credential shape would be found
+- **WHEN** tool output contains ordinary source text, hashes, UUIDs, model
+  names, generic base64, certificates or provider-like strings below documented
+  local floors
+- **THEN** its unmatched bytes remain identical and Kuru makes no claim that an
+  unknown credential shape would be found
+
+#### Scenario: Expanded recognizable forms are projected
+
+- **WHEN** allowed tool text or typed JSON contains a qualifying Slack `xox*`,
+  GitLab `glpat-`, JWT-shaped, URL-userinfo, `token=` or `secret=` synthetic value
+- **THEN** the returned projection contains the visible marker and no raw matched
+  span
+
+#### Scenario: Ordinary near matches remain exact
+
+- **WHEN** tool output contains ordinary dotted identifiers, non-userinfo URLs,
+  `tokenize` or `secretary`, an invalid or short JWT-like value, or a short token
+  prefix
+- **THEN** unmatched bytes remain identical
+
+#### Scenario: Added forms survive streaming boundaries
+
+- **WHEN** each added recognizable form is split at every byte boundary or read
+  one byte at a time
+- **THEN** streaming projection equals whole-value projection and contains no
+  raw matched fragment
 
 ### Requirement: Typed tool output and application errors
 
