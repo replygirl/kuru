@@ -65,7 +65,7 @@ Invoke-CargoJson -Arguments @('metadata', '--format-version=1', '--no-deps', '--
 $fullMessages = Join-Path $state 'full-messages.json'
 $fullArgs = @(
     'test', '--workspace', '--all-targets', '--all-features', '--locked',
-    '--no-run', '--message-format=json'
+    '--no-run', '--message-format=json-render-diagnostics'
 )
 Invoke-CargoJson -Arguments $fullArgs -Path $fullMessages
 $inventory = Join-Path $state 'inventory.json'

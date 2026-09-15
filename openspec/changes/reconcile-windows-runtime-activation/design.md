@@ -57,6 +57,13 @@ release its real blocker only after observing the first denied no-move result,
 proving the production retry. Other controls keep the blocker, mutate names or
 identities, and cancel the caller to prove the deadline and ownership boundaries.
 
+The Windows coverage helper will request Cargo's native
+`json-render-diagnostics` message format for the full build arguments. Cargo
+continues to emit the JSON stream consumed for executable inventory on standard
+output, while rendered compiler diagnostics also reach standard error. This is
+a diagnostic correction only; it does not add a parser, change shard selection,
+or handle compilation failures globally.
+
 ## Risks / Trade-offs
 
 - A two-second retry can delay reporting a persistent access denial. → Only the
@@ -69,3 +76,6 @@ identities, and cancel the caller to prove the deadline and ownership boundaries
   detached; dropping the same owned future releases its source, private stage
   and cache lock together, and native tests prove no partial destination or
   competing-writer window.
+- Rendered Cargo diagnostics add human-readable error output beside the machine
+  stream. → The helper retains the same Cargo JSON inventory and changes only
+  the supported message-format variant used for native builds.

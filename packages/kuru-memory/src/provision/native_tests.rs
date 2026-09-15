@@ -394,15 +394,16 @@ async fn cancelling_checked_activation_recovery_drops_stage_before_cache_lock() 
     let (_parent, blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
     let destination = cache.join("active");
     let lock_path = cache.join(".install.lock");
-    let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<tokio::task::AbortHandle>));
     let observer_abort_slot = abort_slot.clone();
+    let task_destination = destination.clone();
     let task = tokio::spawn(async move {
         let mut blocker = Some(blocker);
         activate_staged_observed(
             stage,
             lock,
             &candidate,
-            &destination,
+            &task_destination,
             move |proven_no_move| {
                 if proven_no_move {
                     drop(blocker.take());
