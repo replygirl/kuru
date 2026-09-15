@@ -250,12 +250,15 @@ conventional version calculation, signed app commit, exact-SHA checks, verified
 archives and Communiqué notes. Preserve the scoped credential names documented
 there; no credentials belong in source or generated artifacts.
 
-Build and publish docs only through the final `build-docs` and `deploy-docs` jobs
-inside that Release workflow, after release publication succeeds and from the
-exact released commit. For recovery, rerun those jobs on the existing release
-run. Do not add or dispatch a standalone Pages workflow, including for initial
-site setup; merging a PR is not a docs deployment trigger. CI may build and
-validate a preview without publishing it.
+Build and publish docs only through the `build-docs` and `deploy-docs` jobs inside
+that Release workflow and from the exact selected release commit. The staged
+Windows candidate acceptance and documentation deployment must succeed before
+the sole final job can promote the public release. For recovery, rerun the failed
+jobs on the existing release run; Pages deployment and GitHub release promotion
+are ordered but are not one atomic service operation. Do not add or dispatch a
+standalone Pages workflow, including for initial site setup; merging a PR is not
+a docs deployment trigger. CI may build and validate a preview without
+publishing it.
 
 ## Documentation and security
 

@@ -40,6 +40,14 @@ enum Action {
         #[arg(long)]
         expected_sha: String,
     },
+    Assemble {
+        #[arg(long)]
+        version: Version,
+        #[arg(long, default_value = "dist")]
+        directory: PathBuf,
+        #[arg(long)]
+        notes: PathBuf,
+    },
     Publish {
         #[arg(long)]
         version: Version,
@@ -106,6 +114,14 @@ async fn execute(root: &Path, action: Action) -> Result<()> {
             "sha",
             &release::commit_version(root, &github()?, &expected_sha, version).await?,
         )])?,
+        Action::Assemble {
+            version,
+            directory,
+            notes,
+        } => println!(
+            "Assembled {} release candidate checks",
+            release::assemble(&directory, version, &notes)?
+        ),
         Action::Publish {
             version,
             sha,

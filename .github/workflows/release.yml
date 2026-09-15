@@ -240,13 +240,13 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-  publish:
+  assemble-candidate:
     needs: [plan, bump, build, notes]
     runs-on: ubuntu-24.04
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
-    permissions:
-      contents: write
+    outputs:
+      artifact_name: ${{ steps.artifact.outputs.name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -267,17 +267,26 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-notes
-      - name: Verify assets and publish complete draft
+      - name: Validate the complete release candidate
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
-          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
-        run: mise run release:tool -- publish --version "$RELEASE_VERSION" --sha "$RELEASE_SHA" --directory dist --notes RELEASE_NOTES.md
+        run: mise run release:tool -- assemble --version "$RELEASE_VERSION" --directory dist --notes RELEASE_NOTES.md
+      - name: Select this candidate's artifact
+        id: artifact
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: printf 'name=release-candidate-%s\n' "$RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: |
+            dist/*
+            RELEASE_NOTES.md
+          if-no-files-found: error
 
-  verify-published-windows:
-    name: Verify published Windows release
-    needs: [plan, bump, publish]
+  verify-staged-windows:
+    name: Verify staged Windows release
+    needs: [plan, bump, assemble-candidate]
     runs-on: windows-2025
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
@@ -294,26 +303,19 @@ jobs:
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
-      - name: Verify the exact published package
-        shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
-          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
-          RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          KURU_PUBLISHED_WINDOWS_RECEIPT: ${{ github.workspace }}/published-windows-verification.json
-        run: mise run //packages/kuru-delivery:verify:published-windows
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: published-windows-verification
-          path: published-windows-verification.json
-          if-no-files-found: error
-          overwrite: true
+          name: ${{ needs.assemble-candidate.outputs.artifact_name }}
+          path: candidate
+      - name: Verify the exact staged package
+        env:
+          KURU_STAGED_WINDOWS_ARCHIVE: ${{ github.workspace }}/candidate/dist/kuru-${{ needs.plan.outputs.version }}-x86_64-pc-windows-msvc.zip
+        run: mise run //apps/kuru-tui:verify:staged-windows
 
-  # Keep documentation in this release run, built from its published commit.
-  # To recover a docs-only failure, rerun these jobs on the same release run.
+  # Documentation and staged acceptance must finish before public promotion.
   build-docs:
     name: Build docs
-    needs: [bump, publish, verify-published-windows]
+    needs: [bump, assemble-candidate]
     runs-on: ubuntu-24.04
     outputs:
       artifact_name: ${{ steps.artifact.outputs.name }}
@@ -354,7 +356,7 @@ jobs:
 
   deploy-docs:
     name: Deploy docs
-    needs: build-docs
+    needs: [build-docs, verify-staged-windows]
     runs-on: ubuntu-24.04
     concurrency:
       group: github-pages
@@ -371,3 +373,34 @@ jobs:
         with:
           # A deploy-only retry retains the prior successful build's output.
           artifact_name: ${{ needs.build-docs.outputs.artifact_name }}
+
+  # Public promotion is the final operation, after every required gate succeeds.
+  publish:
+    needs: [plan, bump, assemble-candidate, verify-staged-windows, deploy-docs]
+    runs-on: ubuntu-24.04
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust aqua:jdx/hk
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.assemble-candidate.outputs.artifact_name }}
+      - name: Publish the verified complete candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
+        run: mise run release:tool -- publish --version "$RELEASE_VERSION" --sha "$RELEASE_SHA" --directory dist --notes RELEASE_NOTES.md

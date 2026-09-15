@@ -615,21 +615,34 @@ pub async fn ensure_tag(api: &GitHub, selected: Version, candidate: &str) -> Res
     .await?;
     Ok(())
 }
-pub fn assets(directory: &Path, selected: Version) -> Result<BTreeMap<String, String>> {
+fn archive_assets(directory: &Path, selected: Version) -> Result<BTreeMap<String, String>> {
     let expected: BTreeSet<_> = TARGETS
         .iter()
         .map(|target| crate::archive::archive_name(&selected.to_string(), target))
         .collect::<Result<_>>()?;
+    let sidecars = expected
+        .iter()
+        .map(|name| format!("{name}.sha256"))
+        .collect::<BTreeSet<_>>();
+    let allowed = expected
+        .iter()
+        .chain(sidecars.iter())
+        .cloned()
+        .chain(std::iter::once("SHA256SUMS".into()))
+        .collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
     for entry in fs::read_dir(directory)? {
-        let name = entry?.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".tar.gz") || name.ends_with(".zip") {
-            actual.insert(name);
-        }
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        ensure!(
+            allowed.contains(&name) && entry.file_type()?.is_file(),
+            "release candidate contains an unexpected or nonregular entry"
+        );
+        actual.insert(name);
     }
     ensure!(
-        actual == expected,
-        "release must contain exactly five supported native archives"
+        expected.is_subset(&actual) && sidecars.is_subset(&actual),
+        "release candidate must contain exactly five supported native archives and sidecars"
     );
     let mut checksums = BTreeMap::new();
     for name in expected {
@@ -647,13 +660,59 @@ pub fn assets(directory: &Path, selected: Version) -> Result<BTreeMap<String, St
         );
         checksums.insert(name, digest);
     }
-    let manifest: String = checksums
+    Ok(checksums)
+}
+
+fn checksum_manifest(checksums: &BTreeMap<String, String>) -> String {
+    checksums
         .iter()
         .map(|(name, digest)| format!("{digest}  {name}\n"))
-        .collect();
+        .collect()
+}
+
+fn checked_notes(notes: &Path) -> Result<()> {
+    let body = fs::read_to_string(notes)?;
+    ensure!(
+        !body.trim().is_empty() && body.len() <= 100_000,
+        "release notes must be bounded and nonempty"
+    );
+    Ok(())
+}
+
+/// Generate the manifest for a complete, local release candidate.
+pub fn assets(directory: &Path, selected: Version) -> Result<BTreeMap<String, String>> {
+    let mut checksums = archive_assets(directory, selected)?;
+    let manifest = checksum_manifest(&checksums);
     fs::write(directory.join("SHA256SUMS"), &manifest)?;
     checksums.insert("SHA256SUMS".into(), digest(manifest.as_bytes()));
     Ok(checksums)
+}
+
+fn assembled_assets(
+    directory: &Path,
+    selected: Version,
+    notes: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let mut checksums = archive_assets(directory, selected)?;
+    let manifest = checksum_manifest(&checksums);
+    ensure!(
+        fs::read_to_string(directory.join("SHA256SUMS"))? == manifest,
+        "candidate checksum manifest differs from its archives"
+    );
+    checked_notes(notes)?;
+    checksums.insert("SHA256SUMS".into(), digest(manifest.as_bytes()));
+    Ok(checksums)
+}
+
+/// Assemble one complete candidate without contacting GitHub.
+pub fn assemble(directory: &Path, selected: Version, notes: &Path) -> Result<usize> {
+    let generated = assets(directory, selected)?;
+    let checked = assembled_assets(directory, selected, notes)?;
+    ensure!(
+        generated == checked,
+        "assembled candidate verification disagrees with its generated manifest"
+    );
+    Ok(checked.len())
 }
 async fn find_release(api: &GitHub, selected: Version) -> Result<Option<Value>> {
     let tag = format!("v{selected}");
@@ -774,12 +833,8 @@ pub async fn publish(
             "missing release draft state"
         );
     }
-    let checksums = assets(directory, selected)?;
+    let checksums = assembled_assets(directory, selected, notes)?;
     let body = fs::read_to_string(notes)?;
-    ensure!(
-        !body.trim().is_empty() && body.len() <= 100_000,
-        "release notes must be bounded and nonempty"
-    );
     let present = if let Some(release) = &existing {
         remote_assets(release, &checksums)?
     } else {
