@@ -1820,6 +1820,37 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    #[ignore = "subprocess entrypoint for windows_shell_timeout_keeps_eof_complete_redacted_stderr"]
+    async fn windows_shell_eof_launcher_retains_only_stdout() -> Result<()> {
+        use kuru_platform::windows::process::{
+            Lifetime, NativeSpawnSpec, StandardStream, Stdio, inherited_stdio, system_directory,
+        };
+
+        const ROOT: &str = "KURU_WINDOWS_SHELL_EOF_ROOT";
+        let root = PathBuf::from(std::env::var_os(ROOT).context("missing test root")?);
+        let system = system_directory()?;
+        let mut spec = NativeSpawnSpec::new(system.join("ping.exe"), root.clone());
+        spec.args = vec!["-n".into(), "90".into(), "127.0.0.1".into()];
+        // This child stays in the outer ToolHost-owned Job after this short-lived
+        // launcher exits. It must retain stdout only: the explicit native handle
+        // list deliberately excludes the ToolHost stderr pipe.
+        spec.lifetime = Lifetime::TrustedSupervisor;
+        spec.stdout = inherited_stdio(StandardStream::Output)?;
+        spec.stdin = Stdio::Null;
+        spec.stderr = Stdio::Null;
+        for key in ["SystemRoot", "WINDIR", "LLVM_PROFILE_FILE"] {
+            if let Some(value) = std::env::var_os(key) {
+                spec.environment.push((key.into(), value));
+            }
+        }
+        let child = spec.spawn().await?;
+        drop(child);
+        std::fs::write(root.join("stderr-eof-ready"), "ready")?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn windows_shell_timeout_keeps_eof_complete_redacted_stderr() {
         const SECRET: &str = "sk-abcdefghijklmnop";
         const OPERATION_TIMEOUT_SECS: u64 = 60;
@@ -1835,18 +1866,34 @@ mod tests {
             },
         )
         .unwrap();
+        let powershell_literal =
+            |value: &OsStr| format!("'{}'", value.to_string_lossy().replace('\'', "''"));
+        let root_literal = powershell_literal(root.path().as_os_str());
+        let test_binary_literal = powershell_literal(
+            std::env::current_exe()
+                .expect("current test binary path")
+                .as_os_str(),
+        );
+        // Instrumented test runs need the runner-selected profile destination
+        // through this short-lived test-binary launcher.
+        let llvm_profile = std::env::var_os("LLVM_PROFILE_FILE")
+            .as_deref()
+            .map(|value| format!("$env:LLVM_PROFILE_FILE = {}\n", powershell_literal(value)))
+            .unwrap_or_default();
         let command = format!(
             r#"
-$child_info = New-Object System.Diagnostics.ProcessStartInfo
-$child_info.FileName = $env:ComSpec
-$child_info.Arguments = '/d /c ping -n 90 127.0.0.1'
-$child_info.UseShellExecute = $false
-$child_info.RedirectStandardError = $true
-$child = New-Object System.Diagnostics.Process
-$child.StartInfo = $child_info
-if (-not $child.Start()) {{ throw 'could not start stdout-retaining fixture child' }}
-$child.StandardError.Close()
-[IO.File]::WriteAllText((Join-Path (Get-Location) 'stderr-eof-ready'), 'ready')
+$env:KURU_WINDOWS_SHELL_EOF_ROOT = {root_literal}
+{llvm_profile}$launcher_info = New-Object System.Diagnostics.ProcessStartInfo
+$launcher_info.FileName = {test_binary_literal}
+$launcher_info.Arguments = '--exact tools::tests::windows_shell_eof_launcher_retains_only_stdout --ignored --nocapture'
+$launcher_info.UseShellExecute = $false
+$launcher_info.RedirectStandardOutput = $false
+$launcher_info.RedirectStandardError = $false
+$launcher = New-Object System.Diagnostics.Process
+$launcher.StartInfo = $launcher_info
+if (-not $launcher.Start()) {{ throw 'could not start stdout-retaining fixture launcher' }}
+$launcher.WaitForExit()
+if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed' }}
 [Console]::Error.Write('useful {SECRET} detail')
 "#
         );
@@ -1885,12 +1932,14 @@ $child.StandardError.Close()
             assert!(
                 output.contains(
                     "shell timed out; stderr: useful [REDACTED:recognized-secret] detail"
-                )
+                ),
+                "{output}"
             );
             assert!(!output.contains(SECRET));
             assert!(!output.contains(&command));
             assert!(!output.contains("<pending EOF>"));
             assert!(!output.contains("<unavailable>"));
+            assert!(!output.contains("cleanup: unconfirmed ownership retained"));
         }
         assert_eq!(error.chain().count(), 1);
     }
