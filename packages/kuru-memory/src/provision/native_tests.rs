@@ -231,6 +231,104 @@ async fn activation_source_open_failure_preserves_stage_before_releasing_cache_l
 
 #[cfg(windows)]
 #[tokio::test]
+async fn held_cold_probe_copy_does_not_block_candidate_activation() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache café 東京");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_path = stage.path().to_owned();
+    let candidate = stage_path.join("runtime");
+    extract(EMBEDDED_ARCHIVE, &candidate, BUNDLED_ASSET).unwrap();
+    let source_identity = files::directory(&candidate).unwrap().identity();
+    let candidate_binary = candidate.join(BUNDLED_ASSET.executable_name);
+    let (candidate_parent, candidate_file) =
+        files::read(&candidate_binary, Privacy::OwnerOnly).unwrap();
+    let candidate_binary_identity = regular_file_info(&candidate_file).unwrap().identity;
+    drop(candidate_file);
+    drop(candidate_parent);
+
+    let probe_home = stage_path.join("probe");
+    let mut observed_probe_identity = None;
+    let probe = prepare_cold_probe_observed(&candidate, &probe_home, BUNDLED_ASSET, |file| {
+        let identity = regular_file_info(file)?.identity;
+        assert_ne!(
+            identity, candidate_binary_identity,
+            "cold probe image must have a distinct filesystem identity"
+        );
+        observed_probe_identity = Some(identity);
+        Ok(())
+    })
+    .unwrap();
+    let probe_binary = probe.binary.clone();
+    assert!(
+        !probe_binary.starts_with(&candidate),
+        "cold probe image must be outside the candidate directory being activated"
+    );
+    let (probe_parent, probe_file) = files::read(&probe_binary, Privacy::OwnerOnly).unwrap();
+    assert_eq!(
+        regular_file_info(&probe_file).unwrap().identity,
+        observed_probe_identity.expect("verified copy observer ran"),
+        "the checked probe copy changed before it was opened for the native hold"
+    );
+    drop(probe_file);
+    drop(probe_parent);
+
+    // Permit the actual version probe to read and execute its isolated copy,
+    // but model a loaded Windows image by denying DELETE sharing. This known
+    // condition must affect only the probe copy, never the activation source.
+    let blocker = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&probe_binary)
+        .unwrap();
+    let renamed_probe = probe_binary.with_file_name("probe-image-renamed.exe");
+    let error = fs::rename(&probe_binary, &renamed_probe)
+        .expect_err("retained probe image handle must deny renaming its own copy");
+    assert_eq!(error.raw_os_error(), Some(32));
+    assert!(probe_binary.is_file());
+    assert!(!renamed_probe.exists());
+
+    let (probe, (stage, lock)) = probe.probe((stage, lock)).await.unwrap();
+    let destination = cache.join("active");
+    activate_staged_after_probe(stage, lock, probe, &candidate, &destination)
+        .await
+        .unwrap();
+    assert_eq!(
+        files::directory(&destination).unwrap().identity(),
+        source_identity
+    );
+    assert!(!candidate.exists());
+    verify_payload(
+        &destination.join(BUNDLED_ASSET.executable_name),
+        BUNDLED_ASSET.executable_bytes,
+        BUNDLED_ASSET.executable_sha256,
+        true,
+    )
+    .unwrap();
+    verify_payload(
+        &destination.join("LICENSES"),
+        BUNDLED_ASSET.license_bytes,
+        BUNDLED_ASSET.license_sha256,
+        false,
+    )
+    .unwrap();
+    assert!(
+        blocker.metadata().is_ok(),
+        "the isolated no-DELETE probe handle must remain held through activation"
+    );
+    let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    drop(reacquired);
+    drop(blocker);
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn held_descendant_releases_after_checked_no_move_and_activation_recovers() {
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache café 東京");

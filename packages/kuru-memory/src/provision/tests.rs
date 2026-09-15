@@ -249,6 +249,83 @@ async fn corrupt_cache_is_rejected_before_execution_and_links_are_never_adopted(
     assert!(private_directory(&shared).is_err());
 }
 
+#[test]
+fn cold_probe_copy_rejects_corrupt_source_and_corrupt_copied_bytes() {
+    let fixture = &*VALID_FIXTURE;
+
+    let source_root = crate::test_support::tempdir().unwrap();
+    let source_candidate = fixture.extract(source_root.path()).unwrap();
+    let mut corrupt_source = SCRIPT.to_vec();
+    corrupt_source[0] = b'!';
+    fs::set_permissions(
+        source_candidate.join("dolt"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    executable(&source_candidate.join("dolt"), &corrupt_source);
+    let source_error = prepare_cold_probe(
+        &source_candidate,
+        &source_root.path().join("probe"),
+        fixture.spec(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{source_error:#}").contains("payload checksum mismatch"),
+        "{source_error:#}"
+    );
+
+    let copy_root = crate::test_support::tempdir().unwrap();
+    let copy_candidate = fixture.extract(copy_root.path()).unwrap();
+    let copy_error = prepare_cold_probe_observed(
+        &copy_candidate,
+        &copy_root.path().join("probe"),
+        fixture.spec(),
+        |copy| {
+            std::io::Seek::rewind(copy)?;
+            copy.write_all(b"!")?;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{copy_error:#}").contains("payload checksum mismatch"),
+        "{copy_error:#}"
+    );
+}
+
+#[tokio::test]
+async fn failing_exact_version_probe_never_activates_and_releases_installation_authority() {
+    const FAILING: &[u8] = b"#!/bin/sh\nexit 17\n";
+    static FIXTURE: std::sync::LazyLock<Fixture> = std::sync::LazyLock::new(|| {
+        let mut fixture = Fixture::new(|entries| entries[2].3 = FAILING.to_vec());
+        fixture.binary_digest = digest(FAILING);
+        fixture.binary_bytes = FAILING.len() as u64;
+        fixture
+    });
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    let (staged, received) = tokio::sync::oneshot::channel();
+    let error = provision_with_extractor(
+        &MemoryConfig::default(),
+        &cache,
+        FIXTURE.spec(),
+        Cow::Borrowed(&FIXTURE.bytes),
+        move |bytes, candidate, asset| {
+            extract(bytes, candidate, asset)?;
+            staged.send(candidate.to_owned()).unwrap();
+            Ok(())
+        },
+    )
+    .await
+    .unwrap_err();
+    let candidate = received.await.unwrap();
+    assert!(format!("{error:#}").contains("Dolt version probe failed"));
+    assert!(!candidate.exists());
+    assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 0);
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    drop(lock);
+}
+
 #[tokio::test]
 async fn stable_lock_waits_times_out_and_does_not_delete_a_held_inode() {
     let temporary = crate::test_support::tempdir().unwrap();

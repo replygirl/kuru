@@ -8,7 +8,7 @@ use crate::progress::ProgressReporter;
 use anyhow::{Context, Result, bail, ensure};
 use flate2::bufread::GzDecoder;
 use kuru_core::MemoryConfig;
-use kuru_platform::fs::{Directory, NameRetention, Privacy, seal_private};
+use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info, seal_private};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -16,7 +16,7 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     fs::{self, File, TryLockError},
-    io::{Cursor, Read},
+    io::{Cursor, Read, Seek},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -145,13 +145,29 @@ async fn provision_with_extractor_observed(
     .await?;
     extraction?;
     progress.report(MemoryOpenStage::CheckingRuntimeVersion);
-    let (staging, lock) = owned_probe(
-        candidate.join(asset.executable_name),
-        staging.path().join("probe"),
-        (staging, lock),
-    )
+    let probe_home = staging.path().join("probe");
+    let candidate_path = candidate.clone();
+    let probe_path = probe_home.clone();
+    let (probe, staging, lock) = tokio::task::spawn_blocking(move || {
+        // On cancellation, the completed output drops in this field order:
+        // checked probe, disposable stage, then installation authority.
+        (
+            prepare_cold_probe(&candidate_path, &probe_path, asset),
+            staging,
+            lock,
+        )
+    })
     .await?;
-    activate_staged(staging, lock, &candidate, &destination).await?;
+    let probe = match probe {
+        Ok(probe) => probe,
+        Err(error) => {
+            drop(staging);
+            drop(lock);
+            return Err(error);
+        }
+    };
+    let (probe, (staging, lock)) = probe.probe((staging, lock)).await?;
+    activate_staged_after_probe(staging, lock, probe, &candidate, &destination).await?;
     Ok(destination.join(asset.executable_name))
 }
 
@@ -321,6 +337,136 @@ async fn owned_probe<T: Send + 'static>(binary: PathBuf, home: PathBuf, retained
     Ok(retained)
 }
 
+#[derive(Debug)]
+struct CheckedColdProbe {
+    directory: Directory,
+    executable_name: std::ffi::OsString,
+    executable: File,
+    binary: PathBuf,
+    home: PathBuf,
+}
+
+impl CheckedColdProbe {
+    fn revalidate(&self) -> Result<()> {
+        self.directory.revalidate()?;
+        self.directory
+            .verify(&self.executable_name, &self.executable)?;
+        Ok(())
+    }
+
+    async fn probe<T: Send + 'static>(self, retained: T) -> Result<(Self, T)> {
+        let binary = self.binary.clone();
+        let home = self.home.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("kuru-dolt-cold-probe".into())
+            .spawn(move || {
+                // Keep the checked copy, stage and installation authority until
+                // the owned process is reaped, including after caller cancellation.
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("create owned Dolt cold probe executor")
+                    .and_then(|runtime| {
+                        self.revalidate()
+                            .and_then(|()| runtime.block_on(verify_version(&binary, &home)))
+                    });
+                let _ = send.send((self, retained, result));
+            })
+            .context("start owned Dolt cold probe thread")?;
+        let (probe, retained, result) = receive
+            .await
+            .context("owned Dolt cold probe did not return its result")?;
+        if let Err(error) = result {
+            // Drop the probe handles and stage before releasing the retained lock.
+            drop(probe);
+            drop(retained);
+            return Err(error);
+        }
+        Ok((probe, retained))
+    }
+}
+
+fn prepare_cold_probe(
+    candidate: &Path,
+    probe_home: &Path,
+    asset: Asset<'_>,
+) -> Result<CheckedColdProbe> {
+    prepare_cold_probe_with(candidate, probe_home, asset, |_| Ok(()))
+}
+
+#[cfg(test)]
+fn prepare_cold_probe_observed(
+    candidate: &Path,
+    probe_home: &Path,
+    asset: Asset<'_>,
+    observer: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<CheckedColdProbe> {
+    prepare_cold_probe_with(candidate, probe_home, asset, observer)
+}
+
+fn prepare_cold_probe_with(
+    candidate: &Path,
+    probe_home: &Path,
+    asset: Asset<'_>,
+    observer: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<CheckedColdProbe> {
+    private_directory(probe_home)?;
+    let source_directory = files::directory(candidate)?;
+    let executable_name = std::ffi::OsStr::new(asset.executable_name);
+    let source_path = candidate.join(executable_name);
+    let mut source = source_directory.read(executable_name)?;
+    verify_payload_file(
+        &mut source,
+        asset.executable_bytes,
+        asset.executable_sha256,
+        true,
+        &source_path,
+    )?;
+    source_directory.verify(executable_name, &source)?;
+    source.rewind()?;
+
+    let probe_directory = files::directory(probe_home)?;
+    let probe_path = probe_home.join(executable_name);
+    let mut probe_writer = probe_directory.create_new(executable_name)?;
+    ensure!(
+        std::io::copy(
+            &mut (&mut source).take(asset.executable_bytes + 1),
+            &mut probe_writer,
+        )? == asset.executable_bytes,
+        "Dolt cold probe copy size mismatch"
+    );
+    seal_private(&probe_writer, true)?;
+    probe_writer.sync_all()?;
+    observer(&mut probe_writer)?;
+    probe_writer.sync_all()?;
+    drop(probe_writer);
+
+    // Retain only read authority after the test seam and before execution.
+    let mut probe = probe_directory.read(executable_name)?;
+    probe.rewind()?;
+    verify_payload_file(
+        &mut probe,
+        asset.executable_bytes,
+        asset.executable_sha256,
+        true,
+        &probe_path,
+    )?;
+    source_directory.verify(executable_name, &source)?;
+    probe_directory.verify(executable_name, &probe)?;
+    ensure!(
+        regular_file_info(&source)?.identity != regular_file_info(&probe)?.identity,
+        "Dolt cold probe copy unexpectedly retained the source identity"
+    );
+    Ok(CheckedColdProbe {
+        directory: probe_directory,
+        executable_name: executable_name.to_owned(),
+        executable: probe,
+        binary: probe_path,
+        home: probe_home.to_owned(),
+    })
+}
+
 fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
     ensure!(
         asset.compressed_bytes > 0 && asset.compressed_bytes <= MAX_COMPRESSED,
@@ -430,9 +576,10 @@ fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
 }
 
 struct StagedActivation {
-    // Rust drops fields in declaration order. Keep the source authority first,
-    // then the disposable private stage, then the cache lease.
+    // Rust drops fields in declaration order. Close the candidate and probe
+    // authorities before the disposable private stage, then the cache lease.
     source: Option<Directory>,
+    probe: Option<CheckedColdProbe>,
     staging: PrivateTemp,
     lock: CacheLock,
 }
@@ -441,12 +588,14 @@ impl StagedActivation {
     fn retain(self, error: anyhow::Error) -> anyhow::Error {
         let Self {
             source,
+            probe,
             staging,
             lock,
         } = self;
         // Close the checked candidate before retaining its stage, then release
         // the cache lock only after stage ownership has been decided.
         drop(source);
+        drop(probe);
         let retained = staging.keep();
         drop(lock);
         error.context(format!(
@@ -456,13 +605,24 @@ impl StagedActivation {
     }
 }
 
+#[cfg(test)]
 async fn activate_staged(
     staging: PrivateTemp,
     lock: CacheLock,
     candidate: &Path,
     destination: &Path,
 ) -> Result<()> {
-    activate_staged_with(staging, lock, candidate, destination, |_| {}).await
+    activate_staged_with(staging, lock, None, candidate, destination, |_| {}).await
+}
+
+async fn activate_staged_after_probe(
+    staging: PrivateTemp,
+    lock: CacheLock,
+    probe: CheckedColdProbe,
+    candidate: &Path,
+    destination: &Path,
+) -> Result<()> {
+    activate_staged_with(staging, lock, Some(probe), candidate, destination, |_| {}).await
 }
 
 #[cfg(test)]
@@ -473,18 +633,20 @@ async fn activate_staged_observed(
     destination: &Path,
     observer: impl FnMut(bool),
 ) -> Result<()> {
-    activate_staged_with(staging, lock, candidate, destination, observer).await
+    activate_staged_with(staging, lock, None, candidate, destination, observer).await
 }
 
 async fn activate_staged_with(
     staging: PrivateTemp,
     lock: CacheLock,
+    probe: Option<CheckedColdProbe>,
     candidate: &Path,
     destination: &Path,
     mut observer: impl FnMut(bool),
 ) -> Result<()> {
     let mut activation = StagedActivation {
         source: None,
+        probe,
         staging,
         lock,
     };
