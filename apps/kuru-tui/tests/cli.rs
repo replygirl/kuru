@@ -82,7 +82,7 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
             "--json",
         ]))
         .unwrap();
-        assert_eq!(result.as_object().unwrap().len(), 8);
+        assert_eq!(result.as_object().unwrap().len(), 10);
         for field in [
             "session",
             "speaker",
@@ -91,6 +91,8 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
             "input_tokens",
             "output_tokens",
             "limited",
+            "limit_reasons",
+            "response_outcome",
             "events",
         ] {
             assert!(
@@ -117,6 +119,58 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     );
     assert!(!env.run(&["undo-dream"]).status.success());
     assert!(env.success(&["run", "plain answer"]).contains("demo"));
+}
+
+#[test]
+fn cli_turn_id_reuses_only_the_exact_request_in_its_session() {
+    let env = Sandbox::new();
+    assert!(env.success(&["run", "--help"]).contains("--turn-id"));
+    assert!(
+        !env.run(&["dream", "--turn-id", "not-valid-here"])
+            .status
+            .success()
+    );
+    let prompt = "retain this exact scripted request";
+    let turn_id = "scripted-turn-1";
+    let first: Value =
+        serde_json::from_str(&env.success(&["run", prompt, "--turn-id", turn_id, "--json"]))
+            .unwrap();
+    let session = first["session"].as_str().unwrap();
+    let replay: Value = serde_json::from_str(&env.success(&[
+        "--resume",
+        session,
+        "run",
+        prompt,
+        "--turn-id",
+        turn_id,
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(replay, first);
+
+    let sessions: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
+    let resumed = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["id"] == session)
+        .unwrap();
+    assert_eq!(resumed["turns"], 1);
+
+    let changed = env.run(&[
+        "--resume",
+        session,
+        "run",
+        "changed request",
+        "--turn-id",
+        turn_id,
+        "--json",
+    ]);
+    assert!(!changed.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed.stderr)
+            .contains("turn ID is already associated with a different request")
+    );
 }
 
 #[test]

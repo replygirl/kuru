@@ -24,6 +24,36 @@ You can resume from a script too:
 kuru --resume SESSION_ID run "Continue from our last turn."
 ```
 
+## Retry the last submitted turn
+
+Each new local CLI or terminal submission receives its own turn ID. Scripted
+callers can supply one explicitly:
+
+```sh
+kuru --resume SESSION_ID run "Continue from our last turn." --turn-id TURN_ID
+```
+
+The terminal command `/retry` uses the session's single durably retained last
+submission: its exact ID, prompt and target. If that turn already completed,
+Kuru reuses the stored result with no provider or tool call and adds no duplicate
+user/answer pair. A retry interrupted before possible dispatch may safely finish
+under the same ID. If external work may have been dispatched, Kuru refuses the
+retry; entering another prompt creates new work. There is no automatic retry or
+arbitrary journal browser.
+
+When an admitted turn settles without an answer, Kuru stores the fixed marker
+`Turn interrupted; no completed answer was committed.` It remains visible after
+later turns and resume, while staying outside provider conversation context. The
+marker does not say whether external work occurred or was rolled back. If the
+completed-answer checkpoint wins a cancellation race, the answer appears and no
+interruption marker is added.
+
+The turn journal retains every admitted turn without expiry so completed results
+remain available for exact retry. Its storage grows in proportion to turns and
+intentionally retains some completed-result data also represented in the
+assistant transcript. This durable semantic history is separate from the bounded
+operational diagnostics ring.
+
 ## Dreaming
 
 Dreaming consolidates memory and considers changes to membership. Parts propose changes using their own context; the runtime validates the proposals.
@@ -76,6 +106,10 @@ kuru --provider demo --mode jungian run "Explore this design."
 kuru --provider demo run "Plan the next step." --json
 ```
 
-JSON output includes the session, speaker, response text, relationship, token counts, budget-limit status, and event trace. `limited` means the round or tool budget constrained the turn; it does not claim the task is complete.
+JSON output includes the session, speaker, response text, relationship, token
+counts, compatibility `limited` status, explicit `limit_reasons`,
+`response_outcome`, and the projected event trace. New results distinguish
+`tool-calls`, `peer-rounds`, and an `empty` response. An older limited result with
+no stored cause reports `legacy-unspecified`.
 
 The [configuration reference](/reference/configuration) describes the budgets and where these settings are stored.

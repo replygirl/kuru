@@ -30,6 +30,7 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | `/relate alliance ID,ID` | Activate a relationship of 2–4 parts |
 | `/memory NAME_OR_ID` | Inspect an identity's stored memory |
 | `/notes NAME_OR_ID` | Inspect an identity's durable notes, separate from its conversation |
+| `/retry` | Retry the last local submission when its exact durable turn is safe to reuse |
 | `/dream` | Run bounded memory/topology consolidation |
 | `/undo-dream` | Restore the previous topology change |
 | `/quit` | End the session |
@@ -41,9 +42,18 @@ receive only the memory available to their own identity.
 
 Cancelling active work signals the runtime and waits for the operation to settle.
 The submitted prompt remains in the conversation. If the answer checkpoint won
-the race, Kuru displays that answer; otherwise it reports the turn as interrupted
-and accepts the next command. A cancelled external call may already have reached
-its peer, so Kuru does not replay that turn automatically.
+the race, Kuru displays that answer. Otherwise it adds the fixed marker `Turn
+interrupted; no completed answer was committed.` The marker survives later turns
+and session resume without claiming that external work was absent or rolled back.
+
+`/retry` addresses only the last durably retained local submission. It reuses the
+same turn ID, exact prompt and target. A completed turn returns its stored result
+without another provider or tool call and without adding another displayed pair.
+An interruption before possible dispatch can finish safely under the same ID;
+its earlier marker remains visible. If external dispatch may have occurred, Kuru
+refuses the retry and explains that entering a new prompt starts new work. Kuru
+never retries automatically and does not provide an arbitrary turn-history
+browser.
 
 `/notes` returns the selected identity's newest 100 durable notes with the
 selected mode, canonical identity, requested limit, and `truncated` metadata.
@@ -85,12 +95,16 @@ kuru --provider demo --mode jungian run "Explore the assumptions in this design.
 kuru --provider demo run "Plan the next step." --json
 kuru sessions
 kuru --resume SESSION_ID --provider demo run "Continue from our last turn."
+kuru --resume SESSION_ID --provider demo run "Continue from our last turn." --turn-id TURN_ID
 kuru memory notes ID --limit 100
 ```
 
 JSON output includes `session`, `speaker`, `text`, `relationship`, token counts,
-`limited` and an event trace. `limited` reports that a round or tool budget
-constrained the turn. Session listing does not create a new session. Reusing a
+`limited`, `limit_reasons`, `response_outcome` and an event trace. New results
+name `tool-calls` and `peer-rounds` separately; an empty model response is the
+separate `empty` response outcome. `limited` remains for compatibility, and an
+older limited record whose specific cause was not stored reports
+`legacy-unspecified`. Session listing does not create a new session. Reusing a
 session restores its transcript; peer and relationship histories also persist
 across sessions within their project and framework scope.
 
@@ -148,8 +162,10 @@ and its process-authority limits.
 `update` installs an explicit verified release or rebuilds a chosen source
 checkout; see [installation](install.md).
 
-Runtime-owning commands keep a small fixed set of private per-project diagnostic
-files while they run. `--debug` adds bounded operational status detail to those
-files; it does not enable `RUST_LOG`, capture prompts, tool arguments/results,
-credentials, or remote error text, and it does not change command stdout or TUI
-rendering. These files are operational diagnostics, not conversation history.
+Runtime-owning commands keep a private per-project operational ring at
+`<data-dir>/diagnostics/<project-hash>/trace-{0..3}.jsonl`: four files of at most
+64 KiB each. `--debug` adds bounded operational status detail to those files and
+prints the resolved ring directory once on standard error. It does not enable
+`RUST_LOG`, capture prompts, tool arguments/results, credentials, or remote error
+text, and it does not change command stdout or TUI rendering. These files are
+operational diagnostics, not conversation history or semantic turn events.

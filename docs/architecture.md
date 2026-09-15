@@ -61,11 +61,20 @@ Jungian collective memory is project-scoped in v1. A future explicit policy can
 add cross-project scope without treating all user projects as one memory.
 
 Each admitted turn writes one user transcript row together with a session-scoped
-journal entry. Before actor work, the runtime records that external dispatch is
-possible. A completed answer, its assistant row and the matching session and
-topology state commit together. This makes exact completed retries safe and leaves
-interrupted prompts visible without claiming that an ambiguous external call did
-or did not happen.
+journal entry. A local CLI or TUI admission also replaces the session's single
+last-submission reference with that turn's exact ID, prompt and target. Before
+actor work, the runtime records that external dispatch is possible. A completed
+answer, its assistant row and the matching session and topology state commit
+together. An interrupted outcome instead commits one fixed internal-role
+transcript marker; that role is visible as a Kuru marker but excluded from model
+conversation context.
+
+Turn-journal rows are durable no-expiry safety and idempotency history. Their
+storage grows in proportion to admitted turns, and completed `TurnOutput` data is
+retained indefinitely for exact retry. This intentionally duplicates some data
+from the assistant transcript even though response events omit the answer body.
+The journal has no aggregate cap, TTL or automatic deletion. It is separate from
+the bounded operational diagnostics ring.
 
 ## Dreaming
 

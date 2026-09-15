@@ -21,7 +21,14 @@ The welcome portrait shows the selected framework. Type a prompt and press <kbd>
 
 Try `/parts` to inspect the active peers and relationships. The starting IFS pool includes Self, two managers, two firefighters, and two exiles. Each role offers a different tendency; Self has no supervisory authority over the others.
 
-The wide layout shows peer activity and relationship membership alongside the conversation. A narrow pane keeps the conversation and editor central. Each completed reply shows the returned speaker or relationship and its input/output token counts beneath the reply. If the returned turn is limited, Kuru shows a generic limited-result marker without guessing why. Activity reports describe routing and phases without exposing private peer messages; they do not determine the final reply.
+The wide layout shows peer activity and relationship membership alongside the
+conversation. A narrow pane keeps the conversation and editor central. Each
+completed reply shows the returned speaker or relationship and its input/output
+token counts beneath the reply. Tool-call and peer-round limits are named
+separately. An empty model response is labeled as a response outcome, while an
+older limited result whose cause was not stored is labeled as an unspecified
+legacy limit. Activity reports describe routing and phases without exposing
+private peer messages; they do not determine the final reply.
 
 ## Make it yours
 
@@ -39,8 +46,12 @@ Use <kbd>Alt</kbd>+<kbd>Enter</kbd> for a newline. <kbd>Page Up</kbd> and <kbd>P
 
 Cancellation waits for the active operation to settle and keeps your submitted
 prompt in the transcript. If an answer completed first, Kuru shows it. Otherwise
-the turn is marked interrupted and you can send the next prompt. Kuru will not
-silently retry an external call that may already have been received.
+Kuru stores a fixed interruption marker that remains visible after later work and
+resume. `/retry` reuses only the last submission's exact durable ID, prompt and
+target. It can return an already completed result or finish work interrupted
+before possible dispatch without duplicating the displayed prompt. It refuses
+when an external call may already have been received. Entering another prompt is
+new work; Kuru does not retry automatically.
 
 Settings cannot change during active work. Cancel or wait for the turn to finish before choosing another model or framework.
 

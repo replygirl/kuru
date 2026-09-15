@@ -7,6 +7,14 @@ use std::{
     time::Duration,
 };
 
+use crate::shell_diagnostic::ProjectedShellDiagnostic;
+#[cfg(unix)]
+use crate::shell_diagnostic::{ShellCapture, ShellFailureCategory, failure as shell_failure};
+#[cfg(windows)]
+use crate::shell_diagnostic::{
+    ShellCapture, ShellFailureCategory, failure as shell_failure,
+    failure_with_cleanup as shell_failure_with_cleanup,
+};
 #[cfg(unix)]
 use crate::unix_shell::ShellRegistry;
 use anyhow::{Context, Result, bail, ensure};
@@ -733,15 +741,41 @@ async fn shell(
     command: &str,
     duration: Duration,
 ) -> Result<String> {
-    registry
+    let result = registry
         .execute(root_guard, root, command.into(), duration, || {
             unix_shell_environment(std::env::vars_os())
         })
-        .await
+        .await;
+    match result {
+        Err(error) if error.downcast_ref::<ProjectedShellDiagnostic>().is_some() => Err(error),
+        Err(_) => Err(shell_failure(
+            ShellFailureCategory::OperationFailed,
+            &ShellCapture::new(),
+        )),
+        Ok(result) => Ok(result),
+    }
 }
 
 #[cfg(windows)]
 async fn shell(
+    root_guard: &Directory,
+    root: &Path,
+    command: &str,
+    duration: Duration,
+) -> Result<String> {
+    let result = shell_inner(root_guard, root, command, duration).await;
+    match result {
+        Err(error) if error.downcast_ref::<ProjectedShellDiagnostic>().is_some() => Err(error),
+        Err(_) => Err(shell_failure(
+            ShellFailureCategory::OperationFailed,
+            &ShellCapture::new(),
+        )),
+        Ok(result) => Ok(result),
+    }
+}
+
+#[cfg(windows)]
+async fn shell_inner(
     root_guard: &Directory,
     root: &Path,
     command: &str,
@@ -807,46 +841,32 @@ async fn shell(
     let mut stderr = child.take_stderr().context("missing shell stderr")?;
     let mut out = ShellCapture::new();
     let mut err = ShellCapture::new();
-    let mut phase = "read shell output";
     let operation = async {
         tokio::try_join!(out.read(&mut stdout), err.read(&mut stderr))?;
         out.finish()?;
         err.finish()?;
-        phase = "wait for shell process tree";
         let status = child.wait(duration).await?;
         Ok::<_, anyhow::Error>(status)
     };
-    let result = timeout(duration, operation)
-        .await
-        .context("shell timed out")
-        .and_then(|result| result);
-    let mut failure_metadata = None;
+    let result = match timeout(duration, operation).await {
+        Err(_) => Err(ShellFailureCategory::TimedOut),
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(_)) => Err(ShellFailureCategory::CaptureFailed),
+    };
+    let mut cleanup_unconfirmed = false;
     let result = match result {
         Ok(status) => Ok(status),
-        Err(error) => {
+        Err(category) => {
             // Query the retained root separately from whole-Job quiescence;
             // observation failure must never prevent the existing cleanup.
-            let root_state = match child.duplicate_process_handle() {
-                Ok(process) => match wait_process_handle(&process, Duration::ZERO).await {
-                    Ok(()) => "exited",
-                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => "running",
-                    Err(_) => "query-error",
-                },
-                Err(_) => "query-error",
+            let _ = match child.duplicate_process_handle() {
+                Ok(process) => wait_process_handle(&process, Duration::ZERO).await,
+                Err(error) => Err(error),
             };
-            let observed = child.try_wait();
+            let _ = child.try_wait();
             let stopped_result = crate::process::stop(&mut child).await;
-            let stopped = match &stopped_result {
-                Ok(()) => "subprocess tree terminated".to_owned(),
-                Err(error) => format!("subprocess cleanup unconfirmed: {error:#}"),
-            };
-            failure_metadata = Some(ShellFailureMetadata {
-                phase: phase.to_owned(),
-                root_state: root_state.to_owned(),
-                observed: format!("{observed:?}"),
-                stopped,
-            });
-            Err(error)
+            cleanup_unconfirmed = stopped_result.is_err();
+            Err(category)
         }
     };
     let cleanup = async {
@@ -862,143 +882,25 @@ async fn shell(
     match result {
         Ok(status) => {
             cleanup?;
-            Ok(json!({"exit_code":status.code(),"success":status.success(),"stdout":out.text,"stderr":err.text}).to_string())
+            Ok(json!({"exit_code":status.code(),"success":status.success(),"stdout":out.text(),"stderr":err.text()}).to_string())
         }
-        Err(error) => {
-            let error = match cleanup {
-                Ok(()) => error,
-                Err(cleanup) => error.context(format!("shell pipe cleanup failed: {cleanup:#}")),
-            };
-            Err(projected_shell_failure(
-                error,
-                &failure_metadata.expect("shell failure metadata was recorded"),
-                &out,
-                &err,
-            )?)
-        }
-    }
-}
-
-/// A source-free shell failure that has already combined and projected all raw
-/// operation, cleanup, and process-observation details.
-#[derive(Debug)]
-struct ProjectedShellDiagnostic(String);
-
-impl std::fmt::Display for ProjectedShellDiagnostic {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ProjectedShellDiagnostic {}
-
-#[cfg(any(windows, test))]
-struct ShellFailureMetadata {
-    phase: String,
-    root_state: String,
-    observed: String,
-    stopped: String,
-}
-
-#[cfg(any(windows, test))]
-fn projected_shell_failure(
-    error: anyhow::Error,
-    metadata: &ShellFailureMetadata,
-    stdout: &ShellCapture,
-    stderr: &ShellCapture,
-) -> Result<anyhow::Error> {
-    let raw = format!(
-        "{error:#}; {}; stdout {} bytes (EOF {}); stderr {} bytes (EOF {}); root before cleanup: {}; tree before cleanup: {}; {}",
-        metadata.phase,
-        stdout.observed,
-        stdout.eof,
-        stderr.observed,
-        stderr.eof,
-        metadata.root_state,
-        metadata.observed,
-        metadata.stopped,
-    );
-    let diagnostic = format!(
-        "{}; stderr prefix: {}",
-        project_text(raw)?,
-        shell_stderr_diagnostic(stderr),
-    );
-    Ok(ProjectedShellDiagnostic(diagnostic).into())
-}
-
-// Keep accepted output outside the cancellable read future. A timeout must not
-// discard the bytes and EOF observations needed to distinguish a running shell
-// from a completed process whose output is still held by another process.
-#[cfg(any(windows, test))]
-struct ShellCapture {
-    projection: Option<redaction::StreamingProjection>,
-    text: Option<String>,
-    observed: usize,
-    eof: bool,
-    #[cfg(test)]
-    bytes: Vec<u8>,
-}
-
-#[cfg(any(windows, test))]
-fn shell_stderr_diagnostic(capture: &ShellCapture) -> String {
-    const DIAGNOSTIC_BYTES: usize = 4096;
-
-    if capture.eof {
-        capture
-            .text
-            .as_deref()
-            .map(|text| redaction::truncate_tool_output(text, DIAGNOSTIC_BYTES))
-            .unwrap_or_default()
-    } else {
-        "<pending EOF>".to_owned()
-    }
-}
-
-#[cfg(any(windows, test))]
-impl ShellCapture {
-    fn new() -> Self {
-        Self {
-            projection: Some(redaction::StreamingProjection::new(MAX_BYTES)),
-            text: None,
-            observed: 0,
-            eof: false,
-            #[cfg(test)]
-            bytes: Vec::new(),
-        }
-    }
-
-    async fn read(&mut self, reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<()> {
-        let mut buffer = [0; 8192];
-        loop {
-            let count = reader.read(&mut buffer).await?;
-            if count == 0 {
-                self.eof = true;
-                return Ok(());
+        Err(category) => {
+            if cleanup.is_err() {
+                cleanup_unconfirmed = true;
             }
-            self.observed = self.observed.saturating_add(count);
-            self.projection
-                .as_mut()
-                .expect("shell capture was already finished")
-                .push(&buffer[..count])?;
-            #[cfg(test)]
-            self.bytes.extend_from_slice(&buffer[..count]);
+            Err(shell_failure_with_cleanup(
+                category,
+                cleanup_unconfirmed,
+                &err,
+            ))
         }
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        self.text = Some(
-            self.projection
-                .take()
-                .expect("shell capture was already finished")
-                .finish()?,
-        );
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell_diagnostic::{ShellCapture, ShellFailureCategory, failure as shell_failure};
     use crate::test_support::{HttpFixture, Reply, drain_bounded};
     #[cfg(unix)]
     use crate::test_support::{StdioFixture, Step};
@@ -1028,16 +930,16 @@ mod tests {
         .await
         .unwrap();
         assert!(capture.bytes.starts_with(b"accepted output"));
-        assert!(!capture.eof);
+        assert!(!capture.eof());
         finish.send(()).unwrap();
         timeout(Duration::from_secs(2), capture.read(&mut reader))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(capture.bytes, b"accepted output!");
-        assert!(capture.eof);
+        assert!(capture.eof());
         capture.finish().unwrap();
-        assert_eq!(capture.text.as_deref(), Some("accepted output!"));
+        assert_eq!(capture.text(), "accepted output!");
         producer.await.unwrap();
     }
 
@@ -1048,13 +950,12 @@ mod tests {
         let mut capture = ShellCapture::new();
         capture.read(&mut source).await.unwrap();
         capture.finish().unwrap();
-        let text = capture.text.as_deref().unwrap();
+        let text = capture.text();
         assert!(text.len() <= MAX_BYTES);
         assert!(text.starts_with('x'));
         assert!(text.ends_with('x'));
         assert!(text.contains("[truncated]"));
-        assert_eq!(capture.observed, bytes.len());
-        assert!(capture.eof);
+        assert!(capture.eof());
     }
 
     #[tokio::test]
@@ -1066,12 +967,12 @@ mod tests {
         let mut capture = ShellCapture::new();
         capture.read(&mut source).await.unwrap();
         capture.finish().unwrap();
-        let text = capture.text.as_deref().unwrap();
+        let text = capture.text();
         assert!(text.len() <= MAX_BYTES);
         assert!(text.starts_with("HEAD?"));
         assert!(text.ends_with("?:TAIL"));
         assert!(text.contains("[truncated]"));
-        assert!(capture.eof);
+        assert!(capture.eof());
     }
 
     #[tokio::test]
@@ -1083,29 +984,7 @@ mod tests {
         capture.read(&mut source).await.unwrap();
         capture.finish().unwrap();
 
-        let diagnostic = shell_stderr_diagnostic(&capture);
-        assert!(diagnostic.len() <= 4096);
-        assert!(diagnostic.contains("[REDACTED:recognized-secret]"));
-        assert!(diagnostic.contains("[truncated]"));
-        assert!(diagnostic.ends_with(":TAIL"));
-        assert!(!diagnostic.contains(secret));
-        let without_markers = diagnostic
-            .replace("[REDACTED:recognized-secret]", "")
-            .replace("[truncated]", "");
-        assert!(!without_markers.contains(['[', ']']));
-
-        let operation_secret = "sk-proj-operation-secret-0123456789";
-        let cleanup_secret = "sk-proj-cleanup-secret-0123456789";
-        let metadata_secret = "sk-proj-metadata-secret-0123456789";
-        let error = anyhow::anyhow!("shell process failure {operation_secret}")
-            .context(format!("shell pipe cleanup failed: {cleanup_secret}"));
-        let metadata = ShellFailureMetadata {
-            phase: format!("read shell output {metadata_secret}"),
-            root_state: format!("query-error {metadata_secret}"),
-            observed: format!("Err({metadata_secret})"),
-            stopped: format!("subprocess cleanup unconfirmed: {metadata_secret}"),
-        };
-        let error = projected_shell_failure(error, &metadata, &capture, &capture).unwrap();
+        let error = shell_failure(ShellFailureCategory::CaptureFailed, &capture);
         assert!(error.downcast_ref::<ProjectedShellDiagnostic>().is_some());
         assert_eq!(error.chain().count(), 1);
         let rendered = project_failure(ToolFailure::built_in(error))
@@ -1114,10 +993,8 @@ mod tests {
         assert!(rendered.contains("[REDACTED:recognized-secret]"));
         assert!(rendered.contains("[truncated]"));
         assert!(rendered.contains(":TAIL"));
-        assert!(rendered.contains("subprocess cleanup unconfirmed"));
-        for secret in [secret, operation_secret, cleanup_secret, metadata_secret] {
-            assert!(!rendered.contains(secret));
-        }
+        assert!(rendered.contains("shell capture failed; stderr: "));
+        assert!(!rendered.contains(secret));
         let without_markers = rendered
             .replace("[REDACTED:recognized-secret]", "")
             .replace("[truncated]", "");
@@ -1870,13 +1747,152 @@ mod tests {
         ];
         let chain_length = error.chain().count();
 
-        assert_eq!(rendered[0], "tool execution failed: shell timed out");
+        assert_eq!(
+            rendered[0],
+            "tool execution failed: shell timed out; stderr: <pending EOF>"
+        );
         for output in rendered {
             assert!(!output.contains(SECRET));
             assert!(!output.contains(&command));
             assert!(!output.contains("[REDACTED:recognized-secret]"));
         }
         assert_eq!(chain_length, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_shell_timeout_keeps_eof_complete_redacted_stderr() {
+        const SECRET: &str = "sk-abcdefghijklmnop";
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("stderr-closed");
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                allow_shell: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let command = format!(
+            "printf 'useful {SECRET} detail' >&2; exec 2>&-; : > stderr-closed; exec sleep 5"
+        );
+        let (ready_result, call_result) = tokio::join!(
+            timeout(Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }),
+            timeout(
+                Duration::from_secs(10),
+                host.execute("shell", json!({"command": command, "timeout_ms": 3_000}),),
+            )
+        );
+        let shutdown_result = timeout(Duration::from_secs(6), host.shutdown()).await;
+
+        ready_result.expect("shell did not close stderr before timeout");
+        assert!(matches!(shutdown_result, Ok(Ok(()))), "{shutdown_result:?}");
+        let error = call_result
+            .expect("timed shell did not return within its timeout and cleanup allowance")
+            .unwrap_err();
+        let rendered = [
+            error.to_string(),
+            format!("{error:#}"),
+            format!("{error:?}"),
+            error
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" | "),
+        ];
+        for output in rendered {
+            assert!(
+                output.contains(
+                    "shell timed out; stderr: useful [REDACTED:recognized-secret] detail"
+                )
+            );
+            assert!(!output.contains(SECRET));
+            assert!(!output.contains(&command));
+            assert!(!output.contains("<pending EOF>"));
+            assert!(!output.contains("<unavailable>"));
+        }
+        assert_eq!(error.chain().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_timeout_keeps_eof_complete_redacted_stderr() {
+        const SECRET: &str = "sk-abcdefghijklmnop";
+        const OPERATION_TIMEOUT_SECS: u64 = 60;
+        const READINESS_TIMEOUT: Duration = Duration::from_secs(OPERATION_TIMEOUT_SECS + 10);
+        const OUTER_TIMEOUT: Duration = Duration::from_secs(OPERATION_TIMEOUT_SECS + 15);
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("stderr-eof-ready");
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                allow_shell: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let command = format!(
+            r#"
+$child_info = New-Object System.Diagnostics.ProcessStartInfo
+$child_info.FileName = $env:ComSpec
+$child_info.Arguments = '/d /c ping -n 90 127.0.0.1'
+$child_info.UseShellExecute = $false
+$child_info.RedirectStandardError = $true
+$child = New-Object System.Diagnostics.Process
+$child.StartInfo = $child_info
+if (-not $child.Start()) {{ throw 'could not start stdout-retaining fixture child' }}
+$child.StandardError.Close()
+[IO.File]::WriteAllText((Join-Path (Get-Location) 'stderr-eof-ready'), 'ready')
+[Console]::Error.Write('useful {SECRET} detail')
+"#
+        );
+        let (ready_result, call_result) = tokio::join!(
+            timeout(READINESS_TIMEOUT, async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }),
+            timeout(
+                OUTER_TIMEOUT,
+                host.execute(
+                    "shell",
+                    json!({
+                        "command": command,
+                        "timeout_ms": OPERATION_TIMEOUT_SECS * 1_000,
+                    }),
+                ),
+            )
+        );
+        ready_result.expect("Windows shell did not launch the stderr-isolated child");
+        let error = call_result
+            .expect("timed Windows shell did not return within native cleanup allowance")
+            .unwrap_err();
+        let rendered = [
+            error.to_string(),
+            format!("{error:#}"),
+            format!("{error:?}"),
+            error
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" | "),
+        ];
+        for output in rendered {
+            assert!(
+                output.contains(
+                    "shell timed out; stderr: useful [REDACTED:recognized-secret] detail"
+                )
+            );
+            assert!(!output.contains(SECRET));
+            assert!(!output.contains(&command));
+            assert!(!output.contains("<pending EOF>"));
+            assert!(!output.contains("<unavailable>"));
+        }
+        assert_eq!(error.chain().count(), 1);
     }
 
     #[cfg(unix)]

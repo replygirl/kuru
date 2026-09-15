@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     fs::File,
     io::{Seek, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -22,11 +23,18 @@ const FILE_COUNT: usize = 4;
 const FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone)]
-pub(crate) struct DiagnosticsGuard(Arc<Ring>);
+pub(crate) struct DiagnosticsGuard {
+    ring: Arc<Ring>,
+    directory: PathBuf,
+}
 
 impl DiagnosticsGuard {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     pub(crate) fn finish(self) -> Result<()> {
-        self.0.finish()
+        self.ring.finish()
     }
 }
 
@@ -47,6 +55,7 @@ pub(crate) fn install(
     );
     let directory = Directory::ensure_private(&data.join("diagnostics").join(hash))
         .context("cannot create the private project diagnostics directory")?;
+    let directory_path = directory.path().to_owned();
     let ring = Arc::new(Ring::open(directory)?);
     let layer = JsonLayer {
         ring: ring.clone(),
@@ -55,7 +64,10 @@ pub(crate) fn install(
     };
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
         .context("cannot install project diagnostics for this process")?;
-    Ok(Some(DiagnosticsGuard(ring)))
+    Ok(Some(DiagnosticsGuard {
+        ring,
+        directory: directory_path,
+    }))
 }
 
 /// Remove the bounded ring for one already-confirmed project purge. The CLI

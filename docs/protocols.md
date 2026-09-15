@@ -130,6 +130,14 @@ observations back off from 100 milliseconds to a one-second maximum without
 abandoning ownership or using stale-PID signaling.
 Windows retains its existing Job-based cleanup.
 
+If a built-in shell cannot complete its normal capture or cleanup path, Kuru
+returns one fixed operational category and a 4 KiB credential-projected stderr
+excerpt. A pipe that has not reached EOF is reported as `stderr: <pending EOF>`;
+Kuru does not return its partial bytes. These diagnostics never include the
+command, stdout, native process observations, or raw error/cleanup chains. A
+child that completes with a nonzero status still returns the ordinary structured
+shell result with its exit code, stdout, and stderr.
+
 The shell uses your process authority, not a sandbox. Configured MCP servers
 also bring their own permissions; the built-in file/shell switches do not impose
 a sandbox on third-party tools.

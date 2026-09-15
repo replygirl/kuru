@@ -88,22 +88,45 @@ preferences written afterward.
 
 ### Requirement: Resource budgets
 
-The runtime MUST bound parallel model calls, peer rounds and tool calls, and permit cancellation.
+The runtime MUST bound parallel model calls, peer rounds and tool calls, and
+permit cancellation. `TurnOutput` MUST name tool-call and peer-round exhaustion
+separately, while an empty final model response MUST be a separate response
+outcome rather than a third budget. The existing `limited` field SHALL remain
+for compatibility. A v0.3.2 output carrying only `limited: true` MUST remain
+readable with an explicitly unspecified legacy limit reason rather than a
+guessed attribution.
 
 #### Scenario: Cyclic peers
 - **WHEN** peers repeatedly request each other
-- **THEN** processing ends at the configured budget with an observable status.
+- **THEN** processing ends at the configured peer-round budget with that reason observable.
+
+#### Scenario: Tool exhaustion
+- **WHEN** a turn attempts more tool calls than configured
+- **THEN** processing remains bounded and the output identifies the tool-call limit.
+
+#### Scenario: Empty response
+- **WHEN** the speaking loop produces no final text
+- **THEN** the output identifies an empty-response outcome separately from both budgets.
+
+#### Scenario: Legacy limited output
+- **WHEN** a stored v0.3.2 output has `limited: true` without a typed reason
+- **THEN** replay reports a legacy unspecified limit and does not invent a budget.
 
 ### Requirement: Stable speaker selection
 
 The runtime SHALL preserve existing caller-target and active-focus precedence.
-For automatic selection it SHALL choose only among successful deliberating peers,
-prefer the greatest reported activation, retain the previous completed speaker
-when that peer shares the greatest activation, and otherwise choose the first
-identity in stable ascending order. Turn count MUST NOT change this tie-break.
-The last completed speaker SHALL persist with session state and old sessions
-without that value SHALL remain readable. Selection reasons SHALL be visible in
-the event trace without changing existing speaker-event meaning or peer authority.
+For automatic selection it SHALL choose only among successful deliberating
+peers, prefer the greatest reported activation, and retain the previous
+completed speaker when that peer shares the greatest activation. When a cold
+tie remains, it SHALL choose the first eligible identity in the built-in mode's
+authored part order: Self first for IFS, Connection for polyvagal, Desire for
+Freudian and Continuity for Jungian, then each mode's next authored identity.
+Only when no authored identity is an eligible tied candidate SHALL stable
+ascending ID order decide. Turn count MUST NOT change these tie-breaks. The last
+completed speaker SHALL persist with session state and old sessions without that
+value SHALL remain readable. Selection reasons SHALL identify the actual rule in
+the event trace without changing existing speaker-event meaning or peer
+authority.
 
 #### Scenario: Equal activations across turns and resume
 - **WHEN** the same eligible peers share the highest activation across completed turns or after resuming the session
@@ -113,9 +136,17 @@ the event trace without changing existing speaker-event meaning or peer authorit
 - **WHEN** an eligible peer has strictly greater activation than the previous speaker
 - **THEN** the higher-activation peer is selected and the reason identifies activation as decisive.
 
+#### Scenario: Cold authored facing
+- **WHEN** a fresh session has multiple eligible maximum-activation peers and no previous completed speaker
+- **THEN** the first eligible identity in that mode's authored order speaks and the reason is `mode-authored-order`.
+
 #### Scenario: Missing or ineligible prior speaker
 - **WHEN** there is no previous completed speaker or that identity is not among the eligible maximum-activation peers
-- **THEN** the stable identity tie-break selects an eligible maximum without creating or reviving an actor.
+- **THEN** authored mode order selects an eligible maximum before stable ID order is considered.
+
+#### Scenario: No eligible authored identity
+- **WHEN** a cold maximum-activation tie contains no eligible built-in authored identity
+- **THEN** stable ascending ID order selects one tied identity and the reason is `stable-id-order`.
 
 #### Scenario: Turn fails before completion publication
 - **WHEN** speaking fails or is cancelled before publishing completed session state
@@ -124,3 +155,27 @@ the event trace without changing existing speaker-event meaning or peer authorit
 #### Scenario: Existing target and focus behavior
 - **WHEN** an existing caller target or valid active focus selects the identity
 - **THEN** that precedence remains effective and its reason is observable without requiring a new command or setting.
+
+### Requirement: Projected semantic turn events
+
+Every semantic turn event MUST cross the shared bounded recognizable-secret
+projection before broadcast, returned `TurnOutput`, journal persistence or
+journal replay. Structured state, peer and relationship detail SHALL be
+projected as JSON before serialization into the existing event detail string so
+useful nonsecret fields remain. Text detail SHALL use the shared text projection.
+The response event MUST contain only a completion marker; `TurnOutput.text`
+remains the authoritative answer. Projection or structured parsing failure MUST
+produce a fixed withheld marker and MUST NOT fall back to raw data. This
+semantic event contract is separate from the operational JSONL trace.
+
+#### Scenario: Structured secret-bearing event
+- **WHEN** state, peer or relationship detail contains recognizable credentials in keys or values
+- **THEN** broadcast, JSON output, journal state and retry replay preserve safe structure and contain no raw credential.
+
+#### Scenario: Completed response event
+- **WHEN** a turn completes with answer text
+- **THEN** that text appears in `TurnOutput.text` and the transcript, while its response event contains only a completion marker.
+
+#### Scenario: Legacy journal replay
+- **WHEN** an old journal contains raw structured or textual event detail
+- **THEN** replay applies the current projection before any event leaves the runtime without rewriting historical revisions.

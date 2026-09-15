@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::future::join_all;
-use kuru_connectors::{Provider, ToolHost, a2a_send};
+use kuru_connectors::{Provider, ToolHost, a2a_send, project_json, project_text};
 use kuru_core::{
     Completion, Config, Framework, Message, Mode, ModelPreference, Part, ProjectPreferences,
     Relationship, RelationshipKind, ToolCall, ToolSpec, load_instructions,
@@ -31,6 +31,12 @@ use crate::{
 
 const SHUTDOWN_DREAM_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TURN_TRANSITIONS: usize = 64;
+const EVENT_WITHHELD: &str = "[event detail withheld]";
+const RESPONSE_COMPLETED: &str = "[response completed]";
+/// Transcript role reserved for Kuru's durable interruption marker.
+pub const INTERRUPTION_ROLE: &str = "kuru-interruption";
+/// Stable user-facing content of a durable interruption marker.
+pub const INTERRUPTION_TEXT: &str = "Turn interrupted; no completed answer was committed.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReport {
@@ -78,7 +84,35 @@ pub struct TurnOutput {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub limited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_reasons: Option<Vec<TurnLimitReason>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_outcome: Option<ResponseOutcome>,
     pub events: Vec<Event>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+/// A concrete resource limit reached while producing a turn.
+pub enum TurnLimitReason {
+    ToolCalls,
+    PeerRounds,
+    LegacyUnspecified,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+/// Whether the provider supplied user-facing text before fallback presentation.
+pub enum ResponseOutcome {
+    Text,
+    Empty,
+}
+
+#[derive(Debug, Clone)]
+/// A controlled local result and whether it came from an ended journal entry.
+pub struct ControlledTurnOutput {
+    pub output: TurnOutput,
+    pub reused: bool,
 }
 
 #[derive(Clone, Default)]
@@ -173,7 +207,18 @@ struct TurnJournal {
     target: Option<String>,
     transitions: Vec<TurnTransition>,
     possible_dispatch: bool,
+    #[serde(default)]
+    interruption_marker: bool,
     output: Option<TurnOutput>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LastLocalSubmission {
+    format: u32,
+    id: String,
+    prompt: String,
+    target: Option<String>,
 }
 
 impl TurnJournal {
@@ -193,6 +238,14 @@ impl TurnJournal {
                     .iter()
                     .any(|transition| matches!(transition, TurnTransition::PossibleDispatch)),
             "stored turn journal dispatch state is invalid"
+        );
+        ensure!(
+            !self.interruption_marker
+                || self
+                    .transitions
+                    .iter()
+                    .any(|transition| matches!(transition, TurnTransition::Interrupted)),
+            "stored turn journal interruption marker state is invalid"
         );
         ensure!(
             self.output.is_some() == matches!(self.transitions.last(), Some(TurnTransition::Ended)),
@@ -480,6 +533,13 @@ impl Harness {
         )
     }
 
+    fn last_local_submission_key(&self) -> String {
+        format!(
+            "{}/session/{}/last-local-submission",
+            self.scope, self.session.id
+        )
+    }
+
     fn turn_correlation(&self, id: &str) -> String {
         let mut digest = Sha256::new();
         digest.update(b"kuru.turn-journal.v1\0");
@@ -507,6 +567,7 @@ impl Harness {
         prompt: &str,
         target: Option<&str>,
         id: &str,
+        remember_local: bool,
         cancellation: &CancellationToken,
     ) -> Result<TurnAdmission> {
         ensure!(
@@ -523,7 +584,7 @@ impl Harness {
                 "turn ID is already associated with a different request in this session"
             );
             if let Some(output) = journal.output {
-                return Ok(TurnAdmission::Reuse(output));
+                return Ok(TurnAdmission::Reuse(project_turn_output(output)));
             }
             ensure!(
                 !journal.possible_dispatch,
@@ -550,14 +611,23 @@ impl Harness {
             target: target.map(str::to_owned),
             transitions: vec![TurnTransition::Started],
             possible_dispatch: false,
+            interruption_marker: false,
             output: None,
         };
+        let mut updates = vec![(key.clone(), serde_json::to_value(&journal)?)];
+        if remember_local {
+            updates.push((
+                self.last_local_submission_key(),
+                serde_json::to_value(LastLocalSubmission {
+                    format: 1,
+                    id: id.into(),
+                    prompt: prompt.into(),
+                    target: target.map(str::to_owned),
+                })?,
+            ));
+        }
         self.memory
-            .checkpoint(
-                &self.transcript_key(),
-                &[user(prompt)],
-                &[(key.clone(), serde_json::to_value(&journal)?)],
-            )
+            .checkpoint(&self.transcript_key(), &[user(prompt)], &updates)
             .await?;
         Ok(TurnAdmission::Run {
             key,
@@ -602,6 +672,7 @@ impl Harness {
         .context("stored turn journal is invalid")?;
         journal.validate(&id)?;
         if let Some(output) = journal.output {
+            let output = project_turn_output(output);
             if recovering_completion {
                 let response = output
                     .events
@@ -614,19 +685,32 @@ impl Harness {
             }
             return Ok(Some(output));
         }
+        let already_marked = journal.interruption_marker;
         journal.push(TurnTransition::Interrupted)?;
+        let marker = Message {
+            role: INTERRUPTION_ROLE.into(),
+            content: INTERRUPTION_TEXT.into(),
+        };
+        let messages = if already_marked { vec![] } else { vec![marker] };
+        journal.interruption_marker = true;
         self.memory
-            .put(key, &serde_json::to_value(journal)?)
+            .checkpoint(
+                &self.transcript_key(),
+                &messages,
+                &[(key.into(), serde_json::to_value(journal)?)],
+            )
             .await?;
         Ok(None)
     }
 
     pub(crate) fn emit(&mut self, kind: &str, actor: &str, detail: impl Into<String>) {
-        let event = Event {
-            kind: kind.into(),
-            actor: actor.into(),
-            detail: detail.into(),
-        };
+        let event = projected_event(kind, actor, EventDetail::Text(detail.into()));
+        let _ = self.events.send(event.clone());
+        self.trace.push(event);
+    }
+
+    pub(crate) fn emit_json(&mut self, kind: &str, actor: &str, detail: Value) {
+        let event = projected_event(kind, actor, EventDetail::Json(detail));
         let _ = self.events.send(event.clone());
         self.trace.push(event);
     }
@@ -957,6 +1041,9 @@ impl Harness {
             .into_iter()
             .rev()
         {
+            if message.role == INTERRUPTION_ROLE {
+                continue;
+            }
             let mut boundary = message.content.len().min(remaining);
             while !message.content.is_char_boundary(boundary) {
                 boundary -= 1;
@@ -1042,8 +1129,7 @@ impl Harness {
 
     pub async fn run(&mut self, prompt: &str) -> Result<TurnOutput> {
         let cancellation = CancellationToken::new();
-        self.run_controlled(prompt, None, &Uuid::new_v4().to_string(), &cancellation)
-            .await
+        self.run_cancellable(prompt, None, &cancellation).await
     }
 
     pub async fn run_for(&mut self, prompt: &str, target: Option<&str>) -> Result<TurnOutput> {
@@ -1057,8 +1143,48 @@ impl Harness {
         target: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<TurnOutput> {
-        self.run_controlled(prompt, target, &Uuid::new_v4().to_string(), cancellation)
+        Ok(self
+            .run_local_controlled(prompt, target, &Uuid::new_v4().to_string(), cancellation)
+            .await?
+            .output)
+    }
+
+    /// Run a local session submission under an explicit durable turn ID.
+    pub async fn run_local_controlled(
+        &mut self,
+        prompt: &str,
+        target: Option<&str>,
+        turn_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ControlledTurnOutput> {
+        self.run_controlled_inner(prompt, target, turn_id, true, cancellation)
             .await
+    }
+
+    /// Retry the last locally admitted submission without changing its tuple.
+    pub async fn retry_last(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<ControlledTurnOutput> {
+        let submission: LastLocalSubmission = serde_json::from_value(
+            self.memory
+                .get(&self.last_local_submission_key())
+                .await?
+                .context("this session has no local submission to retry")?,
+        )
+        .context("stored last local submission is invalid")?;
+        ensure!(
+            submission.format == 1,
+            "unsupported last local submission format"
+        );
+        self.run_controlled_inner(
+            &submission.prompt,
+            submission.target.as_deref(),
+            &submission.id,
+            false,
+            cancellation,
+        )
+        .await
     }
 
     /// Run a session-scoped, durably identified turn with explicit cancellation.
@@ -1072,6 +1198,20 @@ impl Harness {
         turn_id: &str,
         cancellation: &CancellationToken,
     ) -> Result<TurnOutput> {
+        Ok(self
+            .run_controlled_inner(prompt, target, turn_id, false, cancellation)
+            .await?
+            .output)
+    }
+
+    async fn run_controlled_inner(
+        &mut self,
+        prompt: &str,
+        target: Option<&str>,
+        turn_id: &str,
+        remember_local: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ControlledTurnOutput> {
         self.reconcile().await?;
         ensure!(
             !prompt.trim().is_empty() && prompt.len() <= 131_072,
@@ -1079,10 +1219,15 @@ impl Harness {
         );
         cancellation.check()?;
         let (key, mut journal, resolved_target) = match self
-            .admit_turn(prompt, target, turn_id, cancellation)
+            .admit_turn(prompt, target, turn_id, remember_local, cancellation)
             .await?
         {
-            TurnAdmission::Reuse(output) => return Ok(output),
+            TurnAdmission::Reuse(output) => {
+                return Ok(ControlledTurnOutput {
+                    output,
+                    reused: true,
+                });
+            }
             TurnAdmission::Run {
                 key,
                 journal,
@@ -1107,7 +1252,10 @@ impl Harness {
             Err(error) => {
                 if let Some(output) = self.record_interruption(&key, journal).await? {
                     tracing::info!(target: "kuru.runtime", parent: &span, status = "interrupted", elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
-                    Ok(output)
+                    Ok(ControlledTurnOutput {
+                        output,
+                        reused: false,
+                    })
                 } else {
                     tracing::info!(target: "kuru.runtime", parent: &span, status = if turn_was_cancelled(&error) { "cancelled" } else { "error" }, elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
                     Err(error)
@@ -1115,7 +1263,10 @@ impl Harness {
             }
             Ok(output) => {
                 tracing::info!(target: "kuru.runtime", parent: &span, status = "ok", elapsed_ms = started.elapsed().as_millis() as u64, "turn finished");
-                Ok(output)
+                Ok(ControlledTurnOutput {
+                    output,
+                    reused: false,
+                })
             }
         }
     }
@@ -1146,6 +1297,7 @@ impl Harness {
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut limited = false;
+        let mut limit_reasons = BTreeSet::new();
         for round in 0..self.config.max_rounds {
             if pending.is_empty() {
                 break;
@@ -1177,6 +1329,9 @@ impl Harness {
                 for call in completion.calls {
                     let result = if used >= self.config.max_tool_calls {
                         limited = true;
+                        if limit_reasons.insert(TurnLimitReason::ToolCalls) {
+                            self.emit_json("budget", "pool", json!({"reason":"tool-calls"}));
+                        }
                         Err(anyhow::anyhow!("turn tool budget exhausted"))
                     } else {
                         used += 1;
@@ -1194,10 +1349,14 @@ impl Harness {
         }
         if !pending.is_empty() {
             limited = true;
-            self.emit(
+            limit_reasons.insert(TurnLimitReason::PeerRounds);
+            self.emit_json(
                 "budget",
                 "pool",
-                "peer-round limit reached; pending messages preserved for next invocation",
+                json!({
+                    "reason":"peer-rounds",
+                    "detail":"pending messages preserved for next invocation"
+                }),
             );
             for (id, messages) in pending {
                 for message in messages {
@@ -1285,6 +1444,9 @@ impl Harness {
             for call in completion.calls {
                 let result = if used >= self.config.max_tool_calls {
                     limited = true;
+                    if limit_reasons.insert(TurnLimitReason::ToolCalls) {
+                        self.emit_json("budget", "pool", json!({"reason":"tool-calls"}));
+                    }
                     Err(anyhow::anyhow!(
                         "turn tool budget exhausted; finish with available evidence"
                     ))
@@ -1362,10 +1524,13 @@ impl Harness {
                 inputs.push(tool_result(&call, result));
             }
         }
-        if text.is_empty() {
+        let response_outcome = if text.is_empty() {
             text = "The turn ended without a text response. Review the activity trace and available tool budget.".into();
             limited = true;
-        }
+            ResponseOutcome::Empty
+        } else {
+            ResponseOutcome::Text
+        };
         cancellation.check()?;
         let mut session = self.session.clone();
         session.turns += 1;
@@ -1380,11 +1545,7 @@ impl Harness {
                 topology.focus = None;
             }
         }
-        let response = Event {
-            kind: "response".into(),
-            actor: speaker.clone(),
-            detail: text.clone(),
-        };
+        let response = projected_event("response", &speaker, EventDetail::CompletedResponse);
         let mut events = self.trace.clone();
         events.push(response.clone());
         let output = TurnOutput {
@@ -1395,6 +1556,8 @@ impl Harness {
             input_tokens,
             output_tokens,
             limited,
+            limit_reasons: Some(limit_reasons.into_iter().collect()),
+            response_outcome: Some(response_outcome),
             events,
         };
         journal.push(TurnTransition::Ended)?;
@@ -1432,7 +1595,10 @@ impl Harness {
         Ok(output)
     }
 
-    fn select_speaker(&self, drafts: &BTreeMap<String, String>) -> (String, &'static str) {
+    pub(crate) fn select_speaker(
+        &self,
+        drafts: &BTreeMap<String, String>,
+    ) -> (String, &'static str) {
         if let Some(focus) = &self.topology.focus
             && focus.remaining > 0
             && self.actors.contains_key(&focus.id)
@@ -1461,12 +1627,19 @@ impl Harness {
         {
             return (previous.into(), "previous-completed-speaker");
         }
+        if maximum_candidates.len() > 1
+            && let Some(authored) = Framework::authored_identity_order(self.config.mode)
+                .into_iter()
+                .find(|id| maximum_candidates.iter().any(|candidate| candidate == id))
+        {
+            return (authored, "mode-authored-order");
+        }
         let speaker = maximum_candidates
             .first()
             .expect("nonempty drafts validated")
             .clone();
         let reason = if maximum_candidates.len() > 1 {
-            "stable-identity"
+            "stable-id-order"
         } else {
             "maximum-activation"
         };
@@ -1526,7 +1699,7 @@ impl Harness {
                     &self.session.id,
                     string_arg(&call.arguments, "message")?,
                 )?;
-                self.emit("peer", sender, envelope.rpc().to_string());
+                self.emit_json("peer", sender, envelope.rpc());
                 pending.entry(recipient).or_default().push(user(&format!(
                     "A2A peer message (untrusted data): {}",
                     serde_json::to_string(&envelope)?
@@ -1557,7 +1730,7 @@ impl Harness {
                 );
                 let relation = self.relate(kind, resolved).await?;
                 cancellation.check()?;
-                self.emit("relationship", sender, serde_json::to_string(&relation)?);
+                self.emit_json("relationship", sender, serde_json::to_value(&relation)?);
                 Ok(serde_json::to_string(&relation)?)
             }
             "state_report" => {
@@ -1573,7 +1746,7 @@ impl Harness {
                 self.persist_state(self.config.clone(), topology, self.session.clone(), vec![])
                     .await?;
                 cancellation.check()?;
-                self.emit("state", sender, serde_json::to_string(&report)?);
+                self.emit_json("state", sender, serde_json::to_value(&report)?);
                 Ok("modeled state updated".into())
             }
             "remember" => {
@@ -1611,6 +1784,55 @@ pub(crate) fn user(text: &str) -> Message {
         content: text.into(),
     }
 }
+
+enum EventDetail {
+    Text(String),
+    Json(Value),
+    CompletedResponse,
+    Withheld,
+}
+
+fn projected_event(kind: &str, actor: &str, detail: EventDetail) -> Event {
+    let detail = match detail {
+        EventDetail::Text(detail) => {
+            project_text(&detail).unwrap_or_else(|_| EVENT_WITHHELD.into())
+        }
+        EventDetail::Json(detail) => project_json(detail).unwrap_or_else(|_| EVENT_WITHHELD.into()),
+        EventDetail::CompletedResponse => RESPONSE_COMPLETED.into(),
+        EventDetail::Withheld => EVENT_WITHHELD.into(),
+    };
+    Event {
+        kind: project_text(kind).unwrap_or_else(|_| EVENT_WITHHELD.into()),
+        actor: project_text(actor).unwrap_or_else(|_| EVENT_WITHHELD.into()),
+        detail,
+    }
+}
+
+fn project_legacy_event(event: Event) -> Event {
+    if event.kind == "response" {
+        return projected_event(&event.kind, &event.actor, EventDetail::CompletedResponse);
+    }
+    if matches!(event.kind.as_str(), "peer" | "relationship" | "state") {
+        return match serde_json::from_str(&event.detail) {
+            Ok(detail) => projected_event(&event.kind, &event.actor, EventDetail::Json(detail)),
+            Err(_) => projected_event(&event.kind, &event.actor, EventDetail::Withheld),
+        };
+    }
+    projected_event(&event.kind, &event.actor, EventDetail::Text(event.detail))
+}
+
+fn project_turn_output(mut output: TurnOutput) -> TurnOutput {
+    output.events = output
+        .events
+        .into_iter()
+        .map(project_legacy_event)
+        .collect();
+    if output.limit_reasons.is_none() && output.limited {
+        output.limit_reasons = Some(vec![TurnLimitReason::LegacyUnspecified]);
+    }
+    output
+}
+
 fn assistant(text: &str) -> Message {
     Message {
         role: "assistant".into(),
@@ -1975,6 +2197,332 @@ mod publication_tests {
     }
 
     #[tokio::test]
+    async fn local_retry_reports_reuse_and_a2a_does_not_replace_its_tuple() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(CountingProvider::default());
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let first = harness
+            .run_local_controlled(
+                "local request",
+                Some(&target),
+                "local-id",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!first.reused);
+        harness
+            .run_controlled(
+                "a2a request",
+                Some(&target),
+                "a2a-id",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let sends = provider.calls.load(Ordering::SeqCst);
+
+        let retried = harness.retry_last(&CancellationToken::new()).await.unwrap();
+
+        assert!(retried.reused);
+        assert_eq!(retried.output.text, first.output.text);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
+        assert_eq!(harness.history().await.unwrap().len(), 4);
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_retry_resumes_only_a_pre_dispatch_admission() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(CountingProvider::default());
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let admission = harness
+            .admit_turn(
+                "safe local request",
+                Some(&target),
+                "safe-local-id",
+                true,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(admission, TurnAdmission::Run { .. }));
+
+        let retried = harness.retry_last(&CancellationToken::new()).await.unwrap();
+
+        assert!(!retried.reused);
+        assert_eq!(harness.history().await.unwrap().len(), 2);
+        assert!(provider.calls.load(Ordering::SeqCst) > 0);
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interruption_marker_dedup_is_explicit_and_repairs_legacy_journals() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            Arc::new(FailingProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let TurnAdmission::Run {
+            key, mut journal, ..
+        } = harness
+            .admit_turn(
+                "legacy interrupted request",
+                Some(&target),
+                "legacy-interrupted",
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("new journal must run");
+        };
+        journal.push(TurnTransition::Interrupted).unwrap();
+        let mut legacy = serde_json::to_value(&journal).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("interruption_marker");
+        memory.put(&key, &legacy).await.unwrap();
+
+        harness
+            .run_controlled(
+                "legacy interrupted request",
+                Some(&target),
+                "legacy-interrupted",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let stored: TurnJournal =
+            serde_json::from_value(memory.get(&key).await.unwrap().unwrap()).unwrap();
+        assert!(stored.interruption_marker);
+        assert_eq!(
+            harness
+                .history()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|message| message.role == INTERRUPTION_ROLE)
+                .count(),
+            1
+        );
+
+        harness.record_interruption(&key, stored).await.unwrap();
+        assert_eq!(
+            harness
+                .history()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|message| message.role == INTERRUPTION_ROLE)
+                .count(),
+            1
+        );
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[test]
+    fn event_projection_redacts_semantics_and_normalizes_legacy_outcomes() {
+        let secret = "sk-projection-fixture-1234567890";
+        let state = projected_event(
+            "state",
+            "peer",
+            EventDetail::Json(json!({"activation":0.5,"note":format!("token={secret}")})),
+        );
+        assert!(state.detail.contains("activation"));
+        assert!(!state.detail.contains(secret));
+        let peer = projected_event(
+            "peer",
+            "peer",
+            EventDetail::Json(json!({"body":"ordinary semantic body","api_key":secret})),
+        );
+        assert!(peer.detail.contains("ordinary semantic body"));
+        assert!(!peer.detail.contains(secret));
+        let relationship = projected_event(
+            "relationship",
+            "peer",
+            EventDetail::Json(json!({
+                "kind":"alliance",
+                "members":["ordinary-peer"],
+                "token":secret
+            })),
+        );
+        assert!(relationship.detail.contains("ordinary-peer"));
+        assert!(!relationship.detail.contains(secret));
+        let error = projected_event(
+            "error",
+            "peer",
+            EventDetail::Text(format!("token={secret}")),
+        );
+        assert!(!error.detail.contains(secret));
+        let metadata = projected_event(
+            &format!("kind token={secret}"),
+            &format!("actor token={secret}"),
+            EventDetail::Text("ordinary detail".into()),
+        );
+        assert!(!metadata.kind.contains(secret));
+        assert!(!metadata.actor.contains(secret));
+        let response = project_legacy_event(Event {
+            kind: "response".into(),
+            actor: "peer".into(),
+            detail: secret.into(),
+        });
+        assert_eq!(response.detail, RESPONSE_COMPLETED);
+        let malformed = project_legacy_event(Event {
+            kind: "state".into(),
+            actor: "peer".into(),
+            detail: format!("malformed {secret}"),
+        });
+        assert_eq!(malformed.detail, EVENT_WITHHELD);
+
+        let legacy: TurnOutput = serde_json::from_value(json!({
+            "session":"session",
+            "speaker":"peer",
+            "text":"answer",
+            "relationship":null,
+            "input_tokens":1,
+            "output_tokens":1,
+            "limited":true,
+            "events":[]
+        }))
+        .unwrap();
+        let legacy = project_turn_output(legacy);
+        assert_eq!(
+            legacy.limit_reasons,
+            Some(vec![TurnLimitReason::LegacyUnspecified])
+        );
+        assert_eq!(legacy.response_outcome, None);
+    }
+
+    #[tokio::test]
+    async fn projected_events_reach_broadcast_output_and_journal_without_secret_leakage() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Freudian,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            Arc::new(SecretEventProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let secret = "sk-projection-fixture-1234567890";
+        let secret_actor = format!("actor token={secret}");
+        let old_actor = harness.topology.parts.last().unwrap().id.clone();
+        harness.topology.parts.last_mut().unwrap().id = secret_actor.clone();
+        let actor = harness.actors.remove(&old_actor).unwrap();
+        harness.actors.insert(secret_actor, actor);
+        let mut events = harness.subscribe();
+
+        let output = harness
+            .run_controlled(
+                "projection fixture",
+                None,
+                "projection-id",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let serialized_output = serde_json::to_string(&output).unwrap();
+        assert!(!serialized_output.contains(secret));
+        assert!(output.events.iter().any(|event| {
+            event.kind == "state"
+                && event.detail.contains("activation")
+                && !event.detail.contains(secret)
+        }));
+        assert_eq!(output.events.last().unwrap().detail, RESPONSE_COMPLETED);
+        let mut broadcast = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            broadcast.push(event);
+        }
+        assert!(!serde_json::to_string(&broadcast).unwrap().contains(secret));
+        let stored = memory
+            .get(&harness.turn_journal_key("projection-id"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!serde_json::to_string(&stored).unwrap().contains(secret));
+        let replay = harness
+            .run_controlled(
+                "projection fixture",
+                None,
+                "projection-id",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !serde_json::to_string(&replay.events)
+                .unwrap()
+                .contains(secret)
+        );
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stopped_started_turn_resumes_once_but_possible_turn_never_dispatches() {
         let project = tempfile::tempdir().unwrap();
         let data = kuru_memory::test_support::tempdir().unwrap();
@@ -2005,7 +2553,13 @@ mod publication_tests {
         let target = first.topology.parts[0].id.clone();
         let cancellation = CancellationToken::new();
         let TurnAdmission::Run { .. } = first
-            .admit_turn("resume safely", Some(&target), "started", &cancellation)
+            .admit_turn(
+                "resume safely",
+                Some(&target),
+                "started",
+                false,
+                &cancellation,
+            )
             .await
             .unwrap()
         else {
@@ -2014,7 +2568,13 @@ mod publication_tests {
         let TurnAdmission::Run {
             key, mut journal, ..
         } = first
-            .admit_turn("remain uncertain", Some(&target), "possible", &cancellation)
+            .admit_turn(
+                "remain uncertain",
+                Some(&target),
+                "possible",
+                false,
+                &cancellation,
+            )
             .await
             .unwrap()
         else {
@@ -2127,6 +2687,37 @@ mod publication_tests {
         }
     }
 
+    struct SecretEventProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for SecretEventProvider {
+        async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn complete(&self, request: kuru_core::CompletionRequest) -> Result<Completion> {
+            if request.instructions.contains("Phase: deliberate") {
+                Ok(Completion {
+                    text: "projected draft".into(),
+                    calls: vec![ToolCall {
+                        id: "state-fixture".into(),
+                        name: "state_report".into(),
+                        arguments: json!({
+                            "activation": 0.5,
+                            "note": "token=sk-projection-fixture-1234567890"
+                        }),
+                    }],
+                    ..Completion::default()
+                })
+            } else {
+                Ok(Completion {
+                    text: "projected answer".into(),
+                    ..Completion::default()
+                })
+            }
+        }
+    }
+
     struct BlockingOnceProvider {
         calls: std::sync::atomic::AtomicUsize,
         started: Notify,
@@ -2220,7 +2811,16 @@ mod publication_tests {
         cancellation.cancel();
         let (mut harness, result, target) = task.await.unwrap();
         assert!(turn_was_cancelled(&result.unwrap_err()));
-        assert_eq!(harness.history().await.unwrap(), [user("interrupt me")]);
+        assert_eq!(
+            harness.history().await.unwrap(),
+            [
+                user("interrupt me"),
+                Message {
+                    role: INTERRUPTION_ROLE.into(),
+                    content: INTERRUPTION_TEXT.into(),
+                },
+            ]
+        );
         let calls = provider.calls.load(Ordering::SeqCst);
         assert_eq!(
             calls, 1,
@@ -2247,6 +2847,16 @@ mod publication_tests {
             .await
             .unwrap();
         assert!(provider.calls.load(Ordering::SeqCst) > calls);
+        assert_eq!(
+            harness
+                .history()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|message| message.role == INTERRUPTION_ROLE)
+                .count(),
+            1
+        );
         harness.shutdown(false).await.unwrap();
         memory.close().await.unwrap();
     }
@@ -2284,8 +2894,17 @@ mod publication_tests {
         assert!(error.to_string().contains("all peers failed"));
         assert_eq!(
             harness.history().await.unwrap(),
-            [user("retain failed prompt")]
+            [
+                user("retain failed prompt"),
+                Message {
+                    role: INTERRUPTION_ROLE.into(),
+                    content: INTERRUPTION_TEXT.into(),
+                },
+            ]
         );
+        let provider_context = harness.public_context(&memory).await.unwrap();
+        assert!(!provider_context.contains(INTERRUPTION_ROLE));
+        assert!(!provider_context.contains(INTERRUPTION_TEXT));
         let journal: TurnJournal = serde_json::from_value(
             memory
                 .get(&harness.turn_journal_key("ordinary-failure"))
@@ -2402,7 +3021,7 @@ mod publication_tests {
         let mut observed_response = false;
         while let Ok(event) = events.try_recv() {
             if event.kind == "response" {
-                assert_eq!(event.detail, output.text);
+                assert_eq!(event.detail, RESPONSE_COMPLETED);
                 observed_response = true;
                 break;
             }
