@@ -98,8 +98,29 @@ fn write_in(parent: &Directory, name: &OsStr, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The checked outcome of a stopped directory move.
+///
+/// The no-move variant is intentionally private to memory provisioning. Other
+/// callers retain the established erased `Result<Directory>` contract.
+pub(crate) enum DirectoryMove {
+    Moved(Directory),
+    ProvenNoMove(anyhow::Error),
+}
+
 /// Preserve a stopped directory's identity through an uncertain native move.
 pub(crate) fn move_directory(source: &Directory, destination: &Path) -> Result<Directory> {
+    match move_directory_checked(source, destination)? {
+        DirectoryMove::Moved(directory) => Ok(directory),
+        DirectoryMove::ProvenNoMove(error) => Err(error),
+    }
+}
+
+/// Preserve a stopped directory's identity while exposing the one checked
+/// no-move outcome that runtime activation may recover on Windows.
+pub(crate) fn move_directory_checked(
+    source: &Directory,
+    destination: &Path,
+) -> Result<DirectoryMove> {
     move_directory_with(source, destination, |parent, source, name| {
         parent
             .move_new_directory(source, name)
@@ -115,10 +136,11 @@ fn move_directory_with(
         &Directory,
         &OsStr,
     ) -> std::result::Result<Directory, (PublicationPhase, anyhow::Error)>,
-) -> Result<Directory> {
+) -> Result<DirectoryMove> {
     let parent = parent(destination, Privacy::OwnerOnly, NameRetention::Movable)?;
-    match publish(&parent, source, name(destination)?) {
-        Ok(moved) => Ok(moved),
+    let destination_name = name(destination)?;
+    match publish(&parent, source, destination_name) {
+        Ok(moved) => Ok(DirectoryMove::Moved(moved)),
         Err((PublicationPhase::Uncertain, error)) => {
             let reconcile = || -> Result<Directory> {
                 let moved = directory(destination).context("open publication destination")?;
@@ -132,16 +154,40 @@ fn move_directory_with(
                 );
                 Ok(moved)
             };
-            reconcile().map_err(|secondary| {
-                // Preserve the original typed publication/OS error in the cause
-                // chain. These bounded fresh observations never authorize a retry.
-                error.context(format!(
-                    "memory directory reconciliation failed: {secondary:#}; held_source={:?}; source={}; destination={}; preserve both paths",
-                    source.identity(),
-                    observe_directory(source.path(), source.identity()),
-                    observe_directory(destination, source.identity()),
-                ))
-            })
+            match reconcile() {
+                Ok(moved) => Ok(DirectoryMove::Moved(moved)),
+                Err(secondary) => {
+                    // Only an unchanged held source and an absent destination
+                    // prove that this particular move did not occur. Every
+                    // other observation preserves the original uncertain error.
+                    let no_move = source.revalidate().is_ok()
+                        && parent.revalidate().is_ok()
+                        && matches!(parent.read(destination_name), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+                    if no_move {
+                        let mut error = error;
+                        let Some(publication) =
+                            error.downcast_mut::<kuru_platform::fs::PublicationError>()
+                        else {
+                            return Err(error.context(
+                                "uncertain directory move omitted its typed publication error",
+                            ));
+                        };
+                        publication.phase = PublicationPhase::Rejected;
+                        return Ok(DirectoryMove::ProvenNoMove(error.context(
+                            "memory directory reconciliation proved the held source remains and the destination is absent",
+                        )));
+                    }
+                    // Preserve the original typed publication/OS error in the
+                    // cause chain. These bounded fresh observations never
+                    // authorize a retry.
+                    Err(error.context(format!(
+                        "memory directory reconciliation failed: {secondary:#}; held_source={:?}; source={}; destination={}; preserve both paths",
+                        source.identity(),
+                        observe_directory(source.path(), source.identity()),
+                        observe_directory(destination, source.identity()),
+                    )))
+                }
+            }
         }
         Err((_, error)) => Err(error),
     }
@@ -169,13 +215,16 @@ pub(crate) fn move_directory_observed(
     destination: &Path,
     observer: impl FnOnce(&Directory) -> Result<()>,
 ) -> Result<Directory> {
-    move_directory_with(source, destination, |parent, source, name| {
+    match move_directory_with(source, destination, |parent, source, name| {
         let moved = parent
             .move_new_directory(source, name)
             .map_err(|error| (error.phase, anyhow::Error::from(error)))?;
         observer(&moved).map_err(|error| (PublicationPhase::Uncertain, error))?;
         Ok(moved)
-    })
+    })? {
+        DirectoryMove::Moved(directory) => Ok(directory),
+        DirectoryMove::ProvenNoMove(error) => Err(error),
+    }
 }
 
 /// TempDir owns only the disposable outer container. Private data is created
@@ -221,6 +270,37 @@ impl PrivateTemp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untyped_uncertain_no_move_preserves_its_original_error() {
+        let root = PrivateTemp::new("memory-untyped-move-", None).unwrap();
+        let source_path = root.path().join("source");
+        let source = Directory::ensure_private(&source_path).unwrap();
+        let destination = root.path().join("active");
+
+        let error = match move_directory_with(&source, &destination, |_, _, _| {
+            Err((
+                PublicationPhase::Uncertain,
+                std::io::Error::from_raw_os_error(5).into(),
+            ))
+        }) {
+            Ok(_) => panic!("untyped uncertain errors must not expose a no-move marker"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(5)
+        );
+        assert!(format!("{error:#}").contains("omitted its typed publication error"));
+        assert_eq!(
+            directory(&source_path).unwrap().identity(),
+            source.identity()
+        );
+        assert!(!destination.exists());
+    }
 
     #[test]
     fn unresolved_real_move_reports_both_names_and_preserves_original_error() {

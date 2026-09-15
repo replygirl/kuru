@@ -27,6 +27,10 @@ use tokio::process::Command;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(180);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTPUT_LIMIT: u64 = 4096;
+#[cfg(windows)]
+const ACTIVATION_RETRY_LIMIT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const ACTIVATION_RETRY_SPACING: Duration = Duration::from_millis(20);
 
 /// Extract the bundled engine or reuse its verified cache, including offline
 /// first use. An explicit development binary still passes the exact version
@@ -146,13 +150,13 @@ async fn provision_with_extractor_observed(
     .await?;
     extraction?;
     progress.report(MemoryOpenStage::CheckingRuntimeVersion);
-    let (staging, _lock) = owned_probe(
+    let (staging, lock) = owned_probe(
         candidate.join(asset.executable_name),
         staging.path().join("probe"),
         (staging, _lock),
     )
     .await?;
-    activate_staged(staging, &candidate, &destination)?;
+    activate_staged(staging, lock, &candidate, &destination).await?;
     Ok(destination.join(asset.executable_name))
 }
 
@@ -322,27 +326,180 @@ fn extract(archive: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {
     Ok(())
 }
 
-fn activate_staged(staging: PrivateTemp, candidate: &Path, destination: &Path) -> Result<()> {
-    if let Err(error) = activate(candidate, destination) {
-        let retained = staging.keep();
-        return Err(error).with_context(|| {
-            format!(
-                "verified Dolt activation failed; preserved private stage at {}",
-                retained.display()
-            )
-        });
-    }
-    Ok(())
+struct StagedActivation {
+    // Rust drops fields in declaration order. Keep the source authority first,
+    // then the disposable private stage, then the cache lease.
+    source: Option<Directory>,
+    staging: PrivateTemp,
+    lock: CacheLock,
 }
 
+impl StagedActivation {
+    fn retain(self, error: anyhow::Error) -> anyhow::Error {
+        let Self {
+            source,
+            staging,
+            lock,
+        } = self;
+        // Close the checked candidate before retaining its stage, then release
+        // the cache lock only after stage ownership has been decided.
+        drop(source);
+        let retained = staging.keep();
+        drop(lock);
+        error.context(format!(
+            "verified Dolt activation failed; preserved private stage at {}",
+            retained.display()
+        ))
+    }
+}
+
+async fn activate_staged(
+    staging: PrivateTemp,
+    lock: CacheLock,
+    candidate: &Path,
+    destination: &Path,
+) -> Result<()> {
+    activate_staged_with(staging, lock, candidate, destination, |_| {}).await
+}
+
+#[cfg(test)]
+async fn activate_staged_observed(
+    staging: PrivateTemp,
+    lock: CacheLock,
+    candidate: &Path,
+    destination: &Path,
+    observer: impl FnMut(bool),
+) -> Result<()> {
+    activate_staged_with(staging, lock, candidate, destination, observer).await
+}
+
+async fn activate_staged_with(
+    staging: PrivateTemp,
+    lock: CacheLock,
+    candidate: &Path,
+    destination: &Path,
+    mut observer: impl FnMut(bool),
+) -> Result<()> {
+    let mut activation = StagedActivation {
+        source: None,
+        staging,
+        lock,
+    };
+    activation.source = match files::directory(candidate) {
+        Ok(source) => Some(source),
+        Err(error) => {
+            return Err(activation.retain(error.context("open verified Dolt activation source")));
+        }
+    };
+    let source = activation
+        .source
+        .as_ref()
+        .expect("the activation source is set before any move attempt");
+
+    #[cfg(not(windows))]
+    {
+        match activate_once(source, destination) {
+            Ok(files::DirectoryMove::Moved(_)) => {
+                observer(false);
+                Ok(())
+            }
+            Ok(files::DirectoryMove::ProvenNoMove(error)) => {
+                observer(true);
+                Err(activation.retain(error))
+            }
+            Err(error) => Err(activation.retain(error)),
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let deadline = tokio::time::Instant::now() + ACTIVATION_RETRY_LIMIT;
+        let mut first_error = None;
+        let mut retries = 0_u32;
+        loop {
+            if first_error.is_some() {
+                if tokio::time::Instant::now() >= deadline {
+                    let error = first_error
+                        .expect("a pending activation retry retains its first checked error");
+                    return Err(activation.retain(expired_activation_error(error, retries)));
+                }
+                retries += 1;
+            }
+            match activate_once(source, destination) {
+                Ok(files::DirectoryMove::Moved(_)) => {
+                    observer(false);
+                    return Ok(());
+                }
+                Ok(files::DirectoryMove::ProvenNoMove(error)) => {
+                    observer(true);
+                    if error
+                        .downcast_ref::<kuru_platform::fs::PublicationError>()
+                        .is_none_or(|publication| publication.error().raw_os_error() != Some(5))
+                    {
+                        let error = terminal_activation_error(first_error, error, retries);
+                        return Err(activation.retain(error));
+                    }
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        let error = terminal_activation_error(first_error, error, retries);
+                        return Err(activation.retain(error));
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    tokio::time::sleep((deadline - now).min(ACTIVATION_RETRY_SPACING)).await;
+                }
+                Err(error) => {
+                    let error = terminal_activation_error(first_error, error, retries);
+                    return Err(activation.retain(error));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminal_activation_error(
+    first_error: Option<anyhow::Error>,
+    error: anyhow::Error,
+    retries: u32,
+) -> anyhow::Error {
+    match first_error {
+        Some(first_error) => first_error.context(format!(
+            "runtime activation recovery stopped after {retries} retries; latest checked result: {error:#}"
+        )),
+        None => error,
+    }
+}
+
+#[cfg(windows)]
+fn expired_activation_error(error: anyhow::Error, retries: u32) -> anyhow::Error {
+    error.context(format!(
+        "runtime activation recovery stopped after {retries} retries before starting another native move"
+    ))
+}
+
+#[cfg(test)]
 fn activate(candidate: &Path, destination: &Path) -> Result<()> {
+    let source = files::directory(candidate)?;
+    match activate_once(&source, destination)? {
+        files::DirectoryMove::Moved(_) => Ok(()),
+        files::DirectoryMove::ProvenNoMove(error) => Err(error),
+    }
+}
+
+fn activate_once(source: &Directory, destination: &Path) -> Result<files::DirectoryMove> {
     ensure!(
         fs::symlink_metadata(destination).is_err(),
         "Dolt cache destination appeared during installation"
     );
-    files::move_directory(&files::directory(candidate)?, destination)
-        .context("activate verified Dolt runtime")?;
-    Ok(())
+    match files::move_directory_checked(source, destination) {
+        Ok(files::DirectoryMove::Moved(directory)) => Ok(files::DirectoryMove::Moved(directory)),
+        Ok(files::DirectoryMove::ProvenNoMove(error)) => Ok(files::DirectoryMove::ProvenNoMove(
+            error.context("activate verified Dolt runtime"),
+        )),
+        Err(error) => Err(error.context("activate verified Dolt runtime")),
+    }
 }
 
 fn extract_zip(bytes: &[u8], destination: &Path, asset: Asset<'_>) -> Result<()> {

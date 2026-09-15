@@ -357,6 +357,14 @@ The test runner uses two threads and limits
 simultaneous temporary servers. Do not replace these fixtures with SQLite or
 exclude memory modules from coverage.
 
+Windows runtime activation retries access denied only after checked observations
+prove that the verified source directory has not moved and the destination is
+absent. Recovery uses the same source handle, private stage and cache lock for
+up to two seconds, with 20-millisecond asynchronous waits. Other errors or
+uncertain outcomes fail immediately and preserve the stage. Native regressions
+exercise a real held descendant, persistent denial and cancellation; host-only
+tests cannot establish this Windows behavior.
+
 The demo provider allows offline process smoke tests. Authentication and
 provider fixtures use local OAuth and HTTP peers with synthetic credentials,
 including callback validation, token refresh and Responses SSE framing. MCP
