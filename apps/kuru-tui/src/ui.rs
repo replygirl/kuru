@@ -2103,17 +2103,17 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            for expected in [
-                "COMPLETION_TEXT",
-                "8 input tokens",
-                "5 output tokens",
-                "tool-call budget reached",
-            ] {
-                assert!(
-                    screen.contains(expected),
-                    "{size:?} omitted {expected}:\n{screen}"
-                );
-            }
+            let normalized = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+            let answer = normalized
+                .find("COMPLETION_TEXT")
+                .unwrap_or_else(|| panic!("{size:?} omitted the answer:\n{screen}"));
+            let metadata = normalized
+                .find("8 input tokens · 5 output tokens · tool-call budget reached")
+                .unwrap_or_else(|| panic!("{size:?} omitted the answer metadata:\n{screen}"));
+            assert!(
+                answer < metadata,
+                "{size:?} did not keep metadata after its answer:\n{screen}"
+            );
         }
     }
 
