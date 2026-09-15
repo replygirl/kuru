@@ -235,6 +235,7 @@ enum State {
     },
     UrlSuppress,
     SchemeTail,
+    SchemeTailToken(Prefix),
     SchemeSlashOne,
     SchemeSlashTwo,
 }
@@ -581,7 +582,8 @@ impl Scanner {
                 }
                 State::TokenPending { raw, .. } => self.emit_raw(&raw, output)?,
                 State::Jwt { raw, .. } => self.emit_raw(&raw, output)?,
-                State::Url { userinfo } => self.emit_raw(&userinfo, output)?,
+                State::Url { userinfo } => self.project_url_authority(&userinfo, output)?,
+                State::SchemeTailToken(prefix) => self.emit_raw(&prefix.raw, output)?,
                 State::AwsPending { raw, body: 16 } => {
                     self.emit_marker(output)?;
                     self.consume_bytes(&raw);
@@ -728,6 +730,7 @@ impl Scanner {
             State::Url { mut userinfo } => self.feed_url(&mut userinfo, byte, output),
             State::UrlSuppress => self.feed_url_suppress(byte, output),
             State::SchemeTail => self.feed_scheme_tail(byte, output),
+            State::SchemeTailToken(prefix) => self.feed_scheme_tail_token(prefix, byte, output),
             State::SchemeSlashOne => {
                 if byte == b'/' {
                     self.emit_byte(byte, output)?;
@@ -892,7 +895,7 @@ impl Scanner {
                 self.state = State::Normal;
                 return Ok(());
             }
-            self.emit_raw(userinfo, output)?;
+            self.project_url_authority(userinfo, output)?;
             return self.feed(byte, output);
         }
         if userinfo.len() == URL_USERINFO_MAX_BYTES {
@@ -902,7 +905,7 @@ impl Scanner {
             return self.feed(byte, output);
         }
         if is_url_authority_delimiter(byte) {
-            self.emit_raw(userinfo, output)?;
+            self.project_url_authority(userinfo, output)?;
             return self.feed(byte, output);
         }
         userinfo.push(byte);
@@ -936,14 +939,91 @@ impl Scanner {
         output: &mut S,
     ) -> Result<(), ProjectionError> {
         if is_scheme_byte(byte) {
-            self.emit_byte(byte, output)?;
-            self.state = State::SchemeTail;
+            let prefix = Prefix {
+                raw: vec![byte],
+                name_boundary: self.previous.is_none_or(|previous| !is_name_byte(previous)),
+                openai_boundary: self
+                    .previous
+                    .is_none_or(|previous| !TokenKind::OpenAi.alphabet(previous)),
+                github_boundary: self
+                    .previous
+                    .is_none_or(|previous| !TokenKind::GitHub.alphabet(previous)),
+                aws_boundary: self.previous.is_none_or(|previous| {
+                    !previous.is_ascii_uppercase() && !previous.is_ascii_digit()
+                }),
+                jwt_boundary: self.previous.is_none_or(|previous| !is_jwt_byte(previous)),
+                line_start: false,
+            };
+            if has_token_strict_prefix(&prefix) {
+                self.state = State::SchemeTailToken(prefix);
+            } else {
+                self.emit_byte(byte, output)?;
+                self.state = State::SchemeTail;
+            }
         } else if byte == b':' {
             self.emit_byte(byte, output)?;
             self.state = State::SchemeSlashOne;
         } else {
             self.feed(byte, output)?;
         }
+        Ok(())
+    }
+
+    fn feed_scheme_tail_token<S: ProjectionSink>(
+        &mut self,
+        mut prefix: Prefix,
+        byte: u8,
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        if !is_scheme_byte(byte) {
+            self.emit_raw(&prefix.raw, output)?;
+            self.state = State::SchemeTail;
+            return self.feed_scheme_tail(byte, output);
+        }
+        prefix.raw.push(byte);
+        if has_token_strict_prefix(&prefix) {
+            self.state = State::SchemeTailToken(prefix);
+            return Ok(());
+        }
+        if let Some(found) = best_completed_token_prefix(&prefix) {
+            let suffix = prefix.raw[found.length..].to_vec();
+            self.start_prefix(found.kind, prefix.raw[..found.length].to_vec(), output)?;
+            for byte in suffix {
+                self.feed(byte, output)?;
+            }
+            return Ok(());
+        }
+        self.emit_raw(&prefix.raw, output)?;
+        self.state = State::SchemeTail;
+        Ok(())
+    }
+
+    /// URL authority bytes are bounded before this path. Re-scan them in a
+    /// fresh finite scanner so an authority without usable userinfo cannot
+    /// bypass an already-recognized token detector; do not recursively feed the
+    /// same bytes back through this scanner.
+    fn project_url_authority<S: ProjectionSink>(
+        &mut self,
+        authority: &[u8],
+        output: &mut S,
+    ) -> Result<(), ProjectionError> {
+        let mut projected = Vec::new();
+        let mut scanner = Scanner::new();
+        scanner.push(authority, &mut projected)?;
+        scanner.finish(&mut projected)?;
+        let mut start = 0;
+        while let Some(offset) = projected[start..]
+            .windows(MARKER.len())
+            .position(|candidate| candidate == MARKER.as_bytes())
+        {
+            let marker = start + offset;
+            self.append(&projected[start..marker], output, false)?;
+            self.append(MARKER.as_bytes(), output, true)?;
+            start = marker + MARKER.len();
+        }
+        self.append(&projected[start..], output, false)?;
+        self.consume_bytes(authority);
+        self.last_was_marker = projected.ends_with(MARKER.as_bytes());
         Ok(())
     }
 
@@ -1407,10 +1487,36 @@ fn has_strict_prefix(prefix: &Prefix) -> bool {
     })
 }
 
+fn has_token_strict_prefix(prefix: &Prefix) -> bool {
+    for_each_prefix(prefix, |pattern, kind, ascii_fold| {
+        matches!(kind, PrefixKind::Token(_))
+            && pattern.len() > prefix.raw.len()
+            && pattern.starts_with(&prefix.raw, ascii_fold)
+    })
+}
+
 fn best_completed_prefix(prefix: &Prefix) -> Option<PrefixMatch> {
     let mut best = None;
     for_each_prefix(prefix, |pattern, kind, ascii_fold| {
         if pattern.len() <= prefix.raw.len()
+            && pattern.starts_with(&prefix.raw[..pattern.len()], ascii_fold)
+            && best.is_none_or(|current: PrefixMatch| pattern.len() > current.length)
+        {
+            best = Some(PrefixMatch {
+                length: pattern.len(),
+                kind,
+            });
+        }
+        false
+    });
+    best
+}
+
+fn best_completed_token_prefix(prefix: &Prefix) -> Option<PrefixMatch> {
+    let mut best = None;
+    for_each_prefix(prefix, |pattern, kind, ascii_fold| {
+        if matches!(kind, PrefixKind::Token(_))
+            && pattern.len() <= prefix.raw.len()
             && pattern.starts_with(&prefix.raw[..pattern.len()], ascii_fold)
             && best.is_none_or(|current: PrefixMatch| pattern.len() > current.length)
         {
@@ -1884,6 +1990,78 @@ mod tests {
             "XAKIA1234567890ABCDEF"
         );
         assert_eq!(text("AKIA1234567890ABCDEFx").unwrap(), format!("{MARKER}x"));
+    }
+
+    #[test]
+    fn url_authority_passthrough_rechecks_recognized_tokens() {
+        let cases = vec![
+            (
+                "https://sk-abcdefghijklmnop.example/path".to_owned(),
+                format!("https://{MARKER}.example/path"),
+            ),
+            (
+                "https://glpat-abcdefghijklmnop@host.example/path".to_owned(),
+                format!("https://{MARKER}@host.example/path"),
+            ),
+            (
+                format!(
+                    "{}{}.glpat-abcdefghijklmnop://host.example/path",
+                    "a".repeat(SCHEME_PENDING_MAX_BYTES),
+                    "."
+                ),
+                format!(
+                    "{}{}.{}://host.example/path",
+                    "a".repeat(SCHEME_PENDING_MAX_BYTES),
+                    ".",
+                    MARKER
+                ),
+            ),
+            (
+                "custom+scheme://ordinary.example/path".to_owned(),
+                "custom+scheme://ordinary.example/path".to_owned(),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(text(&input).unwrap(), expected, "input: {input}");
+            assert_eq!(
+                streamed(input.as_bytes(), &(0..=input.len()).collect::<Vec<_>>()).unwrap(),
+                expected.as_bytes(),
+                "one-byte chunks: {input}"
+            );
+        }
+
+        let authority = "a".repeat(URL_USERINFO_MAX_BYTES + 64);
+        let input = format!("https://{authority}/path");
+        let expected = format!("https://{MARKER}/path");
+        assert_eq!(text(&input).unwrap(), expected);
+        assert_eq!(
+            streamed(input.as_bytes(), &(0..=input.len()).collect::<Vec<_>>()).unwrap(),
+            expected.as_bytes()
+        );
+
+        let limit = 96;
+        let head_cut = (limit - TRUNCATED.len()) / 2;
+        let input = format!(
+            "{}https://sk-abcdefghijklmnop.example/{}:TAIL",
+            "x".repeat(head_cut - 10),
+            "y".repeat(256)
+        );
+        let mut projection = super::StreamingProjection::new(limit);
+        for chunk in input.as_bytes().chunks(1) {
+            projection.push(chunk).unwrap();
+        }
+        let result = projection.finish().unwrap();
+        assert!(result.len() <= limit);
+        assert!(result.contains(TRUNCATED));
+        assert!(result.ends_with(":TAIL"));
+        for (index, _) in result.match_indices('[') {
+            let suffix = &result[index..];
+            assert!(
+                suffix.starts_with(MARKER) || suffix.starts_with(TRUNCATED),
+                "partial marker in {result:?}"
+            );
+        }
+        assert!(!result.contains("sk-abcdefghijklmnop"));
     }
 
     #[test]

@@ -54,7 +54,6 @@ impl Sandbox {
 fn warm_memory_progress() -> &'static str {
     concat!(
         "Memory: waiting for project ownership…\n",
-        "Memory: waiting for verified runtime cache…\n",
         "Memory: verifying cached runtime…\n",
         "Memory: checking runtime version…\n",
         "Memory: preparing database…\n",

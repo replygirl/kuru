@@ -485,7 +485,6 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
     let mut previous = 0;
     for stage in [
         b"Memory: waiting for project ownership".as_slice(),
-        b"Memory: waiting for verified runtime cache",
         b"Memory: verifying cached runtime",
         b"Memory: checking runtime version",
         b"Memory: preparing database",

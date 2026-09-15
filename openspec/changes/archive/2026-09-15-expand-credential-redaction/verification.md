@@ -1,13 +1,13 @@
 ## 1. Expanded credential projection [critical]
 
-- [x] 1.1 @regression (agent) run the connector redaction unit suite with synthetic Slack, GitLab, JWT, URL-userinfo and bare assignment inputs -> `cargo test -p kuru-connectors redaction:: --locked`: 16 passed; whole and every-byte projection replace each synthetic form with the exact marker
+- [x] 1.1 @regression (agent) run the connector redaction unit suite with synthetic Slack, GitLab, JWT, URL-userinfo and bare assignment inputs -> `mise run //packages/kuru-connectors:test -- redaction::`: 17 passed; whole and every-byte projection replace each synthetic form with the exact marker; the URL-authority overlap regression failed before its correction and now preserves existing token detection
 - [x] 1.2 @unit (agent) exercise text and structured JSON key/value projection plus Display/Debug failure projection -> `cargo test -p kuru-connectors redaction:: --locked`: 16 passed; structured JSON remains valid and marker/error-boundary coverage remains green
 - [x] 1.3 @eval (agent) review expanded detector controls against the documented finite inventory -> implementation uses explicit prefixes, a JOSE-shaped JWT header and bounded RFC-style URL syntax; it adds no entropy heuristic or arbitrary-secret claim
 
 ## 2. Projection limits remain truthful
 
 - [x] 2.1 @equivalence (agent) split every added form at each byte and as one-byte chunks -> `cargo test -p kuru-connectors redaction:: --locked`: 16 passed, including every-byte and long cross-chunk controls without a recognized fragment
-- [x] 2.2 @unit (agent) run ordinary source, URL, assignment and malformed-JWT controls -> `cargo test -p kuru-connectors redaction:: --locked`: 16 passed; ordinary URL, assignment, short-token and malformed-JWT controls remain exact
+- [x] 2.2 @unit (agent) run ordinary source, URL, assignment and malformed-JWT controls -> `mise run //packages/kuru-connectors:test -- redaction::`: 17 passed; ordinary controls remain exact, while bounded URL authority re-projection and long scheme tails retain existing token detection and atomic markers across head/tail truncation
 
 ## 3. Public contract and reference
 
