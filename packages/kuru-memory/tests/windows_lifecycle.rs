@@ -16,7 +16,10 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 
 fn environment() -> Result<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
     let system = kuru_platform::windows::process::system_directory()?;
@@ -649,7 +652,57 @@ async fn loss(whole_job: bool, mode: &str) -> Result<()> {
         );
     }
     drop(lock);
-    let recovered = Server::open(opts).await?;
+    let mut reset_listener = if whole_job {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint_path = opts.directory.join("endpoint.json");
+        let mut endpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&endpoint_path)?)?;
+        let object = endpoint
+            .as_object_mut()
+            .context("published endpoint record is not an object")?;
+        ensure!(
+            object
+                .get("instance")
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "published endpoint record has no instance"
+        );
+        ensure!(
+            object
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "published endpoint record has no port"
+        );
+        object.insert(
+            "port".into(),
+            serde_json::Value::from(listener.local_addr()?.port()),
+        );
+        std::fs::write(&endpoint_path, serde_json::to_vec(&endpoint)?)?;
+        Some(tokio::spawn(async move {
+            let (probe, _) = listener.accept().await?;
+            drop(probe);
+            let (stream, _) = listener.accept().await?;
+            stream.set_zero_linger()?;
+            drop(stream);
+            Ok::<_, std::io::Error>(())
+        }))
+    } else {
+        None
+    };
+    let recovered = Server::open(opts).await;
+    if let Some(listener) = reset_listener.as_mut() {
+        match tokio::time::timeout(Duration::from_secs(3), &mut *listener).await {
+            Ok(result) => result??,
+            Err(error) => {
+                listener.abort();
+                let _ = listener.await;
+                return Err(error)
+                    .context("reset listener did not observe the raw probe and SQL connection");
+            }
+        }
+    }
+    let recovered = recovered?;
     let pool = recovered.pool("main").await?;
     if mode == "partial-ready" {
         assert_eq!(

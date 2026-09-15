@@ -165,7 +165,16 @@ async fn rejected_activation_preserves_verified_stage_and_occupied_destination()
     files::write(&destination.join("record"), b"unrelated occupant").unwrap();
     let occupied_identity = files::directory(&destination).unwrap().identity();
 
-    let error = activate_staged(stage, &candidate, &destination).unwrap_err();
+    let mut recovery_observations = 0_u32;
+    let error = activate_staged_observed(stage, lock, &candidate, &destination, |_| {
+        recovery_observations += 1;
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(
+        recovery_observations, 0,
+        "an occupied destination never reaches checked recovery"
+    );
     assert!(format!("{error:#}").contains("preserved private stage at"));
     assert!(format!("{error:#}").contains(&stage_path.display().to_string()));
     assert!(
@@ -188,17 +197,39 @@ async fn rejected_activation_preserves_verified_stage_and_occupied_destination()
     );
     let contender = open_regular(&cache.join(".install.lock")).unwrap();
     assert_eq!(regular_file_info(&contender).unwrap().identity, identity);
-    assert!(matches!(
-        contender.try_lock(),
-        Err(TryLockError::WouldBlock)
-    ));
-    drop(lock);
     contender.try_lock().unwrap();
+}
+
+#[tokio::test]
+async fn activation_source_open_failure_preserves_stage_before_releasing_cache_lock() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock_identity = regular_file_info(&lock).unwrap().identity;
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_path = stage.path().to_owned();
+    let candidate = stage_path.join("missing-runtime");
+    let destination = cache.join("active");
+
+    let error = activate_staged(stage, lock, &candidate, &destination)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("open verified Dolt activation source"));
+    assert!(format!("{error:#}").contains("preserved private stage at"));
+    assert!(stage_path.is_dir());
+    assert!(!destination.exists());
+    let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(
+        regular_file_info(&reacquired).unwrap().identity,
+        lock_identity
+    );
+    drop(reacquired);
 }
 
 #[cfg(windows)]
 #[tokio::test]
-async fn held_descendant_blocks_activation_without_losing_verified_stage_or_lock() {
+async fn held_descendant_releases_after_checked_no_move_and_activation_recovers() {
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache café 東京");
     private_directory(&cache).unwrap();
@@ -220,58 +251,28 @@ async fn held_descendant_blocks_activation_without_losing_verified_stage_or_lock
     // directory. The real probe already exited before this known blocker opens.
     let (_parent, blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
     let destination = cache.join("active");
-    let error = activate_staged(stage, &candidate, &destination).unwrap_err();
-    let publication = error
-        .downcast_ref::<kuru_platform::fs::PublicationError>()
-        .unwrap();
-    assert_eq!(
-        publication.phase,
-        kuru_platform::fs::PublicationPhase::Uncertain
-    );
-    assert!(publication.error().raw_os_error().is_some());
-    assert!(publication.to_string().contains("during native-move"));
-    let diagnostic = format!("{error:#}");
-    assert!(diagnostic.contains("preserved private stage at"));
-    assert!(diagnostic.contains(&stage_path.display().to_string()));
-    assert!(diagnostic.contains("open publication destination"));
-    assert!(diagnostic.contains("source=same-identity"));
-    assert!(diagnostic.contains("destination=absent"));
-    assert!(stage_path.is_dir());
-    assert_eq!(
-        files::directory(&candidate).unwrap().identity(),
-        source_identity
-    );
-    assert!(!destination.exists());
-    for (name, size, digest, executable) in [
-        (
-            BUNDLED_ASSET.executable_name,
-            BUNDLED_ASSET.executable_bytes,
-            BUNDLED_ASSET.executable_sha256,
-            true,
-        ),
-        (
-            "LICENSES",
-            BUNDLED_ASSET.license_bytes,
-            BUNDLED_ASSET.license_sha256,
-            false,
-        ),
-    ] {
-        verify_payload(&candidate.join(name), size, digest, executable).unwrap();
-    }
-    let contender = open_regular(&cache.join(".install.lock")).unwrap();
-    assert_eq!(
-        regular_file_info(&contender).unwrap().identity,
-        lock_identity
-    );
-    assert!(matches!(
-        contender.try_lock(),
-        Err(TryLockError::WouldBlock)
-    ));
-
-    // Explicit fixture recovery after removing only its known blocker. There
-    // is no corresponding retry in provision or the activation helper.
-    drop(blocker);
-    activate(&candidate, &destination).unwrap();
+    let lock_path = cache.join(".install.lock");
+    let mut blocker = Some(blocker);
+    let mut denied = 0_u32;
+    activate_staged_observed(stage, lock, &candidate, &destination, |proven_no_move| {
+        if !proven_no_move {
+            return;
+        }
+        denied += 1;
+        let contender = open_regular(&lock_path).unwrap();
+        assert_eq!(
+            regular_file_info(&contender).unwrap().identity,
+            lock_identity
+        );
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(blocker.take());
+    })
+    .await
+    .unwrap();
+    assert_eq!(denied, 1, "release only the observed checked rejection");
     assert_eq!(
         files::directory(&destination).unwrap().identity(),
         source_identity
@@ -291,12 +292,144 @@ async fn held_descendant_blocks_activation_without_losing_verified_stage_or_lock
         false,
     )
     .unwrap();
-    assert_eq!(regular_file_info(&lock).unwrap().identity, lock_identity);
-    assert!(matches!(
-        contender.try_lock(),
-        Err(TryLockError::WouldBlock)
-    ));
-    drop(lock);
+    let contender = open_regular(&lock_path).unwrap();
+    assert_eq!(
+        regular_file_info(&contender).unwrap().identity,
+        lock_identity
+    );
+    contender.try_lock().unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn persistent_held_descendant_exhausts_checked_recovery_and_preserves_stage() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache café 東京");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock_identity = regular_file_info(&lock).unwrap().identity;
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_path = stage.path().to_owned();
+    let candidate = stage_path.join("runtime");
+    extract(EMBEDDED_ARCHIVE, &candidate, BUNDLED_ASSET).unwrap();
+    verify_version(
+        &candidate.join(BUNDLED_ASSET.executable_name),
+        &stage_path.join("probe"),
+    )
+    .await
+    .unwrap();
+    let source_identity = files::directory(&candidate).unwrap().identity();
+    let (_parent, _blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    let destination = cache.join("active");
+    let lock_path = cache.join(".install.lock");
+    let mut checked_denials = 0_u32;
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(4),
+        activate_staged_observed(stage, lock, &candidate, &destination, |proven_no_move| {
+            assert!(proven_no_move, "only checked no-move may enter recovery");
+            checked_denials += 1;
+            let contender = open_regular(&lock_path).unwrap();
+            assert_eq!(
+                regular_file_info(&contender).unwrap().identity,
+                lock_identity
+            );
+            assert!(matches!(
+                contender.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+        }),
+    )
+    .await
+    .expect("bounded recovery must not exceed its fixture deadline")
+    .unwrap_err();
+    assert!(
+        started.elapsed() >= ACTIVATION_RETRY_LIMIT,
+        "the persistent blocker must exercise the bounded recovery window"
+    );
+    assert!(checked_denials > 1, "the checked denial must be retried");
+    let publication = error
+        .downcast_ref::<kuru_platform::fs::PublicationError>()
+        .unwrap();
+    assert_eq!(
+        publication.phase,
+        kuru_platform::fs::PublicationPhase::Rejected
+    );
+    assert_eq!(publication.error().raw_os_error(), Some(5));
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("runtime activation recovery stopped"));
+    assert!(diagnostic.contains("preserved private stage at"));
+    assert!(stage_path.is_dir());
+    assert_eq!(
+        files::directory(&candidate).unwrap().identity(),
+        source_identity
+    );
+    assert!(!destination.exists());
+    let contender = open_regular(&lock_path).unwrap();
+    assert_eq!(
+        regular_file_info(&contender).unwrap().identity,
+        lock_identity
+    );
+    contender.try_lock().unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cancelling_checked_activation_recovery_drops_stage_before_cache_lock() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache café 東京");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock_identity = regular_file_info(&lock).unwrap().identity;
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_path = stage.path().to_owned();
+    let candidate = stage_path.join("runtime");
+    extract(EMBEDDED_ARCHIVE, &candidate, BUNDLED_ASSET).unwrap();
+    verify_version(
+        &candidate.join(BUNDLED_ASSET.executable_name),
+        &stage_path.join("probe"),
+    )
+    .await
+    .unwrap();
+    let (_parent, blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    let destination = cache.join("active");
+    let lock_path = cache.join(".install.lock");
+    let abort_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<tokio::task::AbortHandle>));
+    let observer_abort_slot = abort_slot.clone();
+    let task_destination = destination.clone();
+    let task = tokio::spawn(async move {
+        let mut blocker = Some(blocker);
+        activate_staged_observed(
+            stage,
+            lock,
+            &candidate,
+            &task_destination,
+            move |proven_no_move| {
+                if proven_no_move {
+                    drop(blocker.take());
+                    observer_abort_slot
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .expect("abort handle is installed before the task runs")
+                        .abort();
+                }
+            },
+        )
+        .await
+    });
+    *abort_slot.lock().unwrap() = Some(task.abort_handle());
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(!destination.exists());
+    assert!(
+        !stage_path.exists(),
+        "cancellation drops the private stage before releasing the cache lock"
+    );
+    let contender = open_regular(&lock_path).unwrap();
+    assert_eq!(
+        regular_file_info(&contender).unwrap().identity,
+        lock_identity
+    );
     contender.try_lock().unwrap();
 }
 

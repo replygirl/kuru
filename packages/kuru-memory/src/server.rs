@@ -962,6 +962,14 @@ impl ConnectionObservation {
         }
         diagnostic
     }
+
+    fn is_pre_callback_connection_reset(&self, error: &sqlx::Error) -> bool {
+        let Ok(progress) = self.0.lock() else {
+            return false;
+        };
+        progress.phase == "after_connect not entered"
+            && matches!(error, sqlx::Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionReset)
+    }
 }
 
 async fn connect_pool(
@@ -972,6 +980,29 @@ async fn connect_pool(
     read_only: bool,
     max: u32,
 ) -> Result<MySqlPool> {
+    let (result, observation) =
+        connect_pool_attempt(identity, endpoint, directory, branch, read_only, max).await?;
+    result.map_err(|error| connection_error(error, &observation))
+}
+
+fn connection_error(error: sqlx::Error, observation: &ConnectionObservation) -> anyhow::Error {
+    anyhow::Error::from(error).context(format!(
+        "connect to authenticated project memory; {}",
+        observation.diagnostic()
+    ))
+}
+
+async fn connect_pool_attempt(
+    identity: &Identity,
+    endpoint: &Endpoint,
+    directory: &Path,
+    branch: &str,
+    read_only: bool,
+    max: u32,
+) -> Result<(
+    std::result::Result<MySqlPool, sqlx::Error>,
+    ConnectionObservation,
+)> {
     ensure!(
         endpoint.instance == identity.instance && endpoint.port >= 1024,
         "memory endpoint identity mismatch"
@@ -992,7 +1023,7 @@ async fn connect_pool(
     let expected_directory = directory.join("data");
     let observation = ConnectionObservation::new();
     let callback_observation = observation.clone();
-    MySqlPoolOptions::new()
+    let result = MySqlPoolOptions::new()
         .max_connections(max)
         .min_connections(0)
         .acquire_timeout(Duration::from_secs(2))
@@ -1041,13 +1072,8 @@ async fn connect_pool(
             })
         })
         .connect_with(options)
-        .await
-        .with_context(|| {
-            format!(
-                "connect to authenticated project memory; {}",
-                observation.diagnostic()
-            )
-        })
+        .await;
+    Ok((result, observation))
 }
 
 async fn verify_identity(pool: &MySqlPool, directory: &Path, identity: &Identity) -> Result<()> {
@@ -1095,9 +1121,18 @@ async fn live_endpoint(
         Ok(Ok(stream)) => drop(stream),
         _ => return Ok(None),
     }
-    let pool = connect_pool(identity, &endpoint, directory, "main", read_only, 1)
-        .await
-        .context("authenticate published memory endpoint")?;
+    let (result, observation) =
+        connect_pool_attempt(identity, &endpoint, directory, "main", read_only, 1)
+            .await
+            .context("authenticate published memory endpoint")?;
+    let pool = match result {
+        Ok(pool) => pool,
+        Err(error) if observation.is_pre_callback_connection_reset(&error) => return Ok(None),
+        Err(error) => {
+            return Err(connection_error(error, &observation))
+                .context("authenticate published memory endpoint");
+        }
+    };
     let verified = verify_identity(&pool, directory, identity)
         .await
         .context("verify published memory endpoint identity");
@@ -1589,6 +1624,56 @@ async fn initialize_database(
 
 async fn stop_child(child: &mut Child) -> Result<crate::engine::StopOutcome> {
     child.stop(CLOSE_GRACE, KILL_GRACE).await
+}
+
+#[cfg(test)]
+mod stale_endpoint_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pre_callback_connection_reset_is_not_a_live_endpoint() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let directory = root.path().join("memory");
+        private_directory(&directory).context("create private endpoint fixture")?;
+        let identity = Identity {
+            version: 1,
+            instance: Uuid::new_v4().to_string(),
+            project_scope: "project/test".into(),
+            password: secret(),
+            reader_password: secret(),
+            initialized: true,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("bind reset listener")?;
+        let endpoint = Endpoint {
+            instance: identity.instance.clone(),
+            port: listener.local_addr()?.port(),
+        };
+        write_record(&directory.join("endpoint.json"), &endpoint)
+            .context("write stale endpoint record")?;
+        let mut observed = tokio::spawn(async move {
+            let (probe, _) = listener.accept().await?;
+            drop(probe);
+            let (stream, _) = listener.accept().await?;
+            stream.set_zero_linger()?;
+            drop(stream);
+            Ok::<_, std::io::Error>(())
+        });
+
+        let endpoint = live_endpoint(&directory, &identity, false).await;
+        match timeout(Duration::from_secs(3), &mut observed).await {
+            Ok(result) => result??,
+            Err(error) => {
+                observed.abort();
+                let _ = observed.await;
+                return Err(error)
+                    .context("reset listener did not observe the raw probe and SQL connection");
+            }
+        }
+        assert!(endpoint?.is_none());
+        Ok(())
+    }
 }
 
 #[cfg(all(test, unix))]
