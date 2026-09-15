@@ -692,7 +692,7 @@ async fn loss(whole_job: bool, mode: &str) -> Result<()> {
     };
     let recovered = Server::open(opts).await;
     if let Some(listener) = reset_listener.as_mut() {
-        match tokio::time::timeout(Duration::from_secs(3), listener).await {
+        match tokio::time::timeout(Duration::from_secs(3), &mut *listener).await {
             Ok(result) => result??,
             Err(error) => {
                 listener.abort();

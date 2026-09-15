@@ -11,4 +11,4 @@
 ## 3. Repository and native acceptance
 
 - [x] 3.1 @unit (agent) run focused server and Windows lifecycle checks supported by the host, memory typecheck, lint, formatting, strict Cospec validation and diff checks -> the portable reset regression passed 1/1; memory typecheck and lint, Rust format fix/check, strict Cospec validation and `git diff --check` passed; the cfg(windows) whole-Job regression remains pending native CI
-- [ ] 3.2 @runtime (agent) run the deterministic reset recovery and refusal controls plus ordinary Windows memory/runtime, installation and native-mise acceptance in PR CI -> all required native jobs and the fail-closed aggregate pass at one exact head before archive
+- [ ] 3.2 @runtime (agent) run the deterministic reset recovery and refusal controls plus ordinary Windows memory/runtime, installation and native-mise acceptance in PR CI -> exact head `3551a236bd5ce617b867a2c7a8cdb301a17bc4ad` failed Windows compilation with rendered Rust E0382 before native reset behavior executed; the corrected complete native matrix and fail-closed aggregate remain required before archive
