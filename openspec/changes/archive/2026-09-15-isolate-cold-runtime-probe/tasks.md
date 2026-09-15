@@ -7,6 +7,6 @@
 
 - [x] 2.1 Add a native regression that retains the actual probe copy while the real candidate directory move succeeds and preserves the inside-candidate held-handle failure control.
 - [x] 2.2 Add corrupt source/copy and canceled/failed probe controls proving no unverified payload activates and installation authority outlives all work.
-- [ ] 2.3 Run focused memory checks and the packaged Windows install/update cold-open acceptance, recording only observed evidence in the verification ledger.
+- [x] 2.3 Run focused memory checks and the packaged Windows install/update cold-open acceptance, recording only observed evidence in the verification ledger.
 
-The focused local checks pass. The native Windows regression and packaged install/update cold-open acceptance remain pending native CI.
+The focused local checks and native Windows acceptance pass.

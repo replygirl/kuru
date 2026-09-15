@@ -1,8 +1,8 @@
 ## 1. Cold probe isolation and publication [critical]
 
-- [ ] 1.1 @regression (agent) run the actual bundled Windows Dolt version probe from the checked private copy while retaining a handle to that copy, then activate the candidate with the real checked native move -> the copy has a distinct identity outside the candidate and cannot block candidate publication; placing the retained handle inside the candidate blocks before the fix
-- [ ] 1.2 @integration (agent) provision an actual empty Windows managed cache through extraction, exact-version probing and activation -> one fully verified runtime identity is published and opens without activation retries exhausting
-- [ ] 1.3 @e2e (agent) install, cold-open, update and cold-open the packaged Windows application with separate empty caches offline -> both installed versions complete a conversation and preserve the bundled runtime and memory contract
+- [x] 1.1 @regression (agent) run the actual bundled Windows Dolt version probe from the checked private copy while retaining a handle to that copy, then activate the candidate with the real checked native move -> the copy has a distinct identity outside the candidate and cannot block candidate publication; placing the retained handle inside the candidate blocks before the fix
+- [x] 1.2 @integration (agent) provision an actual empty Windows managed cache through extraction, exact-version probing and activation -> one fully verified runtime identity is published and opens without activation retries exhausting
+- [x] 1.3 @e2e (agent) install, cold-open, update and cold-open the packaged Windows application with separate empty caches offline -> both installed versions complete a conversation and preserve the bundled runtime and memory contract
 
 ## 2. Integrity and ownership
 
@@ -21,4 +21,5 @@
 - Local failed exact-version, live-probe cancellation and runtime-destruction controls passed. No candidate activated, and staging/probe ownership ended before the installation lock could be reacquired.
 - Local concurrent-cold, warm-under-held-install-lock, corrupt-cache, checked activation failure and activation-source-open failure controls passed. The actual embedded Dolt also installed from an empty offline cache, completed exact-version verification and reused the verified payload.
 - `cargo check -p kuru-memory --all-targets --all-features --locked --offline`, the equivalent strict Clippy invocation, `cargo fmt --all -- --check`, `git diff --check`, and strict Cospec validation passed.
-- Native Windows execution of the isolated held-probe-copy regression, an actual empty managed-cache open, and the packaged install/update cold-open acceptance remain pending native CI and therefore remain unchecked above.
+- Native [Windows memory-runtime job `104500522195`](https://github.com/replygirl/kuru/actions/runs/35004425100/job/104500522195) passed `held_cold_probe_copy_does_not_block_candidate_activation`, concurrent cold publication of one verified native identity, the real embedded Windows empty-cache install, and corrupt-cache rejection before execution. The checked shard completed 104 memory tests with no failures.
+- Packaged [Windows application job `104500522229`](https://github.com/replygirl/kuru/actions/runs/35004425100/job/104500522229) passed `packaged_install_and_update_preserve_complete_offline_memory` in 108.40 seconds. [Windows installation/offline job `104500522192`](https://github.com/replygirl/kuru/actions/runs/35004425100/job/104500522192) independently reported that direct install and self-update each persisted chat from an empty offline cache and passed the same acceptance in 111.31 seconds.
