@@ -1,6 +1,7 @@
 use super::*;
 use kuru_archive::zip::{Limits, MemberKind, WriteMember, write};
 use kuru_platform::fs::regular_file_info;
+use std::io::{Seek, SeekFrom, Write};
 
 const EXE: &[u8] = b"MZ fixture bytes, deliberately never executed";
 const NOTICES: &[u8] = b"exact upstream notice fixture";
@@ -487,6 +488,48 @@ async fn cache_lease_uses_actual_identity_and_retains_contention_until_owner_dro
         .await
         .unwrap();
     assert_eq!(regular_file_info(&second).unwrap().identity, identity);
+}
+
+#[tokio::test]
+async fn actual_warm_cache_verifies_concurrently_while_installation_lock_is_held() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("actual concurrent warm cache café 東京");
+    let config = MemoryConfig {
+        offline: true,
+        cache_dir: Some(cache.clone()),
+        ..MemoryConfig::default()
+    };
+    let cold_started = std::time::Instant::now();
+    let binary = provision(&config, &cache).await.unwrap();
+    let cold_elapsed = cold_started.elapsed();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let warm_started = std::time::Instant::now();
+    let concurrent = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(provision(&config, &cache), provision(&config, &cache))
+    })
+    .await
+    .expect("actual warm opens must not wait for installation authority");
+    let warm_elapsed = warm_started.elapsed();
+    assert_eq!(concurrent.0.unwrap(), binary);
+    assert_eq!(concurrent.1.unwrap(), binary);
+    eprintln!(
+        "observed actual managed provisioning: cold={cold_elapsed:?}; two concurrent warm opens={warm_elapsed:?}; full payload digests and version probes retained"
+    );
+    drop(lock);
+
+    #[cfg(unix)]
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let parent = files::parent(&binary, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+    let mut corrupt = parent.read_write(files::name(&binary).unwrap()).unwrap();
+    corrupt.seek(SeekFrom::Start(0)).unwrap();
+    corrupt.write_all(b"!").unwrap();
+    corrupt.sync_all().unwrap();
+    parent
+        .verify(files::name(&binary).unwrap(), &corrupt)
+        .unwrap();
+    drop(corrupt);
+    let error = provision(&config, &cache).await.unwrap_err();
+    assert!(format!("{error:#}").contains("payload checksum mismatch"));
 }
 
 #[cfg(windows)]

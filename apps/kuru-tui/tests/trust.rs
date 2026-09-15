@@ -11,9 +11,13 @@ use std::{
 #[cfg(unix)]
 use std::{process::Command as ProcessCommand, time::Duration};
 
+use async_trait::async_trait;
 use axum::{Router, body::Bytes, extract::State, routing::any};
-use kuru_connectors::DemoProvider;
-use kuru_core::{Config, McpConfig};
+use kuru_connectors::{DemoProvider, Provider, ToolHost};
+use kuru_core::{
+    Completion, CompletionRequest, Config, ConfigSnapshot, InvocationOverrides, McpConfig,
+    ModelInfo, ProjectPreferences,
+};
 use kuru_delivery::command::BlockingCommand as Command;
 use kuru_memory::MemoryStore;
 use kuru_runtime::{DreamProposal, Harness, Topology};
@@ -82,6 +86,25 @@ impl Sandbox {
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+struct RecordingDemo {
+    instructions: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Provider for RecordingDemo {
+    async fn models(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        DemoProvider.models().await
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> anyhow::Result<Completion> {
+        self.instructions
+            .lock()
+            .unwrap()
+            .push(request.instructions.clone());
+        DemoProvider.complete(request).await
+    }
 }
 
 struct HttpMcpFixture {
@@ -374,6 +397,7 @@ const CLAIM_LABELS: &[&str] = &[
     "memory cache",
     "Responses route",
     "external agent",
+    "project instructions",
 ];
 
 fn assert_claim_labels(output: &Output, expected: &[&str]) {
@@ -668,6 +692,11 @@ async fn real_cli_commands_enforce_the_documented_claim_matrix_before_side_effec
     let stdio = NativeMcpFixture::new();
     let http = HttpMcpFixture::new().await;
     let sandbox = Sandbox::new(&mixed_manifest_config(&stdio, &http));
+    std::fs::write(
+        sandbox.project.join("AGENTS.md"),
+        "matrix automatic instructions",
+    )
+    .unwrap();
     let mutation = sandbox.project.join("matrix-mutation");
     let file_args =
         json!({"path": "matrix-mutation", "content": "must not be written"}).to_string();
@@ -745,6 +774,145 @@ async fn real_cli_commands_enforce_the_documented_claim_matrix_before_side_effec
     assert!(output.status.success(), "{}", text(&output.stderr));
     assert!(!text(&output.stderr).contains("workspace authority"));
     assert!(!ordinary.data.exists());
+}
+
+#[test]
+fn automatic_instruction_sources_are_ordered_safe_and_stale_complete_approval() {
+    let sandbox = Sandbox::new("");
+    let outer = sandbox.root.path().join("AGENTS.md");
+    let root = sandbox.project.join("AGENTS.md");
+    std::fs::write(&outer, "OUTER-INSTRUCTION-CONTENT").unwrap();
+    std::fs::write(&root, "ROOT-INSTRUCTION-CONTENT").unwrap();
+
+    let status = sandbox.success(&["trust", "status"]);
+    let shown = text(&status.stdout);
+    assert!(shown.contains("project instructions: 2 ordered automatic sources"));
+    let outer_label = outer.to_string_lossy();
+    let root_label = root.to_string_lossy();
+    assert!(shown.find(outer_label.as_ref()).unwrap() < shown.find(root_label.as_ref()).unwrap());
+    assert!(!shown.contains("OUTER-INSTRUCTION-CONTENT"));
+    assert!(!shown.contains("ROOT-INSTRUCTION-CONTENT"));
+
+    // Commands that do not construct peer prompts do not consume instruction
+    // authority, and they do not create private state merely to inspect it.
+    for args in [
+        &["config"][..],
+        &["--provider", "demo", "models"][..],
+        &["tools"][..],
+        &["--provider", "demo", "auth"][..],
+    ] {
+        let output = sandbox.success(args);
+        assert!(!text(&output.stderr).contains("workspace authority"));
+    }
+    assert!(!sandbox.data.exists());
+
+    let refused = sandbox.run(&["--provider", "demo", "run", "must not activate"]);
+    assert_claim_labels(&refused, &["project instructions"]);
+    assert!(!sandbox.data.exists());
+    #[cfg(unix)]
+    {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let mut command = sandbox.command();
+        command
+            .env("OPENAI_API_KEY", OsString::from_vec(vec![0xff, 0xfe]))
+            .args([
+                "--provider",
+                "responses",
+                "--model",
+                "fixture-model",
+                "run",
+                "must not construct provider",
+            ]);
+        let refused = command.output().unwrap();
+        assert_claim_labels(&refused, &["project instructions"]);
+        assert!(!text(&refused.stderr).contains("valid text"));
+        assert!(!sandbox.data.exists());
+    }
+
+    sandbox.success(&["trust", "approve", "--yes"]);
+    assert!(text(&sandbox.success(&["trust", "status"]).stdout).contains("Status: approved"));
+
+    std::fs::write(&root, "ROOT-CHANGED").unwrap();
+    assert!(text(&sandbox.success(&["trust", "status"]).stdout).contains("does not match"));
+    sandbox.success(&["trust", "approve", "--yes"]);
+
+    std::fs::remove_file(&outer).unwrap();
+    assert!(text(&sandbox.success(&["trust", "status"]).stdout).contains("does not match"));
+    sandbox.success(&["trust", "approve", "--yes"]);
+
+    std::fs::write(&outer, "OUTER-RETURNED").unwrap();
+    assert!(text(&sandbox.success(&["trust", "status"]).stdout).contains("does not match"));
+    sandbox.success(&["trust", "approve", "--yes"]);
+
+    let parked = sandbox.project.join("parked-agents");
+    std::fs::rename(&root, &parked).unwrap();
+    std::fs::write(&root, "ROOT-CHANGED").unwrap();
+    assert!(
+        text(&sandbox.success(&["trust", "status"]).stdout).contains("does not match"),
+        "same-byte native replacement must stale approval"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_injects_only_the_instruction_bytes_owned_by_the_reviewed_snapshot() {
+    let sandbox = Sandbox::new("");
+    let outer = sandbox.root.path().join("AGENTS.md");
+    let root = sandbox.project.join("AGENTS.md");
+    std::fs::write(&outer, "OUTER-REVIEWED-BYTES").unwrap();
+    std::fs::write(&root, "ROOT-REVIEWED-BYTES").unwrap();
+    let snapshot = ConfigSnapshot::parse(
+        None,
+        &sandbox.project,
+        None,
+        InvocationOverrides {
+            provider: Some("demo".into()),
+            model: Some("demo".into()),
+            no_dream: true,
+            ..InvocationOverrides::default()
+        },
+    )
+    .unwrap();
+    let reviewed = snapshot.instructions().to_owned();
+    let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
+
+    std::fs::write(&outer, "OUTER-UNREVIEWED-BYTES").unwrap();
+    std::fs::write(&root, "ROOT-UNREVIEWED-BYTES").unwrap();
+
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingDemo {
+        instructions: requests.clone(),
+    });
+    let memory = MemoryStore::temporary().await.unwrap();
+    let tools = ToolHost::new(&sandbox.project, &config).unwrap();
+    let mut harness = Harness::with_tool_host_and_instructions(
+        config,
+        &sandbox.project,
+        reviewed,
+        memory.clone(),
+        provider,
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    harness
+        .run("verify reviewed instruction bytes")
+        .await
+        .unwrap();
+    harness.shutdown(true).await.unwrap();
+    memory.close().await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    for instructions in requests.iter() {
+        assert!(instructions.contains("OUTER-REVIEWED-BYTES"));
+        assert!(instructions.contains("ROOT-REVIEWED-BYTES"));
+        assert!(!instructions.contains("UNREVIEWED-BYTES"));
+        assert!(
+            instructions.find("OUTER-REVIEWED-BYTES").unwrap()
+                < instructions.find("ROOT-REVIEWED-BYTES").unwrap()
+        );
+    }
 }
 
 #[cfg(unix)]

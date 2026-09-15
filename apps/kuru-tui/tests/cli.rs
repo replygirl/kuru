@@ -1002,11 +1002,79 @@ fn cli_refuses_an_unsafe_legacy_directory_before_import() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("legacy memory directory"), "{stderr}");
+    assert!(stderr.contains("memory data directory"), "{stderr}");
     assert!(stderr.contains("mode 0700"), "{stderr}");
     assert!(stderr.contains(&format!("{data:?}")), "{stderr}");
     assert_eq!(std::fs::read(&source).unwrap(), original);
     assert!(!data.join("memory").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_explains_owner_owned_unsafe_data_directory_without_legacy_sqlite() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    let env = Sandbox::new();
+    let data = env.root.path().join("unsafe ordinary data; literal-dollar");
+    kuru_platform::fs::Directory::ensure_private(&data).unwrap();
+    let sentinel = data.join("sentinel");
+    std::fs::write(&sentinel, b"ordinary contents remain untouched").unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let before = std::fs::symlink_metadata(&data).unwrap();
+    assert_eq!(before.uid(), nix::unistd::geteuid().as_raw());
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+    command
+        .arg("-C")
+        .arg(&env.project)
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["--provider", "demo", "--no-dream", "run", "do not start"])
+        .env("XDG_CONFIG_HOME", env.root.path().join("config"));
+    let output = command.output().unwrap();
+    let after = std::fs::symlink_metadata(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("memory data directory"), "{stderr}");
+    assert!(stderr.contains("mode 0700"), "{stderr}");
+    assert!(stderr.contains(&format!("{data:?}")), "{stderr}");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"ordinary contents remain untouched"
+    );
+    assert_eq!(
+        before.permissions().mode() & 0o777,
+        after.permissions().mode() & 0o777
+    );
+    assert!(!data.join("memory.sqlite3").exists());
+    assert!(!data.join("memory").exists());
+
+    let target = env.root.path().join("linked-target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let linked = env.root.path().join("linked-data");
+    symlink(&target, &linked).unwrap();
+    let mut linked_command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+    linked_command
+        .arg("-C")
+        .arg(&env.project)
+        .arg("--data-dir")
+        .arg(&linked)
+        .args(["--provider", "demo", "--no-dream", "run", "do not start"])
+        .env("XDG_CONFIG_HOME", env.root.path().join("config"));
+    let linked_output = linked_command.output().unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!linked_output.status.success());
+    assert!(
+        std::fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!String::from_utf8_lossy(&linked_output.stderr).contains("mode 0700"));
 }
 
 #[test]

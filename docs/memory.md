@@ -62,8 +62,12 @@ Every Kuru executable includes the pinned native Dolt archive and its license
 notices. First memory use verifies and extracts those bytes locally; it needs no
 network, compiler or separate engine installation. The cache is `tools/dolt`
 inside the Kuru data directory; `memory.cache_dir` selects another location.
-Subsequent runs verify and reuse the extracted engine. Corrupt existing caches
-fail explicitly and remain preserved for inspection.
+Subsequent runs read every cached engine and license byte for its pinned digest,
+revalidate the checked names and identities, run the exact-version probe and then
+reuse the engine. Independent warm opens perform those checks concurrently; the
+exclusive installation lock is reserved for missing-cache extraction and atomic
+publication. Corrupt existing caches fail before execution and remain preserved
+for inspection.
 
 Before an application command opens memory, Kuru may print bounded progress on
 standard error for the current work: waiting for private ownership, checking or
@@ -113,12 +117,14 @@ partial or superseded imports are stopped and preserved under `memory/interrupte
 before retry. Unknown data fails explicitly. Correct the reported error and retry;
 do not delete the source or bypass identity checks to force an import.
 
-The legacy data directory must remain private. On macOS and Linux, if Kuru finds
-group or other access, it names that directory and asks you to run `chmod 700`
-on it before retrying; Kuru never changes the mode automatically. On Windows,
-correct the data directory's owner-only access using native file security
-settings and retry. These checks occur before Kuru imports or modifies legacy
-data.
+The data directory must remain private. On macOS and Linux, if Kuru rejects a
+real directory owned by the current user because it grants group or other access,
+it names that exact directory and asks you to restrict it to mode 0700 before
+retrying, whether or not legacy SQLite is present. Kuru never changes the mode
+automatically and does not offer that remedy for a link or foreign-owned path. On
+Windows, correct the data directory's owner-only access using native file
+security settings and retry. These checks occur before Kuru provisions memory or
+imports or modifies legacy data.
 
 ## Schema upgrades
 

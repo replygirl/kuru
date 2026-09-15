@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
     process::{Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -33,6 +33,70 @@ use crate::MAX_BYTES;
 
 const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(5);
 const OBSERVE_INTERVAL: Duration = Duration::from_millis(10);
+/// A retained owner can survive a caller indefinitely, so this is a
+/// process-wide admission bound rather than a per-registry convenience limit.
+const MAX_RETAINED_SHELL_OWNERS: usize = 16;
+const RETAINED_CLEANUP_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const RETAINED_CLEANUP_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+struct ShellAdmission {
+    state: Mutex<usize>,
+    capacity: usize,
+}
+
+impl ShellAdmission {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(0),
+            capacity,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ShellAdmissionPermit> {
+        let mut in_use = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *in_use == self.capacity {
+            return None;
+        }
+        *in_use += 1;
+        Some(ShellAdmissionPermit {
+            admission: self.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    fn in_use(&self) -> usize {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct ShellAdmissionPermit {
+    admission: Arc<ShellAdmission>,
+}
+
+impl Drop for ShellAdmissionPermit {
+    fn drop(&mut self) {
+        let mut in_use = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(*in_use > 0, "retained shell admission underflow");
+        *in_use -= 1;
+    }
+}
+
+fn shell_admission() -> Arc<ShellAdmission> {
+    static ADMISSION: OnceLock<Arc<ShellAdmission>> = OnceLock::new();
+    ADMISSION
+        .get_or_init(|| Arc::new(ShellAdmission::new(MAX_RETAINED_SHELL_OWNERS)))
+        .clone()
+}
 
 pub(crate) struct ShellRegistry {
     inner: Arc<RegistryInner>,
@@ -48,7 +112,10 @@ struct TestHooks {
     retained_cleanup_gate: Arc<Mutex<Option<Arc<TestGate>>>>,
     interrupted_cleanup: Arc<AtomicBool>,
     transitions: Arc<std::sync::atomic::AtomicUsize>,
+    retained_observations: Arc<Mutex<Vec<Instant>>>,
     cleanup_budget_ms: Arc<AtomicU64>,
+    retained_initial_backoff_ms: Arc<AtomicU64>,
+    retained_max_backoff_ms: Arc<AtomicU64>,
 }
 
 #[cfg(test)]
@@ -142,7 +209,14 @@ impl TestHooks {
             retained_cleanup_gate: Arc::new(Mutex::new(None)),
             interrupted_cleanup: Arc::new(AtomicBool::new(false)),
             transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_observations: Arc::new(Mutex::new(Vec::new())),
             cleanup_budget_ms: Arc::new(AtomicU64::new(CLEANUP_ALLOWANCE.as_millis() as u64)),
+            retained_initial_backoff_ms: Arc::new(AtomicU64::new(
+                RETAINED_CLEANUP_INITIAL_BACKOFF.as_millis() as u64,
+            )),
+            retained_max_backoff_ms: Arc::new(AtomicU64::new(
+                RETAINED_CLEANUP_MAX_BACKOFF.as_millis() as u64,
+            )),
         }
     }
 
@@ -229,6 +303,20 @@ impl TestHooks {
         self.transitions.load(Ordering::Acquire)
     }
 
+    fn record_retained_observation(&self) {
+        self.retained_observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Instant::now());
+    }
+
+    fn retained_observations(&self) -> Vec<Instant> {
+        self.retained_observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn set_cleanup_budget(&self, budget: Duration) {
         self.cleanup_budget_ms
             .store(budget.as_millis() as u64, Ordering::Release);
@@ -237,11 +325,28 @@ impl TestHooks {
     fn cleanup_budget(&self) -> Duration {
         Duration::from_millis(self.cleanup_budget_ms.load(Ordering::Acquire))
     }
+
+    fn set_retained_backoff(&self, initial: Duration, maximum: Duration) {
+        assert!(initial > Duration::ZERO);
+        assert!(initial <= maximum);
+        self.retained_initial_backoff_ms
+            .store(initial.as_millis() as u64, Ordering::Release);
+        self.retained_max_backoff_ms
+            .store(maximum.as_millis() as u64, Ordering::Release);
+    }
+
+    fn retained_backoff(&self) -> (Duration, Duration) {
+        (
+            Duration::from_millis(self.retained_initial_backoff_ms.load(Ordering::Acquire)),
+            Duration::from_millis(self.retained_max_backoff_ms.load(Ordering::Acquire)),
+        )
+    }
 }
 
 struct RegistryInner {
     state: Mutex<RegistryState>,
     next: AtomicU64,
+    admission: Arc<ShellAdmission>,
 }
 
 struct RegistryState {
@@ -285,6 +390,10 @@ impl Control {
 
 impl ShellRegistry {
     pub(crate) fn new() -> Self {
+        Self::with_admission(shell_admission())
+    }
+
+    fn with_admission(admission: Arc<ShellAdmission>) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
                 state: Mutex::new(RegistryState {
@@ -292,6 +401,7 @@ impl ShellRegistry {
                     owners: BTreeMap::new(),
                 }),
                 next: AtomicU64::new(1),
+                admission,
             }),
             #[cfg(test)]
             test_hooks: TestHooks::new(),
@@ -317,6 +427,11 @@ impl ShellRegistry {
         let deadline = accepted + duration;
         let cleanup_allowance = self.cleanup_allowance();
         let fallback = deadline + cleanup_allowance;
+        let admission = self
+            .inner
+            .admission
+            .try_acquire()
+            .ok_or_else(|| anyhow::anyhow!("shell owner capacity is exhausted"))?;
         let (sender, receiver) = oneshot::channel();
         let control = Arc::new(Control {
             cancelled: AtomicBool::new(false),
@@ -341,6 +456,7 @@ impl ShellRegistry {
             environment: Box::new(environment),
             deadline,
             cleanup_allowance,
+            admission,
             #[cfg(test)]
             test_hooks: self.test_hooks.clone(),
         };
@@ -485,6 +601,16 @@ impl ShellRegistry {
     }
 
     #[cfg(test)]
+    fn test_set_retained_backoff(&self, initial: Duration, maximum: Duration) {
+        self.test_hooks.set_retained_backoff(initial, maximum);
+    }
+
+    #[cfg(test)]
+    fn test_retained_observations(&self) -> Vec<Instant> {
+        self.test_hooks.retained_observations()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_is_closing(&self) -> bool {
         self.inner
             .state
@@ -511,6 +637,7 @@ struct WorkerRequest {
     >,
     deadline: Instant,
     cleanup_allowance: Duration,
+    admission: ShellAdmissionPermit,
     #[cfg(test)]
     test_hooks: TestHooks,
 }
@@ -523,6 +650,7 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         environment,
         deadline,
         cleanup_allowance,
+        admission,
         #[cfg(test)]
         test_hooks,
     } = request;
@@ -532,6 +660,7 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         control: control.clone(),
         confirmed: AtomicBool::new(false),
         spawned: AtomicBool::new(false),
+        admission: Mutex::new(Some(admission)),
     };
     #[cfg(test)]
     test_hooks.await_start();
@@ -670,7 +799,6 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         Ok(false) => retain_until_confirmed(
             &mut group,
             &finish,
-            cleanup_allowance,
             #[cfg(test)]
             &test_hooks,
         ),
@@ -687,7 +815,6 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
             retain_until_confirmed(
                 &mut group,
                 &finish,
-                cleanup_allowance,
                 #[cfg(test)]
                 &test_hooks,
             );
@@ -701,6 +828,7 @@ struct WorkerFinish {
     control: Arc<Control>,
     confirmed: AtomicBool,
     spawned: AtomicBool,
+    admission: Mutex<Option<ShellAdmissionPermit>>,
 }
 
 impl WorkerFinish {
@@ -718,6 +846,7 @@ impl WorkerFinish {
 
     fn complete(&self, result: Result<String>) {
         self.confirmed.store(true, Ordering::Release);
+        self.release_admission();
         if let Some(registry) = self.registry.upgrade() {
             remove(&registry, self.id);
         }
@@ -726,6 +855,14 @@ impl WorkerFinish {
 
     fn confirm(&self) {
         self.confirmed.store(true, Ordering::Release);
+        self.release_admission();
+    }
+
+    fn release_admission(&self) {
+        self.admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
     }
 }
 
@@ -852,19 +989,26 @@ fn finish_with_cleanup(
 fn retain_until_confirmed(
     group: &mut OwnedProcessGroup,
     finish: &WorkerFinish,
-    cleanup_allowance: Duration,
     #[cfg(test)] test_hooks: &TestHooks,
 ) {
     // Once the caller receives its bounded result the worker remains the owner.
     // A post-signal platform value cannot signal again; an anchored value may
     // still make its one initial transition after a later non-interrupted poll.
+    #[cfg(test)]
+    let (mut retry_interval, maximum_retry_interval) = test_hooks.retained_backoff();
+    #[cfg(not(test))]
+    let (mut retry_interval, maximum_retry_interval) = (
+        RETAINED_CLEANUP_INITIAL_BACKOFF,
+        RETAINED_CLEANUP_MAX_BACKOFF,
+    );
     loop {
         #[cfg(test)]
         test_hooks.await_retained_cleanup();
-        if let Ok(Ok(_)) = catch_unwind(AssertUnwindSafe(|| {
-            cleanup_until(
+        #[cfg(test)]
+        test_hooks.record_retained_observation();
+        if let Ok(Ok(Some(_))) = catch_unwind(AssertUnwindSafe(|| {
+            cleanup_once(
                 group,
-                Instant::now() + cleanup_allowance,
                 #[cfg(test)]
                 test_hooks,
             )
@@ -872,7 +1016,11 @@ fn retain_until_confirmed(
             finish.confirm();
             return;
         }
-        thread::sleep(OBSERVE_INTERVAL);
+        thread::sleep(retry_interval);
+        retry_interval = retry_interval
+            .checked_mul(2)
+            .unwrap_or(maximum_retry_interval)
+            .min(maximum_retry_interval);
     }
 }
 
@@ -892,48 +1040,55 @@ fn cleanup_until(
     #[cfg(test)] test_hooks: &TestHooks,
 ) -> Result<ExitStatus> {
     loop {
-        #[cfg(test)]
-        let termination = if test_hooks.interrupted_cleanup() {
-            Termination::Interrupted
-        } else {
-            group.terminate_before_reap()
-        };
-        #[cfg(not(test))]
-        let termination = group.terminate_before_reap();
-        match termination {
-            Termination::Signalled(_) => {
-                #[cfg(test)]
-                test_hooks.record_transition();
-            }
-            Termination::InvalidPhase => {}
-            Termination::Interrupted => {
-                if Instant::now() >= deadline {
-                    bail!("ownership observation interrupted")
-                }
-                thread::sleep(OBSERVE_INTERVAL);
-                continue;
-            }
-            Termination::Disarmed(reason) => bail!("shell ownership lost: {reason:?}"),
-        }
-        match group.reap_if_exited() {
-            Reap::Reaped(status) => match group.presence_after_reap() {
-                GroupPresence::Absent => return Ok(status),
-                GroupPresence::Present | GroupPresence::PermissionDenied => {}
-                GroupPresence::ObservationError(kind) => {
-                    bail!("shell group observation failed: {kind}")
-                }
-                GroupPresence::InvalidPhase => {
-                    bail!("shell group observation occurred before reap")
-                }
-            },
-            Reap::NotExited | Reap::Interrupted => {}
-            Reap::Disarmed(reason) => bail!("shell ownership lost: {reason:?}"),
-            Reap::InvalidPhase => bail!("shell root cleanup phase is invalid"),
+        if let Some(status) = cleanup_once(
+            group,
+            #[cfg(test)]
+            test_hooks,
+        )? {
+            return Ok(status);
         }
         if Instant::now() >= deadline {
             bail!("cleanup confirmation timed out")
         }
         thread::sleep(OBSERVE_INTERVAL);
+    }
+}
+
+fn cleanup_once(
+    group: &mut OwnedProcessGroup,
+    #[cfg(test)] test_hooks: &TestHooks,
+) -> Result<Option<ExitStatus>> {
+    #[cfg(test)]
+    let termination = if test_hooks.interrupted_cleanup() {
+        Termination::Interrupted
+    } else {
+        group.terminate_before_reap()
+    };
+    #[cfg(not(test))]
+    let termination = group.terminate_before_reap();
+    match termination {
+        Termination::Signalled(_) => {
+            #[cfg(test)]
+            test_hooks.record_transition();
+        }
+        Termination::InvalidPhase => {}
+        Termination::Interrupted => return Ok(None),
+        Termination::Disarmed(reason) => bail!("shell ownership lost: {reason:?}"),
+    }
+    match group.reap_if_exited() {
+        Reap::Reaped(status) => match group.presence_after_reap() {
+            GroupPresence::Absent => Ok(Some(status)),
+            GroupPresence::Present | GroupPresence::PermissionDenied => Ok(None),
+            GroupPresence::ObservationError(kind) => {
+                bail!("shell group observation failed: {kind}")
+            }
+            GroupPresence::InvalidPhase => {
+                bail!("shell group observation occurred before reap")
+            }
+        },
+        Reap::NotExited | Reap::Interrupted => Ok(None),
+        Reap::Disarmed(reason) => bail!("shell ownership lost: {reason:?}"),
+        Reap::InvalidPhase => bail!("shell root cleanup phase is invalid"),
     }
 }
 
@@ -1068,6 +1223,7 @@ mod tests {
             control,
             confirmed: AtomicBool::new(false),
             spawned: AtomicBool::new(true),
+            admission: Mutex::new(registry.inner.admission.try_acquire()),
         };
         finish.complete(Ok("completed".into()));
 
@@ -1089,7 +1245,8 @@ mod tests {
     #[test]
     fn pre_spawn_panic_reclaims_only_its_registered_reservation() {
         let root = tempfile::tempdir().unwrap();
-        let registry = ShellRegistry::new();
+        let admission = Arc::new(ShellAdmission::new(1));
+        let registry = ShellRegistry::with_admission(admission.clone());
         registry.test_hooks.set_point(TestPoint::PreSpawnPanic);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1108,6 +1265,7 @@ mod tests {
 
         assert!(error.to_string().contains("panicked before launch"));
         assert_eq!(registry.owner_count(), 0);
+        assert_eq!(admission.in_use(), 0);
         assert!(!root.path().join("launched-after-panic").exists());
     }
 
@@ -1155,7 +1313,8 @@ mod tests {
             (TestPoint::RuntimeStartFailure, "runtime-start failure"),
         ] {
             let root = tempfile::tempdir().unwrap();
-            let registry = ShellRegistry::new();
+            let admission = Arc::new(ShellAdmission::new(1));
+            let registry = ShellRegistry::with_admission(admission.clone());
             registry.test_hooks.set_point(point);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1174,8 +1333,79 @@ mod tests {
 
             assert!(error.to_string().contains(expected), "{error:#}");
             assert_eq!(registry.owner_count(), 0);
+            assert_eq!(admission.in_use(), 0);
             assert!(!root.path().join("launched-before-spawn-failure").exists());
         }
+    }
+
+    #[test]
+    fn retained_owner_holds_process_wide_admission_across_dropped_registries() {
+        let root = tempfile::tempdir().unwrap();
+        let admission = Arc::new(ShellAdmission::new(1));
+        let registry = ShellRegistry::with_admission(admission.clone());
+        registry.test_hooks.set_point(TestPoint::CleanupPanic);
+        let retained_cleanup = registry.test_hooks.arm_retained_cleanup_gate();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(registry.execute(
+                retained_root(root.path()),
+                root.path().to_path_buf(),
+                "exec sleep 5".into(),
+                Duration::from_millis(25),
+                Vec::new,
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("cleanup panic"), "{error:#}");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !retained_cleanup.entered() {
+                    sleep(OBSERVE_INTERVAL).await;
+                }
+            })
+            .await
+            .expect("retained owner did not begin its retained cleanup");
+        });
+        assert_eq!(admission.in_use(), 1);
+
+        drop(registry);
+        let later_registry = ShellRegistry::with_admission(admission.clone());
+        let overload = runtime
+            .block_on(later_registry.execute(
+                retained_root(root.path()),
+                root.path().to_path_buf(),
+                ": > started-despite-capacity".into(),
+                Duration::from_secs(1),
+                Vec::new,
+            ))
+            .unwrap_err();
+        assert_eq!(overload.to_string(), "shell owner capacity is exhausted");
+        assert!(!root.path().join("started-despite-capacity").exists());
+
+        retained_cleanup.release();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while admission.in_use() != 0 {
+                    sleep(OBSERVE_INTERVAL).await;
+                }
+            })
+            .await
+            .expect("confirmed retained cleanup did not release its admission");
+        });
+        let completed = runtime
+            .block_on(later_registry.execute(
+                retained_root(root.path()),
+                root.path().to_path_buf(),
+                "true".into(),
+                Duration::from_secs(1),
+                Vec::new,
+            ))
+            .unwrap();
+        assert!(completed.contains("\"success\":true"), "{completed}");
+        assert_eq!(admission.in_use(), 0);
     }
 
     #[test]
@@ -1365,6 +1595,61 @@ mod tests {
             })
             .await
             .expect("retained real worker did not confirm cleanup");
+        });
+        assert_eq!(registry.test_transitions(), 1);
+    }
+
+    #[test]
+    fn retained_cleanup_uses_capped_exponential_observation_backoff() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = ShellRegistry::new();
+        registry.test_set_cleanup_budget(Duration::from_millis(20));
+        registry.test_set_retained_backoff(Duration::from_millis(20), Duration::from_millis(40));
+        let interruption = registry.test_arm_interrupted_cleanup();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(registry.execute(
+                retained_root(root.path()),
+                root.path().to_path_buf(),
+                "exec sleep 5".into(),
+                Duration::from_millis(10),
+                Vec::new,
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("cleanup was not confirmed"));
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while registry.test_retained_observations().len() < 3 {
+                    sleep(OBSERVE_INTERVAL).await;
+                }
+            })
+            .await
+            .expect("retained cleanup did not make three paced observations");
+        });
+        let observations = registry.test_retained_observations();
+        assert!(
+            observations[1].duration_since(observations[0]) >= Duration::from_millis(15),
+            "first retained retry was not paced: {observations:?}"
+        );
+        assert!(
+            observations[2].duration_since(observations[1]) >= Duration::from_millis(35),
+            "second retained retry did not back off: {observations:?}"
+        );
+        assert_eq!(registry.test_transitions(), 0);
+
+        interruption.release();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while registry.owner_count() != 0 {
+                    sleep(OBSERVE_INTERVAL).await;
+                }
+            })
+            .await
+            .expect("retained cleanup did not confirm after interruption ended");
         });
         assert_eq!(registry.test_transitions(), 1);
     }

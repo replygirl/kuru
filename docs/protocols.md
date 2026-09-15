@@ -122,7 +122,12 @@ observation. Selected execution/startup timeouts may be followed by one
 five-second cleanup-confirmation allowance; a delayed startup caller returns at
 that deadline plus the allowance, and host shutdown shares one five-second
 window across registered shells. This does not control processes that leave the
-original group.
+original group. Unix built-in shell ownership is process-wide bounded: at most
+16 shell workers or unconfirmed retained process groups are admitted at once,
+and capacity exhaustion is rejected immediately. An unconfirmed owner keeps its
+slot until cleanup confirms root reap and process-group absence; retained
+observations back off from 100 milliseconds to a one-second maximum without
+abandoning ownership or using stale-PID signaling.
 Windows retains its existing Job-based cleanup.
 
 The shell uses your process authority, not a sandbox. Configured MCP servers
@@ -149,16 +154,22 @@ Kuru projects a finite set of recognizable credential forms to
 Proxy-Authorization values; OpenAI `sk-svcacct-`, `sk-proj-`, then `sk-`
 prefixes, longest first, with at least 16 token bytes after that prefix;
 GitHub (`ghp_`, `github_pat_`, `gho_`, `ghu_`, `ghs_`, `ghr_`)
-forms with at least 8 following token bytes, and exact-length AWS
+forms with at least 8 following token bytes; Slack `xox*` and GitLab `glpat-`
+forms with at least 16 following token bytes; and exact-length AWS
 (`AKIA`/`ASIA` plus exactly 16 uppercase-alphanumeric bytes) token shapes;
-supported PEM private-key blocks; and exact
-contextual sensitive field names such as `api_key`, `password`, and
-`refresh_token`. Those local OpenAI and GitHub floors reduce accidental matches;
-they do not validate a credential. Exact sensitive JSON fields have their whole
+supported PEM private-key blocks; JWT-shaped values with a base64url JSON-object
+header containing a nonempty `alg` field and three base64url segments; and URL
+userinfo of the form `scheme://user:password@host` for bounded RFC-style
+schemes (`[A-Za-z][A-Za-z0-9+.-]*://`), including custom schemes and mixed-case
+spellings. Exact contextual sensitive field names include `api_key`,
+`password`, `refresh_token`, bare `token`, and bare `secret`.
+Those local heuristic floors reduce accidental matches; they do not validate a
+credential. Exact sensitive JSON fields have their whole
 value replaced, including non-string values, while other JSON strings and plain
 text retain unmatched bytes. AWS matching uses its uppercase-alphanumeric token
 alphabet for the trailing boundary, so a following lowercase byte is outside that
-token shape.
+token shape. Ordinary dotted text, malformed or short JWT-like values, URLs
+without userinfo, and names such as `tokenize` or `secretary` remain unchanged.
 
 This projects returned results, actionable MCP application errors and outward
 tool-failure details, including error formatting and source chains. It

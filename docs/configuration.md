@@ -22,10 +22,13 @@ When a command opens memory, fixed progress messages appear on standard error
 while Kuru acquires private ownership, verifies or extracts the bundled runtime,
 and opens the database. They describe work in progress, not an estimate or a
 successful open; JSON and other command results remain on standard output.
-Ancestor `AGENTS.md` files provide project instructions, ordered so local
-instructions have precedence. Kuru does not automatically follow arbitrary
+Every ancestor `AGENTS.md`, including the project root, can provide automatic
+project instructions. Kuru captures the present files from outermost to most
+local before workspace review, and local instructions have precedence. The
+reviewed snapshot owns the exact bytes later placed in prompts, so Kuru does not
+reopen those paths after approval. Kuru does not automatically follow arbitrary
 links in instruction files; repositories can put their applicable instructions
-in AGENTS.md itself.
+in `AGENTS.md` itself.
 
 Mode, model and effort choices made in the terminal with F2/F3/F4 or the matching
 slash commands are saved immediately. Relaunching from the same canonical directory
@@ -74,8 +77,11 @@ strings. The API key itself never belongs in configuration.
 
 ## Workspace trust
 
-Kuru reviews effective process, mutation and endpoint authority supplied by
-automatically discovered ancestor `.kuru/config.toml` files before activating it.
+Kuru reviews effective process, mutation, endpoint and prompt authority supplied
+by automatically discovered ancestor `.kuru/config.toml` and `AGENTS.md` files
+before activating it. This includes an `AGENTS.md` at the project root and any
+automatic source under your home directory; location alone does not make a file
+an explicit caller input. Kuru has no separate global-instruction source.
 The trust subject is the exact canonical `-C` directory and its current native
 directory identity. Approval does not inherit to parent or child directories.
 User defaults, an explicit `--config` file and CLI flags are deliberate caller
@@ -92,9 +98,12 @@ kuru -C /path/to/project --trust-workspace-once tools
 
 `trust status` displays the normalized root, automatic ancestor sources, safe
 claim descriptions and whether the complete current manifest matches its stored
-approval. `trust approve` reviews and stores that complete manifest; `--yes` is
-the explicit noninteractive form. Any automatic authority addition, removal or
-value change invalidates the whole stored approval. A change only to mode, model,
+approval. The project-instructions claim lists its bounded source labels in
+outermost-to-most-local order and never prints instruction contents. `trust
+approve` reviews and stores that complete manifest; `--yes` is the explicit
+noninteractive form. Any automatic authority addition, removal or value change,
+or any added, removed, reordered, replaced or changed automatic instruction
+source, invalidates the whole stored approval. A change only to mode, model,
 effort, budgets, dreaming, memory offline state or timeouts leaves it valid.
 `trust revoke` removes the exact root's record without confirmation. Status and
 an absent revoke create no trust directory, lock or record.
@@ -116,7 +125,11 @@ The activation sets are command-specific:
 | `sessions`, `memory ...`, `undo-dream` | Configured memory executable and cache paths |
 | `models` | Configured memory paths used while loading saved selections, plus an active Responses route |
 | `tool`, `tools` | Configured memory paths used while loading saved selections, built-in write/shell grants, and stdio/HTTP MCP configuration |
-| `run`, `dream`, `serve`, interactive TUI | All applicable memory, provider, write, shell, MCP and external-agent claims |
+| `run`, `dream`, `serve`, interactive TUI | All applicable project-instruction, memory, provider, write, shell, MCP and external-agent claims |
+
+The other rows do not construct peer prompts, so they do not consume the
+project-instructions claim. Reading a snapshot for `config` or trust inspection
+does not inject its instruction bytes or activate a provider.
 
 Review output and configuration errors escape and bound source labels and hide
 MCP arguments and environment values, URL queries and credential values. Approval

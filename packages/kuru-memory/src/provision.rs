@@ -118,34 +118,29 @@ async fn provision_with_extractor_observed(
     let cache = config.cache_dir.as_deref().unwrap_or(default_cache);
     private_directory(cache)?;
     let cache = cache.canonicalize()?;
-    progress.report(MemoryOpenStage::WaitingForRuntimeCache);
-    let _lock = cache_lock(&cache, LOCK_TIMEOUT).await?;
     let versions = cache.join(DOLT_VERSION);
     private_directory(&versions)?;
     let destination = versions.join(asset.target);
-    if destination.try_exists()? {
+    if destination_exists(&destination)? {
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
-        return verified_cache_observed(&destination, asset, progress).await.with_context(|| {
-            format!(
-                "Dolt cache is invalid at {}; preserve or remove that version directory and retry",
-                destination.display()
-            )
-        });
+        return verify_existing_cache(&destination, asset, progress).await;
     }
-    // A dangling link also represents an existing unsafe destination.
-    ensure!(
-        fs::symlink_metadata(&destination).is_err(),
-        "Dolt cache destination is not a new directory"
-    );
+    progress.report(MemoryOpenStage::WaitingForRuntimeCache);
+    let lock = cache_lock(&cache, LOCK_TIMEOUT).await?;
+    if destination_exists(&destination)? {
+        drop(lock);
+        progress.report(MemoryOpenStage::VerifyingRuntimeCache);
+        return verify_existing_cache(&destination, asset, progress).await;
+    }
     let staging = PrivateTemp::new(".install-", Some(&versions))?;
     progress.report(MemoryOpenStage::ExtractingEmbeddedRuntime);
     let candidate = staging.path().join("runtime");
     let candidate_path = candidate.clone();
-    let (staging, _lock, extraction) = tokio::task::spawn_blocking(move || {
+    let (staging, lock, extraction) = tokio::task::spawn_blocking(move || {
         let result = extractor(&archive, &candidate_path, asset);
         // Keep the stage and stable lock until the worker exits, even if its
         // caller is cancelled. Drop the stage before releasing the lock.
-        (staging, _lock, result)
+        (staging, lock, result)
     })
     .await?;
     extraction?;
@@ -153,11 +148,34 @@ async fn provision_with_extractor_observed(
     let (staging, lock) = owned_probe(
         candidate.join(asset.executable_name),
         staging.path().join("probe"),
-        (staging, _lock),
+        (staging, lock),
     )
     .await?;
     activate_staged(staging, lock, &candidate, &destination).await?;
     Ok(destination.join(asset.executable_name))
+}
+
+fn destination_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn verify_existing_cache(
+    destination: &Path,
+    asset: Asset<'_>,
+    progress: &mut ProgressReporter,
+) -> Result<PathBuf> {
+    verified_cache_observed(destination, asset, progress)
+        .await
+        .with_context(|| {
+            format!(
+                "Dolt cache is invalid at {}; preserve or remove that version directory and retry",
+                destination.display()
+            )
+        })
 }
 
 #[cfg(test)]
@@ -171,22 +189,107 @@ async fn verified_cache_observed(
     asset: Asset<'_>,
     progress: &mut ProgressReporter,
 ) -> Result<PathBuf> {
-    check_directory(directory)?;
     let binary = directory.join(asset.executable_name);
-    let executable = binary.clone();
+    let directory_path = directory.to_owned();
+    let executable_name = asset.executable_name.to_owned();
     let executable_bytes = asset.executable_bytes;
     let executable_sha256 = asset.executable_sha256.to_owned();
-    let licenses = directory.join("LICENSES");
     let license_bytes = asset.license_bytes;
     let license_sha256 = asset.license_sha256.to_owned();
-    tokio::task::spawn_blocking(move || {
-        verify_payload(&executable, executable_bytes, &executable_sha256, true)?;
-        verify_payload(&licenses, license_bytes, &license_sha256, false)
+    let checked = tokio::task::spawn_blocking(move || {
+        CheckedCache::open_and_verify(
+            &directory_path,
+            &executable_name,
+            executable_bytes,
+            &executable_sha256,
+            license_bytes,
+            &license_sha256,
+        )
     })
     .await??;
     progress.report(MemoryOpenStage::CheckingRuntimeVersion);
-    private_probe(binary.clone()).await?;
+    checked.probe(binary.clone()).await?;
     Ok(binary)
+}
+
+struct CheckedCache {
+    directory: Directory,
+    executable_name: std::ffi::OsString,
+    executable: File,
+    licenses: File,
+}
+
+impl CheckedCache {
+    fn open_and_verify(
+        path: &Path,
+        executable_name: &str,
+        executable_bytes: u64,
+        executable_sha256: &str,
+        license_bytes: u64,
+        license_sha256: &str,
+    ) -> Result<Self> {
+        let directory = files::directory(path)?;
+        let executable_name = std::ffi::OsString::from(executable_name);
+        let mut executable = directory.read(&executable_name)?;
+        let mut licenses = directory.read(std::ffi::OsStr::new("LICENSES"))?;
+        verify_payload_file(
+            &mut executable,
+            executable_bytes,
+            executable_sha256,
+            true,
+            &path.join(&executable_name),
+        )?;
+        verify_payload_file(
+            &mut licenses,
+            license_bytes,
+            license_sha256,
+            false,
+            &path.join("LICENSES"),
+        )?;
+        let checked = Self {
+            directory,
+            executable_name,
+            executable,
+            licenses,
+        };
+        checked.revalidate()?;
+        Ok(checked)
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        self.directory.revalidate()?;
+        self.directory
+            .verify(&self.executable_name, &self.executable)?;
+        self.directory
+            .verify(std::ffi::OsStr::new("LICENSES"), &self.licenses)?;
+        Ok(())
+    }
+
+    async fn probe(self, binary: PathBuf) -> Result<()> {
+        let home = PrivateTemp::new("kuru-dolt-version-", None)?;
+        let home_path = home.path().to_owned();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("kuru-dolt-probe".into())
+            .spawn(move || {
+                // Keep the exact verified payload handles and private probe home
+                // until the owned child has been reaped, even if the caller exits.
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("create owned Dolt probe executor")
+                    .and_then(|runtime| {
+                        self.revalidate()
+                            .and_then(|()| runtime.block_on(verify_version(&binary, &home_path)))
+                    });
+                let _ = send.send((self, home, result));
+            })
+            .context("start owned Dolt probe thread")?;
+        let (_checked, _home, result) = receive
+            .await
+            .context("owned Dolt probe did not return its result")?;
+        result
+    }
 }
 
 async fn private_probe(binary: PathBuf) -> Result<()> {
@@ -627,11 +730,6 @@ pub(crate) fn private_directory(path: &Path) -> Result<()> {
     files::private_dir(path).context("inspect private Dolt directory")
 }
 
-fn check_directory(path: &Path) -> Result<()> {
-    files::directory(path)?;
-    Ok(())
-}
-
 fn checked_regular(path: &Path, executable: bool) -> Result<fs::Metadata> {
     let (_parent, file) = files::read(path, Privacy::Inherited)
         .with_context(|| format!("inspect Dolt file {}", path.display()))?;
@@ -657,14 +755,34 @@ fn new_private_file(path: &Path) -> Result<File> {
 }
 
 fn verify_payload(path: &Path, size: u64, expected: &str, executable: bool) -> Result<()> {
-    let metadata = checked_regular(path, executable)?;
+    let (parent, mut file) = files::read(path, Privacy::Inherited)
+        .with_context(|| format!("inspect Dolt file {}", path.display()))?;
+    verify_payload_file(&mut file, size, expected, executable, path)?;
+    parent.verify(files::name(path)?, &file)?;
+    Ok(())
+}
+
+fn verify_payload_file(
+    file: &mut File,
+    size: u64,
+    expected: &str,
+    executable: bool,
+    path: &Path,
+) -> Result<()> {
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    ensure!(
+        !executable || metadata.permissions().mode() & 0o111 != 0,
+        "configured Dolt file is not executable"
+    );
+    #[cfg(windows)]
+    let _ = executable;
     ensure!(
         metadata.len() == size,
         "Dolt payload size mismatch: {}",
         path.display()
     );
-    let mut file = open_regular(path)?;
-    kuru_platform::fs::require_private(&file)?;
+    kuru_platform::fs::require_private(file)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {

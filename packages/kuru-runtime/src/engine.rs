@@ -294,6 +294,30 @@ impl Harness {
         resume: Option<&str>,
         tools: ToolHost,
     ) -> Result<Self> {
+        let instructions = load_instructions(cwd)?;
+        Self::with_tool_host_and_instructions(
+            config,
+            cwd,
+            instructions,
+            memory,
+            provider,
+            resume,
+            tools,
+        )
+        .await
+    }
+
+    /// Construct a harness from instruction bytes captured and approved by the
+    /// caller's immutable workspace snapshot.
+    pub async fn with_tool_host_and_instructions(
+        config: Config,
+        cwd: &Path,
+        instructions: String,
+        memory: MemoryStore,
+        provider: Arc<dyn Provider>,
+        resume: Option<&str>,
+        tools: ToolHost,
+    ) -> Result<Self> {
         config.validate()?;
         let cwd = cwd.canonicalize()?;
         ensure!(
@@ -322,9 +346,9 @@ impl Harness {
         config.validate()?;
         let topology = read_topology(&memory, &scope, config.mode).await?;
         validate_topology(&topology, &config)?;
-        let instructions = load_instructions(&cwd)?;
-        // Instruction reads are pathname based. Recheck the caller-retained
-        // workspace before this constructor can publish its initial state.
+        // Recheck the caller-retained workspace before this constructor can
+        // publish its initial state. Instructions are already owned bytes and
+        // are never reopened here.
         tools.revalidate_root()?;
         let (events, _) = broadcast::channel(256);
         let mut harness = Self {

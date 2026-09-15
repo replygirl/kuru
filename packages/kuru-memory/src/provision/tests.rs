@@ -495,6 +495,39 @@ async fn concurrent_cold_offline_extraction_activates_once_and_preserves_notices
     assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 1);
 }
 
+#[tokio::test]
+async fn warm_verification_does_not_wait_for_the_installation_lock() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig::default();
+    let installed = provision_managed(
+        &config,
+        &cache,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+    )
+    .await
+    .unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+
+    let warm = tokio::time::timeout(
+        Duration::from_secs(2),
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        ),
+    )
+    .await
+    .expect("warm verification must not wait for installation authority")
+    .unwrap();
+
+    assert_eq!(warm, installed);
+    drop(lock);
+}
+
 async fn observed_stages(progress: &mut crate::MemoryOpenProgress) -> Vec<MemoryOpenStage> {
     let mut stages = Vec::new();
     while let Some(stage) = progress.recv().await {
@@ -547,7 +580,6 @@ async fn observed_provision_reports_actual_cold_warm_and_failure_stages() {
     assert_eq!(
         observed_stages(&mut progress).await,
         [
-            MemoryOpenStage::WaitingForRuntimeCache,
             MemoryOpenStage::VerifyingRuntimeCache,
             MemoryOpenStage::CheckingRuntimeVersion,
         ]
@@ -584,10 +616,7 @@ async fn observed_provision_reports_actual_cold_warm_and_failure_stages() {
     );
     assert_eq!(
         observed_stages(&mut progress).await,
-        [
-            MemoryOpenStage::WaitingForRuntimeCache,
-            MemoryOpenStage::VerifyingRuntimeCache,
-        ]
+        [MemoryOpenStage::VerifyingRuntimeCache]
     );
 
     let corrupt_cache = root.path().join("corrupt");

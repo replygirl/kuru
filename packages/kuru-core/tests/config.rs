@@ -530,7 +530,93 @@ fn combined_limits_apply_across_many_individually_valid_files() {
         Config::load(None, &path, None)
             .unwrap_err()
             .to_string()
-            .contains("configuration read error")
+            .contains("combined AGENTS.md instructions exceed 1 MiB")
+    );
+}
+
+#[test]
+fn snapshot_claims_ordered_automatic_instructions_and_freezes_exact_bytes() {
+    let dir = TempDir::new().unwrap();
+    let parent = dir.path().join("parent");
+    let project = parent.join("project");
+    write(parent.join("AGENTS.md"), "OUTER-APPROVED");
+    write(project.join("AGENTS.md"), "ROOT-APPROVED");
+
+    let snapshot =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let claim = snapshot
+        .manifest()
+        .claims()
+        .iter()
+        .find(|claim| claim.category() == AuthorityClaimCategory::ProjectInstructions)
+        .unwrap();
+    assert_eq!(
+        claim
+            .sources()
+            .iter()
+            .map(|source| source.as_str())
+            .collect::<Vec<_>>(),
+        [
+            escaped_source(&parent.join("AGENTS.md")),
+            escaped_source(&project.join("AGENTS.md")),
+        ]
+    );
+    assert_eq!(claim.display().as_str(), "2 ordered automatic sources");
+    let instructions = snapshot.instructions();
+    assert!(
+        instructions.find("OUTER-APPROVED").unwrap() < instructions.find("ROOT-APPROVED").unwrap()
+    );
+
+    write(parent.join("AGENTS.md"), "OUTER-CHANGED");
+    write(project.join("AGENTS.md"), "ROOT-CHANGED");
+    assert!(snapshot.instructions().contains("OUTER-APPROVED"));
+    assert!(snapshot.instructions().contains("ROOT-APPROVED"));
+    assert!(!snapshot.instructions().contains("CHANGED"));
+}
+
+#[test]
+fn automatic_instruction_add_change_remove_and_replacement_change_manifest() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let empty =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let path = project.join("AGENTS.md");
+    write(&path, "approved bytes");
+    let added =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_ne!(
+        empty.manifest().full_digest(),
+        added.manifest().full_digest()
+    );
+
+    write(&path, "changed bytes");
+    let changed =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_ne!(
+        added.manifest().full_digest(),
+        changed.manifest().full_digest()
+    );
+
+    fs::remove_file(&path).unwrap();
+    let removed =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_eq!(
+        empty.manifest().full_digest(),
+        removed.manifest().full_digest()
+    );
+
+    write(&path, "same bytes");
+    let original =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    fs::rename(&path, project.join("parked-agents")).unwrap();
+    write(&path, "same bytes");
+    let replaced =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_ne!(
+        original.manifest().full_digest(),
+        replaced.manifest().full_digest(),
+        "native file replacement with identical bytes must stale approval"
     );
 }
 

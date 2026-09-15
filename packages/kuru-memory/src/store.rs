@@ -688,7 +688,7 @@ impl MemoryStore {
         options.config.validate()?;
         let directory = project_directory(&options.data_dir, &options.project_scope)?;
         private_dir(&options.data_dir)
-            .map_err(|error| migration::legacy_data_directory_error(&options.data_dir, error))?;
+            .map_err(|error| migration::data_directory_error(&options.data_dir, error))?;
         let parent = directory.parent().context("project store has no parent")?;
         private_dir(parent)?;
         let locks = parent.join("locks");
