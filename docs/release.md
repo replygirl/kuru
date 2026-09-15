@@ -3,7 +3,8 @@
 Kuru releases use one manually dispatched workflow with a version bump as its
 only input. The workflow validates the source, creates a signed version commit
 when necessary, builds all five native archives, generates Communiqué notes,
-publishes a complete draft release, and deploys documentation from that exact commit.
+assembles and tests the complete candidate, deploys documentation from that exact
+commit, and publishes the release only from its final job.
 Pushes and tags do not start release publication or deploy documentation.
 
 ## One-time setup
@@ -32,8 +33,9 @@ without an app exception. GitHub's `createCommitOnBranch` API signs the commit;
 `expectedHeadOid` rejects a race if main moved after the checked revision.
 The app token also allows normal push CI to run for the version commit.
 
-Configure Pages to use GitHub Actions. Documentation builds and publishes in the
-final `build-docs` and `deploy-docs` jobs of `.github/workflows/release.yml`.
+Configure Pages to use GitHub Actions. Documentation builds and publishes through
+the `build-docs` and `deploy-docs` jobs of `.github/workflows/release.yml` before
+the final public-release job.
 The build job has `contents: read` and `pages: read`; only the deploy job receives
 `pages: write` and `id-token: write`. There is no standalone Pages workflow.
 
@@ -105,17 +107,27 @@ runtime is involved.
    validation of the selected version commit. No release writes are available to
    that job. Its output is an artifact for publication, which still waits for
    validation and all five builds.
-5. Verify that all five expected archives exist and match their checksums.
-   Create or reuse the immutable annotated tag, stage the notes and all assets
-   in a draft, and verify uploaded asset digests before publishing by release ID.
-   A matching complete published release is verified and reused without replacing
-   its notes or assets, even if rebuilding produced different bytes.
-   GitHub selects the latest release by version and date; recovering an older
-   draft does not force it to become latest.
-6. Run `build-docs` after `bump` and `publish` succeed, checking out the exact
-   released commit SHA. Build and validate the site, then publish its artifact
-   through `deploy-docs`, the final release stage. These jobs are skipped if
-   release publication fails.
+5. Assemble one attempt-scoped candidate artifact without a release-write token.
+   The delivery tool requires exactly five archives and their checksum sidecars,
+   generates `SHA256SUMS`, validates the bounded notes, and retains `dist/` plus
+   `RELEASE_NOTES.md` for the remaining jobs. Invalid or incomplete inputs stop
+   here without creating a tag, draft, or public release.
+6. On native Windows, run the ordinary mise installation route against simulated
+   GitHub metadata that serves the exact staged Windows ZIP. In parallel,
+   `build-docs` checks out the selected commit and builds and validates the site.
+   The Windows check verifies candidate checksums and bytes, installation,
+   activation, bundled Dolt, an offline conversation and durable reopen. The
+   loopback fixture is not an actual public download.
+7. Run `deploy-docs` only after both staged Windows acceptance and `build-docs`
+   succeed. Pages deployment and GitHub release promotion are separate service
+   operations; this ordering does not claim they update atomically.
+8. Run `publish` as the sole final job. It consumes the same candidate, rechecks
+   the five archives and existing `SHA256SUMS`, creates or reuses the immutable
+   annotated tag, stages notes and release assets in a draft, verifies uploaded
+   digests, and only then promotes the release. A matching complete published
+   release is verified and reused without replacing notes or assets after a lost
+   response. GitHub selects the latest release by version and date; recovering
+   an older draft does not force it to become latest.
 
 The four Unix archives retain `kuru-VERSION-TARGET.tar.gz`; Windows uses
 `kuru-VERSION-x86_64-pc-windows-msvc.zip` with exactly `kuru.exe`, `LICENSE` and
@@ -144,39 +156,38 @@ the commit guard permits only Cargo.toml and Cargo.lock changes. An unexpected
 file is reported by name and must be fixed in source rather than reset or included
 in the version commit.
 
-## Verify published Windows installation
+## Verify the staged Windows candidate
 
-The Release workflow runs `verify-published-windows` on `windows-2025` after the
-publish job. It checks out the exact prepared release commit and invokes the
-delivery package's `verify:published-windows` task with that commit and version.
-The task resolves the pinned native mise executable before clearing its child
-environment, then uses the ordinary `github:replygirl/kuru@VERSION` backend in
-fresh user, project, configuration, cache, data, state and temporary roots.
+Before publication, the Release workflow downloads its complete candidate on
+`windows-2025` and invokes `//apps/kuru-tui:verify:staged-windows` with the exact
+staged Windows ZIP. The task resolves the pinned native mise executable before
+clearing its child environment, then routes the ordinary
+`github:replygirl/kuru@VERSION` backend through isolated loopback release metadata
+in fresh user, project, configuration, cache, data, state and temporary roots.
 
-Mise installation and publication provenance are checked independently. The
-verifier resolves the public tag to the expected commit, requires the complete
-release inventory, verifies `SHA256SUMS` and the Windows ZIP, and compares the
-ZIP's `kuru.exe` with the mise-installed executable. It then runs and resumes an
-offline demo conversation from empty Kuru and engine caches, checks memory
-status, history and sessions, and compares the extracted Dolt executable and
-licenses with `packages/kuru-memory/support/dolt-assets.json` at the released
-commit. The verifier receives no GitHub token, provider credential, proxy or
-custom endpoint. Informational application stderr is allowed; machine results
-remain JSON on stdout.
+The fixture serves the candidate's real ZIP bytes and checksum through the
+simulated metadata, verifies what mise installs, and then runs and resumes an
+offline demo conversation from empty Kuru and engine caches. It checks memory
+status, history and sessions and compares the extracted Dolt executable and
+licenses with `packages/kuru-memory/support/dolt-assets.json` at the selected
+commit. It receives no release token, provider credential, proxy or public
+endpoint. Informational application stderr is allowed; machine results remain
+JSON on stdout. This proves the exact staged package through the native mise
+path, not availability or download behavior from the public GitHub release.
 
-After all owned processes settle and the isolated root is removed, the job
-uploads `published-windows-verification.json`. This bounded receipt contains the
-release identity, hashes, command milestones, durable session observations and
-cleanup confirmation without child output or credentials. `build-docs` depends
-on this job, so neither documentation build nor deployment proceeds when the
-published package fails verification.
+`deploy-docs` depends on this native check and the independent docs build. The
+final `publish` job depends on successful deployment and has no child jobs, so a
+candidate, Windows, docs-build or docs-deployment failure leaves no public Kuru
+release. If Pages deploys and final publication then fails, rerun the failed
+publication work in the same Release run; the workflow does not claim that Pages
+and GitHub Releases commit atomically.
 
-If verification is interrupted or fails after publication, rerun the failed
-`Verify published Windows release` job in the same Release run. It reads the
-existing immutable tag and assets selected by that run; do not dispatch another
-release or replace published files to repair the check. An actual successful
-published run and any recovery rerun remain operational evidence and must not be
-inferred from the pre-publication simulated-metadata fixture.
+The delivery package retains `verify:published-windows` as an optional maintainer
+diagnostic after publication. It resolves the actual public tag and asset
+inventory, installs through the unmodified public mise route, verifies the
+published bytes and bundled runtime, and writes its bounded cleanup-confirmed
+receipt. This diagnostic is not a required Release workflow gate and must not be
+inferred from successful staged loopback acceptance.
 
 ## Notes model and configuration
 

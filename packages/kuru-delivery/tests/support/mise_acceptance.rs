@@ -507,21 +507,13 @@ oauth_client_id=""
 'regex:^(https?://.*)'='FIXTURE_BASE/unexpected/$1'
 "#;
 
-pub async fn run(binary: &Path) -> Result<()> {
-    ensure!(
-        binary.is_absolute(),
-        "mise acceptance requires an absolute actual Kuru binary"
-    );
+async fn run_archive(bytes: Vec<u8>, expected: String) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let env = ["PATH", "PATHEXT", "SystemRoot"]
         .into_iter()
         .filter_map(|key| std::env::var_os(key).map(|value| (key.into(), value)))
         .collect();
     let mise = configured_command(std::ffi::OsStr::new("mise"), &[], &cwd, env)?.executable;
-    let root = tempfile::tempdir()?;
-    let archive = archive::package(binary, TARGET, VERSION, root.path())?;
-    let bytes = fs::read(archive)?;
-    let expected = archive::digest(&fs::read(binary)?);
     for (index, scenario) in [
         Scenario::VALID,
         Scenario {
@@ -684,4 +676,40 @@ pub async fn run(binary: &Path) -> Result<()> {
         server.close().await?;
     }
     Ok(())
+}
+
+pub async fn run(binary: &Path) -> Result<()> {
+    ensure!(
+        binary.is_absolute(),
+        "mise acceptance requires an absolute actual Kuru binary"
+    );
+    let root = tempfile::tempdir()?;
+    let archive = archive::package(binary, TARGET, VERSION, root.path())?;
+    let bytes = fs::read(archive)?;
+    let expected = archive::digest(&fs::read(binary)?);
+    run_archive(bytes, expected).await
+}
+
+pub async fn run_staged(archive_path: &Path) -> Result<()> {
+    ensure!(
+        archive_path.is_absolute(),
+        "staged mise acceptance requires an absolute release archive"
+    );
+    ensure!(
+        archive_path.file_name().and_then(|name| name.to_str()) == Some(&asset_name()),
+        "staged mise acceptance requires the exact versioned Windows ZIP"
+    );
+    let directory = archive_path
+        .parent()
+        .and_then(Path::to_str)
+        .context("staged Windows archive directory is not Unicode")?;
+    let manifest = archive::read_asset(directory, "SHA256SUMS", 64 * 1024).await?;
+    let expected_archive = archive::expected_digest(&manifest, &asset_name())?;
+    let bytes = archive::read_asset(directory, &asset_name(), archive::MAX_ARCHIVE_BYTES).await?;
+    ensure!(
+        archive::digest(&bytes) == expected_archive,
+        "staged Windows archive differs from SHA256SUMS"
+    );
+    let executable = archive::verified_binary(directory, VERSION, TARGET).await?;
+    run_archive(bytes, archive::digest(&executable)).await
 }

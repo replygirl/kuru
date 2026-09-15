@@ -11,7 +11,7 @@ use kuru_delivery::release::{self, GitHub, Version};
 use kuru_delivery::{archive::digest, command};
 use serde_json::{Value, json};
 use std::{
-    fs,
+    fs::{self, File},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -29,38 +29,111 @@ fn v(input: &str) -> Version {
 }
 
 #[test]
-fn published_windows_verifier_is_post_publish_exact_sha_and_gates_docs() {
+fn required_release_checks_precede_the_only_publication_job() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let workflow = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
-    let verifier = workflow
-        .split("  verify-published-windows:\n")
-        .nth(1)
-        .unwrap()
-        .split("\n  build-docs:\n")
-        .next()
-        .unwrap();
+    let job = |name: &str| {
+        workflow
+            .split_once(&format!("\n  {name}:\n"))
+            .unwrap_or_else(|| panic!("missing release job {name}"))
+            .1
+            .lines()
+            .take_while(|line| !line.starts_with("  ") || line.starts_with("    "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // Without condition overrides, failed, cancelled, or skipped prerequisites
+    // prevent their dependent jobs from running under GitHub's default policy.
+    for (name, needs) in [
+        ("build", "needs: [plan, bump, verify, verify-tests]"),
+        ("assemble-candidate", "needs: [plan, bump, build, notes]"),
+        (
+            "verify-staged-windows",
+            "needs: [plan, bump, assemble-candidate]",
+        ),
+        ("build-docs", "needs: [bump, assemble-candidate]"),
+        ("deploy-docs", "needs: [build-docs, verify-staged-windows]"),
+        (
+            "publish",
+            "needs: [plan, bump, assemble-candidate, verify-staged-windows, deploy-docs]",
+        ),
+    ] {
+        let body = job(name);
+        assert!(body.contains(needs), "{name} lost required dependencies");
+        assert!(
+            !body.lines().any(|line| line.starts_with("    if:")),
+            "{name} must retain the default prerequisite success condition"
+        );
+        assert!(
+            !body.contains("continue-on-error:"),
+            "{name} must fail on unsuccessful required work"
+        );
+        if name != "build" {
+            assert!(
+                !body
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("if:")),
+                "{name} must not skip required steps"
+            );
+        }
+    }
+    let assembly = job("assemble-candidate");
+    assert!(assembly.contains("mise run release:tool -- assemble"));
+    assert!(assembly.contains("name=release-candidate-%s"));
+    assert!(assembly.contains("RUN_ATTEMPT: ${{ github.run_attempt }}"));
+    assert!(assembly.contains("artifact_name: ${{ steps.artifact.outputs.name }}"));
+    assert!(assembly.contains("dist/*\n            RELEASE_NOTES.md"));
+    assert!(assembly.contains("if-no-files-found: error"));
+    assert!(!assembly.contains("contents: write"));
+    assert!(!assembly.contains("GH_TOKEN:"));
+
+    let verifier = job("verify-staged-windows");
     for required in [
-        "needs: [plan, bump, publish]",
         "runs-on: windows-2025",
         "ref: ${{ needs.bump.outputs.sha }}",
         "version: 2026.9.4",
-        "RELEASE_VERSION: ${{ needs.plan.outputs.version }}",
-        "RELEASE_SHA: ${{ needs.bump.outputs.sha }}",
-        "mise run //packages/kuru-delivery:verify:published-windows",
-        "name: published-windows-verification",
+        "name: ${{ needs.assemble-candidate.outputs.artifact_name }}",
+        "path: candidate",
+        "KURU_STAGED_WINDOWS_ARCHIVE: ${{ github.workspace }}/candidate/dist/kuru-${{ needs.plan.outputs.version }}-x86_64-pc-windows-msvc.zip",
+        "mise run //apps/kuru-tui:verify:staged-windows",
     ] {
         assert!(verifier.contains(required), "missing {required}");
     }
     let execution = verifier
-        .split("- name: Verify the exact published package")
+        .split("- name: Verify the exact staged package")
         .nth(1)
         .unwrap();
     assert!(!execution.contains("GITHUB_TOKEN"));
     assert!(!execution.contains("GH_TOKEN"));
+    assert!(!workflow.contains("verify-published-windows"));
 
-    let docs = workflow.split("\n  build-docs:\n").nth(1).unwrap();
-    assert!(docs.contains("needs: [bump, publish, verify-published-windows]"));
+    let publication = job("publish");
+    assert!(publication.contains("ref: ${{ needs.bump.outputs.sha }}"));
+    assert!(publication.contains("name: ${{ needs.assemble-candidate.outputs.artifact_name }}"));
+    assert!(!publication.contains("pattern:"));
+    let publish_command = "run: mise run release:tool -- publish --version \"$RELEASE_VERSION\" --sha \"$RELEASE_SHA\" --directory dist --notes RELEASE_NOTES.md";
+    assert_eq!(
+        workflow.matches("mise run release:tool -- publish").count(),
+        1
+    );
+    assert!(
+        workflow.trim_end().ends_with(publish_command),
+        "publication must be the final step of the final job"
+    );
+    assert!(
+        !workflow.lines().any(|line| {
+            line.trim_start().starts_with("needs:")
+                && line
+                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+                    .any(|value| value == "publish")
+        }),
+        "publication must have no dependent jobs"
+    );
+}
 
+#[test]
+fn optional_published_windows_diagnostic_keeps_its_native_launcher() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let task = fs::read_to_string(root.join("packages/kuru-delivery/mise.toml")).unwrap();
     let task = task
         .split("[tasks.\"verify:published-windows\"]")
@@ -584,6 +657,38 @@ async fn real_cli_calculates_plans_and_stamps_without_remote_credentials() {
     assert!(!output.status.success());
 }
 
+#[tokio::test]
+async fn real_cli_assembles_a_candidate_without_github_credentials() {
+    let archives = Archives::new();
+    let output = kuru_delivery::command::Command::new(env!("CARGO_BIN_EXE_kuru-release"))
+        .args([
+            "assemble",
+            "--version",
+            "0.1.0",
+            "--directory",
+            archives.directory.to_str().unwrap(),
+            "--notes",
+            archives.notes.to_str().unwrap(),
+        ])
+        .env_remove("GH_REPO")
+        .env_remove("GH_TOKEN")
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "Assembled 6 release candidate checks"
+    );
+    assert_eq!(
+        fs::read_to_string(archives.directory.join("SHA256SUMS"))
+            .unwrap()
+            .lines()
+            .count(),
+        release::TARGETS.len()
+    );
+}
+
 #[derive(Default)]
 struct Remote {
     head: String,
@@ -1029,6 +1134,7 @@ impl Archives {
         }
         let notes = temp.path().join("notes.md");
         fs::write(&notes, "# Kuru 0.1.0\n\nPersistent peer conversations.\n").unwrap();
+        release::assemble(&directory, v("0.1.0"), &notes).unwrap();
         Self {
             temp,
             directory,
@@ -1195,6 +1301,12 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
     let original = fs::read(&path).unwrap();
     fs::remove_file(&path).unwrap();
     assert!(
+        release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
+            .unwrap_err()
+            .to_string()
+            .contains("five supported")
+    );
+    assert!(
         archives
             .publish(&server.api)
             .await
@@ -1204,6 +1316,12 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
     );
     fs::write(&path, b"corrupt").unwrap();
     assert!(
+        release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch")
+    );
+    assert!(
         archives
             .publish(&server.api)
             .await
@@ -1211,8 +1329,63 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
             .to_string()
             .contains("checksum mismatch")
     );
+    fs::write(&path, &original).unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(
+        release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected or nonregular")
+    );
+    fs::remove_dir(&path).unwrap();
+    fs::write(&path, &original).unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(256 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(
+        release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
+            .unwrap_err()
+            .to_string()
+            .contains("bounded regular")
+    );
     fs::write(path, original).unwrap();
+    fs::write(archives.directory.join("unexpected.sha256"), "unexpected\n").unwrap();
+    assert!(
+        release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected or nonregular")
+    );
+    assert!(
+        archives
+            .publish(&server.api)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected or nonregular")
+    );
+    fs::remove_file(archives.directory.join("unexpected.sha256")).unwrap();
+    fs::write(archives.directory.join("SHA256SUMS"), "stale\n").unwrap();
+    assert!(
+        archives
+            .publish(&server.api)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("candidate checksum manifest")
+    );
+    release::assemble(&archives.directory, v("0.1.0"), &archives.notes).unwrap();
     fs::write(&archives.notes, "").unwrap();
+    assert!(
+        release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
+            .unwrap_err()
+            .to_string()
+            .contains("nonempty")
+    );
     assert!(
         archives
             .publish(&server.api)

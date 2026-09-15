@@ -39,8 +39,8 @@ exact version selection.
 - **THEN** mise installs the matching native executable without a checkout or compiler and can activate it for invocation.
 
 #### Scenario: Candidate mise installation before publication
-- **WHEN** native acceptance routes the real mise GitHub backend through supported URL replacements to simulated release metadata and genuine packaged candidate bytes in isolated configuration
-- **THEN** native selection, checksum enforcement, installation, activation and persistent offline runtime behavior are verified without live fallback, and actual published installation remains a separately pending post-publication check rather than being claimed from the fixture.
+- **WHEN** native acceptance routes the real mise GitHub backend through supported URL replacements to simulated release metadata and the exact staged Windows ZIP selected for final publication
+- **THEN** native selection, checksum enforcement, installation, activation, and persistent offline runtime behavior are verified without live fallback or a public download, while the package-owned published verifier remains available as a separate post-publication diagnostic.
 
 #### Scenario: Source installation
 - **WHEN** the source installer runs with an explicit writable destination
@@ -125,21 +125,22 @@ the existing workspace coverage threshold and release archive contract SHALL rem
 ### Requirement: Native Windows release artifact
 
 The release workflow SHALL build `x86_64-pc-windows-msvc` from the same prepared
-version commit as the existing four native targets and publish its ZIP and
-checksum. The ZIP SHALL contain exactly the flat regular members `kuru.exe`,
-`LICENSE` and `README.md`; the executable SHALL include its verified full Dolt
-bundle. Target selection, expected executable names and formats SHALL have one
-authoritative catalog. The release SHALL retain strategy-only dispatch,
-conventional-commit version selection, automatic exact-commit recovery,
-immutable publication and final Pages jobs after successful publication.
+version commit as the existing four native targets and include its ZIP and
+checksum in the complete staged candidate. The ZIP SHALL contain exactly the
+flat regular members `kuru.exe`, `LICENSE` and `README.md`; the executable SHALL
+include its verified full Dolt bundle. Target selection, expected executable
+names and formats SHALL have one authoritative catalog. The release SHALL retain
+strategy-only dispatch, conventional-commit version selection, automatic
+exact-commit recovery, immutable publication, and documentation deployment from
+the selected commit before the sole final public-release job.
 
 #### Scenario: Windows artifact is missing or invalid
 - **WHEN** any required Windows package or native packaged-runtime check fails
-- **THEN** publication does not create a partial successful release or run the final Pages deployment.
+- **THEN** candidate acceptance fails, final Pages deployment does not run, and no partial successful release is made public.
 
 #### Scenario: Release run resumes
 - **WHEN** an interrupted release is rerun after some target artifacts were prepared
-- **THEN** recovery uses the existing planned version commit, verifies the full five-target inventory and does not create another bump or overwrite published assets.
+- **THEN** recovery uses the existing planned version commit, verifies the full five-target candidate inventory and does not create another bump or overwrite published assets.
 
 ### Requirement: Package-owned published Windows verifier
 

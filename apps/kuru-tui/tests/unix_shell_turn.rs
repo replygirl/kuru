@@ -709,6 +709,22 @@ async fn trace_file(data: &std::path::Path) -> Result<PathBuf> {
     }
 }
 
+async fn wait_for_provider_gate(gate: &Gate, worker: &JoinHandle<Result<CliRun>>) -> Result<()> {
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    while gate.started.load(Ordering::Acquire) == 0 {
+        ensure!(
+            !worker.is_finished(),
+            "CLI worker finished before reaching the fake provider gate"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for fake provider gate"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diagnostic_write_failure_keeps_a_completed_cli_turn_authoritative() -> Result<()> {
     let (server, gate) = Server::start_gated().await?;
@@ -716,14 +732,7 @@ async fn diagnostic_write_failure_keeps_a_completed_cli_turn_authoritative() -> 
     let data = sandbox.data.clone();
     let mut worker = tokio::spawn(run_sandbox(sandbox, true));
     let observation = async {
-        let deadline = Instant::now() + CLEANUP_TIMEOUT;
-        while gate.started.load(Ordering::Acquire) == 0 {
-            ensure!(
-                Instant::now() < deadline,
-                "timed out waiting for fake provider gate"
-            );
-            sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_provider_gate(&gate, &worker).await?;
         let trace = trace_file(&data).await?;
         let replacement = data.join("trace-replacement");
         std::fs::write(&replacement, b"replacement")?;
@@ -738,7 +747,14 @@ async fn diagnostic_write_failure_keeps_a_completed_cli_turn_authoritative() -> 
         .context("bounded CLI worker did not finish after diagnostic replacement")?
         .context("retained CLI worker panicked")??;
     let shutdown = server.shutdown().await;
-    observation?;
+    if let Err(observation) = observation {
+        return Err(observation.context(format!(
+            "fake provider readiness observation failed after CLI exit {}: stdout {:?}; stderr {:?}",
+            run.output.status,
+            String::from_utf8_lossy(&run.output.stdout),
+            String::from_utf8_lossy(&run.output.stderr),
+        )));
+    }
     shutdown?;
     ensure!(
         run.output.status.success(),

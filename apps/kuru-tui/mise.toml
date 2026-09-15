@@ -63,5 +63,11 @@ run = "cargo test -p kuru --test embedded_runtime --all-features --locked -- --n
 description = "Inspect the shipping Windows executable and its embedded Dolt for external DLL requirements"
 env.PSModulePath = false
 run = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/verify-windows-imports.ps1"
+
+[tasks."verify:staged-windows"]
+description = "Install and run the exact staged Windows release archive through native mise"
+depends = ["//packages/kuru-memory:bundle:prepare"]
+run = "echo 'verify:staged-windows requires native Windows' >&2; exit 1"
+run_windows = "cargo test -p kuru --test windows_mise --all-features --locked native_mise_installs_and_activates_exact_staged_windows_archive -- --exact --ignored --nocapture"
 [env]
 RUST_TEST_THREADS = "2"

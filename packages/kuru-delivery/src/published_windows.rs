@@ -105,6 +105,13 @@ struct CommandEvidence {
     status: &'static str,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MiseSettings {
+    #[serde(default)]
+    url_replacements: BTreeMap<String, String>,
+}
+
 #[derive(Serialize)]
 struct KuruConfig<'a> {
     memory: MemoryConfig<'a>,
@@ -511,15 +518,36 @@ impl MiseInstall {
         let replacements = self
             .success(
                 "mise-url-replacements",
-                &["settings", "get", "url_replacements"],
+                &["settings", "ls", "url_replacements", "--json"],
             )
             .await?;
-        ensure!(
-            !replacements.contains("http://") && !replacements.contains("https://"),
-            "published verification cannot use URL replacements"
-        );
+        validate_url_replacements(&replacements)?;
         Ok(count)
     }
+}
+
+fn validate_url_replacements(output: &str) -> Result<()> {
+    let value: Value =
+        serde_json::from_str(output).context("mise url_replacements did not return JSON")?;
+    ensure!(
+        value.is_object(),
+        "mise url_replacements did not return a JSON object"
+    );
+    let replacements: MiseSettings = serde_json::from_value(value)
+        .context("mise url_replacements did not return the expected JSON object")?;
+    ensure!(
+        replacements
+            .url_replacements
+            .iter()
+            .all(|(source, destination)| {
+                !source.contains("http://")
+                    && !source.contains("https://")
+                    && !destination.contains("http://")
+                    && !destination.contains("https://")
+            }),
+        "published verification cannot use URL replacements"
+    );
+    Ok(())
 }
 
 fn diagnostic(output: &Output) -> String {
@@ -1015,5 +1043,72 @@ mod tests {
         assert!(!stderr.is_empty());
         assert!(machine_json(b"notice before json").is_err());
         assert!(value_string(&json!({"session": "session-1"}), "text", "conversation").is_err());
+    }
+
+    #[test]
+    fn optional_url_replacements_require_a_json_object_of_safe_strings() {
+        validate_url_replacements("{}").unwrap();
+        validate_url_replacements(r#"{"url_replacements":{"regex:^github$":"mirror"}}"#).unwrap();
+
+        for invalid in [
+            "{",
+            "[]",
+            r#"{"url_replacements":{"regex:^github$":false}}"#,
+            r#"{"url_replacements":{"https://github.com":"mirror"}}"#,
+            r#"{"url_replacements":{"mirror":"http://example.invalid"}}"#,
+            r#"{"unexpected":{}}"#,
+        ] {
+            assert!(validate_url_replacements(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_mise() -> PathBuf {
+        use kuru_platform::windows::process::configured_command;
+        use std::ffi::OsStr;
+
+        let directory = std::env::current_dir().unwrap();
+        let environment = ["PATH", "PATHEXT", "SystemRoot"]
+            .into_iter()
+            .filter_map(|name| std::env::var_os(name).map(|value| (name.into(), value)))
+            .collect();
+        configured_command(OsStr::new("mise"), &[], &directory, environment)
+            .unwrap()
+            .executable
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn isolated_native_mise_preflight_accepts_unset_url_replacements() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut install = MiseInstall::new(temporary.path(), &native_mise()).unwrap();
+
+        assert!(install.verify_isolation().await.unwrap() > 0);
+        assert!(
+            install
+                .commands
+                .iter()
+                .any(|command| command.name == "mise-url-replacements")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn optional_url_replacements_command_failure_is_fatal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = kuru_platform::windows::process::system_directory()
+            .unwrap()
+            .join("where.exe");
+        let mut install = MiseInstall::new(temporary.path(), &executable).unwrap();
+
+        let error = install
+            .success(
+                "mise-url-replacements",
+                &["settings", "ls", "url_replacements", "--json"],
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mise-url-replacements failed"), "{error}");
     }
 }
