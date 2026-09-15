@@ -2079,7 +2079,10 @@ $child.StandardError.Close()
             .execute("shell", json!({"command":": > launched-after-shutdown"}))
             .await
             .unwrap_err();
-        assert!(rejected.to_string().contains("shutting down"));
+        assert_eq!(
+            rejected.to_string(),
+            "tool execution failed: shell operation failed; stderr: <pending EOF>"
+        );
         starting_gate.release();
         timeout(Duration::from_secs(6), shutdown)
             .await
@@ -2187,13 +2190,15 @@ $child.StandardError.Close()
                 .unwrap(),
             "held object"
         );
-        assert!(
-            host.execute("shell", json!({"command":"printf started > launched"}))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("identity changed")
+        let error = host
+            .execute("shell", json!({"command":"printf started > launched"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "tool execution failed: shell operation failed; stderr: <pending EOF>"
         );
+        assert!(!format!("{error:#}").contains("identity changed"));
         assert!(!root.join("launched").exists());
     }
 

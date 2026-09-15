@@ -1055,9 +1055,15 @@ fn retain_until_confirmed(
 
 fn before_launch(control: &Control, deadline: Instant) -> Option<anyhow::Error> {
     if control.cancelled_or_closed() {
-        Some(anyhow::anyhow!("shell cancelled before launch"))
+        Some(shell_failure(
+            ShellFailureCategory::Cancelled,
+            &ShellCapture::new(),
+        ))
     } else if Instant::now() >= deadline {
-        Some(anyhow::anyhow!("shell timed out before launch"))
+        Some(shell_failure(
+            ShellFailureCategory::TimedOut,
+            &ShellCapture::new(),
+        ))
     } else {
         None
     }
