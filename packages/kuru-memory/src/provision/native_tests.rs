@@ -1,6 +1,7 @@
 use super::*;
 use kuru_archive::zip::{Limits, MemberKind, WriteMember, write};
 use kuru_platform::fs::regular_file_info;
+#[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
 
 const EXE: &[u8] = b"MZ fixture bytes, deliberately never executed";
@@ -518,16 +519,27 @@ async fn actual_warm_cache_verifies_concurrently_while_installation_lock_is_held
     drop(lock);
 
     #[cfg(unix)]
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-    let parent = files::parent(&binary, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
-    let mut corrupt = parent.read_write(files::name(&binary).unwrap()).unwrap();
-    corrupt.seek(SeekFrom::Start(0)).unwrap();
-    corrupt.write_all(b"!").unwrap();
-    corrupt.sync_all().unwrap();
-    parent
-        .verify(files::name(&binary).unwrap(), &corrupt)
-        .unwrap();
-    drop(corrupt);
+    {
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = files::parent(&binary, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+        let mut corrupt = parent.read_write(files::name(&binary).unwrap()).unwrap();
+        corrupt.seek(SeekFrom::Start(0)).unwrap();
+        corrupt.write_all(b"!").unwrap();
+        corrupt.sync_all().unwrap();
+        parent
+            .verify(files::name(&binary).unwrap(), &corrupt)
+            .unwrap();
+    }
+    #[cfg(windows)]
+    {
+        // Installed Windows payloads are deliberately sealed owner-read/execute.
+        // Replace this isolated fixture with private bytes of the expected size
+        // rather than weakening the production ACL to make it writable.
+        fs::remove_file(&binary).unwrap();
+        let corrupt = new_private_file(&binary).unwrap();
+        corrupt.set_len(BUNDLED_ASSET.executable_bytes).unwrap();
+        corrupt.sync_all().unwrap();
+    }
     let error = provision(&config, &cache).await.unwrap_err();
     assert!(format!("{error:#}").contains("payload checksum mismatch"));
 }

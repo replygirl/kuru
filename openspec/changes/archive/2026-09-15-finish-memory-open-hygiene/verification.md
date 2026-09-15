@@ -8,7 +8,7 @@
 ## 2. Cold installation ownership
 
 - [x] 2.1 @integration (agent) race missing-cache callers through the actual checked publication path -> exactly one verified identity is activated after the under-lock recheck
-- [ ] 2.2 @unit (agent) cancel extraction/probe and exercise checked Windows activation uncertainty -> stage, payload handles and installation authority remain owned through real completion or bounded checked recovery
+- [x] 2.2 @unit (agent) cancel extraction/probe and exercise checked Windows activation uncertainty -> stage, payload handles and installation authority remain owned through real completion or bounded checked recovery
 
 ## 3. Unix privacy guidance
 
@@ -25,6 +25,7 @@
 
 - macOS actual bundled-engine run: cold provisioning `3.049301s`; two concurrent warm opens under a held installation lock `136.433708ms`. Both warm callers retained full executable/license digests and exact-version probes; same-size executable corruption then failed with a checksum mismatch.
 - Serial focused provision suite: 17 passed, covering cold contention, checked publication, corrupt cache/archive rejection, exact version, progress stages and cancellation ownership.
+- Windows Server 2025 native CI job `104460054056` passed the checked activation controls `activation_source_open_failure_preserves_stage_before_releasing_cache_lock`, `cancelling_checked_activation_recovery_drops_stage_before_cache_lock`, `held_descendant_releases_after_checked_no_move_and_activation_recovers`, `persistent_held_descendant_exhausts_checked_recovery_and_preserves_stage`, and `rejected_activation_preserves_verified_stage_and_occupied_destination`. Its actual concurrent cold-publication identity control also passed.
+- The same Windows job observed cold provisioning at `3.3969858s` and two concurrent full-digest, exact-version warm opens under a held installation lock at `492.6439ms`; both callers returned the installed runtime. Its separate actual Windows same-size corruption control passed. The combined measurement test subsequently exposed and was corrected for a test-fixture error: it attempted to reopen the deliberately sealed owner-read/execute executable for writing instead of replacing that isolated fixture with owner-private corrupt bytes.
 - Unix permission controls: ordinary owner-owned 0755, legacy owner-owned 0755, symlink and foreign-owner tests passed; the ordinary and legacy fixtures retained their modes and content.
 - `mise run //packages/kuru-memory:typecheck` and `mise run //packages/kuru-memory:lint` passed. Owned Rust files were formatted with `rustfmt`; `git diff --check` passed.
-- Windows-only activation uncertainty execution remains for native Windows CI; the existing checked recovery implementation and platform-specific tests were unchanged.

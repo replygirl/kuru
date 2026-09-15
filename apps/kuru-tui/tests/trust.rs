@@ -88,6 +88,15 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+fn safe_source_label(path: &std::path::Path) -> String {
+    path.as_os_str()
+        .to_string_lossy()
+        .chars()
+        .flat_map(char::escape_default)
+        .take(160)
+        .collect()
+}
+
 struct RecordingDemo {
     instructions: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -787,9 +796,9 @@ fn automatic_instruction_sources_are_ordered_safe_and_stale_complete_approval() 
     let status = sandbox.success(&["trust", "status"]);
     let shown = text(&status.stdout);
     assert!(shown.contains("project instructions: 2 ordered automatic sources"));
-    let outer_label = outer.to_string_lossy();
-    let root_label = root.to_string_lossy();
-    assert!(shown.find(outer_label.as_ref()).unwrap() < shown.find(root_label.as_ref()).unwrap());
+    let outer_label = safe_source_label(&outer);
+    let root_label = safe_source_label(&root);
+    assert!(shown.find(&outer_label).unwrap() < shown.find(&root_label).unwrap());
     assert!(!shown.contains("OUTER-INSTRUCTION-CONTENT"));
     assert!(!shown.contains("ROOT-INSTRUCTION-CONTENT"));
 
