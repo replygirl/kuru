@@ -11,6 +11,7 @@ mod providers;
 mod redaction;
 mod retry;
 mod rpc;
+mod shell_diagnostic;
 mod tool_output;
 mod tools;
 #[cfg(unix)]

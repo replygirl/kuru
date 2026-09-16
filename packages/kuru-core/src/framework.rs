@@ -209,6 +209,18 @@ impl Framework {
             .collect();
         Self { mode, parts }
     }
+
+    /// Return built-in identity IDs in the framework author's declared order.
+    ///
+    /// This is a deterministic tie-break policy only; it does not grant any
+    /// identity authority over its peers.
+    pub fn authored_identity_order(mode: Mode) -> Vec<String> {
+        Self::builtin(mode)
+            .parts
+            .into_iter()
+            .map(|part| part.id)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -279,5 +291,31 @@ impl Relationship {
         )
         .to_string();
         Ok(Self { id, kind, members })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authored_identity_order_is_the_declared_builtin_order() {
+        for (mode, leader) in [
+            (Mode::Ifs, "Self"),
+            (Mode::Polyvagal, "Connection"),
+            (Mode::Freudian, "Desire"),
+            (Mode::Jungian, "Continuity"),
+        ] {
+            let framework = Framework::builtin(mode);
+            assert_eq!(framework.parts[0].name, leader);
+            assert_eq!(
+                Framework::authored_identity_order(mode),
+                framework
+                    .parts
+                    .into_iter()
+                    .map(|part| part.id)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

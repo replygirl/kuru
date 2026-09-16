@@ -26,8 +26,10 @@ Ornament does not represent sentience, inferred work or invented communication.
 Thinking, tools, speaking identities, relationship membership and message endpoints
 come from runtime events while work is in progress. A completed response instead
 uses its returned turn result: its text appears once with the returned speaker or
-relationship and a subdued input/output token line. A generic “limited result”
-marker appears when that returned result is limited; it does not diagnose why.
+relationship and a subdued input/output token line. That line names tool-call and
+peer-round limits independently. An empty model response appears as a separate
+response outcome rather than a budget, and an older limited result whose cause was
+not stored is labeled as an unspecified legacy limit.
 Private peer messages and state notes stay out of the activity feed. Numbered
 nodes map to the adjacent roster in compact sidebars.
 

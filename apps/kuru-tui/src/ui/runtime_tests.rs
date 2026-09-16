@@ -15,7 +15,7 @@ use futures::{Stream, stream};
 use kuru_connectors::{DemoProvider, Provider};
 use kuru_core::{Completion, CompletionRequest, Config, Mode, ModelInfo};
 use kuru_memory::{MemoryStore, StorageRecord, test_support::open_options};
-use kuru_runtime::{CancellationToken, Harness, TurnOutput};
+use kuru_runtime::{CancellationToken, ControlledTurnOutput, Harness, ResponseOutcome, TurnOutput};
 use ratatui::{
     Terminal,
     backend::{Backend, ClearType, TestBackend, WindowSize},
@@ -186,10 +186,19 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
     .await
     .unwrap();
     assert_eq!(h.topology.relationships.len(), 1);
-    assert!(matches!(
-        dispatch(&mut h, &models, "hello").await.unwrap(),
-        DispatchOutcome::Turn(_)
-    ));
+    let first = match dispatch(&mut h, &models, "hello").await.unwrap() {
+        DispatchOutcome::Turn(result) => result,
+        DispatchOutcome::Command(_) => panic!("ordinary input did not run a turn"),
+    };
+    assert!(!first.reused);
+    let history = h.history().await.unwrap();
+    let retry = match dispatch(&mut h, &models, "/retry").await.unwrap() {
+        DispatchOutcome::Turn(result) => result,
+        DispatchOutcome::Command(_) => panic!("retry did not return a turn"),
+    };
+    assert!(retry.reused);
+    assert_eq!(retry.output.text, first.output.text);
+    assert_eq!(h.history().await.unwrap(), history);
     assert!(
         command_text(
             dispatch(&mut h, &models, &format!("/memory {}", ids[0]))
@@ -246,6 +255,18 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
     ] {
         assert!(dispatch(&mut h, &models, bad).await.is_err(), "{bad}");
     }
+}
+
+#[tokio::test]
+async fn retry_without_a_local_submission_is_narrowly_rejected() {
+    let (_dir, mut harness, models) = fixture().await;
+    let error = dispatch(&mut harness, &models, "/retry").await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("this session has no local submission to retry")
+    );
+    assert!(harness.history().await.unwrap().is_empty());
 }
 
 struct BlockingProvider {
@@ -709,15 +730,20 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
     let outcome = apply_completion(
         (
             4,
-            Ok(DispatchOutcome::Turn(TurnOutput {
-                session,
-                speaker: view.parts[0].0.clone(),
-                text: "authoritative completion".into(),
-                relationship: None,
-                input_tokens: 11,
-                output_tokens: 7,
-                limited: false,
-                events: vec![],
+            Ok(DispatchOutcome::Turn(ControlledTurnOutput {
+                output: TurnOutput {
+                    session,
+                    speaker: view.parts[0].0.clone(),
+                    text: "authoritative completion".into(),
+                    relationship: None,
+                    input_tokens: 11,
+                    output_tokens: 7,
+                    limited: false,
+                    limit_reasons: Some(vec![]),
+                    response_outcome: Some(ResponseOutcome::Text),
+                    events: vec![],
+                },
+                reused: false,
             })),
         ),
         4,
@@ -745,6 +771,47 @@ async fn apply_completion_orders_current_outcomes_and_ignores_stale_generations(
         "11 input tokens · 7 output tokens"
     );
     assert_runtime_projection(&view, &harness).await;
+
+    let transcript = view.transcript.clone();
+    let outcome = apply_completion(
+        (
+            5,
+            Ok(DispatchOutcome::Turn(ControlledTurnOutput {
+                output: TurnOutput {
+                    session: view.session.clone(),
+                    speaker: view.parts[0].0.clone(),
+                    text: "authoritative completion".into(),
+                    relationship: None,
+                    input_tokens: 11,
+                    output_tokens: 7,
+                    limited: false,
+                    limit_reasons: Some(vec![]),
+                    response_outcome: Some(ResponseOutcome::Text),
+                    events: vec![],
+                },
+                reused: true,
+            })),
+        ),
+        5,
+        &mut events,
+        &mut view,
+        &harness,
+        &mut job,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        CompletionState::Settled { quit: false, .. }
+    ));
+    assert_eq!(view.transcript, transcript);
+    assert_eq!(view.status, "Complete · stored result reused");
+    assert!(
+        view.notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("no new provider or tool work"))
+    );
 
     seed_stale_runtime(&mut view);
     view.begin_operation();
@@ -869,6 +936,8 @@ async fn cancellation_consumes_an_answer_that_won_the_completion_race() {
         input_tokens: 5,
         output_tokens: 3,
         limited: false,
+        limit_reasons: Some(vec![]),
+        response_outcome: Some(ResponseOutcome::Text),
         events: vec![],
     };
     let (tx, mut completions) = mpsc::channel(1);
@@ -878,9 +947,15 @@ async fn cancellation_consumes_an_answer_that_won_the_completion_race() {
         while !worker_token.is_cancelled() {
             tokio::task::yield_now().await;
         }
-        tx.send((7, Ok(DispatchOutcome::Turn(output))))
-            .await
-            .unwrap();
+        tx.send((
+            7,
+            Ok(DispatchOutcome::Turn(ControlledTurnOutput {
+                output,
+                reused: false,
+            })),
+        ))
+        .await
+        .unwrap();
     }));
     let mut cancellation = Some(token);
     let mut generation = 7;

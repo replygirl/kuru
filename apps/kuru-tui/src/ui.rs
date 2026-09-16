@@ -15,7 +15,10 @@ use crossterm::{
 };
 use futures::{Stream, StreamExt};
 use kuru_core::{Mode, ModelInfo, Relationship};
-use kuru_runtime::{CancellationToken, Event, Harness, TurnOutput, turn_was_cancelled};
+use kuru_runtime::{
+    CancellationToken, ControlledTurnOutput, Event, Harness, INTERRUPTION_ROLE, INTERRUPTION_TEXT,
+    ResponseOutcome, TurnLimitReason, TurnOutput, turn_was_cancelled,
+};
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
@@ -36,8 +39,10 @@ mod runtime_tests;
 mod scene;
 pub use render::draw;
 
-const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /notes ID · /dream · /undo-dream · /quit\n/memory-status · /memory-history\nModel, effort and mode selections are remembered for this project.";
+const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /notes ID · /retry · /dream · /undo-dream · /quit\n/memory-status · /memory-history\nModel, effort and mode selections are remembered for this project.";
 const ACTIVITY_DRAIN_CAP: usize = 256;
+const INTERRUPTION_REFRESH_NOTICE: &str =
+    "Persisted interruption status could not be refreshed · reopen the session to inspect it";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Picker {
@@ -49,7 +54,7 @@ pub enum Picker {
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
     Command(String),
-    Turn(TurnOutput),
+    Turn(ControlledTurnOutput),
 }
 
 #[derive(Debug, Clone)]
@@ -363,6 +368,7 @@ impl View {
     }
 
     pub fn complete_turn(&mut self, output: TurnOutput) {
+        let outcome = outcome_summary(&output);
         let speaker = output
             .relationship
             .as_ref()
@@ -383,25 +389,22 @@ impl View {
         self.speaker = speaker.clone();
         let index = self.transcript.len();
         self.transcript.push((speaker, output.text));
-        let limited = if output.limited {
-            " · limited result"
-        } else {
-            ""
-        };
         self.completion_metadata.insert(
             index,
-            format!(
-                "{} input tokens · {} output tokens{limited}",
-                output.input_tokens, output.output_tokens
-            ),
+            match &outcome {
+                Some(outcome) => format!(
+                    "{} input tokens · {} output tokens · {outcome}",
+                    output.input_tokens, output.output_tokens
+                ),
+                None => format!(
+                    "{} input tokens · {} output tokens",
+                    output.input_tokens, output.output_tokens
+                ),
+            },
         );
         self.show_scene = false;
-        self.status = if output.limited {
-            "Complete · limited result"
-        } else {
-            "Complete"
-        }
-        .into();
+        self.status =
+            outcome.map_or_else(|| "Complete".into(), |value| format!("Complete · {value}"));
         self.completion_locked = true;
     }
 
@@ -545,6 +548,36 @@ impl View {
     }
 }
 
+fn outcome_summary(output: &TurnOutput) -> Option<String> {
+    let mut labels = Vec::new();
+    match output.limit_reasons.as_deref() {
+        Some(reasons) => {
+            for reason in reasons {
+                let label = match reason {
+                    TurnLimitReason::ToolCalls => "tool-call budget reached",
+                    TurnLimitReason::PeerRounds => "peer-round budget reached",
+                    TurnLimitReason::LegacyUnspecified => "legacy limit · cause unspecified",
+                };
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+            if output.limited
+                && labels.is_empty()
+                && output.response_outcome != Some(ResponseOutcome::Empty)
+            {
+                labels.push("limited result · cause unspecified");
+            }
+        }
+        None if output.limited => labels.push("legacy limit · cause unspecified"),
+        None => {}
+    }
+    if output.response_outcome == Some(ResponseOutcome::Empty) {
+        labels.push("empty response");
+    }
+    (!labels.is_empty()).then(|| labels.join(" · "))
+}
+
 fn reduced_motion(value: Option<&str>) -> bool {
     value.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
@@ -556,7 +589,7 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
         .history()
         .await?
         .into_iter()
-        .map(|message| (message.role, message.content))
+        .map(|message| project_transcript_message(&message.role, message.content))
         .collect();
     Ok(InitialViewData {
         transcript,
@@ -570,6 +603,40 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
         motion: !reduced_motion(std::env::var("KURU_REDUCED_MOTION").ok().as_deref()),
         runtime: project_runtime_snapshot(harness),
     })
+}
+
+fn project_transcript_message(role: &str, content: String) -> (String, String) {
+    if role == INTERRUPTION_ROLE {
+        ("kuru".into(), content)
+    } else {
+        (role.into(), content)
+    }
+}
+
+async fn append_missing_interruption_markers(harness: &Harness, view: &mut View) -> Result<()> {
+    let displayed = view
+        .transcript
+        .iter()
+        .filter(|(speaker, body)| speaker == "kuru" && body == INTERRUPTION_TEXT)
+        .count();
+    let durable = harness
+        .history()
+        .await?
+        .into_iter()
+        .filter(|message| message.role == INTERRUPTION_ROLE && message.content == INTERRUPTION_TEXT)
+        .count();
+    for _ in displayed..durable {
+        view.transcript
+            .push(("kuru".into(), INTERRUPTION_TEXT.into()));
+        view.show_scene = false;
+    }
+    Ok(())
+}
+
+fn present_interruption_refresh(view: &mut View, result: Result<()>) {
+    if result.is_err() {
+        view.notify(INTERRUPTION_REFRESH_NOTICE);
+    }
 }
 
 /// Project mutable runtime state without letting the renderer access a Harness.
@@ -970,12 +1037,23 @@ async fn apply_completion(
             view.status = "Complete".into();
             view.completion_locked = true;
         }
-        Ok(DispatchOutcome::Turn(output)) => view.complete_turn(output),
+        Ok(DispatchOutcome::Turn(result)) if result.reused => {
+            view.notify("Stored result reused · no new provider or tool work");
+            view.status = "Complete · stored result reused".into();
+            view.completion_locked = true;
+        }
+        Ok(DispatchOutcome::Turn(result)) => view.complete_turn(result.output),
         Err(error) if turn_was_cancelled(&error) => {
+            let harness = harness.lock().await;
+            let refresh = append_missing_interruption_markers(&harness, view).await;
+            present_interruption_refresh(view, refresh);
             view.status = "Cancelled · turn interrupted".into();
             view.completion_locked = true;
         }
         Err(error) => {
+            let harness = harness.lock().await;
+            let refresh = append_missing_interruption_markers(&harness, view).await;
+            present_interruption_refresh(view, refresh);
             view.transcript.push(("error".into(), format!("{error:#}")));
             view.show_scene = false;
             view.status = "Failed · details in conversation".into();
@@ -1365,6 +1443,11 @@ async fn dispatch_controlled(
         "/notes" => serde_json::to_string_pretty(&harness.notes_for(args, 100).await?)?,
         "/memory-status" => serde_json::to_string_pretty(&harness.memory_status().await?)?,
         "/memory-history" => serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?,
+        "/retry" => {
+            return Ok(DispatchOutcome::Turn(
+                harness.retry_last(cancellation).await?,
+            ));
+        }
         "/dream" => serde_json::to_string_pretty(&harness.dream_controlled(cancellation).await?)?,
         "/undo-dream" => {
             harness.undo_dream().await?;
@@ -1372,8 +1455,11 @@ async fn dispatch_controlled(
         }
         _ if command.starts_with('/') => anyhow::bail!("unknown command; use /help"),
         _ => {
+            let turn_id = uuid::Uuid::new_v4().to_string();
             return Ok(DispatchOutcome::Turn(
-                harness.run_cancellable(command, None, cancellation).await?,
+                harness
+                    .run_local_controlled(command, None, &turn_id, cancellation)
+                    .await?,
             ));
         }
     };
@@ -1418,6 +1504,28 @@ mod tests {
                 default_effort: Some("low".into()),
             }],
         )
+    }
+
+    #[test]
+    fn interruption_role_projects_as_a_fixed_kuru_marker() {
+        assert_eq!(
+            project_transcript_message(INTERRUPTION_ROLE, INTERRUPTION_TEXT.into()),
+            ("kuru".into(), INTERRUPTION_TEXT.into())
+        );
+        assert_eq!(
+            project_transcript_message("user", "ordinary prompt".into()),
+            ("user".into(), "ordinary prompt".into())
+        );
+    }
+
+    #[test]
+    fn marker_refresh_failure_adds_a_fixed_notice_without_replacing_turn_status() {
+        let mut view = fixture();
+        view.status = "Failed · details in conversation".into();
+        present_interruption_refresh(&mut view, Err(anyhow::anyhow!("private storage detail")));
+        assert_eq!(view.status, "Failed · details in conversation");
+        assert_eq!(view.notice.as_deref(), Some(INTERRUPTION_REFRESH_NOTICE));
+        assert!(!view.notice.as_deref().unwrap().contains("private storage"));
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1924,6 +2032,8 @@ mod tests {
             input_tokens: 13,
             output_tokens: 29,
             limited: true,
+            limit_reasons: Some(vec![kuru_runtime::TurnLimitReason::PeerRounds]),
+            response_outcome: Some(kuru_runtime::ResponseOutcome::Text),
             events: vec![],
         });
         view.event(Event {
@@ -1950,7 +2060,7 @@ mod tests {
             view.completion_metadata,
             BTreeMap::from([(
                 0,
-                "13 input tokens · 29 output tokens · limited result".into()
+                "13 input tokens · 29 output tokens · peer-round budget reached".into()
             )])
         );
         assert!(
@@ -1964,7 +2074,7 @@ mod tests {
                 .last()
                 .is_some_and(|activity| activity.starts_with("response · "))
         );
-        assert_eq!(view.status, "Complete · limited result");
+        assert_eq!(view.status, "Complete · peer-round budget reached");
     }
 
     #[test]
@@ -1978,6 +2088,8 @@ mod tests {
             input_tokens: 8,
             output_tokens: 5,
             limited: true,
+            limit_reasons: Some(vec![kuru_runtime::TurnLimitReason::ToolCalls]),
+            response_outcome: Some(kuru_runtime::ResponseOutcome::Text),
             events: vec![],
         });
 
@@ -1991,17 +2103,62 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            for expected in [
-                "COMPLETION_TEXT",
-                "8 input tokens",
-                "5 output tokens",
-                "limited result",
-            ] {
-                assert!(
-                    screen.contains(expected),
-                    "{size:?} omitted {expected}:\n{screen}"
-                );
-            }
+            let normalized = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+            let answer = normalized
+                .find("COMPLETION_TEXT")
+                .unwrap_or_else(|| panic!("{size:?} omitted the answer:\n{screen}"));
+            let metadata = normalized
+                .find("8 input tokens · 5 output tokens · tool-call budget reached")
+                .unwrap_or_else(|| panic!("{size:?} omitted the answer metadata:\n{screen}"));
+            assert!(
+                answer < metadata,
+                "{size:?} did not keep metadata after its answer:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_legacy_outcomes_render_without_inventing_a_budget() {
+        for (limited, reasons, response, expected, absent) in [
+            (
+                true,
+                Some(vec![]),
+                Some(kuru_runtime::ResponseOutcome::Empty),
+                "empty response",
+                "budget reached",
+            ),
+            (
+                true,
+                None,
+                None,
+                "legacy limit · cause unspecified",
+                "empty response",
+            ),
+        ] {
+            let mut view = fixture();
+            view.complete_turn(TurnOutput {
+                session: view.session.clone(),
+                speaker: view.parts[0].0.clone(),
+                text: "explanatory fallback".into(),
+                relationship: None,
+                input_tokens: 8,
+                output_tokens: 0,
+                limited,
+                limit_reasons: reasons,
+                response_outcome: response,
+                events: vec![],
+            });
+            let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+            terminal.draw(|frame| draw(frame, &view)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains(absent), "{rendered}");
         }
     }
 
@@ -2138,6 +2295,8 @@ mod tests {
             input_tokens: 8,
             output_tokens: 5,
             limited: true,
+            limit_reasons: Some(vec![kuru_runtime::TurnLimitReason::ToolCalls]),
+            response_outcome: Some(kuru_runtime::ResponseOutcome::Text),
             events: vec![],
         });
         assert_eq!(view.transcript.last().unwrap().1, "Completed task");
@@ -2153,7 +2312,7 @@ mod tests {
         assert!(text.contains("PARTS /"));
         assert!(text.contains("Completed task"));
         assert!(text.contains("8 input tokens"));
-        assert!(text.contains("limited result"));
+        assert!(text.contains("tool-call budget reached"));
         view.picker = Some(Picker::Models);
         terminal.draw(|f| draw(f, &view)).unwrap();
         let text = terminal
@@ -2191,6 +2350,8 @@ mod tests {
             input_tokens: 3,
             output_tokens: 5,
             limited: false,
+            limit_reasons: Some(vec![]),
+            response_outcome: Some(kuru_runtime::ResponseOutcome::Text),
             events: vec![],
         });
         let next_framework = Framework::builtin(Mode::Freudian);

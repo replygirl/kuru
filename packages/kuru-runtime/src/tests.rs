@@ -1,5 +1,6 @@
 use kuru_memory::MemoryStore;
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -194,7 +195,7 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
             .find(|event| event.kind == "speaker-selection")
             .unwrap()
             .detail,
-        "stable-identity"
+        "mode-authored-order"
     );
     let second = harness.run("second tie").await.unwrap();
     assert_eq!(second.speaker, first.speaker);
@@ -243,11 +244,9 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
     resumed.session.last_completed_speaker = Some("retired-fixture-identity".into());
     let unavailable = resumed.run("missing prior").await.unwrap();
     assert_eq!(unavailable.speaker, first.speaker);
-    assert!(
-        unavailable.events.iter().any(|event| {
-            event.kind == "speaker-selection" && event.detail == "stable-identity"
-        })
-    );
+    assert!(unavailable.events.iter().any(|event| {
+        event.kind == "speaker-selection" && event.detail == "mode-authored-order"
+    }));
     let higher_id = provider
         .requests
         .lock()
@@ -301,6 +300,58 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
             .any(|event| event.kind == "speaker-selection" && event.detail == "active-focus")
     );
     resumed.shutdown(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_ties_follow_each_modes_authored_order() {
+    for (mode, expected_name) in [
+        (Mode::Ifs, "Self"),
+        (Mode::Polyvagal, "Connection"),
+        (Mode::Freudian, "Desire"),
+        (Mode::Jungian, "Continuity"),
+    ] {
+        let provider = Fake::new(|_| answer("equal contribution"));
+        let (_directory, mut harness) = fixture(mode, provider).await;
+        let expected = harness
+            .topology
+            .parts
+            .iter()
+            .find(|part| part.name == expected_name)
+            .unwrap()
+            .id
+            .clone();
+
+        let output = harness.run("cold tie").await.unwrap();
+
+        assert_eq!(output.speaker, expected);
+        assert!(output.events.iter().any(|event| {
+            event.kind == "speaker-selection" && event.detail == "mode-authored-order"
+        }));
+        harness.shutdown(false).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn authored_tie_break_skips_missing_parts_and_falls_back_to_stable_ids() {
+    let provider = Fake::new(|_| answer("fixture"));
+    let (_directory, mut harness) = fixture(Mode::Ifs, provider).await;
+    let authored = kuru_core::Framework::authored_identity_order(Mode::Ifs);
+    let drafts = BTreeMap::from([
+        (authored[1].clone(), "second".into()),
+        (authored[2].clone(), "third".into()),
+    ]);
+    let (speaker, reason) = harness.select_speaker(&drafts);
+    assert_eq!(speaker, authored[1]);
+    assert_eq!(reason, "mode-authored-order");
+
+    let drafts = BTreeMap::from([
+        ("dream-z".to_string(), "z".into()),
+        ("dream-a".to_string(), "a".into()),
+    ]);
+    let (speaker, reason) = harness.select_speaker(&drafts);
+    assert_eq!(speaker, "dream-a");
+    assert_eq!(reason, "stable-id-order");
+    harness.shutdown(false).await.unwrap();
 }
 
 struct FailingSpeaker(AtomicBool);
@@ -751,7 +802,7 @@ async fn modeled_state_selects_a_peer_and_stores_private_notes() {
 }
 
 #[tokio::test]
-async fn cyclic_peers_stop_at_round_and_call_limits() {
+async fn cyclic_peers_stop_at_peer_round_limit() {
     let roster = Arc::new(Mutex::new(Vec::<String>::new()));
     let ids = roster.clone();
     let fake = Fake::new(move |r| {
@@ -761,7 +812,7 @@ async fn cyclic_peers_stop_at_round_and_call_limits() {
             .find(|id| !r.actor.ends_with(id.as_str()))
             .unwrap();
         let mut reply = answer("bounded contribution");
-        if !r.tools.is_empty() {
+        if r.instructions.contains("Phase: deliberate") && !r.tools.is_empty() {
             reply
                 .calls
                 .push(call("peer_send", json!({"to":target,"message":"again"})));
@@ -776,14 +827,65 @@ async fn cyclic_peers_stop_at_round_and_call_limits() {
         .map(|p| p.id.clone())
         .collect();
     harness.config.max_rounds = 2;
-    harness.config.max_tool_calls = 4;
+    harness.config.max_tool_calls = 100;
     let output = tokio::time::timeout(Duration::from_secs(2), harness.run("Cycle"))
         .await
         .unwrap()
         .unwrap();
     assert!(output.limited);
+    assert_eq!(
+        output.limit_reasons,
+        Some(vec![crate::TurnLimitReason::PeerRounds])
+    );
+    assert_eq!(output.response_outcome, Some(crate::ResponseOutcome::Text));
     assert!(output.events.iter().any(|e| e.kind == "budget"));
     assert!(fake.requests.lock().unwrap().len() <= 10);
+}
+
+#[tokio::test]
+async fn empty_response_is_separate_from_resource_limits() {
+    let provider = Fake::new(|request| {
+        if request.instructions.contains("Phase: deliberate") {
+            answer("draft")
+        } else {
+            Completion::default()
+        }
+    });
+    let (_directory, mut harness) = fixture(Mode::Freudian, provider).await;
+
+    let output = harness.run("empty response fixture").await.unwrap();
+
+    assert!(output.limited);
+    assert_eq!(output.limit_reasons, Some(vec![]));
+    assert_eq!(output.response_outcome, Some(crate::ResponseOutcome::Empty));
+    harness.shutdown(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_call_limit_is_reported_without_a_peer_round_limit() {
+    let provider = Fake::new(|request| {
+        if request.instructions.contains("Phase: deliberate") {
+            answer("draft")
+        } else {
+            Completion {
+                text: "answer with exhausted tool request".into(),
+                calls: vec![call("remember", json!({"text":"not executed"}))],
+                ..Completion::default()
+            }
+        }
+    });
+    let (_directory, mut harness) = fixture(Mode::Freudian, provider).await;
+    harness.config.max_tool_calls = 0;
+
+    let output = harness.run("tool budget fixture").await.unwrap();
+
+    assert!(output.limited);
+    assert_eq!(
+        output.limit_reasons,
+        Some(vec![crate::TurnLimitReason::ToolCalls])
+    );
+    assert_eq!(output.response_outcome, Some(crate::ResponseOutcome::Text));
+    harness.shutdown(false).await.unwrap();
 }
 
 #[tokio::test]

@@ -24,12 +24,14 @@ use kuru_platform::{
 };
 use serde_json::json;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
     sync::oneshot,
     time::{sleep, timeout_at},
 };
 
-use crate::MAX_BYTES;
+use crate::shell_diagnostic::{
+    ShellCapture, ShellFailureCategory, failure as shell_failure,
+    failure_with_cleanup as shell_failure_with_cleanup,
+};
 
 const CLEANUP_ALLOWANCE: Duration = Duration::from_secs(5);
 const OBSERVE_INTERVAL: Duration = Duration::from_millis(10);
@@ -357,7 +359,7 @@ struct RegistryState {
 struct Control {
     cancelled: AtomicBool,
     result: Mutex<Option<oneshot::Sender<Result<String>>>>,
-    primary: Mutex<Option<String>>,
+    primary: Mutex<Option<ShellFailureCategory>>,
 }
 
 impl Control {
@@ -371,20 +373,20 @@ impl Control {
                 .is_some_and(oneshot::Sender::is_closed)
     }
 
-    fn record_primary(&self, result: &Result<(Capture, Capture)>) {
-        if let Err(error) = result {
+    fn record_primary(&self, category: Option<ShellFailureCategory>) {
+        if let Some(category) = category {
             *self
                 .primary
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(format!("{error:#}"));
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(category);
         }
     }
 
-    fn primary(&self) -> Option<String> {
-        self.primary
+    fn primary(&self) -> Option<ShellFailureCategory> {
+        *self
+            .primary
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
     }
 }
 
@@ -480,14 +482,14 @@ impl ShellRegistry {
             Ok(Err(_)) => Err(anyhow::anyhow!("shell owner ended without a result")),
             Err(_) => {
                 self.cancel(id);
-                if let Some(primary) = control.primary() {
-                    bail!(
-                        "{primary}; shell cleanup was not confirmed by deadline; unconfirmed owners remain retained"
-                    );
-                }
-                bail!(
-                    "shell cleanup was not confirmed by deadline; unconfirmed owners remain retained"
-                )
+                let category = control
+                    .primary()
+                    .unwrap_or(ShellFailureCategory::CleanupUnconfirmed);
+                Err(shell_failure_with_cleanup(
+                    category,
+                    true,
+                    &ShellCapture::new(),
+                ))
             }
         }
     }
@@ -771,17 +773,19 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
     }));
     let (result, stdout, stderr) = match session {
         Ok(Ok(session)) => session,
-        Ok(Err(error)) => (Err(error), None, None),
+        Ok(Err(_)) => (
+            ShellRead::failed(ShellFailureCategory::OperationFailed),
+            None,
+            None,
+        ),
         Err(_) => (
-            Err(anyhow::anyhow!(
-                "retained shell worker panicked after spawn"
-            )),
+            ShellRead::failed(ShellFailureCategory::OperationFailed),
             None,
             None,
         ),
     };
-    let primary_description = result.as_ref().err().map(|error| format!("{error:#}"));
-    control.record_primary(&result);
+    let primary_category = result.category;
+    control.record_primary(primary_category);
     let finished = catch_unwind(AssertUnwindSafe(|| {
         finish_with_cleanup(
             &mut group,
@@ -803,15 +807,11 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
             &test_hooks,
         ),
         Err(_) => {
-            let error = match primary_description {
-                Some(primary) => anyhow::anyhow!(
-                    "{primary}; shell cleanup was not confirmed; unconfirmed ownership is retained after cleanup panic"
-                ),
-                None => anyhow::anyhow!(
-                    "shell cleanup was not confirmed; unconfirmed ownership is retained after cleanup panic"
-                ),
-            };
-            finish.report(Err(error));
+            finish.report(Err(shell_failure_with_cleanup(
+                primary_category.unwrap_or(ShellFailureCategory::CleanupUnconfirmed),
+                true,
+                &ShellCapture::new(),
+            )));
             retain_until_confirmed(
                 &mut group,
                 &finish,
@@ -882,6 +882,22 @@ impl Drop for WorkerFinish {
     }
 }
 
+struct ShellRead {
+    stdout: ShellCapture,
+    stderr: ShellCapture,
+    category: Option<ShellFailureCategory>,
+}
+
+impl ShellRead {
+    fn failed(category: ShellFailureCategory) -> Self {
+        Self {
+            stdout: ShellCapture::new(),
+            stderr: ShellCapture::new(),
+            category: Some(category),
+        }
+    }
+}
+
 async fn read_until_terminal(
     group: &mut OwnedProcessGroup,
     stdout: &mut tokio::process::ChildStdout,
@@ -889,12 +905,12 @@ async fn read_until_terminal(
     control: &Control,
     deadline: Instant,
     #[cfg(test)] test_hooks: &TestHooks,
-) -> Result<(Capture, Capture)> {
-    let mut out = Capture::new();
-    let mut err = Capture::new();
-    {
-        let out_read = out.read(stdout);
-        let err_read = err.read(stderr);
+) -> ShellRead {
+    let mut stdout_capture = ShellCapture::new();
+    let mut stderr_capture = ShellCapture::new();
+    let mut category = {
+        let out_read = stdout_capture.read(stdout);
+        let err_read = stderr_capture.read(stderr);
         tokio::pin!(out_read);
         tokio::pin!(err_read);
         let mut out_done = false;
@@ -903,44 +919,57 @@ async fn read_until_terminal(
         loop {
             #[cfg(test)]
             if test_hooks.take(TestPoint::PipeReadFailure) {
-                bail!("injected shell pipe read failure");
+                break Some(ShellFailureCategory::CaptureFailed);
             }
             if control.cancelled_or_closed() {
-                bail!("shell cancelled");
+                break Some(ShellFailureCategory::Cancelled);
             }
             if Instant::now() >= deadline {
-                bail!("shell timed out");
+                break Some(ShellFailureCategory::TimedOut);
             }
             match group.root_state() {
-                RootState::Disarmed(reason) => bail!("shell ownership lost: {reason:?}"),
-                RootState::Reaped(_) => bail!("shell root was reaped before cleanup"),
+                RootState::Disarmed(_) | RootState::Reaped(_) => {
+                    break Some(ShellFailureCategory::OwnershipLost);
+                }
                 RootState::Exited => root_exited = true,
                 RootState::Running | RootState::Interrupted => {}
             }
             if out_done && err_done && root_exited {
-                break;
+                break None;
             }
             tokio::select! {
                 result = &mut out_read, if !out_done => {
-                    result.map_err(|error| anyhow::anyhow!("read shell stdout: {error:#}"))?;
-                    out_done = true;
+                    if result.is_ok() {
+                        out_done = true;
+                    } else {
+                        break Some(ShellFailureCategory::CaptureFailed);
+                    }
                 }
                 result = &mut err_read, if !err_done => {
-                    result.map_err(|error| anyhow::anyhow!("read shell stderr: {error:#}"))?;
-                    err_done = true;
+                    if result.is_ok() {
+                        err_done = true;
+                    } else {
+                        break Some(ShellFailureCategory::CaptureFailed);
+                    }
                 }
                 _ = sleep(OBSERVE_INTERVAL) => {}
             }
         }
+    };
+    if category.is_none() && (stdout_capture.finish().is_err() || stderr_capture.finish().is_err())
+    {
+        category = Some(ShellFailureCategory::CaptureFailed);
     }
-    out.finish()?;
-    err.finish()?;
-    Ok((out, err))
+    ShellRead {
+        stdout: stdout_capture,
+        stderr: stderr_capture,
+        category,
+    }
 }
 
 fn finish_with_cleanup(
     group: &mut OwnedProcessGroup,
-    primary: Result<(Capture, Capture)>,
+    primary: ShellRead,
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     finish: &WorkerFinish,
@@ -959,28 +988,28 @@ fn finish_with_cleanup(
         test_hooks,
     ) {
         Ok(status) => {
-            let result = primary.map(|(out, err)| {
-                json!({
+            let result = if let Some(category) = primary.category {
+                Err(shell_failure(category, &primary.stderr))
+            } else {
+                Ok(json!({
                     "exit_code": status.code(),
                     "success": status.success(),
-                    "stdout": out.text,
-                    "stderr": err.text,
+                    "stdout": primary.stdout.text(),
+                    "stderr": primary.stderr.text(),
                 })
-                .to_string()
-            });
+                .to_string())
+            };
             finish.complete(result);
             true
         }
-        Err(error) => {
-            let result = match primary {
-                Ok(_) => Err(anyhow::anyhow!(
-                    "shell cleanup was not confirmed; unconfirmed ownership is retained: {error:#}"
-                )),
-                Err(primary) => Err(anyhow::anyhow!(
-                    "{primary:#}; shell cleanup was not confirmed; unconfirmed ownership is retained: {error:#}"
-                )),
-            };
-            finish.report(result);
+        Err(_) => {
+            finish.report(Err(shell_failure_with_cleanup(
+                primary
+                    .category
+                    .unwrap_or(ShellFailureCategory::CleanupUnconfirmed),
+                true,
+                &primary.stderr,
+            )));
             false
         }
     }
@@ -1026,9 +1055,15 @@ fn retain_until_confirmed(
 
 fn before_launch(control: &Control, deadline: Instant) -> Option<anyhow::Error> {
     if control.cancelled_or_closed() {
-        Some(anyhow::anyhow!("shell cancelled before launch"))
+        Some(shell_failure(
+            ShellFailureCategory::Cancelled,
+            &ShellCapture::new(),
+        ))
     } else if Instant::now() >= deadline {
-        Some(anyhow::anyhow!("shell timed out before launch"))
+        Some(shell_failure(
+            ShellFailureCategory::TimedOut,
+            &ShellCapture::new(),
+        ))
     } else {
         None
     }
@@ -1099,43 +1134,6 @@ fn remove(registry: &RegistryInner, id: u64) {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .owners
         .remove(&id);
-}
-
-struct Capture {
-    output: Option<crate::redaction::StreamingProjection>,
-    text: String,
-}
-
-impl Capture {
-    fn new() -> Self {
-        Self {
-            output: Some(crate::redaction::StreamingProjection::new(MAX_BYTES)),
-            text: String::new(),
-        }
-    }
-
-    async fn read(&mut self, reader: &mut (impl AsyncRead + Unpin)) -> Result<()> {
-        let mut buffer = [0; 8192];
-        loop {
-            let count = reader.read(&mut buffer).await?;
-            if count == 0 {
-                return Ok(());
-            }
-            self.output
-                .as_mut()
-                .expect("shell capture was already finished")
-                .push(&buffer[..count])?;
-        }
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        self.text = self
-            .output
-            .take()
-            .expect("shell capture was already finished")
-            .finish()?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -1291,8 +1289,10 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("shell timed out"), "{error}");
-        assert!(error.contains("cleanup panic"), "{error}");
+        assert_eq!(
+            error,
+            "shell timed out; cleanup: unconfirmed ownership retained; stderr: <pending EOF>"
+        );
         assert_eq!(registry.owner_count(), 1);
         retained_cleanup.release();
         runtime.block_on(async {
@@ -1359,7 +1359,10 @@ mod tests {
                 Vec::new,
             ))
             .unwrap_err();
-        assert!(error.to_string().contains("cleanup panic"), "{error:#}");
+        assert_eq!(
+            error.to_string(),
+            "shell timed out; cleanup: unconfirmed ownership retained; stderr: <pending EOF>"
+        );
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(1), async {
                 while !retained_cleanup.entered() {
@@ -1436,7 +1439,15 @@ mod tests {
                 ))
                 .unwrap_err();
 
-            assert!(error.to_string().contains(expected), "{error:#}");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("shell capture failed; stderr: <pending EOF>")
+                    || error
+                        .to_string()
+                        .starts_with("shell operation failed; stderr: <pending EOF>"),
+                "{expected}: {error:#}"
+            );
             runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(1), async {
                     while registry.owner_count() != 0 {
@@ -1471,7 +1482,10 @@ mod tests {
             .unwrap_err();
 
         assert!(accepted.elapsed() >= CLEANUP_ALLOWANCE);
-        assert!(error.to_string().contains("not confirmed by deadline"));
+        assert_eq!(
+            error.to_string(),
+            "shell cleanup unconfirmed; cleanup: unconfirmed ownership retained; stderr: <pending EOF>"
+        );
         assert_eq!(registry.owner_count(), 1);
         start.release();
         runtime.block_on(async {
@@ -1582,8 +1596,10 @@ mod tests {
             .to_string();
 
         assert!(started.elapsed() >= Duration::from_millis(80));
-        assert!(error.contains("shell timed out"), "{error}");
-        assert!(error.contains("cleanup was not confirmed"), "{error}");
+        assert_eq!(
+            error,
+            "shell timed out; cleanup: unconfirmed ownership retained; stderr: <pending EOF>"
+        );
         assert_eq!(registry.owner_count(), 1);
         assert_eq!(registry.test_transitions(), 0);
         interruption.release();
@@ -1620,7 +1636,10 @@ mod tests {
                 Vec::new,
             ))
             .unwrap_err();
-        assert!(error.to_string().contains("cleanup was not confirmed"));
+        assert_eq!(
+            error.to_string(),
+            "shell timed out; cleanup: unconfirmed ownership retained; stderr: <pending EOF>"
+        );
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(1), async {
                 while registry.test_retained_observations().len() < 3 {
@@ -1676,7 +1695,10 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("cleanup was not confirmed"), "{error}");
+        assert_eq!(
+            error,
+            "shell cleanup unconfirmed; cleanup: unconfirmed ownership retained; stderr: "
+        );
         assert!(!error.contains("exit_code"), "{error}");
         assert_eq!(registry.owner_count(), 1);
         assert_eq!(registry.test_transitions(), 0);

@@ -13,7 +13,10 @@ use kuru_core::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use crate::{CancellationToken, DreamProposal, Harness, turn_was_cancelled};
+use crate::{
+    CancellationToken, DreamProposal, Harness, INTERRUPTION_ROLE, INTERRUPTION_TEXT,
+    turn_was_cancelled,
+};
 
 type Response = dyn Fn(&CompletionRequest) -> Result<Completion> + Send + Sync;
 struct RecordingProvider {
@@ -305,9 +308,11 @@ async fn cancellation_before_shared_tool_dispatch_runs_no_file_mutation() {
     assert!(turn_was_cancelled(&result.unwrap_err()));
     assert!(!project.path().join("not-created.txt").exists());
     let history = harness.history().await.unwrap();
-    assert_eq!(history.len(), 1);
+    assert_eq!(history.len(), 2);
     assert_eq!(history[0].role, "user");
     assert_eq!(history[0].content, "cancel before the tool");
+    assert_eq!(history[1].role, INTERRUPTION_ROLE);
+    assert_eq!(history[1].content, INTERRUPTION_TEXT);
     let retry = harness
         .run_controlled(
             "cancel before the tool",
@@ -1751,7 +1756,10 @@ async fn partial_provider_failures_leave_other_peers_usable_and_total_failure_is
     let error = unavailable.run("Try a request").await.unwrap_err();
     assert!(error.to_string().contains("all peers failed"));
     assert_eq!(unavailable.session.turns, 0);
-    assert_eq!(unavailable.history().await.unwrap().len(), 1);
+    let history = unavailable.history().await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].role, INTERRUPTION_ROLE);
+    assert_eq!(history[1].content, INTERRUPTION_TEXT);
 }
 
 #[tokio::test]

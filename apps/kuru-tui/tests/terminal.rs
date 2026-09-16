@@ -8,7 +8,7 @@ use std::{
     process::Command,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -572,10 +572,12 @@ fn real_pty_accepts_chat_navigation_commands_and_restores_terminal() -> Result<(
 #[derive(Clone)]
 struct ProviderState {
     started: Arc<AtomicBool>,
+    requests: Arc<AtomicUsize>,
     release: watch::Receiver<bool>,
 }
 
 async fn complete(State(mut state): State<ProviderState>, Json(_): Json<Value>) -> Json<Value> {
+    state.requests.fetch_add(1, Ordering::SeqCst);
     let delayed = !*state.release.borrow();
     state.started.store(true, Ordering::SeqCst);
     if delayed {
@@ -607,6 +609,7 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     let sandbox = Sandbox::new()?;
     let (release, receiver) = watch::channel(false);
     let started = Arc::new(AtomicBool::new(false));
+    let requests = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route(
             "/v1/models",
@@ -615,6 +618,7 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
         .route("/v1/responses", post(complete))
         .with_state(ProviderState {
             started: started.clone(),
+            requests: requests.clone(),
             release: receiver,
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -634,7 +638,7 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
         .args([
             "--debug", "--model", "fixture", "--mode", "freudian", "--config",
         ])
-        .arg(config)
+        .arg(&config)
         .env("KURU_FIXTURE_KEY", "fixture")
         .env("KURU_REDUCED_MOTION", "1");
     let mut terminal = Terminal::spawn(command, 35, 120)?;
@@ -647,17 +651,43 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     terminal.send(b"\x1bOQ")?;
     terminal.wait_text(&["current turn"], &[])?;
     terminal.send(b"\x1b")?;
-    terminal.wait_text(&["Cancelled", "Next thought", "enter send"], &[])?;
+    terminal.wait_text(
+        &[
+            "Cancelled",
+            "Turn interrupted",
+            "no completed answer was committed",
+            "Next thought",
+            "enter send",
+        ],
+        &[],
+    )?;
     release.send(true)?;
     terminal.send(b"\r")?;
     terminal.wait_text(
         &[
+            "Turn interrupted",
             "FRESH_RESPONSE_MARKER",
             "32 input tokens",
             "20 output tokens",
         ],
         &[],
     )?;
+    let completed_requests = requests.load(Ordering::SeqCst);
+    terminal.send(b"/retry\r")?;
+    terminal.wait_text(
+        &[
+            "Stored result reused",
+            "Turn interrupted",
+            "FRESH_RESPONSE_MARKER",
+            "enter send",
+        ],
+        &[],
+    )?;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        completed_requests,
+        "completed /retry reached the provider"
+    );
     terminal.resize(35, 65)?;
     terminal.wait_text(
         &[
@@ -674,8 +704,21 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     terminal.wait_exit(EXIT_TIMEOUT)?;
     terminal.assert_restored()?;
     let transcript = String::from_utf8_lossy(&terminal.output);
+    let alternate_start = transcript
+        .find("\u{1b}[?1049h")
+        .context("TUI did not enter the alternate screen")?;
+    let alternate_end = transcript
+        .rfind("\u{1b}[?1049l")
+        .context("TUI did not leave the alternate screen")?;
     ensure!(
-        !transcript.contains("span_open") && !transcript.contains("diagnostics"),
+        transcript[..alternate_start].contains("\"debug_ring\"")
+            && transcript[..alternate_start].contains("/diagnostics/"),
+        "debug ring location was not reported before the TUI: {transcript}"
+    );
+    ensure!(
+        !transcript[alternate_start..alternate_end].contains("debug_ring")
+            && !transcript[alternate_start..alternate_end].contains("span_open")
+            && !transcript[alternate_start..alternate_end].contains("/diagnostics/"),
         "debug diagnostics leaked to the PTY transcript: {transcript}"
     );
     let logs = diagnostics(&sandbox.data)?;
@@ -689,6 +732,29 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     let sessions = sandbox.sessions()?;
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].turns, 1);
+    let mut resume = sandbox.command("responses");
+    resume
+        .args(["--model", "fixture", "--mode", "freudian", "--config"])
+        .arg(&config)
+        .arg("--resume")
+        .arg(&sessions[0].id)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut resumed = Terminal::spawn(resume, 35, 120)?;
+    resumed.wait_text_with_timeout(
+        &[
+            "Turn interrupted",
+            "no completed answer was committed",
+            "FRESH_RESPONSE_MARKER",
+            "enter send",
+        ],
+        &[],
+        sandbox.startup_timeout,
+    )?;
+    resumed.send(b"/quit\r")?;
+    resumed.wait_exit(EXIT_TIMEOUT)?;
+    resumed.assert_restored()?;
+
     let harness = kuru_runtime::Harness::new(
         Config {
             provider: "demo".into(),
@@ -710,6 +776,16 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
         history
             .iter()
             .any(|message| message.role == "user" && message.content == "Next thought")
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|message| {
+                message.role == kuru_runtime::INTERRUPTION_ROLE
+                    && message.content == kuru_runtime::INTERRUPTION_TEXT
+            })
+            .count(),
+        1
     );
     assert!(
         !history

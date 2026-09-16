@@ -348,6 +348,20 @@ fn diagnostics(run: &CliRun) -> Result<String> {
         .map_err(Into::into)
 }
 
+fn reported_debug_ring(output: &std::process::Output) -> Result<PathBuf> {
+    let stderr = std::str::from_utf8(&output.stderr).context("debug stderr is not UTF-8")?;
+    let rings = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|value| value["debug_ring"].as_str().map(PathBuf::from))
+        .collect::<Vec<_>>();
+    ensure!(
+        rings.len() == 1,
+        "debug stderr must report exactly one ring directory: {stderr:?}"
+    );
+    Ok(rings.into_iter().next().expect("checked one ring"))
+}
+
 fn expected_receipt() -> String {
     json!({
         "exit_code": 0,
@@ -433,6 +447,20 @@ async fn kuru_run_uses_the_owned_shell_and_preserves_the_responses_continuation(
         ensure!(
             turn["text"] == FINAL_TEXT,
             "unexpected terminal turn: {turn}"
+        );
+        let hash = kuru_runtime::project_scope(&run.sandbox.project)?
+            .strip_prefix("project/")
+            .context("fixture project scope lacks prefix")?
+            .to_owned();
+        let expected_ring = run
+            .sandbox
+            .data
+            .join("diagnostics")
+            .join(hash)
+            .canonicalize()?;
+        ensure!(
+            reported_debug_ring(output)?.canonicalize()? == expected_ring,
+            "debug stderr reported a different project ring"
         );
         let requests = server.state.requests.lock().await.clone();
         let shell_requests = requests
@@ -637,6 +665,10 @@ async fn debug_cli_rotates_the_fixed_private_diagnostic_ring() -> Result<()> {
             scopes.len() == 1,
             "diagnostics created {} per-project directories instead of one: {scopes:?}",
             scopes.len()
+        );
+        ensure!(
+            reported_debug_ring(&run.output)?.canonicalize()? == scopes[0].canonicalize()?,
+            "rotation run reported a different diagnostics ring"
         );
         for index in 0..DIAGNOSTIC_FILE_COUNT {
             let trace = scopes[0].join(format!("trace-{index}.jsonl"));

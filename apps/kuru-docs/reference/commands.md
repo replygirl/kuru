@@ -30,6 +30,7 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 | `/relate KIND ID,ID` | Activate protection, polarization, or alliance among 2–4 members |
 | `/memory NAME_OR_ID` | Inspect an identity's stored memory                              |
 | `/notes NAME_OR_ID`  | Inspect an identity's separate bounded durable notes             |
+| `/retry`             | Safely retry the last durably retained local submission          |
 | `/memory-status`     | Inspect the project's memory store and current revision          |
 | `/memory-history`    | List committed memory revisions                                  |
 | `/dream`             | Run bounded consolidation                                        |
@@ -43,6 +44,7 @@ Model, effort, and framework selections made here are [saved for the project](./
 | Command                                 | Purpose                                                                                     |
 | --------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `kuru run "PROMPT"`                     | Run a turn without the TUI; add `--json` for structured output                              |
+| `kuru run "PROMPT" --turn-id ID`        | Use a bounded explicit turn ID for exact retry in the resumed session                       |
 | `kuru login`                            | Start browser sign-in for ChatGPT subscription access                                       |
 | `kuru login --no-browser`               | Print the browser sign-in URL for you to open                                               |
 | `kuru login --device`                   | Use device authorization                                                                    |
@@ -94,6 +96,20 @@ unchanged. For API-key access, set `OPENAI_API_KEY` and select
 | `--no-dream`             | Disable periodic and session-end dreaming for this invocation              |
 
 Global options can be used alongside subcommands. Use `kuru COMMAND --help` for command-specific arguments.
+
+`--turn-id` belongs only to `run`. Pair it with `--resume SESSION_ID` when
+retrying a prior scripted turn. The ID never derives from prompt text: repeating
+a prompt without the original ID is new work. An exact completed retry returns
+the stored result without provider or tool work; a changed request conflicts,
+and a turn that may have dispatched external work refuses replay. In the TUI,
+`/retry` uses only the one last local submission retained for that session. It
+does not browse older turns or enable automatic retry.
+
+For runtime-owning commands, `--debug` prints one JSON line naming the resolved
+diagnostic ring directory on standard error. The command result on standard
+output is unchanged, including for `run --json`. The directory contains the
+four-file, 64 KiB-per-file operational ring
+`trace-{0..3}.jsonl`; it is separate from durable turn history.
 
 `/memory` remains conversation inspection. `/notes` and `kuru memory notes ID`
 return a JSON view with the selected `mode`, canonical `identity`, chronological

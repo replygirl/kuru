@@ -14,7 +14,7 @@ use kuru_core::{
 };
 use kuru_memory::{MemoryOpenStage, MemoryStore, OpenOptions as MemoryOptions};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
-use kuru_runtime::{Harness, forget_note, read_notes};
+use kuru_runtime::{CancellationToken, Harness, forget_note, read_notes};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -79,6 +79,9 @@ pub enum Command {
         prompt: String,
         #[arg(long)]
         json: bool,
+        /// Use an explicit durable ID for exact retry in this session.
+        #[arg(long, value_name = "ID")]
+        turn_id: Option<String>,
     },
     /// Sign in to ChatGPT using native OpenAI authentication.
     Login {
@@ -656,6 +659,16 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     } else {
         None
     };
+    if cli.debug
+        && let Some(diagnostics) = &diagnostics
+    {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "debug_ring": diagnostics.directory().to_string_lossy(),
+            })
+        );
+    }
     // A new installation can inspect configuration without creating state. An
     // existing store supplies only this project's interactive choices, never a
     // resumed transcript. Refuse tool-root storage before opening its database.
@@ -828,9 +841,18 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         )
         .await?;
         match cli.command {
-            Some(Command::Run { prompt, json }) => {
+            Some(Command::Run {
+                prompt,
+                json,
+                turn_id,
+            }) => {
                 let mut events = harness.subscribe();
-                let result = harness.run(&prompt).await;
+                let turn_id = turn_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let cancellation = CancellationToken::new();
+                let result = harness
+                    .run_local_controlled(&prompt, None, &turn_id, &cancellation)
+                    .await
+                    .map(|result| result.output);
                 let succeeded = result.is_ok();
                 if let Ok(result) = &result {
                     if json {
