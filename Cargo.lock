@@ -1453,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "kuru"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-archive"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-connectors"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "kuru-platform",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-delivery"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1570,7 +1570,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-memory"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-platform"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "nix 0.31.3",
  "rustix",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-runtime"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "async-trait",
