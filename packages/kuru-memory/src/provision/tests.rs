@@ -104,6 +104,96 @@ fn executable(path: &Path, content: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+fn public_directory(path: &Path) {
+    fs::create_dir(path).unwrap();
+    fs::write(path.join("sentinel"), b"leave private data unchanged").unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn assert_safe_private_directory_remedy(path: &Path, error: anyhow::Error) {
+    let text = format!("{error:#}");
+    assert!(text.contains("memory data directory"), "{text}");
+    assert!(text.contains("mode 0700"), "{text}");
+    assert!(text.contains(&path.display().to_string()), "{text}");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::PermissionDenied),
+        "{text}"
+    );
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::read(path.join("sentinel")).unwrap(),
+        b"leave private data unchanged"
+    );
+}
+
+#[tokio::test]
+async fn public_cache_versions_and_pinned_install_lock_receive_safe_remedies() {
+    let root = crate::test_support::tempdir().unwrap();
+    let fixture = &*VALID_FIXTURE;
+    let cache = root.path().join("cache");
+    public_directory(&cache);
+    let error = provision_managed(
+        &MemoryConfig::default(),
+        &cache,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+    )
+    .await
+    .unwrap_err();
+    assert_safe_private_directory_remedy(&cache, error);
+    assert!(!cache.join(DOLT_VERSION).exists());
+    let lock_error = match cache_lock(&cache, Duration::from_secs(1)).await {
+        Ok(_) => panic!("a public cache must not acquire an installation lock"),
+        Err(error) => error,
+    };
+    assert_safe_private_directory_remedy(&cache, lock_error);
+
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+    let versions = cache.join(DOLT_VERSION);
+    public_directory(&versions);
+    let error = provision_managed(
+        &MemoryConfig::default(),
+        &cache,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+    )
+    .await
+    .unwrap_err();
+    assert_safe_private_directory_remedy(&versions, error);
+    assert!(!versions.join(fixture.spec().target).exists());
+}
+
+#[test]
+fn public_probe_install_destination_and_home_receive_safe_remedies() {
+    let root = crate::test_support::tempdir().unwrap();
+    let fixture = &*VALID_FIXTURE;
+    let candidate = fixture.extract(root.path()).unwrap();
+
+    let probe = root.path().join("probe");
+    public_directory(&probe);
+    assert_safe_private_directory_remedy(
+        &probe,
+        prepare_cold_probe(&candidate, &probe, fixture.spec()).unwrap_err(),
+    );
+
+    let destination = root.path().join("destination");
+    public_directory(&destination);
+    assert_safe_private_directory_remedy(
+        &destination,
+        extract(&fixture.bytes, &destination, fixture.spec()).unwrap_err(),
+    );
+
+    let home = root.path().join("home");
+    public_directory(&home);
+    assert_safe_private_directory_remedy(&home, prepare_private_home(&home).unwrap_err());
+}
+
 #[tokio::test]
 async fn installs_only_fixed_payloads_and_preserves_notices_and_previous_install() {
     let temporary = crate::test_support::tempdir().unwrap();

@@ -21,6 +21,36 @@ fn fixture() -> Result<tempfile::TempDir> {
 }
 
 #[test]
+fn public_lifecycle_directory_refuses_with_the_shared_safe_remedy() -> Result<()> {
+    let root = fixture()?;
+    let directory = root.path().join("memory");
+    fs::create_dir(&directory)?;
+    let sentinel = directory.join("sentinel");
+    fs::write(&sentinel, b"leave server directory unchanged")?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))?;
+
+    let error = LifecycleLease::new(&directory, None).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("memory data directory"), "{text}");
+    assert!(text.contains("mode 0700"), "{text}");
+    assert!(text.contains(&directory.display().to_string()), "{text}");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::PermissionDenied),
+        "{text}"
+    );
+    assert_eq!(
+        fs::metadata(&directory)?.permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(fs::read(sentinel)?, b"leave server directory unchanged");
+    assert!(!directory.join("lifecycle.lock").exists());
+    Ok(())
+}
+
+#[test]
 fn cleanup_observer_retains_real_child_and_directory_after_query_error_and_deadline() -> Result<()>
 {
     use std::io::Write;

@@ -6,6 +6,33 @@ Choose a framework with <kbd>F4</kbd>, `/mode`, or `--mode`. The choice is indep
 
 <FrameworkPortrait />
 
+## Who speaks
+
+Kuru chooses a speaking identity from the peers that contributed to the turn.
+An explicitly targeted identity takes priority, followed by an existing active
+runtime focus. Without either, the highest activation narrows the candidates. If
+the previous completed speaker is still among candidates tied at that maximum,
+it continues as the speaker.
+
+Only a tie left after those rules uses the framework's authored part order. The
+first authored choices are:
+
+| Framework | First authored choice |
+| --------- | --------------------- |
+| IFS       | Self                  |
+| Polyvagal | Connection            |
+| Freudian  | Desire                |
+| Jungian   | Continuity            |
+
+Kuru skips a missing or ineligible built-in and checks the later parts in the
+order shown in each framework's table below. The speaker-selection event records
+`mode-authored-order` for this choice. When none of the tied eligible candidates
+is in the built-in authored list, as in a dream-only tie, stable identity order
+decides and the event records `stable-id-order`.
+
+Authored order is a deterministic fallback for one turn. It does not make the
+selected part a supervisor or grant it authority over its peers.
+
 ## IFS {#ifs}
 
 ```sh

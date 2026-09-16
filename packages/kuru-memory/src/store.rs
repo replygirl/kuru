@@ -687,13 +687,17 @@ impl MemoryStore {
     ) -> Result<Self> {
         options.config.validate()?;
         let directory = project_directory(&options.data_dir, &options.project_scope)?;
+        #[cfg(not(windows))]
+        private_dir(&options.data_dir)?;
+        #[cfg(windows)]
         private_dir(&options.data_dir)
             .map_err(|error| migration::data_directory_error(&options.data_dir, error))?;
         let parent = directory.parent().context("project store has no parent")?;
         private_dir(parent)?;
         let locks = parent.join("locks");
         private_dir(&locks)?;
-        let lock_directory = Directory::open(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
+        let lock_directory =
+            files::open_directory(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
         let name = directory.file_name().context("project store has no name")?;
         let lock = lock_directory.lock_file(name)?;
         progress.report(MemoryOpenStage::WaitingForProjectOwnership);

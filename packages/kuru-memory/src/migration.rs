@@ -5,7 +5,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Error, Result, ensure};
+use crate::files;
+use crate::store::{identifier, private_dir, private_file};
+#[cfg(windows)]
+use anyhow::Error;
+use anyhow::{Context, Result, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy, Publication};
 use rusqlite::{
     Connection, OpenFlags,
@@ -13,11 +17,6 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-use crate::files;
-use crate::store::{identifier, private_dir, private_file};
 
 #[derive(Debug)]
 pub(crate) struct LegacyImport {
@@ -197,6 +196,9 @@ struct SourcePins {
 }
 impl SourcePins {
     fn new(path: &Path) -> Result<Self> {
+        #[cfg(not(windows))]
+        files::directory(path)?;
+        #[cfg(windows)]
         files::directory(path).map_err(|error| data_directory_error(path, error))?;
         let parent = Directory::open(path, Privacy::Inherited, NameRetention::Pinned)?;
         let mut pins = Self {
@@ -251,21 +253,8 @@ impl SourcePins {
     }
 }
 
+#[cfg(windows)]
 pub(crate) fn data_directory_error(path: &Path, error: Error) -> Error {
-    #[cfg(unix)]
-    if let Ok(directory) = fs::symlink_metadata(path)
-        && error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
-        && directory.is_dir()
-        && directory.uid() == nix::unistd::geteuid().as_raw()
-        && directory.permissions().mode() & 0o077 != 0
-    {
-        return error.context(format!(
-            "memory data directory {path:?} is not owner-private; restrict this exact directory to mode 0700 (for example with chmod, using shell quoting) and retry"
-        ));
-    }
-    #[cfg(windows)]
     if error
         .downcast_ref::<std::io::Error>()
         .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
@@ -303,9 +292,32 @@ mod tests {
     use super::*;
     use crate::{MemoryStore, test_support};
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
 
     fn fixture() -> test_support::TempDir {
         test_support::TempDir::new("kuru-legacy memory café 東京-", None).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_store_and_migration_failure_keeps_native_owner_privacy_guidance() {
+        let error = data_directory_error(
+            Path::new(r"C:\\kuru-memory-store"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("owner-only access"), "{text}");
+        assert!(text.contains("Windows file security"), "{text}");
+        assert!(!text.contains("mode 0700"), "{text}");
+        assert!(!text.contains("chmod"), "{text}");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "{text}"
+        );
     }
     fn legacy(path: &Path) -> Connection {
         let database = Connection::open(path).unwrap();
@@ -353,8 +365,7 @@ mod tests {
         fs::write(&sentinel, b"leave owner data untouched").unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let before = fs::metadata(root.path()).unwrap().permissions().mode() & 0o777;
-        let error = files::directory(root.path()).unwrap_err();
-        let text = format!("{:#}", data_directory_error(root.path(), error));
+        let text = format!("{:#}", files::directory(root.path()).unwrap_err());
 
         assert!(text.contains("memory data directory"), "{text}");
         assert!(text.contains("mode 0700"), "{text}");
@@ -374,14 +385,12 @@ mod tests {
         let root = fixture();
         let link = root.path().with_extension("link");
         symlink(root.path(), &link).unwrap();
-        let error = files::directory(&link).unwrap_err();
-        let text = format!("{:#}", data_directory_error(&link, error));
+        let text = format!("{:#}", files::directory(&link).unwrap_err());
         assert!(!text.contains("mode 0700"), "{text}");
 
         let foreign = Path::new("/");
         if fs::symlink_metadata(foreign).unwrap().uid() != nix::unistd::geteuid().as_raw() {
-            let error = files::directory(foreign).unwrap_err();
-            let text = format!("{:#}", data_directory_error(foreign, error));
+            let text = format!("{:#}", files::directory(foreign).unwrap_err());
             assert!(!text.contains("mode 0700"), "{text}");
         }
     }

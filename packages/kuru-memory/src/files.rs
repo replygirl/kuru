@@ -10,25 +10,63 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
 pub(crate) fn directory(path: &Path) -> Result<Directory> {
-    Ok(Directory::open(
-        path,
-        Privacy::OwnerOnly,
-        NameRetention::Movable,
-    )?)
+    open_directory(path, Privacy::OwnerOnly, NameRetention::Movable)
+}
+
+/// Open a checked directory while preserving the caller's privacy and name
+/// retention contract. Memory owns the actionable Unix privacy diagnostic;
+/// the platform continues to provide the checked filesystem fact.
+pub(crate) fn open_directory(
+    path: &Path,
+    privacy: Privacy,
+    retention: NameRetention,
+) -> Result<Directory> {
+    Directory::open(path, privacy, retention)
+        .map_err(anyhow::Error::from)
+        .map_err(|error| private_directory_error(path, privacy, error))
+}
+
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<Directory> {
+    Directory::ensure_private(path)
+        .map_err(anyhow::Error::from)
+        .map_err(|error| private_directory_error(path, Privacy::OwnerOnly, error))
 }
 
 pub(crate) fn private_dir(path: &Path) -> Result<()> {
-    Directory::ensure_private(path)?;
+    ensure_private_directory(path)?;
     Ok(())
 }
 
 pub(crate) fn parent(path: &Path, privacy: Privacy, retention: NameRetention) -> Result<Directory> {
-    Ok(Directory::open(
+    open_directory(
         path.parent().context("memory file needs a parent")?,
         privacy,
         retention,
-    )?)
+    )
+}
+
+fn private_directory_error(path: &Path, privacy: Privacy, error: anyhow::Error) -> anyhow::Error {
+    #[cfg(not(unix))]
+    let _ = (path, privacy);
+    #[cfg(unix)]
+    if privacy == Privacy::OwnerOnly
+        && let Ok(directory) = fs::symlink_metadata(path)
+        && error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        && directory.is_dir()
+        && directory.uid() == nix::unistd::geteuid().as_raw()
+        && directory.permissions().mode() & 0o077 != 0
+    {
+        return error.context(format!(
+            "memory data directory {path:?} is not owner-private; restrict this exact directory to mode 0700 (for example with chmod, using shell quoting) and retry"
+        ));
+    }
+    error
 }
 
 pub(crate) fn name(path: &Path) -> Result<&OsStr> {
@@ -77,7 +115,7 @@ pub(crate) fn write_dolt_config(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn write_in(parent: &Directory, name: &OsStr, bytes: &[u8]) -> Result<()> {
-    let stage = Directory::ensure_private(&parent.path().join("staging"))?;
+    let stage = ensure_private_directory(&parent.path().join("staging"))?;
     let temporary = format!("record-{}.tmp", uuid::Uuid::new_v4());
     let mut file = stage.create_new(OsStr::new(&temporary))?;
     file.write_all(bytes)?;
@@ -194,15 +232,26 @@ fn move_directory_with(
 }
 
 fn observe_directory(path: &Path, expected: FileIdentity) -> String {
-    match Directory::open(path, Privacy::OwnerOnly, NameRetention::Movable) {
+    match open_directory(path, Privacy::OwnerOnly, NameRetention::Movable) {
         Ok(directory) if directory.identity() == expected => "same-identity".into(),
         Ok(directory) => format!("different-identity({:?})", directory.identity()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent".into(),
-        Err(error) => format!(
-            "query-error(kind={:?}, os={:?})",
-            error.kind(),
-            error.raw_os_error()
-        ),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            "absent".into()
+        }
+        Err(error) => {
+            let error = error.downcast_ref::<std::io::Error>();
+            format!(
+                "query-error(kind={:?}, os={:?})",
+                error
+                    .map(std::io::Error::kind)
+                    .unwrap_or(std::io::ErrorKind::Other),
+                error.and_then(std::io::Error::raw_os_error)
+            )
+        }
     }
 }
 
@@ -270,6 +319,83 @@ impl PrivateTemp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn non_store_private_directory_failures_keep_native_diagnostics() {
+        let error = private_directory_error(
+            Path::new(r"C:\\kuru-memory-non-store"),
+            Privacy::OwnerOnly,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
+        );
+        let text = format!("{error:#}");
+        assert!(!text.contains("mode 0700"), "{text}");
+        assert!(!text.contains("chmod"), "{text}");
+        assert!(!text.contains("Windows file security"), "{text}");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "{text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_private_boundaries_offer_a_safe_remedy_without_mutation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let root = PrivateTemp::new("memory-private-boundary-", None).unwrap();
+        let public = root.path().join("public");
+        fs::create_dir(&public).unwrap();
+        let sentinel = public.join("keep");
+        fs::write(&sentinel, b"leave this directory unchanged").unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for error in [
+            directory(&public).unwrap_err(),
+            open_directory(&public, Privacy::OwnerOnly, NameRetention::Pinned).unwrap_err(),
+            ensure_private_directory(&public).unwrap_err(),
+            parent(
+                &public.join("record"),
+                Privacy::OwnerOnly,
+                NameRetention::Movable,
+            )
+            .unwrap_err(),
+        ] {
+            let text = format!("{error:#}");
+            assert!(text.contains("memory data directory"), "{text}");
+            assert!(text.contains("mode 0700"), "{text}");
+            assert!(text.contains(&public.display().to_string()), "{text}");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::PermissionDenied),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(&public).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"leave this directory unchanged"
+        );
+
+        let link = root.path().join("linked");
+        symlink(root.path(), &link).unwrap();
+        let text = format!("{:#}", directory(&link).unwrap_err());
+        assert!(!text.contains("mode 0700"), "{text}");
+
+        let foreign = Path::new("/");
+        if fs::symlink_metadata(foreign).unwrap().uid() != nix::unistd::geteuid().as_raw() {
+            let text = format!("{:#}", directory(foreign).unwrap_err());
+            assert!(!text.contains("mode 0700"), "{text}");
+        }
+    }
 
     #[test]
     fn untyped_uncertain_no_move_preserves_its_original_error() {

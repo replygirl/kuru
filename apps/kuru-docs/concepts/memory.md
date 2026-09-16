@@ -128,13 +128,17 @@ An operating-system writer lock prevents two Kuru processes from overwriting the
 
 Close older Kuru sessions before the first launch with Dolt. Kuru imports the current project's rows from `memory.sqlite3`, verifies them, and preserves the original plus a complete snapshot under `memory/legacy/`. Other projects are imported when opened. After migration, older Kuru versions write only to the old SQLite store, so avoid using them with the same data directory.
 
-The data directory must be private. On macOS and Linux, Kuru names a rejected
-real current-user-owned directory with group or other access and asks you to
-restrict that exact path to mode 0700, whether or not legacy SQLite is present.
-It never changes access modes or offers that remedy for a link or foreign-owned
-path. On Windows, correct the directory's owner-only access in native file
-security settings before retrying. Kuru refuses before provisioning or import,
-so existing files remain untouched.
+Memory-owned directories must be private. On macOS and Linux, Kuru names a
+rejected real current-user-owned directory with group or other access and asks
+you to restrict that exact path to mode 0700. This includes project data,
+managed Dolt cache and version directories, cold probes, installation
+destinations, and private server directories, whether or not legacy SQLite is
+present. It never changes access modes or offers that remedy for a link or
+foreign-owned path. On Windows, correct the project data directory's owner-only
+access in native file security settings before retrying; managed runtime and
+server directories retain native filesystem diagnostics rather than receiving a
+Unix mode instruction. Kuru leaves the rejected directory and its permissions
+unchanged; correct that exact path before retrying.
 
 An interrupted import can resume after validation. Partial imports are stopped and preserved under `memory/interrupted/`; a failed import never becomes the active store. Keep the original and snapshots until you have checked every project you want to retain.
 
