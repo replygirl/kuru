@@ -66,7 +66,8 @@ impl MemoryStore {
         let name = project.file_name().context("project store has no name")?;
         let locks = memory.join("locks");
         private_dir(&locks)?;
-        let lock_directory = Directory::open(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
+        let lock_directory =
+            files::open_directory(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
         let startup_lock = acquire_lock(
             lock_directory.lock_file(name)?,
             Duration::from_secs(options.config.startup_timeout_secs),
@@ -415,7 +416,7 @@ fn validate_quarantine_name(
 }
 
 fn checked_target(path: &Path, expected: [u8; 24]) -> Result<Option<Directory>> {
-    match Directory::open(path, Privacy::OwnerOnly, NameRetention::Movable) {
+    match files::open_directory(path, Privacy::OwnerOnly, NameRetention::Movable) {
         Ok(directory) => {
             ensure!(
                 directory.identity().to_bytes() == expected,
@@ -423,8 +424,14 @@ fn checked_target(path: &Path, expected: [u8; 24]) -> Result<Option<Directory>> 
             );
             Ok(Some(directory))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 

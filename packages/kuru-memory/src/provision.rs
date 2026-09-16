@@ -859,7 +859,7 @@ impl std::ops::Deref for CacheLock {
 
 async fn cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
     let path = directory.join(".install.lock");
-    let directory = Directory::open(directory, Privacy::OwnerOnly, NameRetention::Pinned)?;
+    let directory = files::open_directory(directory, Privacy::OwnerOnly, NameRetention::Pinned)?;
     let file = directory
         .lock_file(files::name(&path)?)
         .context("open stable Dolt installation lock")?;

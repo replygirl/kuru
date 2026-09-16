@@ -117,14 +117,18 @@ partial or superseded imports are stopped and preserved under `memory/interrupte
 before retry. Unknown data fails explicitly. Correct the reported error and retry;
 do not delete the source or bypass identity checks to force an import.
 
-The data directory must remain private. On macOS and Linux, if Kuru rejects a
-real directory owned by the current user because it grants group or other access,
-it names that exact directory and asks you to restrict it to mode 0700 before
-retrying, whether or not legacy SQLite is present. Kuru never changes the mode
-automatically and does not offer that remedy for a link or foreign-owned path. On
-Windows, correct the data directory's owner-only access using native file
-security settings and retry. These checks occur before Kuru provisions memory or
-imports or modifies legacy data.
+Memory-owned directories must remain private. On macOS and Linux, if Kuru
+rejects a real directory owned by the current user because it grants group or
+other access, it names that exact directory and asks you to restrict it to mode
+0700 before retrying. This applies to project data, managed Dolt cache and
+version directories, cold probes, installation destinations, and private server
+directories, whether or not legacy SQLite is present. Kuru never changes the
+mode automatically and does not offer that remedy for a link or foreign-owned
+path. On Windows, correct the project data directory's owner-only access using
+native file security settings and retry; managed runtime and server directories
+retain their native filesystem diagnostics rather than receiving a Unix mode
+instruction. Kuru leaves the rejected directory and its permissions unchanged;
+correct the reported exact path before retrying.
 
 ## Schema upgrades
 

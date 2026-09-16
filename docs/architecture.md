@@ -41,6 +41,20 @@ Stable IDs identify parts. Switching a mode selects a different topology;
 provider/model/effort are independent configuration choices. Adding a framework
 belongs in `kuru-core`, keeping provider code unchanged.
 
+Speaker selection preserves stronger runtime evidence before consulting a
+framework's authored order. An explicit caller target wins first, followed by an
+existing active runtime focus. Otherwise the greatest activation narrows the
+eligible candidates; if the previous completed speaker remains in an equal
+maximum, that continuity wins. Only a remaining tie consults the built-in order.
+The first eligible authored identity is Self for IFS, Connection for polyvagal,
+Desire for Freudian and Continuity for Jungian, with missing or ineligible
+identities skipped in favor of the next authored member. The selection event
+records `mode-authored-order`. If none of the tied eligible candidates belongs to
+the built-in authored list, including a dream-only tie, stable ID order decides
+and the event records `stable-id-order`. These are deterministic tie-break
+reasons for the current turn; they grant no identity authority or supervisory
+role over its peers.
+
 ## Peer and relationship state
 
 Every actor receives its own private history and the context explicitly made

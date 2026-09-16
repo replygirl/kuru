@@ -712,7 +712,7 @@ impl LifecycleLease {
                 "Windows lifecycle_root must be absolute"
             );
             let store = files::directory(directory)?;
-            let root = Directory::ensure_private(root)?;
+            let root = files::ensure_private_directory(root)?;
             ensure!(
                 !root.is_within(&store)?,
                 "Windows lifecycle_root must not lie inside the moved memory store"
@@ -729,7 +729,7 @@ impl LifecycleLease {
             (files::directory(directory.path())?, "lifecycle.lock".into());
         #[cfg(windows)]
         let (lock_directory, lock_name): (_, std::ffi::OsString) = {
-            let root = Directory::open(
+            let root = files::open_directory(
                 root.expect("validated Windows lifecycle root"),
                 Privacy::OwnerOnly,
                 NameRetention::Pinned,
@@ -1422,7 +1422,7 @@ async fn observe_dolt(
 
 fn retire_endpoint(directory: &Path) -> Result<()> {
     let parent = files::directory(directory)?;
-    let stage = Directory::ensure_private(&directory.join("staging"))?;
+    let stage = files::ensure_private_directory(&directory.join("staging"))?;
     let source = std::ffi::OsStr::new("endpoint.json");
     let file = parent.read(source)?;
     let retired = format!("endpoint-{}.retired", Uuid::new_v4());

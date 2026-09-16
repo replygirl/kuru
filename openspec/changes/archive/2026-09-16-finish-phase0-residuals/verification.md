@@ -1,0 +1,26 @@
+## 1. Private-directory guidance [critical]
+
+- [x] 1.1 @regression (agent) pre-create owner-owned Unix Dolt cache and versions directories with mode 0755, then enter real managed provisioning -> focused tests observed exact-path mode-0700 remedies for cache, versions, and the pinned install lock; modes and sentinel bytes remained unchanged and no runtime payload activated
+- [x] 1.2 @regression (agent) pre-create unsafe cold-probe, install-destination, and private-home directories through the real extraction/probe preparation boundaries -> focused tests observed the eligible exact path at each boundary, unchanged mode and sentinel content, and no activation
+- [x] 1.3 @integration (agent) exercise the shared Movable, Pinned, parent, and ensure-private composition plus the real server `LifecycleLease` boundary with owner-owned Unix mode-0755 directories -> focused tests observed the safe exact-path remedy, retained `PermissionDenied`, no lock creation, and no mode/content mutation without inferring unrun full server startup
+- [x] 1.4 @regression (agent) exercise symlinked and foreign-owned controls at the shared memory filesystem boundary -> retained controls refused both paths without mode-0700 guidance or permission mutation
+- [x] 1.5 @equivalence (agent) run native Windows formatter controls plus existing native owner-private filesystem enforcement tests -> the successful complete memory checked shard executed the unignored Windows controls that preserve store/migration native guidance and leave non-store errors unchanged; the successful native-platform job retained ACL enforcement, and neither path emits Unix chmod or mode-0700 advice
+
+## 2. Cold-facing documentation
+
+- [x] 2.1 @manual (agent) compare both architecture/framework pages with the stable-speaker spec and built-in role tables -> both pages name the four first authored identities, subsequent authored order, exact selection precedence, `mode-authored-order`, `stable-id-order`, and the no-authority guarantee; rendered output contains the complete policy and introduces no focus control
+- [x] 2.2 @integration (agent) build and content-check the documentation site -> `mise run //apps/kuru-docs:check` passed formatting, lint, the 12-page VitePress build, generated text artifacts, and local link/anchor validation after app-owned formatting
+
+## 3. Static and behavioral compatibility
+
+- [x] 3.1 @integration (agent) run focused memory format, typecheck, lint, and private-directory/provision/server tests -> Rust formatting, diff-check, all-target memory typecheck, strict all-feature memory lint, and seven focused tests passed with no platform-policy or dependency change
+- [x] 3.2 @integration (agent) run focused core/runtime cold-facing selection tests -> instrumented pre-push coverage passed the declared built-in authored order plus runtime cold-mode order, missing/ineligible authored identity, stable-ID fallback, and completed-speaker continuity controls unchanged
+
+## Observed evidence
+
+- Seven serial `mise run //packages/kuru-memory:test -- <filter>` invocations each passed one test with no failures: the new shared OwnerOnly boundary, actual cache/versions/pinned-lock, probe/install/home and lifecycle regressions, plus the retained legacy, ordinary-open and linked/foreign controls.
+- Independent source review confirmed every changed production OwnerOnly open/create path composes through `kuru-memory::files` while preserving its `Movable` or `Pinned` retention, all Inherited reads remain unchanged, the original I/O error remains downcastable, and no platform-layer code or dependency changed. Strict Cospec validation and `git diff --check` passed.
+- `mise run //packages/kuru-memory:typecheck` passed all targets after package-owned bundle preparation; `mise run //packages/kuru-memory:lint` passed all targets and features with warnings denied. Repository Rust formatting and diff-check passed.
+- `mise run //apps/kuru-docs:check` passed formatting, lint, a 12-page VitePress build, generated `llms.txt` artifacts, and local link/anchor checks. Rendered inspection found the complete cold-facing priority, reason strings, and no-authority text in the framework output.
+- Preliminary commit `082e727` passed all normal pre-push hooks and the 90% coverage gate in 508.92 seconds. Instrumented coverage passed `authored_identity_order_is_the_declared_builtin_order` in core and all 86 runtime tests, including `cold_ties_follow_each_modes_authored_order`, missing/ineligible authored fallback, stable-ID fallback, equal-activation continuity, failed-speaker continuity, and legacy-session compatibility.
+- Native [Windows memory-runtime job `104664056403`](https://github.com/replygirl/kuru/actions/runs/35055280599/job/104664056403) succeeded for preliminary commit `082e727`; its complete checked memory shard includes both unignored `#[cfg(windows)]` formatter controls. Native [Windows platform job `104664056004`](https://github.com/replygirl/kuru/actions/runs/35055280599/job/104664056004) independently succeeded with the existing filesystem/ACL enforcement inventory. These completed jobs establish verification 1.5; other workflow jobs were still running and are not claimed here.
