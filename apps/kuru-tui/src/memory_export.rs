@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::cli::ExportFormat;
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const STAGED_PAYLOAD: &str = "export.json";
 
 pub async fn export(
@@ -124,9 +124,7 @@ async fn render(
                     serde_json::to_writer(&mut writer, &record)?;
                 }
                 ExportFormat::Markdown => {
-                    writeln!(writer, "\n```json")?;
-                    serde_json::to_writer(&mut writer, &record)?;
-                    writeln!(writer, "\n```")?;
+                    render_markdown_record(&mut writer, &record)?;
                 }
             }
             first = false;
@@ -141,6 +139,48 @@ async fn render(
     }
     writer.flush()?;
     Ok(counts)
+}
+
+/// Markdown deliberately retains typed blocks as structured JSON. It must not
+/// flatten a tool receipt, call identity, or future block into prose.
+fn render_markdown_record(writer: &mut impl Write, record: &StorageRecord) -> Result<()> {
+    match record {
+        StorageRecord::Message {
+            sequence,
+            namespace,
+            role,
+            content_format,
+            content,
+        } => {
+            writeln!(writer, "\n### Message {sequence}\n")?;
+            writeln!(writer, "- Content format: `{content_format}`\n")?;
+            writeln!(writer, "```json")?;
+            let content = if content_format == "typed-v1" {
+                serde_json::from_str::<serde_json::Value>(content)
+                    .context("typed export record has invalid JSON")?
+            } else {
+                serde_json::Value::String(content.clone())
+            };
+            serde_json::to_writer(
+                &mut *writer,
+                &serde_json::json!({
+                    "kind": "message",
+                    "sequence": sequence,
+                    "namespace": namespace,
+                    "role": role,
+                    "content_format": content_format,
+                    "content": content,
+                }),
+            )?;
+            writeln!(writer, "\n```")?;
+        }
+        StorageRecord::State { .. } => {
+            writeln!(writer, "\n```json")?;
+            serde_json::to_writer(&mut *writer, record)?;
+            writeln!(writer, "\n```")?;
+        }
+    }
+    Ok(())
 }
 
 fn manifest(provenance: &ExportProvenance) -> serde_json::Value {
@@ -298,6 +338,39 @@ impl Drop for PrivateStage {
         if let Some(path) = self.path.take() {
             let _ = std::fs::remove_dir(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn markdown_keeps_typed_content_structured_and_bumps_the_outer_format() {
+        let record = StorageRecord::Message {
+            sequence: 7,
+            namespace: "project/transcript/session".into(),
+            role: "assistant".into(),
+            content_format: "typed-v1".into(),
+            content: r#"{"blocks":[{"type":"tool_result","call_id":"c1","output":{"ok":true},"is_error":false}]}"#.into(),
+        };
+        let mut rendered = Vec::new();
+        render_markdown_record(&mut rendered, &record).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(rendered.contains("Content format: `typed-v1`"));
+        assert!(rendered.contains("\"call_id\":\"c1\""));
+        assert!(rendered.contains("\"output\":{\"ok\":true}"));
+        assert_eq!(
+            manifest(&ExportProvenance {
+                project_scope: "scope".into(),
+                branch: "main".into(),
+                revision: "revision".into(),
+                schema_version: 3,
+                message_count: 1,
+                state_count: 0,
+            })["format"],
+            2
+        );
     }
 }
 

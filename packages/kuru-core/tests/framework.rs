@@ -244,10 +244,12 @@ fn transport_contracts_preserve_tool_replay_unicode_and_future_efforts() {
     let request = CompletionRequest {
         actor: "witness".into(),
         instructions: "Do useful work.".into(),
-        messages: vec![Message {
-            role: "tool".into(),
-            content: json!({"call_id":"call-1","output":"こんにちは 🪶"}).to_string(),
-        }],
+        messages: vec![Message::tool_result(
+            "call-1",
+            json!("こんにちは 🪶"),
+            false,
+        )],
+        current_message_count: Some(1),
         model: "future-model".into(),
         effort: Some("adaptive-future".into()),
         tools: vec![ToolSpec {
@@ -261,21 +263,21 @@ fn transport_contracts_preserve_tool_replay_unicode_and_future_efforts() {
         serde_json::from_str::<CompletionRequest>(&encoded).unwrap(),
         request
     );
-    let completion = Completion {
-        text: "Done".into(),
-        calls: vec![ToolCall {
+    let completion = Completion::from_legacy(
+        "Done",
+        vec![ToolCall {
             id: "call-1".into(),
             name: "file_read".into(),
             arguments: json!({"path":"日本語.txt"}),
         }],
-        input_tokens: u64::MAX,
-        output_tokens: 123,
-    };
+        u64::MAX,
+        123,
+    );
     assert_eq!(
         serde_json::from_value::<Completion>(serde_json::to_value(&completion).unwrap()).unwrap(),
         completion
     );
-    assert!(Completion::default().calls.is_empty());
+    assert!(Completion::default().calls().is_empty());
     let model = ModelInfo {
         id: "future".into(),
         name: "Future".into(),

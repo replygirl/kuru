@@ -16,4 +16,6 @@ pub use config::{
 pub use framework::{
     Framework, Mode, Part, Relationship, RelationshipKind, canonical_peer_instruction,
 };
-pub use types::{Completion, CompletionRequest, Message, ModelInfo, ToolCall, ToolSpec};
+pub use types::{
+    Completion, CompletionRequest, ContentBlock, Message, ModelInfo, ToolCall, ToolSpec, Usage,
+};

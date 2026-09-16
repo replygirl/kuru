@@ -770,28 +770,28 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     assert!(
         history
             .iter()
-            .any(|message| message.role == "user" && message.content == "Slow request")
+            .any(|message| message.role == "user" && message.plain_text() == Some("Slow request"))
     );
     assert!(
         history
             .iter()
-            .any(|message| message.role == "user" && message.content == "Next thought")
+            .any(|message| message.role == "user" && message.plain_text() == Some("Next thought"))
     );
     assert_eq!(
         history
             .iter()
             .filter(|message| {
                 message.role == kuru_runtime::INTERRUPTION_ROLE
-                    && message.content == kuru_runtime::INTERRUPTION_TEXT
+                    && message.plain_text() == Some(kuru_runtime::INTERRUPTION_TEXT)
             })
             .count(),
         1
     );
-    assert!(
-        !history
-            .iter()
-            .any(|message| message.content.contains("LATE_RESPONSE_MUST_STAY_ABSENT"))
-    );
+    assert!(!history.iter().any(|message| {
+        message
+            .text_projection()
+            .contains("LATE_RESPONSE_MUST_STAY_ABSENT")
+    }));
     Ok(())
 }
 

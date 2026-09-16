@@ -567,7 +567,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .map(|message| message.content.as_str())
+                .map(|message| message.plain_text().expect("legacy text"))
                 .collect::<Vec<_>>(),
             ["first\0東京", "second"]
         );
@@ -665,8 +665,8 @@ mod tests {
         );
         store.append("new", "user", "first turn").await.unwrap();
         assert_eq!(
-            store.history("new", 10).await.unwrap()[0].content,
-            "first turn"
+            store.history("new", 10).await.unwrap()[0].plain_text(),
+            Some("first turn")
         );
         store.close().await.unwrap();
         assert_eq!(

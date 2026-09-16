@@ -59,15 +59,14 @@ impl Provider for StalePeriodicDream {
                     .append("post-answer-live", "user", "force stale dream")
                     .await?;
             }
-            Ok(Completion {
-                text: "candidate summary".into(),
-                ..Completion::default()
-            })
+            Ok(Completion::from_legacy("candidate summary", vec![], 0, 0))
         } else {
-            Ok(Completion {
-                text: "answer before failed maintenance".into(),
-                ..Completion::default()
-            })
+            Ok(Completion::from_legacy(
+                "answer before failed maintenance",
+                vec![],
+                0,
+                0,
+            ))
         }
     }
 }
@@ -84,12 +83,12 @@ impl Provider for HeldPeriodicDream {
             self.started.notify_waiters();
             std::future::pending().await
         } else {
-            Ok(Completion {
-                text: "answer before maintenance".into(),
-                input_tokens: 4,
-                output_tokens: 2,
-                ..Completion::default()
-            })
+            Ok(Completion::from_legacy(
+                "answer before maintenance",
+                vec![],
+                4,
+                2,
+            ))
         }
     }
 }
@@ -103,10 +102,12 @@ impl Provider for HeldDream {
             self.started.send(request).unwrap();
             std::future::pending().await
         } else {
-            Ok(Completion {
-                text: "A later conversation still works".into(),
-                ..Completion::default()
-            })
+            Ok(Completion::from_legacy(
+                "A later conversation still works",
+                vec![],
+                0,
+                0,
+            ))
         }
     }
 }
@@ -350,20 +351,23 @@ impl Provider for ConcurrentWriter {
             self.memory
                 .append("concurrent-chat", "user", "A later live message")
                 .await?;
-            Ok(Completion {
-                text: "Candidate summary".into(),
-                calls: vec![ToolCall {
+            Ok(Completion::from_legacy(
+                "Candidate summary",
+                vec![ToolCall {
                     id: "add-member".into(),
                     name: "dream_suggest".into(),
                     arguments: json!({"action":"add","name":"Observer","role":"ego","instruction":"Consider overlooked details"}),
                 }],
-                ..Completion::default()
-            })
+                0,
+                0,
+            ))
         } else {
-            Ok(Completion {
-                text: "Another candidate summary".into(),
-                ..Completion::default()
-            })
+            Ok(Completion::from_legacy(
+                "Another candidate summary",
+                vec![],
+                0,
+                0,
+            ))
         }
     }
 }
@@ -391,7 +395,7 @@ async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effect
         before_topology
     );
     assert_eq!(
-        memory.history("concurrent-chat", 10).await.unwrap()[0].content,
+        memory.history("concurrent-chat", 10).await.unwrap()[0].text_projection(),
         "A later live message"
     );
     for part in &harness.topology.parts {
@@ -760,7 +764,7 @@ async fn cancelled_live_undo_reconciles_before_a_later_save() {
             .await
             .unwrap()
             .iter()
-            .any(|message| message.content == "later conversation survives")
+            .any(|message| message.text_projection() == "later conversation survives")
     );
     harness.shutdown(false).await.unwrap();
 }

@@ -687,10 +687,7 @@ impl Harness {
         }
         let already_marked = journal.interruption_marker;
         journal.push(TurnTransition::Interrupted)?;
-        let marker = Message {
-            role: INTERRUPTION_ROLE.into(),
-            content: INTERRUPTION_TEXT.into(),
-        };
+        let marker = Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT);
         let messages = if already_marked { vec![] } else { vec![marker] };
         journal.interruption_marker = true;
         self.memory
@@ -1035,7 +1032,7 @@ impl Harness {
     async fn public_context(&self, memory: &MemoryStore) -> Result<String> {
         let mut remaining = 32_768;
         let mut recent = Vec::new();
-        for mut message in memory
+        for message in memory
             .history(&self.transcript_key(), 16)
             .await?
             .into_iter()
@@ -1044,16 +1041,30 @@ impl Harness {
             if message.role == INTERRUPTION_ROLE {
                 continue;
             }
-            let mut boundary = message.content.len().min(remaining);
-            while !message.content.is_char_boundary(boundary) {
-                boundary -= 1;
+            if let Some(content) = message.plain_text() {
+                let mut boundary = content.len().min(remaining);
+                while !content.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                let projected = if boundary < content.len() {
+                    Message::text(
+                        &message.role,
+                        format!("{} [truncated]", &content[..boundary]),
+                    )
+                } else {
+                    message
+                };
+                remaining = remaining.saturating_sub(boundary);
+                recent.push(projected.prompt_projection());
+            } else {
+                let projected = message.prompt_projection();
+                let size = serde_json::to_vec(&projected)?.len();
+                if size > remaining {
+                    continue;
+                }
+                remaining -= size;
+                recent.push(projected);
             }
-            if boundary < message.content.len() {
-                message.content.truncate(boundary);
-                message.content.push_str(" [truncated]");
-            }
-            remaining = remaining.saturating_sub(boundary);
-            recent.push(message);
             if remaining == 0 {
                 break;
             }
@@ -1317,16 +1328,17 @@ impl Harness {
                         continue;
                     }
                 };
-                input_tokens = input_tokens.saturating_add(completion.input_tokens);
-                output_tokens = output_tokens.saturating_add(completion.output_tokens);
+                input_tokens = input_tokens.saturating_add(completion.input_tokens());
+                output_tokens = output_tokens.saturating_add(completion.output_tokens());
                 // A successful function-call-only response is still a viable
                 // participant. It must get a chance to speak after deliberation.
                 let draft = drafts.entry(id.clone()).or_insert_with(String::new);
-                if !completion.text.trim().is_empty() {
-                    *draft = completion.text;
+                let contribution = completion.text_projection();
+                if !contribution.trim().is_empty() {
+                    *draft = contribution;
                 }
                 self.emit("idle", &id, "contribution ready");
-                for call in completion.calls {
+                for call in completion.calls() {
                     let result = if used >= self.config.max_tool_calls {
                         limited = true;
                         if limit_reasons.insert(TurnLimitReason::ToolCalls) {
@@ -1362,7 +1374,7 @@ impl Harness {
                 for message in messages {
                     cancellation.check()?;
                     self.memory
-                        .append(&self.namespace(&id), &message.role, &message.content)
+                        .append_message(&self.namespace(&id), &message)
                         .await?;
                     cancellation.check()?;
                 }
@@ -1432,16 +1444,18 @@ impl Harness {
                     cancellation,
                 )
                 .await?;
-            input_tokens = input_tokens.saturating_add(completion.input_tokens);
-            output_tokens = output_tokens.saturating_add(completion.output_tokens);
-            if !completion.text.trim().is_empty() {
-                text = completion.text;
+            input_tokens = input_tokens.saturating_add(completion.input_tokens());
+            output_tokens = output_tokens.saturating_add(completion.output_tokens());
+            let answer = completion.text_projection();
+            if !answer.trim().is_empty() {
+                text = answer;
             }
-            if completion.calls.is_empty() {
+            let calls = completion.calls();
+            if calls.is_empty() {
                 break;
             }
             inputs = vec![];
-            for call in completion.calls {
+            for call in calls {
                 let result = if used >= self.config.max_tool_calls {
                     limited = true;
                     if limit_reasons.insert(TurnLimitReason::ToolCalls) {
@@ -1475,11 +1489,14 @@ impl Harness {
                                 .await
                             {
                                 Ok(reply) => {
-                                    input_tokens = input_tokens.saturating_add(reply.input_tokens);
+                                    input_tokens =
+                                        input_tokens.saturating_add(reply.input_tokens());
                                     output_tokens =
-                                        output_tokens.saturating_add(reply.output_tokens);
-                                    inputs
-                                        .push(user(&format!("Peer {id} replied: {}", reply.text)));
+                                        output_tokens.saturating_add(reply.output_tokens());
+                                    inputs.push(user(&format!(
+                                        "Peer {id} replied: {}",
+                                        reply.text_projection()
+                                    )));
                                 }
                                 Err(error) if turn_was_cancelled(&error) => return Err(error),
                                 Err(error) => {
@@ -1779,10 +1796,7 @@ impl Harness {
 }
 
 pub(crate) fn user(text: &str) -> Message {
-    Message {
-        role: "user".into(),
-        content: text.into(),
-    }
+    Message::text("user", text)
 }
 
 enum EventDetail {
@@ -1834,10 +1848,7 @@ fn project_turn_output(mut output: TurnOutput) -> TurnOutput {
 }
 
 fn assistant(text: &str) -> Message {
-    Message {
-        role: "assistant".into(),
-        content: text.into(),
-    }
+    Message::text("assistant", text)
 }
 pub fn project_scope(cwd: &Path) -> Result<String> {
     let cwd = cwd.canonicalize()?;
@@ -1852,15 +1863,13 @@ pub(crate) fn path_hash(path: &Path) -> String {
         .collect::<String>()
 }
 fn tool_result(call: &ToolCall, result: Result<String>) -> Message {
+    let is_error = result.is_err();
     let output = match result {
         Ok(output) => output,
         Err(error) => format!("ERROR: {error:#}"),
     };
     let output = kuru_connectors::truncate_tool_output(&output, 8192);
-    Message {
-        role: "tool".into(),
-        content: json!({"call_id":call.id,"output":output}).to_string(),
-    }
+    Message::tool_result(&call.id, Value::String(output), is_error)
 }
 pub(crate) fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
     args.get(name)
@@ -2678,12 +2687,7 @@ mod publication_tests {
 
         async fn complete(&self, _request: kuru_core::CompletionRequest) -> Result<Completion> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Completion {
-                text: "durable answer".into(),
-                input_tokens: 3,
-                output_tokens: 2,
-                ..Completion::default()
-            })
+            Ok(Completion::from_legacy("durable answer", vec![], 3, 2))
         }
     }
 
@@ -2697,9 +2701,9 @@ mod publication_tests {
 
         async fn complete(&self, request: kuru_core::CompletionRequest) -> Result<Completion> {
             if request.instructions.contains("Phase: deliberate") {
-                Ok(Completion {
-                    text: "projected draft".into(),
-                    calls: vec![ToolCall {
+                Ok(Completion::from_legacy(
+                    "projected draft",
+                    vec![ToolCall {
                         id: "state-fixture".into(),
                         name: "state_report".into(),
                         arguments: json!({
@@ -2707,13 +2711,11 @@ mod publication_tests {
                             "note": "token=sk-projection-fixture-1234567890"
                         }),
                     }],
-                    ..Completion::default()
-                })
+                    0,
+                    0,
+                ))
             } else {
-                Ok(Completion {
-                    text: "projected answer".into(),
-                    ..Completion::default()
-                })
+                Ok(Completion::from_legacy("projected answer", vec![], 0, 0))
             }
         }
     }
@@ -2734,10 +2736,7 @@ mod publication_tests {
                 self.started.notify_waiters();
                 std::future::pending().await
             } else {
-                Ok(Completion {
-                    text: "later turn succeeds".into(),
-                    ..Completion::default()
-                })
+                Ok(Completion::from_legacy("later turn succeeds", vec![], 0, 0))
             }
         }
     }
@@ -2815,10 +2814,7 @@ mod publication_tests {
             harness.history().await.unwrap(),
             [
                 user("interrupt me"),
-                Message {
-                    role: INTERRUPTION_ROLE.into(),
-                    content: INTERRUPTION_TEXT.into(),
-                },
+                Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT),
             ]
         );
         let calls = provider.calls.load(Ordering::SeqCst);
@@ -2896,10 +2892,7 @@ mod publication_tests {
             harness.history().await.unwrap(),
             [
                 user("retain failed prompt"),
-                Message {
-                    role: INTERRUPTION_ROLE.into(),
-                    content: INTERRUPTION_TEXT.into(),
-                },
+                Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT),
             ]
         );
         let provider_context = harness.public_context(&memory).await.unwrap();
@@ -3180,7 +3173,7 @@ mod tool_result_tests {
             let ordinary_prefix = "x".repeat(8192 - TRUNCATED.len() - cut);
             let output = format!("{ordinary_prefix}{}{}", REDACTION_MARKER, "tail".repeat(32));
             let receipt = tool_result(&call, Ok(output));
-            let value: Value = serde_json::from_str(&receipt.content).unwrap();
+            let value: Value = crate::test_receipt(&receipt).unwrap();
             assert_eq!(value["call_id"], call.id);
             let output = value["output"].as_str().unwrap();
             assert!(output.len() <= 8192);

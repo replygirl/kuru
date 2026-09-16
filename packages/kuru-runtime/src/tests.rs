@@ -72,12 +72,7 @@ impl Provider for Fake {
     }
 }
 fn answer(text: &str) -> Completion {
-    Completion {
-        text: text.into(),
-        calls: vec![],
-        input_tokens: 7,
-        output_tokens: 3,
-    }
+    Completion::from_legacy(text, vec![], 7, 3)
 }
 fn call(name: &str, args: Value) -> ToolCall {
     ToolCall {
@@ -112,15 +107,15 @@ async fn fixture(mode: Mode, fake: Arc<dyn Provider>) -> (TempDir, Harness) {
 async fn equal_activation_keeps_the_same_speaker_across_completed_turns() {
     let provider = Fake::new(|request| {
         if request.instructions.contains("Phase: deliberate") {
-            Completion {
-                text: "equal contribution".into(),
-                calls: vec![call(
+            Completion::from_legacy(
+                "equal contribution",
+                vec![call(
                     "state_report",
                     json!({"activation":0.5,"note":"equal fixture"}),
                 )],
-                input_tokens: 1,
-                output_tokens: 1,
-            }
+                1,
+                1,
+            )
         } else {
             answer("completed reply")
         }
@@ -156,15 +151,15 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
                 } else {
                     0.5
                 };
-                Completion {
-                    text: format!("draft from {}", request.actor),
-                    calls: vec![call(
+                Completion::from_legacy(
+                    format!("draft from {}", request.actor),
+                    vec![call(
                         "state_report",
                         json!({"activation":activation,"note":"fixture"}),
                     )],
-                    input_tokens: 1,
-                    output_tokens: 1,
-                }
+                    1,
+                    1,
+                )
             } else {
                 answer(&format!("spoken by {}", request.actor))
             }
@@ -364,14 +359,15 @@ impl Provider for FailingSpeaker {
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
         if request.instructions.contains("Phase: deliberate") {
-            Ok(Completion {
-                text: "draft".into(),
-                calls: vec![call(
+            Ok(Completion::from_legacy(
+                "draft",
+                vec![call(
                     "state_report",
                     json!({"activation":0.5,"note":"fixture"}),
                 )],
-                ..Completion::default()
-            })
+                0,
+                0,
+            ))
         } else if self.0.load(Ordering::SeqCst) {
             Err(anyhow::anyhow!("speaking fixture failed"))
         } else {
@@ -474,7 +470,7 @@ async fn peer_messages_route_directly_with_a2a_provenance_and_tool_receipts() {
         let (sender, recipient) = routing.lock().unwrap().clone();
         let mut reply = answer("Ready");
         if r.actor.ends_with(&sender) && r.messages.len() == 1 {
-            reply.calls.push(call(
+            reply.push_call(call(
                 "peer_send",
                 json!({"to":recipient,"message":"Please check this boundary"}),
             ));
@@ -496,7 +492,7 @@ async fn peer_messages_route_directly_with_a2a_provenance_and_tool_receipts() {
         r.actor.ends_with(&recipient)
             && r.messages
                 .iter()
-                .any(|m| m.content.contains("Please check this boundary"))
+                .any(|m| m.text_projection().contains("Please check this boundary"))
     }));
     assert!(
         harness
@@ -504,7 +500,7 @@ async fn peer_messages_route_directly_with_a2a_provenance_and_tool_receipts() {
             .await
             .unwrap()
             .iter()
-            .any(|m| m.role == "tool" && m.content.contains("delivered"))
+            .any(|m| m.role == "tool" && m.text_projection().contains("delivered"))
     );
 }
 
@@ -558,7 +554,7 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
             .await
             .unwrap()
             .iter()
-            .any(|m| m.content.contains("RELATION-ONLY-NOTE"))
+            .any(|m| m.text_projection().contains("RELATION-ONLY-NOTE"))
     );
     let requests = fake.requests.lock().unwrap();
     let group = requests
@@ -570,7 +566,7 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
         group
             .messages
             .iter()
-            .any(|m| m.content.contains("RELATION-ONLY-NOTE"))
+            .any(|m| m.text_projection().contains("RELATION-ONLY-NOTE"))
     );
     for request in requests.iter().filter(|r| !r.actor.ends_with(&relation.id)) {
         assert!(
@@ -593,18 +589,17 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
         let mut reply = answer("Draft");
         if r.instructions.contains("Phase: speak") {
             if r.messages.iter().any(|m| {
+                let output = crate::test_receipt_output(m).unwrap_or_default();
                 m.role == "tool"
-                    && m.content.contains(MARKER)
-                    && m.content.contains(ORDINARY_CONTROL)
-                    && !m.content.contains(TOOL_TOKEN)
+                    && output.contains(MARKER)
+                    && output.contains(ORDINARY_CONTROL)
+                    && !output.contains(TOOL_TOKEN)
             }) {
-                reply.text = format!("Read {ORDINARY_CONTROL} from actual tool");
+                reply.set_text(format!("Read {ORDINARY_CONTROL} from actual tool"));
             } else if provider_phase.load(Ordering::SeqCst) {
-                reply.text = "The resumed context omitted its persisted tool receipt".into();
+                reply.set_text("The resumed context omitted its persisted tool receipt");
             } else {
-                reply
-                    .calls
-                    .push(call("file_read", json!({"path":"sample.txt"})));
+                reply.push_call(call("file_read", json!({"path":"sample.txt"})));
             }
         }
         reply
@@ -664,7 +659,7 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     let session = harness.session.id.clone();
     let stored = harness.memory_for(&speaker).await.unwrap();
     let receipt = stored.iter().find(|m| m.role == "tool").unwrap();
-    let receipt: Value = serde_json::from_str(&receipt.content).unwrap();
+    let receipt: Value = crate::test_receipt(receipt).unwrap();
     let call_id = receipt["call_id"].as_str().unwrap().to_owned();
     let output = receipt["output"].as_str().unwrap();
     assert!(output.len() <= 8192);
@@ -692,9 +687,11 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     let persisted = reopened.memory_for(&speaker).await.unwrap();
     assert!(persisted.iter().any(|message| {
         message.role == "tool"
-            && message.content.contains(MARKER)
-            && message.content.contains(ORDINARY_CONTROL)
-            && !message.content.contains(TOOL_TOKEN)
+            && crate::test_receipt_output(message).is_some_and(|output| {
+                output.contains(MARKER)
+                    && output.contains(ORDINARY_CONTROL)
+                    && !output.contains(TOOL_TOKEN)
+            })
     }));
     assert!(
         reopened
@@ -702,7 +699,9 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
             .await
             .unwrap()
             .iter()
-            .any(|message| message.role == "assistant" && message.content == prior_history)
+            .any(
+                |message| message.role == "assistant" && message.text_projection() == prior_history
+            )
     );
     resumed_phase.store(true, Ordering::SeqCst);
     let continued = reopened.run("Continue from the tool result").await.unwrap();
@@ -715,12 +714,14 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
             .unwrap();
         assert!(resumed_request.messages.iter().any(|message| {
             message.role == "tool"
-                && serde_json::from_str::<Value>(&message.content)
+                && crate::test_receipt(message)
                     .ok()
                     .is_some_and(|receipt| receipt["call_id"] == call_id)
-                && message.content.contains(MARKER)
-                && message.content.contains(ORDINARY_CONTROL)
-                && !message.content.contains(TOOL_TOKEN)
+                && crate::test_receipt_output(message).is_some_and(|output| {
+                    output.contains(MARKER)
+                        && output.contains(ORDINARY_CONTROL)
+                        && !output.contains(TOOL_TOKEN)
+                })
         }));
         for request in requests
             .iter()
@@ -747,11 +748,11 @@ async fn invalid_tool_calls_are_visible_to_the_model_and_cannot_change_state() {
     let fake = Fake::new(|r| {
         let mut reply = answer("Done");
         if r.messages.len() == 1 {
-            reply.calls = vec![
+            reply = reply.with_calls(vec![
                 call("state_report", json!({"activation":3.0,"note":"bad"})),
                 call("remember", json!({"text":""})),
                 call("unavailable", json!({})),
-            ];
+            ]);
         }
         reply
     });
@@ -765,7 +766,7 @@ async fn invalid_tool_calls_are_visible_to_the_model_and_cannot_change_state() {
     assert!(
         history
             .iter()
-            .any(|m| m.role == "tool" && m.content.contains("ERROR"))
+            .any(|m| m.role == "tool" && m.text_projection().contains("ERROR"))
     );
 }
 
@@ -776,13 +777,13 @@ async fn modeled_state_selects_a_peer_and_stores_private_notes() {
     let fake = Fake::new(move |r| {
         let mut reply = answer("Stateful response");
         if r.actor.ends_with(role.lock().unwrap().as_str()) && r.messages.len() == 1 {
-            reply.calls = vec![
+            reply = reply.with_calls(vec![
                 call(
                     "state_report",
                     json!({"activation":0.9,"note":"This task matches my concerns"}),
                 ),
                 call("remember", json!({"text":"durable priority"})),
-            ];
+            ]);
         }
         reply
     });
@@ -813,9 +814,7 @@ async fn cyclic_peers_stop_at_peer_round_limit() {
             .unwrap();
         let mut reply = answer("bounded contribution");
         if r.instructions.contains("Phase: deliberate") && !r.tools.is_empty() {
-            reply
-                .calls
-                .push(call("peer_send", json!({"to":target,"message":"again"})));
+            reply.push_call(call("peer_send", json!({"to":target,"message":"again"})));
         }
         reply
     });
@@ -867,11 +866,12 @@ async fn tool_call_limit_is_reported_without_a_peer_round_limit() {
         if request.instructions.contains("Phase: deliberate") {
             answer("draft")
         } else {
-            Completion {
-                text: "answer with exhausted tool request".into(),
-                calls: vec![call("remember", json!({"text":"not executed"}))],
-                ..Completion::default()
-            }
+            Completion::from_legacy(
+                "answer with exhausted tool request",
+                vec![call("remember", json!({"text":"not executed"}))],
+                0,
+                0,
+            )
         }
     });
     let (_directory, mut harness) = fixture(Mode::Freudian, provider).await;
@@ -940,7 +940,7 @@ async fn dreaming_adds_retires_and_undoes_without_losing_memories() {
             .await
             .unwrap()
             .iter()
-            .any(|m| m.content == "preserve me")
+            .any(|m| m.text_projection() == "preserve me")
     );
     assert!(
         !harness
@@ -1026,7 +1026,7 @@ async fn provider_free_undo_preserves_sessions_and_archives_added_identities() {
             .await
             .unwrap()
             .iter()
-            .any(|message| message.content == "later private conversation")
+            .any(|message| message.text_projection() == "later private conversation")
     );
     let topology = read_topology(&memory, &scope, config.mode).await.unwrap();
     assert!(
@@ -1141,7 +1141,7 @@ async fn dreaming_uses_isolated_actor_histories_and_runs_periodically() {
                 .history(&format!("{}/notes", harness.namespace(&part.id)), 20)
                 .await
                 .unwrap()[0]
-                .content,
+                .text_projection(),
             "durable dream summary"
         );
     }
@@ -1203,7 +1203,7 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
     assert_eq!(resumed.session.turns, 1);
     assert!(
         resumed.history().await.unwrap()[0]
-            .content
+            .text_projection()
             .contains("retain")
     );
     let other = tempfile::tempdir().unwrap();

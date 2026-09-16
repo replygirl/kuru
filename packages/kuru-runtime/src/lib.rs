@@ -14,6 +14,36 @@ pub use engine::{
 };
 
 #[cfg(test)]
+fn test_receipt(message: &kuru_core::Message) -> anyhow::Result<serde_json::Value> {
+    use kuru_core::ContentBlock;
+    use serde_json::json;
+    match message.blocks.as_slice() {
+        [
+            ContentBlock::ToolResult {
+                call_id,
+                output,
+                is_error,
+            },
+        ] => Ok(json!({
+            "call_id": call_id,
+            "output": output,
+            "is_error": is_error,
+        })),
+        [ContentBlock::Text { text }] => Ok(serde_json::from_str(text)?),
+        _ => anyhow::bail!("expected one typed or legacy tool receipt"),
+    }
+}
+
+#[cfg(test)]
+fn test_receipt_output(message: &kuru_core::Message) -> Option<String> {
+    test_receipt(message)
+        .ok()?
+        .get("output")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

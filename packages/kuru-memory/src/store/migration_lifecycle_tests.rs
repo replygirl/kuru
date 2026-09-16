@@ -15,8 +15,8 @@ async fn assert_current_store(store: &MemoryStore) -> Result<()> {
     .await
     .context("fixture receipt query deadline exceeded")??;
     ensure!(
-        receipts == 1,
-        "fixture expected one exact migration receipt"
+        receipts == 2,
+        "fixture expected one exact receipt for each current migration"
     );
     Ok(())
 }
@@ -345,7 +345,7 @@ async fn fresh_and_byte_sensitive_wal_import_publish_current_receipts_once() -> 
             .history(&namespace, 10)
             .await?
             .iter()
-            .map(|message| message.content.as_str())
+            .map(|message| message.plain_text().expect("legacy text"))
             .collect::<Vec<_>>(),
         ["first\0東京", "second café"]
     );
@@ -385,6 +385,15 @@ async fn fresh_and_byte_sensitive_wal_import_publish_current_receipts_once() -> 
             .await?
             .iter()
             .filter(|revision| revision.message.starts_with("Upgrade Kuru memory schema 2"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .revisions(20)
+            .await?
+            .iter()
+            .filter(|revision| revision.message.starts_with("Upgrade Kuru memory schema 3"))
             .count(),
         1
     );

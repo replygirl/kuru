@@ -112,6 +112,20 @@ Dreaming is a consolidation and topology-update mechanism. It does not run an
 unbounded background loop or imply biological sleep. Its provider calls count
 toward the operational cost of a session.
 
+## Message representation
+
+Core messages carry a role and ordered content blocks. Text, tool uses and tool
+results retain their order and call identities; completions carry usage and
+stop metadata separately. Text displayed by the current CLI and TUI is a
+projection of that content, not a second mutable copy. The final `TurnOutput`
+remains authoritative, including when a completed turn is retried.
+
+Reasoning-summary, image and cache-boundary types establish a shared data
+contract. They do not enable image input, visible token streaming, new reasoning
+history capture or prompt-cache optimization. Native encrypted reasoning used
+to continue a tool round remains transient and scoped to its actor. It is not
+written into conversation memory or exposed by inspection.
+
 ## Extension boundaries
 
 | Boundary | Adding a capability |

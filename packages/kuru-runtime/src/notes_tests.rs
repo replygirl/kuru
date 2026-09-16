@@ -103,7 +103,7 @@ async fn forgetting_exact_current_note_keeps_dream_rows_and_other_namespaces() -
     assert_eq!(after.notes[0].role, "note");
     assert_eq!(after.notes[0].content, "KEEP-NOTE");
     assert_eq!(
-        memory.history(&transcript, 10).await?[0].content,
+        memory.history(&transcript, 10).await?[0].text_projection(),
         "CONVERSATION-REMAINS"
     );
     let committed = memory.revision().await?;

@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use kuru_core::{MemoryConfig, Message};
+use kuru_core::{ContentBlock, MemoryConfig, Message};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +42,9 @@ const CANDIDATE_PREFIX: &str = "candidate_";
 const PROMOTING_PREFIX: &str = "kuru_candidate_promoting_";
 const ABANDONED_PREFIX: &str = "kuru_candidate_abandoned_";
 const CANDIDATE_RECOVERY_BATCH: i64 = 16;
+const TEXT_FORMAT: &str = "text-v1";
+const TYPED_FORMAT: &str = "typed-v1";
+const MAX_TYPED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -1033,30 +1036,77 @@ impl MemoryStore {
                 namespace: namespace.into(),
                 role: role.into(),
                 content: content.into(),
+                format: None,
             },
         )
         .await
     }
-    pub async fn history(&self, namespace: &str, limit: usize) -> Result<Vec<Message>> {
+    /// Append one typed message without interpreting any legacy text as JSON.
+    pub async fn append_message(&self, namespace: &str, message: &Message) -> Result<()> {
+        identifier("namespace", namespace, 1024)?;
+        identifier("role", &message.role, 128)?;
+        ensure!(
+            self.schema_version().await? >= 3,
+            "typed messages require an upgraded memory view"
+        );
+        self.mutate(
+            "message",
+            Mutation::Append {
+                namespace: namespace.into(),
+                role: message.role.clone(),
+                content: encode_typed_message(message)?,
+                format: Some(TYPED_FORMAT),
+            },
+        )
+        .await
+    }
+
+    async fn schema_version(&self) -> Result<i32> {
         self.readable()?;
+        if self.branch == "main" {
+            Ok(migrations::CURRENT_VERSION)
+        } else {
+            tokio::time::timeout(QUERY_TIMEOUT, migrations::validate_historical(&self.pool))
+                .await
+                .context("historical memory reader validation deadline exceeded")?
+        }
+    }
+    pub async fn history(&self, namespace: &str, limit: usize) -> Result<Vec<Message>> {
         identifier("namespace", namespace, 1024)?;
         // Candidate branches can intentionally retain an older schema after
         // main advances. Main was validated at open; only historical views
         // need the version-dispatched reader check before their query.
-        if self.branch != "main" {
-            tokio::time::timeout(QUERY_TIMEOUT, migrations::validate_historical(&self.pool))
-                .await
-                .context("historical memory reader validation deadline exceeded")??;
-        }
+        let version = self.schema_version().await?;
         let limit = i64::try_from(limit).context("history limit exceeds integer range")?;
-        let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
-            "SELECT role, content FROM (SELECT sequence, role, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
-        ).bind(namespace.as_bytes()).bind(limit).fetch_all(self.pool.as_ref())).await.context("memory read deadline exceeded")??;
+        let query = if version >= 3 {
+            "SELECT sequence, role, content_format, content FROM (SELECT sequence, role, content_format, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
+        } else {
+            "SELECT sequence, role, content FROM (SELECT sequence, role, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
+        };
+        let rows = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query(query)
+                .bind(namespace.as_bytes())
+                .bind(limit)
+                .fetch_all(self.pool.as_ref()),
+        )
+        .await
+        .context("memory read deadline exceeded")??;
         rows.into_iter()
             .map(|row| {
-                Ok(Message {
-                    role: String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?,
-                    content: row.try_get("content")?,
+                let sequence: i64 = row.try_get("sequence")?;
+                let role = String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?;
+                let content: String = row.try_get("content")?;
+                let format: String = if version >= 3 {
+                    row.try_get("content_format")?
+                } else {
+                    TEXT_FORMAT.into()
+                };
+                decode_message(role, &format, &content).with_context(|| {
+                    format!(
+                        "invalid stored message sequence {sequence} on {}",
+                        self.branch
+                    )
                 })
             })
             .collect()
@@ -1064,18 +1114,44 @@ impl MemoryStore {
     /// Read durable rows with their stable sequence for a caller that already
     /// owns namespace selection. This deliberately preserves every stored role.
     pub async fn notes(&self, namespace: &str, limit: usize) -> Result<Vec<StoredNote>> {
-        self.readable()?;
         identifier("namespace", namespace, 1024)?;
+        let version = self.schema_version().await?;
         let limit = i64::try_from(limit).context("notes limit exceeds integer range")?;
-        let rows = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query(
+        let query = if version >= 3 {
+            "SELECT sequence, role, content_format, content FROM (SELECT sequence, role, content_format, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
+        } else {
             "SELECT sequence, role, content FROM (SELECT sequence, role, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
-        ).bind(namespace.as_bytes()).bind(limit).fetch_all(self.pool.as_ref())).await.context("memory read deadline exceeded")??;
+        };
+        let rows = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query(query)
+                .bind(namespace.as_bytes())
+                .bind(limit)
+                .fetch_all(self.pool.as_ref()),
+        )
+        .await
+        .context("memory read deadline exceeded")??;
         rows.into_iter()
             .map(|row| {
+                let sequence: i64 = row.try_get("sequence")?;
+                let role = String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?;
+                let content: String = row.try_get("content")?;
+                let format: String = if version >= 3 {
+                    row.try_get("content_format")?
+                } else {
+                    TEXT_FORMAT.into()
+                };
+                let message = decode_message(role, &format, &content).with_context(|| {
+                    format!("invalid stored note sequence {sequence} on {}", self.branch)
+                })?;
+                let content = message
+                    .plain_text()
+                    .context("stored note contains structured content")?
+                    .to_owned();
                 Ok(StoredNote {
-                    sequence: row.try_get("sequence")?,
-                    role: String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?,
-                    content: row.try_get("content")?,
+                    sequence,
+                    role: message.role,
+                    content,
                 })
             })
             .collect()
@@ -1118,10 +1194,14 @@ impl MemoryStore {
         values: &[(String, Value)],
     ) -> Result<()> {
         identifier("namespace", namespace, 1024)?;
+        ensure!(
+            self.schema_version().await? >= 3,
+            "typed messages require an upgraded memory view"
+        );
         let mut encoded_messages = Vec::with_capacity(messages.len());
         for message in messages {
             identifier("role", &message.role, 128)?;
-            encoded_messages.push((message.role.clone(), message.content.clone()));
+            encoded_messages.push((message.role.clone(), encode_typed_message(message)?));
         }
         let encoded_state = encode_state(values)?;
         ensure!(
@@ -1558,6 +1638,7 @@ enum Mutation {
         namespace: String,
         role: String,
         content: String,
+        format: Option<&'static str>,
     },
     State(Vec<(String, String)>),
     Checkpoint {
@@ -1584,13 +1665,25 @@ async fn apply(
             namespace,
             role,
             content,
+            format,
         } => {
-            sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
-                .bind(namespace.as_bytes())
-                .bind(role.as_bytes())
-                .bind(content)
-                .execute(&mut *transaction)
-                .await?;
+            if let Some(format) = format {
+                sqlx::query("INSERT INTO messages (namespace, role, content_format, content) VALUES (?, ?, ?, ?)")
+                    .bind(namespace.as_bytes())
+                    .bind(role.as_bytes())
+                    .bind(format)
+                    .bind(content)
+                    .execute(&mut *transaction)
+                    .await?;
+            } else {
+                // This path also works for a retained pre-v3 candidate branch.
+                sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
+                    .bind(namespace.as_bytes())
+                    .bind(role.as_bytes())
+                    .bind(content)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
         }
         Mutation::State(values) => {
             for (key, value) in values {
@@ -1603,9 +1696,10 @@ async fn apply(
             values,
         } => {
             for (role, content) in messages {
-                sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
+                sqlx::query("INSERT INTO messages (namespace, role, content_format, content) VALUES (?, ?, ?, ?)")
                     .bind(namespace.as_bytes())
                     .bind(role.as_bytes())
+                    .bind(TYPED_FORMAT)
                     .bind(content)
                     .execute(&mut *transaction)
                     .await?;
@@ -1664,6 +1758,48 @@ fn encode_state(values: &[(String, Value)]) -> Result<Vec<(String, String)>> {
         encoded.push((key.clone(), serde_json::to_string(value)?));
     }
     Ok(encoded)
+}
+
+#[derive(Serialize)]
+struct TypedMessageRef<'a> {
+    blocks: &'a [ContentBlock],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedMessage {
+    blocks: Vec<ContentBlock>,
+}
+
+fn encode_typed_message(message: &Message) -> Result<String> {
+    let encoded = serde_json::to_string(&TypedMessageRef {
+        blocks: &message.blocks,
+    })?;
+    ensure!(
+        encoded.len() <= MAX_TYPED_MESSAGE_BYTES,
+        "typed message exceeds the memory row limit"
+    );
+    Ok(encoded)
+}
+
+fn decode_message(role: String, format: &str, content: &str) -> Result<Message> {
+    match format {
+        TEXT_FORMAT => Ok(Message::text(role, content)),
+        TYPED_FORMAT => {
+            ensure!(
+                content.len() <= MAX_TYPED_MESSAGE_BYTES,
+                "typed message exceeds the memory row limit"
+            );
+            let payload: TypedMessage = serde_json::from_str(content).map_err(|_| {
+                anyhow::anyhow!("stored typed message has an invalid block payload")
+            })?;
+            Ok(Message {
+                role,
+                blocks: payload.blocks,
+            })
+        }
+        _ => bail!("stored message has an unsupported content format"),
+    }
 }
 
 async fn owned_connection(pool: &MySqlPool) -> Result<(MySqlConnection, u64)> {
@@ -2203,8 +2339,8 @@ mod tests {
                 .await?
                 .last()
                 .expect("reopened history")
-                .content,
-            "after reopen"
+                .plain_text(),
+            Some("after reopen")
         );
         reopened.close().await?;
         Ok(())
@@ -2412,7 +2548,10 @@ mod tests {
         let store = MemoryStore::open(options.clone()).await?;
         assert!(!stage.exists());
         assert_eq!(fs::read(active.join("ready.json"))?, marker);
-        assert_eq!(migrations::version(&store.pool).await?, 2);
+        assert_eq!(
+            migrations::version(&store.pool).await?,
+            migrations::CURRENT_VERSION
+        );
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT value FROM state WHERE `key` = ?")
                 .bind(b"ready-v1-state".as_slice())
@@ -2427,13 +2566,28 @@ mod tests {
         .bind(&upgraded)
         .fetch_one(store.pool.as_ref())
         .await?;
-        assert_eq!(parent, base);
+        let grandparent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&parent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(
+            grandparent, base,
+            "v1 to v3 must contain two ordered upgrades"
+        );
         let commits: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
         )
         .fetch_one(store.pool.as_ref())
         .await?;
         assert_eq!(commits, 1);
+        let typed_commits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 3%'",
+        )
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(typed_commits, 1);
         store.close().await?;
 
         let reopened = MemoryStore::open(options).await?;
@@ -2461,6 +2615,7 @@ mod tests {
             ("dirty", None, false),
             ("v2 attempt", Some(2), false),
             ("v3 attempt", Some(3), false),
+            ("v4 attempt", Some(4), false),
             ("future schema", None, true),
         ] {
             let root = crate::test_support::tempdir()?;
@@ -2480,7 +2635,7 @@ mod tests {
                     Some(name)
                 }
                 None if future_schema => {
-                    sqlx::query("UPDATE kuru_schema SET version = 3 WHERE id = 1")
+                    sqlx::query("UPDATE kuru_schema SET version = 4 WHERE id = 1")
                         .execute(pool.as_ref())
                         .await?;
                     None
@@ -2502,8 +2657,9 @@ mod tests {
             let expected = match (target, future_schema) {
                 (None, false) => "uncommitted changes",
                 (Some(2), false) => "attempt newer than its schema",
-                (Some(3), false) => "unsupported Dolt memory schema transition",
-                (None, true) => "unsupported Dolt memory schema version 3",
+                (Some(3), false) => "attempt newer than its schema",
+                (Some(4), false) => "unsupported Dolt memory schema transition",
+                (None, true) => "unsupported Dolt memory schema version 4",
                 _ => unreachable!(),
             };
             assert!(rendered.contains(expected), "{case}: {rendered}");
@@ -2594,7 +2750,10 @@ mod tests {
             .execute(old_pool.as_ref())
             .await?;
         let old_before = inspection_snapshot(&old_pool).await?;
-        assert_eq!(old.history("candidate", 10).await?[0].content, "v1 only");
+        assert_eq!(
+            old.history("candidate", 10).await?[0].plain_text(),
+            Some("v1 only")
+        );
         assert_eq!(inspection_snapshot(&old_pool).await?, old_before);
         assert_eq!(migrations::version(&old_pool).await?, 1);
         let stale = Candidate {
@@ -2640,13 +2799,13 @@ mod tests {
                 .history("main", 10)
                 .await?
                 .iter()
-                .map(|m| m.content.as_str())
+                .map(|m| m.plain_text().expect("text fixture"))
                 .collect::<Vec<_>>(),
             ["v1 main", "later"]
         );
         assert_eq!(
-            reopened.history("candidate", 10).await?[0].content,
-            "v2 current",
+            reopened.history("candidate", 10).await?[0].plain_text(),
+            Some("v2 current"),
             "the successful current candidate promotion must publish its data"
         );
         let preserved = reopened.shared.server.pool(&branch).await?;
@@ -2658,8 +2817,8 @@ mod tests {
         assert_eq!(revision(&preserved).await?, candidate_head);
         assert_eq!(migrations::version(&preserved).await?, 1);
         assert_eq!(
-            preserved_view.history("candidate", 10).await?[0].content,
-            "v1 only"
+            preserved_view.history("candidate", 10).await?[0].plain_text(),
+            Some("v1 only")
         );
         preserved.close().await;
         reopened.close().await?;
@@ -2719,7 +2878,7 @@ mod tests {
         let error = MemoryStore::open(readonly).await.unwrap_err();
         let error = format!("{error:#}");
         assert!(
-            error.contains("version 1 requires writable upgrade to 2"),
+            error.contains("version 1 requires writable upgrade to 3"),
             "unexpected read-only v1 open error: {error}"
         );
         assert_eq!(fs::read(directory.join("ready.json"))?, marker);
@@ -2744,7 +2903,10 @@ mod tests {
         inspector.close().await?;
 
         let store = MemoryStore::open(options.clone()).await?;
-        assert_eq!(migrations::version(&store.pool).await?, 2);
+        assert_eq!(
+            migrations::version(&store.pool).await?,
+            migrations::CURRENT_VERSION
+        );
         let first = store.revision().await?;
         let parent: String = sqlx::query_scalar(
             "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
@@ -2752,9 +2914,15 @@ mod tests {
         .bind(&first)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let grandparent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&parent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            parent, base,
-            "upgrade must be one direct child of released v1"
+            grandparent, base,
+            "upgrade must retain both ordered commits"
         );
         assert_eq!(
             sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
@@ -2780,13 +2948,14 @@ mod tests {
         let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(store.pool.as_ref())
             .await?;
-        assert_eq!(receipts, 1);
-        let receipt: (i32, String, String, String) =
-            sqlx::query_as("SELECT version, id, digest, operation FROM kuru_migrations")
-                .fetch_one(store.pool.as_ref())
-                .await?;
-        assert_eq!(receipt.0, 2);
-        assert!(Uuid::parse_str(&receipt.3).is_ok());
+        assert_eq!(receipts, 2);
+        let receipt: Vec<(i32, String, String, String)> = sqlx::query_as(
+            "SELECT version, id, digest, operation FROM kuru_migrations ORDER BY version",
+        )
+        .fetch_all(store.pool.as_ref())
+        .await?;
+        assert_eq!(receipt.iter().map(|row| row.0).collect::<Vec<_>>(), [2, 3]);
+        assert!(receipt.iter().all(|row| Uuid::parse_str(&row.3).is_ok()));
         store.close().await?;
 
         let mut current_readonly = options.clone();
@@ -2818,10 +2987,11 @@ mod tests {
             operations
         );
         assert_eq!(fs::read(directory.join("ready.json"))?, marker);
-        let reopened_receipt: (i32, String, String, String) =
-            sqlx::query_as("SELECT version, id, digest, operation FROM kuru_migrations")
-                .fetch_one(reopened.pool.as_ref())
-                .await?;
+        let reopened_receipt: Vec<(i32, String, String, String)> = sqlx::query_as(
+            "SELECT version, id, digest, operation FROM kuru_migrations ORDER BY version",
+        )
+        .fetch_all(reopened.pool.as_ref())
+        .await?;
         assert_eq!(reopened_receipt, receipt);
         reopened.close().await?;
         Ok(())
@@ -3062,7 +3232,7 @@ mod tests {
 
         let store = MemoryStore::temporary().await?;
         sqlx::query(
-            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (3, 'forged', ?, ?)",
+            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (4, 'forged', ?, ?)",
         )
         .bind("0".repeat(64))
         .bind(Uuid::new_v4().hyphenated().to_string())
@@ -3152,7 +3322,10 @@ mod tests {
             "receipt",
             Mutation::Checkpoint {
                 namespace: "turn".into(),
-                messages: vec![("assistant".into(), "answer".into())],
+                messages: vec![(
+                    "assistant".into(),
+                    encode_typed_message(&Message::text("assistant", "answer")).unwrap(),
+                )],
                 values: vec![("two".into(), "2".into())],
             },
         )
@@ -3168,7 +3341,10 @@ mod tests {
                 &"x".repeat(129),
                 Mutation::Checkpoint {
                     namespace: "turn".into(),
-                    messages: vec![("assistant".into(), "duplicate".into())],
+                    messages: vec![(
+                        "assistant".into(),
+                        encode_typed_message(&Message::text("assistant", "duplicate")).unwrap(),
+                    )],
                     values: vec![("one".into(), "10".into())],
                 }
             )
@@ -3182,10 +3358,7 @@ mod tests {
         assert_eq!(store.get("one").await.unwrap(), Some(json!(1)));
         assert_eq!(
             store.history("turn", 10).await.unwrap(),
-            [Message {
-                role: "assistant".into(),
-                content: "answer".into(),
-            }]
+            [Message::text("assistant", "answer")]
         );
         assert_eq!(store.revision().await.unwrap(), before);
         assert!(operation_exists(&store.pool, &operation).await.unwrap());
@@ -3221,24 +3394,10 @@ mod tests {
         let before = store.revision().await.unwrap();
         for result in [
             store
-                .checkpoint(
-                    "",
-                    &[Message {
-                        role: "user".into(),
-                        content: "prompt".into(),
-                    }],
-                    &[],
-                )
+                .checkpoint("", &[Message::text("user", "prompt")], &[])
                 .await,
             store
-                .checkpoint(
-                    "turn",
-                    &[Message {
-                        role: "".into(),
-                        content: "prompt".into(),
-                    }],
-                    &[],
-                )
+                .checkpoint("turn", &[Message::text("", "prompt")], &[])
                 .await,
             store.checkpoint("turn", &[], &[]).await,
             store
@@ -3273,8 +3432,8 @@ mod tests {
         let reader = MemoryStore::open(readonly).await.unwrap();
         assert_eq!(reader.revision().await.unwrap(), revision);
         assert_eq!(
-            reader.history("retained", 10).await.unwrap()[0].content,
-            "hello"
+            reader.history("retained", 10).await.unwrap()[0].plain_text(),
+            Some("hello")
         );
         assert_eq!(reader.get("choice").await.unwrap(), Some(json!("jungian")));
         assert!(reader.put("choice", &json!("ifs")).await.is_err());
@@ -3537,8 +3696,8 @@ mod tests {
         let store = MemoryStore::open(options).await.unwrap();
         assert_eq!(store.revision().await.unwrap(), revision);
         assert_eq!(
-            store.history("session", 10).await.unwrap()[0].content,
-            "retained transcript"
+            store.history("session", 10).await.unwrap()[0].plain_text(),
+            Some("retained transcript")
         );
         assert!(store.history("candidate", 10).await.unwrap().is_empty());
         let candidate_pool = store.shared.server.pool(&branch).await.unwrap();
@@ -3549,6 +3708,92 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(content, "private retained branch");
+        store.close().await.unwrap();
+    }
+
+    #[test]
+    fn typed_row_codec_preserves_literal_json_text_and_bounds_parse_errors() {
+        let literal = r#"{"blocks":[{"type":"tool_use","id":"still text"}]}"#;
+        assert_eq!(
+            decode_message("user".into(), TEXT_FORMAT, literal).unwrap(),
+            Message::text("user", literal)
+        );
+        let message = Message {
+            role: "assistant".into(),
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "first".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "file_read".into(),
+                    arguments: serde_json::json!({"path":"README.md"}),
+                },
+                ContentBlock::Text {
+                    text: "last".into(),
+                },
+            ],
+        };
+        let encoded = encode_typed_message(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&encoded).unwrap(),
+            serde_json::json!({"blocks": message.blocks.clone()})
+        );
+        assert_eq!(
+            decode_message(message.role.clone(), TYPED_FORMAT, &encoded).unwrap(),
+            message
+        );
+        let sentinel = "secret-unknown-block-tag-should-not-leak";
+        let malformed = format!(r#"{{"blocks":[{{"type":"{sentinel}"}}]}}"#);
+        let error = decode_message("user".into(), TYPED_FORMAT, &malformed)
+            .expect_err("unknown block tag was accepted");
+        assert!(format!("{error:#}").contains("invalid block payload"));
+        assert!(!format!("{error:#}").contains(sentinel));
+        assert!(decode_message("user".into(), TYPED_FORMAT, r#"{"blocks":[],"extra":1}"#).is_err());
+        assert!(decode_message("user".into(), "future-v9", literal).is_err());
+    }
+
+    #[tokio::test]
+    async fn committed_unknown_and_malformed_formats_refuse_history_and_export() {
+        let store = MemoryStore::temporary().await.unwrap();
+        store
+            .append("format", "user", "safe original")
+            .await
+            .unwrap();
+        for (format, content, expected) in [
+            ("future-v9", "safe original", "unsupported content format"),
+            (
+                TYPED_FORMAT,
+                r#"{"blocks":[{"type":"private-sentinel-should-not-leak"}]}"#,
+                "invalid block payload",
+            ),
+        ] {
+            sqlx::query("UPDATE messages SET content_format = ?, content = ? WHERE namespace = ?")
+                .bind(format)
+                .bind(content)
+                .bind(b"format".as_slice())
+                .execute(store.pool.as_ref())
+                .await
+                .unwrap();
+            sqlx::query("CALL DOLT_COMMIT('-Am', 'format refusal fixture', '--author', ?)")
+                .bind(AUTHOR)
+                .fetch_all(store.pool.as_ref())
+                .await
+                .unwrap();
+            let error = store
+                .history("format", 10)
+                .await
+                .expect_err("invalid format was read");
+            assert!(format!("{error:#}").contains(expected));
+            assert!(!format!("{error:#}").contains("private-sentinel"));
+            let export = store.begin_active_export().await.unwrap();
+            let error = export
+                .page(None)
+                .await
+                .expect_err("invalid format was exported");
+            assert!(format!("{error:#}").contains(expected));
+            assert!(!format!("{error:#}").contains("private-sentinel"));
+        }
         store.close().await.unwrap();
     }
 }
