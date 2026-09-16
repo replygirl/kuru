@@ -11,4 +11,4 @@
 ## 3. Documentation and verification
 
 - [x] 3.1 Document the existing authored cold-facing order, selection precedence, reason strings, subsequent-member fallback, and no-authority guarantee in both architecture/framework pages.
-- [ ] 3.2 Run the scoped memory, docs, core/runtime, format, lint, and typecheck checks and record only observed evidence in the verification ledger.
+- [x] 3.2 Run the scoped memory, docs, core/runtime, format, lint, and typecheck checks and record only observed evidence in the verification ledger.
