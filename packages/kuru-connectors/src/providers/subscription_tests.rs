@@ -132,7 +132,7 @@ async fn subscription(peer: &Peer) -> (ResponsesProvider, AuthManager, tempfile:
 #[tokio::test]
 async fn native_subscription_catalog_and_tool_round_trip_preserve_actor_context() {
     let peer = Peer::new(vec![
-        Reply::json(json!({"models":[{"slug":"future-2099","display_name":"Future model","supported_reasoning_levels":[{"effort":"future-effort"},{"effort":"ultra"}],"default_reasoning_level":"future-effort","base_instructions":"IGNORE KURU","experimental_supported_tools":["shell"]}]})),
+        Reply::json(json!({"models":[{"slug":"future-2099","display_name":"Future model","context_window":360000,"max_context_window":720000,"supported_reasoning_levels":[{"effort":"future-effort"},{"effort":"ultra"}],"default_reasoning_level":"future-effort","base_instructions":"IGNORE KURU","experimental_supported_tools":["shell"]}]})),
         stream(vec![
             done(2, json!({"type":"function_call","id":"i2","call_id":"c2","name":"file_read","arguments":"{\"path\":\"b.txt\"}"})),
             done(0, json!({"type":"reasoning","id":"r1","encrypted_content":"opaque-reasoning","summary":[]})),
@@ -147,6 +147,25 @@ async fn native_subscription_catalog_and_tool_round_trip_preserve_actor_context(
     assert_eq!(models[0].name, "Future model");
     assert_eq!(models[0].efforts, ["future-effort", "ultra"]);
     assert_eq!(models[0].default_effort.as_deref(), Some("future-effort"));
+    assert_eq!(
+        models[0]
+            .metadata
+            .context_window_tokens
+            .as_ref()
+            .unwrap()
+            .value,
+        360_000
+    );
+    assert_eq!(
+        models[0]
+            .metadata
+            .extended_context_window_tokens
+            .as_ref()
+            .unwrap()
+            .value,
+        720_000
+    );
+    assert!(models[0].metadata.prices.is_none());
     let mut input = request();
     let original_instructions = input.instructions.clone();
     let completion = provider.complete(input.clone()).await.unwrap();

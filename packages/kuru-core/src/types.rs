@@ -171,6 +171,120 @@ pub struct ModelInfo {
     /// Provider-supplied strings, rather than an enum, preserve future efforts.
     pub efforts: Vec<String>,
     pub default_effort: Option<String>,
+    /// Optional facts enrich live discovery but never establish availability.
+    #[serde(default)]
+    pub metadata: ModelMetadata,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelMetadata {
+    pub context_window_tokens: Option<Sourced<u64>>,
+    pub max_output_tokens: Option<Sourced<u64>>,
+    /// A provider may document an extended context option without documenting a
+    /// normal request ceiling or a maximum output limit.
+    pub extended_context_window_tokens: Option<Sourced<u64>>,
+    pub prices: Option<PriceSchedule>,
+    /// Boolean names remain open because provider capability vocabularies grow.
+    #[serde(default)]
+    pub capabilities: std::collections::BTreeMap<String, Sourced<bool>>,
+}
+
+impl ModelMetadata {
+    pub fn resolved_context_window(&self, configured_assumption: Option<u64>) -> Sourced<u64> {
+        self.context_window_tokens.clone().unwrap_or_else(|| {
+            configured_assumption.map_or_else(
+                || Sourced::built_in(128_000),
+                Sourced::configured_assumption,
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Sourced<T> {
+    pub value: T,
+    pub provenance: FactProvenance,
+}
+
+impl<T> Sourced<T> {
+    pub fn advertised(value: T) -> Self {
+        Self {
+            value,
+            provenance: FactProvenance::RouteAdvertisement,
+        }
+    }
+
+    pub fn pinned(value: T, citation: SourceCitation) -> Self {
+        Self {
+            value,
+            provenance: FactProvenance::Pinned { citation },
+        }
+    }
+
+    pub fn configured_assumption(value: T) -> Self {
+        Self {
+            value,
+            provenance: FactProvenance::ConfiguredAssumption,
+        }
+    }
+
+    pub fn built_in(value: T) -> Self {
+        Self {
+            value,
+            provenance: FactProvenance::BuiltInAssumption,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FactProvenance {
+    RouteAdvertisement,
+    Pinned { citation: SourceCitation },
+    ConfiguredAssumption,
+    BuiltInAssumption,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceCitation {
+    pub url: String,
+    pub checked_on: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PriceSchedule {
+    pub basis: PriceBasis,
+    pub source: SourceCitation,
+    pub input_per_million_usd: String,
+    pub cached_input_per_million_usd: Option<String>,
+    pub output_per_million_usd: String,
+    pub long_context_tier: Option<LongContextTier>,
+    pub cache_write: Option<CacheWriteTerms>,
+    /// The provider guarantees the promotional rate at least through this date;
+    /// it is not an automatic expiry date.
+    pub promotional_available_at_least_through: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PriceBasis {
+    ApiStandard { api_model: String },
+    ApiEquivalent { api_model: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LongContextTier {
+    pub input_tokens_over: u64,
+    pub input_multiplier: String,
+    pub cached_input_multiplier: String,
+    pub output_multiplier: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheWriteTerms {
+    PerMillionUsd { value: String },
+    InputMultiplier { value: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "records": [
+    {
+      "route": "open-ai-responses",
+      "model_id": "gpt-6-astra",
+      "context_window_tokens": 1050000,
+      "max_output_tokens": 128000,
+      "source": {"url": "https://developers.openai.com/api/docs/models/gpt-6-astra", "checked_on": "2026-09-16"},
+      "prices": {
+        "basis": {"api-standard": {"api_model": "gpt-6-astra"}},
+        "source": {"url": "https://developers.openai.com/api/docs/models/gpt-6-astra", "checked_on": "2026-09-16"},
+        "input_per_million_usd": "10.00",
+        "cached_input_per_million_usd": "1.00",
+        "output_per_million_usd": "50.00",
+        "long_context_tier": {"input_tokens_over": 272000, "input_multiplier": "2", "cached_input_multiplier": "2", "output_multiplier": "1.5"},
+        "cache_write": {"per-million-usd": {"value": "12.50"}}
+      }
+    },
+    {
+      "route": "open-ai-responses",
+      "model_id": "gpt-5.6-sol",
+      "context_window_tokens": 1050000,
+      "max_output_tokens": 128000,
+      "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol", "checked_on": "2026-09-16"},
+      "prices": {
+        "basis": {"api-standard": {"api_model": "gpt-5.6-sol"}},
+        "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol", "checked_on": "2026-09-16"},
+        "input_per_million_usd": "4.00",
+        "cached_input_per_million_usd": "0.40",
+        "output_per_million_usd": "20.00",
+        "long_context_tier": {"input_tokens_over": 272000, "input_multiplier": "2", "cached_input_multiplier": "2", "output_multiplier": "1.5"},
+        "cache_write": {"input-multiplier": {"value": "1.25"}},
+        "promotional_available_at_least_through": "2026-11-21"
+      }
+    },
+    {
+      "route": "open-ai-responses",
+      "model_id": "gpt-5.6-terra",
+      "context_window_tokens": 1050000,
+      "max_output_tokens": 128000,
+      "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra", "checked_on": "2026-09-16"},
+      "prices": {
+        "basis": {"api-standard": {"api_model": "gpt-5.6-terra"}},
+        "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra", "checked_on": "2026-09-16"},
+        "input_per_million_usd": "2.00",
+        "cached_input_per_million_usd": "0.20",
+        "output_per_million_usd": "12.00",
+        "long_context_tier": {"input_tokens_over": 272000, "input_multiplier": "2", "cached_input_multiplier": "2", "output_multiplier": "1.5"},
+        "cache_write": {"input-multiplier": {"value": "1.25"}}
+      }
+    },
+    {
+      "route": "open-ai-responses",
+      "model_id": "gpt-5.6-luna",
+      "context_window_tokens": 1050000,
+      "max_output_tokens": 128000,
+      "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna", "checked_on": "2026-09-16"},
+      "prices": {
+        "basis": {"api-standard": {"api_model": "gpt-5.6-luna"}},
+        "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna", "checked_on": "2026-09-16"},
+        "input_per_million_usd": "0.20",
+        "cached_input_per_million_usd": "0.02",
+        "output_per_million_usd": "1.20",
+        "long_context_tier": {"input_tokens_over": 272000, "input_multiplier": "2", "cached_input_multiplier": "2", "output_multiplier": "1.5"},
+        "cache_write": {"input-multiplier": {"value": "1.25"}}
+      }
+    },
+    {
+      "route": "codex-subscription",
+      "model_id": "gpt-6-astra",
+      "context_window_tokens": 272000,
+      "extended_context_window_tokens": 872000,
+      "source": {"url": "https://github.com/openai/codex/blob/3a589370a49ddf197de8e5ae03a92615bcad58bf/codex-rs/models-manager/models.json", "checked_on": "2026-09-16"},
+      "prices": {
+        "basis": {"api-equivalent": {"api_model": "gpt-6-astra"}},
+        "source": {"url": "https://developers.openai.com/api/docs/models/gpt-6-astra", "checked_on": "2026-09-16"},
+        "input_per_million_usd": "10.00",
+        "cached_input_per_million_usd": "1.00",
+        "output_per_million_usd": "50.00",
+        "long_context_tier": {"input_tokens_over": 272000, "input_multiplier": "2", "cached_input_multiplier": "2", "output_multiplier": "1.5"},
+        "cache_write": {"per-million-usd": {"value": "12.50"}}
+      }
+    },
+    {
+      "route": "codex-subscription",
+      "model_id": "gpt-5.6-sol",
+      "context_window_tokens": 272000,
+      "extended_context_window_tokens": 872000,
+      "source": {"url": "https://github.com/openai/codex/blob/3a589370a49ddf197de8e5ae03a92615bcad58bf/codex-rs/models-manager/models.json", "checked_on": "2026-09-16"},
+      "prices": {
+        "basis": {"api-equivalent": {"api_model": "gpt-5.6-sol"}},
+        "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol", "checked_on": "2026-09-16"},
+        "input_per_million_usd": "4.00",
+        "cached_input_per_million_usd": "0.40",
+        "output_per_million_usd": "20.00",
+        "long_context_tier": {"input_tokens_over": 272000, "input_multiplier": "2", "cached_input_multiplier": "2", "output_multiplier": "1.5"},
+        "cache_write": {"input-multiplier": {"value": "1.25"}},
+        "promotional_available_at_least_through": "2026-11-21"
+      }
+    },
+    {
+      "route": "codex-subscription",
+      "model_id": "gpt-5.6-terra",
+      "context_window_tokens": 272000,
+      "extended_context_window_tokens": 872000,
+      "source": {"url": "https://github.com/openai/codex/blob/3a589370a49ddf197de8e5ae03a92615bcad58bf/codex-rs/models-manager/models.json", "checked_on": "2026-09-16"},
+      "prices": {
+        "basis": {"api-equivalent": {"api_model": "gpt-5.6-terra"}},
+        "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra", "checked_on": "2026-09-16"},
+        "input_per_million_usd": "2.00",
+        "cached_input_per_million_usd": "0.20",
+        "output_per_million_usd": "12.00",
+        "long_context_tier": {"input_tokens_over": 272000, "input_multiplier": "2", "cached_input_multiplier": "2", "output_multiplier": "1.5"},
+        "cache_write": {"input-multiplier": {"value": "1.25"}}
+      }
+    },
+    {
+      "route": "codex-subscription",
+      "model_id": "gpt-5.6-luna",
+      "context_window_tokens": 272000,
+      "extended_context_window_tokens": 872000,
+      "source": {"url": "https://github.com/openai/codex/blob/3a589370a49ddf197de8e5ae03a92615bcad58bf/codex-rs/models-manager/models.json", "checked_on": "2026-09-16"},
+      "prices": {
+        "basis": {"api-equivalent": {"api_model": "gpt-5.6-luna"}},
+        "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna", "checked_on": "2026-09-16"},
+        "input_per_million_usd": "0.20",
+        "cached_input_per_million_usd": "0.02",
+        "output_per_million_usd": "1.20",
+        "long_context_tier": {"input_tokens_over": 272000, "input_multiplier": "2", "cached_input_multiplier": "2", "output_multiplier": "1.5"},
+        "cache_write": {"input-multiplier": {"value": "1.25"}}
+      }
+    }
+  ]
+}

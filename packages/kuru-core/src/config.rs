@@ -381,6 +381,9 @@ pub struct Config {
     pub provider: String,
     pub model: String,
     pub effort: Option<String>,
+    /// Used only when neither live discovery nor the offline catalog supplies a
+    /// context window. It cannot override a verified provider limit.
+    pub assumed_context_window_tokens: Option<u64>,
     pub max_rounds: usize,
     pub max_tool_calls: usize,
     pub max_parallel: usize,
@@ -404,6 +407,7 @@ impl Default for Config {
             provider: "codex".into(),
             model: "auto".into(),
             effort: None,
+            assumed_context_window_tokens: None,
             max_rounds: 3,
             max_tool_calls: 12,
             max_parallel: 4,
@@ -720,6 +724,12 @@ impl Config {
         nonempty("model", &self.model, 256)?;
         if let Some(effort) = &self.effort {
             nonempty("effort", effort, 128)?;
+        }
+        if let Some(window) = self.assumed_context_window_tokens {
+            ensure!(
+                (1..=2_000_000).contains(&window),
+                "assumed_context_window_tokens must be between 1 and 2000000"
+            );
         }
         bounded("max_rounds", self.max_rounds, 1, 64)?;
         bounded("max_tool_calls", self.max_tool_calls, 1, 1024)?;

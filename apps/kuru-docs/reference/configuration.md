@@ -15,6 +15,12 @@ Later layers take precedence:
 
 Tables merge recursively; arrays replace earlier arrays. Each configuration file is limited to 256 KiB, and combined input to 1 MiB.
 
+[Configuration Schema v1](/configuration.v1.schema.json) describes the
+JSON-equivalent structure for editor and tooling support. Kuru's TOML parser and
+native semantic validation remain authoritative, especially for URL and
+cross-field restrictions. Unknown keys are rejected: a configuration that needs
+a new key requires a newer Kuru version and never silently changes authority.
+
 Ancestor `AGENTS.md` files provide project instructions, with nearer files taking precedence. Put applicable instructions in `AGENTS.md` itself; linked files are not automatically followed.
 
 ## Workspace trust
@@ -66,6 +72,7 @@ These are the default scalar values:
 mode = "ifs"
 provider = "codex"
 model = "auto"
+# assumed_context_window_tokens = 128000 # optional; omit to use the built-in fallback
 max_rounds = 3
 max_tool_calls = 12
 max_parallel = 4
@@ -80,16 +87,24 @@ api_key_env = "OPENAI_API_KEY"
 
 ## Models and providers
 
-| Key           | Accepted value                                                       |
-| ------------- | -------------------------------------------------------------------- |
-| `mode`        | `ifs`, `polyvagal`, `freudian`, `jungian`                            |
-| `provider`    | `codex`, `responses`, `demo`                                         |
-| `model`       | Provider model ID; `auto` permits provider selection where supported |
-| `effort`      | Optional provider-advertised string                                  |
-| `api_base`    | Responses API base URL                                               |
-| `api_key_env` | Environment variable containing the API key                          |
+| Key                             | Accepted value                                                                       |
+| ------------------------------- | ------------------------------------------------------------------------------------ |
+| `mode`                          | `ifs`, `polyvagal`, `freudian`, `jungian`                                            |
+| `provider`                      | `codex`, `responses`, `demo`                                                         |
+| `model`                         | Provider model ID; `auto` permits provider selection where supported                 |
+| `effort`                        | Optional provider-advertised string                                                  |
+| `assumed_context_window_tokens` | Optional 1–2,000,000 fallback for models with no advertised or pinned context window |
+| `api_base`                      | Responses API base URL                                                               |
+| `api_key_env`                   | Environment variable containing the API key                                          |
 
 Use `kuru models` to discover current capabilities. Kuru preserves newly advertised effort strings. The Responses catalog does not supply a default chat model, so that provider requires an explicit `model` or `--model`.
+
+An unknown model remains selectable. Kuru resolves its context window from live
+route advertisement, then a route-matched offline snapshot, then this optional
+fallback setting, and finally a labelled built-in 128,000-token assumption. The
+setting does not override a known provider limit. Prices remain absent when not
+verified; Codex subscription prices, where shown later, are labelled
+API-equivalent estimates rather than billing or quota facts.
 
 The default `codex` provider uses Kuru's own ChatGPT login and direct subscription
 requests. The `responses` provider uses an API key; `api_base` and `api_key_env`

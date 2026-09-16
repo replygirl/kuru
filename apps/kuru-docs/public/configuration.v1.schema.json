@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://replygirl.github.io/kuru/configuration.v1.schema.json",
+  "title": "Kuru configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["ifs", "polyvagal", "freudian", "jungian"],
+      "default": "ifs"
+    },
+    "provider": { "type": "string", "enum": ["codex", "responses", "demo"], "default": "codex" },
+    "model": { "type": "string", "minLength": 1, "maxLength": 256, "default": "auto" },
+    "effort": { "type": ["string", "null"], "minLength": 1, "maxLength": 128, "default": null },
+    "assumed_context_window_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 2000000,
+      "default": null
+    },
+    "max_rounds": { "type": "integer", "minimum": 1, "maximum": 64, "default": 3 },
+    "max_tool_calls": { "type": "integer", "minimum": 1, "maximum": 1024, "default": 12 },
+    "max_parallel": { "type": "integer", "minimum": 1, "maximum": 64, "default": 4 },
+    "dream_every": { "type": "integer", "minimum": 0, "default": 8 },
+    "dream_on_exit": { "type": "boolean", "default": true },
+    "max_parts": { "type": "integer", "minimum": 1, "maximum": 128, "default": 16 },
+    "allow_shell": { "type": "boolean", "default": false },
+    "allow_write": { "type": "boolean", "default": false },
+    "api_base": { "type": "string", "format": "uri", "default": "https://api.openai.com/v1" },
+    "api_key_env": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,255}$",
+      "default": "OPENAI_API_KEY"
+    },
+    "mcp": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+      "additionalProperties": { "$ref": "#/$defs/mcp" },
+      "default": {}
+    },
+    "external_agents": {
+      "type": "object",
+      "maxProperties": 64,
+      "propertyNames": { "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+      "additionalProperties": { "type": "string", "format": "uri" },
+      "default": {}
+    },
+    "memory": {
+      "$ref": "#/$defs/memory",
+      "default": { "offline": false, "startup_timeout_secs": 30 }
+    }
+  },
+  "$defs": {
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dolt_binary": { "type": ["string", "null"], "default": null },
+        "cache_dir": { "type": ["string", "null"], "default": null },
+        "offline": { "type": "boolean", "default": false },
+        "startup_timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300, "default": 30 }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 4096,
+          "default": null
+        },
+        "args": { "type": "array", "items": { "type": "string" }, "maxItems": 256, "default": [] },
+        "url": { "type": ["string", "null"], "format": "uri", "default": null },
+        "env": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,255}$" },
+          "additionalProperties": { "type": "string" },
+          "default": {}
+        }
+      },
+      "oneOf": [
+        { "required": ["command"], "not": { "required": ["url"] } },
+        { "required": ["url"], "not": { "required": ["command"] } }
+      ]
+    }
+  }
+}

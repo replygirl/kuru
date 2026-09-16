@@ -39,6 +39,7 @@ fn fixture(mode: Mode) -> View {
             name: "Offline demo".into(),
             efforts: vec!["low".into(), "high".into()],
             default_effort: Some("low".into()),
+            metadata: Default::default(),
         }],
     )
 }
@@ -249,6 +250,7 @@ fn long_model_catalog_scrolls_selection_into_view_and_preserves_draft() {
             name: format!("Model {index}"),
             efforts: vec![],
             default_effort: None,
+            metadata: Default::default(),
         })
         .collect();
     view.key(key(KeyCode::F(2)));
