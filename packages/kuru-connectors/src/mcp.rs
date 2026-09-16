@@ -1452,7 +1452,7 @@ mod tests {
                 Reply::json(json!({})),
             ])
             .await;
-            let failed = StdioFixture::new([Step::Read, Step::Raw("not JSON")]);
+            let failed = StdioFixture::new([Step::Read, Step::Raw("not JSON"), Step::Read]);
             let (failed_alias, healthy_alias) = if failed_first {
                 ("a_failed", "z_healthy")
             } else {
@@ -1491,7 +1491,22 @@ mod tests {
                     .any(|status| status.alias() == failed_alias && !status.available())
             );
             hosts.shutdown().await.unwrap();
-            failed.assert_completed(1);
+            assert_eq!(
+                failed.conversations(),
+                vec![vec![json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": VERSION,
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "kuru",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
+                    },
+                })]],
+            );
         }
     }
 
