@@ -30,6 +30,17 @@ struct Replay {
 
 #[async_trait]
 impl Provider for Replay {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }

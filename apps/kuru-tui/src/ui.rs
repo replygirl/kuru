@@ -16,8 +16,8 @@ use crossterm::{
 use futures::{Stream, StreamExt};
 use kuru_core::{Mode, ModelInfo, Relationship};
 use kuru_runtime::{
-    CancellationToken, ControlledTurnOutput, Event, Harness, INTERRUPTION_ROLE, INTERRUPTION_TEXT,
-    ResponseOutcome, TurnLimitReason, TurnOutput, turn_was_cancelled,
+    CancellationToken, ControlledTurnOutput, Event, FacingProgress, Harness, INTERRUPTION_ROLE,
+    INTERRUPTION_TEXT, ResponseOutcome, TurnLimitReason, TurnOutput, turn_was_cancelled,
 };
 use ratatui::{
     Terminal,
@@ -25,7 +25,7 @@ use ratatui::{
     text::Line,
 };
 use tokio::{
-    sync::{Mutex, broadcast, mpsc},
+    sync::{Mutex, broadcast, mpsc, watch},
     task::JoinHandle,
     time::{Instant as TokioInstant, sleep_until},
 };
@@ -41,6 +41,7 @@ pub use render::draw;
 
 const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /notes ID · /retry · /dream · /undo-dream · /quit\n/memory-status · /memory-history\nModel, effort and mode selections are remembered for this project.";
 const ACTIVITY_DRAIN_CAP: usize = 256;
+const PREVIEW_PAINT_INTERVAL: Duration = Duration::from_millis(80);
 const INTERRUPTION_REFRESH_NOTICE: &str =
     "Persisted interruption status could not be refreshed · reopen the session to inspect it";
 
@@ -89,6 +90,8 @@ pub struct View {
     pub session: String,
     pub parts: Vec<(String, String)>,
     pub activity: Vec<String>,
+    /// Ephemeral selected-speaker preview; never copied into the transcript.
+    pub preview: Option<FacingProgress>,
     pub busy: bool,
     pub status: String,
     pub speaker: String,
@@ -138,6 +141,7 @@ impl View {
             session,
             parts: runtime.parts,
             activity: vec![],
+            preview: None,
             busy: false,
             status: "Ready · /help for commands".into(),
             speaker: "pool".into(),
@@ -198,6 +202,7 @@ impl View {
 
     fn begin_operation(&mut self) {
         self.busy = true;
+        self.preview = None;
         self.completion_locked = false;
         self.notice = None;
         self.operation_start = Some(self.clock_ms);
@@ -235,6 +240,7 @@ impl View {
 
     fn settle(&mut self) {
         self.operation_start = None;
+        self.preview = None;
         for phase in self.part_activity.values_mut() {
             if phase != "error" {
                 *phase = "idle".into();
@@ -419,6 +425,7 @@ impl View {
     }
 
     pub fn complete_turn(&mut self, output: TurnOutput) {
+        self.preview = None;
         let outcome = outcome_summary(&output);
         let speaker = output
             .relationship
@@ -873,6 +880,7 @@ enum WakeSource {
     Terminal,
     Completion,
     Activity,
+    Progress,
     Animation,
 }
 
@@ -881,7 +889,8 @@ impl WakeSource {
         match self {
             Self::Terminal => Self::Completion,
             Self::Completion => Self::Activity,
-            Self::Activity => Self::Animation,
+            Self::Activity => Self::Progress,
+            Self::Progress => Self::Animation,
             Self::Animation => Self::Terminal,
         }
     }
@@ -892,6 +901,7 @@ enum Wake {
     Terminal(Option<io::Result<TerminalEvent>>),
     Completion(Option<(u64, Result<DispatchOutcome>)>),
     Activity(Result<Event, broadcast::error::RecvError>),
+    Progress(Result<(), watch::error::RecvError>),
     Animation,
 }
 
@@ -906,12 +916,82 @@ struct WakeAvailability {
     activity: bool,
 }
 
-async fn next_wake<S>(
+#[derive(Default)]
+struct PreviewFence {
+    generation: u64,
+    turn_id: Option<String>,
+    round: u32,
+    seq: u64,
+}
+
+impl PreviewFence {
+    fn start(&mut self, generation: u64, turn_id: Option<String>) {
+        *self = Self {
+            generation,
+            turn_id,
+            ..Self::default()
+        };
+    }
+
+    fn clear(&mut self) {
+        self.turn_id = None;
+        self.round = 0;
+        self.seq = 0;
+    }
+
+    fn admit(&mut self, generation: u64, snapshot: &FacingProgress) -> bool {
+        if self.generation != generation
+            || self.turn_id.as_deref() != Some(snapshot.turn_id.as_str())
+            || snapshot.request_round == 0
+            || snapshot.request_round < self.round
+            || snapshot.seq <= self.seq
+        {
+            return false;
+        }
+        self.round = snapshot.request_round;
+        self.seq = snapshot.seq;
+        true
+    }
+}
+
+#[derive(Default)]
+struct PreviewPaint {
+    pending: bool,
+    last_painted: Option<TokioInstant>,
+}
+
+impl PreviewPaint {
+    fn mark(&mut self) {
+        self.pending = true;
+    }
+
+    fn due(&self, now: TokioInstant) -> bool {
+        self.pending
+            && self
+                .last_painted
+                .is_none_or(|last| now.saturating_duration_since(last) >= PREVIEW_PAINT_INTERVAL)
+    }
+
+    fn painted(&mut self, now: TokioInstant) {
+        self.pending = false;
+        self.last_painted = Some(now);
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+// Keep the scheduler's borrowed channels explicit; it does not own their lifetimes.
+#[allow(clippy::too_many_arguments)]
+async fn next_wake_with_progress<S>(
     scheduler: &Scheduler,
     input: &mut S,
     rx: &mut mpsc::Receiver<(u64, Result<DispatchOutcome>)>,
     events: &mut broadcast::Receiver<Event>,
+    progress: &mut watch::Receiver<Option<FacingProgress>>,
     available: WakeAvailability,
+    progress_open: bool,
     animation_at: TokioInstant,
 ) -> Wake
 where
@@ -926,21 +1006,32 @@ where
             event = input.next(), if available.input => Wake::Terminal(event),
             completion = rx.recv(), if available.completion => Wake::Completion(completion),
             activity = events.recv(), if available.activity => Wake::Activity(activity),
+            update = progress.changed(), if progress_open => Wake::Progress(update),
             _ = sleep_until(animation_at) => Wake::Animation,
         },
         WakeSource::Completion => tokio::select! {
             biased;
             completion = rx.recv(), if available.completion => Wake::Completion(completion),
             activity = events.recv(), if available.activity => Wake::Activity(activity),
+            update = progress.changed(), if progress_open => Wake::Progress(update),
             _ = sleep_until(animation_at) => Wake::Animation,
             event = input.next(), if available.input => Wake::Terminal(event),
         },
         WakeSource::Activity => tokio::select! {
             biased;
             activity = events.recv(), if available.activity => Wake::Activity(activity),
+            update = progress.changed(), if progress_open => Wake::Progress(update),
             _ = sleep_until(animation_at) => Wake::Animation,
             event = input.next(), if available.input => Wake::Terminal(event),
             completion = rx.recv(), if available.completion => Wake::Completion(completion),
+        },
+        WakeSource::Progress => tokio::select! {
+            biased;
+            update = progress.changed(), if progress_open => Wake::Progress(update),
+            _ = sleep_until(animation_at) => Wake::Animation,
+            event = input.next(), if available.input => Wake::Terminal(event),
+            completion = rx.recv(), if available.completion => Wake::Completion(completion),
+            activity = events.recv(), if available.activity => Wake::Activity(activity),
         },
         WakeSource::Animation => tokio::select! {
             biased;
@@ -948,8 +1039,35 @@ where
             event = input.next(), if available.input => Wake::Terminal(event),
             completion = rx.recv(), if available.completion => Wake::Completion(completion),
             activity = events.recv(), if available.activity => Wake::Activity(activity),
+            update = progress.changed(), if progress_open => Wake::Progress(update),
         },
     }
+}
+
+#[cfg(test)]
+async fn next_wake<S>(
+    scheduler: &Scheduler,
+    input: &mut S,
+    rx: &mut mpsc::Receiver<(u64, Result<DispatchOutcome>)>,
+    events: &mut broadcast::Receiver<Event>,
+    available: WakeAvailability,
+    animation_at: TokioInstant,
+) -> Wake
+where
+    S: Stream<Item = io::Result<TerminalEvent>> + Unpin,
+{
+    let (_sender, mut progress) = watch::channel(None);
+    next_wake_with_progress(
+        scheduler,
+        input,
+        rx,
+        events,
+        &mut progress,
+        available,
+        false,
+        animation_at,
+    )
+    .await
 }
 
 fn activity_still_open(open: bool, closed: bool) -> bool {
@@ -1204,18 +1322,22 @@ where
         view.show_scene = false;
     }
     let mut events = harness.subscribe();
+    let mut progress = harness.subscribe_progress();
     let harness = Arc::new(Mutex::new(harness));
     let (tx, mut rx) = mpsc::channel::<(u64, Result<DispatchOutcome>)>(8);
     let mut job: Option<JoinHandle<()>> = None;
     let mut cancellation: Option<CancellationToken> = None;
     let mut quit_pending = false;
     let mut generation = 0u64;
+    let mut preview_fence = PreviewFence::default();
     let started = Instant::now();
     let mut dirty = true;
+    let mut preview_paint = PreviewPaint::default();
     let mut scheduler = Scheduler::new();
     let mut input_open = true;
     let mut completion_open = true;
     let mut activity_open = true;
+    let mut progress_open = true;
     let mut animation_at = TokioInstant::now();
 
     let result: Result<()> = async {
@@ -1225,6 +1347,9 @@ where
                     .draw(|frame| draw(frame, &view))
                     .map_err(|error| anyhow::anyhow!("terminal draw: {error}"))?;
                 dirty = false;
+                if preview_paint.pending {
+                    preview_paint.painted(TokioInstant::now());
+                }
                 if let Some(notice) = notice.take() {
                     // This frame contains the system transcript entry. Persist
                     // only after it completed and before input is admitted.
@@ -1232,16 +1357,18 @@ where
                 }
             }
 
-            let wake = next_wake(
+            let wake = next_wake_with_progress(
                 &scheduler,
                 &mut input,
                 &mut rx,
                 &mut events,
+                &mut progress,
                 WakeAvailability {
                     input: input_open,
                     completion: completion_open,
                     activity: activity_open,
                 },
+                progress_open,
                 animation_at,
             )
             .await;
@@ -1253,6 +1380,9 @@ where
                     dirty |= redraw;
                     if let Some(command) = command {
                         if command == "/cancel" {
+                            view.preview = None;
+                            preview_fence.clear();
+                            preview_paint.clear();
                             activity_open = activity_still_open(
                                 activity_open,
                                 cancel_operation(
@@ -1269,6 +1399,9 @@ where
                             );
                             dirty = true;
                         } else if command == "/quit" {
+                            view.preview = None;
+                            preview_fence.clear();
+                            preview_paint.clear();
                             if let Some(cancellation) = cancellation.take() {
                                 cancellation.cancel();
                             }
@@ -1281,6 +1414,7 @@ where
                             view.status = "Closing session".into();
                             quit_pending = true;
                             generation = generation.wrapping_add(1);
+                            preview_fence.clear();
                             let harness = harness.clone();
                             let tx = tx.clone();
                             job = Some(tokio::spawn(async move {
@@ -1323,6 +1457,10 @@ where
                             view.part_activity.clear();
                             view.routes.clear();
                             generation = generation.wrapping_add(1);
+                            let turn_id = (!command.starts_with('/'))
+                                .then(|| uuid::Uuid::new_v4().to_string());
+                            preview_fence.start(generation, turn_id.clone());
+                            preview_paint.clear();
                             let harness = harness.clone();
                             let tx = tx.clone();
                             let models = view.models.clone();
@@ -1334,6 +1472,7 @@ where
                                     &models,
                                     &command,
                                     &operation_cancellation,
+                                    turn_id.as_deref(),
                                 )
                                 .await;
                                 let _ = tx.send((generation, result)).await;
@@ -1354,6 +1493,8 @@ where
                     scheduler.served(WakeSource::Completion);
                     if completion.0 == generation {
                         cancellation = None;
+                        preview_fence.clear();
+                        preview_paint.clear();
                     }
                     match apply_completion(
                         completion,
@@ -1405,9 +1546,25 @@ where
                     scheduler.served(WakeSource::Activity);
                     activity_open = false;
                 }
+                Wake::Progress(Ok(())) => {
+                    scheduler.served(WakeSource::Progress);
+                    // None is a transport reset without turn identity. Only the
+                    // local operation and final result settle visible preview.
+                    if let Some(snapshot) = progress.borrow_and_update().clone()
+                        && preview_fence.admit(generation, &snapshot)
+                    {
+                        view.preview = Some(snapshot);
+                        preview_paint.mark();
+                    }
+                }
+                Wake::Progress(Err(_)) => {
+                    scheduler.served(WakeSource::Progress);
+                    progress_open = false;
+                }
                 Wake::Animation => {
                     scheduler.served(WakeSource::Animation);
-                    dirty |= view.advance_animation(started.elapsed());
+                    dirty |= view.advance_animation(started.elapsed())
+                        || preview_paint.due(TokioInstant::now());
                     let delay = if view.busy {
                         Duration::from_millis(25)
                     } else {
@@ -1436,7 +1593,7 @@ pub(crate) async fn dispatch(
     command: &str,
 ) -> Result<DispatchOutcome> {
     let cancellation = CancellationToken::new();
-    dispatch_controlled(harness, models, command, &cancellation).await
+    dispatch_controlled(harness, models, command, &cancellation, None).await
 }
 
 async fn dispatch_controlled(
@@ -1444,6 +1601,7 @@ async fn dispatch_controlled(
     models: &[ModelInfo],
     command: &str,
     cancellation: &CancellationToken,
+    turn_id: Option<&str>,
 ) -> Result<DispatchOutcome> {
     harness.reconcile().await?;
     let (name, args) = command.split_once(' ').unwrap_or((command, ""));
@@ -1508,10 +1666,16 @@ async fn dispatch_controlled(
         }
         _ if command.starts_with('/') => anyhow::bail!("unknown command; use /help"),
         _ => {
-            let turn_id = uuid::Uuid::new_v4().to_string();
+            let generated;
+            let turn_id = if let Some(turn_id) = turn_id {
+                turn_id
+            } else {
+                generated = uuid::Uuid::new_v4().to_string();
+                &generated
+            };
             return Ok(DispatchOutcome::Turn(
                 harness
-                    .run_local_controlled(command, None, &turn_id, cancellation)
+                    .run_local_controlled(command, None, turn_id, cancellation)
                     .await?,
             ));
         }
@@ -1523,6 +1687,36 @@ mod tests {
     use super::*;
     use kuru_core::{Framework, RelationshipKind};
     use ratatui::backend::TestBackend;
+
+    fn progress(turn_id: &str, request_round: u32, seq: u64) -> FacingProgress {
+        FacingProgress {
+            turn_id: turn_id.into(),
+            request_round,
+            seq,
+            text_tail: "draft".into(),
+            text_truncated: false,
+            summary_tail: String::new(),
+            summary_truncated: false,
+            activity: String::new(),
+            activity_truncated: false,
+        }
+    }
+
+    #[test]
+    fn preview_fence_rejects_stale_turn_round_sequence_and_generation() {
+        let mut fence = PreviewFence::default();
+        fence.start(4, Some("current".into()));
+        assert!(!fence.admit(3, &progress("current", 1, 1)));
+        assert!(!fence.admit(4, &progress("old", 1, 1)));
+        assert!(fence.admit(4, &progress("current", 1, 1)));
+        assert!(!fence.admit(4, &progress("current", 1, 1)));
+        assert!(fence.admit(4, &progress("current", 2, 2)));
+        assert!(!fence.admit(4, &progress("current", 1, 3)));
+        fence.clear();
+        assert!(!fence.admit(4, &progress("current", 3, 4)));
+        fence.start(5, None);
+        assert!(!fence.admit(5, &progress("current", 1, 5)));
+    }
 
     fn runtime_snapshot() -> RuntimeSnapshot {
         let framework = Framework::builtin(Mode::Ifs);
@@ -1681,6 +1875,79 @@ mod tests {
         )
         .await;
         assert!(matches!(wake, Wake::Animation));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn progress_burst_coalesces_and_ready_terminal_input_still_wins() {
+        use futures::stream;
+
+        let (sender, mut progress_rx) = watch::channel(None);
+        for seq in 1..=1000 {
+            sender.send_replace(Some(progress("turn", 1, seq)));
+        }
+        let mut input = stream::repeat_with(|| Ok(TerminalEvent::Resize(80, 24)));
+        let (_completion_tx, mut completion_rx) = mpsc::channel(1);
+        let (_activity_tx, mut activity_rx) = broadcast::channel(1);
+        let available = WakeAvailability {
+            input: true,
+            completion: true,
+            activity: true,
+        };
+        let mut scheduler = Scheduler {
+            first: WakeSource::Progress,
+        };
+        let deadline = TokioInstant::now() + Duration::from_secs(60);
+        let wake = next_wake_with_progress(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            &mut progress_rx,
+            available,
+            true,
+            deadline,
+        )
+        .await;
+        assert!(matches!(wake, Wake::Progress(Ok(()))));
+        assert_eq!(progress_rx.borrow_and_update().as_ref().unwrap().seq, 1000);
+        scheduler.first = WakeSource::Terminal;
+        sender.send_replace(Some(progress("turn", 1, 1001)));
+        let wake = next_wake_with_progress(
+            &scheduler,
+            &mut input,
+            &mut completion_rx,
+            &mut activity_rx,
+            &mut progress_rx,
+            available,
+            true,
+            deadline,
+        )
+        .await;
+        assert!(matches!(
+            wake,
+            Wake::Terminal(Some(Ok(TerminalEvent::Resize(80, 24))))
+        ));
+        let mut paint = PreviewPaint::default();
+        let started = TokioInstant::now();
+        paint.mark();
+        assert!(paint.due(started), "first preview must paint promptly");
+        paint.painted(started);
+        for tick in 1..80 {
+            paint.mark();
+            assert!(
+                !paint.due(started + Duration::from_millis(tick)),
+                "a burst caused a preview-only redraw before 80 ms at {tick} ms"
+            );
+        }
+        let mut reduced = fixture();
+        reduced.busy = true;
+        reduced.motion = false;
+        reduced.focused = false;
+        assert!(!reduced.advance_animation(Duration::from_millis(80)));
+        assert!(
+            paint.due(started + PREVIEW_PAINT_INTERVAL),
+            "reduced motion or lost focus must not suppress a pending preview"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

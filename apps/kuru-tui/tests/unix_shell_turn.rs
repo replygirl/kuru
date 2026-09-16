@@ -15,6 +15,7 @@ use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
     extract::State,
+    http::header::CONTENT_TYPE,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -209,12 +210,22 @@ async fn complete(State(state): State<Arc<ProviderState>>, Json(request): Json<V
     } else {
         json!([{"type":"message","content":[{"type":"output_text","text":"fixture peer contribution"}]}])
     };
-    Json(json!({
-        "status":"completed",
-        "output":output,
-        "usage":{"input_tokens":8,"output_tokens":5},
-    }))
-    .into_response()
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "id":format!("fixture-{attempt}"),
+                    "status":"completed",
+                    "output":output,
+                    "usage":{"input_tokens":8,"output_tokens":5},
+                }
+            })
+        ),
+    )
+        .into_response()
 }
 
 struct Server {

@@ -55,6 +55,17 @@ impl Fake {
 }
 #[async_trait]
 impl Provider for Fake {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -354,6 +365,17 @@ struct FailingSpeaker(AtomicBool);
 
 #[async_trait]
 impl Provider for FailingSpeaker {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }

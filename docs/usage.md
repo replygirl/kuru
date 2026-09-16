@@ -67,6 +67,19 @@ memberships beside the conversation. Narrow panes prioritize chat and the editor
 The activity feed shows peer routing and phase changes without printing private
 peer messages or state notes.
 
+While the selected speaker responds, a provisional preview shows its latest
+text, including an unfinished line. A separate thinking region shows a
+provider-supplied visible summary or the current activity when no summary is
+available. This also works when a relationship speaks; private deliberation,
+peer consultations and dreams remain hidden.
+
+The preview keeps a bounded tail and indicates when earlier text is omitted.
+If tools lead to another speaking round, the next draft replaces the previous
+one. The completed answer replaces the preview and enters the conversation
+once. Cancelling clears the preview; provisional text and visible summaries
+are not saved or replayed by resume or `/retry`. Scripted `kuru run` text and
+JSON output remain final-only.
+
 Each framework has its own portrait: IFS orbits, polyvagal flows, a Freudian
 triangle and a Jungian rosette. Quiet ASCII contours animate while the pane has
 focus, at up to four frames per second. A faint color highlight moves through

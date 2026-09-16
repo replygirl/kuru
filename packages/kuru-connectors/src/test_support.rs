@@ -128,8 +128,30 @@ async fn handle(
         .await
         .pop_front()
         .expect("unexpected fixture request");
-    let text = reply.body.replace("\"$ID\"", &body["id"].to_string());
-    let mut response = (reply.status, [("Content-Type", reply.content_type)], text).into_response();
+    let streaming_json = body["stream"] == true
+        && reply.status == StatusCode::OK
+        && reply.content_type == "application/json";
+    let text = if streaming_json {
+        let mut response: Value = serde_json::from_str(&reply.body).unwrap();
+        if response["id"].is_null() {
+            response["id"] = json!("fixture-response");
+        }
+        if response["status"].is_null() {
+            response["status"] = json!("completed");
+        }
+        format!(
+            "data: {}\n\n",
+            json!({"type":"response.completed","response":response})
+        )
+    } else {
+        reply.body.replace("\"$ID\"", &body["id"].to_string())
+    };
+    let content_type = if streaming_json {
+        "text/event-stream"
+    } else {
+        reply.content_type
+    };
+    let mut response = (reply.status, [("Content-Type", content_type)], text).into_response();
     if reply.session {
         response
             .headers_mut()

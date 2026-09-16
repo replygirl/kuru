@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, fmt::Write as _};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kuru::ui::{InitialViewData, RuntimeSnapshot, View, draw};
 use kuru_core::{Framework, Mode, ModelInfo};
-use kuru_runtime::{Event, PeerMessage};
+use kuru_runtime::{Event, FacingProgress, PeerMessage};
 use ratatui::{
     Terminal,
     backend::TestBackend,
@@ -42,6 +42,51 @@ fn fixture(mode: Mode) -> View {
             metadata: Default::default(),
         }],
     )
+}
+
+#[test]
+fn provisional_tail_and_thinking_remain_separate_from_transcript_at_practical_sizes() {
+    let mut view = fixture(Mode::Ifs);
+    view.show_scene = false;
+    view.busy = true;
+    view.input = "draft for next turn".into();
+    view.preview = Some(FacingProgress {
+        turn_id: "turn".into(),
+        request_round: 1,
+        seq: 3,
+        text_tail: "earlier\nsecond\nthird\nVISIBLE_PARTIAL_TAIL".into(),
+        text_truncated: false,
+        summary_tail: "VISIBLE_THINKING_SUMMARY\ncontinued".into(),
+        summary_truncated: false,
+        activity: "selected voice composing".into(),
+        activity_truncated: false,
+    });
+    for (width, height) in [(80, 24), (120, 40), (40, 18)] {
+        let (buffer, cursor) = render(&view, width, height, &format!("provisional-{width}"));
+        let screen = text(&buffer);
+        assert!(
+            screen.contains("VISIBLE_PARTIAL_TAIL"),
+            "missing preview at {width}x{height}: {screen}"
+        );
+        assert!(
+            screen.contains("thinking"),
+            "missing summary label at {width}x{height}: {screen}"
+        );
+        assert!(
+            screen.contains("activity"),
+            "missing activity at {width}x{height}: {screen}"
+        );
+        assert!(
+            screen.contains("earlier text omitted"),
+            "hidden draft lacks truncation cue at {width}x{height}: {screen}"
+        );
+        assert!(
+            screen.contains("draft for next turn"),
+            "composer lost at {width}x{height}: {screen}"
+        );
+        assert!(cursor.0 < width && cursor.1 < height);
+        assert!(view.transcript.is_empty());
+    }
 }
 
 fn key(code: KeyCode) -> KeyEvent {

@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use axum::{Router, body::Bytes, extract::State, routing::any};
 use kuru_connectors::{DemoProvider, Provider, ToolHost};
 use kuru_core::{
-    Completion, CompletionRequest, Config, ConfigSnapshot, InvocationOverrides, McpConfig,
-    ModelInfo, ProjectPreferences,
+    CompletionRequest, Config, ConfigSnapshot, InvocationOverrides, McpConfig, ModelInfo,
+    ProjectPreferences,
 };
 use kuru_delivery::command::BlockingCommand as Command;
 use kuru_memory::MemoryStore;
@@ -109,12 +109,16 @@ impl Provider for RecordingDemo {
         DemoProvider.models().await
     }
 
-    async fn complete(&self, request: CompletionRequest) -> anyhow::Result<Completion> {
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
         self.instructions
             .lock()
             .unwrap()
             .push(request.instructions.clone());
-        DemoProvider.complete(request).await
+        DemoProvider.stream(request, sink).await
     }
 }
 

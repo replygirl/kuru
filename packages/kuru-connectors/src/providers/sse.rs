@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 
 use crate::MAX_BYTES;
 
-use super::diagnostics::{self, Operation};
+use super::{
+    ProviderEvent, ProviderFailureKind, ProviderSink, TextDeltaSource,
+    diagnostics::{self, Operation},
+};
 
 // The retained result remains Kuru's 2 MiB protocol limit. SSE transport can
 // contain independently discarded deltas and framing, but never grows without
@@ -24,6 +27,8 @@ pub(super) async fn response(
     response: reqwest::Response,
     idle: Duration,
     operation: Operation,
+    allow_missing_content_type: bool,
+    sink: &mut dyn ProviderSink,
 ) -> Result<Value> {
     let mut response = diagnostics::successful(response, operation).await?;
     ensure!(
@@ -41,6 +46,11 @@ pub(super) async fn response(
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream")),
             "ChatGPT response is not an event stream"
         );
+    } else {
+        ensure!(
+            allow_missing_content_type,
+            "Responses API response is not an event stream"
+        );
     }
     let mut decoder = Decoder::default();
     loop {
@@ -49,9 +59,25 @@ pub(super) async fn response(
             .context("Responses stream exceeded idle timeout")?
             .map_err(|error| diagnostics::transport(operation, error))?;
         let Some(chunk) = chunk else {
+            sink.emit(ProviderEvent::Failed {
+                kind: ProviderFailureKind::Incomplete,
+            })
+            .await?;
             bail!("Responses stream closed before response.completed");
         };
-        if let Some(value) = decoder.push(&chunk)? {
+        let value = match decoder.push(&chunk) {
+            Ok(value) => value,
+            Err(error) => {
+                for event in decoder.take_observations() {
+                    sink.emit(event).await?;
+                }
+                return Err(error);
+            }
+        };
+        for event in decoder.take_observations() {
+            sink.emit(event).await?;
+        }
+        if let Some(value) = value {
             return Ok(value);
         }
     }
@@ -67,9 +93,18 @@ struct Decoder {
     started: bool,
     items: BTreeMap<usize, Value>,
     ids: BTreeSet<String>,
+    observations: Vec<ProviderEvent>,
+    text_fragments: BTreeMap<(u64, String, u64, TextDeltaSource), String>,
+    summary_fragments: BTreeMap<(u64, String, u64), String>,
+    tool_fragments: BTreeMap<(u64, String), String>,
+    tool_done: BTreeMap<(u64, String), (String, String)>,
+    settled: bool,
 }
 
 impl Decoder {
+    fn take_observations(&mut self) -> Vec<ProviderEvent> {
+        std::mem::take(&mut self.observations)
+    }
     fn push(&mut self, bytes: &[u8]) -> Result<Option<Value>> {
         self.wire_bytes = self
             .wire_bytes
@@ -79,6 +114,7 @@ impl Decoder {
             self.wire_bytes <= MAX_SSE_WIRE_BYTES,
             "Responses stream exceeds wire size limit"
         );
+        let mut completed = None;
         for &byte in bytes {
             if self.after_cr {
                 self.after_cr = false;
@@ -89,7 +125,10 @@ impl Decoder {
             if matches!(byte, b'\n' | b'\r') {
                 self.after_cr = byte == b'\r';
                 if let Some(value) = self.end_line()? {
-                    return Ok(Some(value));
+                    ensure!(
+                        completed.replace(value).is_none(),
+                        "duplicate terminal stream event"
+                    );
                 }
             } else {
                 self.line.push(byte);
@@ -99,7 +138,7 @@ impl Decoder {
                 );
             }
         }
-        Ok(None)
+        Ok(completed)
     }
 
     fn end_line(&mut self) -> Result<Option<Value>> {
@@ -150,10 +189,133 @@ impl Decoder {
     }
 
     fn event(&mut self, event: Value) -> Result<Option<Value>> {
+        ensure!(
+            !self.settled,
+            "Responses stream contains an event after its terminal outcome"
+        );
         match event["type"]
             .as_str()
             .context("Responses event lacks type")?
         {
+            "response.output_text.delta" | "response.refusal.delta" => {
+                let item_id = event["item_id"]
+                    .as_str()
+                    .context("stream text delta lacks item ID")?;
+                let output_index = event["output_index"]
+                    .as_u64()
+                    .context("stream text delta lacks output index")?;
+                let content_index = event["content_index"]
+                    .as_u64()
+                    .context("stream text delta lacks content index")?;
+                let text = event["delta"]
+                    .as_str()
+                    .context("stream text delta lacks text")?;
+                ensure!(
+                    text.len() <= MAX_BYTES,
+                    "Responses stream delta exceeds retained output limit"
+                );
+                let source = if event["type"] == "response.refusal.delta" {
+                    TextDeltaSource::Refusal
+                } else {
+                    TextDeltaSource::OutputText
+                };
+                append_fragment(
+                    &mut self.text_fragments,
+                    (output_index, item_id.into(), content_index, source),
+                    text,
+                )?;
+                self.observations.push(ProviderEvent::TextDelta {
+                    item_id: item_id.into(),
+                    output_index,
+                    content_index,
+                    source,
+                    text: text.into(),
+                });
+            }
+            "response.reasoning_summary_text.delta" => {
+                let item_id = event["item_id"]
+                    .as_str()
+                    .context("stream summary delta lacks item ID")?;
+                let output_index = event["output_index"]
+                    .as_u64()
+                    .context("stream summary delta lacks output index")?;
+                let summary_index = event["summary_index"]
+                    .as_u64()
+                    .context("stream summary delta lacks summary index")?;
+                let text = event["delta"]
+                    .as_str()
+                    .context("stream summary delta lacks text")?;
+                ensure!(
+                    text.len() <= MAX_BYTES,
+                    "Responses stream delta exceeds retained output limit"
+                );
+                append_fragment(
+                    &mut self.summary_fragments,
+                    (output_index, item_id.into(), summary_index),
+                    text,
+                )?;
+                self.observations
+                    .push(ProviderEvent::ReasoningSummaryDelta {
+                        item_id: item_id.into(),
+                        output_index,
+                        summary_index,
+                        text: text.into(),
+                    });
+            }
+            "response.function_call_arguments.delta" => {
+                let item_id = event["item_id"]
+                    .as_str()
+                    .context("stream function delta lacks item ID")?;
+                let output_index = event["output_index"]
+                    .as_u64()
+                    .context("stream function delta lacks output index")?;
+                let arguments_fragment = event["delta"]
+                    .as_str()
+                    .context("stream function delta lacks arguments")?;
+                ensure!(
+                    arguments_fragment.len() <= MAX_BYTES,
+                    "Responses stream delta exceeds retained output limit"
+                );
+                append_fragment(
+                    &mut self.tool_fragments,
+                    (output_index, item_id.into()),
+                    arguments_fragment,
+                )?;
+                self.observations.push(ProviderEvent::ToolCallDelta {
+                    item_id: item_id.into(),
+                    output_index,
+                    arguments_fragment: arguments_fragment.into(),
+                });
+            }
+            "response.function_call_arguments.done" => {
+                let item_id = event["item_id"]
+                    .as_str()
+                    .context("completed function arguments lack item ID")?;
+                let output_index = event["output_index"]
+                    .as_u64()
+                    .context("completed function arguments lack output index")?;
+                let arguments = event["arguments"]
+                    .as_str()
+                    .context("completed function arguments lack arguments")?;
+                let name = event["name"]
+                    .as_str()
+                    .context("completed function arguments lack name")?;
+                ensure!(
+                    arguments.len() <= MAX_BYTES && name.len() <= MAX_BYTES,
+                    "Responses completed function arguments exceed retained output limit"
+                );
+                let _: Value =
+                    serde_json::from_str(arguments).map_err(|_| diagnostics::stream_protocol())?;
+                ensure!(
+                    self.tool_done
+                        .insert(
+                            (output_index, item_id.into()),
+                            (arguments.into(), name.into())
+                        )
+                        .is_none(),
+                    "duplicate completed function arguments"
+                );
+            }
             "response.output_item.done" => {
                 let index = event["output_index"]
                     .as_u64()
@@ -208,25 +370,38 @@ impl Decoder {
                     response["error"].is_null(),
                     "Responses completed event contains an error"
                 );
-                ensure!(
-                    self.items.keys().copied().eq(0..self.items.len()),
-                    "streamed output indexes are incomplete"
-                );
-                let items: Vec<_> = std::mem::take(&mut self.items).into_values().collect();
+                let items = std::mem::take(&mut self.items);
                 if let Some(output) = response.get("output") {
                     let output = output
                         .as_array()
                         .context("completed response has invalid output")?;
-                    if !items.is_empty() && !output.is_empty() {
+                    let mut final_ids = BTreeSet::new();
+                    for item in output {
+                        if let Some(id) = item["id"].as_str() {
+                            ensure!(final_ids.insert(id), "duplicate completed output ID");
+                        }
+                    }
+                    for (index, item) in &items {
+                        let final_item = output
+                            .get(*index)
+                            .context("completed response omits streamed output")?;
                         ensure!(
-                            output == &items,
+                            final_item == item,
                             "completed response disagrees with streamed output"
                         );
                     }
+                } else {
+                    ensure!(
+                        !items.is_empty(),
+                        "completed response lacks authoritative output"
+                    );
+                    ensure!(
+                        items.keys().copied().eq(0..items.len()),
+                        "streamed output indexes are incomplete"
+                    );
+                    response["output"] = json!(items.into_values().collect::<Vec<_>>());
                 }
-                if !items.is_empty() || response.get("output").is_none() {
-                    response["output"] = json!(items);
-                }
+                self.reconcile_fragments(&response)?;
                 response["status"] = json!("completed");
                 let response_bytes = serde_json::to_vec(&response)
                     .map_err(|_| diagnostics::stream_protocol())?
@@ -235,16 +410,182 @@ impl Decoder {
                     response_bytes <= MAX_BYTES,
                     "Responses retained response exceeds size limit"
                 );
+                self.settled = true;
+                self.observations
+                    .push(ProviderEvent::Usage(super::usage(&response)));
                 return Ok(Some(response));
             }
             // Do not echo remote messages: they can contain tokens or actor
             // context. The event classification is sufficient for this error.
-            "response.failed" => return Err(diagnostics::stream_event(&event)),
-            "response.incomplete" | "error" => return Err(diagnostics::stream_failed()),
+            "response.failed" => {
+                if let Some(response) = event.get("response") {
+                    self.observations
+                        .push(ProviderEvent::Usage(super::usage(response)));
+                }
+                self.settled = true;
+                self.observations.push(ProviderEvent::Failed {
+                    kind: ProviderFailureKind::Failed,
+                });
+                return Err(diagnostics::stream_event(&event));
+            }
+            "response.incomplete" => {
+                if let Some(response) = event.get("response") {
+                    self.observations
+                        .push(ProviderEvent::Usage(super::usage(response)));
+                }
+                self.settled = true;
+                self.observations.push(ProviderEvent::Failed {
+                    kind: ProviderFailureKind::Incomplete,
+                });
+                return Err(diagnostics::stream_failed());
+            }
+            "error" => {
+                self.settled = true;
+                self.observations.push(ProviderEvent::Failed {
+                    kind: ProviderFailureKind::Error,
+                });
+                return Err(diagnostics::stream_failed());
+            }
             _ => {}
         }
         Ok(None)
     }
+}
+
+impl Decoder {
+    fn reconcile_fragments(&self, response: &Value) -> Result<()> {
+        let output = response["output"]
+            .as_array()
+            .context("completed response lacks output")?;
+        for ((index, item_id, content_index, source), fragment) in &self.text_fragments {
+            let item = output
+                .get(*index as usize)
+                .context("stream text fragment lacks final item")?;
+            ensure!(
+                item["id"].as_str() == Some(item_id),
+                "stream text fragment item ID disagrees with final output"
+            );
+            let part = item["content"]
+                .as_array()
+                .and_then(|content| content.get(*content_index as usize))
+                .context("stream text fragment lacks final content")?;
+            let final_text = match source {
+                TextDeltaSource::OutputText => {
+                    ensure!(
+                        part["type"] == "output_text",
+                        "stream text fragment has incompatible final content"
+                    );
+                    part["text"].as_str()
+                }
+                TextDeltaSource::Refusal => {
+                    ensure!(
+                        part["type"] == "refusal",
+                        "stream text fragment has incompatible final content"
+                    );
+                    part["refusal"].as_str()
+                }
+            }
+            .context("stream text fragment has incompatible final content")?;
+            ensure!(
+                final_text == fragment,
+                "stream text fragment disagrees with final output"
+            );
+        }
+        for ((index, item_id, summary_index), fragment) in &self.summary_fragments {
+            let item = output
+                .get(*index as usize)
+                .context("stream summary fragment lacks final item")?;
+            ensure!(
+                item["id"].as_str() == Some(item_id),
+                "stream summary fragment item ID disagrees with final output"
+            );
+            ensure!(
+                item["type"] == "reasoning",
+                "stream summary fragment has incompatible final item"
+            );
+            let summary = item["summary"]
+                .as_array()
+                .and_then(|summary| summary.get(*summary_index as usize))
+                .context("stream summary fragment lacks final summary")?;
+            ensure!(
+                summary["type"] == "summary_text",
+                "stream summary fragment has incompatible final summary"
+            );
+            let final_text = summary["text"]
+                .as_str()
+                .or_else(|| summary["summary_text"].as_str())
+                .context("stream summary fragment has incompatible final summary")?;
+            ensure!(
+                final_text == fragment,
+                "stream summary fragment disagrees with final output"
+            );
+        }
+        for ((index, item_id), fragment) in &self.tool_fragments {
+            let item = output
+                .get(*index as usize)
+                .context("stream function fragment lacks final item")?;
+            ensure!(
+                item["id"].as_str() == Some(item_id),
+                "stream function fragment item ID disagrees with final output"
+            );
+            ensure!(
+                item["type"] == "function_call",
+                "stream function fragment has incompatible final item"
+            );
+            let final_arguments = item["arguments"]
+                .as_str()
+                .context("stream function fragment lacks final arguments")?;
+            ensure!(
+                final_arguments == fragment,
+                "stream function fragment disagrees with final output"
+            );
+            let _: Value = serde_json::from_str(final_arguments)
+                .map_err(|_| diagnostics::stream_protocol())?;
+        }
+        for ((index, item_id), (arguments, name)) in &self.tool_done {
+            let item = output
+                .get(*index as usize)
+                .context("completed function arguments lack final item")?;
+            ensure!(
+                item["id"].as_str() == Some(item_id),
+                "completed function item ID disagrees with final output"
+            );
+            ensure!(
+                item["type"] == "function_call",
+                "completed function has incompatible final item"
+            );
+            ensure!(
+                item["name"].as_str() == Some(name),
+                "completed function name disagrees with final output"
+            );
+            let final_arguments = item["arguments"]
+                .as_str()
+                .context("completed function arguments lack final arguments")?;
+            let expected: Value =
+                serde_json::from_str(arguments).map_err(|_| diagnostics::stream_protocol())?;
+            let actual: Value = serde_json::from_str(final_arguments)
+                .map_err(|_| diagnostics::stream_protocol())?;
+            ensure!(
+                expected == actual,
+                "completed function arguments disagree with final output"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn append_fragment<K: Ord>(fragments: &mut BTreeMap<K, String>, key: K, value: &str) -> Result<()> {
+    let entry = fragments.entry(key).or_default();
+    let size = entry
+        .len()
+        .checked_add(value.len())
+        .context("Responses stream fragment size overflow")?;
+    ensure!(
+        size <= MAX_BYTES,
+        "Responses stream fragment exceeds retained output limit"
+    );
+    entry.push_str(value);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -255,9 +596,9 @@ mod tests {
     fn fragments_utf8_crlf_multiline_data_and_completed_items() {
         let bytes = concat!(
             "\u{feff}:keepalive\r\n\r\n",
-            "event: ignored-label\r\ndata: {\"type\":\"response.output_item.done\",\r\ndata: \"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"text\":\"échec\"}]}}\r\n\r\n",
+            "event: ignored-label\r\ndata: {\"type\":\"response.output_item.done\",\r\ndata: \"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"échec\"}]}}\r\n\r\n",
             "data: {\"type\":\"future.metadata\",\"ignored\":true}\r\r",
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"échec\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"delta\":\"échec\"}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}\n\n"
         ).as_bytes();
         for width in [1, 2, 3, 11, bytes.len()] {
@@ -273,6 +614,111 @@ mod tests {
             assert_eq!(result["output"][0]["content"][0]["text"], "échec");
             assert_eq!(result["usage"]["input_tokens"], 7);
         }
+    }
+
+    #[test]
+    fn reconciles_sparse_raw_indexes_against_full_terminal_output() {
+        let output = json!([
+            {"type":"reasoning","id":"reasoning-0","summary":[]},
+            {"type":"message","id":"message-1","content":[{"type":"output_text","text":"visible"}]},
+            {"type":"function_call","id":"call-2","call_id":"call-id","name":"file_read","arguments":"{\"path\":\"a.txt\"}"}
+        ]);
+        let events = [
+            json!({"type":"response.output_text.delta","item_id":"message-1","output_index":1,"content_index":0,"delta":"vis"}),
+            json!({"type":"response.output_text.delta","item_id":"message-1","output_index":1,"content_index":0,"delta":"ible"}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"call-2","output_index":2,"delta":"{\"path\":\""}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"call-2","output_index":2,"delta":"a.txt\"}"}),
+            json!({"type":"response.function_call_arguments.done","item_id":"call-2","output_index":2,"name":"file_read","arguments":"{ \"path\" : \"a.txt\" }"}),
+            json!({"type":"response.completed","response":{"id":"r1","output":output}}),
+        ];
+        let bytes: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        let result = Decoder::default().push(bytes.as_bytes()).unwrap().unwrap();
+        assert_eq!(result["output"], output);
+    }
+
+    #[test]
+    fn reconciles_visible_summary_and_refusal_and_rejects_conflicts() {
+        let output = json!([
+            {"type":"reasoning","id":"reasoning-0","summary":[{"type":"summary_text","text":"careful"}]},
+            {"type":"message","id":"message-1","content":[{"type":"refusal","refusal":"cannot"}]}
+        ]);
+        let valid = [
+            json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-0","output_index":0,"summary_index":0,"delta":"careful"}),
+            json!({"type":"response.refusal.delta","item_id":"message-1","output_index":1,"content_index":0,"delta":"cannot"}),
+            json!({"type":"response.completed","response":{"id":"r1","output":output}}),
+        ];
+        let bytes: String = valid
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        assert!(Decoder::default().push(bytes.as_bytes()).unwrap().is_some());
+
+        let conflict = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.output_text.delta","item_id":"message-1","output_index":1,"content_index":0,"delta":"wrong"}),
+            json!({"type":"response.completed","response":{"id":"r1","output":output}}),
+        );
+        assert!(Decoder::default().push(conflict.as_bytes()).is_err());
+
+        let hidden_refusal = json!({"type":"response.completed","response":{"id":"r1","output":[
+            {"type":"message","id":"message-1","content":[{"type":"output_text","text":"safe","refusal":"hidden"}]}
+        ]}});
+        let conflict = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.refusal.delta","item_id":"message-1","output_index":0,"content_index":0,"delta":"hidden"}),
+            hidden_refusal,
+        );
+        assert!(Decoder::default().push(conflict.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_buffered_terminal_and_accepts_terminal_only_success() {
+        let terminal = json!({"type":"response.completed","response":{"id":"r1","output":[{"type":"message","content":[{"type":"output_text","text":"terminal"}]}]}});
+        let terminal_only = format!("data: {terminal}\n\n");
+        assert!(
+            Decoder::default()
+                .push(terminal_only.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+        let duplicate = format!("{terminal_only}data: {terminal}\n\n");
+        assert!(Decoder::default().push(duplicate.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn requires_authoritative_output_and_unique_terminal_item_ids() {
+        let no_output = json!({"type":"response.completed","response":{"id":"r1"}});
+        assert!(
+            Decoder::default()
+                .push(format!("data: {no_output}\n\n").as_bytes())
+                .is_err()
+        );
+
+        let duplicates = json!({"type":"response.completed","response":{"id":"r1","output":[
+            {"type":"message","id":"same","content":[]},
+            {"type":"reasoning","id":"same","summary":[]}
+        ]}});
+        assert!(
+            Decoder::default()
+                .push(format!("data: {duplicates}\n\n").as_bytes())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_tool_fragment_for_non_function_terminal_item() {
+        let terminal = json!({"type":"response.completed","response":{"id":"r1","output":[{
+            "type":"message","id":"message-1","name":"file_read","arguments":"{}","content":[]
+        }]}});
+        let data = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.function_call_arguments.delta","item_id":"message-1","output_index":0,"delta":"{}"}),
+            terminal,
+        );
+        assert!(Decoder::default().push(data.as_bytes()).is_err());
     }
 
     #[test]

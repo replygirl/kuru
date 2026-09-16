@@ -9,6 +9,33 @@ use axum::{
     routing::any,
 };
 use std::collections::VecDeque;
+use std::{future::Future, pin::Pin};
+use tokio::sync::{mpsc, oneshot};
+
+struct DiscardSink;
+impl ProviderSink for DiscardSink {
+    fn emit<'a>(
+        &'a mut self,
+        _: ProviderEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct EventSink(mpsc::Sender<ProviderEvent>);
+impl ProviderSink for EventSink {
+    fn emit<'a>(
+        &'a mut self,
+        event: ProviderEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.0
+                .send(event)
+                .await
+                .map_err(|_| anyhow::anyhow!("test observer closed"))
+        })
+    }
+}
 
 struct Recorded {
     uri: Uri,
@@ -791,10 +818,13 @@ async fn real_idle_stream_is_bounded_and_dropped() {
     });
     let _abort = AbortOnDrop(server.abort_handle());
     let response = http::client().unwrap().get(url).send().await.unwrap();
+    let mut sink = DiscardSink;
     let error = sse::response(
         response,
         Duration::from_millis(100),
         diagnostics::Operation::ChatgptCompletion,
+        true,
+        &mut sink,
     )
     .await
     .unwrap_err();
@@ -850,6 +880,85 @@ async fn raw_subscription_stream_with_chunks(
         }).await.expect("raw subscription fixture exceeded its bound");
     });
     (base, task)
+}
+
+async fn raw_subscription_stream_paused_after_delta(
+    delta: String,
+    terminal: String,
+) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (release, released) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in delta.as_bytes().chunks(1) {
+                socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+                socket.flush().await.unwrap();
+            }
+            released.await.unwrap();
+            for chunk in terminal.as_bytes().chunks(1) {
+                socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        })
+        .await
+        .expect("paused raw subscription fixture exceeded its bound");
+    });
+    (base, release, task)
+}
+
+#[tokio::test]
+async fn subscription_sse_delta_reaches_observer_before_delayed_terminal() {
+    let peer = Peer::new(vec![]).await;
+    let (mut provider, _manager, _directory) = subscription(&peer).await;
+    let delta = "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"message-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"visible\"}\n\n".into();
+    let terminal = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[{\"type\":\"message\",\"id\":\"message-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"visible\"}]}]}}\n\n".into();
+    let (base, release, server) = raw_subscription_stream_paused_after_delta(delta, terminal).await;
+    let _abort = AbortOnDrop(server.abort_handle());
+    provider.base = base;
+    let (sender, mut observed) = mpsc::channel(8);
+    let mut sink = EventSink(sender);
+    let mut stream = Box::pin(provider.stream(request(), &mut sink));
+    let first = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            event = observed.recv() => event,
+            result = &mut stream => panic!("stream settled before a delta: {result:?}"),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(first, Some(ProviderEvent::TextDelta { text, .. }) if text == "visible"));
+    release.send(()).unwrap();
+    stream.as_mut().await.unwrap();
+    let terminal = [observed.recv().await, observed.recv().await];
+    assert!(
+        terminal
+            .iter()
+            .any(|event| matches!(event, Some(ProviderEvent::Completed(_))))
+    );
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

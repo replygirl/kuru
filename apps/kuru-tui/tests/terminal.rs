@@ -3,7 +3,7 @@
 use kuru_memory::MemoryStore;
 
 use std::{
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::PathBuf,
     process::Command,
     sync::{
@@ -16,9 +16,13 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
+    body::Body,
     extract::State,
+    http::header::CONTENT_TYPE,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures::stream;
 use kuru_core::{Config, Mode, SelectionOverrides};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -576,7 +580,7 @@ struct ProviderState {
     release: watch::Receiver<bool>,
 }
 
-async fn complete(State(mut state): State<ProviderState>, Json(_): Json<Value>) -> Json<Value> {
+async fn complete(State(mut state): State<ProviderState>, Json(_): Json<Value>) -> Response {
     state.requests.fetch_add(1, Ordering::SeqCst);
     let delayed = !*state.release.borrow();
     state.started.store(true, Ordering::SeqCst);
@@ -589,12 +593,24 @@ async fn complete(State(mut state): State<ProviderState>, Json(_): Json<Value>) 
         .expect("fixture release timed out")
         .expect("fixture release channel closed");
     }
-    Json(json!({
-        "status":"completed", "output":[{"type":"message", "content":[{
-            "type":"output_text", "text": if delayed { "LATE_RESPONSE_MUST_STAY_ABSENT" }
-            else { "FRESH_RESPONSE_MARKER" }
-        }]}], "usage":{"input_tokens":8,"output_tokens":5}
-    }))
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"terminal-fixture",
+                    "status":"completed",
+                    "output":[{"type":"message", "content":[{
+                        "type":"output_text", "text": if delayed { "LATE_RESPONSE_MUST_STAY_ABSENT" }
+                        else { "FRESH_RESPONSE_MARKER" }
+                    }]}],
+                    "usage":{"input_tokens":8,"output_tokens":5}
+                }
+            })
+        ),
+    ).into_response()
 }
 
 struct Server(tokio::task::JoinHandle<()>);
@@ -602,6 +618,264 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[derive(Clone)]
+struct StreamingState {
+    selected_started: Arc<AtomicBool>,
+    selected_requests: Arc<AtomicUsize>,
+    release: watch::Receiver<bool>,
+    burst: bool,
+}
+
+async fn streaming_complete(
+    State(state): State<StreamingState>,
+    Json(request): Json<Value>,
+) -> Response {
+    let speaking = request["instructions"]
+        .as_str()
+        .is_some_and(|instructions| instructions.contains("Phase: speak and act"));
+    if !speaking {
+        return (
+            [(CONTENT_TYPE, "text/event-stream")],
+            format!(
+                "data: {}\n\n",
+                json!({"type":"response.completed","response":{
+                    "id":"private-deliberation","status":"completed",
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"PRIVATE_PEER_SENTINEL"}]}],
+                    "usage":{"input_tokens":8,"output_tokens":5}
+                }})
+            ),
+        )
+            .into_response();
+    }
+    state.selected_started.store(true, Ordering::SeqCst);
+    if state.selected_requests.fetch_add(1, Ordering::SeqCst) > 0 {
+        return (
+            [(CONTENT_TYPE, "text/event-stream")],
+            format!(
+                "data: {}\n\n",
+                json!({"type":"response.completed","response":{
+                    "id":"after-cancel","status":"completed",
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"FRESH_AFTER_CANCEL"}]}],
+                    "usage":{"input_tokens":8,"output_tokens":5}
+                }})
+            ),
+        ).into_response();
+    }
+    let mut first = format!(
+        "data: {}\n\n",
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-1","output_index":0,"summary_index":0,"delta":"VISIBLE_SUMMARY"}),
+    );
+    let leading = if state.burst {
+        "x".repeat(16 * 1024)
+    } else {
+        String::new()
+    };
+    for chunk in leading.as_bytes().chunks(128) {
+        first.push_str(&format!(
+            "data: {}\n\n",
+            json!({"type":"response.output_text.delta","item_id":"message-1","output_index":1,"content_index":0,"delta":std::str::from_utf8(chunk).expect("ASCII burst")}),
+        ));
+    }
+    first.push_str(&format!(
+        "data: {}\n\n",
+        json!({"type":"response.output_text.delta","item_id":"message-1","output_index":1,"content_index":0,"delta":"VISIBLE_LIVE_TAIL "}),
+    ));
+    let final_text = format!("{leading}VISIBLE_LIVE_TAIL FINAL_PUBLIC");
+    let last = format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({"type":"response.output_text.delta","item_id":"message-1","output_index":1,"content_index":0,"delta":"FINAL_PUBLIC"}),
+        json!({"type":"response.completed","response":{
+            "id":"selected-final","status":"completed",
+            "output":[
+                {"id":"reasoning-1","type":"reasoning","summary":[{"type":"summary_text","text":"VISIBLE_SUMMARY"}],"encrypted_content":"PRIVATE_NATIVE_SENTINEL"},
+                {"id":"message-1","type":"message","content":[{"type":"output_text","text":final_text}]}
+            ],
+            "usage":{"input_tokens":8,"output_tokens":5}
+        }}),
+    );
+    let body = stream::unfold((0u8, state.release), move |(phase, mut release)| {
+        let first = first.clone();
+        let last = last.clone();
+        async move {
+            match phase {
+                0 => Some((Ok::<_, io::Error>(first), (1, release))),
+                1 => {
+                    if !*release.borrow() {
+                        release.wait_for(|ready| *ready).await.ok()?;
+                    }
+                    Some((Ok(last), (2, release)))
+                }
+                _ => None,
+            }
+        }
+    });
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(body),
+    )
+        .into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_previews_delayed_native_selected_stream_at_three_sizes() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let (release, receiver) = watch::channel(false);
+    let selected_started = Arc::new(AtomicBool::new(false));
+    let selected_requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(streaming_complete))
+        .with_state(StreamingState {
+            selected_started: selected_started.clone(),
+            selected_requests,
+            release: receiver,
+            burst: true,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("streaming-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 24, 80)?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.send(b"Stream to the user\r")?;
+    terminal.wait("selected provider request started", READY_TIMEOUT, |_| {
+        Ok(selected_started.load(Ordering::SeqCst))
+    })?;
+    for (rows, cols) in [(24, 80), (40, 120), (18, 40)] {
+        if (rows, cols) != (24, 80) {
+            terminal.resize(rows, cols)?;
+        }
+        terminal.wait_composer_frame(
+            &[
+                "VISIBLE_LIVE_TAIL",
+                "thinking",
+                "VISIBLE_SUMMARY",
+                "earlier text omitted",
+            ],
+            READY_TIMEOUT,
+        )?;
+        let screen = terminal.screen();
+        ensure!(
+            !screen.contains("PRIVATE_PEER_SENTINEL")
+                && !screen.contains("PRIVATE_NATIVE_SENTINEL"),
+            "private material appeared at {cols}x{rows}: {screen}"
+        );
+        ensure!(
+            !screen.contains("FINAL_PUBLIC"),
+            "terminal answer appeared before completion"
+        );
+    }
+    terminal.send(b"\x1b[200~NEXT_DRAFT\x1b[201~")?;
+    terminal.wait_composer_frame(&["NEXT_DRAFT", "VISIBLE_LIVE_TAIL"], READY_TIMEOUT)?;
+    release.send(true)?;
+    terminal.wait_composer_frame(&["FINAL_PUBLIC", "NEXT_DRAFT", "enter send"], READY_TIMEOUT)?;
+    let screen = terminal.screen();
+    ensure!(
+        !screen.contains("draft · provisional") && !screen.contains("VISIBLE_SUMMARY"),
+        "settled answer retained a provisional panel: {screen}"
+    );
+    let terminal_output = String::from_utf8_lossy(&terminal.output);
+    ensure!(
+        !terminal_output.contains("PRIVATE_PEER_SENTINEL")
+            && !terminal_output.contains("PRIVATE_NATIVE_SENTINEL"),
+        "private material appeared in terminal output"
+    );
+    terminal.send(b"\x03")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_cancels_provisional_stream_then_retries_only_completed_answer() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let (_release, receiver) = watch::channel(false);
+    let selected_started = Arc::new(AtomicBool::new(false));
+    let selected_requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(streaming_complete))
+        .with_state(StreamingState {
+            selected_started: selected_started.clone(),
+            selected_requests: selected_requests.clone(),
+            release: receiver,
+            burst: false,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("cancel-streaming-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 24, 80)?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.send(b"First turn\r")?;
+    terminal.wait("selected provider request started", READY_TIMEOUT, |_| {
+        Ok(selected_started.load(Ordering::SeqCst))
+    })?;
+    terminal.wait_composer_frame(&["VISIBLE_LIVE_TAIL", "VISIBLE_SUMMARY"], READY_TIMEOUT)?;
+    terminal.send(b"\x1b")?;
+    terminal.wait_composer_frame(&["Turn interrupted", "enter send"], READY_TIMEOUT)?;
+    let cancelled = terminal.screen();
+    ensure!(
+        !cancelled.contains("VISIBLE_LIVE_TAIL") && !cancelled.contains("VISIBLE_SUMMARY"),
+        "cancelled preview remained visible: {cancelled}"
+    );
+    terminal.send(b"Second turn\r")?;
+    terminal.wait_composer_frame(&["FRESH_AFTER_CANCEL", "enter send"], READY_TIMEOUT)?;
+    ensure_eq_selected_requests(&selected_requests, 2)?;
+    terminal.send(b"/retry\r")?;
+    terminal.wait_composer_frame(
+        &["Stored result reused", "FRESH_AFTER_CANCEL"],
+        READY_TIMEOUT,
+    )?;
+    ensure_eq_selected_requests(&selected_requests, 2)?;
+    ensure!(!String::from_utf8_lossy(&terminal.output).contains("PRIVATE_NATIVE_SENTINEL"));
+    terminal.send(b"\x03")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
+fn ensure_eq_selected_requests(selected_requests: &AtomicUsize, expected: usize) -> Result<()> {
+    ensure!(
+        selected_requests.load(Ordering::SeqCst) == expected,
+        "expected {expected} selected provider requests, got {}",
+        selected_requests.load(Ordering::SeqCst)
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

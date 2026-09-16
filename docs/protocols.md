@@ -11,8 +11,9 @@ actor and is not reconstructed from stored conversation text. Legacy string
 receipts are interpreted only at the existing live pending-call boundary with
 matching IDs. An old message that happens to contain JSON remains text, and an
 unsupported content block fails before provider dispatch rather than being
-silently discarded. The current CLI still returns a settled text answer; these
-types alone do not enable live streaming or image input.
+silently discarded. The CLI returns a settled text answer; the TUI can display a
+provisional preview of the selected speaker's stream. Image input remains
+unsupported.
 
 `CompletionRequest.current_message_count` identifies the retained suffix from
 the current actor invocation. Native continuation matches only that suffix,
@@ -58,17 +59,37 @@ live account access.
 The `responses` provider uses the [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses)
 and the configured API-key environment variable. It discovers model IDs from
 `/models`, submits messages and function tool schemas to `/responses`, and
-passes configured reasoning effort. API model catalogs do not necessarily
+passes configured reasoning effort and requests SSE streaming. API model catalogs do not necessarily
 advertise effort capabilities; an empty effort list means no catalog restriction
 was supplied, not that every effort is guaranteed to work. Provider failures use
 fixed status and supported-code categories; Kuru does not retain or render remote
 error messages, unknown codes, parser excerpts, or endpoint queries.
 
+Providers implement `Provider::stream`; `complete` collects the same stream.
+Normalized observations include text and refusals, explicitly visible reasoning
+summaries, tool-argument fragments, usage and terminal outcomes. Cached-input
+and reasoning-output token counts retain the distinction between missing and
+explicitly zero values. These counts are components of the reported totals,
+not additional tokens.
+
+Only a validated completed response authorizes a tool call or a durable
+assistant message. Native item IDs and output indexes reconcile fragments with
+the native terminal response before it is converted into content blocks; an
+item ID is not a tool call ID. A complete terminal response needs no preceding
+deltas. A failure or interrupted stream never authorizes a partial tool call.
+
 Responses completions have a 600-second total operation budget while model
 catalog requests remain bounded to 60 seconds. SSE keeps at most 2 MiB of its
-completed response; ignored deltas and framing use separate finite wire and
-parser limits. A truncated, oversized, or failed stream is an error and is not
-replayed after partial output.
+retained response; deltas and framing also have finite wire and parser limits.
+A truncated, oversized, or failed stream is an error and is not replayed after
+partial output. A successful terminal settles the request without waiting for
+EOF; conflicting terminal frames already buffered are rejected.
+
+The live preview is separate from semantic events, the turn journal and saved
+conversation. Only the selected speaking request exposes text and visible
+summaries, including when a relationship is the speaker. Private deliberation,
+consultations, dreams, tool fragments and raw or encrypted reasoning do not
+appear there. Visible summaries are transient and are not newly saved for replay.
 
 Within that same deadline, Kuru may retry an explicitly rejected provider
 response only for HTTP 429, 500, or 503, with at most three provider sends and

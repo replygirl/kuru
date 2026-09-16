@@ -20,7 +20,7 @@ use kuru_memory::{MemoryStatus, MemoryStore, Revision, StoredNote};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, Semaphore, broadcast, oneshot};
+use tokio::sync::{Notify, Semaphore, broadcast, oneshot, watch};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -29,6 +29,7 @@ use crate::{
     actor::{Actor, Work},
     bus::PeerMessage,
     event::{Event, ToolObservation, ToolOutcome, TurnLimitReason},
+    progress::{FacingProgress, ProgressDescriptor, ProgressTurn},
 };
 
 const SHUTDOWN_DREAM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -339,6 +340,11 @@ enum TurnAdmission {
     },
 }
 
+struct AskControl<'a> {
+    cancellation: &'a CancellationToken,
+    progress: Option<ProgressDescriptor>,
+}
+
 /// A bounded, current-mode projection of one identity's durable notes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NotesView {
@@ -371,6 +377,7 @@ pub struct Harness {
     cwd: PathBuf,
     instructions: String,
     events: broadcast::Sender<Event>,
+    progress: watch::Sender<Option<FacingProgress>>,
     trace: Vec<Event>,
     pub(crate) pending_publication: Option<PendingPublication>,
     #[cfg(test)]
@@ -470,6 +477,7 @@ impl Harness {
         // are never reopened here.
         tools.revalidate_root()?;
         let (events, _) = broadcast::channel(256);
+        let (progress, _) = watch::channel(None);
         let mut harness = Self {
             permits: Arc::new(Semaphore::new(config.max_parallel)),
             config,
@@ -483,6 +491,7 @@ impl Harness {
             cwd,
             instructions,
             events,
+            progress,
             trace: vec![],
             pending_publication: None,
             #[cfg(test)]
@@ -495,6 +504,12 @@ impl Harness {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    /// Subscribe to replaceable, ephemeral progress for the selected speaker.
+    /// A final turn result remains the only authoritative answer.
+    pub fn subscribe_progress(&self) -> watch::Receiver<Option<FacingProgress>> {
+        self.progress.subscribe()
     }
     pub async fn shutdown(&mut self, dream: bool) -> Result<()> {
         let cancellation = CancellationToken::new();
@@ -1206,6 +1221,29 @@ impl Harness {
             .await
     }
 
+    async fn ask_controlled_with_progress(
+        &self,
+        id: &str,
+        inputs: Vec<Message>,
+        phase: &str,
+        tools: Vec<ToolSpec>,
+        cancellation: &CancellationToken,
+        progress: ProgressDescriptor,
+    ) -> Result<Completion> {
+        self.ask_in_controlled_with_progress(
+            &self.memory,
+            id,
+            inputs,
+            phase,
+            tools,
+            AskControl {
+                cancellation,
+                progress: Some(progress),
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn ask_in_controlled(
         &self,
         memory: &MemoryStore,
@@ -1215,7 +1253,30 @@ impl Harness {
         tools: Vec<ToolSpec>,
         cancellation: &CancellationToken,
     ) -> Result<Completion> {
-        cancellation.check()?;
+        self.ask_in_controlled_with_progress(
+            memory,
+            id,
+            inputs,
+            phase,
+            tools,
+            AskControl {
+                cancellation,
+                progress: None,
+            },
+        )
+        .await
+    }
+
+    async fn ask_in_controlled_with_progress(
+        &self,
+        memory: &MemoryStore,
+        id: &str,
+        inputs: Vec<Message>,
+        phase: &str,
+        tools: Vec<ToolSpec>,
+        control: AskControl<'_>,
+    ) -> Result<Completion> {
+        control.cancellation.check()?;
         let actor = self.actors.get(id).context("actor is inactive")?;
         let (reply, rx) = oneshot::channel();
         let history_limit = self
@@ -1226,18 +1287,21 @@ impl Harness {
         let work = Work {
             memory: memory.clone(),
             inputs,
-            instructions: cancellation
+            instructions: control
+                .cancellation
                 .wait(self.instruction(memory, id, phase))
                 .await?,
             model: self.config.model.clone(),
             effort: self.config.effort.clone(),
             tools,
             history_limit,
-            cancellation: cancellation.clone(),
+            cancellation: control.cancellation.clone(),
+            progress: control.progress,
             span: tracing::info_span!(target: "kuru.actor", "actor", actor = self.actor_correlation(id), operation = "completion"),
             reply,
         };
-        cancellation
+        control
+            .cancellation
             .wait(async {
                 actor.tx.send(work).await.context("actor stopped")?;
                 Ok(())
@@ -1399,6 +1463,7 @@ impl Harness {
         cancellation: &CancellationToken,
     ) -> Result<TurnOutput> {
         self.trace.clear();
+        let progress_turn = ProgressTurn::new(self.progress.clone(), journal.id.clone());
         let mut pending: BTreeMap<String, Vec<Message>> = if let Some(id) = &target {
             [(id.clone(), vec![user(prompt)])].into()
         } else {
@@ -1555,19 +1620,22 @@ impl Harness {
             tools.push(external_tool());
         }
         let mut text = String::new();
-        for _ in 0..=self.config.max_tool_calls {
+        for request_index in 0..=self.config.max_tool_calls {
             let available = if used < self.config.max_tool_calls {
                 tools.clone()
             } else {
                 vec![]
             };
+            let request_round = u32::try_from(request_index + 1)
+                .context("speaking request round exceeds progress identity range")?;
             let completion = self
-                .ask_controlled(
+                .ask_controlled_with_progress(
                     &speaker,
                     inputs,
                     "speak and act: you are the identity the user is talking to",
                     available,
                     cancellation,
+                    progress_turn.round(request_round),
                 )
                 .await?;
             input_tokens = input_tokens.saturating_add(completion.input_tokens());
@@ -1757,6 +1825,7 @@ impl Harness {
         self.publish_pending();
         let _ = self.events.send(response.clone());
         self.trace.push(response);
+        progress_turn.finish();
         if self.config.dream_every > 0 && self.session.turns.is_multiple_of(self.config.dream_every)
         {
             match self.dream_controlled(cancellation).await {
@@ -2856,6 +2925,17 @@ mod publication_tests {
 
     #[async_trait::async_trait]
     impl Provider for CountingProvider {
+        async fn stream(
+            &self,
+            request: kuru_core::CompletionRequest,
+            sink: &mut dyn kuru_connectors::ProviderSink,
+        ) -> anyhow::Result<()> {
+            sink.emit(kuru_connectors::ProviderEvent::Completed(
+                self.complete(request).await?,
+            ))
+            .await
+        }
+
         async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
             Ok(vec![])
         }
@@ -2870,6 +2950,17 @@ mod publication_tests {
 
     #[async_trait::async_trait]
     impl Provider for SecretEventProvider {
+        async fn stream(
+            &self,
+            request: kuru_core::CompletionRequest,
+            sink: &mut dyn kuru_connectors::ProviderSink,
+        ) -> anyhow::Result<()> {
+            sink.emit(kuru_connectors::ProviderEvent::Completed(
+                self.complete(request).await?,
+            ))
+            .await
+        }
+
         async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
             Ok(vec![])
         }
@@ -2902,6 +2993,17 @@ mod publication_tests {
 
     #[async_trait::async_trait]
     impl Provider for BlockingOnceProvider {
+        async fn stream(
+            &self,
+            request: kuru_core::CompletionRequest,
+            sink: &mut dyn kuru_connectors::ProviderSink,
+        ) -> anyhow::Result<()> {
+            sink.emit(kuru_connectors::ProviderEvent::Completed(
+                self.complete(request).await?,
+            ))
+            .await
+        }
+
         async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
             Ok(vec![])
         }
@@ -2920,6 +3022,17 @@ mod publication_tests {
 
     #[async_trait::async_trait]
     impl Provider for FailingProvider {
+        async fn stream(
+            &self,
+            request: kuru_core::CompletionRequest,
+            sink: &mut dyn kuru_connectors::ProviderSink,
+        ) -> anyhow::Result<()> {
+            sink.emit(kuru_connectors::ProviderEvent::Completed(
+                self.complete(request).await?,
+            ))
+            .await
+        }
+
         async fn models(&self) -> Result<Vec<kuru_core::ModelInfo>> {
             Ok(vec![])
         }

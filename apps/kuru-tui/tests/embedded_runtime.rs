@@ -254,6 +254,7 @@ impl Installation {
             Json, Router,
             extract::State,
             http::{HeaderMap, StatusCode},
+            response::IntoResponse,
             routing::{get, post},
         };
         use std::sync::Arc;
@@ -282,24 +283,38 @@ impl Installation {
             State(state): State<Shared>,
             headers: HeaderMap,
             Json(body): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
+        ) -> axum::response::Response {
             let mut requests = state.lock().await;
             requests.completions += 1;
             requests.valid &= authorized(&headers)
                 && body["model"] == "fixture-openai-model"
-                && body["store"] == false;
+                && body["store"] == false
+                && body["stream"] == true
+                && headers
+                    .get("accept")
+                    .is_some_and(|value| value == "text/event-stream");
             if requests.reject {
                 return (
                     StatusCode::FORBIDDEN,
                     Json(serde_json::json!({"error":{"message":"synthetic-installed-api-key"}})),
-                );
+                )
+                    .into_response();
             }
+            let completed = serde_json::json!({
+                "type":"response.completed",
+                "response": {
+                    "id":"installed-fixture-response",
+                    "status":"completed",
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"Native OpenAI request completed."}]}],
+                    "usage":{"input_tokens":1,"output_tokens":1}
+                }
+            });
             (
                 StatusCode::OK,
-                Json(
-                    serde_json::json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Native OpenAI request completed."}]}],"usage":{"input_tokens":1,"output_tokens":1}}),
-                ),
+                [("content-type", "text/event-stream")],
+                format!("data: {completed}\n\n"),
             )
+                .into_response()
         }
         let state = Arc::new(Mutex::new(Requests {
             valid: true,

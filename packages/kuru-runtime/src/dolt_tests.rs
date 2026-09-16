@@ -47,6 +47,17 @@ struct StalePeriodicDream {
 
 #[async_trait]
 impl Provider for StalePeriodicDream {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -73,6 +84,17 @@ impl Provider for StalePeriodicDream {
 
 #[async_trait]
 impl Provider for HeldPeriodicDream {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -94,6 +116,17 @@ impl Provider for HeldPeriodicDream {
 }
 #[async_trait]
 impl Provider for HeldDream {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -343,6 +376,17 @@ struct ConcurrentWriter {
 }
 #[async_trait]
 impl Provider for ConcurrentWriter {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }

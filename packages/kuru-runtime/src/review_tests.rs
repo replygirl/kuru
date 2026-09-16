@@ -43,6 +43,17 @@ impl RecordingProvider {
 
 #[async_trait]
 impl Provider for RecordingProvider {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -109,6 +120,17 @@ impl OneToolProvider {
 
 #[async_trait]
 impl Provider for OneToolProvider {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -143,6 +165,17 @@ struct HeldBeforeToolProvider {
 
 #[async_trait]
 impl Provider for HeldBeforeToolProvider {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -234,6 +267,17 @@ struct McpToolProvider {
 
 #[async_trait]
 impl Provider for McpToolProvider {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -802,6 +846,17 @@ struct HeldShutdownDream {
 
 #[async_trait]
 impl Provider for HeldShutdownDream {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -824,6 +879,17 @@ struct HeldPeerConsultation {
 
 #[async_trait]
 impl Provider for HeldPeerConsultation {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -1998,6 +2064,17 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
     }
     #[async_trait]
     impl Provider for Cancellable {
+        async fn stream(
+            &self,
+            request: kuru_core::CompletionRequest,
+            sink: &mut dyn kuru_connectors::ProviderSink,
+        ) -> anyhow::Result<()> {
+            sink.emit(kuru_connectors::ProviderEvent::Completed(
+                self.complete(request).await?,
+            ))
+            .await
+        }
+
         async fn models(&self) -> Result<Vec<ModelInfo>> {
             Ok(vec![])
         }
