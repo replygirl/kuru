@@ -27,6 +27,7 @@ pub use providers::{DemoProvider, Provider, ResponsesProvider, provider};
 pub use redaction::{
     ProjectionError, json as project_json, text as project_text, truncate_tool_output,
 };
+pub use tool_output::is_permission_denied;
 pub use tools::{ToolCatalog, ToolHost};
 
 /// Maximum protocol message/body size; limits also apply to chunked responses.

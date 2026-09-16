@@ -1065,10 +1065,9 @@ async fn completion_caps_activity_while_a_concurrent_sender_continues_producing(
     let (activity_tx, mut events) = broadcast::channel(1024);
     for index in 0..(ACTIVITY_DRAIN_CAP + 44) {
         activity_tx
-            .send(kuru_runtime::Event {
-                kind: "tool".into(),
+            .send(kuru_runtime::Event::ToolStarted {
                 actor: "part".into(),
-                detail: format!("queued-{index}"),
+                name: format!("queued-{index}"),
             })
             .unwrap();
     }
@@ -1077,10 +1076,9 @@ async fn completion_caps_activity_while_a_concurrent_sender_continues_producing(
         thread::spawn(move || {
             for index in 0..128 {
                 activity_tx
-                    .send(kuru_runtime::Event {
-                        kind: "tool".into(),
+                    .send(kuru_runtime::Event::ToolStarted {
                         actor: "part".into(),
-                        detail: format!("concurrent-{index}"),
+                        name: format!("concurrent-{index}"),
                     })
                     .unwrap();
                 thread::yield_now();

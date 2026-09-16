@@ -113,6 +113,19 @@ later maintenance, so its activity or failure cannot remove a completed answer.
 Exit dreaming has a finite deadline; Kuru still attempts actor and tool cleanup
 when the 30-second deadline or the dream itself fails.
 
+Each serialized event remains exactly `{ "kind", "actor", "detail" }`, while
+the runtime and terminal consume typed, projected event values. A settled tool
+call adds a `tool-observation` event whose detail contains bounded projected
+arguments, outcome, admission-to-settlement milliseconds, and receipt metadata
+only. It occurs once for each attempted invocation; an optional `tool` start
+activity has no outcome or receipt claim and does not add a second settlement.
+Call IDs are request-scoped and are never globally deduplicated. `argument_bytes` is the UTF-8 byte length of serialized projected
+arguments. `result_bytes` and `result_sha256` describe the same serialized
+projected result value, including JSON string quoting and escaping; a call with
+no result has zero result bytes and no digest. Completed journals now write
+format 2 and replay older format-1 event triplets through their legacy
+projector without rewriting historical revisions.
+
 `kuru memory notes ID` reads an existing project's selected-mode durable notes
 without starting a conversation, provider, or tool. It returns the same bounded
 notes view as `/notes`: `mode`, canonical `identity`, chronological `notes`,

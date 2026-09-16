@@ -482,7 +482,7 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
         1
     );
     assert!(
-        std::iter::from_fn(|| events.try_recv().ok()).all(|event| event.kind != "peer"),
+        std::iter::from_fn(|| events.try_recv().ok()).all(|event| event.kind() != "peer"),
         "cognitive calls after observed cancellation must not start"
     );
     let retry = harness
@@ -543,6 +543,7 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
     )
     .await;
     let target = harness.topology.parts[0].id.clone();
+    let mut events = harness.subscribe();
     let cancellation = CancellationToken::new();
     let controlled = cancellation.clone();
     let task = tokio::spawn(async move {
@@ -577,6 +578,28 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
             .expect("cancelled shell turn did not settle")
             .unwrap();
     assert!(turn_was_cancelled(&result.unwrap_err()));
+    let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, crate::Event::ToolSettled { observation, .. }
+                    if observation.call_id == "held-shell"
+                        && observation.outcome == crate::ToolOutcome::Cancelled
+                        && observation.result_sha256.is_none())
+            })
+            .count(),
+        1,
+        "the cancelled external invocation settles exactly once"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, crate::Event::ToolSettled { .. }))
+            .count(),
+        1,
+        "no second settlement can be hidden behind a different outcome"
+    );
     let retry = harness
         .run_controlled(
             "start one owned shell",
@@ -603,6 +626,74 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
     })
     .await
     .unwrap_or_else(|_| panic!("owned shell PID {pid} remained live after successful shutdown"));
+    harness.memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn disabled_file_write_emits_a_structured_denied_observation() {
+    let issued = Arc::new(AtomicBool::new(false));
+    let issued_for_provider = issued.clone();
+    let provider = RecordingProvider::new(move |request| {
+        if request.instructions.contains("Phase: deliberate") {
+            reply("ready to attempt the requested write")
+        } else if request
+            .messages
+            .iter()
+            .any(|message| message.role == "tool")
+        {
+            reply("the denied write was reported")
+        } else if !issued_for_provider.swap(true, Ordering::SeqCst) {
+            Completion::from_legacy(
+                "",
+                vec![call(
+                    "denied-write",
+                    "file_write",
+                    json!({"path":"not-created.txt","content":"no mutation"}),
+                )],
+                0,
+                0,
+            )
+        } else {
+            reply("the tool was already attempted")
+        }
+    });
+    let (project, mut harness) = fixture(config(Mode::Freudian), provider).await;
+    let target = harness.topology.parts[0].id.clone();
+    let output = harness
+        .run_controlled(
+            "attempt one denied write",
+            Some(&target),
+            "denied-write",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(!project.path().join("not-created.txt").exists());
+    assert_eq!(
+        output
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event, crate::Event::ToolSettled { observation, .. }
+                    if observation.call_id == "denied-write"
+                        && observation.outcome == crate::ToolOutcome::Denied
+                        && observation.result_bytes == 0
+                        && observation.result_sha256.is_none())
+            })
+            .count(),
+        1,
+        "the denied external invocation settles exactly once"
+    );
+    assert_eq!(
+        output
+            .events
+            .iter()
+            .filter(|event| matches!(event, crate::Event::ToolSettled { .. }))
+            .count(),
+        1,
+        "no second settlement can be hidden behind a different outcome"
+    );
+    harness.shutdown(false).await.unwrap();
     harness.memory.close().await.unwrap();
 }
 
@@ -770,6 +861,7 @@ async fn cancelled_admitted_peer_consultation_is_not_replayed() {
     let (_project, mut harness) = fixture(config(Mode::Freudian), provider.clone()).await;
     let target = harness.topology.parts[0].id.clone();
     *provider.recipient.lock().unwrap() = harness.topology.parts[1].id.clone();
+    let mut events = harness.subscribe();
     let consultation = provider.started.notified();
     tokio::pin!(consultation);
     let cancellation = CancellationToken::new();
@@ -796,6 +888,28 @@ async fn cancelled_admitted_peer_consultation_is_not_replayed() {
             .unwrap();
     assert!(turn_was_cancelled(&result.unwrap_err()));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(event, crate::Event::ToolSettled { observation, .. }
+                    if observation.call_id == "accepted-peer"
+                        && observation.outcome == crate::ToolOutcome::Cancelled
+                        && observation.result_sha256.is_none())
+            })
+            .count(),
+        1,
+        "the admitted peer invocation settles as cancelled after its consultation"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, crate::Event::ToolSettled { .. }))
+            .count(),
+        1,
+        "the initial cognitive result must not settle before consultation completes"
+    );
     let retry = harness
         .run_controlled(
             "consult one peer",
@@ -1108,9 +1222,9 @@ async fn unavailable_mcp_status_stays_out_of_provider_input_and_memory() {
         .unwrap();
     let output = harness.run("Continue with available tools").await.unwrap();
     assert!(output.events.iter().any(|event| {
-        event.kind == "mcp"
-            && event.actor == "failed-fixture"
-            && event.detail == "configured server unavailable"
+        event.kind() == "mcp"
+            && event.actor() == "failed-fixture"
+            && event.detail() == "configured server unavailable"
     }));
     let requests = serde_json::to_string(&*provider.requests.lock().unwrap()).unwrap();
     assert!(!requests.contains(COMMAND));
@@ -1636,7 +1750,7 @@ async fn a_models_relationship_proposal_selects_the_temporary_group_as_speaker()
         output
             .events
             .iter()
-            .any(|event| event.kind == "relationship" && event.actor == ids[0])
+            .any(|event| event.kind() == "relationship" && event.actor() == ids[0])
     );
     assert!(
         provider
@@ -1699,7 +1813,7 @@ async fn a_speaking_peer_consults_another_peer_without_recursive_delegation() {
         output
             .events
             .iter()
-            .filter(|event| event.kind == "peer")
+            .filter(|event| event.kind() == "peer")
             .count(),
         1
     );
@@ -1738,7 +1852,7 @@ async fn partial_provider_failures_leave_other_peers_usable_and_total_failure_is
         output
             .events
             .iter()
-            .any(|event| event.kind == "error" && event.actor == failed_id)
+            .any(|event| event.kind() == "error" && event.actor() == failed_id)
     );
     let all_failed = RecordingProvider::fallible(|_| anyhow::bail!("service unavailable"));
     let (_other_dir, mut unavailable) = fixture(config(Mode::Freudian), all_failed).await;

@@ -36,6 +36,9 @@ const SHELL_MARKER: &str = "SHELL_TURN_RECEIPT";
 const FINAL_TEXT: &str = "SHELL_TURN_FINAL_TEXT";
 const PROVIDER_SECRET: &str = "sk-proj-tracing-provider-secret-0123456789";
 const ROTATION_TOOL_CALLS: usize = 768;
+// The rotation fixture deliberately returns one serialized tool observation per
+// call in the CLI JSON. Keep its capture bounded to the scripted fanout.
+const ROTATION_CAPTURE_LIMIT: usize = ROTATION_TOOL_CALLS * 1024;
 const DIAGNOSTIC_FILE_BYTES: u64 = 64 * 1024;
 const DIAGNOSTIC_FILE_COUNT: usize = 4;
 
@@ -311,6 +314,14 @@ struct CliRun {
 }
 
 async fn run_sandbox(sandbox: Sandbox, debug: bool) -> Result<CliRun> {
+    run_sandbox_with_capture_limit(sandbox, debug, CAPTURE_LIMIT).await
+}
+
+async fn run_sandbox_with_capture_limit(
+    sandbox: Sandbox,
+    debug: bool,
+    capture_limit: usize,
+) -> Result<CliRun> {
     tokio::task::spawn_blocking(move || {
         // If this test future is cancelled, Tokio leaves the started blocking
         // worker running. It retains the complete sandbox through bounded
@@ -320,7 +331,7 @@ async fn run_sandbox(sandbox: Sandbox, debug: bool) -> Result<CliRun> {
             .enable_all()
             .build()
             .context("create retained CLI fixture runtime")?
-            .block_on(bounded_output(&mut command, CLI_TIMEOUT, CAPTURE_LIMIT))
+            .block_on(bounded_output(&mut command, CLI_TIMEOUT, capture_limit))
             .context("run bounded kuru CLI fixture")
             .map(|output| CliRun { output, sandbox })
     })
@@ -633,7 +644,7 @@ async fn debug_cli_rotates_the_fixed_private_diagnostic_ring() -> Result<()> {
             &format!("max_tool_calls = {ROTATION_TOOL_CALLS}\n"),
         )
         .context("prepare bounded tool-call CLI sandbox")?;
-        let run = run_sandbox(sandbox, true)
+        let run = run_sandbox_with_capture_limit(sandbox, true, ROTATION_CAPTURE_LIMIT)
             .await
             .context("run bounded rotation CLI")?;
         ensure!(

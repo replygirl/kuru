@@ -107,10 +107,10 @@ async fn all_four_modes_allow_one_hop_speaking_consultation_with_a_relationship(
         let peers = output
             .events
             .iter()
-            .filter(|event| event.kind == "peer")
+            .filter(|event| event.kind() == "peer")
             .collect::<Vec<_>>();
         assert_eq!(peers.len(), 1, "consultation must stay one hop");
-        let rpc: Value = serde_json::from_str(&peers[0].detail).unwrap();
+        let rpc: Value = serde_json::from_str(&peers[0].detail()).unwrap();
         assert_eq!(
             rpc["params"]["message"]["metadata"]["recipient"],
             relation.id
@@ -202,7 +202,7 @@ async fn all_four_modes_keep_direct_peer_routes_and_round_budget() {
         let peer_events = output
             .events
             .iter()
-            .filter(|event| event.kind == "peer")
+            .filter(|event| event.kind() == "peer")
             .collect::<Vec<_>>();
         assert_eq!(
             peer_events.len(),
@@ -210,12 +210,15 @@ async fn all_four_modes_keep_direct_peer_routes_and_round_budget() {
             "{mode} must route one direct edge per peer"
         );
         for event in peer_events {
-            let rpc: Value = serde_json::from_str(&event.detail).unwrap();
+            let rpc: Value = serde_json::from_str(&event.detail()).unwrap();
             assert_eq!(rpc["method"], "SendMessage");
-            assert_eq!(rpc["params"]["message"]["metadata"]["sender"], event.actor);
+            assert_eq!(
+                rpc["params"]["message"]["metadata"]["sender"],
+                event.actor()
+            );
             assert_eq!(
                 rpc["params"]["message"]["metadata"]["recipient"],
-                targets[&event.actor]
+                targets[event.actor()]
             );
         }
         let requests = provider.requests.lock().unwrap().clone();
@@ -257,14 +260,13 @@ fn config(mode: Mode) -> Config {
     }
 }
 
-fn selection(output: &crate::TurnOutput) -> &str {
+fn selection(output: &crate::TurnOutput) -> String {
     output
         .events
         .iter()
-        .find(|event| event.kind == "speaker-selection")
+        .find(|event| event.kind() == "speaker-selection")
         .expect("speaker decision is traceable")
-        .detail
-        .as_str()
+        .detail()
 }
 
 #[tokio::test]

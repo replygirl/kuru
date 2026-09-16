@@ -111,10 +111,9 @@ async fn runtime_adapter_projects_real_relationship_completion_and_sanitized_rou
         "PRIVATE_PEER_TEXT_MUST_STAY_INTERNAL",
     )
     .unwrap();
-    view.event(Event {
-        kind: "peer".into(),
+    view.event(Event::Peer {
         actor: members[0].clone(),
-        detail: route.rpc().to_string(),
+        envelope: route.rpc(),
     });
     let rendered = screen(&view);
     for expected in [

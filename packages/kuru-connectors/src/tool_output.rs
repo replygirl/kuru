@@ -24,8 +24,9 @@ pub(crate) enum ToolContent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ToolFailureKind {
+pub enum ToolFailureKind {
     BuiltIn,
+    PermissionDenied,
     McpRoute,
     McpCall,
     McpApplication,
@@ -36,6 +37,7 @@ impl fmt::Display for ToolFailureKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::BuiltIn => "tool execution failed",
+            Self::PermissionDenied => "tool permission denied",
             Self::McpRoute => "MCP route failed",
             Self::McpCall => "MCP tool call failed",
             Self::McpApplication => "MCP tool application error",
@@ -53,6 +55,13 @@ impl ToolFailure {
     pub(crate) fn built_in(error: Error) -> Self {
         Self {
             kind: ToolFailureKind::BuiltIn,
+            error,
+        }
+    }
+
+    pub(crate) fn permission_denied(error: Error) -> Self {
+        Self {
+            kind: ToolFailureKind::PermissionDenied,
             error,
         }
     }
@@ -94,3 +103,10 @@ impl fmt::Debug for ProjectedToolError {
 }
 
 impl std::error::Error for ProjectedToolError {}
+
+/// Classify an already-projected execution error without inspecting its text.
+pub fn is_permission_denied(error: &Error) -> bool {
+    error
+        .downcast_ref::<ProjectedToolError>()
+        .is_some_and(|error| matches!(error.kind, ToolFailureKind::PermissionDenied))
+}

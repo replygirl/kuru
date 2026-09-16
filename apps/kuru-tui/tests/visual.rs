@@ -190,8 +190,7 @@ fn motion_changes_decoration_without_changing_text_and_respects_static_override(
     view.motion = true;
     let members = view.parts[..2].to_vec();
     for (id, _) in &members {
-        view.event(Event {
-            kind: "active".into(),
+        view.event(Event::Active {
             actor: id.clone(),
             detail: "peer round 1".into(),
         });
@@ -203,10 +202,9 @@ fn motion_changes_decoration_without_changing_text_and_respects_static_override(
         "Check the draft",
     )
     .unwrap();
-    view.event(Event {
-        kind: "peer".into(),
+    view.event(Event::Peer {
         actor: members[0].0.clone(),
-        detail: route.rpc().to_string(),
+        envelope: route.rpc(),
     });
     let (first, cursor) = render(&view, 120, 45, "busy-frame-zero");
     view.frame = 17;

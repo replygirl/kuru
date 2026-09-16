@@ -292,67 +292,118 @@ impl View {
     }
 
     pub fn event(&mut self, event: Event) {
-        if matches!(
-            event.kind.as_str(),
-            "active" | "idle" | "speaker" | "tool" | "error"
-        ) {
-            self.part_activity
-                .insert(event.actor.clone(), event.kind.clone());
-        }
-        let mut detail = event.detail.clone();
-        if event.kind == "peer" {
-            // Show routing, never the private message contained in the envelope.
-            detail = "peer message".into();
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.detail)
-                && let Some(to) = value
-                    .pointer("/params/message/metadata/recipient")
-                    .and_then(|v| v.as_str())
-            {
-                detail = format!("→ {}", self.actor_name(to));
-                self.routes.push((event.actor.clone(), to.into()));
-                if self.routes.len() > 6 {
-                    self.routes.remove(0);
-                }
+        let (kind, actor, detail) = match event {
+            Event::Active { actor, detail } => {
+                self.part_activity.insert(actor.clone(), "active".into());
+                ("active".into(), actor, detail)
             }
-        } else if event.kind == "relationship" {
-            detail = "relationship updated".into();
-            if let Ok(relation) = serde_json::from_str::<Relationship>(&event.detail) {
-                detail = format!(
+            Event::Idle { actor, detail } => {
+                self.part_activity.insert(actor.clone(), "idle".into());
+                ("idle".into(), actor, detail)
+            }
+            Event::SpeakerSelection { actor, reason } => {
+                ("speaker-selection".into(), actor, reason)
+            }
+            Event::Speaker {
+                actor,
+                identity_kind,
+            } => {
+                if !self.completion_locked {
+                    self.speaker_id = actor.clone();
+                    self.speaker = self
+                        .parts
+                        .iter()
+                        .find(|(id, _)| id == &actor)
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "{} · {}",
+                                identity_kind,
+                                actor.chars().take(8).collect::<String>()
+                            )
+                        });
+                }
+                ("speaker".into(), actor, identity_kind)
+            }
+            Event::ToolStarted { actor, name } => {
+                self.part_activity.insert(actor.clone(), "tool".into());
+                ("tool".into(), actor, name)
+            }
+            Event::ToolSettled { actor, observation } => {
+                self.part_activity.insert(actor.clone(), "tool".into());
+                (
+                    "tool-observation".into(),
+                    actor,
+                    format!(
+                        "{} · {:?} · {} ms",
+                        observation.name, observation.outcome, observation.elapsed_ms
+                    ),
+                )
+            }
+            Event::Mcp { actor, detail } => ("mcp".into(), actor, detail),
+            Event::Dream { actor, detail } => ("dream".into(), actor, detail),
+            Event::Peer { actor, envelope } => {
+                // Show routing, never the private message contained in the envelope.
+                let mut detail = "peer message".into();
+                if let Some(to) = envelope
+                    .pointer("/params/message/metadata/recipient")
+                    .and_then(|value| value.as_str())
+                {
+                    detail = format!("→ {}", self.actor_name(to));
+                    self.routes.push((actor.clone(), to.into()));
+                    if self.routes.len() > 6 {
+                        self.routes.remove(0);
+                    }
+                }
+                ("peer".into(), actor, detail)
+            }
+            Event::Relationship {
+                actor,
+                relationship,
+            } => {
+                let detail = format!(
                     "{} · {}",
-                    relation.kind,
-                    relation
+                    relationship.kind,
+                    relationship
                         .members
                         .iter()
                         .map(|id| self.actor_name(id))
                         .collect::<Vec<_>>()
                         .join(" + ")
                 );
-                self.focus = Some(relation.id.clone());
-                self.relationships.retain(|r| r.id != relation.id);
-                self.relationships.push(relation);
+                self.focus = Some(relationship.id.clone());
+                self.relationships
+                    .retain(|current| current.id != relationship.id);
+                self.relationships.push(relationship);
+                ("relationship".into(), actor, detail)
             }
-        } else if event.kind == "state" {
-            detail = "modeled state updated".into();
-        }
-        if event.kind == "speaker" && !self.completion_locked {
-            self.speaker_id = event.actor.clone();
-            self.speaker = self
-                .parts
-                .iter()
-                .find(|(id, _)| id == &event.actor)
-                .map(|(_, name)| name.clone())
-                .unwrap_or_else(|| {
-                    format!(
-                        "{} · {}",
-                        event.detail,
-                        event.actor.chars().take(8).collect::<String>()
-                    )
-                });
-        }
-        if event.kind == "response" {
-            detail = "response activity".into();
-        }
-        let activity_status = format!("{} · {}", event.kind, self.actor_name(&event.actor));
+            Event::State { actor, report } => (
+                "state".into(),
+                actor,
+                format!("modeled state {:.0}%", report.activation * 100.0),
+            ),
+            Event::Budget {
+                actor,
+                reason,
+                detail,
+            } => (
+                "budget".into(),
+                actor,
+                detail.unwrap_or_else(|| format!("{reason:?}")),
+            ),
+            Event::Error { actor, detail } => {
+                self.part_activity.insert(actor.clone(), "error".into());
+                ("error".into(), actor, detail)
+            }
+            Event::Response { actor } => ("response".into(), actor, "response activity".into()),
+            Event::Legacy {
+                kind,
+                actor,
+                detail,
+            } => (kind, actor, detail),
+            Event::Withheld { kind, actor } => (kind, actor, "[event detail withheld]".into()),
+        };
+        let activity_status = format!("{} · {}", kind, self.actor_name(&actor));
         if !self.completion_locked {
             self.status = activity_status.clone();
         }
@@ -1546,8 +1597,7 @@ mod tests {
             .unwrap();
         let (activity_tx, mut activity_rx) = broadcast::channel(4);
         activity_tx
-            .send(Event {
-                kind: "active".into(),
+            .send(Event::Active {
                 actor: "part".into(),
                 detail: "ready".into(),
             })
@@ -1614,7 +1664,7 @@ mod tests {
             deadline,
         )
         .await;
-        assert!(matches!(wake, Wake::Activity(Ok(Event { .. }))));
+        assert!(matches!(wake, Wake::Activity(Ok(Event::Active { .. }))));
         scheduler.served(WakeSource::Activity);
 
         let wake = next_wake(
@@ -1746,10 +1796,9 @@ mod tests {
         let (activity_tx, mut activity_rx) = broadcast::channel(512);
         for index in 0..(ACTIVITY_DRAIN_CAP + 44) {
             activity_tx
-                .send(Event {
-                    kind: "tool".into(),
+                .send(Event::ToolStarted {
                     actor: "part".into(),
-                    detail: format!("work-{index}"),
+                    name: format!("work-{index}"),
                 })
                 .unwrap();
         }
@@ -1949,30 +1998,29 @@ mod tests {
         let envelope =
             kuru_runtime::PeerMessage::new(&from, &to, "session", "PRIVATE MESSAGE").unwrap();
         for _ in 0..8 {
-            view.event(Event {
-                kind: "peer".into(),
+            view.event(Event::Peer {
                 actor: from.clone(),
-                detail: envelope.rpc().to_string(),
+                envelope: envelope.rpc(),
             });
         }
         assert_eq!(view.routes.len(), 6);
         assert_eq!(view.routes.last(), Some(&(from.clone(), to.clone())));
-        view.event(Event {
-            kind: "state".into(),
+        view.event(Event::State {
             actor: to.clone(),
-            detail: "{\"activation\":0.9,\"note\":\"PRIVATE NOTE\"}".into(),
+            report: kuru_runtime::StateReport {
+                activation: 0.9,
+                note: "PRIVATE NOTE".into(),
+            },
         });
         let relation =
             Relationship::new(RelationshipKind::Alliance, vec![from.clone(), to.clone()]).unwrap();
-        view.event(Event {
-            kind: "relationship".into(),
+        view.event(Event::Relationship {
             actor: from.clone(),
-            detail: serde_json::to_string(&relation).unwrap(),
+            relationship: relation.clone(),
         });
-        view.event(Event {
-            kind: "speaker".into(),
+        view.event(Event::Speaker {
             actor: relation.id.clone(),
-            detail: "alliance".into(),
+            identity_kind: "alliance".into(),
         });
         assert_eq!(view.relationships, vec![relation.clone()]);
         assert_eq!(view.focus.as_deref(), Some(relation.id.as_str()));
@@ -1980,14 +2028,13 @@ mod tests {
         let activity = view.activity.join("\n");
         assert!(!activity.contains("PRIVATE"));
         assert!(activity.contains(view.parts[1].1.split_once(" · ").unwrap().0));
-        view.event(Event {
+        assert!(activity.contains("modeled state 90%"));
+        view.event(Event::Withheld {
             kind: "peer".into(),
             actor: to.clone(),
-            detail: "malformed PRIVATE MESSAGE".into(),
         });
         assert!(!view.activity.last().unwrap().contains("PRIVATE"));
-        view.event(Event {
-            kind: "active".into(),
+        view.event(Event::Active {
             actor: to.clone(),
             detail: "round 1".into(),
         });
@@ -2004,10 +2051,8 @@ mod tests {
     #[test]
     fn response_activity_never_becomes_transcript_content() {
         let mut view = fixture();
-        view.event(Event {
-            kind: "response".into(),
+        view.event(Event::Response {
             actor: "misleading-speaker".into(),
-            detail: "BROADCAST_RESPONSE_MUST_NOT_BE_A_FINAL_ANSWER".into(),
         });
 
         assert!(view.transcript.is_empty());
@@ -2039,15 +2084,12 @@ mod tests {
             response_outcome: Some(kuru_runtime::ResponseOutcome::Text),
             events: vec![],
         });
-        view.event(Event {
-            kind: "speaker".into(),
+        view.event(Event::Speaker {
             actor: "misleading-speaker".into(),
-            detail: "misleading speaker".into(),
+            identity_kind: "misleading speaker".into(),
         });
-        view.event(Event {
-            kind: "response".into(),
+        view.event(Event::Response {
             actor: "misleading-speaker".into(),
-            detail: "DUPLICATE_RESPONSE_MUST_STAY_ACTIVITY".into(),
         });
 
         assert_eq!(view.speaker_id, relation.id);
@@ -2283,10 +2325,9 @@ mod tests {
         view.cursor = view.input.len();
         view.busy = true;
         for i in 0..110 {
-            view.event(Event {
-                kind: "tool".into(),
+            view.event(Event::ToolStarted {
                 actor: "peer".into(),
-                detail: format!("call{i}"),
+                name: format!("call{i}"),
             });
         }
         assert_eq!(view.activity.len(), 100);
