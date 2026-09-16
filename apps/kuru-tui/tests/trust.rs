@@ -307,6 +307,26 @@ impl NativeMcpFixture {
         self.markers("done")
     }
 
+    fn conversations(&self) -> Vec<Vec<Value>> {
+        let mut files: Vec<_> = std::fs::read_dir(self.directory.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|value| value == "requests"))
+            .collect();
+        files.sort();
+        files
+            .into_iter()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
     fn markers(&self, extension: &str) -> usize {
         std::fs::read_dir(self.directory.path())
             .unwrap()
@@ -538,7 +558,7 @@ fn direct_tools_keeps_stdout_json_and_reports_filtered_failed_stdio() {
     let failed = NativeMcpFixture::new();
     std::fs::write(
         PathBuf::from(&failed.command).with_extension("plan"),
-        format!("stderr api_key={SECRET} \u{1b}[31m\nread\nwrite not JSON\n"),
+        format!("stderr api_key={SECRET} \u{1b}[31m\nread\nwrite not JSON\nread\n"),
     )
     .unwrap();
     let config = toml::to_string(&BTreeMap::from([(
@@ -623,7 +643,20 @@ fn direct_tools_keeps_stdout_json_and_reports_filtered_failed_stdio() {
         assert!(!projected.contains(&failed.command));
         assert!(!projected.contains("[REDACTED:recognized-secret]"));
     }
-    assert_eq!(failed.completed(), 4);
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "kuru",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+        },
+    });
+    assert_eq!(failed.conversations(), vec![vec![initialize]; 4]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
