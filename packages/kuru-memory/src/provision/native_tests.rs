@@ -23,15 +23,16 @@ fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentit
         );
         match parent.remove_file(files::name(binary)?, file) {
             Ok(()) => return Ok(()),
+            // The fixture deletes a cache binary the warm probes just executed,
+            // so Windows may refuse either the delete-capable open or the
+            // disposition itself while that image section is torn down.
             Err(error)
-                if {
-                    let code = std::error::Error::source(&error)
+                if matches!(
+                    std::error::Error::source(&error)
                         .and_then(|source| source.downcast_ref::<io::Error>())
-                        .and_then(io::Error::raw_os_error);
-                    code == Some(32)
-                        || (error.phase == kuru_platform::fs::PublicationPhase::Uncertain
-                            && code == Some(5))
-                } =>
+                        .and_then(io::Error::raw_os_error),
+                    Some(5 | 32)
+                ) =>
             {
                 let deadline =
                     *retry_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
