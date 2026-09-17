@@ -319,6 +319,7 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
     let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_path = stage.path().to_owned();
+    let stage_container = stage_path.parent().unwrap().to_owned();
     let candidate = stage_path.join("runtime");
     extract(EMBEDDED_ARCHIVE, &candidate, BUNDLED_ASSET).unwrap();
     let source_identity = files::directory(&candidate).unwrap().identity();
@@ -372,9 +373,20 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
 
     let (probe, (stage, lock)) = probe.probe((stage, lock)).await.unwrap();
     let destination = cache.join("active");
-    activate_staged_after_probe(stage, lock, probe, &candidate, &destination)
+    let error = activate_staged_after_probe(stage, lock, probe, &candidate, &destination)
         .await
-        .unwrap();
+        .unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
+    assert!(detail.contains(&stage_path.display().to_string()));
+    assert!(
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.raw_os_error() == Some(32))
+        }),
+        "the retained no-DELETE probe must be the Windows sharing violation: {detail}"
+    );
     assert_eq!(
         files::directory(&destination).unwrap().identity(),
         source_identity
@@ -401,6 +413,8 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
     let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
     drop(reacquired);
     drop(blocker);
+    fs::remove_dir_all(&stage_container).unwrap();
+    assert!(!stage_container.exists());
 }
 
 #[cfg(windows)]
