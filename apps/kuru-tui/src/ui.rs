@@ -21,10 +21,14 @@ use kuru_connectors::{
     },
     project_text,
 };
-use kuru_core::{Mode, ModelInfo, NativeTool, PermissionSelector, Relationship};
+use kuru_core::{
+    Mode, ModelInfo, NativeTool, PermissionSelector, Relationship, SessionUsage, UsagePhase,
+};
+use kuru_memory::HistoryWindow;
 use kuru_runtime::{
-    CancellationToken, ControlledTurnOutput, Event, FacingProgress, Harness, INTERRUPTION_ROLE,
-    INTERRUPTION_TEXT, ResponseOutcome, TurnLimitReason, TurnOutput, turn_was_cancelled,
+    CancellationToken, ContextSnapshot, ControlledTurnOutput, Event, FacingProgress, Harness,
+    INTERRUPTION_ROLE, INTERRUPTION_TEXT, RequestContext, ResponseOutcome, TurnLimitReason,
+    TurnOutput, turn_was_cancelled,
 };
 use ratatui::{
     Terminal,
@@ -46,7 +50,7 @@ mod runtime_tests;
 mod scene;
 pub use render::draw;
 
-const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · F5 permissions · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /notes ID · /retry · /dream · /undo-dream · /quit\n/memory-status · /memory-history · /permissions\nApproval: Alt+1 Once · Alt+2 Session · Alt+3 Always · Alt+4 Deny.\nModel, effort and mode selections are remembered for this project.";
+const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · F5 permissions · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /notes ID · /retry · /dream · /undo-dream · /quit\n/memory-status · /memory-history · /cost · /permissions\nApproval: Alt+1 Once · Alt+2 Session · Alt+3 Always · Alt+4 Deny.\nModel, effort and mode selections are remembered for this project.";
 const ACTIVITY_DRAIN_CAP: usize = 256;
 const PREVIEW_PAINT_INTERVAL: Duration = Duration::from_millis(80);
 const INTERRUPTION_REFRESH_NOTICE: &str =
@@ -97,6 +101,7 @@ pub struct InitialViewData {
     pub project: String,
     pub motion: bool,
     pub runtime: RuntimeSnapshot,
+    pub usage: Option<SessionUsage>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +118,10 @@ pub struct View {
     pub activity: Vec<String>,
     /// Ephemeral selected-speaker preview; never copied into the transcript.
     pub preview: Option<FacingProgress>,
+    pub request_context: Option<RequestContext>,
+    facing_context: Option<RequestContext>,
+    pub active_operation_id: Option<String>,
+    pub usage: Option<SessionUsage>,
     pub busy: bool,
     pub status: String,
     pub speaker: String,
@@ -154,6 +163,7 @@ impl View {
             project,
             motion,
             runtime,
+            usage,
         } = initial;
         let show_scene = transcript.is_empty();
         Self {
@@ -168,6 +178,10 @@ impl View {
             parts: runtime.parts,
             activity: vec![],
             preview: None,
+            request_context: None,
+            facing_context: None,
+            active_operation_id: None,
+            usage,
             busy: false,
             status: "Ready · /help for commands".into(),
             speaker: "pool".into(),
@@ -231,6 +245,29 @@ impl View {
         self.notice_until = self.clock_ms.saturating_add(5000);
     }
 
+    fn accept_context(&mut self, snapshot: ContextSnapshot) -> bool {
+        if !self.busy {
+            return false;
+        }
+        let active = self.active_operation_id.as_deref();
+        let mut changed = false;
+        if let Some(latest) = snapshot.latest
+            && active == Some(latest.operation_id.as_str())
+        {
+            self.request_context = Some(latest);
+            changed = true;
+        }
+        if let Some(facing) = snapshot.latest_facing
+            && facing.phase == UsagePhase::Speak
+            && active == Some(facing.operation_id.as_str())
+        {
+            self.request_context = Some(facing.clone());
+            self.facing_context = Some(facing);
+            changed = true;
+        }
+        changed
+    }
+
     fn begin_operation(&mut self) {
         self.busy = true;
         self.preview = None;
@@ -272,6 +309,7 @@ impl View {
     fn settle(&mut self) {
         self.operation_start = None;
         self.preview = None;
+        self.active_operation_id = None;
         for phase in self.part_activity.values_mut() {
             if phase != "error" {
                 *phase = "idle".into();
@@ -814,12 +852,7 @@ fn revoke_selected_permission(service: &PermissionService, view: &mut View) -> R
 /// Read the initial TUI presentation from the runtime at the adapter boundary.
 /// `View` itself remains a synchronous owned value.
 pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> {
-    let transcript = harness
-        .history()
-        .await?
-        .into_iter()
-        .map(|message| project_transcript_message(&message.role, message.text_projection()))
-        .collect();
+    let transcript = transcript_from_window(harness.history_window().await?);
     Ok(InitialViewData {
         transcript,
         session: harness.session.id.clone(),
@@ -831,7 +864,28 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
             .into_owned(),
         motion: !reduced_motion(std::env::var("KURU_REDUCED_MOTION").ok().as_deref()),
         runtime: project_runtime_snapshot(harness),
+        usage: Some(harness.session_usage().await?),
     })
+}
+
+fn transcript_from_window(window: HistoryWindow) -> Vec<(String, String)> {
+    let omitted = window
+        .total_rows
+        .saturating_sub(window.messages.len() as u64);
+    let mut transcript: Vec<_> = window
+        .messages
+        .into_iter()
+        .map(|message| project_transcript_message(&message.role, message.text_projection()))
+        .collect();
+    if omitted > 0 {
+        transcript.push((
+            "kuru".into(),
+            format!(
+                "{omitted} earlier message(s) are not shown in this session view; stored history is unchanged."
+            ),
+        ));
+    }
+    transcript
 }
 
 fn project_transcript_message(role: &str, content: String) -> (String, String) {
@@ -840,6 +894,75 @@ fn project_transcript_message(role: &str, content: String) -> (String, String) {
     } else {
         (role.into(), content)
     }
+}
+
+fn format_session_usage(usage: &SessionUsage) -> String {
+    let component = |name: &str, known: Option<u64>, complete: bool| match known {
+        Some(value) if complete => format!("{name}: {value} tokens"),
+        Some(value) => format!("{name}: {value} known tokens (incomplete)"),
+        None => format!("{name}: unknown"),
+    };
+    let money = |name: &str, amount: &kuru_core::MoneyEstimate| match &amount.known_usd {
+        Some(value) if !amount.incomplete => format!("{name}: ${value} estimated"),
+        Some(value) => format!("{name}: ${value} known subtotal (incomplete)"),
+        None => format!("{name}: unknown"),
+    };
+    let mut lines = vec![
+        format!(
+            "Session usage · {} provider invocations",
+            usage.invocation_count
+        ),
+        component(
+            "Input",
+            usage.known_usage.input_tokens,
+            usage.component_complete.input_tokens,
+        ),
+        component(
+            "Output",
+            usage.known_usage.output_tokens,
+            usage.component_complete.output_tokens,
+        ),
+        component(
+            "Cached input (subset)",
+            usage.known_usage.cached_input_tokens,
+            usage.component_complete.cached_input_tokens,
+        ),
+        component(
+            "Reasoning output (subset)",
+            usage.known_usage.reasoning_output_tokens,
+            usage.component_complete.reasoning_output_tokens,
+        ),
+        money("API-standard estimate", &usage.api_standard),
+        money(
+            "API-equivalent estimate (not a subscription charge)",
+            &usage.api_equivalent,
+        ),
+    ];
+    if !usage.historical_complete {
+        lines.push(
+            "Earlier session activity predates usage tracking; totals are incomplete.".into(),
+        );
+    }
+    if usage.incomplete_invocations > 0 {
+        lines.push(format!(
+            "{} invocation(s) have incomplete usage evidence.",
+            usage.incomplete_invocations
+        ));
+    }
+    lines.join("\n")
+}
+
+fn omission_notice(context: &RequestContext) -> Option<String> {
+    let total = context
+        .omitted_public_rows
+        .saturating_add(context.omitted_private_rows)
+        .saturating_add(context.omitted_note_rows);
+    (total > 0).then(|| {
+        format!(
+            "For this response, {} older public, {} private and {} note row(s) were omitted from model context; stored history is unchanged.",
+            context.omitted_public_rows, context.omitted_private_rows, context.omitted_note_rows
+        )
+    })
 }
 
 async fn append_missing_interruption_markers(harness: &Harness, view: &mut View) -> Result<()> {
@@ -1078,6 +1201,7 @@ enum Wake {
 
 enum LoopWake {
     Approval(Option<ApprovalRequest>),
+    Context(Result<(), watch::error::RecvError>),
     Regular(Wake),
 }
 
@@ -1389,7 +1513,23 @@ async fn apply_completion(
             view.status = "Complete · stored result reused".into();
             view.completion_locked = true;
         }
-        Ok(DispatchOutcome::Turn(result)) => view.complete_turn(result.output),
+        Ok(DispatchOutcome::Turn(result)) => {
+            let omitted = view
+                .facing_context
+                .as_ref()
+                .filter(|context| {
+                    context.phase == UsagePhase::Speak
+                        && view.active_operation_id.as_deref()
+                            == Some(context.operation_id.as_str())
+                        && context.actor_id == result.output.speaker
+                        && context.estimate.ensure_fits().is_ok()
+                })
+                .and_then(omission_notice);
+            view.complete_turn(result.output);
+            if let Some(omitted) = omitted {
+                view.transcript.push(("kuru".into(), omitted));
+            }
+        }
         Err(error) if turn_was_cancelled(&error) => {
             let harness = harness.lock().await;
             let refresh = append_missing_interruption_markers(&harness, view).await;
@@ -1408,6 +1548,7 @@ async fn apply_completion(
         }
     }
     view.apply_runtime(project_runtime(harness).await);
+    view.usage = Some(harness.lock().await.session_usage().await?);
     view.settle();
     Ok(CompletionState::Settled {
         quit: false,
@@ -1501,6 +1642,7 @@ where
     }
     let mut events = harness.subscribe();
     let mut progress = harness.subscribe_progress();
+    let mut context = harness.subscribe_context();
     let harness = Arc::new(Mutex::new(harness));
     let (tx, mut rx) = mpsc::channel::<(u64, Result<DispatchOutcome>)>(8);
     let mut job: Option<JoinHandle<()>> = None;
@@ -1518,6 +1660,7 @@ where
     let mut completion_open = true;
     let mut activity_open = true;
     let mut progress_open = true;
+    let mut context_open = true;
     let mut animation_at = TokioInstant::now();
 
     let result: Result<()> = async {
@@ -1539,6 +1682,7 @@ where
 
             let wake = tokio::select! {
                 request = async { approval_rx.as_mut().expect("guarded approval receiver").recv().await }, if approval_rx.is_some() => LoopWake::Approval(request),
+                update = context.changed(), if context_open => LoopWake::Context(update),
                 wake = next_wake_with_progress(
                     &scheduler,
                     &mut input,
@@ -1570,6 +1714,16 @@ where
                 }
                 LoopWake::Approval(None) => {
                     approval_rx = None;
+                    continue;
+                }
+                LoopWake::Context(Ok(())) => {
+                    if view.accept_context(context.borrow_and_update().clone()) {
+                        dirty = true;
+                    }
+                    continue;
+                }
+                LoopWake::Context(Err(_)) => {
+                    context_open = false;
                     continue;
                 }
                 LoopWake::Regular(wake) => wake,
@@ -1687,6 +1841,11 @@ where
                             generation = generation.wrapping_add(1);
                             let turn_id = (!command.starts_with('/'))
                                 .then(|| uuid::Uuid::new_v4().to_string());
+                            view.active_operation_id = turn_id.clone();
+                            if turn_id.is_some() {
+                                view.request_context = None;
+                                view.facing_context = None;
+                            }
                             preview_fence.start(generation, turn_id.clone());
                             preview_paint.clear();
                             let harness = harness.clone();
@@ -1723,6 +1882,7 @@ where
                 Wake::Completion(Some(completion)) => {
                     scheduler.served(WakeSource::Completion);
                     if completion.0 == generation {
+                        view.accept_context(context.borrow_and_update().clone());
                         pending_approval = None;
                         approval_rx = None;
                         view.permission_prompt = None;
@@ -1894,6 +2054,7 @@ async fn dispatch_controlled(
         "/notes" => serde_json::to_string_pretty(&harness.notes_for(args, 100).await?)?,
         "/memory-status" => serde_json::to_string_pretty(&harness.memory_status().await?)?,
         "/memory-history" => serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?,
+        "/cost" => format_session_usage(&harness.session_usage().await?),
         "/retry" => {
             return Ok(DispatchOutcome::Turn(
                 if let Some(approval) = approval.clone() {
@@ -1941,7 +2102,10 @@ async fn dispatch_controlled(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuru_core::{Framework, RelationshipKind};
+    use kuru_core::{
+        ContextBudget, ContextEstimate, Framework, Message, MoneyEstimate, RelationshipKind,
+        Sourced, Usage, UsageCompleteness,
+    };
     use ratatui::backend::TestBackend;
 
     fn progress(turn_id: &str, request_round: u32, seq: u64) -> FacingProgress {
@@ -1956,6 +2120,122 @@ mod tests {
             activity: String::new(),
             activity_truncated: false,
         }
+    }
+
+    #[test]
+    fn cost_projection_keeps_absent_components_and_old_history_incomplete() {
+        let usage = SessionUsage {
+            session_id: "s".into(),
+            historical_complete: false,
+            invocation_count: 2,
+            incomplete_invocations: 1,
+            known_usage: Usage {
+                input_tokens: Some(0),
+                output_tokens: Some(12),
+                cached_input_tokens: None,
+                reasoning_output_tokens: None,
+            },
+            component_complete: UsageCompleteness {
+                input_tokens: false,
+                output_tokens: true,
+                cached_input_tokens: false,
+                reasoning_output_tokens: false,
+            },
+            api_standard: MoneyEstimate {
+                known_usd: Some("0.000012".into()),
+                incomplete: true,
+            },
+            api_equivalent: MoneyEstimate {
+                known_usd: None,
+                incomplete: true,
+            },
+        };
+        let text = format_session_usage(&usage);
+        assert!(text.contains("Input: 0 known tokens (incomplete)"));
+        assert!(text.contains("Cached input (subset): unknown"));
+        assert!(text.contains("$0.000012 known subtotal (incomplete)"));
+        assert!(text.contains("API-equivalent estimate (not a subscription charge)"));
+        assert!(text.contains("Earlier session activity predates usage tracking"));
+    }
+
+    #[test]
+    fn initial_history_notice_uses_the_exact_count_beyond_the_500_row_view() {
+        let visible = (0..500)
+            .map(|index| Message::text("user", format!("message {index}")))
+            .collect::<Vec<_>>();
+        let transcript = transcript_from_window(HistoryWindow {
+            messages: visible.clone(),
+            total_rows: 503,
+        });
+        assert_eq!(transcript.len(), 501);
+        assert!(
+            transcript
+                .last()
+                .unwrap()
+                .1
+                .starts_with("3 earlier message(s)")
+        );
+        assert!(transcript.last().unwrap().1.contains("session view"));
+        assert_eq!(
+            transcript_from_window(HistoryWindow {
+                messages: visible,
+                total_rows: 500,
+            })
+            .len(),
+            500
+        );
+    }
+
+    #[test]
+    fn context_projection_accepts_only_the_active_operation_and_reports_exact_omissions() {
+        let mut view = fixture();
+        view.begin_operation();
+        view.active_operation_id = Some("turn-1".into());
+        let context = RequestContext {
+            operation_id: "turn-1".into(),
+            actor_id: "part".into(),
+            phase: UsagePhase::Speak,
+            estimate: ContextEstimate::for_final_body(
+                ContextBudget::resolve(Sourced::configured_assumption(10_000), None, None).unwrap(),
+                100,
+                false,
+                vec![],
+            ),
+            runtime_sources: vec![],
+            omitted_public_rows: 2,
+            omitted_private_rows: 1,
+            omitted_note_rows: 0,
+        };
+        let mut foreign = context.clone();
+        foreign.operation_id = "other-turn".into();
+        assert!(!view.accept_context(ContextSnapshot {
+            latest: Some(foreign.clone()),
+            latest_facing: Some(foreign),
+        }));
+        assert!(view.request_context.is_none());
+        assert!(view.accept_context(ContextSnapshot {
+            latest: Some(context.clone()),
+            latest_facing: Some(context.clone()),
+        }));
+        assert!(
+            omission_notice(&context)
+                .unwrap()
+                .contains("2 older public, 1 private")
+        );
+        let mut dream = context.clone();
+        dream.operation_id = "dream-after-turn".into();
+        dream.phase = UsagePhase::Dream;
+        assert!(view.accept_context(ContextSnapshot {
+            latest: Some(dream),
+            latest_facing: Some(context.clone()),
+        }));
+        assert_eq!(view.facing_context.as_ref(), Some(&context));
+        assert_eq!(view.request_context.as_ref(), Some(&context));
+        view.settle();
+        assert!(!view.accept_context(ContextSnapshot {
+            latest: Some(context),
+            latest_facing: None,
+        }));
     }
 
     #[test]
@@ -1999,6 +2279,7 @@ mod tests {
                 project: "plain-project".into(),
                 motion: true,
                 runtime: runtime_snapshot(),
+                usage: None,
             },
             vec![ModelInfo {
                 id: "demo".into(),
@@ -2999,6 +3280,7 @@ mod tests {
                 project: "initial-project".into(),
                 motion: true,
                 runtime: initial_runtime,
+                usage: None,
             },
             vec![],
         );

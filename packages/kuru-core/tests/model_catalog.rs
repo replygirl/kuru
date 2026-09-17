@@ -72,10 +72,9 @@ fn unknown_models_keep_absent_prices_and_resolve_labelled_fallbacks() {
     let known = ModelCatalog::embedded()
         .unwrap()
         .enrich(ModelRoute::OpenAiResponses, model("gpt-5.6-luna"));
-    assert_eq!(
-        known.metadata.resolved_context_window(Some(64_000)).value,
-        1_050_000
-    );
+    let pinned = known.metadata.resolved_context_window(Some(64_000));
+    assert_eq!(pinned.value, 1_050_000);
+    assert!(matches!(pinned.provenance, FactProvenance::Pinned { .. }));
 }
 
 #[test]

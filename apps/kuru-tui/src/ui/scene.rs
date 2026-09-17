@@ -491,6 +491,7 @@ mod tests {
                     relationships: vec![],
                     focus: None,
                 },
+                usage: None,
             },
             vec![],
         );

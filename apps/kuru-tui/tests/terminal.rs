@@ -458,6 +458,75 @@ fn real_event_stream_preserves_co_ready_resize_and_paste() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn real_pty_cost_inspection_survives_120_80_and_40_columns() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let mut terminal = Terminal::spawn(sandbox.command("demo"), 35, 120)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command("hello", None)?;
+    terminal.wait_composer_frame(&["[demo]", "enter send"], READY_TIMEOUT)?;
+    for (rows, cols) in [(35, 120), (24, 80), (18, 40)] {
+        terminal.resize(rows, cols)?;
+        terminal.command("/cost", None)?;
+        terminal.wait_composer_frame(&["enter send"], READY_TIMEOUT)?;
+        let screen = terminal.screen();
+        ensure!(
+            screen.contains("unknown"),
+            "unknown price must remain explicit at {cols}x{rows}: {screen}"
+        );
+        ensure!(
+            screen.contains("assumed") || screen.contains("built-in assumption"),
+            "the last prepared request must show its assumed bound at {cols}x{rows}: {screen}"
+        );
+        if cols == 120 {
+            ensure!(screen.contains("Session usage"), "{screen}");
+            ensure!(screen.contains("not a subscription charge"), "{screen}");
+        }
+    }
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
+#[test]
+fn real_pty_reports_actual_optional_context_omission_without_erasing_history() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let sentinel = "older-context-remains-stored";
+    let long_prompt = format!("{sentinel} {}", "x".repeat(12_000));
+    let first = sandbox
+        .command("demo")
+        .args(["run", &long_prompt, "--json"])
+        .output()?;
+    ensure!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout)?;
+    let session = first["session"]
+        .as_str()
+        .context("first run has no session")?;
+    let config_path = sandbox.root.path().join("config/kuru/config.toml");
+    let config = format!(
+        "assumed_context_window_tokens = 4000\ncontext_output_reserve_tokens = 256\n{}",
+        std::fs::read_to_string(&config_path)?
+    );
+    std::fs::write(config_path, config)?;
+
+    let mut command = sandbox.command("demo");
+    command.args(["--resume", session]);
+    let mut terminal = Terminal::spawn(command, 35, 120)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command("short follow-up", None)?;
+    terminal.wait_composer_frame(&["omitted", "enter send"], READY_TIMEOUT)?;
+    let screen = terminal.screen();
+    ensure!(screen.contains("older public"), "{screen}");
+    ensure!(screen.contains("stored history is unchanged"), "{screen}");
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
 fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> Result<()> {
     let mut command = sandbox.command("demo");
     command.args(["--mode", "freudian"]);

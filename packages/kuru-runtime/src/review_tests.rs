@@ -1443,22 +1443,28 @@ async fn a_different_speaker_sees_public_answers_but_not_private_memories() {
 }
 
 #[tokio::test]
-async fn shared_transcript_is_bounded_and_unicode_safe() {
+async fn shared_transcript_keeps_whole_unicode_rows_without_byte_slicing() {
     let provider = RecordingProvider::new(|_| reply("Ready"));
-    let (_dir, harness) = fixture(config(Mode::Freudian), provider).await;
+    let (_dir, harness) = fixture(config(Mode::Freudian), provider.clone()).await;
     let key = format!("{}/transcript/{}", harness.scope, harness.session.id);
     harness
         .memory
         .append(&key, "assistant", &format!("a{}", "🪶".repeat(20_000)))
         .await
         .unwrap();
-    let instructions = harness
-        .instruction(&harness.memory, &harness.topology.parts[0].id, "inspect")
+    harness
+        .ask(
+            &harness.topology.parts[0].id,
+            vec![kuru_core::Message::text("user", "inspect")],
+            "inspect",
+            vec![],
+        )
         .await
         .unwrap();
-    assert!(instructions.contains("[truncated]"));
-    assert!(instructions.contains("🪶"));
-    assert!(instructions.len() < 45_000);
+    let requests = provider.requests.lock().unwrap();
+    let instructions = &requests.last().unwrap().instructions;
+    assert!(instructions.contains(&"🪶".repeat(20_000)));
+    assert!(!instructions.contains("[truncated]"));
 }
 
 #[tokio::test]
@@ -1664,7 +1670,7 @@ async fn failed_mode_focus_and_relationship_saves_leave_the_running_pool_intact(
 }
 
 #[tokio::test]
-async fn large_private_context_is_bounded_without_losing_any_current_tool_receipt() {
+async fn large_private_context_keeps_every_current_tool_receipt_whole() {
     let provider = RecordingProvider::new(|_| reply("Read all receipts"));
     let (_dir, harness) = fixture(
         Config {
@@ -1709,14 +1715,7 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
         .unwrap();
     let requests = provider.requests.lock().unwrap();
     let request = requests.last().unwrap();
-    assert!(
-        request
-            .messages
-            .iter()
-            .map(|message| message.text_projection().len())
-            .sum::<usize>()
-            <= 112 * 1024
-    );
+    assert!(request.context_budget.is_some());
     let receipts = request
         .messages
         .iter()
@@ -1726,7 +1725,7 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
     assert_eq!(receipts.len(), 64);
     for (i, receipt) in receipts.iter().enumerate() {
         assert_eq!(receipt["call_id"], format!("call-{i}"));
-        assert!(receipt["output"].as_str().unwrap().contains("[truncated]"));
+        assert_eq!(receipt["output"].as_str().unwrap(), "\0\n🪶".repeat(3000));
     }
     let notes_json = request
         .instructions
@@ -1734,12 +1733,11 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
         .last()
         .unwrap();
     let notes: Vec<kuru_core::Message> = serde_json::from_str(notes_json).unwrap();
+    assert_eq!(notes.len(), 16);
     assert!(
         notes
             .iter()
-            .map(|note| note.text_projection().len())
-            .sum::<usize>()
-            <= 16 * 1024
+            .all(|note| note.text_projection().contains(&"🪶".repeat(3000)))
     );
 }
 

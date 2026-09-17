@@ -10,8 +10,9 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use kuru_core::{
-    Completion, CompletionRequest, Config, ContentBlock, Message, ModelInfo, ModelMetadata,
-    ModelRoute, Usage, advertised_metadata, enrich_model,
+    Completion, CompletionRequest, Config, ContentBlock, ContextBudget, ContextEstimate,
+    ContextSourceKind, ContextSourceSize, Message, ModelInfo, ModelMetadata, ModelRoute, Usage,
+    advertised_metadata, enrich_model, estimated_tokens_for_bytes,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -48,6 +49,7 @@ pub trait Provider: Send + Sync {
 /// neither tool-call IDs nor positions in [`Completion::blocks`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderEvent {
+    ContextMeasured(ContextEstimate),
     TextDelta {
         item_id: String,
         output_index: u64,
@@ -223,6 +225,34 @@ impl Provider for DemoProvider {
         for message in &request.messages {
             provider_text(message)?;
         }
+        // Demo has no HTTP body, but it is still a harness provider. Measure
+        // its effective prompt rather than silently bypassing the same budget.
+        let prompt = json!({
+            "instructions": request.instructions,
+            "messages": request.messages,
+            "tools": request.tools,
+        });
+        let prompt_bytes = serde_json::to_vec(&prompt)?.len() as u64;
+        let effective_budget = request
+            .context_budget
+            .clone()
+            .unwrap_or_else(ContextBudget::legacy_default);
+        effective_budget.validate()?;
+        let context = ContextEstimate::for_final_body(
+            effective_budget,
+            prompt_bytes,
+            false,
+            vec![ContextSourceSize {
+                kind: ContextSourceKind::CurrentInput,
+                serialized_bytes: prompt_bytes,
+                estimated_tokens: estimated_tokens_for_bytes(prompt_bytes),
+                units: 1,
+                mandatory: true,
+            }],
+        );
+        sink.emit(ProviderEvent::ContextMeasured(context.clone()))
+            .await?;
+        context.ensure_fits()?;
         let latest = request
             .messages
             .iter()
@@ -549,11 +579,11 @@ fn text_message(message: &Message) -> Result<Value> {
     }
 }
 
-fn input_items(
+fn input_items_selected(
     messages: &[Message],
     pending: Option<&Pending>,
     current_message_count: Option<usize>,
-) -> Result<Vec<Value>> {
+) -> Result<(Vec<Value>, bool)> {
     // Validate every block before selecting native continuation records: a
     // matching tool receipt must not let an earlier unsupported block vanish
     // from validation and reach a provider dispatch.
@@ -563,14 +593,20 @@ fn input_items(
     // An absent boundary is a legacy/direct request. Never infer native
     // continuation from historical text or receipt adjacency.
     let Some(current_message_count) = current_message_count else {
-        return messages.iter().map(text_message).collect();
+        return Ok((
+            messages.iter().map(text_message).collect::<Result<_>>()?,
+            false,
+        ));
     };
     ensure!(
         current_message_count <= messages.len(),
         "current model input boundary exceeds message history"
     );
     let Some(pending) = pending else {
-        return messages.iter().map(text_message).collect();
+        return Ok((
+            messages.iter().map(text_message).collect::<Result<_>>()?,
+            false,
+        ));
     };
     let current = &messages[messages.len() - current_message_count..];
     let mut found = BTreeMap::new();
@@ -619,7 +655,10 @@ fn input_items(
     // A fresh user turn has no current receipt and starts a new protocol
     // context. Historical receipts remain ordinary safe history.
     if found.is_empty() {
-        return messages.iter().map(text_message).collect();
+        return Ok((
+            messages.iter().map(text_message).collect::<Result<_>>()?,
+            false,
+        ));
     }
     ensure!(
         found.len() == pending.calls.len(),
@@ -632,7 +671,16 @@ fn input_items(
         input.push(json!({"type":"function_call_output","call_id":call,"output":output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string())}));
     }
     input.extend(other_current);
-    Ok(input)
+    Ok((input, true))
+}
+
+#[cfg(test)]
+fn input_items(
+    messages: &[Message],
+    pending: Option<&Pending>,
+    current_message_count: Option<usize>,
+) -> Result<Vec<Value>> {
+    input_items_selected(messages, pending, current_message_count).map(|(items, _)| items)
 }
 
 fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Completion> {
@@ -821,11 +869,12 @@ impl ResponsesProvider {
         );
         let actor = self.actor(&request.actor).await?;
         let mut pending = actor.lock().await;
-        let input = input_items(
+        let (input, native_continuation_mandatory) = input_items_selected(
             &request.messages,
             pending.as_ref(),
             request.current_message_count,
         )?;
+        let input_bytes = serde_json::to_vec(&input)?.len() as u64;
         let mut body = json!({"model":request.model,"instructions":request.instructions,"input":input,"store":false,"include":["reasoning.encrypted_content"],"tools":request.tools.iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false})).collect::<Vec<_>>()});
         if let Some(effort) = request.effort {
             body["reasoning"] = json!({"effort":effort});
@@ -835,15 +884,71 @@ impl ResponsesProvider {
             body["tool_choice"] = json!("auto");
             body["parallel_tool_calls"] = json!(true);
         }
+        let payload = serde_json::to_vec(&body)?;
         ensure!(
-            body.to_string().len() <= crate::MAX_BYTES,
+            payload.len() <= crate::MAX_BYTES,
             "Responses request exceeds 2 MiB transport limit; shorten actor context"
         );
+        let instructions_bytes = serde_json::to_vec(&body["instructions"])?.len() as u64;
+        let tools_bytes = serde_json::to_vec(&body["tools"])?.len() as u64;
+        let source = |kind, serialized_bytes, units, mandatory| ContextSourceSize {
+            kind,
+            serialized_bytes,
+            estimated_tokens: estimated_tokens_for_bytes(serialized_bytes),
+            units,
+            mandatory,
+        };
+        let accounted = instructions_bytes
+            .saturating_add(tools_bytes)
+            .saturating_add(input_bytes);
+        let effective_budget = request
+            .context_budget
+            .unwrap_or_else(ContextBudget::legacy_default);
+        effective_budget.validate()?;
+        let context = ContextEstimate::for_final_body(
+            effective_budget,
+            payload.len() as u64,
+            native_continuation_mandatory,
+            vec![
+                source(
+                    ContextSourceKind::SelectedInstructions,
+                    instructions_bytes,
+                    1,
+                    false,
+                ),
+                source(
+                    ContextSourceKind::ToolSchemas,
+                    tools_bytes,
+                    request.tools.len() as u64,
+                    true,
+                ),
+                source(
+                    if native_continuation_mandatory {
+                        ContextSourceKind::NativeContinuation
+                    } else {
+                        ContextSourceKind::SelectedInput
+                    },
+                    input_bytes,
+                    body["input"].as_array().map_or(0, |items| items.len()) as u64,
+                    native_continuation_mandatory,
+                ),
+                source(
+                    ContextSourceKind::WireOverhead,
+                    (payload.len() as u64).saturating_sub(accounted),
+                    1,
+                    true,
+                ),
+            ],
+        );
+        sink.emit(ProviderEvent::ContextMeasured(context.clone()))
+            .await?;
+        context.ensure_fits()?;
         let mut builder = self
             .client
             .post(format!("{}/responses", self.base))
             .timeout(self.completion_timeout)
-            .json(&body);
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload);
         builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
         let operation = self.operation(false);
         let response = self.send(builder, operation, budget).await?;
@@ -972,6 +1077,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_sse_preserves_partial_usage_and_stops_on_observer_write_failure() {
+        let partial = HttpFixture::new(vec![Reply {
+            body: "data: {\"type\":\"response.failed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}\n\n".into(),
+            status: axum::http::StatusCode::OK,
+            content_type: "text/event-stream",
+            session: false,
+        }])
+        .await;
+        let provider = ResponsesProvider::new(&partial.url, "").unwrap();
+        let mut observed = Events::default();
+        let error = collect_completion(&provider, request(), Some(&mut observed))
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("input_tokens"));
+        assert!(matches!(
+            observed.0.first(),
+            Some(ProviderEvent::ContextMeasured(_))
+        ));
+        assert!(matches!(
+            observed.0.as_slice(),
+            [
+                _,
+                ProviderEvent::Usage(Usage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(2),
+                    ..
+                }),
+                ProviderEvent::Failed {
+                    kind: ProviderFailureKind::Failed
+                }
+            ]
+        ));
+        assert_eq!(partial.requests.lock().await.len(), 1);
+
+        struct FailOnUsage(Vec<ProviderEvent>);
+        impl ProviderSink for FailOnUsage {
+            fn emit<'a>(
+                &'a mut self,
+                event: ProviderEvent,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.0.push(event.clone());
+                    if matches!(event, ProviderEvent::Usage(_)) {
+                        bail!("observer write failed");
+                    }
+                    Ok(())
+                })
+            }
+        }
+        let terminal = HttpFixture::new(vec![Reply {
+            body: "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]}],\"usage\":{\"input_tokens\":9,\"output_tokens\":3}}}\n\n".into(),
+            status: axum::http::StatusCode::OK,
+            content_type: "text/event-stream",
+            session: false,
+        }])
+        .await;
+        let provider = ResponsesProvider::new(&terminal.url, "").unwrap();
+        let mut sink = FailOnUsage(vec![]);
+        let error = collect_completion(&provider, request(), Some(&mut sink))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("observer write failed"));
+        assert!(matches!(sink.0.last(), Some(ProviderEvent::Usage(_))));
+        assert!(
+            !sink
+                .0
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Completed(_)))
+        );
+        assert_eq!(terminal.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn api_sse_delta_reaches_observer_before_delayed_terminal() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1028,7 +1206,16 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(matches!(first, Some(ProviderEvent::TextDelta { text, .. }) if text == "visible"));
+        assert!(matches!(first, Some(ProviderEvent::ContextMeasured(_))));
+        let delta = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                event = observed.recv() => event,
+                result = &mut stream => panic!("stream settled before a delta: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(delta, Some(ProviderEvent::TextDelta { text, .. }) if text == "visible"));
         release.send(()).unwrap();
         stream.as_mut().await.unwrap();
         let terminal = [observed.recv().await, observed.recv().await];
@@ -1117,6 +1304,132 @@ mod tests {
                 .to_string()
                 .contains("opaque-private-reasoning")
         );
+    }
+
+    #[tokio::test]
+    async fn final_body_preflight_refuses_before_http_and_marks_native_chain_mandatory() {
+        let peer = HttpFixture::new(vec![
+            Reply::json(json!({
+                "status":"completed",
+                "output":[
+                    {"type":"reasoning","encrypted_content":"opaque-private-reasoning","summary":[]},
+                    {"type":"function_call","call_id":"c1","name":"file_read","arguments":"{}"},
+                    {"type":"function_call","call_id":"c2","name":"file_read","arguments":"{}"}
+                ]
+            })),
+            Reply::json(json!({
+                "status":"completed",
+                "output":[
+                    {"type":"reasoning","encrypted_content":"second-private-reasoning","summary":[]},
+                    {"type":"function_call","call_id":"c3","name":"file_read","arguments":"{}"}
+                ]
+            })),
+        ])
+        .await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        let mut too_large = request();
+        too_large.context_budget = Some(
+            ContextBudget::resolve(
+                kuru_core::Sourced::configured_assumption(100),
+                None,
+                Some(1),
+            )
+            .unwrap(),
+        );
+        let mut observations = Events::default();
+        let error = provider
+            .stream(too_large, &mut observations)
+            .await
+            .unwrap_err();
+        let fit = error.downcast_ref::<kuru_core::ContextTooLarge>().unwrap();
+        assert!(!fit.native_continuation_mandatory);
+        assert!(peer.requests.lock().await.is_empty());
+        assert!(matches!(
+            observations.0.as_slice(),
+            [ProviderEvent::ContextMeasured(_)]
+        ));
+
+        let mut continuation = request();
+        assert_eq!(
+            provider
+                .complete(continuation.clone())
+                .await
+                .unwrap()
+                .calls()
+                .len(),
+            2
+        );
+        continuation.messages.extend([
+            Message::tool_result("c2", json!("second"), false),
+            Message::tool_result("c1", json!("first"), false),
+        ]);
+        continuation.current_message_count = Some(2);
+        assert_eq!(
+            provider
+                .complete(continuation.clone())
+                .await
+                .unwrap()
+                .calls()
+                .len(),
+            1
+        );
+        assert_eq!(peer.requests.lock().await.len(), 2);
+        continuation
+            .messages
+            .push(Message::text("user", "private-sentinel-".repeat(1_000)));
+        continuation
+            .messages
+            .push(Message::tool_result("c3", json!("third"), false));
+        continuation.current_message_count = Some(1);
+        continuation.context_budget = Some(
+            ContextBudget::resolve(
+                kuru_core::Sourced::configured_assumption(100),
+                None,
+                Some(1),
+            )
+            .unwrap(),
+        );
+        let mut observations = Events::default();
+        let error = provider
+            .stream(continuation, &mut observations)
+            .await
+            .unwrap_err();
+        let fit = error.downcast_ref::<kuru_core::ContextTooLarge>().unwrap();
+        assert!(fit.native_continuation_mandatory);
+        assert_eq!(peer.requests.lock().await.len(), 2);
+        assert!(!error.to_string().contains("private-sentinel"));
+        let [ProviderEvent::ContextMeasured(measurement)] = observations.0.as_slice() else {
+            panic!("one context measurement must precede refusal")
+        };
+        assert!(measurement.final_body_bytes > 0);
+        assert!(measurement.sources.iter().any(|source| source.kind
+            == ContextSourceKind::NativeContinuation
+            && source.mandatory));
+        assert!(!format!("{measurement:?}").contains("private-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn offline_demo_also_measures_and_refuses_an_oversize_prompt() {
+        let mut input = request();
+        input.model = "demo".into();
+        input.context_budget = Some(
+            ContextBudget::resolve(
+                kuru_core::Sourced::configured_assumption(100),
+                None,
+                Some(1),
+            )
+            .unwrap(),
+        );
+        let mut observations = Events::default();
+        let error = DemoProvider
+            .stream(input, &mut observations)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<kuru_core::ContextTooLarge>().is_some());
+        assert!(matches!(
+            observations.0.as_slice(),
+            [ProviderEvent::ContextMeasured(_)]
+        ));
     }
 
     #[tokio::test]

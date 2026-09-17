@@ -389,6 +389,9 @@ pub struct Config {
     /// Used only when neither live discovery nor the offline catalog supplies a
     /// context window. It cannot override a verified provider limit.
     pub assumed_context_window_tokens: Option<u64>,
+    /// Optional fit reserve. This is local accounting, not a provider wire
+    /// parameter or an override of verified model output metadata.
+    pub context_output_reserve_tokens: Option<u64>,
     pub max_rounds: usize,
     pub max_tool_calls: usize,
     pub max_parallel: usize,
@@ -414,6 +417,7 @@ impl Default for Config {
             model: "auto".into(),
             effort: None,
             assumed_context_window_tokens: None,
+            context_output_reserve_tokens: None,
             max_rounds: 3,
             max_tool_calls: 12,
             max_parallel: 4,
@@ -781,6 +785,12 @@ impl Config {
             ensure!(
                 (1..=2_000_000).contains(&window),
                 "assumed_context_window_tokens must be between 1 and 2000000"
+            );
+        }
+        if let Some(reserve) = self.context_output_reserve_tokens {
+            ensure!(
+                (1..=2_000_000).contains(&reserve),
+                "context_output_reserve_tokens must be between 1 and 2000000"
             );
         }
         bounded("max_rounds", self.max_rounds, 1, 64)?;

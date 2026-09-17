@@ -297,6 +297,10 @@ pub struct CompletionRequest {
     /// continuation is disabled rather than inferred from durable history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_message_count: Option<usize>,
+    /// Effective request window and reserved output space. Direct callers
+    /// without this field use the connector's documented legacy assumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_budget: Option<crate::ContextBudget>,
     pub model: String,
     pub effort: Option<String>,
     pub tools: Vec<ToolSpec>,

@@ -31,7 +31,7 @@ fn published_schema_accepts_defaults_and_documented_configuration() {
     let validator = schema();
     let defaults = serde_json::to_value(Config::default()).unwrap();
     assert!(validator.is_valid(&defaults));
-    let example = "provider='responses'\nmodel='future-model'\neffort='future-effort'\nassumed_context_window_tokens=64000\n[mcp.local]\ncommand='runner'\nargs=['--stdio']\n[mcp.local.env]\nTOKEN='from-environment'\n[external_agents]\npeer='https://example.test/a2a'\n[memory]\nstartup_timeout_secs=60";
+    let example = "provider='responses'\nmodel='future-model'\neffort='future-effort'\nassumed_context_window_tokens=64000\ncontext_output_reserve_tokens=4096\n[mcp.local]\ncommand='runner'\nargs=['--stdio']\n[mcp.local.env]\nTOKEN='from-environment'\n[external_agents]\npeer='https://example.test/a2a'\n[memory]\nstartup_timeout_secs=60";
     let value = json_from_toml(example);
     assert!(validator.is_valid(&value));
     parse_config(example).unwrap();
@@ -46,6 +46,8 @@ fn schema_and_parser_reject_unknown_keys_and_shared_bounds() {
         "[mcp.local]\ncommand='runner'\nunexpected=true",
         "assumed_context_window_tokens=0",
         "assumed_context_window_tokens=2000001",
+        "context_output_reserve_tokens=0",
+        "context_output_reserve_tokens=2000001",
         "[memory]\nstartup_timeout_secs=0",
     ] {
         assert!(!validator.is_valid(&json_from_toml(text)), "schema: {text}");

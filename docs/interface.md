@@ -5,6 +5,10 @@ open conversation canvas and a composer that holds model, effort and framework
 values beside their shortcuts. Project and session context sit in the header.
 The status line carries active work, elapsed time, cancellations, failures and
 brief saved-setting confirmations. It stays quiet on an untouched welcome screen.
+Request context is labelled as an estimate for the facing or active request,
+with window provenance and actual omission counts. `/cost` separates known usage
+from incomplete reports and API-equivalent estimates. These measurements do not
+replace the model, effort, mode or permission controls.
 
 Ink surfaces, mint, blue, lilac, amber and rose distinguish identities and activity.
 Color always accompanies readable labels. The ornamental alphabet is ordinary

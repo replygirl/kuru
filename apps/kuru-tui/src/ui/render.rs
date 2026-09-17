@@ -2,7 +2,7 @@
 
 use std::{cell::RefCell, collections::BTreeMap};
 
-use kuru_core::RelationshipKind;
+use kuru_core::{FactProvenance, RelationshipKind, UsagePhase};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -945,6 +945,32 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
     {
         return;
     }
+    let context_label = view.request_context.as_ref().map(|context| {
+        let phase = match context.phase {
+            UsagePhase::Deliberate => "deliberate",
+            UsagePhase::Speak => "speak",
+            UsagePhase::Consult => "consult",
+            UsagePhase::Dream => "dream",
+        };
+        let (provenance, short_provenance) = match &context.estimate.budget.window.provenance {
+            FactProvenance::RouteAdvertisement => ("advertised", "adv"),
+            FactProvenance::Pinned { .. } => ("pinned", "pin"),
+            FactProvenance::ConfiguredAssumption => ("configured assumption", "cfg"),
+            FactProvenance::BuiltInAssumption => ("built-in assumption", "assumed"),
+        };
+        let input = context.estimate.estimated_input_tokens;
+        let reserve = context.estimate.budget.output_reserve_tokens;
+        let window = context.estimate.budget.window.value;
+        if area.width < 60 {
+            format!("≈{input}+{reserve}/{window} {short_provenance}")
+        } else {
+            format!(
+                "≈{input}+{reserve}/{window} tokens · {} {} · {provenance}",
+                view.actor_name(&context.actor_id),
+                phase,
+            )
+        }
+    });
     let (glyph, label, color) = if let Some(notice) = &view.notice {
         (
             if view.busy { "i" } else { "✓" },
@@ -952,41 +978,83 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
             identity.accent,
         )
     } else if view.busy {
-        let thinking = view
-            .part_activity
-            .values()
-            .filter(|s| matches!(s.as_str(), "active" | "tool"))
-            .count();
-        (
-            spinner(view),
-            format!(
-                "{}  ·  {}s{}",
-                view.status,
-                view.operation_ms / 1000,
-                if thinking > 0 {
-                    format!("  ·  {thinking} active")
-                } else {
-                    String::new()
-                }
-            ),
-            if error { ROSE } else { identity.accent },
-        )
+        if let Some(context) = context_label.as_ref()
+            && view.active_operation_id.as_deref().is_some_and(|id| {
+                view.request_context
+                    .as_ref()
+                    .is_some_and(|item| item.operation_id == id)
+            })
+        {
+            (
+                spinner(view),
+                format!(
+                    "{}{context}",
+                    if area.width < 60 {
+                        "est "
+                    } else {
+                        "prepared est "
+                    }
+                ),
+                identity.accent,
+            )
+        } else {
+            let thinking = view
+                .part_activity
+                .values()
+                .filter(|s| matches!(s.as_str(), "active" | "tool"))
+                .count();
+            (
+                spinner(view),
+                format!(
+                    "{}  ·  {}s{}",
+                    view.status,
+                    view.operation_ms / 1000,
+                    if thinking > 0 {
+                        format!("  ·  {thinking} active")
+                    } else {
+                        String::new()
+                    }
+                ),
+                if error { ROSE } else { identity.accent },
+            )
+        }
     } else if cancelled || error {
         (
             if error { "!" } else { "-" },
             view.status.clone(),
             if error { ROSE } else { AMBER },
         )
+    } else if let Some(context) = context_label.as_ref() {
+        ("◆", format!("last {context}"), identity.accent)
     } else if view.speaker != "pool" && !view.show_scene {
         (
             "◆",
-            format!("{}  ·  {} parts present", view.speaker, view.parts.len()),
+            format!(
+                "{}  ·  {} parts present{}",
+                view.speaker,
+                view.parts.len(),
+                view.usage
+                    .as_ref()
+                    .map_or_else(String::new, |usage| format!(
+                        " · {} recorded calls · /cost",
+                        usage.invocation_count
+                    ))
+            ),
             identity.accent,
         )
     } else {
         (
             identity.symbol,
-            format!("{} parts present", view.parts.len()),
+            format!(
+                "{} parts present{}",
+                view.parts.len(),
+                view.usage
+                    .as_ref()
+                    .map_or_else(String::new, |usage| format!(
+                        " · {} recorded calls · /cost",
+                        usage.invocation_count
+                    ))
+            ),
             MUTED,
         )
     };

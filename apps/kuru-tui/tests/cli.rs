@@ -1193,6 +1193,45 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     );
 }
 
+#[test]
+fn headless_json_remains_machine_readable_when_old_context_is_omitted() {
+    let env = Sandbox::new();
+    let sentinel = "older-context-remains-stored";
+    let long_prompt = format!("{sentinel} {}", "x".repeat(12_000));
+    let first = env.run(&["run", &long_prompt, "--json"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let config_path = env.root.path().join("config/kuru/config.toml");
+    let config = format!(
+        "assumed_context_window_tokens = 4000\ncontext_output_reserve_tokens = 256\n{}",
+        std::fs::read_to_string(&config_path).unwrap()
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let second = env.run(&["run", "short follow-up", "--json"]);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let result: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert!(result["text"].as_str().is_some());
+    assert!(!String::from_utf8_lossy(&second.stdout).contains(sentinel));
+    assert!(!String::from_utf8_lossy(&second.stderr).contains(sentinel));
+
+    let export = env.run(&["memory", "export"]);
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(String::from_utf8_lossy(&export.stdout).contains(sentinel));
+}
+
 #[tokio::test]
 async fn cli_undo_dream_shows_one_notice_without_constructing_a_provider() {
     use kuru_memory::MemoryStore;

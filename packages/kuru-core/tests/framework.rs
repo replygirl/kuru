@@ -250,6 +250,7 @@ fn transport_contracts_preserve_tool_replay_unicode_and_future_efforts() {
             false,
         )],
         current_message_count: Some(1),
+        context_budget: None,
         model: "future-model".into(),
         effort: Some("adaptive-future".into()),
         tools: vec![ToolSpec {

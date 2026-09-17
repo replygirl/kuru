@@ -350,6 +350,21 @@ mod tests {
     -> Result<()> {
         let store = MemoryStore::temporary().await?;
         let large = commit_fixture_rows(&store).await?;
+        let ledger = store.usage_ledger()?;
+        ledger.mark_new_session("export-session").await?;
+        ledger
+            .admit(kuru_core::InvocationStart {
+                session_id: "export-session".into(),
+                invocation_id: "export-invocation".into(),
+                operation_id: "export-fixture".into(),
+                phase: kuru_core::UsagePhase::Speak,
+                actor_id: "fixture".into(),
+                route: "fixture".into(),
+                model: "fixture".into(),
+                price_at_invocation: None,
+            })
+            .await?;
+        drop(ledger);
         let snapshot = store.begin_active_export().await?;
         assert_eq!(snapshot.provenance().branch, "main");
         assert_eq!(
@@ -447,6 +462,8 @@ mod tests {
             "main-after-snapshot",
             "candidate-after-snapshot",
             "dirty-after-snapshot",
+            "kuru.usage.v1",
+            "export-invocation",
         ] {
             assert!(!rendered.contains(omitted), "snapshot included {omitted}");
         }

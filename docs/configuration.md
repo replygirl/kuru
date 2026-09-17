@@ -81,6 +81,35 @@ provider; consult `kuru models` instead of relying on a hardcoded list.
 `model = "auto"` uses provider selection. Kuru preserves newly advertised effort
 strings. The API key itself never belongs in configuration.
 
+## Context budget
+
+Kuru estimates each provider request after its native continuation and tool
+results have been assembled. The estimate includes instructions, tool schemas,
+current input, history and private continuation. It uses serialized bytes divided
+by two, rounded up; this is an estimate, not the provider's tokenizer or a
+guaranteed token upper bound. The status display labels it accordingly.
+
+Model windows come from validated route metadata or the pinned catalog. When
+neither provides a window, Kuru assumes 128,000 tokens and labels that assumption.
+For an unfamiliar model you can configure the fallback window and output reserve:
+
+```toml
+assumed_context_window_tokens = 128000
+context_output_reserve_tokens = 8192
+```
+
+Both optional settings accept 1–2,000,000 tokens. The window setting is a fallback
+for missing metadata. Without an output-reserve override, Kuru reserves the
+smallest of 8,192 tokens, the model's reported output limit, and a quarter of the
+window, with a minimum of one token. A configured reserve is never silently
+reduced to fit the window.
+
+Older optional history can be omitted as complete rows to fit a request; the
+interface reports actual omitted counts. Stored memory and conversations remain
+intact. Current input, required tool receipts and native continuation are kept
+together. If mandatory material plus the reserve cannot fit, the request fails
+before inference is sent. Transport byte limits still apply separately.
+
 ## Tool permissions
 
 Tools use `allow`, `ask` or `deny` decisions after workspace trust and the

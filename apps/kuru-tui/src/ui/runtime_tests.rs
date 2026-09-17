@@ -199,6 +199,13 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
         DispatchOutcome::Command(_) => panic!("ordinary input did not run a turn"),
     };
     assert!(!first.reused);
+    let usage_before_retry = h.session_usage().await.unwrap();
+    let cost = command_text(dispatch(&mut h, &models, "/cost").await.unwrap());
+    assert!(cost.contains(&format!(
+        "{} provider invocations",
+        usage_before_retry.invocation_count
+    )));
+    assert!(cost.contains("API-equivalent estimate (not a subscription charge)"));
     let history = h.history().await.unwrap();
     let retry = match dispatch(&mut h, &models, "/retry").await.unwrap() {
         DispatchOutcome::Turn(result) => result,
@@ -207,6 +214,7 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
     assert!(retry.reused);
     assert_eq!(retry.output.text, first.output.text);
     assert_eq!(h.history().await.unwrap(), history);
+    assert_eq!(h.session_usage().await.unwrap(), usage_before_retry);
     assert!(
         command_text(
             dispatch(&mut h, &models, &format!("/memory {}", ids[0]))

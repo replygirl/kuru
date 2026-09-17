@@ -482,6 +482,7 @@ pub fn request() -> kuru_core::CompletionRequest {
         instructions: "Actor-specific context".into(),
         messages: vec![kuru_core::Message::text("user", "hello")],
         current_message_count: Some(1),
+        context_budget: None,
         model: "future-model".into(),
         effort: Some("future-effort".into()),
         tools: vec![kuru_core::ToolSpec {
