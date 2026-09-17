@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use kuru_core::{Completion, CompletionRequest, Config, ContentBlock, Message, ModelInfo, Usage};
+use kuru_core::{
+    Completion, CompletionRequest, Config, ContentBlock, Message, ModelInfo, ModelMetadata,
+    ModelRoute, Usage, advertised_metadata, enrich_model,
+};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -60,6 +63,7 @@ impl Provider for DemoProvider {
             name: "Deterministic demo (offline)".into(),
             efforts: vec![],
             default_effort: None,
+            metadata: ModelMetadata::default(),
         }])
     }
 
@@ -169,6 +173,23 @@ impl ResponsesProvider {
 
     fn is_subscription(&self) -> bool {
         matches!(self.auth, Authentication::Subscription { .. })
+    }
+
+    fn model_route(&self) -> ModelRoute {
+        if self.is_subscription() {
+            ModelRoute::CodexSubscription
+        } else if self.base == "https://api.openai.com/v1" {
+            ModelRoute::OpenAiResponses
+        } else {
+            ModelRoute::CustomResponses
+        }
+    }
+
+    fn enrich_models(&self, models: Vec<ModelInfo>) -> Result<Vec<ModelInfo>> {
+        models
+            .into_iter()
+            .map(|model| enrich_model(self.model_route(), model))
+            .collect()
     }
 
     fn operation(&self, catalog: bool) -> diagnostics::Operation {
@@ -520,7 +541,7 @@ impl Provider for ResponsesProvider {
             let value =
                 diagnostics::json(self.send(builder, operation, &budget).await?, operation).await?;
             if self.is_subscription() {
-                return subscription_models(&value);
+                return self.enrich_models(subscription_models(&value)?);
             }
             let data = value["data"]
                 .as_array()
@@ -535,9 +556,11 @@ impl Provider for ResponsesProvider {
                         name: id.into(),
                         efforts: vec![],
                         default_effort: None,
+                        metadata: advertised_model_metadata(model),
                     })
                 })
-                .collect()
+                .collect::<Result<Vec<_>>>()
+                .and_then(|models| self.enrich_models(models))
         })
         .await
         .context("model catalog exceeded 60-second total limit")?
@@ -590,9 +613,28 @@ fn subscription_models(value: &Value) -> Result<Vec<ModelInfo>> {
                 name: model["display_name"].as_str().unwrap_or(id).into(),
                 efforts,
                 default_effort,
+                metadata: advertised_model_metadata(model),
             })
         })
         .collect()
+}
+
+fn advertised_model_metadata(model: &Value) -> ModelMetadata {
+    let mut metadata = advertised_metadata(
+        model["context_window"].as_u64(),
+        model["max_output_tokens"].as_u64(),
+        model
+            .get("capabilities")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|capabilities| capabilities.iter())
+            .filter_map(|(name, value)| value.as_bool().map(|value| (name.clone(), value))),
+    );
+    metadata.extended_context_window_tokens = model["max_context_window"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .map(kuru_core::Sourced::advertised);
+    metadata
 }
 
 impl ResponsesProvider {
@@ -885,6 +927,33 @@ mod tests {
             .unwrap();
         assert_eq!(models[0].id, "future-2099");
         assert!(models[0].efforts.is_empty());
+        assert!(models[0].metadata.prices.is_none());
+    }
+
+    #[test]
+    fn official_and_custom_response_routes_have_distinct_catalog_facts() {
+        let mut provider = ResponsesProvider::new("http://127.0.0.1:1", "").unwrap();
+        let live = ModelInfo {
+            id: "gpt-5.6-sol".into(),
+            name: "Future display name".into(),
+            efforts: vec!["future-effort".into()],
+            default_effort: Some("future-effort".into()),
+            metadata: ModelMetadata::default(),
+        };
+        assert!(
+            provider.enrich_models(vec![live.clone()]).unwrap()[0]
+                .metadata
+                .prices
+                .is_none()
+        );
+        provider.base = "https://api.openai.com/v1".into();
+        let official = provider.enrich_models(vec![live]).unwrap().pop().unwrap();
+        assert_eq!(official.efforts, ["future-effort"]);
+        assert_eq!(
+            official.metadata.context_window_tokens.unwrap().value,
+            1_050_000
+        );
+        assert!(official.metadata.prices.is_some());
     }
 
     #[tokio::test]

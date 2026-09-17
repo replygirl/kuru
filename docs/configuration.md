@@ -8,6 +8,12 @@ replace. Unknown keys, invalid types, unsupported provider names and invalid
 bounds fail with context. Each configuration file is bounded to 256 KiB and the
 combined input to 1 MiB.
 
+The published `apps/kuru-docs/public/configuration.v1.schema.json` describes the
+JSON-equivalent structure for editor and tooling support. Kuru's TOML parser and
+native semantic validation remain authoritative, especially for URL and
+cross-field restrictions. Unknown keys are rejected: a configuration that needs
+a new key requires a newer Kuru version and never silently changes authority.
+
 Use `kuru config` and `kuru --help` to inspect configured options and CLI overrides.
 `kuru config` redacts MCP environment values and deliberately omits saved project
 mode, model and effort preferences so inspection never starts or provisions

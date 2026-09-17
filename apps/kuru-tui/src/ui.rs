@@ -1504,6 +1504,7 @@ mod tests {
                 name: "Demo".into(),
                 efforts: vec!["low".into(), "high".into()],
                 default_effort: Some("low".into()),
+                metadata: Default::default(),
             }],
         )
     }

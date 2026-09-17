@@ -283,6 +283,7 @@ fn transport_contracts_preserve_tool_replay_unicode_and_future_efforts() {
         name: "Future".into(),
         efforts: vec!["adaptive-future".into()],
         default_effort: Some("adaptive-future".into()),
+        metadata: Default::default(),
     };
     assert_eq!(
         serde_json::from_value::<ModelInfo>(serde_json::to_value(&model).unwrap()).unwrap(),

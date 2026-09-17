@@ -5,6 +5,7 @@
 
 mod config;
 mod framework;
+mod model_catalog;
 mod types;
 
 pub use config::{
@@ -16,6 +17,9 @@ pub use config::{
 pub use framework::{
     Framework, Mode, Part, Relationship, RelationshipKind, canonical_peer_instruction,
 };
+pub use model_catalog::{ModelCatalog, ModelRoute, advertised_metadata, enrich_model};
 pub use types::{
-    Completion, CompletionRequest, ContentBlock, Message, ModelInfo, ToolCall, ToolSpec, Usage,
+    CacheWriteTerms, Completion, CompletionRequest, ContentBlock, FactProvenance, LongContextTier,
+    Message, ModelInfo, ModelMetadata, PriceBasis, PriceSchedule, SourceCitation, Sourced,
+    ToolCall, ToolSpec, Usage,
 };

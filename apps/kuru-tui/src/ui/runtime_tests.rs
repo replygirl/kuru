@@ -68,6 +68,7 @@ async fn harness_with_provider(
         name: "Demo".into(),
         efforts: vec!["low".into(), "high".into()],
         default_effort: Some("low".into()),
+        metadata: Default::default(),
     }];
     (directory, harness, models)
 }
