@@ -548,7 +548,7 @@ async fn response(
         .unwrap()
         .unwrap();
     }
-    let completed = json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":if delayed { "LATE_WINDOWS_RESULT" } else { "FRESH_WINDOWS_RESULT" }}]}]});
+    let completed = json!({"id":"fixture-cancellation","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":if delayed { "LATE_WINDOWS_RESULT" } else { "FRESH_WINDOWS_RESULT" }}]}]});
     let event = json!({"type":"response.completed","response":completed});
     (
         [("content-type", "text/event-stream")],
