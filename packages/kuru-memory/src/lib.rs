@@ -11,8 +11,9 @@ mod store;
 pub use progress::{MemoryOpenProgress, MemoryOpenStage};
 pub use store::purge::PurgeOutcome;
 pub use store::{
-    ActiveExportSnapshot, Candidate, ExportCursor, ExportPage, ExportProvenance, MemoryStatus,
-    MemoryStore, MemoryView, OpenOptions, Revision, StorageRecord, StoredNote,
+    ActiveExportSnapshot, Candidate, ExportCursor, ExportPage, ExportProvenance, HistoryWindow,
+    MemoryStatus, MemoryStore, MemoryView, OpenOptions, Revision, StorageRecord, StoredNote,
+    UsageLedger,
 };
 
 #[cfg(any(test, feature = "test-support"))]

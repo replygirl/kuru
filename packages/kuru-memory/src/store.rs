@@ -82,6 +82,7 @@ struct Shared {
     read_only: bool,
     write: Arc<Mutex<()>>,
     uncertain: StdMutex<Option<Pending>>,
+    usage_pool: StdMutex<Option<Arc<MySqlPool>>>,
     #[cfg(test)]
     candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
     _permit: Option<OwnedSemaphorePermit>,
@@ -142,6 +143,15 @@ pub struct StoredNote {
     pub sequence: i64,
     pub role: String,
     pub content: String,
+}
+
+/// A bounded suffix of one retained namespace together with its exact durable
+/// row count. Callers can report omission from the actual source, rather than
+/// inferring it from a requested limit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryWindow {
+    pub messages: Vec<Message>,
+    pub total_rows: u64,
 }
 
 #[derive(Debug)]
@@ -640,7 +650,9 @@ mod export;
 pub(crate) mod marker_fixture;
 mod migrations;
 pub(crate) mod purge;
+mod usage_ledger;
 pub use export::{ActiveExportSnapshot, ExportCursor, ExportPage, ExportProvenance, StorageRecord};
+pub use usage_ledger::UsageLedger;
 
 impl MemoryStore {
     pub fn exists(data_dir: &Path, project_scope: &str) -> Result<bool> {
@@ -972,6 +984,7 @@ impl MemoryStore {
             read_only: options.read_only,
             write: Arc::new(Mutex::new(())),
             uncertain: StdMutex::new(None),
+            usage_pool: StdMutex::new(None),
             #[cfg(test)]
             candidate_recovery_pause: options.candidate_recovery_pause,
             _permit: permit,
@@ -983,6 +996,7 @@ impl MemoryStore {
         };
         if !options.read_only {
             run_candidate_recovery_worker(&store).await?;
+            usage_ledger::establish(&store).await?;
         } else {
             let lock: File = store.shared.server.take_reap_guard();
             drop(lock);
@@ -1032,6 +1046,24 @@ impl MemoryStore {
     fn writable(&self) -> Result<()> {
         ensure!(!self.shared.read_only, "this memory view is read-only");
         self.readable()
+    }
+
+    /// Return the memory-owned, permanent operational usage ledger. The
+    /// opaque handle does not expose its Dolt branch or SQL connection.
+    pub fn usage_ledger(&self) -> Result<UsageLedger> {
+        self.readable()?;
+        let pool = self
+            .shared
+            .usage_pool
+            .lock()
+            .expect("usage pool lock")
+            .clone()
+            .context("usage ledger is unavailable in this read-only or pre-ledger store")?;
+        Ok(UsageLedger::new(MemoryStore {
+            shared: self.shared.clone(),
+            pool,
+            branch: usage_ledger::BRANCH.into(),
+        }))
     }
 
     pub async fn append(&self, namespace: &str, role: &str, content: &str) -> Result<()> {
@@ -1117,6 +1149,63 @@ impl MemoryStore {
                 })
             })
             .collect()
+    }
+
+    /// Read the bounded newest suffix and the exact total number of rows in
+    /// the same branch-pinned namespace.
+    pub async fn history_window(&self, namespace: &str, limit: usize) -> Result<HistoryWindow> {
+        identifier("namespace", namespace, 1024)?;
+        let version = self.schema_version().await?;
+        let limit = i64::try_from(limit).context("history limit exceeds integer range")?;
+        let query = if version >= 3 {
+            "SELECT sequence, role, content_format, content FROM (SELECT sequence, role, content_format, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
+        } else {
+            "SELECT sequence, role, content FROM (SELECT sequence, role, content FROM messages WHERE namespace = ? ORDER BY sequence DESC LIMIT ?) AS recent ORDER BY sequence"
+        };
+        // Keep count and suffix in one branch-pinned read transaction. It is a
+        // short snapshot query only; provider work never holds it.
+        let mut transaction = self.pool.begin().await?;
+        let total_rows: i64 = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE namespace = ?")
+                .bind(namespace.as_bytes())
+                .fetch_one(&mut *transaction),
+        )
+        .await
+        .context("memory history count deadline exceeded")??;
+        let rows = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query(query)
+                .bind(namespace.as_bytes())
+                .bind(limit)
+                .fetch_all(&mut *transaction),
+        )
+        .await
+        .context("memory history window deadline exceeded")??;
+        transaction.commit().await?;
+        let messages = rows
+            .into_iter()
+            .map(|row| {
+                let sequence: i64 = row.try_get("sequence")?;
+                let role = String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?;
+                let content: String = row.try_get("content")?;
+                let format: String = if version >= 3 {
+                    row.try_get("content_format")?
+                } else {
+                    TEXT_FORMAT.into()
+                };
+                decode_message(role, &format, &content).with_context(|| {
+                    format!(
+                        "invalid stored message sequence {sequence} on {}",
+                        self.branch
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(HistoryWindow {
+            messages,
+            total_rows: u64::try_from(total_rows).context("memory history count is negative")?,
+        })
     }
     /// Read durable rows with their stable sequence for a caller that already
     /// owns namespace selection. This deliberately preserves every stored role.
@@ -2268,9 +2357,12 @@ mod tests {
             root.path().to_owned(),
             format!("project/{}", "e".repeat(64)),
         )?;
+        let fixture_options = options.clone();
         let (progress, opening) = MemoryStore::open_observed(options);
         drop(progress);
-        let store = opening.await?;
+        let store = opening
+            .await
+            .map_err(|error| crate::test_support::fixture_startup_error(&fixture_options, error))?;
         assert!(!store.revision().await?.is_empty());
         store.close().await?;
         Ok(())
@@ -3147,6 +3239,7 @@ mod tests {
                 read_only: true,
                 write: Arc::new(Mutex::new(())),
                 uncertain: StdMutex::new(None),
+                usage_pool: StdMutex::new(None),
                 candidate_recovery_pause: None,
                 _permit: None,
             }),

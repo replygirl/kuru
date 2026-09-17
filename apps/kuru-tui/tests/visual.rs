@@ -2,8 +2,8 @@ use std::{collections::BTreeSet, fmt::Write as _};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use kuru::ui::{InitialViewData, RuntimeSnapshot, View, draw};
-use kuru_core::{Framework, Mode, ModelInfo};
-use kuru_runtime::{Event, FacingProgress, PeerMessage};
+use kuru_core::{ContextBudget, ContextEstimate, Framework, Mode, ModelInfo, Sourced, UsagePhase};
+use kuru_runtime::{Event, FacingProgress, PeerMessage, RequestContext};
 use ratatui::{
     Terminal,
     backend::TestBackend,
@@ -33,6 +33,7 @@ fn fixture(mode: Mode) -> View {
                 relationships: vec![],
                 focus: None,
             },
+            usage: None,
         },
         vec![ModelInfo {
             id: "demo".into(),
@@ -87,6 +88,62 @@ fn provisional_tail_and_thinking_remain_separate_from_transcript_at_practical_si
         assert!(cursor.0 < width && cursor.1 < height);
         assert!(view.transcript.is_empty());
     }
+}
+
+#[test]
+fn prepared_context_status_is_bounded_and_keeps_the_composer_at_practical_sizes() {
+    let mut view = fixture(Mode::Ifs);
+    view.show_scene = false;
+    view.busy = true;
+    view.status = "Listening to the parts".into();
+    view.input = "unsent draft".into();
+    view.active_operation_id = Some("turn".into());
+    view.request_context = Some(RequestContext {
+        operation_id: "turn".into(),
+        actor_id: view.parts[0].0.clone(),
+        phase: UsagePhase::Speak,
+        estimate: ContextEstimate::for_final_body(
+            ContextBudget::resolve(Sourced::advertised(128_000), None, None).unwrap(),
+            1_024,
+            false,
+            vec![],
+        ),
+        runtime_sources: vec![],
+        omitted_public_rows: 2,
+        omitted_private_rows: 1,
+        omitted_note_rows: 0,
+    });
+    for (width, height) in [(40, 18), (80, 24), (120, 35)] {
+        let (buffer, cursor) = render(&view, width, height, "context-status");
+        let screen = text(&buffer);
+        assert!(screen.contains("est"), "{width}x{height}: {screen}");
+        assert!(
+            screen.contains("512+8192/128000"),
+            "{width}x{height}: {screen}"
+        );
+        assert!(
+            screen.contains("unsent draft"),
+            "{width}x{height}: {screen}"
+        );
+        if width == 40 {
+            assert!(screen.contains("adv"), "{screen}");
+        }
+        if width == 120 {
+            assert!(screen.contains("advertised"), "{screen}");
+        }
+        assert!(cursor.0 < width && cursor.1 < height);
+    }
+    view.request_context
+        .as_mut()
+        .unwrap()
+        .estimate
+        .budget
+        .window = Sourced::built_in(128_000);
+    let (buffer, _) = render(&view, 40, 18, "assumed-context-status");
+    assert!(text(&buffer).contains("assumed"));
+    view.active_operation_id = Some("other".into());
+    let (buffer, _) = render(&view, 120, 35, "foreign-context-status");
+    assert!(!text(&buffer).contains("prepared est"));
 }
 
 fn key(code: KeyCode) -> KeyEvent {

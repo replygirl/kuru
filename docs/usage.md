@@ -32,6 +32,7 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | `/relate alliance ID,ID` | Activate a relationship of 2–4 parts |
 | `/memory NAME_OR_ID` | Inspect an identity's stored memory |
 | `/notes NAME_OR_ID` | Inspect an identity's durable notes, separate from its conversation |
+| `/cost` | Inspect this session's reported usage and estimated API cost |
 | `/retry` | Retry the last local submission when its exact durable turn is safe to reuse |
 | `/dream` | Run bounded memory/topology consolidation |
 | `/undo-dream` | Restore the previous topology change |
@@ -60,6 +61,34 @@ browser.
 `/notes` returns the selected identity's newest 100 durable notes with the
 selected mode, canonical identity, requested limit, and `truncated` metadata.
 It does not show that identity's conversation; use `/memory` for that history.
+
+## Usage and context
+
+`/cost` includes inference for deliberation, speaking, peer consultation and
+dreaming, including reported usage from failed or interrupted work. Cached input
+and reasoning output are subsets of the input and output totals. They are not
+added a second time. A completed `/retry` does not make a new provider call or add
+usage.
+
+Missing reports and prices are shown as unknown or incomplete. An incomplete
+estimate names the priced terms it left out, such as a long-context tier or a
+cache-write rate, and a term that cannot be decided is never applied in part.
+Each record keeps its raw per-kind token components and its recorded price, so a
+later reading can apply a term this version does not price. Sessions created
+before usage accounting remain labelled as having incomplete historical totals
+when resumed. Estimates use the price terms recorded for each invocation; later
+catalog changes do not reprice earlier work. For ChatGPT subscription access,
+an API-equivalent estimate is a comparison with API prices, not a bill or a
+measure of remaining subscription quota.
+
+The context indicator describes one request, preferring the facing speaker when
+available. It is not a shared context window for the whole pool. Token estimates,
+assumed window limits and omitted history are labelled. The composer keeps a
+standing row with that context estimate and the session cost estimate, beside the
+model, effort, framework and permission controls, so one frame carries all six.
+Its figures are the ones `/cost` and `/permissions` report. Earlier conversation
+rows omitted from the bounded display remain in storage. See
+[context budget](configuration.md#context-budget) for fitting and reserve settings.
 
 ## The live interface
 

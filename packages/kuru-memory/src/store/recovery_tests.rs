@@ -1507,6 +1507,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
             read_only: false,
             write: Arc::new(Mutex::new(())),
             uncertain: StdMutex::new(None),
+            usage_pool: StdMutex::new(None),
             candidate_recovery_pause: None,
             _permit: None,
         }),

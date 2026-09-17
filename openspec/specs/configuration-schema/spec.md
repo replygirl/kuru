@@ -25,16 +25,23 @@ The published schema SHALL reject unknown root, nested memory, and per-MCP-entry
 keys and SHALL accept the supported documented configuration examples after
 TOML-to-JSON conversion. Its supported key inventory and default values SHALL
 remain aligned with `Config` serialization and defaults; model and effort values
-SHALL remain open strings rather than catalog-derived enums.
+SHALL remain open strings rather than catalog-derived enums. A parser rejection
+of an unknown key SHALL carry the documented forward-compatibility policy — that
+unknown keys are rejected, that a configuration needing a new key requires a
+newer Kuru version, and that authority never changes silently — without echoing
+the offending key, and an in-range key with an invalid value SHALL NOT borrow
+that message.
 
 #### Scenario: Unknown authority field is rejected
 - **WHEN** configuration contains an unknown root, memory, or MCP-entry key
-- **THEN** both schema validation and Kuru's parser SHALL reject it
+- **THEN** both schema validation and Kuru's parser SHALL reject it, and the
+  parser's message SHALL state the documented forward-compatibility policy
 
 #### Scenario: Invalid numeric bound is rejected
 - **WHEN** configuration supplies a startup timeout or configured fallback window
   outside its documented bounds
 - **THEN** both schema validation and Kuru's semantic validation SHALL reject it
+  without presenting it as a forward-compatibility rejection
 
 #### Scenario: Cross-field rules retain native enforcement
 - **WHEN** a configuration violates an MCP command-versus-URL exclusivity rule,
@@ -57,3 +64,15 @@ The published versioned configuration schema and native TOML parser SHALL accept
 #### Scenario: Higher-priority rule array replaces lower-priority entries
 - **WHEN** layered configuration supplies a later `permissions` array
 - **THEN** only that effective array participates in matching and workspace manifest derivation.
+
+### Requirement: Bounded context configuration parity
+
+P7 SHALL reuse the existing bounded `assumed_context_window_tokens` setting and add only an optional bounded `context_output_reserve_tokens` override for fitting. The native configuration parser and published `configuration.v1.schema.json` SHALL accept the same supported fields, reject unknown keys and out-of-range values, and retain ordinary model and effort values as open strings. An override SHALL not grant tool authority or mutate the frozen provider route; an output reserve greater than the selected effective window SHALL cause a pre-dispatch fit refusal.
+
+#### Scenario: Explicit window override
+- **WHEN** a user configures a valid context window for an unfamiliar model
+- **THEN** fit uses that explicit bound with its configured provenance and both parser and published schema accept the equivalent configuration.
+
+#### Scenario: Invalid bound
+- **WHEN** the window or reserve is outside documented bounds or uses an unsupported key
+- **THEN** native validation and published schema both reject the configuration.

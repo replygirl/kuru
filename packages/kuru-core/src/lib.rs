@@ -3,18 +3,29 @@
 //! The framework profiles are metaphors for complementary working tendencies.
 //! They do not describe clinical treatment or establish machine consciousness.
 
+mod accounting;
 mod config;
+mod context;
 mod framework;
 mod model_catalog;
 mod permissions;
 mod policy;
 mod types;
 
+pub use accounting::{
+    InvocationOutcome, InvocationStart, InvocationUsage, MoneyEstimate, SessionUsage,
+    UnappliedPriceTerm, UsageCompleteness, UsageObservation, UsagePhase,
+};
 pub use config::{
     AuthorityClaim, AuthorityClaimCategory, AuthorityManifest, ClaimDigest, Config, ConfigSnapshot,
     InvocationOverrides, ManifestDigest, McpConfig, MemoryConfig, ModelPreference,
     ProjectPreferences, ResponsesRouteConfig, SafeClaimDisplay, SafeManifest, SafeSource,
     SelectionOverrides, load_instructions,
+};
+pub use context::{
+    ContextBudget, ContextEstimate, ContextSourceKind, ContextSourceSize, ContextTooLarge,
+    DEFAULT_OUTPUT_RESERVE_TOKENS, MAX_CONFIGURED_OUTPUT_RESERVE_TOKENS,
+    estimated_tokens_for_bytes,
 };
 pub use framework::{
     Framework, Mode, Part, Relationship, RelationshipKind, canonical_peer_instruction,

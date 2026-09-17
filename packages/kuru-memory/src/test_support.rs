@@ -80,26 +80,59 @@ pub(crate) fn fixture_startup_error(options: &OpenOptions, error: Error) -> Erro
             || message.starts_with(
                 "memory server startup failed: Dolt startup/lifetime failed; private diagnostics:",
             )
+            || message == "memory supervisor readiness deadline exceeded"
     }) {
         return error;
     }
     match staged_fixture_server_log(options) {
-        Some(log) => error.context(log),
-        None => error,
+        FixtureLog::Found(log) => error.context(log),
+        FixtureLog::Absent => match active_fixture_server_log(options) {
+            Some(log) => error.context(log),
+            None => error,
+        },
+        FixtureLog::Unsafe => error,
     }
 }
 
-fn staged_fixture_server_log(options: &OpenOptions) -> Option<String> {
-    let active = crate::store::project_directory(&options.data_dir, &options.project_scope).ok()?;
-    let parent = active.parent()?;
-    let name = active.file_name()?.to_str()?;
+fn fixture_server_log(log: PathBuf) -> Option<String> {
+    let bytes = files::read_bytes(&log, STARTUP_LOG_BYTES).ok()?;
+    let tail = &bytes[bytes.len().saturating_sub(STARTUP_TAIL_BYTES)..];
+    Some(format!(
+        "fixture Dolt server log tail ({}): {}",
+        log.display(),
+        String::from_utf8_lossy(tail)
+    ))
+}
+
+enum FixtureLog {
+    Found(String),
+    Absent,
+    Unsafe,
+}
+
+fn staged_fixture_server_log(options: &OpenOptions) -> FixtureLog {
+    let Ok(active) = crate::store::project_directory(&options.data_dir, &options.project_scope)
+    else {
+        return FixtureLog::Unsafe;
+    };
+    let Some(parent) = active.parent() else {
+        return FixtureLog::Unsafe;
+    };
+    let Some(name) = active.file_name().and_then(|name| name.to_str()) else {
+        return FixtureLog::Unsafe;
+    };
     let prefix = format!("{name}.staging-");
     let mut stage = None;
-    for (index, entry) in fs::read_dir(parent).ok()?.enumerate() {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return FixtureLog::Unsafe;
+    };
+    for (index, entry) in entries.enumerate() {
         if index >= MAX_STAGE_ENTRIES {
-            return None;
+            return FixtureLog::Unsafe;
         }
-        let entry = entry.ok()?;
+        let Ok(entry) = entry else {
+            return FixtureLog::Unsafe;
+        };
         let entry_name = entry.file_name();
         let Some(suffix) = entry_name
             .to_str()
@@ -110,18 +143,29 @@ fn staged_fixture_server_log(options: &OpenOptions) -> Option<String> {
         if uuid::Uuid::parse_str(suffix).is_err() {
             continue;
         }
-        if !entry.file_type().ok()?.is_dir() || stage.replace(entry.path()).is_some() {
-            return None;
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir())
+            || stage.replace(entry.path()).is_some()
+        {
+            return FixtureLog::Unsafe;
         }
     }
-    let log = stage?.join("server.log");
-    let bytes = files::read_bytes(&log, STARTUP_LOG_BYTES).ok()?;
-    let tail = &bytes[bytes.len().saturating_sub(STARTUP_TAIL_BYTES)..];
-    Some(format!(
-        "fixture Dolt server log tail ({}): {}",
-        log.display(),
-        String::from_utf8_lossy(tail)
-    ))
+    let Some(stage) = stage else {
+        return FixtureLog::Absent;
+    };
+    let log = stage.join("server.log");
+    match fs::symlink_metadata(&log) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => FixtureLog::Absent,
+        Ok(_) => fixture_server_log(log).map_or(FixtureLog::Unsafe, FixtureLog::Found),
+        Err(_) => FixtureLog::Unsafe,
+    }
+}
+
+fn active_fixture_server_log(options: &OpenOptions) -> Option<String> {
+    fixture_server_log(
+        crate::store::project_directory(&options.data_dir, &options.project_scope)
+            .ok()?
+            .join("server.log"),
+    )
 }
 
 #[cfg(test)]
@@ -132,6 +176,12 @@ mod fixture_diagnostic_tests {
         anyhow::anyhow!(
             "memory server startup failed: Dolt startup/lifetime failed; private diagnostics: fixture/server.log: Dolt exited before readiness"
         )
+    }
+
+    fn readiness_error() -> Error {
+        anyhow::anyhow!("memory supervisor readiness deadline exceeded")
+            .context("memory startup cleanup also failed: memory supervisor exited unsuccessfully (exit code: 1)")
+            .context("open staged memory server")
     }
 
     #[test]
@@ -154,17 +204,49 @@ mod fixture_diagnostic_tests {
         let unrelated = anyhow::anyhow!("ordinary fixture error");
         let unchanged = fixture_startup_error(&options, unrelated);
         assert_eq!(unchanged.to_string(), "ordinary fixture error");
+        let unrelated_deadline = fixture_startup_error(
+            &options,
+            anyhow::anyhow!("provider readiness deadline exceeded"),
+        );
+        assert_eq!(
+            unrelated_deadline.to_string(),
+            "provider readiness deadline exceeded"
+        );
         let captured = fixture_startup_error(&options, startup_error());
         let rendered = format!("{captured:#}");
         assert!(rendered.contains("fixture-private-log"));
         assert!(rendered.contains(&log.display().to_string()));
         assert!(rendered.contains("Dolt exited before readiness"));
+        let readiness_captured = fixture_startup_error(&options, readiness_error());
+        let readiness_rendered = format!("{readiness_captured:#}");
+        assert!(readiness_rendered.contains("fixture-private-log"));
+        assert!(readiness_rendered.contains(&log.display().to_string()));
+        assert!(readiness_rendered.contains("memory supervisor readiness deadline exceeded"));
 
         files::write(&log, &vec![b'x'; 8 * 1024])?;
         let bounded = fixture_startup_error(&options, startup_error()).to_string();
         assert!(bounded.len() < 5 * 1024, "fixture log tail was not bounded");
         assert!(bounded.ends_with(&"x".repeat(4 * 1024)));
         fs::remove_file(&log)?;
+        files::private_dir(&active)?;
+        let active_log = active.join("server.log");
+        files::write(&active_log, b"fixture-active-log")?;
+        let active_captured = fixture_startup_error(&options, startup_error());
+        assert!(format!("{active_captured:#}").contains("fixture-active-log"));
+        let parent = active.parent().context("active project parent")?;
+        let name = active
+            .file_name()
+            .context("active project name")?
+            .to_string_lossy();
+        for _ in 0..2 {
+            files::private_dir(&parent.join(format!("{name}.staging-{}", uuid::Uuid::new_v4())))?;
+        }
+        let ambiguous = fixture_startup_error(&options, startup_error());
+        assert!(
+            !format!("{ambiguous:#}").contains("fixture-active-log"),
+            "ambiguous staging must not disclose an active log"
+        );
+        fs::remove_file(&active_log)?;
         let missing = fixture_startup_error(&options, startup_error());
         assert!(!format!("{missing:#}").contains("fixture Dolt server log tail"));
         Ok(())

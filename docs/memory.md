@@ -56,6 +56,12 @@ rows, operations, and schema tables. Export never starts a provider, imports leg
 or creates a fresh memory store. It is a current committed snapshot, not a
 historical-revision browser or a secure-erasure/archive facility.
 
+The operational usage ledger is separate from the exported live-memory snapshot
+and is not included in `memory export`. It belongs to the same managed project
+store, so closing or purging that store also covers its ledger. Dream promotion,
+abandonment and undo do not remove observed usage; `/cost` reads session usage
+separately from conversation and note history.
+
 ## Runtime and offline use
 
 Every Kuru executable includes the pinned native Dolt archive and its license

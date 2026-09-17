@@ -946,7 +946,16 @@ async fn subscription_sse_delta_reaches_observer_before_delayed_terminal() {
     })
     .await
     .unwrap();
-    assert!(matches!(first, Some(ProviderEvent::TextDelta { text, .. }) if text == "visible"));
+    assert!(matches!(first, Some(ProviderEvent::ContextMeasured(_))));
+    let delta = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            event = observed.recv() => event,
+            result = &mut stream => panic!("stream settled before a delta: {result:?}"),
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(delta, Some(ProviderEvent::TextDelta { text, .. }) if text == "visible"));
     release.send(()).unwrap();
     stream.as_mut().await.unwrap();
     let terminal = [observed.recv().await, observed.recv().await];

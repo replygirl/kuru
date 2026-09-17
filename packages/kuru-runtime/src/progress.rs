@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use kuru_connectors::{ProviderEvent, ProviderSink};
+use kuru_core::{ContextEstimate, ContextSourceSize, UsagePhase};
 use tokio::sync::watch;
 
 const TEXT_LIMIT: usize = 8 * 1024;
@@ -20,6 +21,30 @@ pub struct FacingProgress {
     pub summary_truncated: bool,
     pub activity: String,
     pub activity_truncated: bool,
+}
+
+/// Bounded, replaceable facts for one prepared provider request. No request
+/// content or opaque native continuation is retained here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestContext {
+    pub operation_id: String,
+    pub actor_id: String,
+    pub phase: UsagePhase,
+    pub estimate: ContextEstimate,
+    /// Runtime-visible source inventory; final wire fit remains connector-owned.
+    pub runtime_sources: Vec<ContextSourceSize>,
+    pub omitted_public_rows: u64,
+    pub omitted_private_rows: u64,
+    pub omitted_note_rows: u64,
+}
+
+/// At most the latest prepared request and the latest facing request are kept.
+/// A private consultation or automatic dream cannot erase the facing fit that
+/// the just-completed user turn needs to present.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextSnapshot {
+    pub latest: Option<RequestContext>,
+    pub latest_facing: Option<RequestContext>,
 }
 
 struct Shared {
@@ -172,6 +197,7 @@ impl ProviderSink for ProgressObserver {
                 ProviderEvent::TextDelta { text, .. } => self.text(&text),
                 ProviderEvent::ReasoningSummaryDelta { text, .. } => self.summary(&text),
                 ProviderEvent::ToolCallDelta { .. }
+                | ProviderEvent::ContextMeasured(_)
                 | ProviderEvent::Usage(_)
                 | ProviderEvent::Completed(_)
                 | ProviderEvent::Failed { .. } => {}

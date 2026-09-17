@@ -15,7 +15,7 @@ pub use engine::{
     project_scope, read_notes, turn_was_cancelled,
 };
 pub use event::{Event, StateReport, ToolObservation, ToolOutcome, TurnLimitReason};
-pub use progress::FacingProgress;
+pub use progress::{ContextSnapshot, FacingProgress, RequestContext};
 
 #[cfg(test)]
 fn test_receipt(message: &kuru_core::Message) -> anyhow::Result<serde_json::Value> {
@@ -70,6 +70,9 @@ mod progress_tests;
 
 #[cfg(test)]
 mod permission_tests;
+
+#[cfg(test)]
+mod accounting_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tool_tests;

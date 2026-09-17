@@ -123,6 +123,24 @@ Dreaming is a consolidation and topology-update mechanism. It does not run an
 unbounded background loop or imply biological sleep. Its provider calls count
 toward the operational cost of a session.
 
+## Context and usage accounting
+
+Runtime assigns each provider invocation an identity and admits it durably before
+inference. The actor awaits usage writes through the fallible provider stream and
+records success, failure or cancellation separately from reported token counts.
+Missing reports remain incomplete. The memory package keeps these operational
+records on a permanent project-owned Dolt branch, outside live and candidate
+history. Usage commits cannot invalidate a dream's promotion base or disappear
+with an abandoned candidate. Session totals are folded from invocation records;
+there is no independently mutable total to replay twice.
+
+Context assembly inventories optional history separately from mandatory
+instructions, current input and tool receipts. It can omit whole older rows
+without changing storage. Connectors check the actual serialized request,
+including actor-private native continuation, immediately before dispatch.
+Only non-content measurements leave that boundary. The status and `/cost`
+projections distinguish estimates, known reports and incomplete history.
+
 ## Message representation
 
 Core messages carry a role and ordered content blocks. Text, tool uses and tool

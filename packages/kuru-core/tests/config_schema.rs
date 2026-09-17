@@ -31,7 +31,7 @@ fn published_schema_accepts_defaults_and_documented_configuration() {
     let validator = schema();
     let defaults = serde_json::to_value(Config::default()).unwrap();
     assert!(validator.is_valid(&defaults));
-    let example = "provider='responses'\nmodel='future-model'\neffort='future-effort'\nassumed_context_window_tokens=64000\n[mcp.local]\ncommand='runner'\nargs=['--stdio']\n[mcp.local.env]\nTOKEN='from-environment'\n[external_agents]\npeer='https://example.test/a2a'\n[memory]\nstartup_timeout_secs=60";
+    let example = "provider='responses'\nmodel='future-model'\neffort='future-effort'\nassumed_context_window_tokens=64000\ncontext_output_reserve_tokens=4096\n[mcp.local]\ncommand='runner'\nargs=['--stdio']\n[mcp.local.env]\nTOKEN='from-environment'\n[external_agents]\npeer='https://example.test/a2a'\n[memory]\nstartup_timeout_secs=60";
     let value = json_from_toml(example);
     assert!(validator.is_valid(&value));
     parse_config(example).unwrap();
@@ -46,6 +46,8 @@ fn schema_and_parser_reject_unknown_keys_and_shared_bounds() {
         "[mcp.local]\ncommand='runner'\nunexpected=true",
         "assumed_context_window_tokens=0",
         "assumed_context_window_tokens=2000001",
+        "context_output_reserve_tokens=0",
+        "context_output_reserve_tokens=2000001",
         "[memory]\nstartup_timeout_secs=0",
     ] {
         assert!(!validator.is_valid(&json_from_toml(text)), "schema: {text}");
@@ -70,6 +72,39 @@ fn schema_and_parser_reject_unknown_keys_and_shared_bounds() {
         );
         assert!(parse_config(&text).is_err(), "parser: {text}");
     }
+}
+
+/// The forward-compatibility policy is documented, so the rejection has to say
+/// it rather than leave the reader with a bare type error.
+#[test]
+fn unknown_keys_are_rejected_with_the_documented_forward_compatibility_message() {
+    const POLICY: &str = "nknown keys are rejected: a configuration that needs a new key requires a newer Kuru version and never silently changes authority";
+    for page in [
+        include_str!("../../../docs/configuration.md"),
+        include_str!("../../../apps/kuru-docs/reference/configuration.md"),
+    ] {
+        let flattened = page.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flattened.contains(POLICY), "documented policy drifted");
+    }
+
+    for text in [
+        "unexpected=true",
+        "[memory]\nunexpected=true",
+        "[mcp.local]\ncommand='runner'\nunexpected=true",
+        "[[permissions]]\naction='allow'\nselector={kind='native',name='file_write'}\nextra=true",
+    ] {
+        let error = format!("{:#}", parse_config(text).unwrap_err());
+        assert!(error.contains(POLICY), "{text}: {error}");
+        assert!(!error.contains("unexpected"), "{text}: {error}");
+    }
+
+    // An in-range key with an out-of-range value is not a forward-compatibility
+    // rejection and must not borrow its message.
+    let error = format!(
+        "{:#}",
+        parse_config("assumed_context_window_tokens=0").unwrap_err()
+    );
+    assert!(!error.contains(POLICY), "{error}");
 }
 
 #[test]

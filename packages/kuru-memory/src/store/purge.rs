@@ -560,6 +560,21 @@ mod tests {
         let options = crate::test_support::open_options(root.path().to_owned(), scope.clone())?;
         let store = MemoryStore::open(options.clone()).await?;
         assert!(store.get(&key).await?.is_some());
+        let ledger = store.usage_ledger()?;
+        ledger.mark_new_session("purged-session").await?;
+        ledger
+            .admit(kuru_core::InvocationStart {
+                session_id: "purged-session".into(),
+                invocation_id: "purged-invocation".into(),
+                operation_id: "purge-fixture".into(),
+                phase: kuru_core::UsagePhase::Speak,
+                actor_id: "fixture".into(),
+                route: "fixture".into(),
+                model: "fixture".into(),
+                price_at_invocation: None,
+            })
+            .await?;
+        drop(ledger);
         let revision = store.revision().await?;
         store.close().await?;
         let project = project_directory(root.path(), &scope)?;
@@ -588,6 +603,14 @@ mod tests {
         let reopened = MemoryStore::open(options).await?;
         assert_ne!(reopened.revision().await?, revision);
         assert_eq!(reopened.get(&key).await?, None);
+        assert_eq!(
+            reopened
+                .usage_ledger()?
+                .session("purged-session")
+                .await?
+                .invocation_count,
+            0
+        );
         reopened.close().await?;
         drop(source);
         Ok(())

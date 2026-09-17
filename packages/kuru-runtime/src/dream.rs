@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use futures::future::join_all;
-use kuru_core::{Config, Mode, Part, ToolSpec, canonical_peer_instruction};
+use kuru_core::{ActorPhase, Config, Mode, Part, ToolSpec, canonical_peer_instruction};
 use kuru_memory::{Candidate, MemoryStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -45,9 +45,28 @@ impl Harness {
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<DreamReport> {
+        self.dream_controlled_inner(cancellation, true).await
+    }
+
+    pub(crate) async fn dream_controlled_during_turn(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<DreamReport> {
+        self.dream_controlled_inner(cancellation, false).await
+    }
+
+    async fn dream_controlled_inner(
+        &mut self,
+        cancellation: &CancellationToken,
+        reset_context: bool,
+    ) -> Result<DreamReport> {
+        if reset_context {
+            self.reset_context_snapshot();
+        }
         cancellation.check()?;
         self.reconcile().await?;
         cancellation.check()?;
+        self.operation_id = format!("dream-{}", Uuid::new_v4());
         let candidate = self.memory.begin_candidate("dream").await?;
         let outcome = async {
             cancellation.check()?;
@@ -62,12 +81,12 @@ impl Harness {
                 .collect::<Vec<_>>();
             let replies = join_all(ids.iter().map(|id| self.ask_in_controlled(&memory, id,
                 vec![user("Review your own history. Write a concise durable memory summary of useful facts and unresolved concerns. You may suggest a new complementary member of an existing role or retire yourself if your role is redundantly covered. A suggestion is optional; do not manufacture changes. No other tools are available during dreaming.")],
-                "dream: consolidate your own memory, optionally propose membership changes", vec![dream_tool()], cancellation))).await;
+                ("dream: consolidate your own memory, optionally propose membership changes", ActorPhase::Dream), vec![dream_tool()], cancellation))).await;
             let mut report = DreamReport::default();
             let mut proposals = vec![];
             for (id, reply) in ids.into_iter().zip(replies) {
                 match reply {
-                    Err(error) if error.is::<crate::actor::MemoryFailure>() => return Err(error),
+                    Err(error) if error.is::<crate::actor::MemoryFailure>() || error.is::<crate::actor::AccountingFailure>() => return Err(error),
                     Err(error) if turn_was_cancelled(&error) => return Err(error),
                     Err(error) => report.rejected.push(format!("{id}: {error:#}")),
                     Ok(reply) => {

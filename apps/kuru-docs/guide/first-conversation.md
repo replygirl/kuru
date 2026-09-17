@@ -40,6 +40,8 @@ The controls beside the composer show your current choices:
 | <kbd>F3</kbd> | Reasoning effort |
 | <kbd>F4</kbd> | Framework        |
 
+Below them, a standing row keeps the last prepared request's context estimate and this session's cost estimate next to the permission counts, so one screen carries all six. An unknown price reads as `cost unknown`, never as a zero charge or a quota, and the figures are the ones `/cost` and `/permissions` report. Very narrow terminals abbreviate that row rather than drop a control.
+
 Type in a picker to filter, use the arrow keys to move, and press <kbd>Enter</kbd> to select. <kbd>Escape</kbd> closes it. Your unsent draft stays in place. Choices persist for this project, including after quitting and relaunching.
 
 Use <kbd>Alt</kbd>+<kbd>Enter</kbd> for a newline. <kbd>Page Up</kbd> and <kbd>Page Down</kbd> scroll the transcript. During work, <kbd>Escape</kbd> or <kbd>Ctrl</kbd>+<kbd>C</kbd> cancels the operation. While idle, <kbd>Ctrl</kbd>+<kbd>C</kbd> quits.
