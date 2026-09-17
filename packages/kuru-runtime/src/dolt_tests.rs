@@ -835,6 +835,7 @@ async fn reconciliation_publishes_only_durable_choices_before_the_next_mutation(
     )];
     harness.pending_publication = Some(PendingPublication {
         config,
+        profile: harness.profile.clone(),
         topology: harness.topology.clone(),
         session: harness.session.clone(),
         updates: updates.clone(),
@@ -848,6 +849,7 @@ async fn reconciliation_publishes_only_durable_choices_before_the_next_mutation(
     unpublished.model = "not-committed".into();
     harness.pending_publication = Some(PendingPublication {
         config: unpublished,
+        profile: harness.profile.clone(),
         topology: harness.topology.clone(),
         session: harness.session.clone(),
         updates: vec![("missing-write".into(), json!(true))],

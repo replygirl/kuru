@@ -16,10 +16,11 @@ use kuru_connectors::{
     project_text,
 };
 use kuru_core::{
-    ActorPhase, Completion, Config, ContextBudget, Framework, InvocationStart, Message, Mode,
-    ModelInfo, ModelMetadata, ModelPreference, ModelRoute, Part, ProjectPreferences, Relationship,
-    RelationshipKind, SessionUsage, ToolCall, ToolSpec, UsagePhase, enrich_model,
-    load_instructions,
+    ActorPhase, Completion, Config, ContextBudget, FacingInput, InvocationStart, Message, Mode,
+    ModeProfile, ModelInfo, ModelMetadata, ModelPreference, ModelRoute, Part, ProjectPreferences,
+    Relationship, RelationshipKind, RelationshipOrigin, SessionUsage, ToolCall, ToolSpec,
+    UsagePhase, enrich_model, load_instructions, validate_contributions, validate_facing,
+    validate_peer_edge, validate_recipients, validate_relationship_members,
 };
 use kuru_memory::{HistoryWindow, MemoryStatus, MemoryStore, Revision, StoredNote};
 use serde::{Deserialize, Serialize};
@@ -117,6 +118,7 @@ struct TurnCancelled;
 struct CognitiveSettlement {
     admitted: std::time::Instant,
     observe: bool,
+    speaking: bool,
 }
 
 impl std::fmt::Display for TurnCancelled {
@@ -377,6 +379,7 @@ pub struct ForgetNoteResult {
 
 pub struct Harness {
     pub config: Config,
+    pub(crate) profile: ModeProfile,
     pub topology: Topology,
     pub session: Session,
     pub(crate) memory: MemoryStore,
@@ -402,9 +405,15 @@ pub struct Harness {
 
 pub(crate) struct PendingPublication {
     pub config: Config,
+    pub profile: ModeProfile,
     pub topology: Topology,
     pub session: Session,
     pub updates: Vec<(String, Value)>,
+}
+
+struct ConstructorAuthority {
+    tools: ToolHost,
+    profile: Option<ModeProfile>,
 }
 
 #[cfg(test)]
@@ -460,6 +469,61 @@ impl Harness {
         resume: Option<&str>,
         tools: ToolHost,
     ) -> Result<Self> {
+        Self::construct(
+            config,
+            cwd,
+            instructions,
+            memory,
+            provider,
+            resume,
+            ConstructorAuthority {
+                tools,
+                profile: None,
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_with_test_profile(
+        config: Config,
+        cwd: &Path,
+        memory: MemoryStore,
+        provider: Arc<dyn Provider>,
+        resume: Option<&str>,
+        profile: ModeProfile,
+    ) -> Result<Self> {
+        let cwd = cwd.canonicalize()?;
+        let tools = ToolHost::new(&cwd, &config)?;
+        let instructions = load_instructions(&cwd)?;
+        Self::construct(
+            config,
+            &cwd,
+            instructions,
+            memory,
+            provider,
+            resume,
+            ConstructorAuthority {
+                tools,
+                profile: Some(profile),
+            },
+        )
+        .await
+    }
+
+    async fn construct(
+        config: Config,
+        cwd: &Path,
+        instructions: String,
+        memory: MemoryStore,
+        provider: Arc<dyn Provider>,
+        resume: Option<&str>,
+        authority: ConstructorAuthority,
+    ) -> Result<Self> {
+        let ConstructorAuthority {
+            tools,
+            profile: override_profile,
+        } = authority;
         config.validate()?;
         let cwd = cwd.canonicalize()?;
         ensure!(
@@ -486,8 +550,14 @@ impl Harness {
         let mut config = config;
         config.mode = session.mode;
         config.validate()?;
-        let topology = read_topology(&memory, &scope, config.mode).await?;
-        validate_topology(&topology, &config)?;
+        let profile = override_profile.unwrap_or_else(|| ModeProfile::builtin(config.mode));
+        ensure!(
+            profile.mode == config.mode,
+            "mode profile does not match saved session mode"
+        );
+        profile.validate(config.max_parts)?;
+        let topology = read_topology_with_profile(&memory, &scope, &profile).await?;
+        validate_topology_with_profile(&topology, &config, &profile)?;
         // Recheck the caller-retained workspace before this constructor can
         // publish its initial state. Instructions are already owned bytes and
         // are never reopened here.
@@ -506,6 +576,7 @@ impl Harness {
         let mut harness = Self {
             permits: Arc::new(Semaphore::new(config.max_parallel)),
             config,
+            profile,
             topology,
             session,
             memory,
@@ -1021,11 +1092,19 @@ impl Harness {
             self.pending_publication.is_none(),
             "pending memory publication must be reconciled before another state change"
         );
+        let profile = if config.mode == self.profile.mode {
+            self.profile.clone()
+        } else {
+            ModeProfile::builtin(config.mode)
+        };
+        profile.validate(config.max_parts)?;
+        validate_topology_with_profile(&topology, &config, &profile)?;
         let updates = self
             .state_updates(&self.memory, &topology, &session, updates)
             .await?;
         self.pending_publication = Some(PendingPublication {
             config,
+            profile,
             topology,
             session,
             updates: updates.clone(),
@@ -1073,6 +1152,7 @@ impl Harness {
     pub(crate) fn publish_pending(&mut self) {
         if let Some(pending) = self.pending_publication.take() {
             self.config = pending.config;
+            self.profile = pending.profile;
             self.topology = pending.topology;
             self.session = pending.session;
             self.sync_actors();
@@ -1102,8 +1182,14 @@ impl Harness {
         let mut config = self.config.clone();
         config.mode = mode;
         config.validate()?;
-        let topology = read_topology(&self.memory, &self.scope, mode).await?;
-        validate_topology(&topology, &config)?;
+        let profile = if mode == self.profile.mode {
+            self.profile.clone()
+        } else {
+            ModeProfile::builtin(mode)
+        };
+        profile.validate(config.max_parts)?;
+        let topology = read_topology_with_profile(&self.memory, &self.scope, &profile).await?;
+        validate_topology_with_profile(&topology, &config, &profile)?;
         let mut preferences = read_preferences(&self.memory, &self.scope).await?;
         preferences.mode = Some(mode);
         let update = self.preference_update(&preferences)?;
@@ -1175,6 +1261,16 @@ impl Harness {
         kind: RelationshipKind,
         members: Vec<String>,
     ) -> Result<Relationship> {
+        self.relate_from(RelationshipOrigin::User, kind, members)
+            .await
+    }
+
+    async fn relate_from(
+        &mut self,
+        origin: RelationshipOrigin,
+        kind: RelationshipKind,
+        members: Vec<String>,
+    ) -> Result<Relationship> {
         self.reconcile().await?;
         let members = members
             .iter()
@@ -1186,7 +1282,42 @@ impl Harness {
                 .all(|id| self.topology.parts.iter().any(|p| p.active && &p.id == id)),
             "relationships contain parts, not other relationships"
         );
-        let relation = Relationship::new(kind, members)?;
+        let active_parts = self
+            .topology
+            .parts
+            .iter()
+            .filter(|part| part.active)
+            .map(|part| part.id.clone())
+            .collect::<BTreeSet<_>>();
+        if let RelationshipOrigin::Peer {
+            sender,
+            sender_members,
+        } = &origin
+        {
+            let participates = if sender_members.is_empty() {
+                active_parts.contains(sender) && members.contains(sender)
+            } else {
+                self.topology.relationships.iter().any(|relation| {
+                    relation.id == *sender
+                        && self.actors.contains_key(sender)
+                        && relation.members == *sender_members
+                        && sender_members
+                            .iter()
+                            .all(|id| active_parts.contains(id) && members.contains(id))
+                })
+            };
+            ensure!(
+                participates,
+                "a part can only propose a relationship it participates in"
+            );
+        }
+        let proposed = Relationship::new(kind, members.clone())?;
+        let relation = self
+            .profile
+            .peering
+            .relationship(&origin, kind, members, &active_parts)?;
+        validate_relationship_members(&relation, &active_parts)?;
+        ensure!(relation == proposed, "mode changed a relationship proposal");
         let mut topology = self.topology.clone();
         if !topology.relationships.iter().any(|r| r.id == relation.id) {
             topology.relationships.push(relation.clone());
@@ -1639,16 +1770,35 @@ impl Harness {
         self.reset_context_snapshot();
         self.operation_id = journal.id.clone();
         let progress_turn = ProgressTurn::new(self.progress.clone(), journal.id.clone());
-        let mut pending: BTreeMap<String, Vec<Message>> = if let Some(id) = &target {
-            [(id.clone(), vec![user(prompt)])].into()
+        let active_parts = self
+            .topology
+            .parts
+            .iter()
+            .filter(|part| part.active)
+            .map(|part| part.id.clone())
+            .collect::<Vec<_>>();
+        let eligible = active_parts.iter().cloned().collect::<BTreeSet<_>>();
+        let live = self.actors.keys().cloned().collect::<BTreeSet<_>>();
+        let initial = self
+            .profile
+            .flow
+            .initial_recipients(target.as_deref(), &active_parts);
+        validate_recipients(&initial, &live)?;
+        if let Some(id) = &target {
+            ensure!(
+                initial == [id.clone()],
+                "mode redirected an explicit target"
+            );
         } else {
-            self.topology
-                .parts
-                .iter()
-                .filter(|p| p.active)
-                .map(|p| (p.id.clone(), vec![user(prompt)]))
-                .collect()
-        };
+            ensure!(
+                !initial.is_empty() && initial.iter().all(|id| eligible.contains(id)),
+                "mode selected no eligible initial peers"
+            );
+        }
+        let mut pending: BTreeMap<String, Vec<Message>> = initial
+            .into_iter()
+            .map(|id| (id, vec![user(prompt)]))
+            .collect();
         self.mark_possible_dispatch(journal_key, journal, cancellation)
             .await?;
         let mut drafts = BTreeMap::new();
@@ -1661,7 +1811,26 @@ impl Harness {
             if pending.is_empty() {
                 break;
             }
-            let batch = std::mem::take(&mut pending);
+            let selected = if round == 0 {
+                pending.keys().cloned().collect::<Vec<_>>()
+            } else {
+                let available = pending.keys().cloned().collect::<BTreeSet<_>>();
+                let selected = self.profile.flow.next_recipients(&available);
+                validate_recipients(&selected, &available)?;
+                selected
+            };
+            if selected.is_empty() {
+                break;
+            }
+            let batch = selected
+                .into_iter()
+                .map(|id| {
+                    pending
+                        .remove(&id)
+                        .map(|messages| (id, messages))
+                        .expect("validated pending recipient")
+                })
+                .collect::<BTreeMap<_, _>>();
             for id in batch.keys() {
                 self.emit_event(Event::Active {
                     actor: id.clone(),
@@ -1722,6 +1891,7 @@ impl Harness {
                             CognitiveSettlement {
                                 admitted,
                                 observe: true,
+                                speaking: false,
                             },
                             approval,
                         )
@@ -1758,26 +1928,22 @@ impl Harness {
             !drafts.is_empty(),
             "all peers failed to produce a contribution; inspect provider/model configuration and event errors"
         );
-        let (speaker, selection_reason) = target
-            .map(|target| (target, "caller-target"))
-            .unwrap_or_else(|| self.select_speaker(&drafts));
+        let (speaker, selection_reason) = self.choose_speaker(target.as_deref(), &drafts)?;
         let relation = self
             .topology
             .relationships
             .iter()
             .find(|r| r.id == speaker)
             .cloned();
-        let shared = if let Some(r) = &relation {
-            r.members
-                .iter()
-                .filter_map(|id| drafts.get(id).map(|text| json!({"sender":id,"text":text})))
-                .collect::<Vec<_>>()
-        } else {
-            drafts
-                .get(&speaker)
-                .map(|t| vec![json!({"sender":speaker,"text":t})])
-                .unwrap_or_default()
-        };
+        let contributions =
+            self.profile
+                .flow
+                .shared_contributions(&speaker, relation.as_ref(), &drafts);
+        validate_contributions(&speaker, relation.as_ref(), &drafts, &contributions)?;
+        let shared = contributions
+            .into_iter()
+            .map(|contribution| json!({"sender":contribution.sender,"text":contribution.text}))
+            .collect::<Vec<_>>();
         self.emit_event(Event::SpeakerSelection {
             actor: speaker.clone(),
             reason: selection_reason.into(),
@@ -1873,6 +2039,7 @@ impl Harness {
                                 CognitiveSettlement {
                                     admitted,
                                     observe: false,
+                                    speaking: true,
                                 },
                                 approval,
                             )
@@ -2015,6 +2182,7 @@ impl Harness {
         );
         self.pending_publication = Some(PendingPublication {
             config: self.config.clone(),
+            profile: self.profile.clone(),
             topology,
             session,
             updates: updates.clone(),
@@ -2043,55 +2211,63 @@ impl Harness {
         Ok(output)
     }
 
+    fn choose_speaker(
+        &self,
+        target: Option<&str>,
+        drafts: &BTreeMap<String, String>,
+    ) -> Result<(String, &'static str)> {
+        let live = self.actors.keys().cloned().collect::<BTreeSet<_>>();
+        let drafted = drafts.keys().cloned().collect::<BTreeSet<_>>();
+        let activation = self
+            .topology
+            .states
+            .iter()
+            .map(|(id, state)| (id.clone(), state.activation))
+            .collect::<BTreeMap<_, _>>();
+        let authored_order = self.profile.roles.authored_order();
+        let decision = self.profile.facing.choose(FacingInput {
+            target,
+            focus: self
+                .topology
+                .focus
+                .as_ref()
+                .map(|focus| (focus.id.as_str(), focus.remaining)),
+            live: &live,
+            drafts: &drafted,
+            activation: &activation,
+            previous_completed: self.session.last_completed_speaker.as_deref(),
+            authored_order: &authored_order,
+        })?;
+        validate_facing(&decision, &live)?;
+        if let Some(target) = target {
+            ensure!(
+                decision.speaker == target,
+                "mode redirected an explicit target"
+            );
+        } else if let Some(focus) = &self.topology.focus
+            && focus.remaining > 0
+            && live.contains(&focus.id)
+        {
+            ensure!(
+                decision.speaker == focus.id,
+                "mode redirected an active focus"
+            );
+        } else {
+            ensure!(
+                drafted.contains(&decision.speaker),
+                "mode selected an undrafted speaker"
+            );
+        }
+        Ok((decision.speaker, decision.reason))
+    }
+
+    #[cfg(test)]
     pub(crate) fn select_speaker(
         &self,
         drafts: &BTreeMap<String, String>,
     ) -> (String, &'static str) {
-        if let Some(focus) = &self.topology.focus
-            && focus.remaining > 0
-            && self.actors.contains_key(&focus.id)
-        {
-            return (focus.id.clone(), "active-focus");
-        }
-        let activation = |id: &str| {
-            self.topology
-                .states
-                .get(id)
-                .map_or(0.0, |state| state.activation)
-        };
-        let maximum = drafts
-            .keys()
-            .map(|id| activation(id))
-            .max_by(f64::total_cmp)
-            .expect("nonempty drafts validated");
-        let maximum_candidates = drafts
-            .keys()
-            .filter(|id| activation(id).total_cmp(&maximum).is_eq())
-            .cloned()
-            .collect::<Vec<_>>();
-        if maximum_candidates.len() > 1
-            && let Some(previous) = self.session.last_completed_speaker.as_deref()
-            && maximum_candidates.iter().any(|id| id == previous)
-        {
-            return (previous.into(), "previous-completed-speaker");
-        }
-        if maximum_candidates.len() > 1
-            && let Some(authored) = Framework::authored_identity_order(self.config.mode)
-                .into_iter()
-                .find(|id| maximum_candidates.iter().any(|candidate| candidate == id))
-        {
-            return (authored, "mode-authored-order");
-        }
-        let speaker = maximum_candidates
-            .first()
-            .expect("nonempty drafts validated")
-            .clone();
-        let reason = if maximum_candidates.len() > 1 {
-            "stable-id-order"
-        } else {
-            "maximum-activation"
-        };
-        (speaker, reason)
+        self.choose_speaker(None, drafts)
+            .expect("valid built-in facing choice")
     }
 
     async fn cognitive_call(
@@ -2111,7 +2287,14 @@ impl Harness {
         );
         let started = std::time::Instant::now();
         let result = self
-            .cognitive_call_inner(sender, call, pending, cancellation, approval)
+            .cognitive_call_inner(
+                sender,
+                call,
+                pending,
+                cancellation,
+                settlement.speaking,
+                approval,
+            )
             .instrument(span.clone())
             .await;
         let status = match &result {
@@ -2138,6 +2321,7 @@ impl Harness {
         call: &ToolCall,
         pending: &mut BTreeMap<String, Vec<Message>>,
         cancellation: &CancellationToken,
+        speaking: bool,
         approval: Option<&ApprovalSender>,
     ) -> Result<String> {
         cancellation.check()?;
@@ -2146,7 +2330,22 @@ impl Harness {
         match call.name.as_str() {
             "peer_send" => {
                 let recipient = self.resolve(string_arg(&call.arguments, "to")?)?;
-                ensure!(recipient != sender, "send to another peer");
+                let live = self.actors.keys().cloned().collect::<BTreeSet<_>>();
+                validate_peer_edge(sender, &recipient, &live)?;
+                ensure!(
+                    self.profile
+                        .peering
+                        .allows_direct(sender, &recipient, &live),
+                    "mode denied peer delivery"
+                );
+                if speaking {
+                    let selected = self.profile.flow.consultation_recipients(&recipient, &live);
+                    validate_recipients(&selected, &live)?;
+                    ensure!(
+                        selected == [recipient.clone()],
+                        "mode denied or redirected speaking consultation"
+                    );
+                }
                 let envelope = PeerMessage::new(
                     sender,
                     &recipient,
@@ -2175,17 +2374,29 @@ impl Harness {
                     .iter()
                     .map(|m| self.resolve(m))
                     .collect::<Result<Vec<_>>>()?;
-                ensure!(
-                    resolved.iter().any(|id| id == sender)
-                        || self
-                            .topology
-                            .relationships
-                            .iter()
-                            .any(|r| r.id == sender
-                                && r.members.iter().all(|id| resolved.contains(id))),
-                    "a part can only propose a relationship it participates in"
-                );
-                let relation = self.relate(kind, resolved).await?;
+                let origin = if self
+                    .topology
+                    .parts
+                    .iter()
+                    .any(|part| part.active && part.id == sender)
+                {
+                    RelationshipOrigin::Peer {
+                        sender: sender.into(),
+                        sender_members: vec![],
+                    }
+                } else {
+                    let sender_relation = self
+                        .topology
+                        .relationships
+                        .iter()
+                        .find(|relation| relation.id == sender && self.actors.contains_key(sender))
+                        .context("relationship proposer is not live")?;
+                    RelationshipOrigin::Peer {
+                        sender: sender.into(),
+                        sender_members: sender_relation.members.clone(),
+                    }
+                };
+                let relation = self.relate_from(origin, kind, resolved).await?;
                 cancellation.check()?;
                 self.emit_event(Event::Relationship {
                     actor: sender.into(),
@@ -2491,11 +2702,21 @@ fn resolve_active_identity(topology: &Topology, identity: &str) -> Result<String
     Ok(matches[0].id.clone())
 }
 
+#[cfg(test)]
 pub(crate) async fn read_topology(
     memory: &MemoryStore,
     scope: &str,
     mode: Mode,
 ) -> Result<Topology> {
+    read_topology_with_profile(memory, scope, &ModeProfile::builtin(mode)).await
+}
+
+pub(crate) async fn read_topology_with_profile(
+    memory: &MemoryStore,
+    scope: &str,
+    profile: &ModeProfile,
+) -> Result<Topology> {
+    let mode = profile.mode;
     memory
         .get(&format!("{scope}/{mode}/topology"))
         .await?
@@ -2504,7 +2725,7 @@ pub(crate) async fn read_topology(
         .map_err(Into::into)
         .map(|topology| {
             topology.unwrap_or_else(|| Topology {
-                parts: Framework::builtin(mode).parts,
+                parts: profile.roles.seeds(),
                 relationships: vec![],
                 states: BTreeMap::new(),
                 focus: None,
@@ -2525,7 +2746,21 @@ async fn read_preferences(memory: &MemoryStore, scope: &str) -> Result<ProjectPr
         .context("invalid saved project preferences")?;
     Ok(preferences)
 }
+#[cfg(test)]
 pub(crate) fn validate_topology(topology: &Topology, config: &Config) -> Result<()> {
+    validate_topology_with_profile(topology, config, &ModeProfile::builtin(config.mode))
+}
+
+pub(crate) fn validate_topology_with_profile(
+    topology: &Topology,
+    config: &Config,
+    profile: &ModeProfile,
+) -> Result<()> {
+    ensure!(
+        profile.mode == config.mode,
+        "mode profile does not match saved mode"
+    );
+    profile.validate(config.max_parts)?;
     let active = topology
         .parts
         .iter()
@@ -2541,11 +2776,18 @@ pub(crate) fn validate_topology(topology: &Topology, config: &Config) -> Result<
         .map(|p| &p.id)
         .collect::<BTreeSet<_>>();
     ensure!(ids.len() == topology.parts.len(), "duplicate part ID");
-    for seed in Framework::builtin(config.mode).parts {
+    ensure!(
+        topology
+            .parts
+            .iter()
+            .all(|part| profile.roles.accepts_role(&part.role)),
+        "mode topology contains an unsupported role"
+    );
+    for role in profile.roles.required_roles() {
         ensure!(
-            active.iter().any(|p| p.role == seed.role),
+            active.iter().any(|p| p.role == role),
             "last {} part must remain active",
-            seed.role
+            role
         );
     }
     for relation in &topology.relationships {
@@ -2562,6 +2804,80 @@ pub(crate) fn validate_topology(topology: &Topology, config: &Config) -> Result<
 mod publication_tests {
     use super::*;
     use kuru_connectors::DemoProvider;
+
+    #[tokio::test]
+    async fn mode_profile_publishes_only_after_durable_state_reconciliation() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            Arc::new(DemoProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let old_ids = harness
+            .topology
+            .parts
+            .iter()
+            .map(|part| part.id.clone())
+            .collect::<Vec<_>>();
+        let (written, release) = harness.pause_after_next_memory_write();
+        let mut change = Box::pin(harness.set_mode(Mode::Jungian));
+        tokio::select! {
+            result = &mut change => panic!("mode change completed before publication pause: {result:?}"),
+            result = written => result.unwrap(),
+        }
+        drop(change);
+        drop(release);
+        assert_eq!(harness.config.mode, Mode::Ifs);
+        assert_eq!(harness.session.mode, Mode::Ifs);
+        assert_eq!(harness.profile.mode, Mode::Ifs);
+        assert_eq!(
+            harness
+                .topology
+                .parts
+                .iter()
+                .map(|part| part.id.clone())
+                .collect::<Vec<_>>(),
+            old_ids
+        );
+        let pending = harness.pending_publication.as_ref().unwrap();
+        assert_eq!(pending.profile.mode, Mode::Jungian);
+        assert_eq!(pending.session.mode, Mode::Jungian);
+        assert!(
+            memory
+                .get(&format!("{}/jungian/topology", harness.scope))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        harness.reconcile().await.unwrap();
+        assert_eq!(harness.config.mode, Mode::Jungian);
+        assert_eq!(harness.session.mode, Mode::Jungian);
+        assert_eq!(harness.profile.mode, Mode::Jungian);
+        assert_ne!(
+            harness
+                .topology
+                .parts
+                .iter()
+                .map(|part| part.id.clone())
+                .collect::<Vec<_>>(),
+            old_ids
+        );
+        assert!(harness.pending_publication.is_none());
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn completed_turn_retry_is_exact_and_session_scoped() {
@@ -3591,6 +3907,7 @@ mod publication_tests {
             // The SQL write became durable, but its caller did not publish the snapshot.
             harness.pending_publication = Some(PendingPublication {
                 config: harness.config.clone(),
+                profile: harness.profile.clone(),
                 topology,
                 session: harness.session.clone(),
                 updates,
@@ -3628,6 +3945,7 @@ mod publication_tests {
                         CognitiveSettlement {
                             admitted: std::time::Instant::now(),
                             observe: true,
+                            speaking: false,
                         },
                         None,
                     )

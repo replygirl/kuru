@@ -36,9 +36,9 @@ pub use permissions::{
 };
 pub use policy::{
     ActorPhase, ConsolidationPlan, ContextSource, Contribution, FacingDecision, FacingInput,
-    FacingPolicy, FlowPolicy, MemoryPolicy, ModeProfile, PeeringPolicy, RolesPolicy, StateKeys,
-    VisibilityPolicy, validate_context_sources, validate_contributions, validate_facing,
-    validate_identity_namespace, validate_peer_edge, validate_recipients,
+    FacingPolicy, FlowPolicy, MemoryPolicy, ModeProfile, PeeringPolicy, RelationshipOrigin,
+    RolesPolicy, StateKeys, VisibilityPolicy, validate_context_sources, validate_contributions,
+    validate_facing, validate_identity_namespace, validate_peer_edge, validate_recipients,
     validate_relationship_members,
 };
 pub use types::{

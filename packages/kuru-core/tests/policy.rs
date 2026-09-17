@@ -6,9 +6,9 @@ use std::{
 use kuru_core::{
     ActorPhase, ConsolidationPlan, ContextSource, Contribution, FacingDecision, FacingInput,
     FacingPolicy, FlowPolicy, Framework, MemoryPolicy, Mode, ModeProfile, Part, PeeringPolicy,
-    Relationship, RelationshipKind, RolesPolicy, StateKeys, validate_context_sources,
-    validate_contributions, validate_facing, validate_identity_namespace, validate_peer_edge,
-    validate_recipients, validate_relationship_members,
+    Relationship, RelationshipKind, RelationshipOrigin, RolesPolicy, StateKeys,
+    validate_context_sources, validate_contributions, validate_facing, validate_identity_namespace,
+    validate_peer_edge, validate_recipients, validate_relationship_members,
 };
 use sha2::{Digest, Sha256};
 
@@ -84,8 +84,10 @@ fn reference_decisions_cover_peering_flow_facing_visibility_and_memory() {
         let relation = profile
             .peering
             .relationship(
-                &ids[0],
-                None,
+                &RelationshipOrigin::Peer {
+                    sender: ids[0].clone(),
+                    sender_members: vec![],
+                },
                 RelationshipKind::Alliance,
                 ids[..2].to_vec(),
                 &live,
@@ -107,8 +109,10 @@ fn reference_decisions_cover_peering_flow_facing_visibility_and_memory() {
             profile
                 .peering
                 .relationship(
-                    &ids[2],
-                    None,
+                    &RelationshipOrigin::Peer {
+                        sender: ids[2].clone(),
+                        sender_members: vec![],
+                    },
                     RelationshipKind::Alliance,
                     ids[..2].to_vec(),
                     &live
@@ -185,6 +189,115 @@ fn reference_decisions_cover_peering_flow_facing_visibility_and_memory() {
         assert_eq!(plan.participants, ids);
         assert_eq!(plan.max_proposals_per_part, 2);
     }
+}
+
+#[test]
+fn relationship_origins_preserve_user_admission_and_check_peer_context() {
+    let profile = ModeProfile::builtin(Mode::Ifs);
+    let ids = profile.roles.authored_order();
+    let live = ids.iter().cloned().collect::<BTreeSet<_>>();
+
+    let user_relationship = profile
+        .peering
+        .relationship(
+            &RelationshipOrigin::User,
+            RelationshipKind::Alliance,
+            ids[..2].to_vec(),
+            &live,
+        )
+        .unwrap();
+    assert_eq!(
+        user_relationship,
+        Relationship::new(RelationshipKind::Alliance, ids[..2].to_vec()).unwrap()
+    );
+    validate_relationship_members(&user_relationship, &live).unwrap();
+
+    assert!(
+        profile
+            .peering
+            .relationship(
+                &RelationshipOrigin::Peer {
+                    sender: ids[2].clone(),
+                    sender_members: vec![],
+                },
+                RelationshipKind::Alliance,
+                ids[..2].to_vec(),
+                &live,
+            )
+            .is_err()
+    );
+    assert!(
+        profile
+            .peering
+            .relationship(
+                &RelationshipOrigin::Peer {
+                    sender: "inactive".into(),
+                    sender_members: vec![],
+                },
+                RelationshipKind::Alliance,
+                ids[..2].to_vec(),
+                &live,
+            )
+            .is_err()
+    );
+
+    let peer_relationship =
+        Relationship::new(RelationshipKind::Protection, ids[..2].to_vec()).unwrap();
+    let peer_origin = RelationshipOrigin::Peer {
+        sender: peer_relationship.id.clone(),
+        sender_members: peer_relationship.members.clone(),
+    };
+    assert!(
+        profile
+            .peering
+            .relationship(
+                &peer_origin,
+                RelationshipKind::Alliance,
+                ids[..3].to_vec(),
+                &live,
+            )
+            .is_ok()
+    );
+
+    assert!(
+        profile
+            .peering
+            .relationship(
+                &RelationshipOrigin::Peer {
+                    sender: "forged-relationship".into(),
+                    sender_members: peer_relationship.members.clone(),
+                },
+                RelationshipKind::Alliance,
+                ids[..3].to_vec(),
+                &live,
+            )
+            .is_err()
+    );
+    assert!(
+        profile
+            .peering
+            .relationship(
+                &RelationshipOrigin::Peer {
+                    sender: peer_relationship.id,
+                    sender_members: peer_relationship.members.iter().rev().cloned().collect(),
+                },
+                RelationshipKind::Alliance,
+                ids[..3].to_vec(),
+                &live,
+            )
+            .is_err()
+    );
+    assert!(
+        profile
+            .peering
+            .relationship(
+                &RelationshipOrigin::User,
+                RelationshipKind::Alliance,
+                vec![ids[0].clone(), ids[0].clone()],
+                &live,
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -327,8 +440,7 @@ impl PeeringPolicy for OtherPeering {
     }
     fn relationship(
         &self,
-        _: &str,
-        _: Option<&[String]>,
+        _: &RelationshipOrigin,
         _: RelationshipKind,
         _: Vec<String>,
         _: &BTreeSet<String>,

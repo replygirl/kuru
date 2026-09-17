@@ -24,12 +24,26 @@ pub trait PeeringPolicy: Send + Sync {
     fn allows_direct(&self, sender: &str, recipient: &str, active: &BTreeSet<String>) -> bool;
     fn relationship(
         &self,
-        sender: &str,
-        sender_members: Option<&[String]>,
+        origin: &RelationshipOrigin,
         kind: RelationshipKind,
         members: Vec<String>,
         active_parts: &BTreeSet<String>,
     ) -> Result<Relationship>;
+}
+
+/// The checked source of a relationship proposal.
+///
+/// `Peer` is constructed by the runtime only after it has resolved the live
+/// actor. A part supplies an empty `sender_members`; a relationship actor
+/// supplies its canonical member list. The policy still validates that context
+/// before applying the participation rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelationshipOrigin {
+    User,
+    Peer {
+        sender: String,
+        sender_members: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,8 +370,7 @@ impl PeeringPolicy for ReferencePeering {
     }
     fn relationship(
         &self,
-        sender: &str,
-        sender_members: Option<&[String]>,
+        origin: &RelationshipOrigin,
         kind: RelationshipKind,
         members: Vec<String>,
         active_parts: &BTreeSet<String>,
@@ -366,11 +379,42 @@ impl PeeringPolicy for ReferencePeering {
             members.iter().all(|id| active_parts.contains(id)),
             "relationship members must be active parts"
         );
-        ensure!(members.iter().any(|id| id == sender)
-            || sender_members.is_some_and(|own| !own.is_empty()
-                && own.iter().all(|id| members.contains(id))),
-            "a part can only propose a relationship it participates in");
-        Relationship::new(kind, members)
+        let relationship = Relationship::new(kind, members)?;
+        if let RelationshipOrigin::Peer {
+            sender,
+            sender_members,
+        } = origin
+        {
+            let participates = if sender_members.is_empty() {
+                active_parts.contains(sender) && relationship.members.contains(sender)
+            } else {
+                sender_members
+                    .iter()
+                    .all(|member| active_parts.contains(member))
+                    && [
+                        RelationshipKind::Protection,
+                        RelationshipKind::Polarization,
+                        RelationshipKind::Alliance,
+                    ]
+                    .into_iter()
+                    .any(|sender_kind| {
+                        Relationship::new(sender_kind, sender_members.clone()).is_ok_and(
+                            |sender_relationship| {
+                                sender_relationship.id == *sender
+                                    && sender_relationship.members == *sender_members
+                            },
+                        )
+                    })
+                    && sender_members
+                        .iter()
+                        .all(|member| relationship.members.contains(member))
+            };
+            ensure!(
+                participates,
+                "a peer can only propose a relationship it participates in"
+            );
+        }
+        Ok(relationship)
     }
 }
 

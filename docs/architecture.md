@@ -48,9 +48,18 @@ facing (speaker choice), visibility (admitted context sources), and memory
 (namespace keys and dream consolidation plan). These components return decisions;
 the runtime still checks live identities and isolation, enforces budgets and tool
 permissions, owns candidate memory, and performs every provider or tool call.
-The current engine, actor, and dream loops retain their existing dispatch logic.
-Routing those loops through the profile is later work; this contract alone does
-not add a mode or a user control.
+The engine consumes roles, peering, flow and facing at their execution boundaries:
+roles supply fresh members and required-role checks; peering admits direct
+messages and relationship proposals; flow selects pending recipients,
+consultations and shared drafts; facing chooses the speaking identity. The
+runtime validates those decisions against live identities, actual pending input
+and the caller's target before acting. Selecting a peer grants no extra tool
+authority. A mode change publishes its profile together with the configuration,
+session and topology only after the memory checkpoint settles.
+
+Visibility and memory remain defined policy contracts pending their integration
+into actor context and dream consolidation. The four existing modes retain their
+behavior; the dispatch integration adds no mode or user control.
 
 Speaker selection preserves stronger runtime evidence before consulting a
 framework's authored order. An explicit caller target wins first, followed by an

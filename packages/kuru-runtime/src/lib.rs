@@ -66,6 +66,9 @@ mod notes_tests;
 mod mode_baseline_tests;
 
 #[cfg(test)]
+mod mode_policy_tests;
+
+#[cfg(test)]
 mod progress_tests;
 
 #[cfg(test)]

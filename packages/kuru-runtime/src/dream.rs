@@ -9,10 +9,13 @@ use uuid::Uuid;
 use crate::{
     Event,
     engine::{
-        CancellationToken, Harness, PendingPublication, Session, Topology, read_topology, spec,
-        turn_was_cancelled, user, validate_topology,
+        CancellationToken, Harness, PendingPublication, Session, Topology,
+        read_topology_with_profile, spec, turn_was_cancelled, user, validate_topology_with_profile,
     },
 };
+
+#[cfg(test)]
+use crate::engine::read_topology;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -215,6 +218,7 @@ impl Harness {
         cancellation.check()?;
         self.pending_publication = Some(PendingPublication {
             config: self.config.clone(),
+            profile: self.profile.clone(),
             topology,
             session: self.session.clone(),
             updates,
@@ -278,7 +282,7 @@ impl Harness {
                     }
                 }
             }
-            .and_then(|()| validate_topology(&candidate, &self.config));
+            .and_then(|()| validate_topology_with_profile(&candidate, &self.config, &self.profile));
             match validation {
                 Ok(()) => {
                     topology = candidate;
@@ -297,6 +301,7 @@ impl Harness {
             &self.scope,
             &self.memory,
             Some(&self.session.id),
+            Some(&self.profile),
         )
         .await?;
         self.persist_state(
@@ -318,7 +323,7 @@ pub async fn undo_dream(
     memory: &MemoryStore,
     resume: Option<&str>,
 ) -> Result<()> {
-    let undo = prepare_undo_dream(config, scope, memory, resume).await?;
+    let undo = prepare_undo_dream(config, scope, memory, resume, None).await?;
     memory
         .put_many(&[
             (
@@ -343,6 +348,7 @@ async fn prepare_undo_dream(
     scope: &str,
     memory: &MemoryStore,
     resume: Option<&str>,
+    profile: Option<&kuru_core::ModeProfile>,
 ) -> Result<UndoDream> {
     config.validate()?;
     memory.reconcile().await?;
@@ -350,7 +356,18 @@ async fn prepare_undo_dream(
     let mut config = config.clone();
     config.mode = mode;
     config.validate()?;
-    let current = read_topology(memory, scope, mode).await?;
+    let builtin;
+    let profile = if let Some(profile) = profile {
+        ensure!(
+            profile.mode == mode,
+            "mode profile does not match dream undo mode"
+        );
+        profile
+    } else {
+        builtin = kuru_core::ModeProfile::builtin(mode);
+        &builtin
+    };
+    let current = read_topology_with_profile(memory, scope, profile).await?;
     let key = format!("{scope}/{mode}/dream-undo");
     let value = memory
         .get(&key)
@@ -358,9 +375,9 @@ async fn prepare_undo_dream(
         .filter(|value| !value.is_null())
         .context("no dreaming change to undo")?;
     let previous: Topology = serde_json::from_value(value)?;
-    validate_topology(&previous, &config)?;
+    validate_topology_with_profile(&previous, &config, profile)?;
     let restored = restore_topology(previous, &current);
-    validate_topology(&restored, &config)?;
+    validate_topology_with_profile(&restored, &config, profile)?;
     Ok(UndoDream {
         mode,
         topology: restored,
