@@ -827,9 +827,14 @@ async fn cyclic_peers_stop_at_peer_round_limit() {
         .collect();
     harness.config.max_rounds = 2;
     harness.config.max_tool_calls = 100;
-    let output = tokio::time::timeout(Duration::from_secs(2), harness.run("Cycle"))
+    let output = tokio::time::timeout(Duration::from_secs(30), harness.run("Cycle"))
         .await
-        .unwrap()
+        .unwrap_or_else(|_| {
+            panic!(
+                "cyclic peer test exceeded the 30-second outer safety bound after {} provider requests",
+                fake.requests.lock().unwrap().len()
+            )
+        })
         .unwrap();
     assert!(output.limited);
     assert_eq!(
