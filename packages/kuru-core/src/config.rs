@@ -540,7 +540,7 @@ impl ConfigSnapshot {
             let _: Config = merged
                 .clone()
                 .try_into()
-                .map_err(|_| config_error("type", &path))?;
+                .map_err(|error| config_type_error(&path, &error))?;
         }
         let (local, local_origins) = if let Some(path) = local {
             let source =
@@ -556,7 +556,9 @@ impl ConfigSnapshot {
             reject_removed_settings(&patch).map_err(|_| config_error("validation", path))?;
             let mut checked = merged.clone();
             merge(&mut checked, patch.clone());
-            let _: Config = checked.try_into().map_err(|_| config_error("type", path))?;
+            let _: Config = checked
+                .try_into()
+                .map_err(|error| config_type_error(path, &error))?;
             let mut local_origins = BTreeMap::new();
             record_origins(&patch, "", layer_origin(path, false), &mut local_origins);
             (Some(patch), local_origins)
@@ -579,7 +581,7 @@ impl ConfigSnapshot {
         let config: Config = value
             .clone()
             .try_into()
-            .map_err(|_| config_error("type", provisional.workspace()))?;
+            .map_err(|error| config_type_error(provisional.workspace(), &error))?;
         config
             .memory
             .validate()
@@ -931,6 +933,25 @@ fn merge(base: &mut toml::Value, patch: toml::Value) {
 
 fn config_error(category: &str, path: &Path) -> anyhow::Error {
     anyhow::anyhow!("configuration {category} error in {}", safe_source(path))
+}
+
+/// The documented forward-compatibility policy, kept verbatim with
+/// `docs/configuration.md` and the published configuration reference so a
+/// rejection tells the user why a newer key is not silently ignored.
+const UNKNOWN_KEY_POLICY: &str = "unknown keys are rejected: a configuration that needs a new key requires a newer Kuru version and never silently changes authority";
+
+/// An unknown key is a forward-compatibility rejection, not an ordinary type
+/// error; the offending key itself stays out of the message like every other
+/// configuration diagnostic.
+fn config_type_error(path: &Path, error: &toml::de::Error) -> anyhow::Error {
+    if error.to_string().contains("unknown field") {
+        anyhow::anyhow!(
+            "configuration key error in {}: {UNKNOWN_KEY_POLICY}",
+            safe_source(path)
+        )
+    } else {
+        config_error("type", path)
+    }
 }
 
 fn config_parse_error(path: &Path, source: &str, error: &toml::de::Error) -> anyhow::Error {

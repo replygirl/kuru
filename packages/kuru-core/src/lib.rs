@@ -14,7 +14,7 @@ mod types;
 
 pub use accounting::{
     InvocationOutcome, InvocationStart, InvocationUsage, MoneyEstimate, SessionUsage,
-    UsageCompleteness, UsageObservation, UsagePhase,
+    UnappliedPriceTerm, UsageCompleteness, UsageObservation, UsagePhase,
 };
 pub use config::{
     AuthorityClaim, AuthorityClaimCategory, AuthorityManifest, ClaimDigest, Config, ConfigSnapshot,

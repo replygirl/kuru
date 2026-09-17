@@ -458,6 +458,11 @@ fn real_event_stream_preserves_co_ready_resize_and_paste() -> Result<()> {
     Ok(())
 }
 
+/// The standing dock, which every frame keeps below the transient status slot.
+fn dock(screen: &str) -> String {
+    screen.lines().rev().take(6).collect::<Vec<_>>().join("\n")
+}
+
 #[test]
 fn real_pty_cost_inspection_survives_120_80_and_40_columns() -> Result<()> {
     let sandbox = Sandbox::new()?;
@@ -482,6 +487,65 @@ fn real_pty_cost_inspection_survives_120_80_and_40_columns() -> Result<()> {
             ensure!(screen.contains("Session usage"), "{screen}");
             ensure!(screen.contains("not a subscription charge"), "{screen}");
         }
+    }
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
+/// T3's coherent surface: one completed frame carries model, effort, mode,
+/// cost, context use and permission state at once, and the cost and permission
+/// figures are the same ones `/cost` and `/permissions` print.
+#[test]
+fn real_pty_status_bar_holds_all_six_session_facts_at_80_and_120_columns() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let mut terminal = Terminal::spawn(sandbox.command("demo"), 35, 120)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command("hello", None)?;
+    terminal.wait_composer_frame(&["[demo]", "enter send"], READY_TIMEOUT)?;
+    for (rows, cols) in [(35, 120), (24, 80)] {
+        terminal.resize(rows, cols)?;
+        terminal.command("/cost", None)?;
+        terminal.wait_composer_frame(&["enter send"], READY_TIMEOUT)?;
+        let screen = terminal.screen();
+        let standing = dock(&screen);
+        for (element, token) in [
+            ("model", "demo"),
+            ("effort", "default"),
+            ("mode", "IFS"),
+            ("context use", "ctx ≈"),
+            ("cost", "cost unknown"),
+            ("permission state", "Permissions · 0 session · 0 always"),
+        ] {
+            ensure!(
+                standing.contains(token),
+                "{element} is missing from the standing dock at {cols}x{rows}: {screen}"
+            );
+        }
+        // An unknown price is never a zero charge and never a quota figure.
+        ensure!(!standing.contains('$'), "{screen}");
+        // The bar's context bound repeats the prepared request's own numbers.
+        ensure!(standing.contains("assumed"), "{screen}");
+        // The bar's cost token says exactly what /cost says in this same frame.
+        ensure!(
+            screen.contains("API-standard estimate: unknown")
+                && screen.contains("charge): unknown"),
+            "status bar cost must agree with /cost at {cols}x{rows}: {screen}"
+        );
+
+        // /permissions reports the same grants the dock counts.
+        terminal.command("/permissions", None)?;
+        terminal.wait_composer_frame(&["Permissions · ↑↓ select"], READY_TIMEOUT)?;
+        let screen = terminal.screen();
+        ensure!(screen.contains("No session or always grants."), "{screen}");
+        ensure!(
+            dock(&screen).contains("Permissions · 0 session · 0 always"),
+            "the dock must keep agreeing with /permissions at {cols}x{rows}: {screen}"
+        );
+        terminal.send(b"\x1b")?;
+        terminal.wait("permission inspector closes", READY_TIMEOUT, |terminal| {
+            Ok(!terminal.screen().contains("Permissions · ↑↓ select"))
+        })?;
     }
     terminal.send(b"/quit\r")?;
     terminal.wait_exit(EXIT_TIMEOUT)?;
