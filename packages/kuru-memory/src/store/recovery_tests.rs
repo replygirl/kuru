@@ -1248,7 +1248,7 @@ async fn dropped_uncommitted_session_resolves_absent_receipt_only_after_teardown
 }
 
 #[tokio::test]
-async fn in_flight_disconnect_waits_for_real_query_and_session_teardown() {
+async fn in_flight_disconnect_waits_for_real_query_and_session_teardown() -> Result<()> {
     let store = MemoryStore::temporary().await.unwrap();
     let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
     let running = tokio::spawn(async move {
@@ -1284,7 +1284,23 @@ async fn in_flight_disconnect_waits_for_real_query_and_session_teardown() {
         .unwrap();
     // Independent authenticated readers must survive this owned socket close.
     assert_eq!(store.status().await.unwrap().engine, "dolt");
-    store.close().await.unwrap();
+    let pool = store.pool.clone();
+    let before = (pool.size(), pool.num_idle(), pool.is_closed());
+    let close_started = std::time::Instant::now();
+    if let Err(error) = store.close().await {
+        let after = (pool.size(), pool.num_idle(), pool.is_closed());
+        return Err(error.context(format!(
+            "fixture pool close state: before size={} idle={} closed={}; after size={} idle={} closed={}; elapsed_ms={}",
+            before.0,
+            before.1,
+            before.2,
+            after.0,
+            after.1,
+            after.2,
+            close_started.elapsed().as_millis(),
+        )));
+    }
+    Ok(())
 }
 
 #[tokio::test]
