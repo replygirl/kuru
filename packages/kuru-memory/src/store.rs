@@ -2357,9 +2357,12 @@ mod tests {
             root.path().to_owned(),
             format!("project/{}", "e".repeat(64)),
         )?;
+        let fixture_options = options.clone();
         let (progress, opening) = MemoryStore::open_observed(options);
         drop(progress);
-        let store = opening.await?;
+        let store = opening
+            .await
+            .map_err(|error| crate::test_support::fixture_startup_error(&fixture_options, error))?;
         assert!(!store.revision().await?.is_empty());
         store.close().await?;
         Ok(())
