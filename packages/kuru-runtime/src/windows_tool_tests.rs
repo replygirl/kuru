@@ -257,7 +257,14 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         "unexpected listing: {listed}"
     );
     let shell: Value = serde_json::from_str(&receipts["shell"])
-        .with_context(|| format!("shell receipt was not JSON: {}", receipts["shell"]))?;
+        .with_context(|| {
+            format!(
+                "shell receipt was not JSON: {}; shell-read-has-written-bytes={}; shell-delete-succeeded={}",
+                receipts["shell"],
+                receipts["shell-read"] == "shell bytes",
+                receipts["shell-delete"] == "Deleted file"
+            )
+        })?;
     ensure!(
         shell["exit_code"] == 7 && shell["success"] == false,
         "wrong native status: {shell}"
