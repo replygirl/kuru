@@ -879,8 +879,9 @@ impl ToolHost {
         // Windows canonicalization expands DOS 8.3 names; inspect that spelling
         // too so AUTH~1.JSO cannot alias an otherwise protected auth.json.
         let expanded = path.canonicalize()?;
+        let root = self.root.canonicalize()?;
         let relative = expanded
-            .strip_prefix(&self.root)
+            .strip_prefix(&root)
             .context("expanded tool path is outside the project root")?;
         for component in relative.components() {
             if let Component::Normal(name) = component {
@@ -1443,6 +1444,72 @@ mod tests {
             std::fs::read_to_string(root.path().join("allowed.txt")).unwrap(),
             "written"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_windows_root_spellings_reach_file_permission_decisions() {
+        let root = tempfile::tempdir().unwrap();
+        let ordinary = root.path().to_path_buf();
+        let verbatim = root.path().canonicalize().unwrap();
+
+        for (index, spelling) in [ordinary, verbatim].into_iter().enumerate() {
+            let retained = Arc::new(
+                Directory::open(&spelling, Privacy::Inherited, NameRetention::Pinned).unwrap(),
+            );
+            let allowed_name = format!("allowed-{index}.txt");
+            let allowed = ToolHost::with_retained_root(
+                retained.clone(),
+                &Config {
+                    permissions: vec![PermissionRule {
+                        action: PermissionAction::Allow,
+                        selector: PermissionSelector::native(NativeTool::FileWrite),
+                        path: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            allowed
+                .execute(
+                    "file_write",
+                    json!({"path": &allowed_name, "content": "written"}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.path().join(&allowed_name)).unwrap(),
+                "written"
+            );
+
+            let asked_name = format!("asked-{index}.txt");
+            let asked = ToolHost::with_retained_root(
+                retained,
+                &Config {
+                    permissions: vec![PermissionRule {
+                        action: PermissionAction::Ask,
+                        selector: PermissionSelector::native(NativeTool::FileWrite),
+                        path: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let refused = asked
+                .execute(
+                    "file_write",
+                    json!({"path": &asked_name, "content": "must not be written"}),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                crate::is_permission_denied(&refused),
+                "unexpected projected tool error: {refused:#}"
+            );
+            assert!(!root.path().join(asked_name).exists());
+            asked.shutdown().await.unwrap();
+            allowed.shutdown().await.unwrap();
+        }
     }
 
     #[cfg(any(windows, target_os = "macos"))]

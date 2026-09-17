@@ -1369,7 +1369,10 @@ mod permission_tests {
             )
             .await
             .unwrap_err();
-        assert!(kuru_connectors::is_permission_denied(&refused));
+        assert!(
+            kuru_connectors::is_permission_denied(&refused),
+            "unexpected projected tool error: {refused:#}"
+        );
         assert!(!project.join("note.txt").exists());
         host.shutdown().await.unwrap();
     }
