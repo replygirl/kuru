@@ -23,7 +23,7 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
 };
-use kuru_core::{Config, ToolSpec};
+use kuru_core::{Config, NativeTool, PermissionSelector, ProjectRelativeTarget, ToolSpec};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 #[cfg(windows)]
 use kuru_platform::fs::{regular_file_info, validate_component};
@@ -175,6 +175,7 @@ fn windows_shell_environment(
 use crate::{
     MAX_BYTES,
     mcp::{McpExecution, McpHosts, McpStatus},
+    permissions::{ApprovalSender, PermissionInvocation, PermissionOutcome, PermissionService},
     redaction,
     tool_output::{ProjectedToolError, ToolContent, ToolExecution, ToolFailure, ToolFailureKind},
 };
@@ -185,8 +186,7 @@ pub struct ToolHost {
     root: PathBuf,
     directory: Dir,
     root_guard: Arc<Directory>,
-    allow_write: bool,
-    allow_shell: bool,
+    permissions: Arc<PermissionService>,
     mcp: McpHosts,
     #[cfg(unix)]
     shells: ShellRegistry,
@@ -225,7 +225,22 @@ impl ToolHost {
     /// Construct a host from the workspace capability retained before
     /// configuration review. Configured process launches keep this exact guard.
     pub fn with_retained_root(root_guard: Arc<Directory>, config: &Config) -> Result<Self> {
+        let permissions = Arc::new(PermissionService::unattended(
+            root_guard.as_ref(),
+            config.clone(),
+        )?);
+        Self::with_permission_service(root_guard, config, permissions)
+    }
+
+    /// Construct a host using the app-preflighted permission service. The
+    /// service must bind this exact retained workspace and effective routes.
+    pub fn with_permission_service(
+        root_guard: Arc<Directory>,
+        config: &Config,
+        permissions: Arc<PermissionService>,
+    ) -> Result<Self> {
         root_guard.revalidate()?;
+        permissions.validate_context(root_guard.as_ref(), config)?;
         let root = root_guard.path().to_path_buf();
         let directory = Dir::open_ambient_dir(&root, ambient_authority())?;
         root_guard.revalidate()?;
@@ -234,8 +249,7 @@ impl ToolHost {
             root,
             directory,
             root_guard,
-            allow_write: config.allow_write,
-            allow_shell: config.allow_shell,
+            permissions,
             #[cfg(unix)]
             shells: ShellRegistry::new(),
         })
@@ -244,6 +258,51 @@ impl ToolHost {
     /// Verify the held workspace identity without reopening a replacement.
     pub fn revalidate_root(&self) -> Result<()> {
         Ok(self.root_guard.revalidate()?)
+    }
+
+    /// Confirm that a runtime configuration still matches this host's retained
+    /// workspace and immutable permission service before it dispatches tools.
+    pub fn validate_permission_context(&self, config: &Config) -> Result<()> {
+        self.permissions
+            .validate_context(self.root_guard.as_ref(), config)
+    }
+
+    /// Shared with the runtime for outbound A2A admission. The service itself
+    /// retains no UI channel; callers lend one only for a foreground operation.
+    pub fn permission_service(&self) -> Arc<PermissionService> {
+        Arc::clone(&self.permissions)
+    }
+
+    /// Admit one configured outbound A2A call using the same immutable service
+    /// as native/MCP tools. The runtime has no platform dependency and never
+    /// owns grants or a process-wide approval sender.
+    pub async fn authorize_a2a(
+        &self,
+        alias: &str,
+        endpoint: &str,
+        arguments: &Value,
+        approval: Option<&ApprovalSender>,
+    ) -> Result<()> {
+        self.permissions.validate_a2a_route(alias, endpoint)?;
+        let selector = PermissionSelector::a2a(alias)?;
+        let invocation = PermissionInvocation::new(selector, None, arguments)?;
+        match self.permissions.authorize(&invocation, approval).await? {
+            outcome if outcome.is_authorized() => {
+                self.root_guard.revalidate()?;
+                Ok(())
+            }
+            PermissionOutcome::Denied => Err(ProjectedToolError::new(
+                ToolFailureKind::PermissionDenied,
+                String::new(),
+            )
+            .into()),
+            PermissionOutcome::PermissionRequired => Err(ProjectedToolError::new(
+                ToolFailureKind::PermissionRequired,
+                String::new(),
+            )
+            .into()),
+            _ => unreachable!("permission service returned an invalid outcome"),
+        }
     }
 
     /// Canonical pathname paired with the retained root capability.
@@ -256,22 +315,39 @@ impl ToolHost {
     }
 
     pub async fn catalog(&self) -> Result<ToolCatalog> {
-        let mut specs = vec![
-            spec(
+        let mut specs = Vec::new();
+        if self
+            .permissions
+            .advertises(&PermissionSelector::native(NativeTool::FileRead))
+        {
+            specs.push(spec(
                 "file_read",
                 "Read a UTF-8 project file with a bounded head-and-tail excerpt.",
                 &["path"],
                 &["path"],
-            ),
-            spec(
+            ));
+        }
+        if self
+            .permissions
+            .advertises(&PermissionSelector::native(NativeTool::FileList))
+        {
+            specs.push(spec(
                 "file_list",
                 "List immediate children of a project directory. Protected paths are omitted.",
                 &["path"],
                 &[],
-            ),
-        ];
-        if self.allow_write {
+            ));
+        }
+        if self
+            .permissions
+            .advertises(&PermissionSelector::native(NativeTool::FileWrite))
+        {
             specs.push(spec("file_write", "Create or replace a project file. Parent directories must exist. Instruction/config/memory paths are protected.", &["path", "content"], &["path", "content"]));
+        }
+        if self
+            .permissions
+            .advertises(&PermissionSelector::native(NativeTool::FileDelete))
+        {
             specs.push(spec(
                 "file_delete",
                 "Delete a single project file (never directories).",
@@ -279,7 +355,10 @@ impl ToolHost {
                 &["path"],
             ));
         }
-        if self.allow_shell {
+        if self
+            .permissions
+            .advertises(&PermissionSelector::native(NativeTool::Shell))
+        {
             let mut shell = spec(
                 "shell",
                 "Execute a shell command with process authority, in the project cwd. This is not a filesystem sandbox. Only the documented compatibility environment is inherited. Output is capped; timeout is at most 120 seconds.",
@@ -291,7 +370,16 @@ impl ToolHost {
             specs.push(shell);
         }
         let mcp = self.mcp.catalog().await?;
-        specs.extend(mcp.tools);
+        for spec in mcp.tools {
+            if self
+                .mcp
+                .selector(&spec.name)
+                .await
+                .is_ok_and(|selector| self.permissions.advertises(&selector))
+            {
+                specs.push(spec);
+            }
+        }
         Ok(ToolCatalog {
             tools: specs,
             mcp: mcp.statuses,
@@ -299,10 +387,204 @@ impl ToolHost {
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> Result<String> {
-        match self.execute_inner(name, args).await {
+        self.execute_with_approval(name, args, None).await
+    }
+
+    /// Execute one native or MCP invocation after the central permission gate.
+    /// Callers without an operation-scoped foreground sender never wait for UI.
+    pub async fn execute_with_approval(
+        &self,
+        name: &str,
+        args: Value,
+        approval: Option<&ApprovalSender>,
+    ) -> Result<String> {
+        let result: std::result::Result<ToolExecution, ToolFailure> = async {
+            let (selector, target) = self.permission_facts(name, &args).await?;
+            let invocation = PermissionInvocation::new(selector, target, &args)
+                .map_err(ToolFailure::built_in)?;
+            match self
+                .permissions
+                .authorize(&invocation, approval)
+                .await
+                .map_err(ToolFailure::built_in)?
+            {
+                outcome if outcome.is_authorized() => {
+                    // Permission storage or a foreground answer may have waited.
+                    // Re-derive the checked facts before dispatch so a changed
+                    // path spelling, case alias, parent, or MCP route cannot
+                    // turn this invocation into a different operation.
+                    let (current_selector, current_target) =
+                        self.permission_facts(name, &args).await?;
+                    if current_selector != *invocation.selector()
+                        || current_target.as_ref() != invocation.target()
+                    {
+                        return Err(ToolFailure::permission_denied(anyhow::anyhow!(
+                            "tool permission target changed while approval was pending"
+                        )));
+                    }
+                    // The operation still has the same checked facts; confirm
+                    // the reviewed workspace identity immediately before its
+                    // effect, including an operation backed by a held file
+                    // capability.
+                    self.root_guard
+                        .revalidate()
+                        .map_err(|error| ToolFailure::built_in(error.into()))?;
+                }
+                PermissionOutcome::Denied => {
+                    return Err(ToolFailure::permission_denied(anyhow::anyhow!(
+                        "tool permission was denied"
+                    )));
+                }
+                PermissionOutcome::PermissionRequired => {
+                    return Err(ToolFailure::permission_required(anyhow::anyhow!(
+                        "foreground permission approval is required"
+                    )));
+                }
+                _ => unreachable!("permission service returned an invalid outcome"),
+            }
+            self.execute_inner(name, args).await
+        }
+        .await;
+        match result {
             Ok(execution) => project_execution(execution),
             Err(failure) => project_failure(failure),
         }
+    }
+
+    async fn permission_facts(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> std::result::Result<(PermissionSelector, Option<ProjectRelativeTarget>), ToolFailure> {
+        let native = |tool| PermissionSelector::native(tool);
+        let facts = match name {
+            "file_read" => (
+                native(NativeTool::FileRead),
+                Some(
+                    self.validated_permission_target(
+                        string(args, "path").map_err(ToolFailure::built_in)?,
+                        false,
+                    )
+                    .map_err(ToolFailure::built_in)?,
+                ),
+            ),
+            "file_list" => {
+                let path = args
+                    .get("path")
+                    .map(|value| value.as_str().context("path must be a string"))
+                    .transpose()
+                    .map_err(ToolFailure::built_in)?
+                    .unwrap_or(".");
+                (
+                    native(NativeTool::FileList),
+                    Some(
+                        self.validated_permission_target(path, false)
+                            .map_err(ToolFailure::built_in)?,
+                    ),
+                )
+            }
+            "file_write" => (
+                native(NativeTool::FileWrite),
+                Some(
+                    self.validated_permission_target(
+                        string(args, "path").map_err(ToolFailure::built_in)?,
+                        true,
+                    )
+                    .map_err(ToolFailure::built_in)?,
+                ),
+            ),
+            "file_delete" => (
+                native(NativeTool::FileDelete),
+                Some(
+                    self.validated_permission_target(
+                        string(args, "path").map_err(ToolFailure::built_in)?,
+                        true,
+                    )
+                    .map_err(ToolFailure::built_in)?,
+                ),
+            ),
+            "shell" => (native(NativeTool::Shell), None),
+            _ => (
+                self.mcp
+                    .selector(name)
+                    .await
+                    .map_err(|failure| ToolFailure {
+                        kind: failure.kind,
+                        error: failure.error,
+                    })?,
+                None,
+            ),
+        };
+        Ok(facts)
+    }
+
+    fn validated_permission_target(
+        &self,
+        value: &str,
+        writing: bool,
+    ) -> Result<ProjectRelativeTarget> {
+        self.root_guard.revalidate()?;
+        let _ = self.path(value, writing)?;
+        #[cfg(any(windows, target_os = "macos"))]
+        return self.physical_permission_target(value);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let path = Path::new(value);
+            let mut components = Vec::new();
+            for component in path.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::Normal(name) => components
+                        .push(name.to_str().context(
+                            "tool path must use UTF-8 spelling for permission matching",
+                        )?),
+                    _ => anyhow::bail!("tool path cannot traverse outside the project root"),
+                }
+            }
+            let spelling = if components.is_empty() {
+                ".".into()
+            } else {
+                components.join("/")
+            };
+            ProjectRelativeTarget::parse(spelling)
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn physical_permission_target(&self, value: &str) -> Result<ProjectRelativeTarget> {
+        // The physical spelling is the authorization target. This prevents a
+        // case variant (and on Windows a DOS 8.3 alias) from bypassing a rule.
+        let candidate = self.root.join(value);
+        let expanded = match candidate.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let input = Path::new(value);
+                let parent = input.parent().unwrap_or_else(|| Path::new("."));
+                let final_name = input
+                    .file_name()
+                    .context("permission target lacks a final component")?;
+                self.root.join(parent).canonicalize()?.join(final_name)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let root = self.root.canonicalize()?;
+        let relative = expanded
+            .strip_prefix(root)
+            .context("expanded permission target is outside the retained project root")?;
+        let mut components = Vec::new();
+        for component in relative.components() {
+            if let Component::Normal(name) = component {
+                components.push(
+                    name.to_str()
+                        .context("expanded permission target is not valid UTF-8")?,
+                );
+            }
+        }
+        ProjectRelativeTarget::parse(if components.is_empty() {
+            ".".into()
+        } else {
+            components.join("/")
+        })
     }
 
     async fn execute_inner(
@@ -361,11 +643,6 @@ impl ToolHost {
                 execution.map_err(ToolFailure::built_in)
             }
             "file_write" => {
-                if !self.allow_write {
-                    return Err(ToolFailure::permission_denied(anyhow::anyhow!(
-                        "file writes require allow_write=true"
-                    )));
-                }
                 let execution = (|| -> Result<ToolExecution> {
                     let content = string(&args, "content")?;
                     ensure!(
@@ -401,11 +678,6 @@ impl ToolHost {
                 execution.map_err(ToolFailure::built_in)
             }
             "file_delete" => {
-                if !self.allow_write {
-                    return Err(ToolFailure::permission_denied(anyhow::anyhow!(
-                        "file deletion requires allow_write=true"
-                    )));
-                }
                 let execution = (|| -> Result<ToolExecution> {
                     let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
                     ensure!(
@@ -457,11 +729,6 @@ impl ToolHost {
                 execution.map_err(ToolFailure::built_in)
             }
             "shell" => {
-                if !self.allow_shell {
-                    return Err(ToolFailure::permission_denied(anyhow::anyhow!(
-                        "shell requires allow_shell=true (process authority)"
-                    )));
-                }
                 let execution = async {
                     let duration = args
                         .get("timeout_ms")
@@ -913,7 +1180,7 @@ mod tests {
     use crate::test_support::{HttpFixture, Reply, drain_bounded};
     #[cfg(unix)]
     use crate::test_support::{StdioFixture, Step};
-    use kuru_core::McpConfig;
+    use kuru_core::{McpConfig, PermissionAction, PermissionRule};
 
     #[tokio::test]
     async fn cancelled_shell_capture_preserves_received_bytes_until_actual_eof() {
@@ -1120,6 +1387,329 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn central_permission_gate_denies_effects_and_explicit_allow_overrides_legacy_false() {
+        let root = tempfile::tempdir().unwrap();
+        let denied_path = root.path().join("denied.txt");
+        let denied = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::native(NativeTool::FileWrite),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !denied
+                .specs()
+                .await
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "file_write")
+        );
+        let error = denied
+            .execute(
+                "file_write",
+                json!({"path":"denied.txt","content":"must not exist"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(crate::is_permission_denied(&error));
+        assert!(!denied_path.exists());
+
+        let allowed = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Allow,
+                    selector: PermissionSelector::native(NativeTool::FileWrite),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        allowed
+            .execute(
+                "file_write",
+                json!({"path":"allowed.txt","content":"written"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("allowed.txt")).unwrap(),
+            "written"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn physical_case_alias_cannot_bypass_file_permission_path_deny() {
+        let root = tempfile::tempdir().unwrap();
+        let actual = root.path().join("Secret.txt");
+        std::fs::write(&actual, "original").unwrap();
+
+        // This fixture only applies when the host filesystem resolves a case
+        // alias. APFS and the usual Windows volumes do; a case-sensitive
+        // workspace has no alias to exercise.
+        let alias = root.path().join("secret.txt");
+        if !alias.exists() {
+            eprintln!("host filesystem has no case alias; fixture is inapplicable");
+            return;
+        }
+        eprintln!("host filesystem resolved Secret.txt through secret.txt");
+
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::native(NativeTool::FileWrite),
+                    path: Some("Secret.txt".into()),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = host
+            .execute(
+                "file_write",
+                json!({"path":"secret.txt","content":"must not replace"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(crate::is_permission_denied(&error));
+        assert_eq!(std::fs::read_to_string(actual).unwrap(), "original");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn changed_physical_target_while_approval_is_pending_has_no_effect() {
+        let root = tempfile::tempdir().unwrap();
+        let actual = root.path().join("Secret.txt");
+        std::fs::write(&actual, "original").unwrap();
+        let alias = root.path().join("secret.txt");
+        if !alias.exists() {
+            eprintln!("host filesystem has no case alias; fixture is inapplicable");
+            return;
+        }
+
+        let host = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    permissions: vec![PermissionRule {
+                        action: PermissionAction::Ask,
+                        selector: PermissionSelector::native(NativeTool::FileWrite),
+                        path: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::ApprovalRequest>(1);
+        let pending = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move {
+                host.execute_with_approval(
+                    "file_write",
+                    json!({"path":"secret.txt","content":"must not replace"}),
+                    Some(&crate::ApprovalSender::new(sender)),
+                )
+                .await
+            })
+        };
+        let request = receiver.recv().await.unwrap();
+        std::fs::rename(&actual, root.path().join("previous.txt")).unwrap();
+        std::fs::write(&alias, "replacement").unwrap();
+        request.reply.send(crate::ApprovalAnswer::Once).unwrap();
+
+        let error = pending.await.unwrap().unwrap_err();
+        assert!(crate::is_permission_denied(&error));
+        assert_eq!(std::fs::read_to_string(alias).unwrap(), "replacement");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("previous.txt")).unwrap(),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_once_approval_dispatches_the_bound_native_write() {
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(root.path(), &Config::default()).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::ApprovalRequest>(1);
+        let reply = tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            assert!(request.display.rememberable);
+            assert_eq!(request.scope.target().unwrap().as_str(), "approved.txt");
+            request.reply.send(crate::ApprovalAnswer::Once).unwrap();
+        });
+        host.execute_with_approval(
+            "file_write",
+            json!({"path":"approved.txt","content":"approved"}),
+            Some(&crate::ApprovalSender::new(sender)),
+        )
+        .await
+        .unwrap();
+        reply.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("approved.txt")).unwrap(),
+            "approved"
+        );
+        assert!(
+            host.execute("file_write", json!({"path":"retry.txt","content":"retry"}))
+                .await
+                .is_err(),
+            "once approval did not survive a new invocation"
+        );
+        assert!(!root.path().join("retry.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn central_permission_gate_denies_shell_before_process_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("shell-denied");
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::native(NativeTool::Shell),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = host
+            .execute(
+                "shell",
+                json!({"command":format!("touch {}", marker.display())}),
+            )
+            .await
+            .unwrap_err();
+        assert!(crate::is_permission_denied(&error));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_once_approval_dispatches_shell() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("shell-approved");
+        let host = ToolHost::new(root.path(), &Config::default()).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::ApprovalRequest>(1);
+        let reply = tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            assert_eq!(request.display.label, "native shell");
+            request.reply.send(crate::ApprovalAnswer::Once).unwrap();
+        });
+        host.execute_with_approval(
+            "shell",
+            json!({"command":format!("touch {}", marker.display())}),
+            Some(&crate::ApprovalSender::new(sender)),
+        )
+        .await
+        .unwrap();
+        reply.await.unwrap();
+        assert!(marker.exists());
+    }
+
+    #[tokio::test]
+    async fn central_permission_gate_denies_http_mcp_before_tools_call() {
+        let mut initialized =
+            Reply::rpc(json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}));
+        initialized.session = true;
+        let peer = HttpFixture::new(vec![
+            initialized,
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[{"name":"remote","inputSchema":{"type":"object"}}]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                mcp: [(
+                    "http".into(),
+                    McpConfig {
+                        command: None,
+                        args: vec![],
+                        url: Some(peer.url.clone()),
+                        env: BTreeMap::new(),
+                    },
+                )]
+                .into(),
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::mcp("http", "remote").unwrap(),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            host.specs()
+                .await
+                .unwrap()
+                .iter()
+                .all(|spec| !spec.name.starts_with("mcp_"))
+        );
+        let name = format!(
+            "mcp_{}",
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, b"http\0remote").simple()
+        );
+        let error = host
+            .execute(&name, json!({"write":"blocked"}))
+            .await
+            .unwrap_err();
+        assert!(crate::is_permission_denied(&error));
+        host.shutdown().await.unwrap();
+        let requests = peer.requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.body["method"] != "tools/call")
+        );
+    }
+
+    #[tokio::test]
+    async fn a2a_admission_uses_the_same_typed_denial_before_http() {
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                external_agents: [("remote".into(), "http://127.0.0.1:1".into())].into(),
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::a2a("remote").unwrap(),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = host
+            .authorize_a2a(
+                "remote",
+                "http://127.0.0.1:1",
+                &json!({"agent":"remote","message":"blocked"}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(crate::is_permission_denied(&error));
+    }
+
+    #[tokio::test]
     async fn tool_projection_redacts_results_without_altering_files_or_arguments() {
         const SECRET: &str = "sk-abcdefghijklmnop";
         const MARKER: &str = "[REDACTED:recognized-secret]";
@@ -1319,6 +1909,145 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn central_permission_gate_denies_stdio_mcp_before_tools_call() {
+        let peer = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"remote","inputSchema":{"type":"object"}}]}}),
+            ),
+            Step::Eof,
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                mcp: [(
+                    "fixture".into(),
+                    McpConfig {
+                        command: Some(peer.command().into()),
+                        args: vec![],
+                        url: None,
+                        env: BTreeMap::new(),
+                    },
+                )]
+                .into(),
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::mcp("fixture", "remote").unwrap(),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            host.specs()
+                .await
+                .unwrap()
+                .iter()
+                .all(|spec| !spec.name.starts_with("mcp_"))
+        );
+        let name = format!(
+            "mcp_{}",
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, b"fixture\0remote").simple()
+        );
+        let error = host
+            .execute(&name, json!({"write":"blocked"}))
+            .await
+            .unwrap_err();
+        assert!(crate::is_permission_denied(&error));
+        host.shutdown().await.unwrap();
+        assert_eq!(
+            peer.conversations(),
+            vec![vec![
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"kuru","version":env!("CARGO_PKG_VERSION")}}}),
+                json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+            ]]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_once_approval_dispatches_stdio_mcp_tool_call() {
+        let peer = StdioFixture::new([
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}}),
+            ),
+            Step::Read,
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"remote","inputSchema":{"type":"object"}}]}}),
+            ),
+            Step::Read,
+            Step::Write(
+                json!({"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"approved"}]}}),
+            ),
+            Step::Eof,
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                mcp: [(
+                    "fixture".into(),
+                    McpConfig {
+                        command: Some(peer.command().into()),
+                        args: vec![],
+                        url: None,
+                        env: BTreeMap::new(),
+                    },
+                )]
+                .into(),
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Ask,
+                    selector: PermissionSelector::mcp("fixture", "remote").unwrap(),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let name = host
+            .specs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|spec| spec.description.starts_with("MCP fixture/remote:"))
+            .unwrap()
+            .name;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::ApprovalRequest>(1);
+        let reply = tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            assert!(request.scope.target().is_none());
+            request.reply.send(crate::ApprovalAnswer::Once).unwrap();
+        });
+        assert!(
+            host.execute_with_approval(
+                &name,
+                json!({"write":"approved"}),
+                Some(&crate::ApprovalSender::new(sender)),
+            )
+            .await
+            .unwrap()
+            .contains("approved")
+        );
+        reply.await.unwrap();
+        host.shutdown().await.unwrap();
+        assert_eq!(
+            peer.conversations()[0][3],
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remote","arguments":{"write":"approved"}}})
+        );
+    }
+
     #[tokio::test]
     async fn toolhost_http_mcp_projects_application_success_and_protocol_results() {
         const SECRET: &str = "sk-abcdefghijklmnop";
@@ -1470,7 +2199,16 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect();
-        assert_eq!(names, vec!["file_read", "file_list"]);
+        assert_eq!(
+            names,
+            vec![
+                "file_read",
+                "file_list",
+                "file_write",
+                "file_delete",
+                "shell"
+            ]
+        );
         for name in ["file_write", "file_delete", "shell"] {
             assert!(
                 read_only
@@ -2224,7 +2962,7 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn retained_root_replacement_blocks_shell_and_keeps_file_capability() {
+    async fn retained_root_replacement_refuses_all_tool_dispatch() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
@@ -2242,21 +2980,28 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
         std::fs::rename(&root, parent.path().join("replaced")).unwrap();
         std::fs::create_dir(&root).unwrap();
 
-        assert_eq!(
-            host.execute("file_read", json!({"path":"held.txt"}))
-                .await
-                .unwrap(),
-            "held object"
-        );
-        let error = host
+        // A held directory can still name the moved file, but permission
+        // context is bound to the reviewed root name and identity. A
+        // replacement invalidates that context before every tool effect.
+        let file_error = host
+            .execute("file_read", json!({"path":"held.txt"}))
+            .await
+            .unwrap_err();
+        let shell_error = host
             .execute("shell", json!({"command":"printf started > launched"}))
             .await
             .unwrap_err();
+        for error in [&file_error, &shell_error] {
+            assert_eq!(
+                error.to_string(),
+                "tool execution failed: directory name or ancestor identity changed"
+            );
+            assert_eq!(format!("{error:#}"), error.to_string());
+        }
         assert_eq!(
-            error.to_string(),
-            "tool execution failed: shell operation failed; stderr: <pending EOF>"
+            std::fs::read_to_string(parent.path().join("replaced/held.txt")).unwrap(),
+            "held object"
         );
-        assert!(!format!("{error:#}").contains("identity changed"));
         assert!(!root.join("launched").exists());
     }
 

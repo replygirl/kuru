@@ -11,7 +11,10 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::future::join_all;
-use kuru_connectors::{Provider, ToolHost, a2a_send, is_permission_denied, project_text};
+use kuru_connectors::{
+    ApprovalSender, PermissionService, Provider, ToolHost, a2a_send, is_permission_denied,
+    project_text,
+};
 use kuru_core::{
     Completion, Config, Framework, Message, Mode, ModelPreference, Part, ProjectPreferences,
     Relationship, RelationshipKind, ToolCall, ToolSpec, load_instructions,
@@ -108,6 +111,11 @@ struct CancellationState {
 
 #[derive(Debug)]
 struct TurnCancelled;
+
+struct CognitiveSettlement {
+    admitted: std::time::Instant,
+    observe: bool,
+}
 
 impl std::fmt::Display for TurnCancelled {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -476,6 +484,10 @@ impl Harness {
         // publish its initial state. Instructions are already owned bytes and
         // are never reopened here.
         tools.revalidate_root()?;
+        tools.validate_permission_context(&config)?;
+        // A new or resumed runtime starts a new grant session. The checked
+        // store may still supply matching persistent grants after this reset.
+        tools.permission_service().reset_session()?;
         let (events, _) = broadcast::channel(256);
         let (progress, _) = watch::channel(None);
         let mut harness = Self {
@@ -504,6 +516,12 @@ impl Harness {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    /// Shared checked grants for foreground inspection and revocation. This
+    /// service retains no process-wide approval sender.
+    pub fn permission_service(&self) -> Arc<PermissionService> {
+        self.tools.permission_service()
     }
 
     /// Subscribe to replaceable, ephemeral progress for the selected speaker.
@@ -1340,7 +1358,20 @@ impl Harness {
         turn_id: &str,
         cancellation: &CancellationToken,
     ) -> Result<ControlledTurnOutput> {
-        self.run_controlled_inner(prompt, target, turn_id, true, cancellation)
+        self.run_controlled_inner(prompt, target, turn_id, true, cancellation, None)
+            .await
+    }
+
+    /// Run one attached foreground submission with an operation-scoped prompt.
+    pub async fn run_local_controlled_with_approval(
+        &mut self,
+        prompt: &str,
+        target: Option<&str>,
+        turn_id: &str,
+        cancellation: &CancellationToken,
+        approval: ApprovalSender,
+    ) -> Result<ControlledTurnOutput> {
+        self.run_controlled_inner(prompt, target, turn_id, true, cancellation, Some(&approval))
             .await
     }
 
@@ -1348,6 +1379,24 @@ impl Harness {
     pub async fn retry_last(
         &mut self,
         cancellation: &CancellationToken,
+    ) -> Result<ControlledTurnOutput> {
+        self.retry_last_inner(cancellation, None).await
+    }
+
+    /// Retry an attached foreground submission; completed retries reuse their
+    /// durable output before any permission request or provider dispatch.
+    pub async fn retry_last_with_approval(
+        &mut self,
+        cancellation: &CancellationToken,
+        approval: ApprovalSender,
+    ) -> Result<ControlledTurnOutput> {
+        self.retry_last_inner(cancellation, Some(&approval)).await
+    }
+
+    async fn retry_last_inner(
+        &mut self,
+        cancellation: &CancellationToken,
+        approval: Option<&ApprovalSender>,
     ) -> Result<ControlledTurnOutput> {
         let submission: LastLocalSubmission = serde_json::from_value(
             self.memory
@@ -1366,6 +1415,7 @@ impl Harness {
             &submission.id,
             false,
             cancellation,
+            approval,
         )
         .await
     }
@@ -1382,7 +1432,7 @@ impl Harness {
         cancellation: &CancellationToken,
     ) -> Result<TurnOutput> {
         Ok(self
-            .run_controlled_inner(prompt, target, turn_id, false, cancellation)
+            .run_controlled_inner(prompt, target, turn_id, false, cancellation, None)
             .await?
             .output)
     }
@@ -1394,6 +1444,7 @@ impl Harness {
         turn_id: &str,
         remember_local: bool,
         cancellation: &CancellationToken,
+        approval: Option<&ApprovalSender>,
     ) -> Result<ControlledTurnOutput> {
         self.reconcile().await?;
         ensure!(
@@ -1427,8 +1478,15 @@ impl Harness {
         );
         let started = std::time::Instant::now();
         let result = Box::pin(
-            self.run_admitted(prompt, resolved_target, &key, &mut journal, cancellation)
-                .instrument(span.clone()),
+            self.run_admitted(
+                prompt,
+                resolved_target,
+                &key,
+                &mut journal,
+                cancellation,
+                approval,
+            )
+            .instrument(span.clone()),
         )
         .await;
         match result {
@@ -1461,6 +1519,7 @@ impl Harness {
         journal_key: &str,
         journal: &mut TurnJournal,
         cancellation: &CancellationToken,
+        approval: Option<&ApprovalSender>,
     ) -> Result<TurnOutput> {
         self.trace.clear();
         let progress_turn = ProgressTurn::new(self.progress.clone(), journal.id.clone());
@@ -1536,8 +1595,18 @@ impl Harness {
                         result
                     } else {
                         used += 1;
-                        self.cognitive_call(&id, &call, &mut pending, cancellation, admitted, true)
-                            .await
+                        self.cognitive_call(
+                            &id,
+                            &call,
+                            &mut pending,
+                            cancellation,
+                            CognitiveSettlement {
+                                admitted,
+                                observe: true,
+                            },
+                            approval,
+                        )
+                        .await
                     };
                     let result = match result {
                         Err(error) if turn_was_cancelled(&error) => return Err(error),
@@ -1679,8 +1748,11 @@ impl Harness {
                                 &call,
                                 &mut mail,
                                 cancellation,
-                                admitted,
-                                false,
+                                CognitiveSettlement {
+                                    admitted,
+                                    observe: false,
+                                },
+                                approval,
                             )
                             .await
                         {
@@ -1734,7 +1806,11 @@ impl Harness {
                         );
                         let started = std::time::Instant::now();
                         let result = cancellation
-                            .wait(self.tools.execute(&call.name, call.arguments.clone()))
+                            .wait(self.tools.execute_with_approval(
+                                &call.name,
+                                call.arguments.clone(),
+                                approval,
+                            ))
                             .instrument(span.clone())
                             .await;
                         let status = match &result {
@@ -1897,8 +1973,8 @@ impl Harness {
         call: &ToolCall,
         pending: &mut BTreeMap<String, Vec<Message>>,
         cancellation: &CancellationToken,
-        admitted: std::time::Instant,
-        settle: bool,
+        settlement: CognitiveSettlement,
+        approval: Option<&ApprovalSender>,
     ) -> Result<String> {
         let span = tracing::info_span!(
             target: "kuru.tool",
@@ -1908,7 +1984,7 @@ impl Harness {
         );
         let started = std::time::Instant::now();
         let result = self
-            .cognitive_call_inner(sender, call, pending, cancellation)
+            .cognitive_call_inner(sender, call, pending, cancellation, approval)
             .instrument(span.clone())
             .await;
         let status = match &result {
@@ -1923,8 +1999,8 @@ impl Harness {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "cognitive tool finished"
         );
-        if settle {
-            self.observe_tool(sender, call, &result, admitted, true);
+        if settlement.observe {
+            self.observe_tool(sender, call, &result, settlement.admitted, true);
         }
         result
     }
@@ -1935,6 +2011,7 @@ impl Harness {
         call: &ToolCall,
         pending: &mut BTreeMap<String, Vec<Message>>,
         cancellation: &CancellationToken,
+        approval: Option<&ApprovalSender>,
     ) -> Result<String> {
         cancellation.check()?;
         self.reconcile().await?;
@@ -2024,6 +2101,14 @@ impl Harness {
                     .external_agents
                     .get(alias)
                     .context("external agent alias is not configured")?;
+                cancellation
+                    .wait(
+                        self.tools
+                            .authorize_a2a(alias, url, &call.arguments, approval),
+                    )
+                    .await?;
+                cancellation.check()?;
+                self.tools.revalidate_root()?;
                 cancellation
                     .wait(a2a_send(
                         url,
@@ -3413,8 +3498,11 @@ mod publication_tests {
                         },
                         &mut BTreeMap::new(),
                         &CancellationToken::new(),
-                        std::time::Instant::now(),
-                        true,
+                        CognitiveSettlement {
+                            admitted: std::time::Instant::now(),
+                            observe: true,
+                        },
+                        None,
                     )
                     .await
                     .unwrap();

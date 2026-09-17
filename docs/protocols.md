@@ -136,9 +136,9 @@ conversation is not evidence of live OpenAI authentication or inference.
 | --- | --- | --- |
 | `file_read` | `path` | Workspace read |
 | `file_list` | `path` | Workspace listing |
-| `file_write` | `path`, `content` | Requires `allow_write` |
-| `file_delete` | `path` | Requires `allow_write` |
-| `shell` | `command` | Requires `allow_shell` |
+| `file_write` | `path`, `content` | Requires an effective allow decision or approval |
+| `file_delete` | `path` | Requires an effective allow decision or approval |
+| `shell` | `command` | Requires an effective allow decision or approval |
 
 Paths are relative to the opened project capability. Absolute paths, parent
 traversal and symlinks are rejected; capability-relative filesystem operations
@@ -176,9 +176,18 @@ command, stdout, native process observations, or raw error/cleanup chains. A
 child that completes with a nonzero status still returns the ordinary structured
 shell result with its exit code, stdout, and stderr.
 
+Native tools and MCP calls share execution-time permission evaluation; outbound
+`a2a_send` uses the same service before network dispatch. Rules match checked
+native targets, configured MCP alias/original tool name, or the outbound A2A
+alias. Explicit deny wins over saved grants. Unresolved asks without an attached
+foreground approval channel return a typed permission-required refusal and
+perform no tool effect. Workspace trust remains a separate prerequisite for
+configured authority, including MCP startup. See
+[tool permissions](configuration.md#tool-permissions).
+
 The shell uses your process authority, not a sandbox. Configured MCP servers
-also bring their own permissions; the built-in file/shell switches do not impose
-a sandbox on third-party tools.
+also bring their own permissions; call approval does not impose a sandbox on
+third-party tools.
 
 The built-in shell receives a finite compatibility subset of inherited
 environment variables for command discovery, home/profile, temporary paths,

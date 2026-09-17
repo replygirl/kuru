@@ -27,6 +27,12 @@
     "max_parts": { "type": "integer", "minimum": 1, "maximum": 128, "default": 16 },
     "allow_shell": { "type": "boolean", "default": false },
     "allow_write": { "type": "boolean", "default": false },
+    "permissions": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/permission" },
+      "default": []
+    },
     "api_base": { "type": "string", "format": "uri", "default": "https://api.openai.com/v1" },
     "api_key_env": {
       "type": "string",
@@ -53,6 +59,73 @@
     }
   },
   "$defs": {
+    "permission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "selector"],
+      "properties": {
+        "action": { "type": "string", "enum": ["allow", "ask", "deny"] },
+        "selector": { "$ref": "#/$defs/permissionSelector" },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?:\\.|(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.?($|/))(?:\\*\\*|(?:[^/\\\\\\[\\]{}*?\\x00-\\x1F\\x7F-\\x9F]|\\?|\\*(?!\\*))+)(?:/(?:\\*\\*|(?:[^/\\\\\\[\\]{}*?\\x00-\\x1F\\x7F-\\x9F]|\\?|\\*(?!\\*))+))*)$"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["path"] },
+          "then": {
+            "properties": {
+              "selector": {
+                "properties": {
+                  "kind": { "const": "native" },
+                  "name": { "enum": ["file_read", "file_list", "file_write", "file_delete"] }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "permissionSelector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "const": "native" },
+            "name": { "enum": ["file_read", "file_list", "file_write", "file_delete", "shell"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "alias", "tool"],
+          "properties": {
+            "kind": { "const": "mcp" },
+            "alias": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" },
+            "tool": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "alias"],
+          "properties": {
+            "kind": { "const": "a2a" },
+            "alias": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$" }
+          }
+        }
+      ]
+    },
     "memory": {
       "type": "object",
       "additionalProperties": false,

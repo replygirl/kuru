@@ -6,6 +6,7 @@
 mod config;
 mod framework;
 mod model_catalog;
+mod permissions;
 mod policy;
 mod types;
 
@@ -19,6 +20,9 @@ pub use framework::{
     Framework, Mode, Part, Relationship, RelationshipKind, canonical_peer_instruction,
 };
 pub use model_catalog::{ModelCatalog, ModelRoute, advertised_metadata, enrich_model};
+pub use permissions::{
+    NativeTool, PermissionAction, PermissionRule, PermissionSelector, ProjectRelativeTarget,
+};
 pub use policy::{
     ActorPhase, ConsolidationPlan, ContextSource, Contribution, FacingDecision, FacingInput,
     FacingPolicy, FlowPolicy, MemoryPolicy, ModeProfile, PeeringPolicy, RolesPolicy, StateKeys,

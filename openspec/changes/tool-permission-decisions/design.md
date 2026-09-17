@@ -1,0 +1,33 @@
+## Context
+
+The strict layered `Config` already captures effective authority and final-leaf provenance for exact-root workspace trust. `ToolHost` checks native file, shell and MCP mechanics; outbound `a2a_send` is dispatched in the runtime. App-owned private files already hold trust/authentication state, while the foreground TUI has cancellation and operation-generation fences. P1 supplies typed tool receipts, P2 publishes the strict config schema, and P4 supplies typed denied tool observations.
+
+## Goals / Non-Goals
+
+**Goals:** Keep one pure rule decision and one checked grant-resolution service across every external-effect call path, with user-visible scope matching the scope actually stored. Preserve the existing authority boundaries and make unattended asks terminate without side effects.
+
+**Non-Goals:** A new tool inventory, general glob language for shell commands or opaque MCP arguments, config hot reload, global approval server, OS sandbox, protocol extension, cost ledger or mode-policy change.
+
+## Decisions
+
+1. **Match a typed operation, not display text.** Core parses a bounded rule list and returns `deny > ask > allow`, independent of array order. A stable selector identifies native name, MCP `(alias, original name)`, or outbound A2A alias. The optional bounded glob is anchored to a validated normalized project-relative file target. The checked target and complete arguments stay in the invocation identity; a separately projected, escaped preview cannot authorize execution. Reject arbitrary description matches and shell/MCP argument patterns because those would be ambiguous about actual effects and are outside the approved Phase 1 grammar. Higher-priority config arrays replace lower-priority arrays under existing layering.
+2. **Resolve fallback and grants at execution.** With no explicit match, native read/list and configured MCP/A2A stay allowed after trust; legacy write/shell `true` means allow and `false` means ask. `ToolHost::execute` evaluates even direct calls, and runtime `a2a_send` uses the same service before its network effect. Tool discovery advertises ask-capable operations instead of hiding them. The service returns a typed denial variant for P4's `Denied` outcome; it never infers denial from message text. Keep trust review before configured MCP startup and apply checked root/protected-path validation before permission evaluation, then revalidate the retained root immediately before dispatch. A policy decision cannot widen the root or authorize a protected path.
+3. **Separate approval transport from execution ownership.** Only a foreground TUI invocation installs a bounded request/reply channel on its own service instance. The request carries immutable identity/context and a safe display scope; cancellation or channel closure returns a typed refusal. No memory transaction or UI lock spans the wait. Direct CLI, unattended A2A, dream and other callers have no prompt channel, so unresolved asks refuse promptly. A shared/global TUI prompt would let unrelated or resumed callers inherit authority; do not add one.
+4. **Persist scopes, not invocations.** Once approval binds and is consumed by the exact full invocation before dispatch; it cannot survive uncertain dispatch or retry. Session grants live only in the running session and reset before resume or context change. Always grants use app-owned checked private storage via existing platform file primitives and bind root identity, complete reviewed manifest and effective permission/tool-route context. The default file scope is one validated exact relative target, including literal metacharacters; shell/MCP/A2A display and store whole-tool scope. Persist scope/fingerprints rather than raw command, argument, credential or unredacted preview. Grant-store failure is an error. Explicit deny wins even when a valid grant exists. Rejecting a grant after a context change is preferable to silently carrying broader authority forward.
+5. **Keep approval UI local to the operation.** The TUI shows once/session/always/deny with the exact scope, keeps the composer responsive, and fences late replies by operation generation. The dock chip and `/permissions` read the same service state and revoke session/always scopes. There is no separate command-specific approval model or new config layer.
+
+## Risks / Trade-offs
+
+- Legacy `false` changes from silent refusal to requestable authority → document the behavior change, retain typed headless refusal, test explicit deny precedence and trust preflight before any effect.
+- A redacted preview may omit distinguishing bytes → compare the immutable invocation and checked context, never its display, when consuming a once decision.
+- A persisted grant may outlive a route or manifest change → bind native root/manifest/route fingerprints and refuse on mismatch, with no implicit migration to a wider scope.
+- A prompt could strand an owned execution path → use a bounded foreground channel, cancellation/close wakeups and no held memory/UI locks; dispatch only after a settled allow.
+- Native file and Windows path spelling can differ → match only the platform-validated target normalized to project-relative slash spelling and prove literal metacharacters plus native ownership/root checks.
+
+## Operational surface
+
+The existing local binary and TUI own permission prompts and private grants; there is no new listener, bind address, container, runner service, credential, secret, release binary or architecture. The bounded approval channel exists only during an attached foreground operation. Existing MCP/A2A route and shell process limits remain unchanged, and checked grant files stay under Kuru's existing private data directory rather than a project tool root.
+
+## Integration contract
+
+The core matcher consumes canonical native names, configured MCP alias plus original tool name, and configured outbound A2A alias. The connector's provider-facing hashed MCP name is only a transport/discovery label; it must resolve back to the configured stable identity before matching. Runtime A2A uses the same service contract with its configured alias and endpoint fingerprint, not a second rule parser. The app supplies the effective immutable config/trust snapshot and checked grant store to the service. The published JSON Schema describes the TOML-equivalent rule entries; native semantic validation remains authoritative for checked paths, endpoint constraints and cross-field context. Fixtures must exercise actual native file/shell, stdio/HTTP MCP and loopback A2A effects with fake credentials and isolated private state.

@@ -16,6 +16,8 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | Enter | Send the input |
 | Alt+Enter | Insert a newline |
 | F2 / F3 / F4 | Select model / effort / framework |
+| F5 or `/permissions` | Inspect session and saved tool grants; Delete revokes the selected scope |
+| Alt+1 / Alt+2 / Alt+3 / Alt+4 | Answer a tool prompt: once / session / always / deny |
 | Type / paste in a picker | Filter the available choices |
 | Escape | Close a picker or cancel active work |
 | Ctrl+C | Cancel active work; quit while idle |
@@ -79,6 +81,17 @@ one. The completed answer replaces the preview and enters the conversation
 once. Cancelling clears the preview; provisional text and visible summaries
 are not saved or replayed by resume or `/retry`. Scripted `kuru run` text and
 JSON output remain final-only.
+
+An asked tool pauses for an inline permission decision above the composer. The
+prompt shows the tool, a redacted preview and the exact grant scope. Ordinary
+typing and paste continue to edit your draft; Alt+1–4 answer the prompt.
+Escape or Ctrl+C cancels the active turn without granting the pending tool.
+Once covers this invocation; session and always cover the displayed exact file
+or whole-tool scope. If that scope cannot be shown completely without redaction,
+the prompt offers only once and deny. The permission chip shows remembered grant
+counts; F5 or `/permissions` opens their inspection and revocation view.
+Use Up/Down to select a grant, PgUp/PgDn to read a long scope, and Delete to
+revoke it. Up/Down scrolls long scopes in a pending permission prompt.
 
 Each framework has its own portrait: IFS orbits, polyvagal flows, a Freudian
 triangle and a Jungian rosette. Quiet ASCII contours animate while the pane has
@@ -163,9 +176,12 @@ kuru -C /path/to/project --allow-write tool file_write \
 
 `tools` discovers built-ins and configured MCP tools. Use the returned stable
 namespaced identifier when calling an MCP tool. Discovery and calls fail
-clearly when a configured server is unavailable. Shell requires
-`--allow-shell` and runs with your process permissions; it is not a sandbox.
-See [configuration](configuration.md) for persistent permissions and budgets.
+clearly when a configured server is unavailable. Ask-capable tools remain
+discoverable. Direct CLI calls use the same rules and saved grants as the TUI,
+but an unresolved ask refuses immediately instead of opening a prompt. Shell
+uses your process permissions; it is not a sandbox. See
+[tool permissions](configuration.md#tool-permissions) for legacy flags, explicit
+rules, grant lifetimes and deny precedence.
 
 ## Authentication and service commands
 

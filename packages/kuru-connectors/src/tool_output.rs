@@ -27,6 +27,7 @@ pub(crate) enum ToolContent {
 pub enum ToolFailureKind {
     BuiltIn,
     PermissionDenied,
+    PermissionRequired,
     McpRoute,
     McpCall,
     McpApplication,
@@ -38,6 +39,7 @@ impl fmt::Display for ToolFailureKind {
         formatter.write_str(match self {
             Self::BuiltIn => "tool execution failed",
             Self::PermissionDenied => "tool permission denied",
+            Self::PermissionRequired => "tool permission required",
             Self::McpRoute => "MCP route failed",
             Self::McpCall => "MCP tool call failed",
             Self::McpApplication => "MCP tool application error",
@@ -62,6 +64,13 @@ impl ToolFailure {
     pub(crate) fn permission_denied(error: Error) -> Self {
         Self {
             kind: ToolFailureKind::PermissionDenied,
+            error,
+        }
+    }
+
+    pub(crate) fn permission_required(error: Error) -> Self {
+        Self {
+            kind: ToolFailureKind::PermissionRequired,
             error,
         }
     }
@@ -108,5 +117,10 @@ impl std::error::Error for ProjectedToolError {}
 pub fn is_permission_denied(error: &Error) -> bool {
     error
         .downcast_ref::<ProjectedToolError>()
-        .is_some_and(|error| matches!(error.kind, ToolFailureKind::PermissionDenied))
+        .is_some_and(|error| {
+            matches!(
+                error.kind,
+                ToolFailureKind::PermissionDenied | ToolFailureKind::PermissionRequired
+            )
+        })
 }

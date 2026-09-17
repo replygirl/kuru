@@ -81,6 +81,67 @@ provider; consult `kuru models` instead of relying on a hardcoded list.
 `model = "auto"` uses provider selection. Kuru preserves newly advertised effort
 strings. The API key itself never belongs in configuration.
 
+## Tool permissions
+
+Tools use `allow`, `ask` or `deny` decisions after workspace trust and the
+existing file-root checks. The legacy `allow_write` and `allow_shell` booleans
+are fallback rules: `true` allows, while `false` asks in an attached interactive
+session. A direct CLI command or unattended operation that needs approval
+returns a permission-required refusal without executing or waiting for input.
+Use an explicit `deny` rule when an operation must never be approved.
+
+```toml
+[[permissions]]
+action = "ask"
+selector = { kind = "native", name = "file_write" }
+path = "src/**"
+
+[[permissions]]
+action = "deny"
+selector = { kind = "native", name = "shell" }
+
+[[permissions]]
+action = "ask"
+selector = { kind = "mcp", alias = "local_service", tool = "write_document" }
+
+[[permissions]]
+action = "ask"
+selector = { kind = "a2a", alias = "research_peer" }
+```
+
+Selectors use exact native names (`file_read`, `file_list`, `file_write`,
+`file_delete`, `shell`), an MCP configuration alias and original server tool
+name, or an outbound A2A configuration alias. MCP's provider-facing hashed tool
+name is not a permission selector. File patterns are anchored to the validated
+project-relative path; they cannot authorize an outside or protected target.
+Shell commands and MCP arguments do not have pattern matching.
+
+Up to 128 rules are supported. File patterns contain at most 512 Unicode
+characters: `*` and `?` match within one path segment, while a whole-segment
+`**` spans zero or more segments. `.` names the project root for listing.
+Absolute paths, drive prefixes, backslashes, traversal, control characters and
+bracket/brace pattern syntax are rejected.
+
+Any matching `deny` wins, followed by `ask`, then `allow`, independent of rule
+order. Only when no explicit rule matches do the legacy booleans apply. Ordinary
+reads/listing and configured MCP/A2A calls otherwise remain allowed after trust.
+A higher-priority configuration layer replaces the entire `permissions` array.
+
+The TUI offers once, session, always and deny. Once covers the exact invocation.
+Session and always cover the displayed scope: one exact file target, or the whole
+shell/MCP/A2A tool. Filename metacharacters stay literal in these grants. Session
+grants end with the running session, including before resume. Always grants are
+stored privately outside project memory and bind the workspace's native identity,
+reviewed authority manifest and effective permission/tool routes. A changed
+authority context invalidates them. `/permissions` inspects and revokes grants;
+explicit deny still wins over a saved grant. Closing or cancelling an unanswered
+prompt does not authorize execution.
+Tool execution stops if the checked project directory is renamed or replaced;
+reopen Kuru from the intended directory to establish its current workspace context.
+If an exact scope cannot be displayed without shortening or redaction, only
+once and deny are available; Kuru will not remember a scope the prompt did not
+fully show.
+
 ## Workspace trust
 
 Kuru reviews effective process, mutation, endpoint and prompt authority supplied
@@ -130,8 +191,8 @@ The activation sets are command-specific:
 | `auth` | Active Responses route; under another provider its API-key availability is not checked |
 | `sessions`, `memory ...`, `undo-dream` | Configured memory executable and cache paths |
 | `models` | Configured memory paths used while loading saved selections, plus an active Responses route |
-| `tool`, `tools` | Configured memory paths used while loading saved selections, built-in write/shell grants, and stdio/HTTP MCP configuration |
-| `run`, `dream`, `serve`, interactive TUI | All applicable project-instruction, memory, provider, write, shell, MCP and external-agent claims |
+| `tool`, `tools` | Configured memory paths used while loading saved selections, built-in write/shell defaults, permission rules, and stdio/HTTP MCP configuration |
+| `run`, `dream`, `serve`, interactive TUI | All applicable project-instruction, memory, provider, write, shell, permission-rule, MCP and external-agent claims |
 
 The other rows do not construct peer prompts, so they do not consume the
 project-instructions claim. Reading a snapshot for `config` or trust inspection
@@ -143,7 +204,9 @@ records live in checked private files under `<data-dir>/trust/workspaces`, outsi
 Dolt and the tool root, and contain digests rather than configuration values.
 
 Workspace trust authorizes configuration; it does not restrict an approved
-process. Shell and stdio MCP processes retain your account's process authority.
+process or approve a tool's pending ask. Automatically discovered permission
+rules are part of the reviewed manifest. Shell and stdio MCP processes retain
+your account's process authority.
 Kuru retains the reviewed workspace directory and detects an observed pathname
 replacement before configured cwd-based launches. On Unix, a replacement can
 still race between that check and child startup; this is not an atomic cwd binding
@@ -205,8 +268,10 @@ url = "https://example.com/mcp"
 
 Stdio servers may have an `env` table; avoid storing credentials in shared
 configuration. HTTP entries cannot contain process arguments or an environment
-table. Enabling an MCP server means granting the harness access to that server's
-tools; Kuru's built-in `allow_write` and `allow_shell` only govern its own tools.
+table. Enabling an MCP server gives the harness access to its tools after trust;
+permission rules can then ask or deny individual calls. Kuru's built-in
+`allow_write` and `allow_shell` fallbacks govern only its own tools. Call approval
+does not replace the separate trust check before MCP startup.
 
 ## External agents
 
@@ -260,8 +325,9 @@ The startup timeout is 1–300 seconds. See [memory storage](memory.md) for
 migration, revision inspection and backups, or
 [development](development.md#bundled-engine-build-inputs) for build-input settings.
 
-Writes and shell execution require opt-in through config or the corresponding
-CLI flags. Enabling shell permits subprocess activity with your account's
+Writes and shell execution require an effective allow rule, the corresponding
+legacy opt-in flag, or a valid approval. Explicit deny overrides these grants.
+Approving shell permits subprocess activity with your account's
 permissions, including network access; the working directory does not constrain
 what a subprocess can access. Built-in file tools separately enforce canonical
 root containment, including symlinks, and protect instructions, configuration

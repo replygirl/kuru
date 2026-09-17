@@ -254,7 +254,7 @@ impl<'a> ApprovalStore<'a> {
     }
 }
 
-fn private_child(parent: &Directory, name: &OsStr) -> Result<Directory> {
+pub(crate) fn private_child(parent: &Directory, name: &OsStr) -> Result<Directory> {
     match parent.create_private_directory(name) {
         Ok(created) => {
             drop(created);
@@ -273,7 +273,7 @@ fn private_child(parent: &Directory, name: &OsStr) -> Result<Directory> {
     }
 }
 
-fn lock(directory: &Directory, name: &OsStr) -> Result<File> {
+pub(crate) fn lock(directory: &Directory, name: &OsStr) -> Result<File> {
     let file = directory.lock_file(name)?;
     file.try_lock()?;
     directory.verify(name, &file)?;
@@ -292,7 +292,7 @@ fn movable_record_directory(directory: &Directory) -> Result<Directory> {
     Ok(operations)
 }
 
-fn publish(directory: &Directory, destination: &OsStr, bytes: &[u8]) -> Result<()> {
+pub(crate) fn publish(directory: &Directory, destination: &OsStr, bytes: &[u8]) -> Result<()> {
     let operations = movable_record_directory(directory)?;
     let pending = pending_name(destination);
     remove_pending(&operations, &pending)?;
@@ -358,7 +358,7 @@ fn remove_pending(directory: &Directory, name: &OsStr) -> Result<()> {
     }
 }
 
-fn exists(path: &Path) -> Result<bool> {
+pub(crate) fn exists(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
@@ -366,7 +366,7 @@ fn exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn ensure_outside_root(data: &Path, root: &Directory) -> Result<()> {
+pub(crate) fn ensure_outside_root(data: &Path, root: &Directory) -> Result<()> {
     ensure!(
         !data.starts_with(root.path()),
         "approval storage must be outside the workspace"

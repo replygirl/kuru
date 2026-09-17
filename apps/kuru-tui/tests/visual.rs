@@ -556,13 +556,21 @@ fn quiet_typing_leaves_portrait_and_composer_decoration_untouched() {
         let mut view = fixture(mode);
         view.motion = true;
         let (baseline, _) = render(&view, 140, 50, &format!("quiet-before-{mode}"));
-        // Rows 0..45 include the complete scene and composer separator; the
-        // editable draft starts on row 45. The clock stays fixed throughout.
+        // The dock can gain control rows. Locate its separator so the fixed
+        // scene and decoration are compared without including editable input.
+        let separator = text(&baseline)
+            .lines()
+            .enumerate()
+            .filter(|(_, row)| row.trim_start().starts_with(".    ."))
+            .map(|(index, _)| index)
+            .last()
+            .expect("composer separator");
+        let fixed_cells = 140 * (separator + 1);
         for c in "A thought".chars() {
             view.key(key(KeyCode::Char(c)));
             let (typed, _) = render(&view, 140, 50, &format!("quiet-typed-{mode}"));
             assert!(
-                baseline.content[..140 * 45] == typed.content[..140 * 45],
+                baseline.content[..fixed_cells] == typed.content[..fixed_cells],
                 "typing disturbed the {mode} portrait or composer decoration"
             );
         }
@@ -572,7 +580,7 @@ fn quiet_typing_leaves_portrait_and_composer_decoration_untouched() {
         view.key(key(KeyCode::Delete));
         let (edited, _) = render(&view, 140, 50, &format!("quiet-edited-{mode}"));
         assert!(
-            baseline.content[..140 * 45] == edited.content[..140 * 45],
+            baseline.content[..fixed_cells] == edited.content[..fixed_cells],
             "paste/edit disturbed the {mode} scene"
         );
         assert_eq!(view.input, " thought and a pasted continuatio");

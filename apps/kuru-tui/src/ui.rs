@@ -14,7 +14,14 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::{Stream, StreamExt};
-use kuru_core::{Mode, ModelInfo, Relationship};
+use kuru_connectors::{
+    permissions::{
+        ApprovalAnswer, ApprovalRequest, ApprovalSender, GrantScope, PermissionDisplay,
+        PermissionService,
+    },
+    project_text,
+};
+use kuru_core::{Mode, ModelInfo, NativeTool, PermissionSelector, Relationship};
 use kuru_runtime::{
     CancellationToken, ControlledTurnOutput, Event, FacingProgress, Harness, INTERRUPTION_ROLE,
     INTERRUPTION_TEXT, ResponseOutcome, TurnLimitReason, TurnOutput, turn_was_cancelled,
@@ -39,11 +46,25 @@ mod runtime_tests;
 mod scene;
 pub use render::draw;
 
-const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /notes ID · /retry · /dream · /undo-dream · /quit\n/memory-status · /memory-history\nModel, effort and mode selections are remembered for this project.";
+const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · F5 permissions · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /notes ID · /retry · /dream · /undo-dream · /quit\n/memory-status · /memory-history · /permissions\nApproval: Alt+1 Once · Alt+2 Session · Alt+3 Always · Alt+4 Deny.\nModel, effort and mode selections are remembered for this project.";
 const ACTIVITY_DRAIN_CAP: usize = 256;
 const PREVIEW_PAINT_INTERVAL: Duration = Duration::from_millis(80);
 const INTERRUPTION_REFRESH_NOTICE: &str =
     "Persisted interruption status could not be refreshed · reopen the session to inspect it";
+
+#[derive(Debug, Clone)]
+pub struct PermissionRow {
+    pub scope: GrantScope,
+    pub persistent: bool,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionPrompt {
+    pub display: PermissionDisplay,
+    pub whole_tool: bool,
+    pub scroll: u16,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Picker {
@@ -96,6 +117,11 @@ pub struct View {
     pub status: String,
     pub speaker: String,
     pub picker: Option<Picker>,
+    pub permission_prompt: Option<PermissionPrompt>,
+    pub permission_rows: Option<Vec<PermissionRow>>,
+    pub permission_selected: usize,
+    pub permission_detail_scroll: u16,
+    pub permission_counts: (usize, usize),
     pub selected: usize,
     pub models: Vec<ModelInfo>,
     pub scroll: u16,
@@ -146,6 +172,11 @@ impl View {
             status: "Ready · /help for commands".into(),
             speaker: "pool".into(),
             picker: None,
+            permission_prompt: None,
+            permission_rows: None,
+            permission_selected: 0,
+            permission_detail_scroll: 0,
+            permission_counts: (0, 0),
             selected: 0,
             models,
             scroll: 0,
@@ -495,6 +526,60 @@ impl View {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Some(if self.busy { "/cancel" } else { "/quit" }.into());
         }
+        if let Some(prompt) = &mut self.permission_prompt {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                let answer = match key.code {
+                    KeyCode::Char('1') => Some("/approval-once"),
+                    KeyCode::Char('2') if prompt.display.rememberable => Some("/approval-session"),
+                    KeyCode::Char('3') if prompt.display.rememberable => Some("/approval-always"),
+                    KeyCode::Char('4') => Some("/approval-deny"),
+                    _ => None,
+                };
+                if answer.is_some() {
+                    return answer.map(str::to_owned);
+                }
+                if matches!(key.code, KeyCode::Char('2' | '3')) && !prompt.display.rememberable {
+                    self.notify("Session and Always require the complete visible scope.");
+                    return None;
+                }
+            }
+            match key.code {
+                KeyCode::Up => {
+                    prompt.scroll = prompt.scroll.saturating_sub(1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    prompt.scroll = prompt.scroll.saturating_add(1);
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(rows) = &self.permission_rows {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(5) => self.permission_rows = None,
+                KeyCode::Up => {
+                    self.permission_selected = self.permission_selected.saturating_sub(1);
+                    self.permission_detail_scroll = 0;
+                }
+                KeyCode::Down => {
+                    self.permission_selected =
+                        (self.permission_selected + 1).min(rows.len().saturating_sub(1));
+                    self.permission_detail_scroll = 0;
+                }
+                KeyCode::PageUp => {
+                    self.permission_detail_scroll = self.permission_detail_scroll.saturating_sub(3)
+                }
+                KeyCode::PageDown => {
+                    self.permission_detail_scroll = self.permission_detail_scroll.saturating_add(3)
+                }
+                KeyCode::Delete | KeyCode::Backspace if !rows.is_empty() => {
+                    return Some("/permissions-revoke".into());
+                }
+                _ => {}
+            }
+            return None;
+        }
         if self.picker.is_some() {
             let len = self.options().len();
             match key.code {
@@ -526,6 +611,7 @@ impl View {
             return None;
         }
         match key.code {
+            KeyCode::F(5) if !self.busy => return Some("/permissions".into()),
             KeyCode::F(2) => {
                 self.open_picker(Picker::Models);
             }
@@ -638,6 +724,91 @@ fn outcome_summary(output: &TurnOutput) -> Option<String> {
 
 fn reduced_motion(value: Option<&str>) -> bool {
     value.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn grant_scope_label(scope: &GrantScope) -> String {
+    let selector = match scope.selector() {
+        PermissionSelector::Native { name } => match name {
+            NativeTool::FileRead => "native file read".to_owned(),
+            NativeTool::FileList => "native file list".to_owned(),
+            NativeTool::FileWrite => "native file write".to_owned(),
+            NativeTool::FileDelete => "native file delete".to_owned(),
+            NativeTool::Shell => "native shell (whole tool)".to_owned(),
+        },
+        PermissionSelector::Mcp { alias, tool } => format!("MCP {alias}/{tool} (whole tool)"),
+        PermissionSelector::A2a { alias } => format!("external agent {alias} (whole tool)"),
+    };
+    let raw = match scope.target() {
+        Some(target) => format!("{selector} · project file {}", target.as_str()),
+        None => selector,
+    };
+    // Private records are validated authority, not pre-projected terminal
+    // text. Render through the same connector redaction boundary as prompts.
+    let safe = project_text(&raw).unwrap_or_else(|_| "[withheld]".into());
+    if safe.len() <= 4608 {
+        return safe;
+    }
+    let mut end = 4608;
+    while !safe.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &safe[..end])
+}
+
+fn refresh_permission_state(service: &PermissionService, view: &mut View) -> Result<()> {
+    let inspection = service.inspect()?;
+    view.permission_counts = (inspection.session.len(), inspection.persistent.len());
+    if view.permission_rows.is_some() {
+        let rows = inspection
+            .session
+            .into_iter()
+            .map(|scope| PermissionRow {
+                label: grant_scope_label(&scope),
+                scope,
+                persistent: false,
+            })
+            .chain(
+                inspection
+                    .persistent
+                    .into_iter()
+                    .map(|scope| PermissionRow {
+                        label: grant_scope_label(&scope),
+                        scope,
+                        persistent: true,
+                    }),
+            )
+            .collect::<Vec<_>>();
+        view.permission_selected = view.permission_selected.min(rows.len().saturating_sub(1));
+        view.permission_rows = Some(rows);
+    }
+    Ok(())
+}
+
+fn open_permission_inspector(service: &PermissionService, view: &mut View) -> Result<()> {
+    view.permission_rows = Some(Vec::new());
+    view.permission_selected = 0;
+    view.permission_detail_scroll = 0;
+    refresh_permission_state(service, view)
+}
+
+fn revoke_selected_permission(service: &PermissionService, view: &mut View) -> Result<()> {
+    // Capture the checked scope before reloading the list: positional row IDs
+    // change as grants are removed or added by a concurrent private-store user.
+    let scope = view
+        .permission_rows
+        .as_ref()
+        .and_then(|rows| rows.get(view.permission_selected))
+        .map(|row| row.scope.clone());
+    if let Some(scope) = scope {
+        let removed = service.revoke(&scope)?;
+        refresh_permission_state(service, view)?;
+        view.notify(if removed.session_removed || removed.persistent_removed {
+            "Permission revoked"
+        } else {
+            "Permission was already absent"
+        });
+    }
+    Ok(())
 }
 
 /// Read the initial TUI presentation from the runtime at the adapter boundary.
@@ -903,6 +1074,11 @@ enum Wake {
     Activity(Result<Event, broadcast::error::RecvError>),
     Progress(Result<(), watch::error::RecvError>),
     Animation,
+}
+
+enum LoopWake {
+    Approval(Option<ApprovalRequest>),
+    Regular(Wake),
 }
 
 struct Scheduler {
@@ -1316,6 +1492,8 @@ where
 {
     let initial = project_initial_view(&harness).await?;
     let mut view = View::from_initial(initial, models);
+    let permission_service = harness.permission_service();
+    refresh_permission_state(&permission_service, &mut view)?;
     if let Some(notice) = &notice {
         view.transcript
             .push(("system".into(), notice.text().into()));
@@ -1327,6 +1505,8 @@ where
     let (tx, mut rx) = mpsc::channel::<(u64, Result<DispatchOutcome>)>(8);
     let mut job: Option<JoinHandle<()>> = None;
     let mut cancellation: Option<CancellationToken> = None;
+    let mut approval_rx: Option<mpsc::Receiver<ApprovalRequest>> = None;
+    let mut pending_approval: Option<ApprovalRequest> = None;
     let mut quit_pending = false;
     let mut generation = 0u64;
     let mut preview_fence = PreviewFence::default();
@@ -1357,21 +1537,43 @@ where
                 }
             }
 
-            let wake = next_wake_with_progress(
-                &scheduler,
-                &mut input,
-                &mut rx,
-                &mut events,
-                &mut progress,
-                WakeAvailability {
-                    input: input_open,
-                    completion: completion_open,
-                    activity: activity_open,
-                },
-                progress_open,
-                animation_at,
-            )
-            .await;
+            let wake = tokio::select! {
+                request = async { approval_rx.as_mut().expect("guarded approval receiver").recv().await }, if approval_rx.is_some() => LoopWake::Approval(request),
+                wake = next_wake_with_progress(
+                    &scheduler,
+                    &mut input,
+                    &mut rx,
+                    &mut events,
+                    &mut progress,
+                    WakeAvailability {
+                        input: input_open,
+                        completion: completion_open,
+                        activity: activity_open,
+                    },
+                    progress_open,
+                    animation_at,
+                ) => LoopWake::Regular(wake),
+            };
+
+            let wake = match wake {
+                LoopWake::Approval(Some(request)) => {
+                    if view.busy && pending_approval.is_none() {
+                        view.permission_prompt = Some(PermissionPrompt {
+                            display: request.display.clone(),
+                            whole_tool: request.scope.target().is_none(),
+                            scroll: 0,
+                        });
+                        pending_approval = Some(request);
+                        dirty = true;
+                    }
+                    continue;
+                }
+                LoopWake::Approval(None) => {
+                    approval_rx = None;
+                    continue;
+                }
+                LoopWake::Regular(wake) => wake,
+            };
 
             match wake {
                 Wake::Terminal(Some(Ok(event))) => {
@@ -1379,7 +1581,30 @@ where
                     let (redraw, command) = view.terminal_event(event);
                     dirty |= redraw;
                     if let Some(command) = command {
-                        if command == "/cancel" {
+                        if let Some(answer) = match command.as_str() {
+                            "/approval-once" => Some(ApprovalAnswer::Once),
+                            "/approval-session" => Some(ApprovalAnswer::Session),
+                            "/approval-always" => Some(ApprovalAnswer::Always),
+                            "/approval-deny" => Some(ApprovalAnswer::Deny),
+                            _ => None,
+                        } {
+                            if let Some(request) = pending_approval.take() {
+                                let _ = request.reply.send(answer);
+                                view.permission_prompt = None;
+                                dirty = true;
+                            }
+                        } else if command == "/permissions" && !view.busy {
+                            open_permission_inspector(&permission_service, &mut view)?;
+                            dirty = true;
+                        } else if command == "/permissions-revoke" && !view.busy {
+                            revoke_selected_permission(&permission_service, &mut view)?;
+                            dirty = true;
+                        } else if command == "/cancel" {
+                            // The worker may be awaiting this exact oneshot. Close
+                            // both ends before waiting for its cancelled result.
+                            pending_approval = None;
+                            approval_rx = None;
+                            view.permission_prompt = None;
                             view.preview = None;
                             preview_fence.clear();
                             preview_paint.clear();
@@ -1399,6 +1624,9 @@ where
                             );
                             dirty = true;
                         } else if command == "/quit" {
+                            pending_approval = None;
+                            approval_rx = None;
+                            view.permission_prompt = None;
                             view.preview = None;
                             preview_fence.clear();
                             preview_paint.clear();
@@ -1466,6 +1694,8 @@ where
                             let models = view.models.clone();
                             let operation_cancellation = CancellationToken::new();
                             cancellation = Some(operation_cancellation.clone());
+                            let (approval_tx, receiver) = mpsc::channel(1);
+                            approval_rx = Some(receiver);
                             job = Some(tokio::spawn(async move {
                                 let result = dispatch_controlled(
                                     &mut *harness.lock().await,
@@ -1473,6 +1703,7 @@ where
                                     &command,
                                     &operation_cancellation,
                                     turn_id.as_deref(),
+                                    Some(ApprovalSender::new(approval_tx)),
                                 )
                                 .await;
                                 let _ = tx.send((generation, result)).await;
@@ -1492,6 +1723,9 @@ where
                 Wake::Completion(Some(completion)) => {
                     scheduler.served(WakeSource::Completion);
                     if completion.0 == generation {
+                        pending_approval = None;
+                        approval_rx = None;
+                        view.permission_prompt = None;
                         cancellation = None;
                         preview_fence.clear();
                         preview_paint.clear();
@@ -1520,6 +1754,7 @@ where
                             activity_closed,
                         } => {
                             activity_open = activity_still_open(activity_open, activity_closed);
+                            refresh_permission_state(&permission_service, &mut view)?;
                             dirty = true;
                         }
                     }
@@ -1533,7 +1768,9 @@ where
                 }
                 Wake::Activity(Ok(event)) => {
                     scheduler.served(WakeSource::Activity);
+                    let settled_tool = matches!(&event, Event::ToolSettled { .. });
                     view.event(event);
+                    if settled_tool { refresh_permission_state(&permission_service, &mut view)?; }
                     dirty = true;
                 }
                 Wake::Activity(Err(broadcast::error::RecvError::Lagged(count))) => {
@@ -1576,6 +1813,8 @@ where
         }
     }
     .await;
+    drop(pending_approval);
+    drop(approval_rx);
     finish_loop(
         result,
         &mut job,
@@ -1593,7 +1832,7 @@ pub(crate) async fn dispatch(
     command: &str,
 ) -> Result<DispatchOutcome> {
     let cancellation = CancellationToken::new();
-    dispatch_controlled(harness, models, command, &cancellation, None).await
+    dispatch_controlled(harness, models, command, &cancellation, None, None).await
 }
 
 async fn dispatch_controlled(
@@ -1602,6 +1841,7 @@ async fn dispatch_controlled(
     command: &str,
     cancellation: &CancellationToken,
     turn_id: Option<&str>,
+    approval: Option<ApprovalSender>,
 ) -> Result<DispatchOutcome> {
     harness.reconcile().await?;
     let (name, args) = command.split_once(' ').unwrap_or((command, ""));
@@ -1656,7 +1896,13 @@ async fn dispatch_controlled(
         "/memory-history" => serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?,
         "/retry" => {
             return Ok(DispatchOutcome::Turn(
-                harness.retry_last(cancellation).await?,
+                if let Some(approval) = approval.clone() {
+                    harness
+                        .retry_last_with_approval(cancellation, approval)
+                        .await?
+                } else {
+                    harness.retry_last(cancellation).await?
+                },
             ));
         }
         "/dream" => serde_json::to_string_pretty(&harness.dream_controlled(cancellation).await?)?,
@@ -1673,11 +1919,21 @@ async fn dispatch_controlled(
                 generated = uuid::Uuid::new_v4().to_string();
                 &generated
             };
-            return Ok(DispatchOutcome::Turn(
+            return Ok(DispatchOutcome::Turn(if let Some(approval) = approval {
+                harness
+                    .run_local_controlled_with_approval(
+                        command,
+                        None,
+                        turn_id,
+                        cancellation,
+                        approval,
+                    )
+                    .await?
+            } else {
                 harness
                     .run_local_controlled(command, None, turn_id, cancellation)
-                    .await?,
-            ));
+                    .await?
+            }));
         }
     };
     Ok(DispatchOutcome::Command(feedback))
@@ -1752,6 +2008,101 @@ mod tests {
                 metadata: Default::default(),
             }],
         )
+    }
+
+    #[test]
+    fn permission_prompt_preserves_draft_and_requires_visible_scope_for_remembering() {
+        let mut view = fixture();
+        view.busy = true;
+        view.permission_prompt = Some(PermissionPrompt {
+            display: PermissionDisplay {
+                label: "native file write".into(),
+                scope: "project file notes/exact.txt".into(),
+                preview: "bounded preview".into(),
+                rememberable: true,
+                remember_disabled_reason: None,
+            },
+            whole_tool: false,
+            scroll: 0,
+        });
+        view.key(key(KeyCode::Char('7')));
+        assert_eq!(view.input, "7");
+        assert_eq!(
+            view.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT)),
+            Some("/approval-session".into())
+        );
+        assert_eq!(view.input, "7");
+        view.key(key(KeyCode::Down));
+        assert_eq!(view.permission_prompt.as_ref().unwrap().scroll, 1);
+        view.permission_prompt.as_mut().unwrap().scroll = 0;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(38, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &view)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("native file write"));
+        assert!(screen.contains("Alt+2 Session"));
+
+        view.permission_prompt
+            .as_mut()
+            .unwrap()
+            .display
+            .rememberable = false;
+        assert_eq!(
+            view.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT)),
+            None
+        );
+        assert_eq!(view.input, "7");
+        assert_eq!(
+            view.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)),
+            Some("/approval-once".into())
+        );
+        assert_eq!(view.key(key(KeyCode::Esc)), Some("/cancel".into()));
+    }
+
+    #[test]
+    fn permission_inspector_scrolls_detail_and_revoke_uses_selected_scope() {
+        let mut view = fixture();
+        let scopes = [
+            GrantScope::WholeTool {
+                selector: PermissionSelector::Native {
+                    name: NativeTool::Shell,
+                },
+            },
+            GrantScope::ExactFile {
+                selector: PermissionSelector::Native {
+                    name: NativeTool::FileRead,
+                },
+                target: kuru_core::ProjectRelativeTarget::parse("notes.txt").unwrap(),
+            },
+        ];
+        view.permission_rows = Some(
+            scopes
+                .iter()
+                .cloned()
+                .map(|scope| PermissionRow {
+                    label: "checked scope".into(),
+                    scope,
+                    persistent: false,
+                })
+                .collect(),
+        );
+        view.key(key(KeyCode::PageDown));
+        assert_eq!(view.permission_detail_scroll, 3);
+        view.key(key(KeyCode::Down));
+        assert_eq!(view.permission_selected, 1);
+        assert_eq!(view.permission_detail_scroll, 0);
+        assert_eq!(view.permission_rows.as_ref().unwrap()[1].scope, scopes[1]);
+        assert_eq!(
+            view.key(key(KeyCode::Delete)),
+            Some("/permissions-revoke".into())
+        );
+        assert_eq!(view.key(key(KeyCode::Esc)), None);
+        assert!(view.permission_rows.is_none());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -139,7 +139,7 @@ pub fn draw(frame: &mut Frame<'_>, view: &View) {
         draw_tiny(frame, view, area);
         return;
     }
-    let control_rows = if area.width >= 72 {
+    let control_rows = 1 + if area.width >= 72 {
         1
     } else if area.width >= 38 {
         2
@@ -188,6 +188,17 @@ pub fn draw(frame: &mut Frame<'_>, view: &View) {
     draw_footer(frame, view, rows[5]);
     if view.picker.is_some() {
         draw_picker(frame, view, area);
+    }
+    let overlay = Rect::new(
+        area.x.saturating_add(1),
+        rows[1].y,
+        area.width.saturating_sub(2),
+        rows[3].bottom().saturating_sub(rows[1].y),
+    );
+    if view.permission_prompt.is_some() {
+        draw_permission_prompt(frame, view, overlay);
+    } else if view.permission_rows.is_some() {
+        draw_permission_inspector(frame, view, overlay);
     }
 }
 
@@ -772,12 +783,149 @@ fn dock_controls(view: &View, width: u16) -> Vec<Line<'static>> {
         "F4",
         identity.accent,
     );
-    if width >= 68 {
+    let mut rows = if width >= 68 {
         vec![Line::from([model, effort, mode].concat())]
     } else if width >= 34 {
         vec![Line::from(model), Line::from([effort, mode].concat())]
     } else {
         vec![Line::from(model), Line::from(effort), Line::from(mode)]
+    };
+    rows.push(Line::from(Span::styled(
+        clipped(
+            &format!(
+                "◈ Permissions · {} session · {} always  F5",
+                view.permission_counts.0, view.permission_counts.1
+            ),
+            usize::from(width),
+        ),
+        style(MINT),
+    )));
+    rows
+}
+
+fn draw_permission_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let Some(prompt) = &view.permission_prompt else {
+        return;
+    };
+    if area.width < 8 || area.height < 5 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let title = if prompt.display.rememberable {
+        "Permission request · ↑↓ scope"
+    } else {
+        "Permission request · Once only"
+    };
+    let inner = panel(title, AMBER).inner(area);
+    frame.render_widget(panel(title, AMBER), area);
+    if inner.height < 3 {
+        return;
+    }
+    let choices_height = if inner.width >= 62 { 1 } else { 2 };
+    let reason_height = u16::from(!prompt.display.rememberable);
+    let body_height = inner.height.saturating_sub(choices_height + reason_height);
+    let body = Rect::new(inner.x, inner.y, inner.width, body_height);
+    let scope_kind = if prompt.whole_tool {
+        "whole tool"
+    } else {
+        "literal project file"
+    };
+    let content = format!(
+        "{}\nExact grant scope ({scope_kind}): {}\nPreview: {}",
+        prompt.display.label, prompt.display.scope, prompt.display.preview
+    );
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: false })
+            .scroll((prompt.scroll, 0)),
+        body,
+    );
+    if !prompt.display.rememberable {
+        let reason = prompt
+            .display
+            .remember_disabled_reason
+            .as_deref()
+            .unwrap_or("Exact grant scope is unavailable.");
+        frame.render_widget(
+            Paragraph::new(clipped(reason, usize::from(inner.width))).style(style(ROSE)),
+            Rect::new(inner.x, body.bottom(), inner.width, reason_height),
+        );
+    }
+    let choices = if prompt.display.rememberable {
+        if inner.width >= 62 {
+            "Alt+1 Once   Alt+2 Session   Alt+3 Always   Alt+4 Deny"
+        } else {
+            "Alt+1 Once  Alt+2 Session\nAlt+3 Always  Alt+4 Deny"
+        }
+    } else if inner.width >= 62 {
+        "Alt+1 Once   Alt+2/3 unavailable   Alt+4 Deny"
+    } else {
+        "Alt+1 Once  Alt+4 Deny\nSession/Always unavailable"
+    };
+    frame.render_widget(
+        Paragraph::new(choices).style(bold(AMBER)),
+        Rect::new(
+            inner.x,
+            inner.bottom().saturating_sub(choices_height),
+            inner.width,
+            choices_height,
+        ),
+    );
+}
+
+fn draw_permission_inspector(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let Some(rows) = &view.permission_rows else {
+        return;
+    };
+    if area.width < 8 || area.height < 5 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let title = "Permissions · ↑↓ select · PgUp/PgDn detail · Delete revoke · Esc close";
+    let inner = panel(title, MINT).inner(area);
+    frame.render_widget(panel(title, MINT), area);
+    if inner.height == 0 {
+        return;
+    }
+    if rows.is_empty() {
+        frame.render_widget(Paragraph::new("No session or always grants."), inner);
+        return;
+    }
+    let detail_height = inner.height.saturating_sub(2).min(8);
+    let list_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(detail_height),
+    );
+    let items = rows
+        .iter()
+        .map(|row| {
+            let lifetime = if row.persistent { "Always" } else { "Session" };
+            ListItem::new(clipped(
+                &format!("{lifetime} · {}", row.label),
+                usize::from(inner.width),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(view.permission_selected));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(bold(AMBER)),
+        list_area,
+        &mut state,
+    );
+    if let Some(row) = rows.get(view.permission_selected) {
+        let detail = format!(
+            "Selected exact scope · PgUp/PgDn to inspect all:\n{}",
+            row.label
+        );
+        frame.render_widget(
+            Paragraph::new(detail)
+                .wrap(Wrap { trim: false })
+                .scroll((view.permission_detail_scroll, 0))
+                .style(style(TEXT)),
+            Rect::new(inner.x, list_area.bottom(), inner.width, detail_height),
+        );
     }
 }
 

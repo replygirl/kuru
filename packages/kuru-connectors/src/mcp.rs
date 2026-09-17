@@ -12,7 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::future::join_all;
-use kuru_core::{McpConfig, ToolSpec};
+use kuru_core::{McpConfig, PermissionSelector, ToolSpec};
 use kuru_platform::fs::Directory;
 #[cfg(test)]
 use kuru_platform::fs::{NameRetention, Privacy};
@@ -344,6 +344,21 @@ impl McpHosts {
         } else {
             Ok(McpExecution::Success(result))
         }
+    }
+
+    /// Resolve the provider-facing hash to its stable configured identity
+    /// before permission matching. The hash itself is never an authority key.
+    pub(crate) async fn selector(
+        &self,
+        name: &str,
+    ) -> std::result::Result<PermissionSelector, McpCallFailure> {
+        let route = self.routes.read().await.get(name).cloned();
+        let (alias, original) = route.ok_or_else(|| {
+            McpCallFailure::route(anyhow::anyhow!(
+                "unknown tool: {name}; discover configured MCP tools first"
+            ))
+        })?;
+        PermissionSelector::mcp(alias, original).map_err(McpCallFailure::route)
     }
 
     pub async fn shutdown(&self) -> Result<()> {
