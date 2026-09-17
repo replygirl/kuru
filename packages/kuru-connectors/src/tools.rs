@@ -1052,6 +1052,25 @@ async fn shell(
 }
 
 #[cfg(windows)]
+#[cfg(test)]
+fn windows_shell_fixture_stage_path() -> Option<PathBuf> {
+    if std::env::var("KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_CHILD").as_deref() != Ok("1") {
+        return None;
+    }
+    let root = std::env::var_os("KURU_WINDOWS_SHELL_ENVIRONMENT_TEST_ROOT")?;
+    let case = match std::env::var("NO_COLOR").as_deref() {
+        Ok("inherited") => "inherited",
+        Ok("fallback") => "fallback",
+        _ => return None,
+    };
+    Some(
+        PathBuf::from(root)
+            .join("temporary")
+            .join(format!("shell-stage-{case}.txt")),
+    )
+}
+
+#[cfg(windows)]
 async fn shell_inner(
     root_guard: &Directory,
     root: &Path,
@@ -1073,13 +1092,32 @@ async fn shell_inner(
     // Load the two shipped modules used by Kuru's stock-shell contracts from
     // their exact PSHOME manifests. This retains arbitrary module autoloading
     // while avoiding generic cold command discovery for their first command.
+    #[cfg(test)]
+    let fixture_stage = windows_shell_fixture_stage_path();
+    #[cfg(test)]
+    let [before_imports, after_management, after_utility] = fixture_stage.as_ref().map_or_else(
+        || [String::new(), String::new(), String::new()],
+        |stage| {
+            let stage = stage.to_string_lossy().replace('\'', "''");
+            ["source-entered", "management-imported", "utility-imported"]
+                .map(|name| format!("[IO.File]::AppendAllText('{stage}', \"{name}`n\");\n"))
+        },
+    );
+    #[cfg(not(test))]
+    let [before_imports, after_management, after_utility] = ["", "", ""];
     let source = format!(
         concat!(
+            "{before_imports}",
             "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding;\n",
             "$null = Microsoft.PowerShell.Core\\Import-Module -Name ([IO.Path]::Combine($PSHOME, 'Modules\\Microsoft.PowerShell.Management\\Microsoft.PowerShell.Management.psd1')) -ErrorAction Stop;\n",
+            "{after_management}",
             "$null = Microsoft.PowerShell.Core\\Import-Module -Name ([IO.Path]::Combine($PSHOME, 'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop;\n",
+            "{after_utility}",
             "{command}"
         ),
+        before_imports = before_imports,
+        after_management = after_management,
+        after_utility = after_utility,
         command = command
     );
     let bytes: Vec<_> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -1136,10 +1174,25 @@ async fn shell_inner(
         Err(category) => {
             // Query the retained root separately from whole-Job quiescence;
             // observation failure must never prevent the existing cleanup.
-            let _ = match child.duplicate_process_handle() {
+            let root_status = match child.duplicate_process_handle() {
                 Ok(process) => wait_process_handle(&process, Duration::ZERO).await,
                 Err(error) => Err(error),
             };
+            #[cfg(test)]
+            if let Some(stage) = &fixture_stage {
+                let marker = match &root_status {
+                    Ok(()) => "root-exited\n",
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => "root-alive\n",
+                    Err(_) => "root-status-unknown\n",
+                };
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(stage)
+                    .and_then(|mut file| file.write_all(marker.as_bytes()));
+            }
+            #[cfg(not(test))]
+            let _ = root_status;
             let _ = child.try_wait();
             let stopped_result = crate::process::stop(&mut child).await;
             cleanup_unconfirmed = stopped_result.is_err();
@@ -3604,7 +3657,7 @@ if ($failed.Count -eq 0) {{
             );
             assert_eq!(
                 stage_trace(),
-                "entered\nstock-modules-loaded\nbefore-join-path\nafter-join-path\nhome-temp-written\nbefore-where\nafter-where\nbefore-probe\nafter-probe\nbefore-checks\nafter-checks\n"
+                "source-entered\nmanagement-imported\nutility-imported\nentered\nstock-modules-loaded\nbefore-join-path\nafter-join-path\nhome-temp-written\nbefore-where\nafter-where\nbefore-probe\nafter-probe\nbefore-checks\nafter-checks\n"
             );
             assert_eq!(
                 std::fs::read_to_string(home.join("shell-home.txt")).unwrap(),
