@@ -80,6 +80,7 @@ pub(crate) fn fixture_startup_error(options: &OpenOptions, error: Error) -> Erro
             || message.starts_with(
                 "memory server startup failed: Dolt startup/lifetime failed; private diagnostics:",
             )
+            || message == "memory supervisor readiness deadline exceeded"
     }) {
         return error;
     }
@@ -177,6 +178,12 @@ mod fixture_diagnostic_tests {
         )
     }
 
+    fn readiness_error() -> Error {
+        anyhow::anyhow!("memory supervisor readiness deadline exceeded")
+            .context("memory startup cleanup also failed: memory supervisor exited unsuccessfully (exit code: 1)")
+            .context("open staged memory server")
+    }
+
     #[test]
     fn startup_log_capture_is_opt_in_exact_and_bounded() -> Result<()> {
         let root = tempdir()?;
@@ -197,11 +204,24 @@ mod fixture_diagnostic_tests {
         let unrelated = anyhow::anyhow!("ordinary fixture error");
         let unchanged = fixture_startup_error(&options, unrelated);
         assert_eq!(unchanged.to_string(), "ordinary fixture error");
+        let unrelated_deadline = fixture_startup_error(
+            &options,
+            anyhow::anyhow!("provider readiness deadline exceeded"),
+        );
+        assert_eq!(
+            unrelated_deadline.to_string(),
+            "provider readiness deadline exceeded"
+        );
         let captured = fixture_startup_error(&options, startup_error());
         let rendered = format!("{captured:#}");
         assert!(rendered.contains("fixture-private-log"));
         assert!(rendered.contains(&log.display().to_string()));
         assert!(rendered.contains("Dolt exited before readiness"));
+        let readiness_captured = fixture_startup_error(&options, readiness_error());
+        let readiness_rendered = format!("{readiness_captured:#}");
+        assert!(readiness_rendered.contains("fixture-private-log"));
+        assert!(readiness_rendered.contains(&log.display().to_string()));
+        assert!(readiness_rendered.contains("memory supervisor readiness deadline exceeded"));
 
         files::write(&log, &vec![b'x'; 8 * 1024])?;
         let bounded = fixture_startup_error(&options, startup_error()).to_string();
