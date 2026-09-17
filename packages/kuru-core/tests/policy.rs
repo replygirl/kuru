@@ -7,8 +7,9 @@ use kuru_core::{
     ActorPhase, ConsolidationPlan, ContextSource, Contribution, FacingDecision, FacingInput,
     FacingPolicy, FlowPolicy, Framework, MemoryPolicy, Mode, ModeProfile, Part, PeeringPolicy,
     Relationship, RelationshipKind, RelationshipOrigin, RolesPolicy, StateKeys,
-    validate_context_sources, validate_contributions, validate_facing, validate_identity_namespace,
-    validate_peer_edge, validate_recipients, validate_relationship_members,
+    validate_consolidation_plan, validate_context_sources, validate_contributions, validate_facing,
+    validate_identity_namespace, validate_peer_edge, validate_recipients,
+    validate_relationship_members,
 };
 use sha2::{Digest, Sha256};
 
@@ -301,6 +302,64 @@ fn relationship_origins_preserve_user_admission_and_check_peer_context() {
 }
 
 #[test]
+fn context_and_consolidation_validators_preserve_mandatory_input_and_live_order() {
+    let ids = ModeProfile::builtin(Mode::Ifs).roles.authored_order();
+    let active = ids.iter().cloned().collect::<BTreeSet<_>>();
+    assert!(
+        validate_context_sources(
+            &ids[0],
+            &[
+                ContextSource::OwnHistory(ids[0].clone()),
+                ContextSource::ExplicitInput,
+            ],
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_context_sources(&ids[0], &[ContextSource::OwnHistory(ids[0].clone())]).is_err()
+    );
+    assert!(
+        validate_context_sources(
+            &ids[0],
+            &[ContextSource::ExplicitInput, ContextSource::ExplicitInput],
+        )
+        .is_err()
+    );
+
+    let plan = ConsolidationPlan {
+        participants: vec![ids[2].clone(), ids[0].clone()],
+        prompt: "review".into(),
+        phase: "dream".into(),
+        max_proposals_per_part: 2,
+    };
+    validate_consolidation_plan(&plan, &active).unwrap();
+    for invalid in [
+        ConsolidationPlan {
+            participants: vec![ids[0].clone(), ids[0].clone()],
+            ..plan.clone()
+        },
+        ConsolidationPlan {
+            participants: vec!["inactive".into()],
+            ..plan.clone()
+        },
+        ConsolidationPlan {
+            prompt: " ".into(),
+            ..plan.clone()
+        },
+        ConsolidationPlan {
+            phase: "".into(),
+            ..plan.clone()
+        },
+        ConsolidationPlan {
+            max_proposals_per_part: 3,
+            ..plan
+        },
+    ] {
+        assert!(validate_consolidation_plan(&invalid, &active).is_err());
+    }
+}
+
+#[test]
 fn facing_parity_covers_activation_focus_relationship_and_dream_only_tie() {
     let profile = ModeProfile::builtin(Mode::Ifs);
     let authored = profile.roles.authored_order();
@@ -452,7 +511,10 @@ impl PeeringPolicy for OtherPeering {
 struct OtherVisibility;
 impl kuru_core::VisibilityPolicy for OtherVisibility {
     fn context_sources(&self, identity: &str, _: ActorPhase) -> Vec<ContextSource> {
-        vec![ContextSource::OwnHistory(identity.into())]
+        vec![
+            ContextSource::OwnHistory(identity.into()),
+            ContextSource::ExplicitInput,
+        ]
     }
     fn allows_delivery(&self, _: &str, _: &str, _: &BTreeSet<String>) -> bool {
         false
@@ -474,9 +536,11 @@ impl MemoryPolicy for OtherMemory {
         }
     }
     fn consolidation_plan(&self, active: &[String]) -> ConsolidationPlan {
-        ModeProfile::builtin(Mode::Ifs)
+        let mut plan = ModeProfile::builtin(Mode::Ifs)
             .memory
-            .consolidation_plan(active)
+            .consolidation_plan(active);
+        plan.participants = active.iter().rev().take(2).cloned().collect();
+        plan
     }
 }
 
@@ -524,7 +588,10 @@ fn components_can_be_replaced_independently_and_invalid_results_refuse() {
         changed
             .visibility
             .context_sources(&ids[0], ActorPhase::Speak),
-        vec![ContextSource::OwnHistory(ids[0].clone())]
+        vec![
+            ContextSource::OwnHistory(ids[0].clone()),
+            ContextSource::ExplicitInput,
+        ]
     );
     changed.validate(32).unwrap();
     changed = original.clone();

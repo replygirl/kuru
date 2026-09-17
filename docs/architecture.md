@@ -57,9 +57,19 @@ and the caller's target before acting. Selecting a peer grants no extra tool
 authority. A mode change publishes its profile together with the configuration,
 session and topology only after the memory checkpoint settles.
 
-Visibility and memory remain defined policy contracts pending their integration
-into actor context and dream consolidation. The four existing modes retain their
-behavior; the dispatch integration adds no mode or user control.
+Visibility selects an actor's optional context before any of those sources are
+read and gates peer delivery alongside peering. The selected sources feed the
+same request-fit estimate used before inference. Current input, required tool
+receipts and native continuation remain mandatory; omitting older context does
+not delete it. Relationship actors use their own private namespace and explicitly
+shared contributions.
+
+Memory selects checked identity namespaces, transcript and state keys, and each
+dream's consolidation plan. The runtime validates those paths against the actual
+project and identity before use. Actor tasks follow the namespace of the
+published profile, including after mode changes and reconciliation. The four
+existing modes retain their behavior and namespace layout; the policy boundary
+adds no mode or user control.
 
 Speaker selection preserves stronger runtime evidence before consulting a
 framework's authored order. An explicit caller target wins first, followed by an
@@ -132,6 +142,13 @@ Dreaming is a consolidation and topology-update mechanism. It does not run an
 unbounded background loop or imply biological sleep. Its provider calls count
 toward the operational cost of a session.
 
+The memory policy selects dream participants from the current active parts,
+along with the prompt, descriptive phase and a proposal limit of at most two per
+part. The runtime validates that plan before creating a candidate, preserves its
+participant/result order under the existing parallel budget, and retains typed
+Dream accounting. Candidate writes, promotion, cancellation, retirement checks
+and compensating undo remain runtime-owned.
+
 ## Context and usage accounting
 
 Runtime assigns each provider invocation an identity and admits it durably before
@@ -169,7 +186,7 @@ written into conversation memory or exposed by inspection.
 | Boundary | Adding a capability |
 | --- | --- |
 | `Config` and validation | Add a typed option, default, validation and layered-config test |
-| `Framework` | Add roles/instructions and topology invariants |
+| `ModeProfile` | Define pure roles, peering, flow, facing, visibility and memory decisions within runtime invariants |
 | `Provider` | Implement dynamic `models` and normalized `complete` |
 | `ToolHost` | Add a schema and bounded execution handler with permission checks |
 | Protocol adapters | Translate MCP/A2A messages at the boundary |

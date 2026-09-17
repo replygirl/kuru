@@ -1,5 +1,24 @@
 # Verification record
 
+## Phase 1 foundation checks (2026-09-16)
+
+The local regression suite covers typed content and durable migration,
+provider-visible streaming with settled final answers, tool approvals and
+workspace-bound grants, whole-request context fit, and durable session usage.
+Real HTTP, process, terminal and Dolt fixtures exercise failures and cancellation
+as well as successful requests.
+
+Four-mode parity fixtures retain the built-in roles, instructions, recipients,
+speaking decisions and namespace layout. Test-only alternate profiles exercise
+all six policy boundaries through actual requests and storage: rejected peer
+effects, retained mandatory input, restricted optional context, private namespace
+selection and candidate-safe dreaming. Permission denial, exact retry, deferred
+publication and undo preserving later history remain part of the same suite.
+
+Observed local results are recorded in the archived change ledgers. Hosted CI
+and release results are recorded separately; the dated release evidence below
+retains its stated version and platform scope.
+
 ## Native CI and release candidates (2026-09-15)
 
 Hosted CI runs separate quality jobs for format, Rust lint, typechecking,

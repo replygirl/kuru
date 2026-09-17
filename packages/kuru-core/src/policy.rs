@@ -237,14 +237,8 @@ impl ModeProfile {
             "invalid mode state keys"
         );
         let active = seeds.iter().map(|part| part.id.clone()).collect::<Vec<_>>();
-        let consolidation = self.memory.consolidation_plan(&active);
-        ensure!(
-            consolidation.participants == active
-                && !consolidation.prompt.trim().is_empty()
-                && !consolidation.phase.trim().is_empty()
-                && consolidation.max_proposals_per_part <= 2,
-            "invalid mode consolidation plan"
-        );
+        let active_set = active.iter().cloned().collect::<BTreeSet<_>>();
+        validate_consolidation_plan(&self.memory.consolidation_plan(&active), &active_set)?;
         Ok(())
     }
 }
@@ -261,6 +255,32 @@ pub fn validate_context_sources(identity: &str, sources: &[ContextSource]) -> Re
         };
         ensure!(seen.insert(key), "duplicate mode context source");
     }
+    ensure!(seen.contains(&3), "mode policy omitted explicit input");
+    Ok(())
+}
+
+pub fn validate_consolidation_plan(
+    plan: &ConsolidationPlan,
+    active_parts: &BTreeSet<String>,
+) -> Result<()> {
+    ensure!(
+        plan.participants
+            .iter()
+            .all(|participant| active_parts.contains(participant)),
+        "mode consolidation plan selected an inactive participant"
+    );
+    ensure!(
+        plan.participants.iter().collect::<BTreeSet<_>>().len() == plan.participants.len(),
+        "mode consolidation plan repeated a participant"
+    );
+    ensure!(
+        !plan.prompt.trim().is_empty() && !plan.phase.trim().is_empty(),
+        "mode consolidation plan has blank prompt or phase"
+    );
+    ensure!(
+        plan.max_proposals_per_part <= 2,
+        "mode consolidation plan exceeds proposal ceiling"
+    );
     Ok(())
 }
 
