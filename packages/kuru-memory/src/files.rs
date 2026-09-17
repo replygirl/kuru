@@ -388,6 +388,7 @@ fn close_windows_private_stage_with(
     after_first_recoverable_error: impl FnOnce(Option<PublicationPhase>),
 ) -> Result<()> {
     let mut retry_deadline = None;
+    let mut attempts = 0u32;
     let mut first_error = None;
     let mut after_first_recoverable_error = Some(after_first_recoverable_error);
     let mut child = Some(initial_child);
@@ -406,6 +407,7 @@ fn close_windows_private_stage_with(
                     }
                     wait_for_cleanup_retry(
                         cleanup_deadline(&mut retry_deadline),
+                        &mut attempts,
                         &mut first_error,
                     )?;
                     continue;
@@ -437,7 +439,11 @@ fn close_windows_private_stage_with(
                 "private temporary stage remained after checked removal"
             ));
         }
-        wait_for_cleanup_retry(cleanup_deadline(&mut retry_deadline), &mut first_error)?;
+        wait_for_cleanup_retry(
+            cleanup_deadline(&mut retry_deadline),
+            &mut attempts,
+            &mut first_error,
+        )?;
     }
     loop {
         match child_state(child_path, child_identity)? {
@@ -448,7 +454,11 @@ fn close_windows_private_stage_with(
                         "private child became pending after checked removal"
                     ));
                 }
-                wait_for_cleanup_retry(cleanup_deadline(&mut retry_deadline), &mut first_error)?;
+                wait_for_cleanup_retry(
+                    cleanup_deadline(&mut retry_deadline),
+                    &mut attempts,
+                    &mut first_error,
+                )?;
                 continue;
             }
             ChildState::Same(_) => {
@@ -463,7 +473,11 @@ fn close_windows_private_stage_with(
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
-                wait_for_cleanup_retry(cleanup_deadline(&mut retry_deadline), &mut first_error)?;
+                wait_for_cleanup_retry(
+                    cleanup_deadline(&mut retry_deadline),
+                    &mut attempts,
+                    &mut first_error,
+                )?;
                 continue;
             }
             OuterState::Same => {}
@@ -479,6 +493,7 @@ fn close_windows_private_stage_with(
                     }
                     wait_for_cleanup_retry(
                         cleanup_deadline(&mut retry_deadline),
+                        &mut attempts,
                         &mut first_error,
                     )?;
                 }
@@ -488,6 +503,7 @@ fn close_windows_private_stage_with(
                     }
                     wait_for_cleanup_retry(
                         cleanup_deadline(&mut retry_deadline),
+                        &mut attempts,
                         &mut first_error,
                     )?;
                 }
@@ -499,7 +515,11 @@ fn close_windows_private_stage_with(
                 if let Some(observer) = after_first_recoverable_error.take() {
                     observer(None);
                 }
-                wait_for_cleanup_retry(cleanup_deadline(&mut retry_deadline), &mut first_error)?;
+                wait_for_cleanup_retry(
+                    cleanup_deadline(&mut retry_deadline),
+                    &mut attempts,
+                    &mut first_error,
+                )?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -606,16 +626,25 @@ fn cleanup_deadline(deadline: &mut Option<Instant>) -> Instant {
     *deadline.get_or_insert_with(|| Instant::now() + CLEANUP_RETRY_LIMIT)
 }
 
+/// Report how long the bounded window actually ran and how many reconcile
+/// attempts it made. A single blocked native call and a fast spin both exhaust
+/// the same deadline, and only these counts separate them in a native CI log.
 #[cfg(windows)]
 fn wait_for_cleanup_retry(
     deadline: Instant,
+    attempts: &mut u32,
     first_error: &mut Option<anyhow::Error>,
 ) -> Result<()> {
+    *attempts += 1;
     if Instant::now() >= deadline {
+        let elapsed = Instant::now().saturating_duration_since(deadline - CLEANUP_RETRY_LIMIT);
+        let attempts = *attempts;
         return Err(first_error
             .take()
             .expect("a bounded cleanup retry retains its first cause")
-            .context("private temporary stage cleanup exhausted its bounded recovery; preserve the published stage for inspection"));
+            .context(format!(
+                "private temporary stage cleanup exhausted its bounded recovery after {attempts} reconcile attempts over {elapsed:?}; preserve the published stage for inspection"
+            )));
     }
     thread::sleep(
         deadline
@@ -668,10 +697,17 @@ mod tests {
             .unwrap()
     }
 
-    /// Hold a delete-on-close handle so the name stays present but
-    /// delete-pending. Every later checked open then reports native error 5,
-    /// the same result Windows gives for the live image of a just-executed
-    /// private probe copy.
+    /// Leave the name genuinely delete-pending and return the handle that keeps
+    /// it in the namespace. A separate delete-on-close handle applies the
+    /// disposition as it closes; because this retained handle still references
+    /// the object, Windows keeps the entry and refuses every later open with
+    /// native error 5, the same result it gives for the live image of a
+    /// just-executed private probe copy.
+    ///
+    /// A delete-on-close handle alone is not enough: it shares `FILE_SHARE_DELETE`,
+    /// so later checked opens still succeed and the child delete completes. The
+    /// fixture asserts the denied open so a change in these native semantics
+    /// fails here, naming its own premise, instead of in the outcome assertion.
     #[cfg(windows)]
     fn delete_pending_private_file(path: &Path) -> File {
         use std::os::windows::fs::OpenOptionsExt;
@@ -682,12 +718,27 @@ mod tests {
         const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 
         fs::write(path, b"fixture delete-pending blocker").unwrap();
-        fs::OpenOptions::new()
-            .access_mode(GENERIC_READ | DELETE)
+        let retained = fs::OpenOptions::new()
+            .access_mode(GENERIC_READ)
             .share_mode(SHARE_READ_WRITE_DELETE)
-            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
             .open(path)
-            .unwrap()
+            .unwrap();
+        drop(
+            fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(SHARE_READ_WRITE_DELETE)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                .open(path)
+                .unwrap(),
+        );
+        let denied = File::open(path)
+            .expect_err("a delete-pending name refuses every later open while a holder retains it");
+        assert_eq!(
+            denied.raw_os_error(),
+            Some(5),
+            "the fixture must reproduce the native denied open of a delete-pending name"
+        );
+        retained
     }
 
     #[cfg(windows)]
@@ -709,7 +760,13 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(observed, Some(PublicationPhase::Rejected));
+        assert_eq!(
+            observed,
+            Some(PublicationPhase::Rejected),
+            "a delete-pending child rejects the checked removal before anything is removed; an \
+             uncertain result instead means the child delete completed and the still-occupied \
+             parent directory failed afterwards"
+        );
         assert!(
             !outer.exists(),
             "the exact disposable outer stage is removed after a denied child delete is reconciled"
