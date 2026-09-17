@@ -229,6 +229,82 @@ async fn activation_source_open_failure_preserves_stage_before_releasing_cache_l
     drop(reacquired);
 }
 
+#[tokio::test]
+async fn successful_activation_removes_its_disposable_stage() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_container = stage.path().parent().unwrap().to_owned();
+    let candidate = stage.path().join("runtime");
+    let bytes = zip();
+    with_asset(&bytes, |asset| extract(&bytes, &candidate, asset)).unwrap();
+    let destination = cache.join("active");
+
+    activate_staged(stage, lock, &candidate, &destination)
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read(destination.join("dolt.exe")).unwrap(), EXE);
+    assert_eq!(fs::read(destination.join("LICENSES")).unwrap(), NOTICES);
+    assert!(!stage_container.exists());
+    assert_eq!(
+        fs::read_dir(&cache)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".install-"))
+            .count(),
+        0
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn published_engine_reports_failed_stage_cleanup_and_releases_cache_lease() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock_identity = regular_file_info(&lock).unwrap().identity;
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_container = stage.path().parent().unwrap().to_owned();
+    let candidate = stage.path().join("runtime");
+    let bytes = zip();
+    with_asset(&bytes, |asset| extract(&bytes, &candidate, asset)).unwrap();
+    let blocker_path = stage.path().join("cleanup-blocker");
+    files::write(&blocker_path, b"fixture-only blocker").unwrap();
+    // This sibling does not block the checked candidate move; denying delete
+    // sharing makes only the disposable stage close fail on Windows.
+    let blocker = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x3)
+        .open(&blocker_path)
+        .unwrap();
+    let destination = cache.join("active");
+
+    let error = activate_staged(stage, lock, &candidate, &destination)
+        .await
+        .unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
+    assert!(detail.contains(&stage_container.display().to_string()));
+    assert_eq!(fs::read(destination.join("dolt.exe")).unwrap(), EXE);
+    assert_eq!(fs::read(destination.join("LICENSES")).unwrap(), NOTICES);
+    assert!(blocker_path.exists());
+    let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(
+        regular_file_info(&reacquired).unwrap().identity,
+        lock_identity
+    );
+    drop(reacquired);
+
+    drop(blocker);
+    fs::remove_dir_all(&stage_container).unwrap();
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn held_cold_probe_copy_does_not_block_candidate_activation() {

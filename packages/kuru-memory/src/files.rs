@@ -314,6 +314,14 @@ impl PrivateTemp {
         let _container_path = self._container.keep();
         self.path
     }
+
+    /// Report removal failures after a successfully published private stage.
+    pub(crate) fn close(self) -> Result<()> {
+        let Self { _container, path } = self;
+        _container
+            .close()
+            .with_context(|| format!("remove private temporary stage at {}", path.display()))
+    }
 }
 
 #[cfg(test)]
