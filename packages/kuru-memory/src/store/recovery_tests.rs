@@ -2013,6 +2013,7 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
     let (hooks, control) =
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforeCommit);
     let hooks = hooks.with_route(migrations::MigrationBoundary::BeforeCommit, reserved.port);
+    let completion_deadline = migration_observation_deadline(&options);
     options.migration_hooks = Some(Arc::new(hooks));
     let opening = tokio::spawn(MemoryStore::open(options.clone()));
 
@@ -2030,9 +2031,15 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
         .context("production migration did not reach the commit boundary")??;
     control.resume();
 
-    let store = tokio::time::timeout(TEST_DEADLINE, opening)
+    let store = tokio::time::timeout(completion_deadline, opening)
         .await
-        .context("production migration did not reconcile the lost commit reply")???;
+        .with_context(|| {
+            format!(
+                "production migration did not reconcile the lost commit reply (reply_discarded={}, routed_session_ended={})",
+                proxy.discarded.load(Ordering::Acquire),
+                proxy.session_ended.load(Ordering::Acquire)
+            )
+        })???;
     assert!(
         proxy.discarded.load(Ordering::Acquire),
         "fixture must discard the durable production migration DOLT_COMMIT reply"
