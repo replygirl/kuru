@@ -80,6 +80,7 @@ struct ProcessLossChild {
 async fn spawn_process_loss_creator(
     root: &std::path::Path,
     scope: &str,
+    cache_dir: &std::path::Path,
     stderr: &std::path::Path,
     test_name: &'static str,
     mode: ProcessLossMode,
@@ -91,6 +92,11 @@ async fn spawn_process_loss_creator(
         .env("PATH", "/usr/bin:/bin")
         .env(PROCESS_LOSS_ROOT, root)
         .env(PROCESS_LOSS_SCOPE, scope)
+        // The child's environment is otherwise empty: it must receive the
+        // parent's already-resolved engine cache directory explicitly rather
+        // than re-deriving one, or its own KURU_DOLT_CACHE fallback can pick a
+        // different (and on some platforms unwritable) directory.
+        .env("KURU_DOLT_CACHE", cache_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(std::fs::File::create(stderr)?)
@@ -98,11 +104,7 @@ async fn spawn_process_loss_creator(
     if matches!(mode, ProcessLossMode::Staging) {
         command.env(PROCESS_LOSS_STAGE, "1");
     }
-    for name in [
-        "KURU_DOLT_CACHE",
-        "KURU_TEST_SUPERVISOR_PREPARED",
-        "LLVM_PROFILE_FILE",
-    ] {
+    for name in ["KURU_TEST_SUPERVISOR_PREPARED", "LLVM_PROFILE_FILE"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
@@ -114,6 +116,7 @@ async fn spawn_process_loss_creator(
 async fn spawn_process_loss_creator(
     root: &std::path::Path,
     scope: &str,
+    cache_dir: &std::path::Path,
     stderr: &std::path::Path,
     test_name: &'static str,
     mode: ProcessLossMode,
@@ -133,17 +136,18 @@ async fn spawn_process_loss_creator(
         ("PATH".into(), system.into_os_string()),
         (PROCESS_LOSS_ROOT.into(), root.as_os_str().into()),
         (PROCESS_LOSS_SCOPE.into(), scope.into()),
+        // The child's environment is otherwise empty (no TMP/TEMP), so
+        // std::env::temp_dir() inside it falls back to the Windows directory.
+        // Pass the parent's already-resolved engine cache directory through
+        // explicitly instead of relying on the child re-deriving one.
+        ("KURU_DOLT_CACHE".into(), cache_dir.as_os_str().into()),
     ];
     if matches!(mode, ProcessLossMode::Staging) {
         command
             .environment
             .push((PROCESS_LOSS_STAGE.into(), "1".into()));
     }
-    for name in [
-        "KURU_DOLT_CACHE",
-        "KURU_TEST_SUPERVISOR_PREPARED",
-        "LLVM_PROFILE_FILE",
-    ] {
+    for name in ["KURU_TEST_SUPERVISOR_PREPARED", "LLVM_PROFILE_FILE"] {
         if let Some(value) = std::env::var_os(name) {
             command.environment.push((name.into(), value));
         }
@@ -185,9 +189,15 @@ impl ProcessLossChild {
         // child's own observation begins.
         let readiness_deadline = migration_observation_deadline(options)
             .saturating_add(Duration::from_secs(options.config.startup_timeout_secs));
+        let cache_dir = options
+            .config
+            .cache_dir
+            .as_deref()
+            .context("process-loss fixture requires a resolved engine cache directory")?;
         let child = spawn_process_loss_creator(
             retained_root.path(),
             &options.project_scope,
+            cache_dir,
             &stderr,
             test_name,
             mode,

@@ -574,10 +574,16 @@ fn outer_state(path: &Path, expected: FileIdentity) -> Result<OuterState> {
     }
 }
 
+/// A rejected removal changed nothing, so a sharing violation or a denied
+/// delete of a name Windows still holds - a delete-pending entry, or the image
+/// of the just-executed private probe copy - may be reconciled against the same
+/// retained identity. This matches `pending_open_error` and bounded activation
+/// recovery, which already treat native error 5 as a transient native holder.
 #[cfg(windows)]
 fn recoverable_child_removal(error: &RemovalError) -> bool {
     error.phase == PublicationPhase::Uncertain
-        || (error.phase == PublicationPhase::Rejected && removal_error_code(error) == Some(32))
+        || (error.phase == PublicationPhase::Rejected
+            && matches!(removal_error_code(error), Some(5 | 32)))
 }
 
 #[cfg(windows)]
@@ -660,6 +666,54 @@ mod tests {
             .share_mode(0x3)
             .open(path)
             .unwrap()
+    }
+
+    /// Hold a delete-on-close handle so the name stays present but
+    /// delete-pending. Every later checked open then reports native error 5,
+    /// the same result Windows gives for the live image of a just-executed
+    /// private probe copy.
+    #[cfg(windows)]
+    fn delete_pending_private_file(path: &Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const SHARE_READ_WRITE_DELETE: u32 = 0x7;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+
+        fs::write(path, b"fixture delete-pending blocker").unwrap();
+        fs::OpenOptions::new()
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(SHARE_READ_WRITE_DELETE)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_temp_retries_a_denied_child_delete_after_the_holder_releases() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateTemp::new("memory-cleanup-denied-", Some(root.path())).unwrap();
+        let outer = stage.path().parent().unwrap().to_owned();
+        let stage_path = stage.path().to_owned();
+        let stage_identity = directory(&stage_path).unwrap().identity();
+        let blocker = delete_pending_private_file(&stage_path.join("pending"));
+        let mut blocker = Some(blocker);
+        let mut observed = None;
+
+        close_private_temp_observed(stage, |phase| {
+            observed = phase;
+            assert_eq!(directory(&stage_path).unwrap().identity(), stage_identity);
+            drop(blocker.take());
+        })
+        .unwrap();
+
+        assert_eq!(observed, Some(PublicationPhase::Rejected));
+        assert!(
+            !outer.exists(),
+            "the exact disposable outer stage is removed after a denied child delete is reconciled"
+        );
     }
 
     #[cfg(windows)]
