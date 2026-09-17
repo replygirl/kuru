@@ -1282,7 +1282,7 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
             .await
             .unwrap()
             .iter()
-            .any(|message| message.content == "later private conversation")
+            .any(|message| message.plain_text() == Some("later private conversation"))
     );
     let topology: Topology = serde_json::from_value(
         memory

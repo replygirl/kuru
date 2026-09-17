@@ -484,12 +484,12 @@ impl Installation {
         ensure!(
             transcript
                 .iter()
-                .any(|message| message.role == "user" && message.content == marker),
+                .any(|message| message.role == "user" && message.plain_text() == Some(marker)),
             "original user message was not persisted"
         );
         ensure!(
             transcript.iter().any(|message| message.role == "user"
-                && message.content == "Continue the saved conversation"),
+                && message.plain_text() == Some("Continue the saved conversation")),
             "resumed user message was not persisted"
         );
         ensure!(

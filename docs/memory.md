@@ -144,6 +144,24 @@ Startup also stops when retained migration attempts are ambiguous or exceed its
 bounded inventory. It preserves those branches and reports the condition for
 recovery rather than deleting or resetting history.
 
+Schema 3 adds an explicit message-content format. Existing rows retain their
+exact strings under `text-v1`, including strings that look like JSON. Typed
+message writes use `typed-v1`, which stores an ordered block payload separately
+from the row's role. Raw note/text appends remain text records. Readers use each
+view's schema and format; malformed or unknown formats fail explicitly rather
+than fall back to text. Supported old revisions and candidate branches remain
+readable without rewriting them. Typed writes require an upgraded view.
+
+Memory exports include the content format and use export format version 2.
+Consumers must inspect that version and the per-message discriminator rather
+than assume every content string is ordinary prose. JSON preserves the stored
+payload, and Markdown identifies structured records. This does not add an
+export-import command or rewrite existing user exports.
+
+An older Kuru binary that does not understand schema 3 refuses the upgraded
+store. Replacing the executable with an older release does not downgrade memory;
+use a compatible Kuru to reopen it. Original legacy SQLite data remains intact.
+
 The SQL schema version is independent from the format-1 `ready.json` activation
 record, the database identity record, and the supervisor protocol. An old dream
 candidate stays on its recorded historical schema and remains stale if `main`

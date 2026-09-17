@@ -108,10 +108,7 @@ impl Provider for CapturingProvider {
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<Completion> {
         self.requests.lock().unwrap().push(request);
         self.started.notify_waiters();
-        Ok(Completion {
-            text: "captured response".into(),
-            ..Completion::default()
-        })
+        Ok(Completion::from_legacy("captured response", vec![], 0, 0))
     }
 }
 
@@ -648,13 +645,13 @@ async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
         request
             .messages
             .iter()
-            .any(|message| message.content == "turn reaches provider")
+            .any(|message| message.plain_text() == Some("turn reaches provider"))
     }));
     assert!(requests.iter().all(|request| {
         request
             .messages
             .iter()
-            .all(|message| !message.content.contains("Memory is ready at"))
+            .all(|message| !message.text_projection().contains("Memory is ready at"))
     }));
 
     drop(input_tx);

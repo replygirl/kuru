@@ -16,10 +16,7 @@ async fn private_namespaces_order_and_literal_values_survive() {
             .unwrap();
     }
     let expected = (3..6)
-        .map(|index| Message {
-            role: "user".into(),
-            content: format!("one-{index}"),
-        })
+        .map(|index| Message::text("user", format!("one-{index}")))
         .collect::<Vec<_>>();
     assert_eq!(store.history("part/one", 3).await.unwrap(), expected);
     assert_eq!(store.history("part/two", 100).await.unwrap().len(), 6);
@@ -34,14 +31,8 @@ async fn private_namespaces_order_and_literal_values_survive() {
     assert_eq!(
         store.history("部品/記憶", 2).await.unwrap(),
         [
-            Message {
-                role: "tool".into(),
-                content: content.into()
-            },
-            Message {
-                role: "future_protocol_role".into(),
-                content: "".into()
-            }
+            Message::text("tool", content),
+            Message::text("future_protocol_role", "")
         ]
     );
     let injection = "'; DELETE FROM messages; --";
@@ -58,8 +49,8 @@ async fn private_namespaces_order_and_literal_values_survive() {
         Some(json!({"text":content,"nested":[1,true,null]}))
     );
     assert_eq!(
-        store.history(injection, 10).await.unwrap()[0].content,
-        "literal"
+        store.history(injection, 10).await.unwrap()[0].plain_text(),
+        Some("literal")
     );
     store.clear(injection).await.unwrap();
     assert_eq!(store.history("part/one", 10).await.unwrap().len(), 6);
@@ -85,8 +76,8 @@ async fn clear_state_upserts_and_validation_preserve_unrelated_data() {
     assert!(store.history("part/a", 10).await.unwrap().is_empty());
     for namespace in ["part/b", "group/a-b", "session/a"] {
         assert_eq!(
-            store.history(namespace, 10).await.unwrap()[0].content,
-            namespace
+            store.history(namespace, 10).await.unwrap()[0].plain_text(),
+            Some(namespace)
         );
     }
     assert_eq!(
@@ -180,8 +171,8 @@ async fn selected_note_deletion_keeps_other_rows_and_prior_revision() {
         }]
     );
     assert_eq!(
-        store.history(transcript, 10).await.unwrap()[0].content,
-        "conversation remains"
+        store.history(transcript, 10).await.unwrap()[0].plain_text(),
+        Some("conversation remains")
     );
     let committed = store.revision().await.unwrap();
     assert!(store.forget_note(notes, removed).await.is_err());
@@ -240,8 +231,8 @@ async fn candidates_remain_private_and_stale_promotion_preserves_both_histories(
     assert_ne!(promoted, base);
     assert_eq!(store.get("topology").await.unwrap(), Some(json!("after")));
     assert_eq!(
-        store.history("private", 10).await.unwrap()[0].content,
-        "candidate note"
+        store.history("private", 10).await.unwrap()[0].plain_text(),
+        Some("candidate note")
     );
     assert_eq!(candidate.promote().await.unwrap(), promoted);
     let stale = store.begin_candidate("stale").await.unwrap();
@@ -299,7 +290,7 @@ async fn concurrent_peers_preserve_each_peers_order() {
         let actual: Vec<_> = history
             .iter()
             .filter(|message| message.role == format!("peer-{peer}"))
-            .map(|message| message.content.parse::<usize>().unwrap())
+            .map(|message| message.plain_text().unwrap().parse::<usize>().unwrap())
             .collect();
         assert_eq!(actual, (0..8).collect::<Vec<_>>());
     }

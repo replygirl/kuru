@@ -150,34 +150,45 @@ async fn native_subscription_catalog_and_tool_round_trip_preserve_actor_context(
     let mut input = request();
     let original_instructions = input.instructions.clone();
     let completion = provider.complete(input.clone()).await.unwrap();
+    let calls = completion.calls();
     assert_eq!(
-        completion
-            .calls
+        calls
             .iter()
             .map(|call| call.id.as_str())
             .collect::<Vec<_>>(),
         ["c1", "c2"]
     );
-    assert_eq!(completion.calls[0].arguments, json!({"path":"a.txt"}));
-    assert_eq!((completion.input_tokens, completion.output_tokens), (8, 5));
+    assert_eq!(calls[0].arguments, json!({"path":"a.txt"}));
+    assert_eq!(
+        (completion.input_tokens(), completion.output_tokens()),
+        (8, 5)
+    );
     let mut other = input.clone();
     other.actor = "different-project/part".into();
-    assert_eq!(provider.complete(other).await.unwrap().text, "other actor");
-    for (call, output) in [("c2", "second"), ("c1", "first")] {
-        input.messages.push(Message {
-            role: "tool".into(),
-            content: json!({"call_id":call,"output":output}).to_string(),
-        });
-    }
     assert_eq!(
-        provider.complete(input.clone()).await.unwrap().text,
+        provider.complete(other).await.unwrap().text_projection(),
+        "other actor"
+    );
+    for (call, output) in [("c2", "second"), ("c1", "first")] {
+        input
+            .messages
+            .push(Message::tool_result(call, json!(output), false));
+    }
+    input.current_message_count = Some(2);
+    assert_eq!(
+        provider
+            .complete(input.clone())
+            .await
+            .unwrap()
+            .text_projection(),
         "files compared"
     );
-    input.messages.push(Message {
-        role: "user".into(),
-        content: "new turn".into(),
-    });
-    assert_eq!(provider.complete(input).await.unwrap().text, "new phase");
+    input.messages.push(Message::text("user", "new turn"));
+    input.current_message_count = Some(1);
+    assert_eq!(
+        provider.complete(input).await.unwrap().text_projection(),
+        "new phase"
+    );
     let sent = peer.requests.lock().await;
     assert_eq!(sent.len(), 5);
     assert_eq!(sent[0].method, Method::GET);
@@ -231,6 +242,88 @@ async fn native_subscription_catalog_and_tool_round_trip_preserve_actor_context(
 }
 
 #[tokio::test]
+async fn consecutive_subscription_calls_accept_only_the_current_receipt_batch() {
+    let peer = Peer::new(vec![
+        stream(vec![
+            done(
+                0,
+                json!({"type":"reasoning","id":"r1","encrypted_content":"first-subscription-reasoning","summary":[]}),
+            ),
+            done(
+                1,
+                json!({"type":"function_call","id":"i1","call_id":"c1","name":"file_read","arguments":"{}"}),
+            ),
+            completed(),
+        ]),
+        stream(vec![
+            done(
+                0,
+                json!({"type":"reasoning","id":"r2","encrypted_content":"second-subscription-reasoning","summary":[]}),
+            ),
+            done(
+                1,
+                json!({"type":"function_call","id":"i2","call_id":"c2","name":"file_read","arguments":"{}"}),
+            ),
+            completed(),
+        ]),
+        message("complete"),
+    ])
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    let mut input = request();
+
+    let first = provider.complete(input.clone()).await.unwrap();
+    input.messages.push(Message {
+        role: "assistant".into(),
+        blocks: first.blocks,
+    });
+    input
+        .messages
+        .push(Message::tool_result("c1", json!("first receipt"), false));
+    input.current_message_count = Some(1);
+
+    let second = provider.complete(input.clone()).await.unwrap();
+    input.messages.push(Message {
+        role: "assistant".into(),
+        blocks: second.blocks,
+    });
+    input
+        .messages
+        .push(Message::tool_result("c2", json!("second receipt"), false));
+    input.current_message_count = Some(1);
+
+    assert_eq!(
+        provider.complete(input).await.unwrap().text_projection(),
+        "complete"
+    );
+    let sent = peer.requests.lock().await;
+    assert_eq!(sent.len(), 3);
+    let outputs: Vec<_> = sent[2].body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .collect();
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0]["call_id"], "c1");
+    assert_eq!(outputs[0]["output"], "first receipt");
+    assert_eq!(outputs[1]["call_id"], "c2");
+    assert_eq!(outputs[1]["output"], "second receipt");
+    assert!(
+        sent[2]
+            .body
+            .to_string()
+            .contains("first-subscription-reasoning")
+    );
+    assert!(
+        sent[2]
+            .body
+            .to_string()
+            .contains("second-subscription-reasoning")
+    );
+}
+
+#[tokio::test]
 async fn rejected_subscription_rotates_once_without_changing_account_or_route() {
     let rotated = crate::auth::test_future_jwt("account-one");
     let peer = Peer::new(vec![
@@ -242,7 +335,14 @@ async fn rejected_subscription_rotates_once_without_changing_account_or_route() 
     ])
     .await;
     let (provider, manager, _directory) = subscription(&peer).await;
-    assert_eq!(provider.complete(request()).await.unwrap().text, "rotated");
+    assert_eq!(
+        provider
+            .complete(request())
+            .await
+            .unwrap()
+            .text_projection(),
+        "rotated"
+    );
     let sent = peer.requests.lock().await;
     assert_eq!(sent.len(), 3);
     assert_eq!(sent[0].uri.path(), "/responses");
@@ -287,11 +387,19 @@ async fn rejected_503_then_401_shares_one_finite_rotation_budget() {
     .await;
     let (provider, _manager, _directory) = subscription(&peer).await;
     assert_eq!(
-        provider.complete(request()).await.unwrap().text,
+        provider
+            .complete(request())
+            .await
+            .unwrap()
+            .text_projection(),
         "bounded rotation"
     );
     assert_eq!(
-        provider.complete(request()).await.unwrap().text,
+        provider
+            .complete(request())
+            .await
+            .unwrap()
+            .text_projection(),
         "later operation"
     );
     let sent = peer.requests.lock().await;
@@ -332,7 +440,14 @@ async fn subscription_completion_and_catalog_retry_explicit_rejections() {
         rejected.status = status;
         let peer = Peer::new(vec![rejected, message("retried")]).await;
         let (provider, _manager, _directory) = subscription(&peer).await;
-        assert_eq!(provider.complete(request()).await.unwrap().text, "retried");
+        assert_eq!(
+            provider
+                .complete(request())
+                .await
+                .unwrap()
+                .text_projection(),
+            "retried"
+        );
         let sent = peer.requests.lock().await;
         assert_eq!(sent.len(), 2, "completion status {status}");
         assert_eq!(sent[0].body, sent[1].body);
@@ -411,7 +526,14 @@ async fn repeated_401_and_partial_stream_errors_do_not_retry_or_leak_tokens() {
     let error = provider.complete(request()).await.unwrap_err();
     assert!(!format!("{error:#}").contains("subscription-access"));
     assert_eq!(peer.requests.lock().await.len(), 1);
-    assert_eq!(provider.complete(request()).await.unwrap().text, "next");
+    assert_eq!(
+        provider
+            .complete(request())
+            .await
+            .unwrap()
+            .text_projection(),
+        "next"
+    );
     assert_eq!(peer.requests.lock().await.len(), 2);
 }
 
@@ -475,10 +597,9 @@ async fn replacement_login_rejects_old_provider_before_sending_pending_context()
             .seed_test_session("new-access", "new-refresh", account)
             .await
             .unwrap();
-        input.messages.push(Message {
-            role: "tool".into(),
-            content: json!({"call_id":"c1","output":"private-result"}).to_string(),
-        });
+        input
+            .messages
+            .push(Message::tool_result("c1", json!("private-result"), false));
         let error = provider.complete(input).await.unwrap_err();
         assert!(error.to_string().contains("session changed"), "{error:#}");
         assert_eq!(peer.requests.lock().await.len(), 1);
@@ -627,7 +748,7 @@ async fn cancelled_partial_stream_closes_socket_and_releases_same_actor() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(result.text, "after cancellation");
+    assert_eq!(result.text_projection(), "after cancellation");
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .unwrap()
@@ -725,7 +846,7 @@ async fn fragmented_discarded_subscription_sse_does_not_exhaust_retained_output_
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(result.text, "small completion");
+    assert_eq!(result.text_projection(), "small completion");
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .unwrap()
@@ -748,11 +869,12 @@ async fn missing_content_type_accepts_fragmented_subscription_sse() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(result.text, "réponse");
-    assert_eq!((result.input_tokens, result.output_tokens), (8, 5));
-    assert_eq!(result.calls.len(), 1);
-    assert_eq!(result.calls[0].id, "call-one");
-    assert_eq!(result.calls[0].arguments, json!({"path":"one.txt"}));
+    assert_eq!(result.text_projection(), "réponse");
+    assert_eq!((result.input_tokens(), result.output_tokens()), (8, 5));
+    let calls = result.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "call-one");
+    assert_eq!(calls[0].arguments, json!({"path":"one.txt"}));
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .unwrap()
@@ -807,7 +929,11 @@ async fn missing_content_type_still_rejects_malformed_and_truncated_streams() {
         );
         provider.base = peer.url.clone();
         assert_eq!(
-            provider.complete(request()).await.unwrap().text,
+            provider
+                .complete(request())
+                .await
+                .unwrap()
+                .text_projection(),
             "clean request"
         );
         let sent = peer.requests.lock().await;

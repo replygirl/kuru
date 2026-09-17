@@ -589,7 +589,7 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
         .history()
         .await?
         .into_iter()
-        .map(|message| project_transcript_message(&message.role, message.content))
+        .map(|message| project_transcript_message(&message.role, message.text_projection()))
         .collect();
     Ok(InitialViewData {
         transcript,
@@ -623,7 +623,9 @@ async fn append_missing_interruption_markers(harness: &Harness, view: &mut View)
         .history()
         .await?
         .into_iter()
-        .filter(|message| message.role == INTERRUPTION_ROLE && message.content == INTERRUPTION_TEXT)
+        .filter(|message| {
+            message.role == INTERRUPTION_ROLE && message.plain_text() == Some(INTERRUPTION_TEXT)
+        })
         .count();
     for _ in displayed..durable {
         view.transcript

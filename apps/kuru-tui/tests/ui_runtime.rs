@@ -60,7 +60,7 @@ async fn runtime_adapter_projects_real_relationship_completion_and_sanitized_rou
             .await
             .unwrap()
             .into_iter()
-            .map(|message| (message.role, message.content))
+            .map(|message| (message.role.clone(), message.text_projection()))
             .collect::<Vec<_>>()
     );
     assert_eq!(initial.session, harness.session.id);

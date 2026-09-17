@@ -35,12 +35,7 @@ impl Provider for Replay {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
-        let mut reply = Completion {
-            text: "No additional peer work needed".into(),
-            calls: vec![],
-            input_tokens: 7,
-            output_tokens: 3,
-        };
+        let mut reply = Completion::from_legacy("No additional peer work needed", vec![], 7, 3);
         if !request.instructions.contains("Phase: speak") {
             return Ok(reply);
         }
@@ -50,11 +45,17 @@ impl Provider for Replay {
             .iter()
             .filter(|message| message.role == "tool")
         {
-            let receipt: Value = serde_json::from_str(&message.content)?;
-            let id = receipt["call_id"]
-                .as_str()
-                .context("tool receipt call ID")?;
-            let output = receipt["output"].as_str().context("tool receipt output")?;
+            let [
+                kuru_core::ContentBlock::ToolResult {
+                    call_id: id,
+                    output,
+                    ..
+                },
+            ] = message.blocks.as_slice()
+            else {
+                anyhow::bail!("tool message did not contain a typed result");
+            };
+            let output = output.as_str().context("tool receipt output")?;
             observed.receipts.insert(id.into(), output.into());
             observed.recipients.insert(request.actor.clone());
         }
@@ -64,11 +65,11 @@ impl Provider for Replay {
                 "authorized tool is absent from the model's catalog: {}",
                 call.name
             );
-            reply.text = "Running the next native tool request".into();
-            reply.calls.push(call.clone());
+            reply.set_text("Running the next native tool request");
+            reply.push_call(call.clone());
             observed.next += 1;
         } else {
-            reply.text = "Native tool replay complete".into();
+            reply.set_text("Native tool replay complete");
         }
         Ok(reply)
     }

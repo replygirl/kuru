@@ -6,7 +6,7 @@ use serde_json::Value;
 use sqlx::{MySqlPool, Row};
 use uuid::Uuid;
 
-use super::{MemoryStore, QUERY_TIMEOUT, Shared, migrations, revision};
+use super::{MemoryStore, QUERY_TIMEOUT, Shared, decode_message, migrations, revision};
 
 const PAGE_SIZE: i64 = 256;
 
@@ -29,6 +29,7 @@ pub enum StorageRecord {
         sequence: i64,
         namespace: String,
         role: String,
+        content_format: String,
         content: String,
     },
     State {
@@ -119,7 +120,7 @@ impl ActiveExportSnapshot {
         };
         match phase {
             Phase::Messages(after) => {
-                let records = messages(&self.pool, after).await?;
+                let records = messages(&self.pool, self.provenance.schema_version, after).await?;
                 let next_sequence = match records.last() {
                     Some(StorageRecord::Message { sequence, .. })
                         if records.len() == PAGE_SIZE as usize =>
@@ -189,14 +190,22 @@ async fn count(pool: &MySqlPool, table: &'static str) -> Result<u64> {
     u64::try_from(count).context("export count is negative")
 }
 
-async fn messages(pool: &MySqlPool, after: Option<i64>) -> Result<Vec<StorageRecord>> {
+async fn messages(
+    pool: &MySqlPool,
+    schema_version: i32,
+    after: Option<i64>,
+) -> Result<Vec<StorageRecord>> {
+    let current = schema_version >= 3;
     let rows = match after {
         Some(after) => {
+            let query = if current {
+                "SELECT sequence, namespace, role, content_format, content FROM messages WHERE sequence > ? ORDER BY sequence LIMIT ?"
+            } else {
+                "SELECT sequence, namespace, role, content FROM messages WHERE sequence > ? ORDER BY sequence LIMIT ?"
+            };
             tokio::time::timeout(
                 QUERY_TIMEOUT,
-                sqlx::query(
-                    "SELECT sequence, namespace, role, content FROM messages WHERE sequence > ? ORDER BY sequence LIMIT ?",
-                )
+                sqlx::query(query)
                 .bind(after)
                 .bind(PAGE_SIZE)
                 .fetch_all(pool),
@@ -204,11 +213,14 @@ async fn messages(pool: &MySqlPool, after: Option<i64>) -> Result<Vec<StorageRec
             .await
         }
         None => {
+            let query = if current {
+                "SELECT sequence, namespace, role, content_format, content FROM messages ORDER BY sequence LIMIT ?"
+            } else {
+                "SELECT sequence, namespace, role, content FROM messages ORDER BY sequence LIMIT ?"
+            };
             tokio::time::timeout(
                 QUERY_TIMEOUT,
-                sqlx::query(
-                    "SELECT sequence, namespace, role, content FROM messages ORDER BY sequence LIMIT ?",
-                )
+                sqlx::query(query)
                 .bind(PAGE_SIZE)
                 .fetch_all(pool),
             )
@@ -218,13 +230,24 @@ async fn messages(pool: &MySqlPool, after: Option<i64>) -> Result<Vec<StorageRec
     .context("export message page deadline exceeded")??;
     rows.into_iter()
         .map(|row| {
+            let sequence: i64 = row.try_get("sequence")?;
+            let role = String::from_utf8(row.try_get("role")?)
+                .context("export message role is not UTF-8")?;
+            let content_format: String = if current {
+                row.try_get("content_format")?
+            } else {
+                "text-v1".into()
+            };
+            let content: String = row.try_get("content")?;
+            decode_message(role.clone(), &content_format, &content)
+                .with_context(|| format!("invalid export message sequence {sequence}"))?;
             Ok(StorageRecord::Message {
-                sequence: row.try_get("sequence")?,
+                sequence,
                 namespace: String::from_utf8(row.try_get("namespace")?)
                     .context("export message namespace is not UTF-8")?,
-                role: String::from_utf8(row.try_get("role")?)
-                    .context("export message role is not UTF-8")?,
-                content: row.try_get("content")?,
+                role,
+                content_format,
+                content,
             })
         })
         .collect()
@@ -386,9 +409,10 @@ mod tests {
         )));
         assert!(records.iter().any(|record| matches!(
             record,
-            StorageRecord::Message { sequence: -2, namespace, role, content }
+            StorageRecord::Message { sequence: -2, namespace, role, content_format, content }
                 if namespace == "export/unknown-namespace"
                     && role == "legacy/unknown-role"
+                    && content_format == "text-v1"
                     && content == &large
         )));
         assert!(records.iter().any(|record| matches!(
@@ -467,6 +491,45 @@ mod tests {
         let state = snapshot.page(snapshot.page(None).await?.next).await;
         let error = state.expect_err("malformed state must fail export");
         assert!(error.to_string().contains("invalid JSON"));
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn export_keeps_legacy_and_typed_message_formats_distinct() -> Result<()> {
+        use kuru_core::{ContentBlock, Message};
+
+        let store = MemoryStore::temporary().await?;
+        let literal = r#"{"blocks":[{"type":"text","text":"literal JSON"}]}"#;
+        store.append("export/mixed", "user", literal).await?;
+        let typed = Message {
+            role: "assistant".into(),
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "before".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-7".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"README.md"}),
+                },
+            ],
+        };
+        store.append_message("export/mixed", &typed).await?;
+        let snapshot = store.begin_active_export().await?;
+        assert_eq!(snapshot.provenance().schema_version, 3);
+        let records = snapshot.page(None).await?.records;
+        assert_eq!(records.len(), 2);
+        assert!(matches!(&records[0], StorageRecord::Message {
+            role, content_format, content, ..
+        } if role == "user" && content_format == "text-v1" && content == literal));
+        assert!(matches!(&records[1], StorageRecord::Message {
+            role, content_format, content, ..
+        } if role == "assistant"
+            && content_format == "typed-v1"
+            && serde_json::from_str::<Value>(content).ok()
+                == Some(json!({"blocks": typed.blocks.clone()}))));
+        snapshot.verify_counts(2, 0)?;
         store.close().await?;
         Ok(())
     }

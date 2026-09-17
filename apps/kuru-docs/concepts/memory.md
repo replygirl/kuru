@@ -77,6 +77,17 @@ current memory while retaining earlier Dolt revisions.
 
 The authenticated SQL sidecar runs only while its owning Kuru process needs it. Existing SQLite data is imported from a consistent snapshot; the original and snapshot remain preserved.
 
+Messages can contain ordered text and structured tool-call/result blocks. Schema
+3 labels old rows as literal text and new typed rows with an explicit content
+format; JSON-looking old messages remain text. Upgrading preserves their bytes,
+revision history and old candidate branches. Older Kuru binaries that do not
+support schema 3 refuse the upgraded store instead of downgrading it.
+
+JSON and Markdown memory exports use export format version 2 and include each
+message's content-format discriminator. Export consumers should check those
+versions before interpreting the stored content. This representation does not
+enable image input or store native encrypted reasoning.
+
 Use `kuru memory status` to inspect the store and current revision, `kuru memory
 history` to list committed changes, or `kuru memory notes ID --limit N` to read
 one identity's current-mode notes from an existing live store. Exact retained

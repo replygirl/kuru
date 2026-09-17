@@ -451,7 +451,7 @@ impl Installation {
         ensure!(
             transcript
                 .iter()
-                .any(|message| message.role == "user" && message.content == marker),
+                .any(|message| { message.role == "user" && message.plain_text() == Some(marker) }),
             "mise-installed transcript lost original input"
         );
         ensure!(

@@ -1,8 +1,25 @@
 # Providers, tools and protocols
 
-Kuru normalizes provider output into text and tool-call proposals. The runtime
-owns permission checks, peer routing, memory and tool execution. Providers do
-not own the actor pool.
+Kuru normalizes provider output into ordered content blocks, including text and
+tool-call proposals. Typed tool results retain their call IDs and JSON values;
+the native connector sends matching results in the pending request's call
+order. The runtime owns permission checks, peer routing, memory and tool
+execution. Providers do not own the actor pool.
+
+Native continuation state, including encrypted reasoning, stays private to the
+actor and is not reconstructed from stored conversation text. Legacy string
+receipts are interpreted only at the existing live pending-call boundary with
+matching IDs. An old message that happens to contain JSON remains text, and an
+unsupported content block fails before provider dispatch rather than being
+silently discarded. The current CLI still returns a settled text answer; these
+types alone do not enable live streaming or image input.
+
+`CompletionRequest.current_message_count` identifies the retained suffix from
+the current actor invocation. Native continuation matches only that suffix,
+preserving earlier receipts as history even when a bounded projection omits an
+assistant record. Current peer messages may appear between receipts and remain
+in the native request. Direct callers that omit the boundary get a fresh request;
+the connector does not infer a native continuation from historical content.
 
 ## OpenAI authentication and models
 

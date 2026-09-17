@@ -72,19 +72,20 @@ impl Harness {
                     Err(error) if turn_was_cancelled(&error) => return Err(error),
                     Err(error) => report.rejected.push(format!("{id}: {error:#}")),
                     Ok(reply) => {
-                        if !reply.text.trim().is_empty() {
+                        let summary = reply.text_projection();
+                        if !summary.trim().is_empty() {
                             cancellation.check()?;
                             memory
                                 .append(
                                     &format!("{}/notes", self.namespace(&id)),
                                     "dream",
-                                    &crate::actor::truncate_text(&reply.text, 8192),
+                                    &crate::actor::truncate_text(&summary, 8192),
                                 )
                                 .await?;
                             cancellation.check()?;
                             report.summaries += 1;
                         }
-                        for (index, call) in reply.calls.into_iter().enumerate() {
+                        for (index, call) in reply.calls().into_iter().enumerate() {
                             let result = if index >= 2 {
                                 Err(anyhow::anyhow!(
                                     "at most two dream proposals are accepted per part"
@@ -486,7 +487,7 @@ mod cancellation_tests {
                 .history("candidate-proof", 10)
                 .await
                 .unwrap()[0]
-                .content,
+                .text_projection(),
             "accepted candidate only"
         );
         assert_eq!(

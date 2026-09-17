@@ -54,10 +54,7 @@ impl Provider for RecordingProvider {
 }
 
 fn reply(text: &str) -> Completion {
-    Completion {
-        text: text.into(),
-        ..Completion::default()
-    }
+    Completion::from_legacy(text, vec![], 0, 0)
 }
 fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
     ToolCall {
@@ -133,10 +130,7 @@ impl Provider for OneToolProvider {
         }
         if let Some(tool) = self.tool.lock().unwrap().take() {
             self.issued.fetch_add(1, Ordering::SeqCst);
-            return Ok(Completion {
-                calls: vec![tool],
-                ..Completion::default()
-            });
+            return Ok(Completion::from_legacy("", vec![tool], 0, 0));
         }
         Ok(reply("the later turn completed"))
     }
@@ -163,14 +157,16 @@ impl Provider for HeldBeforeToolProvider {
         if let Some(release) = self.release.lock().await.take() {
             let _ = release.await;
         }
-        Ok(Completion {
-            calls: vec![call(
+        Ok(Completion::from_legacy(
+            "",
+            vec![call(
                 "cancelled-file-write",
                 "file_write",
                 json!({"path":"not-created.txt","content":"must not be written"}),
             )],
-            ..Completion::default()
-        })
+            0,
+            0,
+        ))
     }
 }
 
@@ -252,14 +248,16 @@ impl Provider for McpToolProvider {
                 .iter()
                 .find(|tool| tool.description.contains("MCP accepted/mutate"))
                 .expect("configured MCP tool must reach the speaking request");
-            return Ok(Completion {
-                calls: vec![call(
+            return Ok(Completion::from_legacy(
+                "",
+                vec![call(
                     "accepted-mcp-call",
                     &tool.name,
                     json!({"write":"once"}),
                 )],
-                ..Completion::default()
-            });
+                0,
+                0,
+            ));
         }
         Ok(reply("the later turn completed"))
     }
@@ -310,9 +308,9 @@ async fn cancellation_before_shared_tool_dispatch_runs_no_file_mutation() {
     let history = harness.history().await.unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].role, "user");
-    assert_eq!(history[0].content, "cancel before the tool");
+    assert_eq!(history[0].text_projection(), "cancel before the tool");
     assert_eq!(history[1].role, INTERRUPTION_ROLE);
-    assert_eq!(history[1].content, INTERRUPTION_TEXT);
+    assert_eq!(history[1].text_projection(), INTERRUPTION_TEXT);
     let retry = harness
         .run_controlled(
             "cancel before the tool",
@@ -361,11 +359,9 @@ async fn accepted_file_mutation_survives_cancellation_without_replay() {
         .await
         .expect("provider did not observe the accepted file receipt")
         .unwrap();
-    assert!(
-        receipt.messages.iter().any(|message| {
-            message.role == "tool" && message.content.contains("Wrote 17 bytes")
-        })
-    );
+    assert!(receipt.messages.iter().any(|message| {
+        message.role == "tool" && message.text_projection().contains("Wrote 17 bytes")
+    }));
     assert_eq!(
         std::fs::read_to_string(project.path().join("accepted.txt")).unwrap(),
         "one durable write"
@@ -418,26 +414,23 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
             && !provider_issued.swap(true, Ordering::SeqCst)
         {
             let identities = configured.lock().unwrap();
-            return Completion {
-                calls: vec![
-                    call(
-                        "accepted-note",
-                        "remember",
-                        json!({"text":"retain this accepted note once"}),
-                    ),
-                    call(
-                        "accepted-state",
-                        "state_report",
-                        json!({"activation":0.75,"note":"accepted before cancellation"}),
-                    ),
-                    call(
-                        "blocked-peer",
-                        "peer_send",
-                        json!({"to":identities[1],"message":"must not be delivered"}),
-                    ),
-                ],
-                ..reply("cognitive work")
-            };
+            return reply("cognitive work").with_calls(vec![
+                call(
+                    "accepted-note",
+                    "remember",
+                    json!({"text":"retain this accepted note once"}),
+                ),
+                call(
+                    "accepted-state",
+                    "state_report",
+                    json!({"activation":0.75,"note":"accepted before cancellation"}),
+                ),
+                call(
+                    "blocked-peer",
+                    "peer_send",
+                    json!({"to":identities[1],"message":"must not be delivered"}),
+                ),
+            ]);
         }
         reply("the later cognitive turn completed")
     });
@@ -484,7 +477,7 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
             .await
             .unwrap()
             .iter()
-            .filter(|message| message.content == "retain this accepted note once")
+            .filter(|message| message.text_projection() == "retain this accepted note once")
             .count(),
         1
     );
@@ -509,7 +502,7 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
             .await
             .unwrap()
             .iter()
-            .filter(|message| message.content == "retain this accepted note once")
+            .filter(|message| message.text_projection() == "retain this accepted note once")
             .count(),
         1
     );
@@ -753,17 +746,14 @@ impl Provider for HeldPeerConsultation {
         if request.instructions.contains("Phase: speak")
             && !self.issued.swap(true, Ordering::SeqCst)
         {
-            return Ok(Completion {
-                calls: vec![call(
-                    "accepted-peer",
-                    "peer_send",
-                    json!({
-                        "to":self.recipient.lock().unwrap().clone(),
-                        "message":"consult exactly once"
-                    }),
-                )],
-                ..reply("request peer input")
-            });
+            return Ok(reply("request peer input").with_calls(vec![call(
+                "accepted-peer",
+                "peer_send",
+                json!({
+                    "to":self.recipient.lock().unwrap().clone(),
+                    "message":"consult exactly once"
+                }),
+            )]));
         }
         Ok(reply("the later peer turn completed"))
     }
@@ -951,14 +941,11 @@ async fn cancelled_outbound_a2a_request_is_received_once_without_replay() {
         if request.instructions.contains("Phase: speak")
             && !provider_issued.swap(true, Ordering::SeqCst)
         {
-            return Completion {
-                calls: vec![call(
-                    "accepted-a2a",
-                    "a2a_send",
-                    json!({"agent":"held","message":"perform this once"}),
-                )],
-                ..reply("sending once")
-            };
+            return reply("sending once").with_calls(vec![call(
+                "accepted-a2a",
+                "a2a_send",
+                json!({"agent":"held","message":"perform this once"}),
+            )]);
         }
         reply("the later outbound turn completed")
     });
@@ -1030,14 +1017,16 @@ async fn cancelled_outbound_a2a_request_is_received_once_without_replay() {
 async fn tool_only_deliberation_proceeds_to_a_useful_speaking_turn() {
     let provider = RecordingProvider::new(|request| {
         if request.instructions.contains("Phase: deliberate") {
-            Completion {
-                calls: vec![call(
+            Completion::from_legacy(
+                "",
+                vec![call(
                     "state",
                     "state_report",
                     json!({"activation":0.5,"note":"Ready to help"}),
                 )],
-                ..Completion::default()
-            }
+                0,
+                0,
+            )
         } else {
             reply("Completed the user's request")
         }
@@ -1167,27 +1156,30 @@ async fn unavailable_mcp_status_stays_out_of_provider_input_and_memory() {
 
 #[tokio::test]
 async fn every_dream_call_gets_a_receipt_including_foreign_retirement_and_excess_calls() {
-    let provider = RecordingProvider::new(|_| Completion {
-        text: "Useful private summary".into(),
-        calls: vec![
-            call("bad-tool", "not_a_dream_tool", json!({})),
-            call(
-                "foreign-retirement",
-                "dream_suggest",
-                json!({"action":"retire","id":"another-part"}),
-            ),
-            call(
-                "excess-1",
-                "dream_suggest",
-                json!({"action":"add","name":"Extra","role":"id","instruction":"Help"}),
-            ),
-            call(
-                "excess-2",
-                "dream_suggest",
-                json!({"action":"retire","id":"another-part"}),
-            ),
-        ],
-        ..Completion::default()
+    let provider = RecordingProvider::new(|_| {
+        Completion::from_legacy(
+            "Useful private summary",
+            vec![
+                call("bad-tool", "not_a_dream_tool", json!({})),
+                call(
+                    "foreign-retirement",
+                    "dream_suggest",
+                    json!({"action":"retire","id":"another-part"}),
+                ),
+                call(
+                    "excess-1",
+                    "dream_suggest",
+                    json!({"action":"add","name":"Extra","role":"id","instruction":"Help"}),
+                ),
+                call(
+                    "excess-2",
+                    "dream_suggest",
+                    json!({"action":"retire","id":"another-part"}),
+                ),
+            ],
+            0,
+            0,
+        )
     });
     let (_dir, mut harness) = fixture(config(Mode::Freudian), provider).await;
     let report = harness.dream().await.unwrap();
@@ -1201,7 +1193,7 @@ async fn every_dream_call_gets_a_receipt_including_foreign_retirement_and_excess
             .unwrap()
             .into_iter()
             .filter(|message| message.role == "tool")
-            .map(|message| serde_json::from_str::<Value>(&message.content).unwrap())
+            .map(|message| crate::test_receipt(&message).unwrap())
             .collect();
         assert_eq!(receipts.len(), 4);
         assert_eq!(receipts[0]["call_id"], "bad-tool");
@@ -1338,11 +1330,11 @@ async fn archived_part_and_relationship_histories_remain_inspectable_without_rou
     assert!(harness.resolve(&retiring).is_err());
     assert!(harness.resolve(&relation.id).is_err());
     assert_eq!(
-        harness.memory_for(&retiring).await.unwrap()[0].content,
+        harness.memory_for(&retiring).await.unwrap()[0].text_projection(),
         "retained part insight"
     );
     assert_eq!(
-        harness.memory_for(&relation.id).await.unwrap()[0].content,
+        harness.memory_for(&relation.id).await.unwrap()[0].text_projection(),
         "retained group insight"
     );
     harness.undo_dream().await.unwrap();
@@ -1370,7 +1362,7 @@ async fn undo_archives_new_members_and_preserves_their_memories() {
     harness.undo_dream().await.unwrap();
     assert!(harness.resolve(&added).is_err());
     assert_eq!(
-        harness.memory_for(&added).await.unwrap()[0].content,
+        harness.memory_for(&added).await.unwrap()[0].text_projection(),
         "new insight"
     );
     assert!(harness.undo_dream().await.is_err());
@@ -1390,8 +1382,9 @@ async fn a_large_tool_batch_retains_all_current_receipts_for_protocol_replay() {
         if outputs > 0 {
             return reply(&format!("Received {outputs} receipts"));
         }
-        Completion {
-            calls: (0..64)
+        Completion::from_legacy(
+            "",
+            (0..64)
                 .map(|i| {
                     call(
                         &format!("note-{i}"),
@@ -1400,8 +1393,9 @@ async fn a_large_tool_batch_retains_all_current_receipts_for_protocol_replay() {
                     )
                 })
                 .collect(),
-            ..Completion::default()
-        }
+            0,
+            0,
+        )
     });
     let (_dir, mut harness) = fixture(
         Config {
@@ -1522,10 +1516,11 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
         .await
         .unwrap();
     let inputs = (0..64)
-        .map(|i| kuru_core::Message {
-            role: "tool".into(),
-            content: json!({"call_id":format!("call-{i}"), "output":"\0\n🪶".repeat(3000)})
-                .to_string(),
+        .map(|i| {
+            kuru_core::Message::text(
+                "tool",
+                json!({"call_id":format!("call-{i}"), "output":"\0\n🪶".repeat(3000)}).to_string(),
+            )
         })
         .collect();
     harness
@@ -1538,7 +1533,7 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
         request
             .messages
             .iter()
-            .map(|message| message.content.len())
+            .map(|message| message.text_projection().len())
             .sum::<usize>()
             <= 112 * 1024
     );
@@ -1546,7 +1541,7 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
         .messages
         .iter()
         .filter(|message| message.role == "tool")
-        .map(|message| serde_json::from_str::<Value>(&message.content).unwrap())
+        .map(|message| crate::test_receipt(message).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(receipts.len(), 64);
     for (i, receipt) in receipts.iter().enumerate() {
@@ -1559,7 +1554,13 @@ async fn large_private_context_is_bounded_without_losing_any_current_tool_receip
         .last()
         .unwrap();
     let notes: Vec<kuru_core::Message> = serde_json::from_str(notes_json).unwrap();
-    assert!(notes.iter().map(|note| note.content.len()).sum::<usize>() <= 16 * 1024);
+    assert!(
+        notes
+            .iter()
+            .map(|note| note.text_projection().len())
+            .sum::<usize>()
+            <= 16 * 1024
+    );
 }
 
 #[tokio::test]
@@ -1568,10 +1569,7 @@ async fn malformed_current_tool_receipts_fail_before_provider_invocation() {
     let (_dir, harness) = fixture(config(Mode::Freudian), provider.clone()).await;
     let id = &harness.topology.parts[0].id;
     for content in ["not JSON", "{}", "{\"call_id\":\"a\"}"] {
-        let inputs = vec![kuru_core::Message {
-            role: "tool".into(),
-            content: content.into(),
-        }];
+        let inputs = vec![kuru_core::Message::text("tool", content)];
         assert!(
             harness
                 .ask(id, inputs, "invalid followup", vec![])
@@ -1605,14 +1603,11 @@ async fn a_models_relationship_proposal_selects_the_temporary_group_as_speaker()
                 .iter()
                 .any(|message| message.role == "tool")
         {
-            return Completion {
-                calls: vec![call(
-                    "create-alliance",
-                    "relate",
-                    json!({"kind":"alliance","members":&ids[..2]}),
-                )],
-                ..reply("Combine our complementary perspectives")
-            };
+            return reply("Combine our complementary perspectives").with_calls(vec![call(
+                "create-alliance",
+                "relate",
+                json!({"kind":"alliance","members":&ids[..2]}),
+            )]);
         }
         if request.instructions.contains("Phase: speak") {
             reply("A joint perspective answered")
@@ -1664,31 +1659,25 @@ async fn a_speaking_peer_consults_another_peer_without_recursive_delegation() {
             assert!(request.tools.is_empty());
             // Even an uncooperative provider cannot recursively delegate from
             // this consultation phase: the runtime consumes only its reply.
-            return Completion {
-                calls: vec![call(
-                    "recursive-attempt",
-                    "peer_send",
-                    json!({"to":ids[0],"message":"Try recursion"}),
-                )],
-                ..reply("VERIFIED-PEER-ADVICE")
-            };
+            return reply("VERIFIED-PEER-ADVICE").with_calls(vec![call(
+                "recursive-attempt",
+                "peer_send",
+                json!({"to":ids[0],"message":"Try recursion"}),
+            )]);
         }
         if request.instructions.contains("Phase: speak") {
             if request
                 .messages
                 .iter()
-                .any(|message| message.content.contains("VERIFIED-PEER-ADVICE"))
+                .any(|message| message.text_projection().contains("VERIFIED-PEER-ADVICE"))
             {
                 return reply("Used the verified peer advice");
             }
-            return Completion {
-                calls: vec![call(
-                    "consult",
-                    "peer_send",
-                    json!({"to":ids[1],"message":"Check the final implementation"}),
-                )],
-                ..reply("Checking with a peer")
-            };
+            return reply("Checking with a peer").with_calls(vec![call(
+                "consult",
+                "peer_send",
+                json!({"to":ids[1],"message":"Check the final implementation"}),
+            )]);
         }
         reply("A concise draft")
     });
@@ -1759,7 +1748,7 @@ async fn partial_provider_failures_leave_other_peers_usable_and_total_failure_is
     let history = unavailable.history().await.unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[1].role, INTERRUPTION_ROLE);
-    assert_eq!(history[1].content, INTERRUPTION_TEXT);
+    assert_eq!(history[1].text_projection(), INTERRUPTION_TEXT);
 }
 
 #[tokio::test]
@@ -1768,14 +1757,11 @@ async fn dreaming_accepts_a_valid_model_proposal_and_failed_undo_remains_recover
     let selected = proposer.clone();
     let provider = RecordingProvider::new(move |request| {
         if request.actor.ends_with(selected.lock().unwrap().as_str()) {
-            return Completion {
-                calls: vec![call(
+            return reply("The project would benefit from broader options").with_calls(vec![call(
                     "new-peer",
                     "dream_suggest",
                     json!({"action":"add","name":"Possibility","role":"id","instruction":"Explore practical alternatives as an equal peer"}),
-                )],
-                ..reply("The project would benefit from broader options")
-            };
+                )]);
         }
         reply("Consolidated private project knowledge")
     });
@@ -1820,21 +1806,18 @@ async fn speaking_peers_send_only_explicit_messages_to_configured_external_a2a_a
     let provider = RecordingProvider::new(|request| {
         if request.instructions.contains("Phase: speak") {
             assert!(request.tools.iter().any(|tool| tool.name == "a2a_send"));
-            if request
-                .messages
-                .iter()
-                .any(|message| message.content.contains("EXTERNAL-REVIEW-COMPLETE"))
-            {
+            if request.messages.iter().any(|message| {
+                message
+                    .text_projection()
+                    .contains("EXTERNAL-REVIEW-COMPLETE")
+            }) {
                 return reply("Applied the external review");
             }
-            return Completion {
-                calls: vec![call(
-                    "external",
-                    "a2a_send",
-                    json!({"agent":"reviewer","message":"Review this explicitly shared question"}),
-                )],
-                ..reply("Requesting a review")
-            };
+            return reply("Requesting a review").with_calls(vec![call(
+                "external",
+                "a2a_send",
+                json!({"agent":"reviewer","message":"Review this explicitly shared question"}),
+            )]);
         }
         reply("Draft ready")
     });
@@ -1962,7 +1945,7 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
         request
             .messages
             .iter()
-            .any(|message| message.role == "user" && message.content == "Start a task")
+            .any(|message| message.role == "user" && message.text_projection() == "Start a task")
     );
     assert_eq!(provider.active.load(Ordering::SeqCst), 1);
     assert!(
@@ -2037,7 +2020,10 @@ async fn one_rejected_model_does_not_discard_other_peers_dream_summaries() {
         if part.id == failed {
             assert!(notes.is_empty());
         } else {
-            assert_eq!(notes[0].content, "Retain this useful private summary");
+            assert_eq!(
+                notes[0].text_projection(),
+                "Retain this useful private summary"
+            );
         }
     }
     harness.shutdown(false).await.unwrap();

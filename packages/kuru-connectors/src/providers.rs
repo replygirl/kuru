@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use kuru_core::{Completion, CompletionRequest, Config, Message, ModelInfo, ToolCall};
+use kuru_core::{Completion, CompletionRequest, Config, ContentBlock, Message, ModelInfo, Usage};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -64,12 +64,17 @@ impl Provider for DemoProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        // Keep demo behavior aligned with the native route: unsupported media
+        // is a request validation failure, never silently ignored content.
+        for message in &request.messages {
+            provider_text(message)?;
+        }
         let latest = request
             .messages
             .iter()
             .rev()
-            .find(|message| message.role == "user")
-            .map(|message| message.content.as_str())
+            .filter(|message| message.role == "user")
+            .find_map(Message::plain_text)
             .unwrap_or("Ready");
         let original = latest
             .strip_prefix("User request: ")
@@ -100,12 +105,7 @@ impl Provider for DemoProvider {
         } else {
             format!("[demo] Offline contribution: {concise}")
         };
-        Ok(Completion {
-            text,
-            calls: vec![],
-            input_tokens: 0,
-            output_tokens: 0,
-        })
+        Ok(Completion::from_legacy(text, vec![], 0, 0))
     }
 }
 
@@ -340,69 +340,113 @@ fn subscription_headers(
         .header("ChatGPT-Account-ID", account))
 }
 
-fn text_message(message: &Message) -> Value {
+fn provider_text(message: &Message) -> Result<String> {
+    if let Some(text) = message.plain_text() {
+        return Ok(text.into());
+    }
+    ensure!(
+        !message.blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::Image { .. } | ContentBlock::CacheBoundary { .. }
+        )),
+        "Responses provider does not support image or cache content blocks"
+    );
+    serde_json::to_string(&message.blocks).context("encode typed message for Responses provider")
+}
+
+fn text_message(message: &Message) -> Result<Value> {
+    let content = provider_text(message)?;
     match message.role.as_str() {
         "assistant" | "system" | "developer" | "user" => {
-            json!({"role":message.role,"content":message.content})
+            Ok(json!({"role":message.role,"content":content}))
         }
-        _ => {
-            json!({"role":"user","content":format!("[{} record]\n{}", message.role, message.content)})
-        }
+        _ => Ok(json!({"role":"user","content":format!("[{} record]\n{content}", message.role)})),
     }
 }
 
-fn input_items(messages: &[Message], pending: Option<&Pending>) -> Result<Vec<Value>> {
-    // Runtime tool continuations end with a tool receipt. A trailing user
-    // message explicitly starts a new conversational/model phase.
-    if messages
-        .last()
-        .is_some_and(|message| message.role == "user")
-    {
-        return Ok(messages.iter().map(text_message).collect());
+fn input_items(
+    messages: &[Message],
+    pending: Option<&Pending>,
+    current_message_count: Option<usize>,
+) -> Result<Vec<Value>> {
+    // Validate every block before selecting native continuation records: a
+    // matching tool receipt must not let an earlier unsupported block vanish
+    // from validation and reach a provider dispatch.
+    for message in messages {
+        provider_text(message)?;
     }
-    let Some(pending) = pending else {
-        return Ok(messages.iter().map(text_message).collect());
+    // An absent boundary is a legacy/direct request. Never infer native
+    // continuation from historical text or receipt adjacency.
+    let Some(current_message_count) = current_message_count else {
+        return messages.iter().map(text_message).collect();
     };
+    ensure!(
+        current_message_count <= messages.len(),
+        "current model input boundary exceeds message history"
+    );
+    let Some(pending) = pending else {
+        return messages.iter().map(text_message).collect();
+    };
+    let current = &messages[messages.len() - current_message_count..];
     let mut found = BTreeMap::new();
-    for (index, message) in messages.iter().enumerate().rev() {
+    let mut other_current = Vec::new();
+    let mut invalid_tool = false;
+    for message in current {
         if message.role != "tool" {
+            other_current.push(text_message(message)?);
             continue;
         }
-        if let Ok(value) = serde_json::from_str::<Value>(&message.content)
-            && let Some(id) = value["call_id"].as_str()
-            && pending.calls.iter().any(|call| call == id)
-        {
-            found.entry(id.to_owned()).or_insert((index, value));
+        let receipt = match message.blocks.as_slice() {
+            [
+                ContentBlock::ToolResult {
+                    call_id, output, ..
+                },
+            ] => Some((call_id.clone(), output.clone())),
+            // Legacy string-encoded receipts are accepted only at this live
+            // continuation seam. Durable history is never guessed from JSON text.
+            [ContentBlock::Text { text }] => {
+                serde_json::from_str::<Value>(text).ok().and_then(|value| {
+                    value["call_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .zip(value.get("output").cloned())
+                })
+            }
+            _ => None,
+        };
+        if let Some((id, output)) = receipt {
+            ensure!(
+                pending.calls.iter().any(|call| call == &id),
+                "tool receipt does not match a pending Responses call"
+            );
+            ensure!(
+                found.insert(id.to_owned(), output).is_none(),
+                "duplicate tool receipt for pending Responses call"
+            );
+        } else {
+            invalid_tool = true;
         }
     }
-    // New non-tool user input starts a fresh protocol context. Historical tool
-    // records after a restart are deliberately represented as ordinary text.
+    ensure!(
+        !invalid_tool,
+        "invalid current tool receipt for pending Responses call"
+    );
+    // A fresh user turn has no current receipt and starts a new protocol
+    // context. Historical receipts remain ordinary safe history.
     if found.is_empty() {
-        return Ok(messages.iter().map(text_message).collect());
+        return messages.iter().map(text_message).collect();
     }
-    if found.len() != pending.calls.len() {
-        let latest_output = found.values().map(|(index, _)| *index).max().unwrap_or(0);
-        if messages
-            .iter()
-            .skip(latest_output + 1)
-            .any(|message| message.role == "user")
-        {
-            // A canceled operation can leave partial receipts. An explicit new
-            // user turn starts fresh instead of trapping this actor forever.
-            return Ok(messages.iter().map(text_message).collect());
-        }
-        bail!("missing function outputs for pending Responses calls");
-    }
+    ensure!(
+        found.len() == pending.calls.len(),
+        "missing function outputs for pending Responses calls"
+    );
     let mut input = pending.input.clone();
     input.extend(pending.output.clone());
-    let mut final_index = 0;
     for call in &pending.calls {
-        let (index, record) = &found[call];
-        final_index = final_index.max(*index);
-        let output = record.get("output").context("tool result lacks output")?;
+        let output = &found[call];
         input.push(json!({"type":"function_call_output","call_id":call,"output":output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string())}));
     }
-    input.extend(messages.iter().skip(final_index + 1).map(text_message));
+    input.extend(other_current);
     Ok(input)
 }
 
@@ -411,8 +455,7 @@ fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Comple
     let output = value["output"]
         .as_array()
         .context("Responses response lacks output array")?;
-    let mut text = Vec::new();
-    let mut calls = Vec::new();
+    let mut blocks = Vec::new();
     let mut ids = BTreeSet::new();
     for item in output {
         match item["type"].as_str() {
@@ -422,7 +465,9 @@ fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Comple
                         if let Some(value) =
                             part["text"].as_str().or_else(|| part["refusal"].as_str())
                         {
-                            text.push(value.to_owned());
+                            blocks.push(ContentBlock::Text {
+                                text: value.to_owned(),
+                            });
                         }
                     }
                 }
@@ -439,7 +484,7 @@ fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Comple
                         .context("function call lacks arguments")?,
                 )
                 .map_err(|_| diagnostics::function_arguments(operation))?;
-                calls.push(ToolCall {
+                blocks.push(ContentBlock::ToolUse {
                     id: id.into(),
                     name: name.into(),
                     arguments,
@@ -449,10 +494,13 @@ fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Comple
         }
     }
     Ok(Completion {
-        text: text.join("\n"),
-        calls,
-        input_tokens: value["usage"]["input_tokens"].as_u64().unwrap_or(0),
-        output_tokens: value["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        blocks,
+        usage: Usage {
+            input_tokens: value["usage"]["input_tokens"].as_u64(),
+            output_tokens: value["usage"]["output_tokens"].as_u64(),
+            ..Usage::default()
+        },
+        stop_reason: None,
     })
 }
 
@@ -559,7 +607,11 @@ impl ResponsesProvider {
         );
         let actor = self.actor(&request.actor).await?;
         let mut pending = actor.lock().await;
-        let input = input_items(&request.messages, pending.as_ref())?;
+        let input = input_items(
+            &request.messages,
+            pending.as_ref(),
+            request.current_message_count,
+        )?;
         let mut body = json!({"model":request.model,"instructions":request.instructions,"input":input,"store":false,"include":["reasoning.encrypted_content"],"tools":request.tools.iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false})).collect::<Vec<_>>()});
         if let Some(effort) = request.effort {
             body["reasoning"] = json!({"effort":effort});
@@ -589,7 +641,7 @@ impl ResponsesProvider {
             diagnostics::json(response, operation).await?
         };
         let result = completion(&value, operation)?;
-        *pending = if result.calls.is_empty() {
+        *pending = if result.calls().is_empty() {
             None
         } else {
             Some(Pending {
@@ -598,7 +650,7 @@ impl ResponsesProvider {
                     .as_array()
                     .context("missing output")?
                     .clone(),
-                calls: result.calls.iter().map(|call| call.id.clone()).collect(),
+                calls: result.calls().into_iter().map(|call| call.id).collect(),
             })
         };
         Ok(result)
@@ -621,30 +673,40 @@ mod tests {
         let provider = ResponsesProvider::new(&peer.url, "").unwrap();
         let mut first = request();
         let completion = provider.complete(first.clone()).await.unwrap();
-        assert_eq!(completion.calls.len(), 2);
-        assert_eq!((completion.input_tokens, completion.output_tokens), (8, 5));
+        assert_eq!(completion.calls().len(), 2);
+        assert_eq!(
+            (completion.input_tokens(), completion.output_tokens()),
+            (8, 5)
+        );
         let mut other = first.clone();
         other.actor = "other-project/part".into();
-        assert_eq!(provider.complete(other).await.unwrap().text, "other actor");
-        first.messages.push(Message {
-            role: "assistant".into(),
-            content: "requesting file reads".into(),
-        });
-        for (call, text) in [("c2", "second file"), ("c1", "first file")] {
-            first.messages.push(Message {
-                role: "tool".into(),
-                content: json!({"call_id":call,"output":text}).to_string(),
-            });
-        }
         assert_eq!(
-            provider.complete(first.clone()).await.unwrap().text,
+            provider.complete(other).await.unwrap().text_projection(),
+            "other actor"
+        );
+        first
+            .messages
+            .push(Message::text("assistant", "requesting file reads"));
+        for (call, text) in [("c2", "second file"), ("c1", "first file")] {
+            first
+                .messages
+                .push(Message::tool_result(call, json!(text), false));
+        }
+        first.current_message_count = Some(2);
+        assert_eq!(
+            provider
+                .complete(first.clone())
+                .await
+                .unwrap()
+                .text_projection(),
             "files compared"
         );
-        first.messages.push(Message {
-            role: "user".into(),
-            content: "new turn".into(),
-        });
-        assert_eq!(provider.complete(first).await.unwrap().text, "declined");
+        first.messages.push(Message::text("user", "new turn"));
+        first.current_message_count = Some(1);
+        assert_eq!(
+            provider.complete(first).await.unwrap().text_projection(),
+            "declined"
+        );
         let sent = peer.requests.lock().await;
         assert_eq!(sent[0].body["reasoning"]["effort"], "future-effort");
         assert_eq!(sent[0].body["tools"][0]["name"], "file_read");
@@ -673,6 +735,140 @@ mod tests {
                 .body
                 .to_string()
                 .contains("opaque-private-reasoning")
+        );
+    }
+
+    #[tokio::test]
+    async fn consecutive_native_calls_accept_only_the_current_receipt_batch() {
+        let peer = HttpFixture::new(vec![
+            Reply::json(json!({"status":"completed","output":[
+                {"type":"reasoning","encrypted_content":"first-native-reasoning","summary":[]},
+                {"type":"function_call","call_id":"c1","name":"file_read","arguments":"{}"}
+            ]})),
+            Reply::json(json!({"status":"completed","output":[
+                {"type":"reasoning","encrypted_content":"second-native-reasoning","summary":[]},
+                {"type":"function_call","call_id":"c2","name":"file_read","arguments":"{}"}
+            ]})),
+            Reply::json(json!({"status":"completed","output":[
+                {"type":"message","content":[{"type":"output_text","text":"complete"}]}
+            ]})),
+        ])
+        .await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        let mut input = request();
+
+        let first = provider.complete(input.clone()).await.unwrap();
+        input.messages.push(Message {
+            role: "assistant".into(),
+            blocks: first.blocks,
+        });
+        input
+            .messages
+            .push(Message::tool_result("c1", json!("first receipt"), false));
+        input.current_message_count = Some(1);
+
+        let second = provider.complete(input.clone()).await.unwrap();
+        input.messages.push(Message {
+            role: "assistant".into(),
+            blocks: second.blocks,
+        });
+        input
+            .messages
+            .push(Message::tool_result("c2", json!("second receipt"), false));
+        input.current_message_count = Some(1);
+
+        assert_eq!(
+            provider.complete(input).await.unwrap().text_projection(),
+            "complete"
+        );
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent.len(), 3);
+        let outputs: Vec<_> = sent[2].body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0]["call_id"], "c1");
+        assert_eq!(outputs[0]["output"], "first receipt");
+        assert_eq!(outputs[1]["call_id"], "c2");
+        assert_eq!(outputs[1]["output"], "second receipt");
+        assert!(sent[2].body.to_string().contains("first-native-reasoning"));
+        assert!(sent[2].body.to_string().contains("second-native-reasoning"));
+    }
+
+    #[tokio::test]
+    async fn omitted_assistant_delimiter_does_not_mix_old_and_current_receipts() {
+        let peer = HttpFixture::new(vec![
+            Reply::json(json!({"status":"completed","output":[{"type":"function_call","call_id":"c1","name":"file_read","arguments":"{}"}]})),
+            Reply::json(json!({"status":"completed","output":[{"type":"function_call","call_id":"c2","name":"file_read","arguments":"{}"}]})),
+            Reply::json(json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]})),
+        ]).await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        let mut input = request();
+        provider.complete(input.clone()).await.unwrap();
+        input
+            .messages
+            .push(Message::tool_result("c1", json!("first"), false));
+        input.current_message_count = Some(1);
+        provider.complete(input.clone()).await.unwrap();
+        // Bounded history may omit the assistant record between these results.
+        input
+            .messages
+            .push(Message::tool_result("c2", json!("second"), false));
+        input.current_message_count = Some(1);
+        assert_eq!(
+            provider.complete(input).await.unwrap().text_projection(),
+            "done"
+        );
+        let sent = peer.requests.lock().await;
+        let outputs = sent[2].body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0]["call_id"], "c1");
+        assert_eq!(outputs[1]["call_id"], "c2");
+    }
+
+    #[tokio::test]
+    async fn current_peer_message_between_receipts_is_sent_after_native_outputs() {
+        let peer = HttpFixture::new(vec![
+            Reply::json(json!({"status":"completed","output":[{"type":"function_call","call_id":"c1","name":"file_read","arguments":"{}"},{"type":"function_call","call_id":"c2","name":"file_read","arguments":"{}"}]})),
+            Reply::json(json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]})),
+        ]).await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        let mut input = request();
+        provider.complete(input.clone()).await.unwrap();
+        input.messages.extend([
+            Message::tool_result("c1", json!("first"), false),
+            Message::text("user", "Peer reply: check the file"),
+            Message::tool_result("c2", json!("second"), false),
+        ]);
+        input.current_message_count = Some(3);
+        assert_eq!(
+            provider.complete(input).await.unwrap().text_projection(),
+            "done"
+        );
+        let sent = peer.requests.lock().await;
+        let items = sent[1].body["input"].as_array().unwrap();
+        let outputs = items
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|item| item["call_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["c1", "c2"]
+        );
+        assert_eq!(
+            items.last().unwrap()["content"],
+            "Peer reply: check the file"
         );
     }
 
@@ -751,7 +947,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(completion.text, "later");
+        assert_eq!(completion.text_projection(), "later");
         tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .unwrap()
@@ -803,12 +999,18 @@ mod tests {
             demo.complete(request())
                 .await
                 .unwrap()
-                .text
+                .text_projection()
                 .contains("hello")
         );
         let mut empty = request();
         empty.messages.clear();
-        assert!(demo.complete(empty).await.unwrap().text.contains("Ready"));
+        assert!(
+            demo.complete(empty)
+                .await
+                .unwrap()
+                .text_projection()
+                .contains("Ready")
+        );
         assert!(
             provider(
                 &Config {
@@ -890,26 +1092,138 @@ mod tests {
             output: vec![],
             calls: vec!["a".into(), "b".into()],
         };
-        let messages = vec![Message {
-            role: "tool".into(),
-            content: json!({"call_id":"a","output":"ok"}).to_string(),
-        }];
-        assert!(input_items(&messages, Some(&pending)).is_err());
-        assert_eq!(input_items(&messages, None).unwrap()[0]["role"], "user");
+        let messages = vec![Message::tool_result("a", json!("ok"), false)];
+        assert!(input_items(&messages, Some(&pending), Some(1)).is_err());
         assert_eq!(
-            input_items(&request().messages, Some(&pending))
+            input_items(&messages, None, Some(1)).unwrap()[0]["role"],
+            "user"
+        );
+        assert_eq!(
+            input_items(&request().messages, Some(&pending), Some(1))
                 .unwrap()
                 .len(),
             1
         );
-        let malformed = vec![Message {
-            role: "tool".into(),
-            content: "not JSON".into(),
-        }];
-        assert_eq!(
-            input_items(&malformed, Some(&pending)).unwrap()[0]["role"],
-            "user"
+        let malformed = vec![Message::text("tool", "not JSON")];
+        assert!(
+            input_items(&malformed, Some(&pending), Some(1))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid current tool receipt")
         );
+        let mixed = vec![Message {
+            role: "tool".into(),
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "not a receipt".into(),
+                },
+                ContentBlock::ToolResult {
+                    call_id: "a".into(),
+                    output: json!("ok"),
+                    is_error: false,
+                },
+            ],
+        }];
+        assert!(
+            input_items(&mixed, Some(&pending), Some(1))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid current tool receipt")
+        );
+        let mismatch = vec![Message::tool_result("other", json!("no"), false)];
+        let error = input_items(&mismatch, Some(&pending), Some(1)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match a pending Responses call")
+        );
+    }
+
+    #[test]
+    fn completion_keeps_ordered_typed_blocks_and_unknown_usage_absent() {
+        let completion = completion(
+            &json!({
+                "status":"completed",
+                "output":[
+                    {"type":"message","content":[{"type":"output_text","text":"before"}]},
+                    {"type":"function_call","call_id":"call-one","name":"file_read","arguments":"{\"path\":\"one\"}"},
+                    {"type":"message","content":[{"type":"refusal","refusal":"after"}]}
+                ],
+                "usage": {}
+            }),
+            diagnostics::Operation::ResponsesCompletion,
+        )
+        .unwrap();
+        assert_eq!(completion.text_projection(), "before\nafter");
+        assert_eq!(completion.calls()[0].id, "call-one");
+        assert_eq!(completion.usage.input_tokens, None);
+        assert_eq!(completion.usage.output_tokens, None);
+        assert!(matches!(
+            completion.blocks.as_slice(),
+            [
+                ContentBlock::Text { text },
+                ContentBlock::ToolUse { id, .. },
+                ContentBlock::Text { .. }
+            ] if text == "before" && id == "call-one"
+        ));
+    }
+
+    #[tokio::test]
+    async fn unsupported_typed_content_is_rejected_before_dispatch() {
+        let peer = HttpFixture::new(vec![]).await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        let mut input = request();
+        input.messages[0].blocks = vec![ContentBlock::Image {
+            media_type: "image/png".into(),
+            data_base64: "AAEC".into(),
+        }];
+        let error = provider.complete(input).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support image or cache content blocks")
+        );
+        assert!(peer.requests.lock().await.is_empty());
+        let mut demo_input = request();
+        demo_input.messages[0].blocks = vec![ContentBlock::CacheBoundary {
+            kind: "ephemeral".into(),
+        }];
+        let error = DemoProvider.complete(demo_input).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support image or cache content blocks")
+        );
+
+        let pending_peer = HttpFixture::new(vec![Reply::json(json!({
+            "status":"completed",
+            "output":[{"type":"function_call","call_id":"pending-call","name":"file_read","arguments":"{}"}]
+        }))])
+        .await;
+        let pending_provider = ResponsesProvider::new(&pending_peer.url, "").unwrap();
+        let mut continuation = request();
+        pending_provider
+            .complete(continuation.clone())
+            .await
+            .unwrap();
+        continuation.messages.push(Message {
+            role: "tool".into(),
+            blocks: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data_base64: "AAEC".into(),
+            }],
+        });
+        continuation
+            .messages
+            .push(Message::tool_result("pending-call", json!("ok"), false));
+        continuation.current_message_count = Some(2);
+        let error = pending_provider.complete(continuation).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support image or cache content blocks")
+        );
+        assert_eq!(pending_peer.requests.lock().await.len(), 1);
     }
 
     #[tokio::test]
@@ -1236,10 +1550,9 @@ mod tests {
         let mut input = request();
         input.effort = None;
         provider.complete(input.clone()).await.unwrap();
-        input.messages.push(Message {
-            role: "tool".into(),
-            content: json!({"call_id":"a","output":{"answer":4}}).to_string(),
-        });
+        input
+            .messages
+            .push(Message::tool_result("a", json!({"answer":4}), false));
         assert!(provider.complete(input.clone()).await.is_err());
         provider.complete(input).await.unwrap();
         let sent = peer.requests.lock().await;
@@ -1378,10 +1691,12 @@ mod tests {
         let provider = Arc::new(ResponsesProvider::new(&peer.url, "").unwrap());
         let mut continuation = request();
         provider.complete(continuation.clone()).await.unwrap();
-        continuation.messages.push(Message {
-            role: "tool".into(),
-            content: json!({"call_id":"pending-call","output":"preserved"}).to_string(),
-        });
+        continuation.messages.push(Message::tool_result(
+            "pending-call",
+            json!("preserved"),
+            false,
+        ));
+        continuation.current_message_count = Some(1);
         let task = {
             let provider = provider.clone();
             let continuation = continuation.clone();

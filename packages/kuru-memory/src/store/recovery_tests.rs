@@ -706,7 +706,10 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
             )));
         }
     };
-    assert_eq!(migrations::version(&recovered.pool).await?, 2);
+    assert_eq!(
+        migrations::version(&recovered.pool).await?,
+        migrations::CURRENT_VERSION
+    );
     assert_eq!(
         recovered.get("process-loss-source").await?,
         Some(json!("retained"))
@@ -716,14 +719,14 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(recovered.pool.as_ref())
             .await?,
-        1
+        2
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_branches WHERE LEFT(BINARY name, 15) = BINARY 'kuru_migration_'")
             .fetch_one(recovered.pool.as_ref())
             .await?,
-        2,
-        "cold recovery must retain the failed branch and add one fresh attempt"
+        3,
+        "cold recovery retains the failed branch and both ordered migration attempts"
     );
     let retained_failed = recovered.shared.server.pool(&failed_branch).await?;
     assert_eq!(revision(&retained_failed).await?, failed_head);
@@ -738,7 +741,16 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
         .fetch_one(recovered.pool.as_ref())
         .await?,
         1,
-        "cold recovery must publish exactly one migration commit"
+        "cold recovery must publish the v2 migration exactly once"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 3%'"
+        )
+        .fetch_one(recovered.pool.as_ref())
+        .await?,
+        1,
+        "cold recovery must publish the v3 migration exactly once"
     );
     let recovered_candidate = recovered.shared.server.pool(&candidate).await?;
     assert_eq!(revision(&recovered_candidate).await?, candidate_head);
@@ -847,7 +859,10 @@ async fn fresh_staging_process_loss_after_ddl_is_preserved_and_never_reused() ->
     );
 
     let store = MemoryStore::open(options.clone()).await?;
-    assert_eq!(migrations::version(&store.pool).await?, 2);
+    assert_eq!(
+        migrations::version(&store.pool).await?,
+        migrations::CURRENT_VERSION
+    );
     assert_clean_status(store.pool.as_ref()).await;
     store.close().await?;
     ensure!(
@@ -1120,7 +1135,10 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
                     "accepted migration worker did not finish after caller cancellation at {boundary:?}"
                 )
             })??;
-        assert_eq!(migrations::version(&store.pool).await?, 2);
+        assert_eq!(
+            migrations::version(&store.pool).await?,
+            migrations::CURRENT_VERSION
+        );
         assert_eq!(
             store.get("migration-source").await?,
             Some(json!("retained"))
@@ -1130,7 +1148,7 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
                 .fetch_one(store.pool.as_ref())
                 .await?,
-            1
+            2
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -1138,7 +1156,7 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
             )
             .fetch_one(store.pool.as_ref())
             .await?,
-            1
+            2
         );
         store.close().await?;
     }
@@ -1313,8 +1331,8 @@ async fn lost_commit_reply_recovers_one_durable_update_and_reopens_without_repla
     let reopened = MemoryStore::open(options).await.unwrap();
     assert_eq!(reopened.revision().await.unwrap(), revision);
     assert_eq!(
-        reopened.history("conversation", 10).await.unwrap()[0].content,
-        "exactly once"
+        reopened.history("conversation", 10).await.unwrap()[0].plain_text(),
+        Some("exactly once")
     );
     reopened.close().await.unwrap();
 }
@@ -1644,7 +1662,11 @@ async fn assert_schema_commit(
     source_history: &[Message],
     receipt: &str,
 ) {
-    migrations::validate_current(&view.pool).await.unwrap();
+    assert_eq!(
+        migrations::validate_historical(&view.pool).await.unwrap(),
+        2,
+        "the manual transaction must publish the exact released v2 schema"
+    );
     let head = view.revision().await.unwrap();
     assert_ne!(head, before);
     let parent: String = sqlx::query_scalar(
@@ -1685,7 +1707,7 @@ async fn assert_schema_commit(
         .unwrap();
     assert_eq!(commits, 1, "fixture must publish exactly one schema commit");
     assert_eq!(
-        view.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap(),
+        history_at_head(view.pool.as_ref(), SCHEMA_BOUNDARY_NAMESPACE).await,
         source_history
     );
     assert_clean_status(view.pool.as_ref()).await;
@@ -1699,7 +1721,7 @@ async fn manual_dolt_commit_atomically_publishes_ddl_version_and_receipt() {
         .await
         .unwrap();
     let before = store.revision().await.unwrap();
-    let source_history = store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap();
+    let source_history = history_at_head(store.pool.as_ref(), SCHEMA_BOUNDARY_NAMESPACE).await;
     let candidate = preserved_candidate(&store).await;
     let receipt = Uuid::new_v4().to_string();
     let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
@@ -1722,7 +1744,7 @@ async fn dropping_precommit_ddl_session_retains_dirty_working_ddl_outside_head()
         .await
         .unwrap();
     let before = store.revision().await.unwrap();
-    let source_history = store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap();
+    let source_history = history_at_head(store.pool.as_ref(), SCHEMA_BOUNDARY_NAMESPACE).await;
     let candidate = preserved_candidate(&store).await;
     let receipt = Uuid::new_v4().to_string();
     let (mut connection, id) = owned_connection(&store.pool).await.unwrap();
@@ -1775,7 +1797,7 @@ async fn dropping_precommit_ddl_session_retains_dirty_working_ddl_outside_head()
         "pinned Dolt retains each uncommitted migration row outside HEAD: {observation:?}"
     );
     assert_eq!(
-        store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap(),
+        history_at_head(store.pool.as_ref(), SCHEMA_BOUNDARY_NAMESPACE).await,
         source_history,
         "{observation:?}"
     );
@@ -1823,22 +1845,34 @@ async fn working_status(pool: &MySqlPool) -> Vec<(String, i64, String)> {
 }
 
 async fn history_at_head(pool: &MySqlPool, namespace: &str) -> Vec<Message> {
-    sqlx::query(
-        "SELECT role, content FROM messages AS OF 'HEAD' WHERE namespace = ? ORDER BY sequence",
-    )
-    .bind(namespace.as_bytes())
-    .fetch_all(pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|row| {
-        Ok(Message {
-            role: String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?,
-            content: row.try_get("content")?,
+    let version: i32 =
+        sqlx::query_scalar("SELECT version FROM kuru_schema AS OF 'HEAD' WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let query = if version >= 3 {
+        "SELECT role, content_format, content FROM messages AS OF 'HEAD' WHERE namespace = ? ORDER BY sequence"
+    } else {
+        "SELECT role, content FROM messages AS OF 'HEAD' WHERE namespace = ? ORDER BY sequence"
+    };
+    sqlx::query(query)
+        .bind(namespace.as_bytes())
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            let role = String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?;
+            let content: String = row.try_get("content")?;
+            let format: String = if version >= 3 {
+                row.try_get("content_format")?
+            } else {
+                "text-v1".into()
+            };
+            super::decode_message(role, &format, &content)
         })
-    })
-    .collect::<Result<Vec<_>>>()
-    .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap()
 }
 
 async fn assert_dirty_schema_branch(
@@ -1914,7 +1948,7 @@ async fn lost_manual_dolt_commit_reply_reconciles_one_clean_schema_commit() {
         .await
         .unwrap();
     let before = store.revision().await.unwrap();
-    let source_history = store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap();
+    let source_history = history_at_head(store.pool.as_ref(), SCHEMA_BOUNDARY_NAMESPACE).await;
     let candidate = preserved_candidate(&store).await;
     let receipt = Uuid::new_v4().to_string();
     let proxy = AckDropProxy::start(
@@ -1990,7 +2024,10 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
         proxy.session_ended.load(Ordering::Acquire),
         "the proxy must observe the original routed SQL session end before reconciliation"
     );
-    assert_eq!(migrations::version(&store.pool).await?, 2);
+    assert_eq!(
+        migrations::version(&store.pool).await?,
+        migrations::CURRENT_VERSION
+    );
     assert_clean_status(store.pool.as_ref()).await;
     let upgraded = store.revision().await?;
     let commits: i64 = sqlx::query_scalar(
@@ -2072,13 +2109,16 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
         store.get("branch-reply-source").await?,
         Some(json!("retained"))
     );
-    assert_eq!(migrations::version(&store.pool).await?, 2);
+    assert_eq!(
+        migrations::version(&store.pool).await?,
+        migrations::CURRENT_VERSION
+    );
     assert_clean_status(store.pool.as_ref()).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(store.pool.as_ref())
             .await?,
-        1
+        2
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -2160,18 +2200,31 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
         .context("production migration did not reconcile lost fast-forward reply")???;
     assert!(proxy.discarded.load(Ordering::Acquire));
     assert!(proxy.session_ended.load(Ordering::Acquire));
-    assert_eq!(store.revision().await?, target);
+    let completed = store.revision().await?;
+    let parent: String = sqlx::query_scalar(
+        "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+    )
+    .bind(&completed)
+    .fetch_one(store.pool.as_ref())
+    .await?;
+    assert_eq!(
+        parent, target,
+        "v3 must descend from the reconciled v2 target"
+    );
     assert_eq!(
         store.get("fast-forward-reply-source").await?,
         Some(json!("retained"))
     );
-    assert_eq!(migrations::version(&store.pool).await?, 2);
+    assert_eq!(
+        migrations::version(&store.pool).await?,
+        migrations::CURRENT_VERSION
+    );
     assert_clean_status(store.pool.as_ref()).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(store.pool.as_ref())
             .await?,
-        1
+        2
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -2191,7 +2244,7 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
     store.close().await?;
     proxy.close().await;
     let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
-    assert_eq!(reopened.revision().await?, target);
+    assert_eq!(reopened.revision().await?, completed);
     assert_eq!(
         reopened.get("fast-forward-reply-source").await?,
         Some(json!("retained"))
@@ -2274,17 +2327,30 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
     inspection_main.close().await;
     inspection.close().await?;
     let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
-    assert_eq!(reopened.revision().await?, target);
+    let completed = reopened.revision().await?;
+    let parent: String = sqlx::query_scalar(
+        "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+    )
+    .bind(&completed)
+    .fetch_one(reopened.pool.as_ref())
+    .await?;
+    assert_eq!(
+        parent, target,
+        "v3 must descend from the retained ready v2 target"
+    );
     assert_eq!(
         reopened.get("absent-fast-forward-source").await?,
         Some(json!("retained"))
     );
-    assert_eq!(migrations::version(&reopened.pool).await?, 2);
+    assert_eq!(
+        migrations::version(&reopened.pool).await?,
+        migrations::CURRENT_VERSION
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(reopened.pool.as_ref())
             .await?,
-        1
+        2
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT hash FROM dolt_branches WHERE name = ?")
@@ -2315,7 +2381,7 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
         .await
         .unwrap();
     let base = store.revision().await.unwrap();
-    let source_history = store.history(SCHEMA_BOUNDARY_NAMESPACE, 10).await.unwrap();
+    let source_history = history_at_head(store.pool.as_ref(), SCHEMA_BOUNDARY_NAMESPACE).await;
     let candidate = preserved_candidate(&store).await;
 
     let failed = exact_base_schema_branch(&store).await;
