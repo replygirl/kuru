@@ -161,7 +161,34 @@ session. No external Codex executable or credential-store import is needed.
 
 ## Tool permissions
 
-`allow_write` enables built-in file writes and deletion. `allow_shell` enables ordinary shell processes. The corresponding CLI flags enable them for one invocation.
+Tools get `allow`, `ask`, or `deny` decisions from an ordered `[[permissions]]` array, evaluated after workspace trust and the built-in file-root checks.
+
+```toml
+[[permissions]]
+action = "ask"
+selector = { kind = "native", name = "file_write" }
+path = "src/**"
+
+[[permissions]]
+action = "deny"
+selector = { kind = "native", name = "shell" }
+
+[[permissions]]
+action = "ask"
+selector = { kind = "mcp", alias = "local_service", tool = "write_document" }
+
+[[permissions]]
+action = "ask"
+selector = { kind = "a2a", alias = "research_peer" }
+```
+
+Selectors name a native tool exactly (`file_read`, `file_list`, `file_write`, `file_delete`, `shell`), an MCP tool by its configuration alias and original server tool name, or an outbound A2A endpoint by its configuration alias — the same evaluator governs runtime `a2a_send`. Anchored, project-relative path patterns apply only to the native file tools; shell commands and MCP arguments have no pattern matching. Up to 128 rules are accepted; a pattern holds at most 512 Unicode characters, `*`/`?` match within one path segment, and a whole-segment `**` spans zero or more segments. Absolute paths, drive prefixes, backslashes, traversal, control characters, and `[`/`{` pattern syntax are rejected.
+
+**Any matching `deny` wins, then `ask`, then `allow` — independent of rule order.** Only when no rule matches a call at all do the legacy `allow_write`/`allow_shell` booleans apply, and only to the tools they name: `file_write`/`file_delete` fall back to `allow_write`, `shell` falls back to `allow_shell`. Unmatched reads, listing, and configured MCP/A2A calls stay allowed regardless of those booleans.
+
+> **Upgrade note.** Before Phase 1's permission engine, `allow_write = false` and `allow_shell = false` — including the unset default — were a hard ceiling: the write or shell call simply failed. They are now the fallback spelling of `ask`: the same interactive prompt an explicit `ask` rule produces, or a structured permission-required refusal for a direct CLI command or other headless caller with no prompt to answer. `allow_write = true` / `allow_shell = true` are unchanged, and an explicit `allow` rule still beats the legacy fallback. **To keep the old hard block, add an explicit `deny` rule** for that tool — unlike the legacy booleans, `deny` is never overridable by a prompt or a saved grant.
+
+The TUI offers once, session, always, and deny for a prompted call. Once covers only that exact invocation. Session lives in memory and ends with the process, including before `--resume`. Always is stored privately outside project memory, bound to the workspace's native identity and complete reviewed authority manifest, and is revoked with `/permissions`. A changed authority context invalidates stored always-grants. Explicit `deny` always wins over a saved grant, and closing or cancelling a prompt authorizes nothing.
 
 The shell has your process authority; the project working directory does not constrain what it can access. MCP tools retain their own permissions. See [tools and permissions](./tools).
 

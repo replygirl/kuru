@@ -13,13 +13,15 @@ kuru -C /path/to/project tool file_read --args '{"path":"README.md"}'
 
 ## Built-in tools
 
-| Tool          | Arguments                        | Permission      |
-| ------------- | -------------------------------- | --------------- |
-| `file_read`   | `path`                           | Project read    |
-| `file_list`   | `path`                           | Project listing |
-| `file_write`  | `path`, `content`                | `allow_write`   |
-| `file_delete` | `path`                           | `allow_write`   |
-| `shell`       | `command`, optional `timeout_ms` | `allow_shell`   |
+A [`[[permissions]]` rule](./configuration#tool-permissions) can `allow`, `ask`, or `deny` any of these by exact name, and can additionally pattern-match the two file-mutation tools by anchored, project-relative path. Absent a matching rule, reads and listing stay allowed; `file_write`/`file_delete` fall back to `allow_write` and `shell` falls back to `allow_shell` — both now mean _ask_, not a hard block. Add an explicit `deny` rule to refuse a tool outright.
+
+| Tool          | Arguments                        | Permission fallback              |
+| ------------- | -------------------------------- | -------------------------------- |
+| `file_read`   | `path`                           | Always allowed (project read)    |
+| `file_list`   | `path`                           | Always allowed (project listing) |
+| `file_write`  | `path`, `content`                | `allow_write` → ask              |
+| `file_delete` | `path`                           | `allow_write` → ask              |
+| `shell`       | `command`, optional `timeout_ms` | `allow_shell` → ask              |
 
 For an explicit write:
 
@@ -36,7 +38,7 @@ The built-in file tools enforce containment through capability-relative filesyst
 
 ## Shell authority
 
-Shell execution requires `--allow-shell` or `allow_shell = true`. It runs with your process permissions, including possible network access and access beyond the project. It is not a sandbox.
+Shell execution goes through the permission engine. An explicit `deny` rule refuses it outright and can never be prompted around; an explicit `allow` rule runs it immediately. Absent a matching rule, `--allow-shell` or `allow_shell = true` allows it, and `allow_shell = false` (the default) asks for approval rather than blocking — a direct CLI command or other headless caller that hits that ask with no prompt to answer gets a structured permission-required refusal instead of executing or hanging. Once approved, it runs with your process permissions, including possible network access and access beyond the project. It is not a sandbox.
 
 The built-in shell receives a finite compatibility subset of inherited variables
 for command discovery, home/profile, temporary paths, locale, time, and standard

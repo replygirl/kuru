@@ -39,7 +39,7 @@ Calls are limited to 60 seconds and 2 MiB. Pagination is bounded; repeated curso
 
 For direct commands, an unavailable stdio server can include a recent bounded stderr tail on stderr. Kuru replaces its documented finite set of recognizable secret patterns before retention, then escapes terminal controls. This can miss encoded, transformed, new, or deliberately disguised secrets, and ordinary server-authored paths, URLs, or configuration-like text can remain. Runtime events, model input, and memory receive only fixed unavailable metadata, not the captured tail.
 
-Enabling a server grants access to its tools. Its permissions are independent of Kuru's built-in `allow_write` and `allow_shell` switches.
+Enabling a server grants access to its tools. Its own permissions are independent of Kuru's built-in `allow_write` and `allow_shell` switches, though a [`[[permissions]]` rule](./configuration#tool-permissions) can additionally `allow`, `ask`, or `deny` a specific `{ kind = "mcp", alias, tool }` selector — MCP tool arguments have no pattern matching.
 
 ## Current scope
 
