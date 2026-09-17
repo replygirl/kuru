@@ -82,3 +82,77 @@ fn native_validation_keeps_cross_field_rules_authoritative() {
         assert!(parse_config(text).is_err(), "{text}");
     }
 }
+
+#[test]
+fn permission_schema_and_parser_agree_on_documented_and_invalid_rules() {
+    let validator = schema();
+    let documented = concat!(
+        "allow_write=false\n",
+        "[[permissions]]\naction='ask'\nselector={kind='native',name='file_write'}\npath='src/**'\n",
+        "[[permissions]]\naction='deny'\nselector={kind='native',name='shell'}\n",
+        "[[permissions]]\naction='ask'\nselector={kind='mcp',alias='local_service',tool='write_document'}\n",
+        "[[permissions]]\naction='ask'\nselector={kind='a2a',alias='research_peer'}\n",
+        "[mcp.local_service]\ncommand='runner'\n",
+        "[external_agents]\nresearch_peer='https://example.test/a2a'\n"
+    );
+    assert!(validator.is_valid(&json_from_toml(documented)));
+    assert_eq!(parse_config(documented).unwrap().permissions.len(), 4);
+
+    for rule in [
+        "action='permit'\nselector={kind='native',name='file_write'}",
+        "action='allow'\nselector={kind='native',name='missing'}",
+        "action='allow'\nselector={kind='native',name='file_write',description='anything'}",
+        "action='allow'\nselector={kind='native',name='file_write'}\nextra=true",
+        "action='allow'\nselector={kind='native',name='file_write'}\npath='/absolute'",
+        "action='allow'\nselector={kind='native',name='file_write'}\npath='src/../secret'",
+        "action='allow'\nselector={kind='native',name='file_write'}\npath='src/a**b'",
+        "action='allow'\nselector={kind='native',name='file_write'}\npath='src/[ab]'",
+        "action='allow'\nselector={kind='native',name='shell'}\npath='src/**'",
+    ] {
+        let text = format!("[[permissions]]\n{rule}");
+        assert!(
+            !validator.is_valid(&json_from_toml(&text)),
+            "schema: {text}"
+        );
+        assert!(parse_config(&text).is_err(), "parser: {text}");
+    }
+
+    // Unicode scalar counts, rather than UTF-8 byte counts, match the schema's
+    // maxLength contract. The same C0, DEL and C1 controls are forbidden.
+    for pattern in ["1:report", &"é".repeat(512)] {
+        let text = format!(
+            "[[permissions]]\naction='ask'\nselector={{kind='native',name='file_read'}}\npath='{pattern}'"
+        );
+        assert!(validator.is_valid(&json_from_toml(&text)), "schema: {text}");
+        parse_config(&text).unwrap();
+    }
+    let oversized = "é".repeat(513);
+    let text = format!(
+        "[[permissions]]\naction='ask'\nselector={{kind='native',name='file_read'}}\npath='{oversized}'"
+    );
+    assert!(!validator.is_valid(&json_from_toml(&text)));
+    assert!(parse_config(&text).is_err());
+    for (length, accepted) in [(256, true), (257, false)] {
+        let tool = "é".repeat(length);
+        let text = format!(
+            "[[permissions]]\naction='ask'\nselector={{kind='mcp',alias='files',tool='{tool}'}}\n[mcp.files]\ncommand='runner'"
+        );
+        assert_eq!(validator.is_valid(&json_from_toml(&text)), accepted);
+        assert_eq!(parse_config(&text).is_ok(), accepted);
+    }
+    for control in ['\u{7f}', '\u{85}'] {
+        let path = format!("src/{control}");
+        let value = serde_json::json!({"permissions":[{
+            "action":"ask", "selector":{"kind":"native","name":"file_read"}, "path":path
+        }]});
+        assert!(!validator.is_valid(&value));
+        let text = format!(
+            "[[permissions]]\naction='ask'\nselector={{kind='native',name='file_read'}}\npath='src/{control}'"
+        );
+        assert!(parse_config(&text).is_err());
+        let value = serde_json::json!({"permissions":[{
+            "action":"ask", "selector":{"kind":"mcp","alias":"files","tool":format!("write{control}")}
+        }]});
+        assert!(!validator.is_valid(&value));
+    }
+}

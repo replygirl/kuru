@@ -163,8 +163,17 @@ autodiscovery or implicit trust.
 Concurrency, peer rounds and tool-call budgets bound cyclic conversation.
 Cancellation is an explicit signal through actor, provider, tool, A2A and dream
 waits. Accepted memory writes still settle or reconcile, and shell or MCP owners
-keep responsibility for their process cleanup. File read/list operations are available
-within the root; mutations require write opt-in. Shell execution requires a
-separate opt-in and is ordinary process authority. A working directory is not
-a security sandbox. MCP servers and configured external endpoints are trusted
-extensions and can have their own authority beyond Kuru's built-in file tools.
+keep responsibility for their process cleanup. After workspace trust, core
+permission rules select allow, ask or deny. The connector service checks the
+validated invocation at native/MCP execution and before runtime outbound A2A.
+Explicit deny always wins; an unresolved ask without a foreground approval
+channel returns a typed refusal. The app owns private persistent grant files;
+session grants live only in the running session, and once decisions remain
+bound to one invocation. No approval channel is inherited by background work.
+
+File tools retain root containment and protected-path checks regardless of
+grants. Shell execution is ordinary process authority. A working directory is
+not a security sandbox. MCP servers and configured external endpoints can have
+their own authority beyond Kuru's built-in file tools. See
+[tool permissions](configuration.md#tool-permissions) for rule precedence and
+approval scopes.

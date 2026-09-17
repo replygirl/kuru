@@ -5,6 +5,7 @@ mod a2a;
 mod auth;
 mod http;
 mod mcp;
+pub mod permissions;
 #[cfg(windows)]
 mod process;
 mod providers;
@@ -23,6 +24,11 @@ mod test_support;
 pub use a2a::a2a_send;
 pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
 pub use mcp::McpStatus;
+pub use permissions::{
+    ApprovalAnswer, ApprovalRequest, ApprovalSender, GrantInspection, GrantRevocation, GrantScope,
+    PermissionBinding, PermissionDisplay, PermissionGrantStore, PermissionInvocation,
+    PermissionOutcome, PermissionService, PersistentGrant,
+};
 pub use providers::{
     DemoProvider, Provider, ProviderEvent, ProviderFailureKind, ProviderSink, ResponsesProvider,
     TextDeltaSource, collect_completion, provider,

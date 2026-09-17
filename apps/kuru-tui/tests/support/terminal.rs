@@ -332,8 +332,16 @@ impl Terminal {
             READY_TIMEOUT,
             |terminal| {
                 let screen = terminal.screen();
-                let composer: String = screen.lines().rev().take(5).collect();
-                Ok(composer.contains(text))
+                let rows = screen.lines().collect::<Vec<_>>();
+                // The dock grows as controls are added. Find the rendered
+                // separator instead of assuming a fixed number of bottom rows.
+                let separator = rows
+                    .iter()
+                    .rposition(|row| row.trim_start().starts_with(".    ."));
+                Ok(separator.is_some_and(|row| {
+                    rows.get(row + 1..rows.len().saturating_sub(1))
+                        .is_some_and(|composer| composer.join("\n").contains(text))
+                }))
             },
         )?;
         self.send(b"\r")?;

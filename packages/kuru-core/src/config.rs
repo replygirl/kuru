@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{Framework, Mode};
+use crate::permissions;
+use crate::{
+    Framework, Mode, PermissionAction, PermissionRule, PermissionSelector, ProjectRelativeTarget,
+};
 
 const MAX_FILE_BYTES: usize = 256 * 1024;
 const MAX_COMBINED_BYTES: usize = 1024 * 1024;
@@ -87,6 +90,7 @@ pub enum AuthorityClaimCategory {
     ResponsesRoute,
     ExternalAgent,
     ProjectInstructions,
+    ToolPermissions,
 }
 
 impl AuthorityClaimCategory {
@@ -94,6 +98,7 @@ impl AuthorityClaimCategory {
         match self {
             Self::WorkspaceWrite => "workspace write",
             Self::Shell => "shell",
+            Self::ToolPermissions => "tool permissions",
             Self::McpStdio => "stdio MCP",
             Self::McpHttp => "HTTP MCP",
             Self::MemoryDoltBinary => "memory executable",
@@ -393,6 +398,7 @@ pub struct Config {
     pub max_parts: usize,
     pub allow_shell: bool,
     pub allow_write: bool,
+    pub permissions: Vec<PermissionRule>,
     pub api_base: String,
     pub api_key_env: String,
     pub mcp: BTreeMap<String, McpConfig>,
@@ -416,6 +422,7 @@ impl Default for Config {
             max_parts: 16,
             allow_shell: false,
             allow_write: false,
+            permissions: Vec::new(),
             api_base: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             mcp: BTreeMap::new(),
@@ -573,6 +580,8 @@ impl ConfigSnapshot {
             .memory
             .validate()
             .map_err(|_| config_error("validation", provisional.workspace()))?;
+        permissions::validate_rules(&config.permissions)
+            .map_err(|_| config_error("validation", provisional.workspace()))?;
         let manifest = derive_manifest(&config, &value_origins, &instruction_sources)?;
         Ok(Self {
             memory: config.memory.clone(),
@@ -678,6 +687,31 @@ impl ConfigSnapshot {
 }
 
 impl Config {
+    /// Decide a checked invocation. The caller must have validated the physical
+    /// workspace root, protected paths and file target before using this result.
+    pub fn permission_decision(
+        &self,
+        selector: &PermissionSelector,
+        target: Option<&ProjectRelativeTarget>,
+    ) -> PermissionAction {
+        match selector {
+            PermissionSelector::Mcp { alias, .. } if !self.mcp.contains_key(alias) => {
+                return PermissionAction::Deny;
+            }
+            PermissionSelector::A2a { alias } if !self.external_agents.contains_key(alias) => {
+                return PermissionAction::Deny;
+            }
+            _ => {}
+        }
+        permissions::decide(
+            &self.permissions,
+            selector,
+            target,
+            self.allow_write,
+            self.allow_shell,
+        )
+    }
+
     /// Merge user, outer-to-inner project, then explicit local TOML.
     ///
     /// Missing ancestor files are normal. An explicitly provided user or local
@@ -717,6 +751,24 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         self.memory.validate()?;
+        permissions::validate_rules(&self.permissions)?;
+        for rule in &self.permissions {
+            match &rule.selector {
+                PermissionSelector::Mcp { alias, .. } => {
+                    ensure!(
+                        self.mcp.contains_key(alias),
+                        "permission MCP alias is not configured"
+                    );
+                }
+                PermissionSelector::A2a { alias } => {
+                    ensure!(
+                        self.external_agents.contains_key(alias),
+                        "permission A2A alias is not configured"
+                    );
+                }
+                PermissionSelector::Native { .. } => {}
+            }
+        }
         ensure!(
             matches!(self.provider.as_str(), "codex" | "responses" | "demo"),
             "provider must be codex, responses, or demo"
@@ -1114,6 +1166,19 @@ fn derive_manifest(
             config.allow_shell,
             &shell_origins,
             "shell enabled",
+        )?;
+    }
+    let permission_origins = automatic_origins(origins, "permissions");
+    if !permission_origins.is_empty() {
+        push_claim(
+            &mut claims,
+            AuthorityClaimCategory::ToolPermissions,
+            &config.permissions,
+            &permission_origins,
+            format!(
+                "{} ordered tool permission rule(s)",
+                config.permissions.len()
+            ),
         )?;
     }
     let binary_origins = automatic_origins(origins, "memory.dolt_binary");

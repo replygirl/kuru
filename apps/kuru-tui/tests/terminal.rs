@@ -621,6 +621,286 @@ impl Drop for Server {
 }
 
 #[derive(Clone)]
+struct PermissionProvider {
+    tool: String,
+    arguments: String,
+}
+
+async fn permission_complete(
+    State(state): State<PermissionProvider>,
+    Json(request): Json<Value>,
+) -> Response {
+    let speaking = request["instructions"]
+        .as_str()
+        .is_some_and(|text| text.contains("Phase: speak and act"));
+    let continued = request["input"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    });
+    let output = if !speaking || continued {
+        json!([{"type":"message","content":[{"type":"output_text","text":"PERMISSION_FINAL"}]}])
+    } else {
+        json!([{"type":"function_call","call_id":"permission-fixture", "name":state.tool,
+            "arguments":state.arguments}])
+    };
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.completed",
+                "response":{"id":"permission-response","status":"completed","output":output,
+                    "usage":{"input_tokens":8,"output_tokens":5}}
+            })
+        ),
+    )
+        .into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_permission_choices_show_exact_file_scope_and_revoke_grants() -> Result<()> {
+    for (answer, dimensions, granted, remembered) in [
+        (b"\x1b1".as_slice(), (24, 80), true, false),
+        (b"\x1b2".as_slice(), (35, 120), true, true),
+        (b"\x1b3".as_slice(), (24, 80), true, true),
+        (b"\x1b4".as_slice(), (35, 120), false, false),
+    ] {
+        let sandbox = Sandbox::new()?;
+        let marker = sandbox.project.join("literal[1].txt");
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+            )
+            .route("/v1/responses", post(permission_complete))
+            .with_state(PermissionProvider {
+                tool: "file_write".into(),
+                arguments: json!({"path":"literal[1].txt","content":"approved"}).to_string(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = sandbox.root.path().join("permission-provider.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=3\n",
+                listener.local_addr()?
+            ),
+        )?;
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        let mut command = sandbox.command("responses");
+        command
+            .args(["--model", "fixture", "--mode", "freudian", "--config"])
+            .arg(&config)
+            .env("KURU_FIXTURE_KEY", "fixture")
+            .env("KURU_REDUCED_MOTION", "1");
+        let mut terminal = Terminal::spawn(command, dimensions.0, dimensions.1)?;
+        terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+        terminal.send(b"Permission fixture turn\r")?;
+        terminal.wait_composer_frame(
+            &[
+                "Permission request",
+                "literal[1].txt",
+                "Alt+1 Once",
+                "esc cancel",
+            ],
+            READY_TIMEOUT,
+        )?;
+        ensure!(!marker.exists(), "file operation ran before approval");
+        terminal.send(answer)?;
+        terminal.wait("permission choice settled", READY_TIMEOUT, |terminal| {
+            let screen = terminal.screen();
+            Ok(!screen.contains("Permission request") && screen.contains("enter send"))
+        })?;
+        ensure_eq_marker(&marker, granted)?;
+        terminal.send(b"/permissions\r")?;
+        if remembered {
+            terminal.wait_text(&["Selected exact scope", "literal[1].txt"], &[])?;
+            terminal.send(b"\x1b[3~")?;
+            terminal.wait_text(&["No session or always grants"], &[])?;
+        } else {
+            terminal.wait_text(&["No session or always grants"], &[])?;
+        }
+        terminal.send(b"\x1b")?;
+        terminal.wait("permission inspector closed", READY_TIMEOUT, |terminal| {
+            Ok(!terminal.screen().contains("Permissions · ↑↓ select"))
+        })?;
+        terminal.send(b"/quit\r")?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        terminal.assert_restored()?;
+    }
+    Ok(())
+}
+
+fn ensure_eq_marker(path: &std::path::Path, expected: bool) -> Result<()> {
+    ensure!(
+        path.exists() == expected,
+        "unexpected permission effect at {}",
+        path.display()
+    );
+    if expected {
+        ensure!(
+            std::fs::read_to_string(path)? == "approved",
+            "file content changed unexpectedly"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_shell_permission_cancel_closes_reply_and_preserves_draft() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let marker = sandbox.project.join("shell-permission-marker");
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(permission_complete))
+        .with_state(PermissionProvider {
+            tool: "shell".into(),
+            arguments: json!({"command":"printf approved > shell-permission-marker"}).to_string(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("permission-shell.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=3\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap()
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--mode", "freudian", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 24, 80)?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.send(b"First shell turn\r")?;
+    terminal.wait_composer_frame(
+        &[
+            "Permission request",
+            "native shell",
+            "whole tool",
+            "Alt+4 Deny",
+        ],
+        READY_TIMEOUT,
+    )?;
+    terminal.send(b"Next draft")?;
+    terminal.wait_composer_frame(&["Next draft", "Permission request"], READY_TIMEOUT)?;
+    ensure!(
+        !marker.exists(),
+        "shell ran while permission reply was pending"
+    );
+    terminal.send(b"\x1b")?;
+    terminal.wait_composer_frame(&["Cancelled", "Next draft", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"\x1b1")?;
+    ensure!(
+        !marker.exists(),
+        "late answer dispatched the cancelled shell invocation"
+    );
+    terminal.send(b"\r")?;
+    terminal.wait_composer_frame(
+        &["Permission request", "native shell", "whole tool"],
+        READY_TIMEOUT,
+    )?;
+    ensure!(
+        !marker.exists(),
+        "new shell invocation ran before its own decision"
+    );
+    terminal.send(b"\x1b4")?;
+    terminal.wait("denied shell settled", READY_TIMEOUT, |terminal| {
+        Ok(!terminal.screen().contains("Permission request")
+            && terminal.screen().contains("enter send"))
+    })?;
+    ensure!(!marker.exists(), "denied shell created a marker");
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_long_literal_permission_scope_survives_resize_and_inspection() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let parent = "a".repeat(220);
+    let leaf = "b".repeat(220);
+    std::fs::create_dir(sandbox.project.join(&parent))?;
+    let target = format!("{parent}/{leaf}");
+    let marker = sandbox.project.join(&target);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(permission_complete))
+        .with_state(PermissionProvider {
+            tool: "file_write".into(),
+            arguments: json!({"path":target,"content":"approved"}).to_string(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("permission-long-file.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=3\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap()
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--mode", "freudian", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 24, 48)?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.send(b"Long literal path turn\r")?;
+    terminal.wait_composer_frame(
+        &["Permission request", "Exact grant scope", "Alt+1 Once"],
+        READY_TIMEOUT,
+    )?;
+    ensure!(!marker.exists(), "long-path operation ran before approval");
+    terminal.send(b"\x1b[B\x1b[B\x1b[B")?;
+    terminal.resize(35, 120)?;
+    terminal.wait_composer_frame(
+        &[
+            "Permission request",
+            &parent[..16],
+            &leaf[..16],
+            "Alt+2 Session",
+        ],
+        READY_TIMEOUT,
+    )?;
+    terminal.send(b"\x1b2")?;
+    terminal.wait("long-path grant settled", READY_TIMEOUT, |terminal| {
+        Ok(!terminal.screen().contains("Permission request")
+            && terminal.screen().contains("enter send"))
+    })?;
+    ensure_eq_marker(&marker, true)?;
+    terminal.send(b"/permissions\r")?;
+    terminal.wait_text(&["Selected exact scope", &parent[..16], &leaf[..16]], &[])?;
+    terminal.send(b"\x1b[3~")?;
+    terminal.wait_text(&["No session or always grants"], &[])?;
+    terminal.send(b"\x1b")?;
+    terminal.wait("permission inspector closed", READY_TIMEOUT, |terminal| {
+        Ok(!terminal.screen().contains("Permissions · ↑↓ select"))
+    })?;
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
+#[derive(Clone)]
 struct StreamingState {
     selected_started: Arc<AtomicBool>,
     selected_requests: Arc<AtomicUsize>,

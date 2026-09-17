@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
+use kuru_connectors::permissions::{PermissionBinding, PermissionService};
 use kuru_connectors::{McpStatus, Provider, ToolHost, provider};
 use kuru_core::{
     AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
@@ -20,6 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     memory_export,
+    permission_store::GrantStore,
     trust::{ApprovalState, ApprovalStore},
 };
 
@@ -46,12 +48,16 @@ pub struct Cli {
     pub effort: Option<String>,
     #[arg(long, global = true)]
     pub resume: Option<String>,
-    #[arg(long, global = true, help = "Allow workspace file mutations")]
+    #[arg(
+        long,
+        global = true,
+        help = "Allow workspace file mutations unless an explicit permission rule restricts them"
+    )]
     pub allow_write: bool,
     #[arg(
         long,
         global = true,
-        help = "Allow shell processes with your process authority (not a sandbox)"
+        help = "Allow shell unless an explicit permission rule restricts it (process authority, not a sandbox)"
     )]
     pub allow_shell: bool,
     #[arg(long, global = true)]
@@ -761,7 +767,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 return Ok(());
             }
             Some(Command::Tool { name, args }) => {
-                let host = ToolHost::with_retained_root(root.clone(), &config)?;
+                let host = permission_host(&data, root.clone(), &config, &snapshot)?;
                 let result = async {
                     let arguments = serde_json::from_str(args)?;
                     let catalog = host.catalog().await?;
@@ -775,7 +781,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 return Ok(());
             }
             Some(Command::Tools) => {
-                let host = ToolHost::with_retained_root(root.clone(), &config)?;
+                let host = permission_host(&data, root.clone(), &config, &snapshot)?;
                 let catalog = host.catalog().await;
                 let cleanup = host.shutdown().await;
                 let catalog = catalog?;
@@ -815,7 +821,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         let memory = match existing_memory {
             Some(memory) => memory,
             None => {
-                let mut options = MemoryOptions::new(data, scope);
+                let mut options = MemoryOptions::new(data.clone(), scope);
                 options.config = memory_config;
                 open_memory(options).await?
             }
@@ -829,7 +835,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         {
             notice.announce().await?;
         }
-        let tools = ToolHost::with_retained_root(root.clone(), &config)?;
+        let tools = permission_host(&data, root.clone(), &config, &snapshot)?;
         let mut harness = Harness::with_tool_host_and_instructions(
             config,
             &cwd,
@@ -948,6 +954,18 @@ fn report_mcp_statuses(statuses: &[McpStatus]) {
     }
 }
 
+fn permission_host(
+    data: &Path,
+    root: Arc<Directory>,
+    config: &Config,
+    snapshot: &ConfigSnapshot,
+) -> Result<ToolHost> {
+    let binding = PermissionBinding::checked(&root, snapshot.manifest().full_digest(), config)?;
+    let store = Arc::new(GrantStore::new(data, root.clone(), binding.clone())?);
+    let permissions = Arc::new(PermissionService::new(config.clone(), binding, store)?);
+    ToolHost::with_permission_service(root, config, permissions)
+}
+
 fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClaimCategory> {
     use AuthorityClaimCategory as Category;
     [
@@ -960,6 +978,7 @@ fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClaimCategory> 
         Category::ResponsesRoute,
         Category::ExternalAgent,
         Category::ProjectInstructions,
+        Category::ToolPermissions,
     ]
     .into_iter()
     .collect()
@@ -982,6 +1001,7 @@ fn command_claim_categories(
         Some(Command::Tool { .. } | Command::Tools) => &[
             Category::WorkspaceWrite,
             Category::Shell,
+            Category::ToolPermissions,
             Category::McpStdio,
             Category::McpHttp,
             Category::MemoryDoltBinary,
@@ -990,6 +1010,7 @@ fn command_claim_categories(
         None | Some(Command::Run { .. } | Command::Dream | Command::Serve { .. }) => &[
             Category::WorkspaceWrite,
             Category::Shell,
+            Category::ToolPermissions,
             Category::McpStdio,
             Category::McpHttp,
             Category::MemoryDoltBinary,
@@ -1303,4 +1324,56 @@ async fn build_windows_source(source: &Path) -> Result<PathBuf> {
         source.join(target)
     };
     Ok(target.join(host).join("release/kuru.exe"))
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn automatic_permission_claim_is_reviewed_but_trust_does_not_grant_a_call() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        let data = temporary.path().join("data");
+        std::fs::create_dir_all(project.join(".kuru")).unwrap();
+        std::fs::write(
+            project.join(".kuru/config.toml"),
+            concat!(
+                "[[permissions]]\naction='ask'\n",
+                "selector={kind='native',name='file_write'}\n"
+            ),
+        )
+        .unwrap();
+        let root =
+            Arc::new(Directory::open(&project, Privacy::Inherited, NameRetention::Pinned).unwrap());
+        let snapshot =
+            ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+        let cli = Cli::try_parse_from(["kuru", "tool", "file_write", "--args", "{}"]).unwrap();
+        let error = preflight(&cli, &root, &data, &snapshot).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("workspace authority is not approved")
+        );
+        assert!(all_claim_categories().contains(&AuthorityClaimCategory::ToolPermissions));
+        ApprovalStore::new(&data, &root)
+            .approve_command(snapshot.manifest())
+            .unwrap();
+        preflight(&cli, &root, &data, &snapshot).unwrap();
+        let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
+        let host = permission_host(&data, root, &config, &snapshot).unwrap();
+        let refused = host
+            .execute(
+                "file_write",
+                serde_json::json!({"path":"note.txt","content":"must not be written"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            kuru_connectors::is_permission_denied(&refused),
+            "unexpected projected tool error: {refused:#}"
+        );
+        assert!(!project.join("note.txt").exists());
+        host.shutdown().await.unwrap();
+    }
 }

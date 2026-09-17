@@ -45,6 +45,15 @@ previews of other modes show their built-in members and are labeled as previews.
 No-match results remain editable. Settings cannot change halfway through active
 work; the status line explains that constraint without losing the draft.
 
+Permission requests appear above the composer, with a redacted operation preview
+and the exact file or whole-tool grant scope. Alt+1–4 select once, session,
+always or deny without consuming ordinary draft input. Remembered choices are
+unavailable when redaction or shortening prevents a complete scope display.
+F5 or `/permissions` opens grant inspection; revocation acts on the selected
+scope itself. Up/Down selects a grant and PgUp/PgDn scrolls its complete scope;
+Delete revokes it. Pending replies belong to one foreground operation and are
+discarded on cancellation, completion or shutdown.
+
 Conversation styling distinguishes speakers, headings, quotations, bullets, code
 fences, inline code and bold text. This is a small terminal presentation layer,
 not a full Markdown engine.

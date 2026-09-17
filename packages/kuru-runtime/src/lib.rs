@@ -68,5 +68,8 @@ mod mode_baseline_tests;
 #[cfg(test)]
 mod progress_tests;
 
+#[cfg(test)]
+mod permission_tests;
+
 #[cfg(all(test, windows))]
 mod windows_tool_tests;
