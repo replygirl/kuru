@@ -26,6 +26,8 @@ use std::{os::unix::fs::PermissionsExt, process::Stdio};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const OUTPUT_LIMIT: u64 = 1024 * 1024;
+const BOOTSTRAP_INVENTORY_ENTRIES: usize = 64;
+const BOOTSTRAP_INVENTORY_BYTES: usize = 4096;
 // Cold creation starts staging and active servers, each with the configured
 // 30-second bound, then includes their handshakes and bounded shutdowns.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(100);
@@ -40,6 +42,8 @@ const BOOTSTRAP_PHASES: &[&str] = &[
     "Kuru bootstrap phase: loading release archive",
     "Kuru bootstrap phase: release archive verified",
     "Kuru bootstrap phase: release archive validated",
+    "Kuru bootstrap phase: installation stage opened",
+    "Kuru bootstrap phase: publication starting",
     "Kuru bootstrap phase: installation published",
     "Kuru bootstrap phase: cleanup complete",
 ];
@@ -60,6 +64,138 @@ fn digest(path: &Path) -> Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+fn bounded_bootstrap_inventory(install_dir: &Path) -> String {
+    fn stage_name(name: &str) -> bool {
+        let Some(uuid) = name.strip_prefix(".kuru-install-") else {
+            return false;
+        };
+        uuid.len() == 36
+            && uuid.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+    }
+
+    fn entry(path: &Path, name: &str) -> String {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                let kind = if metadata.file_type().is_file() {
+                    "file"
+                } else if metadata.file_type().is_dir() {
+                    "directory"
+                } else if metadata.file_type().is_symlink() {
+                    "symlink"
+                } else {
+                    "other"
+                };
+                format!("{name}={kind}:{}", metadata.len())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                format!("{name}=absent")
+            }
+            Err(error) => format!("{name}=error:{:?}", error.kind()),
+        }
+    }
+
+    let root = entry(install_dir, "install");
+    let Ok(metadata) = fs::symlink_metadata(install_dir) else {
+        return root;
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return root;
+    }
+    let mut entries = match fs::read_dir(install_dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .take(BOOTSTRAP_INVENTORY_ENTRIES)
+            .collect::<Vec<_>>(),
+        Err(error) => return format!("{root}; entries=error:{:?}", error.kind()),
+    };
+    entries.sort_by_key(|entry| entry.file_name());
+    let target = entry(&install_dir.join("kuru.exe"), "target");
+    let stage = entries.into_iter().find(|entry| {
+        entry.file_name().to_str().is_some_and(stage_name)
+            && fs::symlink_metadata(entry.path()).is_ok_and(|metadata| {
+                metadata.file_type().is_dir() && !metadata.file_type().is_symlink()
+            })
+    });
+    let detail = stage.map_or_else(
+        || "stage=absent; candidate=absent".to_owned(),
+        |stage| {
+            let name = stage.file_name();
+            let name = name.to_string_lossy().chars().take(128).collect::<String>();
+            let path = stage.path();
+            let stage = entry(&path, &format!("stage:{name}"));
+            let candidate = entry(&path.join("kuru.exe"), "candidate");
+            format!("{stage}; {candidate}")
+        },
+    );
+    let inventory = format!("{root}; {target}; {detail}");
+    let mut end = inventory.len().min(BOOTSTRAP_INVENTORY_BYTES);
+    while !inventory.is_char_boundary(end) {
+        end -= 1;
+    }
+    inventory[..end].to_owned()
+}
+
+#[cfg(test)]
+mod bootstrap_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_inventory_is_direct_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = bounded_bootstrap_inventory(&root.path().join("absent"));
+        assert_eq!(absent, "install=absent");
+
+        let install = root.path().join("install");
+        fs::create_dir(&install).unwrap();
+        fs::write(install.join("kuru.exe"), b"target").unwrap();
+        let first = install.join(".kuru-install-00000000-0000-0000-0000-000000000000");
+        let second = install.join(".kuru-install-11111111-1111-1111-1111-111111111111");
+        fs::create_dir(install.join(".kuru-install-not-a-uuid")).unwrap();
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(first.join("kuru.exe"), b"candidate").unwrap();
+        let inventory = bounded_bootstrap_inventory(&install);
+        assert!(inventory.contains("target=file:6"), "{inventory}");
+        assert_eq!(
+            inventory.matches("stage:.kuru-install-").count(),
+            1,
+            "{inventory}"
+        );
+        assert!(!inventory.contains("not-a-uuid"), "{inventory}");
+        assert!(inventory.contains("candidate=file:9"), "{inventory}");
+        assert!(inventory.len() <= BOOTSTRAP_INVENTORY_BYTES);
+
+        let unsupported = root.path().join("ordinary-file");
+        fs::write(&unsupported, b"").unwrap();
+        assert!(
+            bounded_bootstrap_inventory(&unsupported).starts_with("install=file:0"),
+            "regular-file roots must not be opened as directories"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_inventory_does_not_follow_install_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("kuru.exe"), b"target").unwrap();
+        let link = root.path().join("install-link");
+        symlink(&target, &link).unwrap();
+        let inventory = bounded_bootstrap_inventory(&link);
+        assert!(inventory.starts_with("install=symlink:"), "{inventory}");
+        assert!(!inventory.contains("target="), "{inventory}");
+    }
 }
 
 #[cfg(unix)]
@@ -624,9 +760,15 @@ async fn install_packaged(
     if let Some(value) = std::env::var_os("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", value);
     }
-    let output = execute(&mut command)
-        .await
-        .context("execute stock PowerShell package installation")?;
+    let output = match execute(&mut command).await {
+        Ok(output) => output,
+        Err(error) => {
+            let inventory = bounded_bootstrap_inventory(install_dir);
+            return Err(error).context(format!(
+                "execute stock PowerShell package installation; bootstrap inventory: {inventory}"
+            ));
+        }
+    };
     ensure!(
         output.status.success(),
         "stock PowerShell could not install the genuine packaged Kuru: {}\n{}",
