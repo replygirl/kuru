@@ -7,6 +7,10 @@ param(
     [string]$InstallDir,
     [switch]$Recover
 )
+if ($PSBoundParameters.ContainsKey('Verbose') -and [bool]$PSBoundParameters['Verbose']) {
+    [Console]::Error.WriteLine('Kuru bootstrap direct checkpoint: script entered')
+    [Console]::Error.Flush()
+}
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 Write-Verbose 'Kuru bootstrap phase: entered'
@@ -19,6 +23,10 @@ Write-Verbose 'Kuru bootstrap phase: entered'
 # https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-lockfileex
 # https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-movefileexw
 if (-not ('Kuru.Bootstrap.Native' -as [type])) {
+if ($PSBoundParameters.ContainsKey('Verbose') -and [bool]$PSBoundParameters['Verbose']) {
+    [Console]::Error.WriteLine('Kuru bootstrap direct checkpoint: native bridge starting')
+    [Console]::Error.Flush()
+}
 Write-Verbose 'Kuru bootstrap phase: loading native bridge'
 Add-Type -TypeDefinition @'
 using System;
@@ -505,6 +513,10 @@ public static class Native {
 }
 }
 '@
+}
+if ($PSBoundParameters.ContainsKey('Verbose') -and [bool]$PSBoundParameters['Verbose']) {
+    [Console]::Error.WriteLine('Kuru bootstrap direct checkpoint: native bridge ready')
+    [Console]::Error.Flush()
 }
 Write-Verbose 'Kuru bootstrap phase: native bridge ready'
 

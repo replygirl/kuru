@@ -47,6 +47,12 @@ const BOOTSTRAP_PHASES: &[&str] = &[
     "Kuru bootstrap phase: installation published",
     "Kuru bootstrap phase: cleanup complete",
 ];
+#[cfg(windows)]
+const BOOTSTRAP_DIRECT_CHECKPOINTS: &[&str] = &[
+    "Kuru bootstrap direct checkpoint: script entered",
+    "Kuru bootstrap direct checkpoint: native bridge starting",
+    "Kuru bootstrap direct checkpoint: native bridge ready",
+];
 
 fn digest(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
@@ -261,6 +267,16 @@ async fn execute(command: &mut Command) -> Result<Output> {
 fn assert_bootstrap_phases(output: &Output) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut checkpoint_offset = 0;
+    for checkpoint in BOOTSTRAP_DIRECT_CHECKPOINTS {
+        let Some(found) = stderr[checkpoint_offset..].find(checkpoint) else {
+            anyhow::bail!(
+                "stock PowerShell omitted direct bootstrap checkpoint {checkpoint:?}; stderr prefix: {:?}",
+                String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(64 * 1024)])
+            );
+        };
+        checkpoint_offset += found + checkpoint.len();
+    }
     let captured = format!("{stdout}\n{stderr}");
     let mut offset = 0;
     for phase in BOOTSTRAP_PHASES {

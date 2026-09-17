@@ -258,7 +258,7 @@ async fn held_candidate_view_delays_explicit_abandonment_without_losing_history(
         .await?;
     let names = CandidateNames::from_open(&candidate.view.branch)?;
     let target = candidate.view().revision().await?;
-    let held = candidate.view.pool.acquire().await?.detach();
+    let (held, held_id) = owned_connection(&candidate.view.pool).await?;
     let error = candidate
         .abandon()
         .await
@@ -270,6 +270,7 @@ async fn held_candidate_view_delays_explicit_abandonment_without_losing_history(
     assert!(store.history("candidate history", 10).await?.is_empty());
 
     drop(held);
+    await_session_end(&store.pool, held_id, TEST_DEADLINE).await?;
     tokio::time::timeout(TEST_DEADLINE, candidate.abandon()).await??;
     assert!(candidate_heads(&store.pool, &names).await?.is_empty());
     store.put("after held view", &json!(true)).await?;

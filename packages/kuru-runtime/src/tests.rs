@@ -351,6 +351,13 @@ async fn authored_tie_break_skips_missing_parts_and_falls_back_to_stable_ids() {
     assert_eq!(speaker, authored[1]);
     assert_eq!(reason, "mode-authored-order");
 
+    for (id, name) in [("dream-z", "Dream Z"), ("dream-a", "Dream A")] {
+        let mut part = harness.topology.parts[0].clone();
+        part.id = id.into();
+        part.name = name.into();
+        harness.topology.parts.push(part);
+    }
+    harness.sync_actors();
     let drafts = BTreeMap::from([
         ("dream-z".to_string(), "z".into()),
         ("dream-a".to_string(), "a".into()),

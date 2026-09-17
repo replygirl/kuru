@@ -422,10 +422,22 @@ async fn all_four_modes_keep_pre_extraction_requests_and_facing_outcomes() {
             ("dream-z".to_string(), "candidate z".to_string()),
             ("dream-a".to_string(), "candidate a".to_string()),
         ]);
+        for (id, name) in [("dream-z", "Dream Z"), ("dream-a", "Dream A")] {
+            let mut part = seeds[0].clone();
+            part.id = id.into();
+            part.name = name.into();
+            harness.topology.parts.push(part);
+        }
+        harness.sync_actors();
         assert_eq!(
             harness.select_speaker(&dream_only),
             ("dream-a".into(), "stable-id-order")
         );
+        harness
+            .topology
+            .parts
+            .retain(|part| !dream_only.contains_key(&part.id));
+        harness.sync_actors();
         assert_eq!(
             harness.namespace(&ids[0]),
             format!("{}/{mode}/identity/{}", harness.scope, ids[0])
