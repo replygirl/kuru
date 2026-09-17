@@ -155,9 +155,15 @@ pub fn draw(frame: &mut Frame<'_>, view: &View) {
     .len()
     .clamp(2, 5) as u16;
     let dock_height = (input_rows + control_rows + 2).min(area.height.saturating_sub(3));
+    let preview_height = if view.preview.is_some() {
+        6.min(area.height.saturating_sub(dock_height + 5))
+    } else {
+        0
+    };
     let rows = Layout::vertical([
         Constraint::Length(if area.height >= 16 { 2 } else { 1 }),
         Constraint::Min(0),
+        Constraint::Length(preview_height),
         Constraint::Length(1),
         Constraint::Length(dock_height),
         Constraint::Length(1),
@@ -176,12 +182,112 @@ pub fn draw(frame: &mut Frame<'_>, view: &View) {
     } else {
         draw_conversation(frame, view, rows[1]);
     }
-    draw_status(frame, view, rows[2]);
-    draw_composer(frame, view, rows[3]);
-    draw_footer(frame, view, rows[4]);
+    draw_preview(frame, view, rows[2]);
+    draw_status(frame, view, rows[3]);
+    draw_composer(frame, view, rows[4]);
+    draw_footer(frame, view, rows[5]);
     if view.picker.is_some() {
         draw_picker(frame, view, area);
     }
+}
+
+fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let Some(preview) = &view.preview else { return };
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let inner = inset(area, 2.min(area.width / 4), 1);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let mut info = Vec::new();
+    if !preview.summary_tail.is_empty() {
+        let prefix = if preview.summary_truncated {
+            "thinking … "
+        } else {
+            "thinking · "
+        };
+        info.push(Line::from(Span::styled(
+            clipped(
+                &format!("{prefix}{}", safe_preview_line(&preview.summary_tail)),
+                inner.width as usize,
+            ),
+            style(LILAC),
+        )));
+    }
+    if !preview.activity.is_empty() {
+        let prefix = if preview.activity_truncated {
+            "activity … "
+        } else {
+            "activity · "
+        };
+        info.push(Line::from(Span::styled(
+            clipped(
+                &format!("{prefix}{}", safe_preview_line(&preview.activity)),
+                inner.width as usize,
+            ),
+            style(MUTED),
+        )));
+    }
+    let info_height = (info.len() as u16).min(inner.height.saturating_sub(1));
+    let text_height = inner.height.saturating_sub(info_height);
+    let text_area = Rect::new(inner.x, inner.y, inner.width, text_height);
+    let text = if preview.text_tail.is_empty() {
+        vec![Line::from(Span::styled(
+            "Waiting for the selected voice…",
+            style(MUTED),
+        ))]
+    } else {
+        preview
+            .text_tail
+            .lines()
+            .map(|line| Line::from(Span::styled(safe_preview(line), style(TEXT))))
+            .collect()
+    };
+    let wrapped = wrap_lines(text, inner.width as usize);
+    let title = if preview.text_truncated || wrapped.len() > text_height as usize {
+        " draft · earlier text omitted "
+    } else {
+        " draft · provisional "
+    };
+    frame.render_widget(panel(title, MINT), area);
+    let visible = wrapped
+        .into_iter()
+        .rev()
+        .take(text_height as usize)
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(visible.into_iter().rev().collect::<Vec<_>>()),
+        text_area,
+    );
+    if info_height > 0 {
+        frame.render_widget(
+            Paragraph::new(
+                info.into_iter()
+                    .take(info_height as usize)
+                    .collect::<Vec<_>>(),
+            ),
+            Rect::new(inner.x, text_area.bottom(), inner.width, info_height),
+        );
+    }
+}
+
+fn safe_preview(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || *character == '\n')
+        .collect()
+}
+
+fn safe_preview_line(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn draw_tiny(frame: &mut Frame<'_>, view: &View, area: Rect) {

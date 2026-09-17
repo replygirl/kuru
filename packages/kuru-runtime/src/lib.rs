@@ -4,6 +4,7 @@ mod bus;
 mod dream;
 mod engine;
 mod event;
+mod progress;
 pub mod server;
 
 pub use bus::PeerMessage;
@@ -14,6 +15,7 @@ pub use engine::{
     project_scope, read_notes, turn_was_cancelled,
 };
 pub use event::{Event, StateReport, ToolObservation, ToolOutcome, TurnLimitReason};
+pub use progress::FacingProgress;
 
 #[cfg(test)]
 fn test_receipt(message: &kuru_core::Message) -> anyhow::Result<serde_json::Value> {
@@ -62,6 +64,9 @@ mod notes_tests;
 
 #[cfg(test)]
 mod mode_baseline_tests;
+
+#[cfg(test)]
+mod progress_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tool_tests;

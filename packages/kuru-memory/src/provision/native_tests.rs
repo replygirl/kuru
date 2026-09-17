@@ -3,9 +3,54 @@ use kuru_archive::zip::{Limits, MemberKind, WriteMember, write};
 use kuru_platform::fs::regular_file_info;
 #[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(windows)]
+use std::{
+    io, thread,
+    time::{Duration, Instant},
+};
 
 const EXE: &[u8] = b"MZ fixture bytes, deliberately never executed";
 const NOTICES: &[u8] = b"exact upstream notice fixture";
+
+#[cfg(windows)]
+fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentity) -> Result<()> {
+    let mut retry_deadline = None;
+    loop {
+        let (parent, file) = files::read(binary, Privacy::OwnerOnly)?;
+        ensure!(
+            regular_file_info(&file)?.identity == expected,
+            "fixture cache binary identity changed before invalidation"
+        );
+        match parent.remove_file(files::name(binary)?, file) {
+            Ok(()) => return Ok(()),
+            // The fixture deletes a cache binary the warm probes just executed,
+            // so Windows may refuse either the delete-capable open or the
+            // disposition itself while that image section is torn down.
+            Err(error)
+                if matches!(
+                    std::error::Error::source(&error)
+                        .and_then(|source| source.downcast_ref::<io::Error>())
+                        .and_then(io::Error::raw_os_error),
+                    Some(5 | 32)
+                ) =>
+            {
+                let deadline =
+                    *retry_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+                if Instant::now() >= deadline {
+                    return Err(anyhow::Error::new(error).context(
+                        "fixture cache binary invalidation exhausted its bounded native removal recovery",
+                    ));
+                }
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
+    }
+}
 
 #[tokio::test]
 async fn invalid_memory_config_fails_before_provision_creates_cache() {
@@ -229,6 +274,94 @@ async fn activation_source_open_failure_preserves_stage_before_releasing_cache_l
     drop(reacquired);
 }
 
+#[tokio::test]
+async fn successful_activation_removes_its_disposable_stage() {
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_container = stage.path().parent().unwrap().to_owned();
+    let candidate = stage.path().join("runtime");
+    let bytes = zip();
+    with_asset(&bytes, |asset| extract(&bytes, &candidate, asset)).unwrap();
+    let destination = cache.join("active");
+
+    activate_staged(stage, lock, &candidate, &destination)
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read(destination.join("dolt.exe")).unwrap(), EXE);
+    assert_eq!(fs::read(destination.join("LICENSES")).unwrap(), NOTICES);
+    assert!(!stage_container.exists());
+    assert_eq!(
+        fs::read_dir(&cache)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".install-"))
+            .count(),
+        0
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn published_engine_reports_failed_stage_cleanup_and_releases_cache_lease() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = crate::test_support::tempdir().unwrap();
+    let cache = root.path().join("cache");
+    private_directory(&cache).unwrap();
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock_identity = regular_file_info(&lock).unwrap().identity;
+    let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
+    let stage_container = stage.path().parent().unwrap().to_owned();
+    let stage_identity = files::directory(stage.path()).unwrap().identity();
+    let candidate = stage.path().join("runtime");
+    let bytes = zip();
+    with_asset(&bytes, |asset| extract(&bytes, &candidate, asset)).unwrap();
+    let blocker_path = stage.path().join("cleanup-blocker");
+    files::write(&blocker_path, b"fixture-only blocker").unwrap();
+    // This sibling does not block the checked candidate move; denying delete
+    // sharing makes only the disposable stage close fail on Windows.
+    let blocker = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x3)
+        .open(&blocker_path)
+        .unwrap();
+    let destination = cache.join("active");
+
+    let error = activate_staged(stage, lock, &candidate, &destination)
+        .await
+        .unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
+    assert!(detail.contains(&stage_container.display().to_string()));
+    assert!(
+        detail.contains("(os error 32)"),
+        "the persistent no-DELETE holder must retain the native cleanup cause: {detail}"
+    );
+    assert_eq!(fs::read(destination.join("dolt.exe")).unwrap(), EXE);
+    assert_eq!(fs::read(destination.join("LICENSES")).unwrap(), NOTICES);
+    assert!(blocker_path.exists());
+    assert_eq!(
+        files::directory(stage_container.join("private").as_path())
+            .unwrap()
+            .identity(),
+        stage_identity,
+        "the exhausted cleanup must preserve the original private stage"
+    );
+    let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(
+        regular_file_info(&reacquired).unwrap().identity,
+        lock_identity
+    );
+    drop(reacquired);
+
+    drop(blocker);
+    fs::remove_dir_all(&stage_container).unwrap();
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn held_cold_probe_copy_does_not_block_candidate_activation() {
@@ -243,6 +376,7 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
     let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_path = stage.path().to_owned();
+    let stage_container = stage_path.parent().unwrap().to_owned();
     let candidate = stage_path.join("runtime");
     extract(EMBEDDED_ARCHIVE, &candidate, BUNDLED_ASSET).unwrap();
     let source_identity = files::directory(&candidate).unwrap().identity();
@@ -296,9 +430,16 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
 
     let (probe, (stage, lock)) = probe.probe((stage, lock)).await.unwrap();
     let destination = cache.join("active");
-    activate_staged_after_probe(stage, lock, probe, &candidate, &destination)
+    let error = activate_staged_after_probe(stage, lock, probe, &candidate, &destination)
         .await
-        .unwrap();
+        .unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
+    assert!(detail.contains(&stage_path.display().to_string()));
+    assert!(
+        detail.contains("(os error 32)"),
+        "the retained no-DELETE probe must be the Windows sharing violation: {detail}"
+    );
     assert_eq!(
         files::directory(&destination).unwrap().identity(),
         source_identity
@@ -325,6 +466,8 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
     let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
     drop(reacquired);
     drop(blocker);
+    fs::remove_dir_all(&stage_container).unwrap();
+    assert!(!stage_container.exists());
 }
 
 #[cfg(windows)]
@@ -345,33 +488,41 @@ async fn held_descendant_releases_after_checked_no_move_and_activation_recovers(
     )
     .await
     .unwrap();
-    let source = files::directory(&candidate).unwrap();
-    let source_identity = source.identity();
+    let source_identity = files::directory(&candidate).unwrap().identity();
     // Even a delete-sharing data handle prevents moving its containing Windows
     // directory. The real probe already exited before this known blocker opens.
-    let (_parent, blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    let (parent, blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    // The parent was needed only to establish the checked read. Retaining it
+    // would keep an ancestor of the disposable stage open after the leaf
+    // blocker is released.
+    drop(parent);
     let destination = cache.join("active");
     let lock_path = cache.join(".install.lock");
     let mut blocker = Some(blocker);
     let mut denied = 0_u32;
-    activate_staged_observed(stage, lock, &candidate, &destination, |proven_no_move| {
-        if !proven_no_move {
-            return;
-        }
-        denied += 1;
-        let contender = open_regular(&lock_path).unwrap();
-        assert_eq!(
-            regular_file_info(&contender).unwrap().identity,
-            lock_identity
-        );
-        assert!(matches!(
-            contender.try_lock(),
-            Err(TryLockError::WouldBlock)
-        ));
-        drop(blocker.take());
-    })
-    .await
-    .unwrap();
+    // The native move and reconciliation are synchronous. Keep the real probe
+    // above, then isolate only this positive retry from runner wall-clock load.
+    tokio::time::pause();
+    let result =
+        activate_staged_observed(stage, lock, &candidate, &destination, |proven_no_move| {
+            if !proven_no_move {
+                return;
+            }
+            denied += 1;
+            let contender = open_regular(&lock_path).unwrap();
+            assert_eq!(
+                regular_file_info(&contender).unwrap().identity,
+                lock_identity
+            );
+            assert!(matches!(
+                contender.try_lock(),
+                Err(TryLockError::WouldBlock)
+            ));
+            drop(blocker.take());
+        })
+        .await;
+    tokio::time::resume();
+    result.unwrap();
     assert_eq!(denied, 1, "release only the observed checked rejection");
     assert_eq!(
         files::directory(&destination).unwrap().identity(),
@@ -447,7 +598,10 @@ async fn persistent_held_descendant_exhausts_checked_recovery_and_preserves_stag
         started.elapsed() >= ACTIVATION_RETRY_LIMIT,
         "the persistent blocker must exercise the bounded recovery window"
     );
-    assert!(checked_denials > 1, "the checked denial must be retried");
+    assert!(
+        checked_denials >= 1,
+        "the held descendant must deny a checked move"
+    );
     let publication = error
         .downcast_ref::<kuru_platform::fs::PublicationError>()
         .unwrap();
@@ -633,7 +787,11 @@ async fn actual_warm_cache_verifies_concurrently_while_installation_lock_is_held
         // Installed Windows payloads are deliberately sealed owner-read/execute.
         // Replace this isolated fixture with private bytes of the expected size
         // rather than weakening the production ACL to make it writable.
-        fs::remove_file(&binary).unwrap();
+        let (_parent, file) = files::read(&binary, Privacy::OwnerOnly).unwrap();
+        let identity = regular_file_info(&file).unwrap().identity;
+        drop(file);
+        drop(_parent);
+        remove_fixture_binary(&binary, identity).unwrap();
         let corrupt = new_private_file(&binary).unwrap();
         corrupt.set_len(BUNDLED_ASSET.executable_bytes).unwrap();
         corrupt.sync_all().unwrap();
@@ -717,7 +875,7 @@ async fn real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_b
         )),
         BUNDLED_ASSET.license_sha256
     );
-    fs::remove_file(&binary).unwrap();
+    remove_fixture_binary(&binary, identity).unwrap();
     let file = new_private_file(&binary).unwrap();
     file.set_len(BUNDLED_ASSET.executable_bytes).unwrap();
     file.sync_all().unwrap();

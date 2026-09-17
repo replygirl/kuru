@@ -10,6 +10,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(windows)]
+use kuru_platform::fs::RemovalError;
+#[cfg(windows)]
+use std::{
+    io, thread,
+    time::{Duration, Instant},
+};
+
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -314,11 +322,536 @@ impl PrivateTemp {
         let _container_path = self._container.keep();
         self.path
     }
+
+    /// Report removal failures after a successfully published private stage.
+    pub(crate) fn close(self) -> Result<()> {
+        let Self { _container, path } = self;
+        #[cfg(windows)]
+        {
+            let outer_path = _container.path().to_owned();
+            let kept = _container.keep();
+            ensure!(
+                kept == outer_path,
+                "temporary stage container path changed before cleanup"
+            );
+            let outer = open_directory(&outer_path, Privacy::Inherited, NameRetention::Movable)?;
+            let outer_identity = outer.identity();
+            drop(outer);
+            let child = open_directory(&path, Privacy::OwnerOnly, NameRetention::Movable)?;
+            let child_identity = child.identity();
+            return close_windows_private_stage(
+                &outer_path,
+                outer_identity,
+                &path,
+                child_identity,
+                child,
+            )
+            .with_context(|| format!("remove private temporary stage at {}", path.display()));
+        }
+        #[cfg(not(windows))]
+        _container
+            .close()
+            .with_context(|| format!("remove private temporary stage at {}", path.display()))
+    }
+}
+
+#[cfg(windows)]
+const CLEANUP_RETRY_LIMIT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const CLEANUP_RETRY_SPACING: Duration = Duration::from_millis(20);
+
+#[cfg(windows)]
+fn close_windows_private_stage(
+    outer_path: &Path,
+    outer_identity: FileIdentity,
+    child_path: &Path,
+    child_identity: FileIdentity,
+    initial_child: Directory,
+) -> Result<()> {
+    close_windows_private_stage_with(
+        outer_path,
+        outer_identity,
+        child_path,
+        child_identity,
+        initial_child,
+        |_| {},
+    )
+}
+
+#[cfg(windows)]
+fn close_windows_private_stage_with(
+    outer_path: &Path,
+    outer_identity: FileIdentity,
+    child_path: &Path,
+    child_identity: FileIdentity,
+    initial_child: Directory,
+    after_first_recoverable_error: impl FnOnce(Option<PublicationPhase>),
+) -> Result<()> {
+    let mut retry_deadline = None;
+    let mut attempts = 0u32;
+    let mut first_error = None;
+    let mut after_first_recoverable_error = Some(after_first_recoverable_error);
+    let mut child = Some(initial_child);
+    loop {
+        exact_outer(outer_path, outer_identity)?;
+        let stage = match child.take() {
+            Some(stage) => stage,
+            None => match child_state(child_path, child_identity)? {
+                ChildState::Same(stage) => stage,
+                ChildState::Absent => break,
+                ChildState::Pending => {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!(
+                            "private child became pending after checked removal"
+                        ));
+                    }
+                    wait_for_cleanup_retry(
+                        cleanup_deadline(&mut retry_deadline),
+                        &mut attempts,
+                        &mut first_error,
+                    )?;
+                    continue;
+                }
+            },
+        };
+        let state = match stage.remove_tree() {
+            Ok(()) => child_state(child_path, child_identity)?,
+            Err(error) if recoverable_child_removal(&error) => {
+                cleanup_deadline(&mut retry_deadline);
+                let phase = error.phase;
+                if first_error.is_none() {
+                    first_error = Some(anyhow::Error::new(error));
+                }
+                if let Some(observer) = after_first_recoverable_error.take() {
+                    observer(Some(phase));
+                }
+                child_state(child_path, child_identity)?
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        };
+        match state {
+            ChildState::Absent => break,
+            ChildState::Same(stage) => child = Some(stage),
+            ChildState::Pending => {}
+        }
+        if first_error.is_none() {
+            first_error = Some(anyhow::anyhow!(
+                "private temporary stage remained after checked removal"
+            ));
+        }
+        wait_for_cleanup_retry(
+            cleanup_deadline(&mut retry_deadline),
+            &mut attempts,
+            &mut first_error,
+        )?;
+    }
+    loop {
+        match child_state(child_path, child_identity)? {
+            ChildState::Absent => {}
+            ChildState::Pending => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!(
+                        "private child became pending after checked removal"
+                    ));
+                }
+                wait_for_cleanup_retry(
+                    cleanup_deadline(&mut retry_deadline),
+                    &mut attempts,
+                    &mut first_error,
+                )?;
+                continue;
+            }
+            ChildState::Same(_) => {
+                return Err(anyhow::anyhow!(
+                    "private temporary stage remained after checked removal"
+                ));
+            }
+        }
+        match outer_state(outer_path, outer_identity)? {
+            OuterState::Absent => return Ok(()),
+            OuterState::Pending(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                wait_for_cleanup_retry(
+                    cleanup_deadline(&mut retry_deadline),
+                    &mut attempts,
+                    &mut first_error,
+                )?;
+                continue;
+            }
+            OuterState::Same => {}
+        }
+        match fs::remove_dir(outer_path) {
+            Ok(()) => match outer_state(outer_path, outer_identity)? {
+                OuterState::Absent => return Ok(()),
+                OuterState::Same => {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!(
+                            "temporary stage container remained after removal"
+                        ));
+                    }
+                    wait_for_cleanup_retry(
+                        cleanup_deadline(&mut retry_deadline),
+                        &mut attempts,
+                        &mut first_error,
+                    )?;
+                }
+                OuterState::Pending(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    wait_for_cleanup_retry(
+                        cleanup_deadline(&mut retry_deadline),
+                        &mut attempts,
+                        &mut first_error,
+                    )?;
+                }
+            },
+            Err(error) if matches!(error.raw_os_error(), Some(32 | 145)) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::Error::from(error));
+                }
+                if let Some(observer) = after_first_recoverable_error.take() {
+                    observer(None);
+                }
+                wait_for_cleanup_retry(
+                    cleanup_deadline(&mut retry_deadline),
+                    &mut attempts,
+                    &mut first_error,
+                )?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(windows)]
+enum ChildState {
+    Same(Directory),
+    Absent,
+    Pending,
+}
+
+#[cfg(windows)]
+enum OuterState {
+    Same,
+    Absent,
+    Pending(anyhow::Error),
+}
+
+#[cfg(windows)]
+fn exact_outer(path: &Path, expected: FileIdentity) -> Result<()> {
+    let outer = open_directory(path, Privacy::Inherited, NameRetention::Movable)?;
+    ensure!(
+        outer.identity() == expected,
+        "temporary stage container identity changed during cleanup"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn child_state(path: &Path, expected: FileIdentity) -> Result<ChildState> {
+    match open_directory(path, Privacy::OwnerOnly, NameRetention::Movable) {
+        Ok(child) => {
+            ensure!(
+                child.identity() == expected,
+                "private temporary stage identity changed during cleanup"
+            );
+            Ok(ChildState::Same(child))
+        }
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            Ok(ChildState::Absent)
+        }
+        Err(error) if pending_open_error(&error) => Ok(ChildState::Pending),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn outer_state(path: &Path, expected: FileIdentity) -> Result<OuterState> {
+    match open_directory(path, Privacy::Inherited, NameRetention::Movable) {
+        Ok(outer) => {
+            ensure!(
+                outer.identity() == expected,
+                "temporary stage container identity changed during cleanup"
+            );
+            Ok(OuterState::Same)
+        }
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            Ok(OuterState::Absent)
+        }
+        Err(error) if pending_open_error(&error) => Ok(OuterState::Pending(error)),
+        Err(error) => Err(error),
+    }
+}
+
+/// A rejected removal changed nothing, so a sharing violation or a denied
+/// delete of a name Windows still holds - a delete-pending entry, or the image
+/// of the just-executed private probe copy - may be reconciled against the same
+/// retained identity. This matches `pending_open_error` and bounded activation
+/// recovery, which already treat native error 5 as a transient native holder.
+#[cfg(windows)]
+fn recoverable_child_removal(error: &RemovalError) -> bool {
+    error.phase == PublicationPhase::Uncertain
+        || (error.phase == PublicationPhase::Rejected
+            && matches!(removal_error_code(error), Some(5 | 32)))
+}
+
+#[cfg(windows)]
+fn removal_error_code(error: &RemovalError) -> Option<i32> {
+    std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<io::Error>())
+        .and_then(io::Error::raw_os_error)
+}
+
+#[cfg(windows)]
+fn pending_open_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(error.raw_os_error(), Some(5 | 32))
+            || error.kind() == io::ErrorKind::PermissionDenied
+    })
+}
+
+#[cfg(windows)]
+fn cleanup_deadline(deadline: &mut Option<Instant>) -> Instant {
+    *deadline.get_or_insert_with(|| Instant::now() + CLEANUP_RETRY_LIMIT)
+}
+
+/// Report how long the bounded window actually ran and how many reconcile
+/// attempts it made. A single blocked native call and a fast spin both exhaust
+/// the same deadline, and only these counts separate them in a native CI log.
+#[cfg(windows)]
+fn wait_for_cleanup_retry(
+    deadline: Instant,
+    attempts: &mut u32,
+    first_error: &mut Option<anyhow::Error>,
+) -> Result<()> {
+    *attempts += 1;
+    if Instant::now() >= deadline {
+        let elapsed = Instant::now().saturating_duration_since(deadline - CLEANUP_RETRY_LIMIT);
+        let attempts = *attempts;
+        return Err(first_error
+            .take()
+            .expect("a bounded cleanup retry retains its first cause")
+            .context(format!(
+                "private temporary stage cleanup exhausted its bounded recovery after {attempts} reconcile attempts over {elapsed:?}; preserve the published stage for inspection"
+            )));
+    }
+    thread::sleep(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(CLEANUP_RETRY_SPACING),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn close_private_temp_observed(
+        stage: PrivateTemp,
+        after_first_recoverable_error: impl FnOnce(Option<PublicationPhase>),
+    ) -> Result<()> {
+        let PrivateTemp { _container, path } = stage;
+        let outer_path = _container.path().to_owned();
+        let kept = _container.keep();
+        ensure!(
+            kept == outer_path,
+            "temporary stage container path changed before cleanup"
+        );
+        let outer = open_directory(&outer_path, Privacy::Inherited, NameRetention::Movable)?;
+        let outer_identity = outer.identity();
+        drop(outer);
+        let child = open_directory(&path, Privacy::OwnerOnly, NameRetention::Movable)?;
+        let child_identity = child.identity();
+        close_windows_private_stage_with(
+            &outer_path,
+            outer_identity,
+            &path,
+            child_identity,
+            child,
+            after_first_recoverable_error,
+        )
+    }
+
+    #[cfg(windows)]
+    fn held_private_file(path: &Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        fs::write(path, b"fixture cleanup blocker").unwrap();
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x3)
+            .open(path)
+            .unwrap()
+    }
+
+    /// Leave the name genuinely delete-pending and return the handle that keeps
+    /// it in the namespace. A separate delete-on-close handle applies the
+    /// disposition as it closes; because this retained handle still references
+    /// the object, Windows keeps the entry and refuses every later open with
+    /// native error 5, the same result it gives for the live image of a
+    /// just-executed private probe copy.
+    ///
+    /// A delete-on-close handle alone is not enough: it shares `FILE_SHARE_DELETE`,
+    /// so later checked opens still succeed and the child delete completes. The
+    /// fixture asserts the denied open so a change in these native semantics
+    /// fails here, naming its own premise, instead of in the outcome assertion.
+    #[cfg(windows)]
+    fn delete_pending_private_file(path: &Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const SHARE_READ_WRITE_DELETE: u32 = 0x7;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+
+        fs::write(path, b"fixture delete-pending blocker").unwrap();
+        let retained = fs::OpenOptions::new()
+            .access_mode(GENERIC_READ)
+            .share_mode(SHARE_READ_WRITE_DELETE)
+            .open(path)
+            .unwrap();
+        drop(
+            fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(SHARE_READ_WRITE_DELETE)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                .open(path)
+                .unwrap(),
+        );
+        let denied = File::open(path)
+            .expect_err("a delete-pending name refuses every later open while a holder retains it");
+        assert_eq!(
+            denied.raw_os_error(),
+            Some(5),
+            "the fixture must reproduce the native denied open of a delete-pending name"
+        );
+        retained
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_temp_retries_a_denied_child_delete_after_the_holder_releases() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateTemp::new("memory-cleanup-denied-", Some(root.path())).unwrap();
+        let outer = stage.path().parent().unwrap().to_owned();
+        let stage_path = stage.path().to_owned();
+        let stage_identity = directory(&stage_path).unwrap().identity();
+        let blocker = delete_pending_private_file(&stage_path.join("pending"));
+        let mut blocker = Some(blocker);
+        let mut observed = None;
+
+        close_private_temp_observed(stage, |phase| {
+            observed = phase;
+            assert_eq!(directory(&stage_path).unwrap().identity(), stage_identity);
+            drop(blocker.take());
+        })
+        .unwrap();
+
+        assert_eq!(
+            observed,
+            Some(PublicationPhase::Rejected),
+            "a delete-pending child rejects the checked removal before anything is removed; an \
+             uncertain result instead means the child delete completed and the still-occupied \
+             parent directory failed afterwards"
+        );
+        assert!(
+            !outer.exists(),
+            "the exact disposable outer stage is removed after a denied child delete is reconciled"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_temp_retries_an_observed_os32_after_the_holder_releases() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateTemp::new("memory-cleanup-recover-", Some(root.path())).unwrap();
+        let outer = stage.path().parent().unwrap().to_owned();
+        let stage_path = stage.path().to_owned();
+        let stage_identity = directory(&stage_path).unwrap().identity();
+        let blocker = held_private_file(&stage.path().join("held"));
+        let mut blocker = Some(blocker);
+        let mut observed = None;
+
+        close_private_temp_observed(stage, |phase| {
+            observed = phase;
+            assert_eq!(directory(&stage_path).unwrap().identity(), stage_identity);
+            drop(blocker.take());
+        })
+        .unwrap();
+
+        assert_eq!(observed, Some(PublicationPhase::Rejected));
+        assert!(
+            !outer.exists(),
+            "the exact disposable outer stage is removed after checked recovery"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_temp_reconciles_pending_nested_delete_after_the_holder_releases() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateTemp::new("memory-cleanup-pending-", Some(root.path())).unwrap();
+        let outer = stage.path().parent().unwrap().to_owned();
+        let probe = stage.path().join("probe");
+        private_dir(&probe).unwrap();
+        fs::write(probe.join("record"), b"fixture-only pending descendant").unwrap();
+        let holder = Directory::open(&probe, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+        let mut holder = Some(holder);
+        let mut observed = None;
+
+        close_private_temp_observed(stage, |phase| {
+            observed = phase;
+            drop(holder.take());
+        })
+        .unwrap();
+
+        assert_eq!(observed, Some(PublicationPhase::Uncertain));
+        assert!(
+            !outer.exists(),
+            "the exact outer stage is removed after pending-name reconciliation"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_temp_refuses_a_replacement_after_an_observed_os32() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateTemp::new("memory-cleanup-replacement-", Some(root.path())).unwrap();
+        let stage_path = stage.path().to_owned();
+        let outer = stage_path.parent().unwrap().to_owned();
+        let original = directory(&stage_path).unwrap().identity();
+        let blocker = held_private_file(&stage_path.join("held"));
+        let mut blocker = Some(blocker);
+
+        let error = close_private_temp_observed(stage, |_| {
+            drop(blocker.take());
+            fs::remove_dir_all(&stage_path).unwrap();
+            private_dir(&stage_path).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}")
+                .contains("private temporary stage identity changed during cleanup"),
+            "replacement must be refused rather than removed: {error:#}"
+        );
+        assert!(stage_path.is_dir());
+        assert_ne!(directory(&stage_path).unwrap().identity(), original);
+        fs::remove_dir_all(&outer).unwrap();
+    }
 
     #[cfg(windows)]
     #[test]

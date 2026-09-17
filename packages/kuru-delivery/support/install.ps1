@@ -619,6 +619,8 @@ try {
         $payload = [Kuru.Bootstrap.Native]::Executable($archive)
         Write-Verbose 'Kuru bootstrap phase: release archive validated'
         $stage = [Kuru.Bootstrap.Native+DirectoryLease]::new($parent.Child(".kuru-install-$([Guid]::NewGuid().ToString('D'))"), $true, $true)
+        Write-Verbose 'Kuru bootstrap phase: installation stage opened'
+        Write-Verbose 'Kuru bootstrap phase: publication starting'
         [Kuru.Bootstrap.Native]::Publish($stage, $parent, $payload)
         Write-Verbose 'Kuru bootstrap phase: installation published'
         Write-Output "Installed Kuru $Version at $($parent.Child('kuru.exe')); add $($parent.Path) to PATH."

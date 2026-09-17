@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::Path,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -33,7 +35,155 @@ const CATALOG_COMPATIBILITY: &str = "0.154.0";
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn models(&self) -> Result<Vec<ModelInfo>>;
-    async fn complete(&self, request: CompletionRequest) -> Result<Completion>;
+    async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()>;
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        collect_completion(self, request, None).await
+    }
+}
+
+/// A bounded, protocol-neutral observation from a provider response stream.
+///
+/// Native item IDs and output indexes are opaque correlation values. They are
+/// neither tool-call IDs nor positions in [`Completion::blocks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderEvent {
+    TextDelta {
+        item_id: String,
+        output_index: u64,
+        content_index: u64,
+        source: TextDeltaSource,
+        text: String,
+    },
+    ReasoningSummaryDelta {
+        item_id: String,
+        output_index: u64,
+        summary_index: u64,
+        text: String,
+    },
+    ToolCallDelta {
+        item_id: String,
+        output_index: u64,
+        arguments_fragment: String,
+    },
+    Usage(Usage),
+    Completed(Completion),
+    Failed {
+        kind: ProviderFailureKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TextDeltaSource {
+    OutputText,
+    Refusal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureKind {
+    Incomplete,
+    Failed,
+    Error,
+}
+
+/// Async, fallible callback for provider observations. Implementations must
+/// retain bounded state; an error stops the provider request.
+pub trait ProviderSink: Send {
+    fn emit<'a>(
+        &'a mut self,
+        event: ProviderEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
+/// Collect one normalized provider stream into its sole final completion.
+/// An optional observer sees the same bounded observations while collection
+/// keeps terminal and usage rules authoritative.
+pub async fn collect_completion<P: Provider + ?Sized>(
+    provider: &P,
+    request: CompletionRequest,
+    observer: Option<&mut dyn ProviderSink>,
+) -> Result<Completion> {
+    let mut collector = CompletionCollector {
+        observer,
+        completion: None,
+        failed: None,
+        usage: Usage::default(),
+    };
+    provider.stream(request, &mut collector).await?;
+    ensure!(
+        collector.failed.is_none(),
+        "provider stream ended after failure"
+    );
+    collector
+        .completion
+        .map(|mut completion| {
+            fill_missing_usage(&mut completion.usage, &collector.usage);
+            completion
+        })
+        .context("provider stream ended without response.completed")
+}
+
+struct CompletionCollector<'a> {
+    observer: Option<&'a mut dyn ProviderSink>,
+    completion: Option<Completion>,
+    failed: Option<ProviderFailureKind>,
+    usage: Usage,
+}
+
+impl ProviderSink for CompletionCollector<'_> {
+    fn emit<'a>(
+        &'a mut self,
+        event: ProviderEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            ensure!(
+                self.completion.is_none() && self.failed.is_none(),
+                "provider stream emitted an event after its terminal outcome"
+            );
+            if let ProviderEvent::Usage(usage) = &event {
+                merge_usage(&mut self.usage, usage);
+            }
+            match &event {
+                ProviderEvent::Completed(completion) => self.completion = Some(completion.clone()),
+                ProviderEvent::Failed { kind } => self.failed = Some(*kind),
+                _ => {}
+            }
+            if let Some(observer) = self.observer.as_mut() {
+                observer.emit(event).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+fn merge_usage(target: &mut Usage, observed: &Usage) {
+    if observed.input_tokens.is_some() {
+        target.input_tokens = observed.input_tokens;
+    }
+    if observed.output_tokens.is_some() {
+        target.output_tokens = observed.output_tokens;
+    }
+    if observed.cached_input_tokens.is_some() {
+        target.cached_input_tokens = observed.cached_input_tokens;
+    }
+    if observed.reasoning_output_tokens.is_some() {
+        target.reasoning_output_tokens = observed.reasoning_output_tokens;
+    }
+}
+
+fn fill_missing_usage(target: &mut Usage, observed: &Usage) {
+    if target.input_tokens.is_none() {
+        target.input_tokens = observed.input_tokens;
+    }
+    if target.output_tokens.is_none() {
+        target.output_tokens = observed.output_tokens;
+    }
+    if target.cached_input_tokens.is_none() {
+        target.cached_input_tokens = observed.cached_input_tokens;
+    }
+    if target.reasoning_output_tokens.is_none() {
+        target.reasoning_output_tokens = observed.reasoning_output_tokens;
+    }
 }
 
 pub async fn provider(config: &Config, cwd: &Path, data_dir: &Path) -> Result<Arc<dyn Provider>> {
@@ -67,7 +217,7 @@ impl Provider for DemoProvider {
         }])
     }
 
-    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+    async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
         // Keep demo behavior aligned with the native route: unsupported media
         // is a request validation failure, never silently ignored content.
         for message in &request.messages {
@@ -109,7 +259,21 @@ impl Provider for DemoProvider {
         } else {
             format!("[demo] Offline contribution: {concise}")
         };
-        Ok(Completion::from_legacy(text, vec![], 0, 0))
+        sink.emit(ProviderEvent::TextDelta {
+            item_id: "demo-output".into(),
+            output_index: 0,
+            content_index: 0,
+            source: TextDeltaSource::OutputText,
+            text: text.clone(),
+        })
+        .await?;
+        sink.emit(ProviderEvent::Completed(Completion::from_legacy(
+            text,
+            vec![],
+            0,
+            0,
+        )))
+        .await
     }
 }
 
@@ -516,13 +680,19 @@ fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Comple
     }
     Ok(Completion {
         blocks,
-        usage: Usage {
-            input_tokens: value["usage"]["input_tokens"].as_u64(),
-            output_tokens: value["usage"]["output_tokens"].as_u64(),
-            ..Usage::default()
-        },
+        usage: usage(value),
         stop_reason: None,
     })
+}
+
+fn usage(value: &Value) -> Usage {
+    Usage {
+        input_tokens: value["usage"]["input_tokens"].as_u64(),
+        output_tokens: value["usage"]["output_tokens"].as_u64(),
+        cached_input_tokens: value["usage"]["input_tokens_details"]["cached_tokens"].as_u64(),
+        reasoning_output_tokens: value["usage"]["output_tokens_details"]["reasoning_tokens"]
+            .as_u64(),
+    }
 }
 
 #[async_trait]
@@ -566,14 +736,15 @@ impl Provider for ResponsesProvider {
         .context("model catalog exceeded 60-second total limit")?
     }
 
-    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+    async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
         let budget = OperationBudget::new(self.completion_timeout);
-        tokio::time::timeout(
+        let completion = tokio::time::timeout(
             self.completion_timeout,
-            self.complete_request(request, &budget),
+            self.complete_request(request, &budget, sink),
         )
         .await
-        .context("Responses request exceeded 600-second total limit")?
+        .context("Responses request exceeded 600-second total limit")??;
+        sink.emit(ProviderEvent::Completed(completion)).await
     }
 }
 
@@ -642,6 +813,7 @@ impl ResponsesProvider {
         &self,
         request: CompletionRequest,
         budget: &OperationBudget,
+        sink: &mut dyn ProviderSink,
     ) -> Result<Completion> {
         ensure!(
             request.model != "auto",
@@ -658,8 +830,8 @@ impl ResponsesProvider {
         if let Some(effort) = request.effort {
             body["reasoning"] = json!({"effort":effort});
         }
+        body["stream"] = json!(true);
         if self.is_subscription() {
-            body["stream"] = json!(true);
             body["tool_choice"] = json!("auto");
             body["parallel_tool_calls"] = json!(true);
         }
@@ -672,16 +844,17 @@ impl ResponsesProvider {
             .post(format!("{}/responses", self.base))
             .timeout(self.completion_timeout)
             .json(&body);
-        if self.is_subscription() {
-            builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
-        }
+        builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
         let operation = self.operation(false);
         let response = self.send(builder, operation, budget).await?;
-        let value = if self.is_subscription() {
-            sse::response(response, crate::IO_TIMEOUT, operation).await?
-        } else {
-            diagnostics::json(response, operation).await?
-        };
+        let value = sse::response(
+            response,
+            crate::IO_TIMEOUT,
+            operation,
+            self.is_subscription(),
+            sink,
+        )
+        .await?;
         let result = completion(&value, operation)?;
         *pending = if result.calls().is_empty() {
             None
@@ -703,6 +876,172 @@ impl ResponsesProvider {
 mod tests {
     use super::*;
     use crate::test_support::{HttpFixture, Reply, request};
+
+    struct ScriptedProvider(Vec<ProviderEvent>);
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn models(&self) -> Result<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+        async fn stream(&self, _: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
+            for event in &self.0 {
+                sink.emit(event.clone()).await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct Events(Vec<ProviderEvent>);
+    impl ProviderSink for Events {
+        fn emit<'a>(
+            &'a mut self,
+            event: ProviderEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                self.0.push(event);
+                Ok(())
+            })
+        }
+    }
+
+    struct ChannelEvents(tokio::sync::mpsc::Sender<ProviderEvent>);
+    impl ProviderSink for ChannelEvents {
+        fn emit<'a>(
+            &'a mut self,
+            event: ProviderEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                self.0
+                    .send(event)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("test observer closed"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn collector_preserves_raw_terminal_usage_for_observers() {
+        let provider = ScriptedProvider(vec![
+            ProviderEvent::Usage(Usage {
+                input_tokens: Some(7),
+                cached_input_tokens: Some(0),
+                ..Usage::default()
+            }),
+            ProviderEvent::Completed(Completion {
+                blocks: vec![],
+                usage: Usage {
+                    input_tokens: Some(8),
+                    output_tokens: Some(2),
+                    ..Usage::default()
+                },
+                stop_reason: None,
+            }),
+        ]);
+        let mut observer = Events::default();
+        let completion = collect_completion(&provider, request(), Some(&mut observer))
+            .await
+            .unwrap();
+        assert_eq!(completion.usage.input_tokens, Some(8));
+        assert_eq!(completion.usage.cached_input_tokens, Some(0));
+        assert_eq!(completion.usage.output_tokens, Some(2));
+        assert!(
+            matches!(observer.0.last(), Some(ProviderEvent::Completed(Completion { usage, .. })) if usage.input_tokens == Some(8) && usage.cached_input_tokens.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn collector_rejects_missing_duplicate_and_failed_terminals() {
+        let completion = Completion::from_legacy("done", vec![], 0, 0);
+        for events in [
+            vec![],
+            vec![
+                ProviderEvent::Completed(completion.clone()),
+                ProviderEvent::Completed(completion.clone()),
+            ],
+            vec![ProviderEvent::Failed {
+                kind: ProviderFailureKind::Incomplete,
+            }],
+        ] {
+            assert!(
+                collect_completion(&ScriptedProvider(events), request(), None)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_sse_delta_reaches_observer_before_delayed_terminal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "client closed before sending the request");
+                request.extend_from_slice(&chunk[..read]);
+                let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..headers_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|length| length.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= headers_end + 4 + content_length {
+                    break;
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            let delta = b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"message-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"visible\"}\n\n";
+            for byte in delta {
+                socket.write_all(b"1\r\n").await.unwrap();
+                socket.write_all(&[*byte]).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.flush().await.unwrap();
+            released.await.unwrap();
+            let terminal = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[{\"type\":\"message\",\"id\":\"message-1\",\"content\":[{\"type\":\"output_text\",\"text\":\"visible\"}]}]}}\n\n";
+            for byte in terminal {
+                socket.write_all(b"1\r\n").await.unwrap();
+                socket.write_all(&[*byte]).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        let provider = ResponsesProvider::new(&base, "").unwrap();
+        let (sender, mut observed) = tokio::sync::mpsc::channel(8);
+        let mut sink = ChannelEvents(sender);
+        let mut stream = Box::pin(provider.stream(request(), &mut sink));
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                event = observed.recv() => event,
+                result = &mut stream => panic!("stream settled before a delta: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(first, Some(ProviderEvent::TextDelta { text, .. }) if text == "visible"));
+        release.send(()).unwrap();
+        stream.as_mut().await.unwrap();
+        let terminal = [observed.recv().await, observed.recv().await];
+        assert!(
+            terminal
+                .iter()
+                .any(|event| matches!(event, Some(ProviderEvent::Completed(_))))
+        );
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn native_function_round_trip_keeps_reasoning_and_actor_isolation() {
@@ -997,9 +1336,14 @@ mod tests {
             let mut request = [0; 4096];
             assert_ne!(socket.read(&mut request).await.unwrap(), 0);
             tokio::time::sleep(Duration::from_millis(150)).await;
+            let body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"later\"}]}]}}\n\n";
             socket
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 81\r\nConnection: close\r\n\r\n{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"text\":\"later\"}]}]}",
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
                 )
                 .await
                 .unwrap();

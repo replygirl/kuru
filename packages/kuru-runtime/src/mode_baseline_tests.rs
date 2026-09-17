@@ -30,6 +30,17 @@ struct RelationshipConsult {
 
 #[async_trait]
 impl Provider for RelationshipConsult {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }
@@ -129,6 +140,17 @@ async fn all_four_modes_allow_one_hop_speaking_consultation_with_a_relationship(
 
 #[async_trait]
 impl Provider for Scripted {
+    async fn stream(
+        &self,
+        request: kuru_core::CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> anyhow::Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         Ok(vec![])
     }

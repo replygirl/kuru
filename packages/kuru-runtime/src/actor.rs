@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use kuru_connectors::Provider;
+use kuru_connectors::{Provider, ProviderSink, collect_completion};
 use kuru_core::{Completion, CompletionRequest, ContentBlock, Message, ToolSpec};
 use kuru_memory::MemoryStore;
 use serde_json::Value;
@@ -15,7 +15,10 @@ use tokio::{
 };
 use tracing::Instrument;
 
-use crate::engine::{CancellationToken, turn_was_cancelled};
+use crate::{
+    engine::{CancellationToken, turn_was_cancelled},
+    progress::ProgressDescriptor,
+};
 
 #[derive(Debug)]
 pub(crate) struct MemoryFailure(pub anyhow::Error);
@@ -35,6 +38,7 @@ pub(crate) struct Work {
     pub tools: Vec<ToolSpec>,
     pub history_limit: usize,
     pub cancellation: CancellationToken,
+    pub progress: Option<ProgressDescriptor>,
     pub span: tracing::Span,
     pub reply: oneshot::Sender<Result<Completion>>,
 }
@@ -112,12 +116,19 @@ impl Actor {
                         effort: work.effort.clone(),
                         tools: work.tools.clone(),
                     };
+                    let mut observer = work.progress.as_ref().map(ProgressDescriptor::observer);
                     let completion = work
                         .cancellation
                         .wait(async {
                             tokio::time::timeout(
                                 Duration::from_secs(180),
-                                provider.complete(request),
+                                collect_completion(
+                                    provider.as_ref(),
+                                    request,
+                                    observer
+                                        .as_mut()
+                                        .map(|observer| observer as &mut dyn ProviderSink),
+                                ),
                             )
                             .await
                             .context("model call exceeded 180 seconds")?

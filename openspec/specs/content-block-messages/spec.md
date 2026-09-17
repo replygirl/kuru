@@ -33,15 +33,17 @@ fail explicitly instead of disappearing or falling back to text.
 
 ### Requirement: Explicit projections without new product surfaces
 
-Existing text answer, CLI and TUI projections SHALL derive only from intended
-text blocks, preserve current text joining and final-answer authority, and retain
-the existing final TurnOutput JSON fields. Typed representations MUST NOT cause
-raw or encrypted reasoning to enter persistent history, public transcript,
-events or export. Reasoning-summary and image types are foundations; this change
-MUST NOT automatically capture new provider summaries, fetch media, enable media
-input or enable streaming. Unsupported request content MUST fail before provider
-dispatch rather than be silently omitted. Inspection/export SHALL identify
-structured blocks explicitly rather than present their encoding as ordinary prose.
+Text answer, CLI and TUI projections SHALL derive only from intended text blocks,
+preserve current text joining and final-answer authority, and retain the existing
+final TurnOutput JSON fields. Typed representations MUST NOT cause raw or
+encrypted reasoning to enter persistent history, public transcript, events or
+export. Provider-supplied visible reasoning summaries MAY appear transiently for
+the selected speaking request, but MUST NOT be newly captured in durable history
+or replayed as a persisted-reasoning product. Image and cache types remain
+foundations without automatic media fetching or new media input. Unsupported
+request content MUST fail before provider dispatch rather than be silently
+omitted. Inspection/export SHALL identify structured blocks explicitly rather
+than present their encoding as ordinary prose.
 
 #### Scenario: Unsupported request media
 
@@ -52,3 +54,9 @@ structured blocks explicitly rather than present their encoding as ordinary pros
 
 - **WHEN** a text turn completes and its completed turn ID is retried
 - **THEN** the same final answer and existing JSON fields are returned without another dispatch or transcript insert.
+
+#### Scenario: Transient visible summary
+
+- **WHEN** the selected speaking request supplies a visible summary
+- **THEN** it may appear in the live preview but new durable assistant history,
+  semantic events and final turn output do not acquire that summary.

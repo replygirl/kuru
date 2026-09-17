@@ -12,7 +12,7 @@ use std::{
 };
 
 use futures::{Stream, stream};
-use kuru_connectors::{DemoProvider, Provider};
+use kuru_connectors::{DemoProvider, Provider, ProviderEvent, ProviderSink};
 use kuru_core::{Completion, CompletionRequest, Config, Mode, ModelInfo};
 use kuru_memory::{MemoryStore, StorageRecord, test_support::open_options};
 use kuru_runtime::{CancellationToken, ControlledTurnOutput, Harness, ResponseOutcome, TurnOutput};
@@ -106,10 +106,20 @@ impl Provider for CapturingProvider {
         Ok(vec![])
     }
 
-    async fn complete(&self, request: CompletionRequest) -> anyhow::Result<Completion> {
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        sink: &mut dyn ProviderSink,
+    ) -> anyhow::Result<()> {
         self.requests.lock().unwrap().push(request);
         self.started.notify_waiters();
-        Ok(Completion::from_legacy("captured response", vec![], 0, 0))
+        sink.emit(ProviderEvent::Completed(Completion::from_legacy(
+            "captured response",
+            vec![],
+            0,
+            0,
+        )))
+        .await
     }
 }
 
@@ -303,7 +313,7 @@ impl Provider for BlockingProvider {
         Ok(vec![])
     }
 
-    async fn complete(&self, _: CompletionRequest) -> anyhow::Result<Completion> {
+    async fn stream(&self, _: CompletionRequest, _: &mut dyn ProviderSink) -> anyhow::Result<()> {
         struct Dropped<'a>(&'a AtomicUsize);
         impl Drop for Dropped<'_> {
             fn drop(&mut self) {
@@ -314,7 +324,7 @@ impl Provider for BlockingProvider {
         let _dropped = Dropped(&self.dropped);
         self.started.fetch_add(1, Ordering::SeqCst);
         self.wake.notify_one();
-        std::future::pending::<anyhow::Result<Completion>>().await
+        std::future::pending::<anyhow::Result<()>>().await
     }
 }
 

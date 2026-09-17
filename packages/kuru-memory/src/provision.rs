@@ -585,6 +585,22 @@ struct StagedActivation {
 }
 
 impl StagedActivation {
+    fn finish_published(self) -> Result<()> {
+        let Self {
+            source,
+            probe,
+            staging,
+            lock,
+        } = self;
+        drop(source);
+        drop(probe);
+        let result = staging
+            .close()
+            .context("Dolt engine publication succeeded, but private stage cleanup failed");
+        drop(lock);
+        result
+    }
+
     fn retain(self, error: anyhow::Error) -> anyhow::Error {
         let Self {
             source,
@@ -666,7 +682,7 @@ async fn activate_staged_with(
         match activate_once(source, destination) {
             Ok(files::DirectoryMove::Moved(_)) => {
                 observer(false);
-                Ok(())
+                activation.finish_published()
             }
             Ok(files::DirectoryMove::ProvenNoMove(error)) => {
                 observer(true);
@@ -693,7 +709,7 @@ async fn activate_staged_with(
             match activate_once(source, destination) {
                 Ok(files::DirectoryMove::Moved(_)) => {
                     observer(false);
-                    return Ok(());
+                    return activation.finish_published();
                 }
                 Ok(files::DirectoryMove::ProvenNoMove(error)) => {
                     observer(true);
