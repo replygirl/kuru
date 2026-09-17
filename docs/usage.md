@@ -70,7 +70,11 @@ and reasoning output are subsets of the input and output totals. They are not
 added a second time. A completed `/retry` does not make a new provider call or add
 usage.
 
-Missing reports and prices are shown as unknown or incomplete. Sessions created
+Missing reports and prices are shown as unknown or incomplete. An incomplete
+estimate names the priced terms it left out, such as a long-context tier or a
+cache-write rate, and a term that cannot be decided is never applied in part.
+Each record keeps its raw per-kind token components and its recorded price, so a
+later reading can apply a term this version does not price. Sessions created
 before usage accounting remain labelled as having incomplete historical totals
 when resumed. Estimates use the price terms recorded for each invocation; later
 catalog changes do not reprice earlier work. For ChatGPT subscription access,
@@ -79,7 +83,10 @@ measure of remaining subscription quota.
 
 The context indicator describes one request, preferring the facing speaker when
 available. It is not a shared context window for the whole pool. Token estimates,
-assumed window limits and omitted history are labelled. Earlier conversation
+assumed window limits and omitted history are labelled. The composer keeps a
+standing row with that context estimate and the session cost estimate, beside the
+model, effort, framework and permission controls, so one frame carries all six.
+Its figures are the ones `/cost` and `/permissions` report. Earlier conversation
 rows omitted from the bounded display remain in storage. See
 [context budget](configuration.md#context-budget) for fitting and reserve settings.
 

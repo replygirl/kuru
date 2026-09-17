@@ -6,9 +6,16 @@ values beside their shortcuts. Project and session context sit in the header.
 The status line carries active work, elapsed time, cancellations, failures and
 brief saved-setting confirmations. It stays quiet on an untouched welcome screen.
 Request context is labelled as an estimate for the facing or active request,
-with window provenance and actual omission counts. `/cost` separates known usage
-from incomplete reports and API-equivalent estimates. These measurements do not
-replace the model, effort, mode or permission controls.
+with window provenance and actual omission counts. The composer keeps its own
+standing meter row beside the model, effort, framework and permission controls:
+the last prepared request's context estimate with its window provenance, and a
+labelled session cost estimate. An unknown price reads as `cost unknown`, never
+as a zero charge or a quota. Very narrow terminals abbreviate that row — token
+counts collapse to thousands and an assumed window keeps a `~` marker — before
+any control is dropped. `/cost` separates known usage from incomplete reports
+and API-equivalent estimates, and names the priced terms an incomplete estimate
+could not apply. These measurements do not replace the model, effort, mode or
+permission controls.
 
 Ink surfaces, mint, blue, lilac, amber and rose distinguish identities and activity.
 Color always accompanies readable labels. The ornamental alphabet is ordinary

@@ -111,13 +111,48 @@ pub struct UsageCompleteness {
     pub reasoning_output_tokens: bool,
 }
 
+/// A priced term the fold did not apply to a subtotal. The ledger keeps the raw
+/// per-kind token components and the frozen price basis, so naming the term is
+/// enough for a later reprice; a partly modelled term is never half-applied.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum UnappliedPriceTerm {
+    /// A schedule's long-context tier could not be decided or parsed, so no
+    /// tier multiplier was applied to that invocation.
+    LongContextTier,
+    /// The schedule prices cache writes, which this fold does not model.
+    CacheWriteRate,
+    /// Cached input tokens were reported without a usable cached-input rate.
+    CachedInputRate,
+    /// An invocation carried no frozen price, or its rates were unusable.
+    InvocationPrice,
+    /// A token component the subtotal needs was never reported.
+    TokenComponents,
+}
+
+impl UnappliedPriceTerm {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LongContextTier => "long-context tier",
+            Self::CacheWriteRate => "cache-write rate",
+            Self::CachedInputRate => "cached-input rate",
+            Self::InvocationPrice => "invocation price",
+            Self::TokenComponents => "token components",
+        }
+    }
+}
+
 /// A known subtotal and its uncertainty. The decimal string is computed from
 /// frozen invocation prices; `None` never means a known zero charge.
+/// `unapplied` names what an incomplete subtotal leaves out.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MoneyEstimate {
     pub known_usd: Option<String>,
     pub incomplete: bool,
+    /// Sorted and deduplicated; empty whenever nothing priced was skipped.
+    #[serde(default)]
+    pub unapplied: Vec<UnappliedPriceTerm>,
 }
 
 /// Bounded result of folding one session's operational records on read. It
