@@ -3,15 +3,17 @@ mod actor;
 mod bus;
 mod dream;
 mod engine;
+mod event;
 pub mod server;
 
 pub use bus::PeerMessage;
 pub use dream::{DreamProposal, DreamReport, undo_dream};
 pub use engine::{
-    CancellationToken, ControlledTurnOutput, Event, ForgetNoteResult, Harness, INTERRUPTION_ROLE,
-    INTERRUPTION_TEXT, NotesView, ResponseOutcome, Session, StateReport, Topology, TurnLimitReason,
-    TurnOutput, forget_note, project_scope, read_notes, turn_was_cancelled,
+    CancellationToken, ControlledTurnOutput, ForgetNoteResult, Harness, INTERRUPTION_ROLE,
+    INTERRUPTION_TEXT, NotesView, ResponseOutcome, Session, Topology, TurnOutput, forget_note,
+    project_scope, read_notes, turn_was_cancelled,
 };
+pub use event::{Event, StateReport, ToolObservation, ToolOutcome, TurnLimitReason};
 
 #[cfg(test)]
 fn test_receipt(message: &kuru_core::Message) -> anyhow::Result<serde_json::Value> {

@@ -361,8 +361,12 @@ impl ToolHost {
                 execution.map_err(ToolFailure::built_in)
             }
             "file_write" => {
+                if !self.allow_write {
+                    return Err(ToolFailure::permission_denied(anyhow::anyhow!(
+                        "file writes require allow_write=true"
+                    )));
+                }
                 let execution = (|| -> Result<ToolExecution> {
-                    ensure!(self.allow_write, "file writes require allow_write=true");
                     let content = string(&args, "content")?;
                     ensure!(
                         content.len() <= MAX_BYTES,
@@ -397,8 +401,12 @@ impl ToolHost {
                 execution.map_err(ToolFailure::built_in)
             }
             "file_delete" => {
+                if !self.allow_write {
+                    return Err(ToolFailure::permission_denied(anyhow::anyhow!(
+                        "file deletion requires allow_write=true"
+                    )));
+                }
                 let execution = (|| -> Result<ToolExecution> {
-                    ensure!(self.allow_write, "file deletion requires allow_write=true");
                     let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
                     ensure!(
                         directory.symlink_metadata(&path)?.is_file(),
@@ -449,11 +457,12 @@ impl ToolHost {
                 execution.map_err(ToolFailure::built_in)
             }
             "shell" => {
-                let execution = async {
-                    ensure!(
-                        self.allow_shell,
+                if !self.allow_shell {
+                    return Err(ToolFailure::permission_denied(anyhow::anyhow!(
                         "shell requires allow_shell=true (process authority)"
-                    );
+                    )));
+                }
+                let execution = async {
                     let duration = args
                         .get("timeout_ms")
                         .map(|value| {

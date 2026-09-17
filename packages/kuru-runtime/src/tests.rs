@@ -16,10 +16,11 @@ use axum::{
 };
 use kuru_connectors::{Provider, ToolHost};
 use kuru_core::{
-    Completion, CompletionRequest, Config, Mode, ModelInfo, RelationshipKind, ToolCall,
-    canonical_peer_instruction,
+    Completion, CompletionRequest, Config, ContentBlock, Mode, ModelInfo, RelationshipKind,
+    ToolCall, canonical_peer_instruction,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -187,9 +188,9 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
         first
             .events
             .iter()
-            .find(|event| event.kind == "speaker-selection")
+            .find(|event| event.kind() == "speaker-selection")
             .unwrap()
-            .detail,
+            .detail(),
         "mode-authored-order"
     );
     let second = harness.run("second tie").await.unwrap();
@@ -198,9 +199,9 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
         second
             .events
             .iter()
-            .find(|event| event.kind == "speaker-selection")
+            .find(|event| event.kind() == "speaker-selection")
             .unwrap()
-            .detail,
+            .detail(),
         "previous-completed-speaker"
     );
     let session = harness.session.id.clone();
@@ -231,16 +232,16 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
         resumed_turn
             .events
             .iter()
-            .find(|event| event.kind == "speaker-selection")
+            .find(|event| event.kind() == "speaker-selection")
             .unwrap()
-            .detail,
+            .detail(),
         "previous-completed-speaker"
     );
     resumed.session.last_completed_speaker = Some("retired-fixture-identity".into());
     let unavailable = resumed.run("missing prior").await.unwrap();
     assert_eq!(unavailable.speaker, first.speaker);
     assert!(unavailable.events.iter().any(|event| {
-        event.kind == "speaker-selection" && event.detail == "mode-authored-order"
+        event.kind() == "speaker-selection" && event.detail() == "mode-authored-order"
     }));
     let higher_id = provider
         .requests
@@ -264,15 +265,15 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
         higher_turn
             .events
             .iter()
-            .find(|event| event.kind == "speaker-selection")
+            .find(|event| event.kind() == "speaker-selection")
             .unwrap()
-            .detail,
+            .detail(),
         "maximum-activation"
     );
     let higher_again = resumed.run("higher activation again").await.unwrap();
     assert_eq!(higher_again.speaker, higher_id);
     assert!(higher_again.events.iter().any(|event| {
-        event.kind == "speaker-selection" && event.detail == "maximum-activation"
+        event.kind() == "speaker-selection" && event.detail() == "maximum-activation"
     }));
     let targeted = resumed
         .run_for("target", Some(&first.speaker))
@@ -283,7 +284,7 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
         targeted
             .events
             .iter()
-            .any(|event| event.kind == "speaker-selection" && event.detail == "caller-target")
+            .any(|event| event.kind() == "speaker-selection" && event.detail() == "caller-target")
     );
     resumed.focus(Some(&higher_id)).await.unwrap();
     let focused = resumed.run("focused").await.unwrap();
@@ -292,7 +293,7 @@ async fn automatic_speaker_selection_is_stable_and_persists_after_dolt_reopen() 
         focused
             .events
             .iter()
-            .any(|event| event.kind == "speaker-selection" && event.detail == "active-focus")
+            .any(|event| event.kind() == "speaker-selection" && event.detail() == "active-focus")
     );
     resumed.shutdown(false).await.unwrap();
 }
@@ -320,7 +321,7 @@ async fn cold_ties_follow_each_modes_authored_order() {
 
         assert_eq!(output.speaker, expected);
         assert!(output.events.iter().any(|event| {
-            event.kind == "speaker-selection" && event.detail == "mode-authored-order"
+            event.kind() == "speaker-selection" && event.detail() == "mode-authored-order"
         }));
         harness.shutdown(false).await.unwrap();
     }
@@ -482,8 +483,8 @@ async fn peer_messages_route_directly_with_a2a_provenance_and_tool_receipts() {
     let recipient = harness.topology.parts[1].id.clone();
     *routes.lock().unwrap() = (sender.clone(), recipient.clone());
     let result = harness.run("Plan a feature").await.unwrap();
-    let event = result.events.iter().find(|e| e.kind == "peer").unwrap();
-    let rpc: Value = serde_json::from_str(&event.detail).unwrap();
+    let event = result.events.iter().find(|e| e.kind() == "peer").unwrap();
+    let rpc: Value = serde_json::from_str(&event.detail()).unwrap();
     assert_eq!(rpc["method"], "SendMessage");
     assert_eq!(rpc["params"]["message"]["metadata"]["sender"], sender);
     assert_eq!(rpc["params"]["message"]["metadata"]["recipient"], recipient);
@@ -648,11 +649,32 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     );
     let source_path = dir.path().join("sample.txt");
     std::fs::write(&source_path, &source).unwrap();
-    let result = harness.run("Read sample.txt").await.unwrap();
+    let result = harness
+        .run_controlled(
+            "Read sample.txt",
+            None,
+            "tool-v2-replay",
+            &crate::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
     assert!(result.text.contains(ORDINARY_CONTROL));
-    let tool_event = result.events.iter().find(|e| e.kind == "tool").unwrap();
-    assert_eq!(tool_event.detail, "file_read");
-    assert!(!tool_event.detail.contains(TOOL_TOKEN));
+    let tool_event = result.events.iter().find(|e| e.kind() == "tool").unwrap();
+    assert_eq!(tool_event.detail(), "file_read");
+    assert!(!tool_event.detail().contains(TOOL_TOKEN));
+    let observation = result
+        .events
+        .iter()
+        .find_map(|event| match event {
+            crate::Event::ToolSettled { observation, .. } => Some(observation),
+            _ => None,
+        })
+        .expect("each executed tool has one settled observation");
+    assert_eq!(observation.name, "file_read");
+    assert_eq!(
+        observation.argument_bytes,
+        serde_json::to_vec(&observation.arguments).unwrap().len() as u64
+    );
 
     let speaker = result.speaker.clone();
     assert_eq!(speaker, prior_owner);
@@ -663,10 +685,24 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     let call_id = receipt["call_id"].as_str().unwrap().to_owned();
     let output = receipt["output"].as_str().unwrap();
     assert!(output.len() <= 8192);
-    assert!(output.starts_with(&format!("openai_api_key={MARKER}\n")));
+    assert!(
+        output.starts_with(&format!("openai_api_key={MARKER}\n")),
+        "unexpected projected receipt prefix: {}",
+        output.chars().take(160).collect::<String>()
+    );
     assert!(output.ends_with(&format!("{ORDINARY_CONTROL}:TAIL")));
     assert!(output.contains("[truncated]"));
     assert!(!output.contains(TOOL_TOKEN));
+    let receipt_bytes = serde_json::to_vec(&receipt["output"]).unwrap();
+    assert_eq!(observation.result_bytes, receipt_bytes.len() as u64);
+    let receipt_digest = Sha256::digest(&receipt_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        observation.result_sha256.as_deref(),
+        Some(receipt_digest.as_str())
+    );
     assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
 
     let requests_before_reopen = fake.requests.lock().unwrap().len();
@@ -683,6 +719,29 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     )
     .await
     .unwrap();
+    let calls_before_replay = fake.requests.lock().unwrap().len();
+    let replay = reopened
+        .run_controlled(
+            "Read sample.txt",
+            None,
+            "tool-v2-replay",
+            &crate::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&replay.events).unwrap(),
+        serde_json::to_vec(&result.events).unwrap()
+    );
+    assert_eq!(fake.requests.lock().unwrap().len(), calls_before_replay);
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .filter(|event| matches!(event, crate::Event::ToolSettled { .. }))
+            .count(),
+        1
+    );
     reopened.focus(Some(&speaker)).await.unwrap();
     let persisted = reopened.memory_for(&speaker).await.unwrap();
     assert!(persisted.iter().any(|message| {
@@ -756,18 +815,73 @@ async fn invalid_tool_calls_are_visible_to_the_model_and_cannot_change_state() {
         }
         reply
     });
-    let (_dir, mut harness) = fixture(Mode::Freudian, fake).await;
-    harness.run("Try invalid proposals").await.unwrap();
-    assert!(harness.topology.states.is_empty());
-    let history = harness
-        .memory_for(&harness.topology.parts[0].id)
-        .await
-        .unwrap();
-    assert!(
-        history
+    let (_dir, mut harness) = fixture(Mode::Freudian, fake.clone()).await;
+    let output = harness.run("Try invalid proposals").await.unwrap();
+    let expected_attempts = fake
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.messages.len() == 1)
+        .count()
+        * 3;
+    assert_eq!(
+        output
+            .events
             .iter()
-            .any(|m| m.role == "tool" && m.text_projection().contains("ERROR"))
+            .filter(|event| matches!(event, crate::Event::ToolSettled { observation, .. } if observation.outcome == crate::ToolOutcome::Error))
+            .count(),
+        expected_attempts,
+        "each scripted invalid invocation settles exactly once"
     );
+    assert_eq!(
+        output
+            .events
+            .iter()
+            .filter(|event| matches!(event, crate::Event::ToolSettled { .. }))
+            .count(),
+        expected_attempts,
+        "no invocation receives a second settlement with a different outcome"
+    );
+    assert!(harness.topology.states.is_empty());
+    let (actor, call_id, result_bytes, result_sha256) = output
+        .events
+        .iter()
+        .find_map(|event| match event {
+            crate::Event::ToolSettled { actor, observation }
+                if observation.outcome == crate::ToolOutcome::Error =>
+            {
+                Some((
+                    actor.clone(),
+                    observation.call_id.clone(),
+                    observation.result_bytes,
+                    observation.result_sha256.clone(),
+                ))
+            }
+            _ => None,
+        })
+        .expect("scripted invalid call has an error observation");
+    let history = harness.memory_for(&actor).await.unwrap();
+    let receipt = history
+        .iter()
+        .find_map(|message| match message.blocks.as_slice() {
+            [
+                ContentBlock::ToolResult {
+                    call_id: stored_id,
+                    output,
+                    is_error: true,
+                },
+            ] if stored_id == &call_id => Some(output),
+            _ => None,
+        })
+        .expect("observed error receipt is delivered to its actor");
+    let bytes = serde_json::to_vec(receipt).unwrap();
+    assert_eq!(result_bytes, bytes.len() as u64);
+    let digest = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(result_sha256.as_deref(), Some(digest.as_str()));
 }
 
 #[tokio::test]
@@ -842,7 +956,7 @@ async fn cyclic_peers_stop_at_peer_round_limit() {
         Some(vec![crate::TurnLimitReason::PeerRounds])
     );
     assert_eq!(output.response_outcome, Some(crate::ResponseOutcome::Text));
-    assert!(output.events.iter().any(|e| e.kind == "budget"));
+    assert!(output.events.iter().any(|e| e.kind() == "budget"));
     assert!(fake.requests.lock().unwrap().len() <= 10);
 }
 
@@ -890,6 +1004,15 @@ async fn tool_call_limit_is_reported_without_a_peer_round_limit() {
         Some(vec![crate::TurnLimitReason::ToolCalls])
     );
     assert_eq!(output.response_outcome, Some(crate::ResponseOutcome::Text));
+    assert_eq!(
+        output
+            .events
+            .iter()
+            .filter(|event| matches!(event, crate::Event::ToolSettled { observation, .. } if observation.outcome == crate::ToolOutcome::Error))
+            .count(),
+        1,
+        "the budget-refused invocation settles exactly once"
+    );
     harness.shutdown(false).await.unwrap();
 }
 
@@ -1131,13 +1254,13 @@ async fn dreaming_uses_isolated_actor_histories_and_runs_periodically() {
     let mut events = harness.subscribe();
     let output = harness.run("one turn").await.unwrap();
     assert!(
-        !output.events.iter().any(|event| event.kind == "dream"),
+        !output.events.iter().any(|event| event.kind() == "dream"),
         "returned turn output freezes before maintenance dreaming"
     );
-    assert_eq!(output.events.last().unwrap().kind, "response");
+    assert_eq!(output.events.last().unwrap().kind(), "response");
     assert!(
         std::iter::from_fn(|| events.try_recv().ok())
-            .any(|e| e.kind == "dream" && e.detail.contains("3 summaries"))
+            .any(|e| e.kind() == "dream" && e.detail().contains("3 summaries"))
     );
     for part in &harness.topology.parts {
         assert_eq!(

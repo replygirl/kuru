@@ -249,8 +249,8 @@ async fn periodic_dream_cancellation_preserves_the_exact_completed_output() {
     cancellation.cancel();
     let (mut harness, output, target) = task.await.unwrap();
     let output = output.unwrap();
-    assert!(matches!(output.events.last(), Some(event) if event.kind == "response"));
-    assert!(!output.events.iter().any(|event| event.kind == "dream"));
+    assert!(matches!(output.events.last(), Some(event) if event.kind() == "response"));
+    assert!(!output.events.iter().any(|event| event.kind() == "dream"));
     let calls = provider.calls.load(Ordering::SeqCst);
     let retry = harness
         .run_controlled(
@@ -268,7 +268,7 @@ async fn periodic_dream_cancellation_preserves_the_exact_completed_output() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
     let mut kinds = Vec::new();
     while let Ok(event) = events.try_recv() {
-        kinds.push(event.kind);
+        kinds.push(event.kind().to_owned());
     }
     assert!(kinds.iter().any(|kind| kind == "response"));
     assert!(kinds.iter().any(|kind| kind == "dream"));
@@ -309,8 +309,8 @@ async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
         )
         .await
         .unwrap();
-    assert!(matches!(output.events.last(), Some(event) if event.kind == "response"));
-    assert!(!output.events.iter().any(|event| event.kind == "dream"));
+    assert!(matches!(output.events.last(), Some(event) if event.kind() == "response"));
+    assert!(!output.events.iter().any(|event| event.kind() == "dream"));
     let calls = provider.calls.load(Ordering::SeqCst);
     let retry = harness
         .run_controlled(
@@ -329,7 +329,7 @@ async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
     let mut observed_failure = false;
     while let Ok(event) = events.try_recv() {
         observed_failure |=
-            event.kind == "error" && event.actor == "dream" && event.detail.contains("stale");
+            event.kind() == "error" && event.actor() == "dream" && event.detail().contains("stale");
     }
     assert!(observed_failure);
     assert_eq!(harness.history().await.unwrap().len(), 2);

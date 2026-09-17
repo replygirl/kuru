@@ -36,6 +36,9 @@ const SHELL_MARKER: &str = "SHELL_TURN_RECEIPT";
 const FINAL_TEXT: &str = "SHELL_TURN_FINAL_TEXT";
 const PROVIDER_SECRET: &str = "sk-proj-tracing-provider-secret-0123456789";
 const ROTATION_TOOL_CALLS: usize = 768;
+// The rotation fixture deliberately returns one serialized tool observation per
+// call in the CLI JSON. Keep its capture bounded to the scripted fanout.
+const ROTATION_CAPTURE_LIMIT: usize = ROTATION_TOOL_CALLS * 1024;
 const DIAGNOSTIC_FILE_BYTES: u64 = 64 * 1024;
 const DIAGNOSTIC_FILE_COUNT: usize = 4;
 
@@ -311,6 +314,14 @@ struct CliRun {
 }
 
 async fn run_sandbox(sandbox: Sandbox, debug: bool) -> Result<CliRun> {
+    run_sandbox_with_capture_limit(sandbox, debug, CAPTURE_LIMIT).await
+}
+
+async fn run_sandbox_with_capture_limit(
+    sandbox: Sandbox,
+    debug: bool,
+    capture_limit: usize,
+) -> Result<CliRun> {
     tokio::task::spawn_blocking(move || {
         // If this test future is cancelled, Tokio leaves the started blocking
         // worker running. It retains the complete sandbox through bounded
@@ -320,7 +331,7 @@ async fn run_sandbox(sandbox: Sandbox, debug: bool) -> Result<CliRun> {
             .enable_all()
             .build()
             .context("create retained CLI fixture runtime")?
-            .block_on(bounded_output(&mut command, CLI_TIMEOUT, CAPTURE_LIMIT))
+            .block_on(bounded_output(&mut command, CLI_TIMEOUT, capture_limit))
             .context("run bounded kuru CLI fixture")
             .map(|output| CliRun { output, sandbox })
     })
@@ -426,6 +437,37 @@ fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
     ensure!(
         lines.next().is_none(),
         "normal kuru run emitted unexpected stderr after startup and notice: {stderr:?}"
+    );
+    Ok(())
+}
+
+fn normalize_tool_elapsed(turn: &mut Value) -> Result<()> {
+    let events = turn["events"]
+        .as_array_mut()
+        .context("turn omitted events")?;
+    let mut observations = 0;
+    for event in events {
+        if event["kind"] != "tool-observation" {
+            continue;
+        }
+        let detail = event["detail"]
+            .as_str()
+            .context("tool observation omitted detail")?;
+        let mut observation: Value = serde_json::from_str(detail)?;
+        ensure!(
+            observation["elapsed_ms"].as_u64().is_some(),
+            "tool observation omitted unsigned elapsed milliseconds"
+        );
+        observation
+            .as_object_mut()
+            .context("tool observation detail must be an object")?
+            .remove("elapsed_ms");
+        event["detail"] = Value::String(serde_json::to_string(&observation)?);
+        observations += 1;
+    }
+    ensure!(
+        observations == 1,
+        "expected one tool observation in CLI turn"
     );
     Ok(())
 }
@@ -547,9 +589,11 @@ async fn kuru_run_uses_the_owned_shell_and_preserves_the_responses_continuation(
             .as_object_mut()
             .context("normal turn must be an object")?
             .remove("session");
+        normalize_tool_elapsed(&mut debug_turn)?;
+        normalize_tool_elapsed(&mut normal_turn)?;
         ensure!(
             normal_turn == debug_turn,
-            "--debug changed the JSON turn beyond its newly generated session identity"
+            "--debug changed the JSON turn beyond its session identity and measured tool duration"
         );
         let normal_logs = diagnostics(&normal)?;
         ensure!(
@@ -633,7 +677,7 @@ async fn debug_cli_rotates_the_fixed_private_diagnostic_ring() -> Result<()> {
             &format!("max_tool_calls = {ROTATION_TOOL_CALLS}\n"),
         )
         .context("prepare bounded tool-call CLI sandbox")?;
-        let run = run_sandbox(sandbox, true)
+        let run = run_sandbox_with_capture_limit(sandbox, true, ROTATION_CAPTURE_LIMIT)
             .await
             .context("run bounded rotation CLI")?;
         ensure!(

@@ -14,7 +14,7 @@ use kuru_core::{
 };
 use kuru_memory::{MemoryOpenStage, MemoryStore, OpenOptions as MemoryOptions};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
-use kuru_runtime::{CancellationToken, Harness, forget_note, read_notes};
+use kuru_runtime::{CancellationToken, Event, Harness, forget_note, read_notes};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -865,8 +865,10 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 result.map_err(|error| {
                     let mut failures = std::collections::BTreeSet::new();
                     while let Ok(event) = events.try_recv() {
-                        if event.kind == "error" && failures.len() < 8 {
-                            failures.insert(event.detail.chars().take(512).collect::<String>());
+                        if let Event::Error { detail, .. } = event
+                            && failures.len() < 8
+                        {
+                            failures.insert(detail.chars().take(512).collect::<String>());
                         }
                     }
                     if failures.is_empty() {

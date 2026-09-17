@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::engine::{
-    CancellationToken, Harness, PendingPublication, Session, Topology, read_topology, spec,
-    turn_was_cancelled, user, validate_topology,
+use crate::{
+    Event,
+    engine::{
+        CancellationToken, Harness, PendingPublication, Session, Topology, read_topology, spec,
+        turn_was_cancelled, user, validate_topology,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,11 +52,7 @@ impl Harness {
         let outcome = async {
             cancellation.check()?;
             let memory = candidate.view();
-            self.emit(
-                "dream",
-                "pool",
-                "parts are consolidating their own memories",
-            );
+            self.emit_event(Event::Dream { actor: "pool".into(), detail: "parts are consolidating their own memories".into() });
             let ids = self
                 .topology
                 .parts
@@ -133,16 +132,15 @@ impl Harness {
             report.rejected.extend(changes.rejected);
             self.finish_dream(&candidate, topology, &report, cancellation)
                 .await?;
-            self.emit(
-                "dream",
-                "pool",
-                format!(
+            self.emit_event(Event::Dream {
+                actor: "pool".into(),
+                detail: format!(
                     "{} summaries, {} changes, {} rejected proposals",
                     report.summaries,
                     report.accepted.len(),
                     report.rejected.len()
                 ),
-            );
+            });
             Ok(report)
         }
         .await;

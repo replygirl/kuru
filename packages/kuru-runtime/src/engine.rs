@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::future::join_all;
-use kuru_connectors::{Provider, ToolHost, a2a_send, project_json, project_text};
+use kuru_connectors::{Provider, ToolHost, a2a_send, is_permission_denied, project_text};
 use kuru_core::{
     Completion, Config, Framework, Message, Mode, ModelPreference, Part, ProjectPreferences,
     Relationship, RelationshipKind, ToolCall, ToolSpec, load_instructions,
@@ -24,25 +24,19 @@ use tokio::sync::{Notify, Semaphore, broadcast, oneshot};
 use tracing::Instrument;
 use uuid::Uuid;
 
+pub use crate::event::StateReport;
 use crate::{
     actor::{Actor, Work},
     bus::PeerMessage,
+    event::{Event, ToolObservation, ToolOutcome, TurnLimitReason},
 };
 
 const SHUTDOWN_DREAM_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TURN_TRANSITIONS: usize = 64;
-const EVENT_WITHHELD: &str = "[event detail withheld]";
-const RESPONSE_COMPLETED: &str = "[response completed]";
 /// Transcript role reserved for Kuru's durable interruption marker.
 pub const INTERRUPTION_ROLE: &str = "kuru-interruption";
 /// Stable user-facing content of a durable interruption marker.
 pub const INTERRUPTION_TEXT: &str = "Turn interrupted; no completed answer was committed.";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StateReport {
-    pub activation: f64,
-    pub note: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Focus {
@@ -69,13 +63,6 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Event {
-    pub kind: String,
-    pub actor: String,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnOutput {
     pub session: String,
     pub speaker: String,
@@ -89,15 +76,6 @@ pub struct TurnOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_outcome: Option<ResponseOutcome>,
     pub events: Vec<Event>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "kebab-case")]
-/// A concrete resource limit reached while producing a turn.
-pub enum TurnLimitReason {
-    ToolCalls,
-    PeerRounds,
-    LegacyUnspecified,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,7 +201,10 @@ struct LastLocalSubmission {
 
 impl TurnJournal {
     fn validate(&self, id: &str) -> Result<()> {
-        ensure!(self.format == 1, "unsupported turn journal format");
+        ensure!(
+            matches!(self.format, 1 | 2),
+            "unsupported turn journal format"
+        );
         ensure!(self.id == id, "stored turn journal identity mismatch");
         ensure!(
             !self.transitions.is_empty()
@@ -262,6 +243,91 @@ impl TurnJournal {
         self.transitions.push(transition);
         Ok(())
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredWireEvent {
+    kind: String,
+    actor: String,
+    detail: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTurnOutput {
+    session: String,
+    speaker: String,
+    text: String,
+    relationship: Option<Relationship>,
+    input_tokens: u64,
+    output_tokens: u64,
+    limited: bool,
+    #[serde(default)]
+    limit_reasons: Option<Vec<TurnLimitReason>>,
+    #[serde(default)]
+    response_outcome: Option<ResponseOutcome>,
+    events: Vec<StoredWireEvent>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTurnJournal {
+    format: u32,
+    id: String,
+    prompt: String,
+    target: Option<String>,
+    transitions: Vec<TurnTransition>,
+    possible_dispatch: bool,
+    #[serde(default)]
+    interruption_marker: bool,
+    output: Option<RawTurnOutput>,
+}
+
+fn decode_turn_journal(value: Value) -> Result<TurnJournal> {
+    let raw: RawTurnJournal = serde_json::from_value(value)?;
+    ensure!(
+        matches!(raw.format, 1 | 2),
+        "unsupported turn journal format"
+    );
+    let output = raw
+        .output
+        .map(|output| {
+            let events = output
+                .events
+                .into_iter()
+                .map(|wire| {
+                    Ok(match raw.format {
+                        1 => Event::from_wire_v1(wire.kind, wire.actor, wire.detail),
+                        2 => Event::from_wire_v2(wire.kind, wire.actor, wire.detail),
+                        _ => unreachable!(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok::<_, anyhow::Error>(TurnOutput {
+                session: output.session,
+                speaker: output.speaker,
+                text: output.text,
+                relationship: output.relationship,
+                input_tokens: output.input_tokens,
+                output_tokens: output.output_tokens,
+                limited: output.limited,
+                limit_reasons: output.limit_reasons,
+                response_outcome: output.response_outcome,
+                events,
+            })
+        })
+        .transpose()?;
+    Ok(TurnJournal {
+        format: raw.format,
+        id: raw.id,
+        prompt: raw.prompt,
+        target: raw.target,
+        transitions: raw.transitions,
+        possible_dispatch: raw.possible_dispatch,
+        interruption_marker: raw.interruption_marker,
+        output,
+    })
 }
 
 enum TurnAdmission {
@@ -576,8 +642,8 @@ impl Harness {
         );
         let key = self.turn_journal_key(id);
         if let Some(value) = self.memory.get(&key).await? {
-            let mut journal: TurnJournal =
-                serde_json::from_value(value).context("stored turn journal is invalid")?;
+            let mut journal =
+                decode_turn_journal(value).context("stored turn journal is invalid")?;
             journal.validate(id)?;
             ensure!(
                 journal.prompt == prompt && journal.target.as_deref() == target,
@@ -590,6 +656,9 @@ impl Harness {
                 !journal.possible_dispatch,
                 "turn may have reached external work; use a new turn ID"
             );
+            // A resumable historical entry becomes v2 before it can write a
+            // newly completed output. Completed v1 journals return above.
+            journal.format = 2;
             let resolved_target = target.map(|value| self.resolve(value)).transpose()?;
             cancellation.check()?;
             journal.push(TurnTransition::Resumed)?;
@@ -605,7 +674,7 @@ impl Harness {
         let resolved_target = target.map(|value| self.resolve(value)).transpose()?;
         cancellation.check()?;
         let journal = TurnJournal {
-            format: 1,
+            format: 2,
             id: id.into(),
             prompt: prompt.into(),
             target: target.map(str::to_owned),
@@ -663,7 +732,7 @@ impl Harness {
         let recovering_completion = self.pending_publication.is_some() && journal.output.is_some();
         self.reconcile().await?;
         let id = journal.id.clone();
-        journal = serde_json::from_value(
+        journal = decode_turn_journal(
             self.memory
                 .get(key)
                 .await?
@@ -677,7 +746,7 @@ impl Harness {
                 let response = output
                     .events
                     .last()
-                    .filter(|event| event.kind == "response")
+                    .filter(|event| event.kind() == "response")
                     .context("completed turn journal lacks its response event")?
                     .clone();
                 let _ = self.events.send(response.clone());
@@ -700,16 +769,55 @@ impl Harness {
         Ok(None)
     }
 
-    pub(crate) fn emit(&mut self, kind: &str, actor: &str, detail: impl Into<String>) {
-        let event = projected_event(kind, actor, EventDetail::Text(detail.into()));
+    pub(crate) fn emit_event(&mut self, event: Event) {
+        let event = event.projected();
         let _ = self.events.send(event.clone());
         self.trace.push(event);
     }
 
-    pub(crate) fn emit_json(&mut self, kind: &str, actor: &str, detail: Value) {
-        let event = projected_event(kind, actor, EventDetail::Json(detail));
-        let _ = self.events.send(event.clone());
-        self.trace.push(event);
+    fn observe_tool(
+        &mut self,
+        actor: &str,
+        call: &ToolCall,
+        result: &Result<String>,
+        admitted: std::time::Instant,
+        project_receipt: bool,
+    ) {
+        let (outcome, receipt) = match result {
+            Ok(output)
+                if call.name == "shell"
+                    && serde_json::from_str::<Value>(output)
+                        .ok()
+                        .and_then(|value| value["success"].as_bool())
+                        == Some(false) =>
+            {
+                (
+                    ToolOutcome::Error,
+                    Some(projected_tool_receipt(result, project_receipt)),
+                )
+            }
+            Ok(_) => (
+                ToolOutcome::Ok,
+                Some(projected_tool_receipt(result, project_receipt)),
+            ),
+            Err(error) if turn_was_cancelled(error) => (ToolOutcome::Cancelled, None),
+            Err(error) if is_permission_denied(error) => (ToolOutcome::Denied, None),
+            Err(_) => (
+                ToolOutcome::Error,
+                Some(projected_tool_receipt(result, project_receipt)),
+            ),
+        };
+        self.emit_event(Event::ToolSettled {
+            actor: actor.into(),
+            observation: ToolObservation::from_projected_receipt(
+                &call.id,
+                &call.name,
+                call.arguments.clone(),
+                outcome,
+                receipt,
+                admitted.elapsed(),
+            ),
+        });
     }
 
     pub(crate) fn sync_actors(&mut self) {
@@ -1315,7 +1423,10 @@ impl Harness {
             }
             let batch = std::mem::take(&mut pending);
             for id in batch.keys() {
-                self.emit("active", id, format!("peer round {}", round + 1));
+                self.emit_event(Event::Active {
+                    actor: id.clone(),
+                    detail: format!("peer round {}", round + 1),
+                });
             }
             let results = join_all(batch.iter().map(|(id, inputs)| self.ask_controlled(id, inputs.clone(),
                 "deliberate: form a concise useful contribution; explicitly send any needed peer messages. The selected speaking identity will execute workspace tools next.", cognition_tools(), cancellation))).await;
@@ -1324,7 +1435,10 @@ impl Harness {
                     Ok(c) => c,
                     Err(error) if turn_was_cancelled(&error) => return Err(error),
                     Err(error) => {
-                        self.emit("error", &id, format!("{error:#}"));
+                        self.emit_event(Event::Error {
+                            actor: id.clone(),
+                            detail: format!("{error:#}"),
+                        });
                         continue;
                     }
                 };
@@ -1337,24 +1451,34 @@ impl Harness {
                 if !contribution.trim().is_empty() {
                     *draft = contribution;
                 }
-                self.emit("idle", &id, "contribution ready");
+                self.emit_event(Event::Idle {
+                    actor: id.clone(),
+                    detail: "contribution ready".into(),
+                });
                 for call in completion.calls() {
+                    let admitted = std::time::Instant::now();
                     let result = if used >= self.config.max_tool_calls {
                         limited = true;
                         if limit_reasons.insert(TurnLimitReason::ToolCalls) {
-                            self.emit_json("budget", "pool", json!({"reason":"tool-calls"}));
+                            self.emit_event(Event::Budget {
+                                actor: "pool".into(),
+                                reason: TurnLimitReason::ToolCalls,
+                                detail: None,
+                            });
                         }
-                        Err(anyhow::anyhow!("turn tool budget exhausted"))
+                        let result = Err(anyhow::anyhow!("turn tool budget exhausted"));
+                        self.observe_tool(&id, &call, &result, admitted, true);
+                        result
                     } else {
                         used += 1;
-                        self.cognitive_call(&id, &call, &mut pending, cancellation)
+                        self.cognitive_call(&id, &call, &mut pending, cancellation, admitted, true)
                             .await
                     };
                     let result = match result {
                         Err(error) if turn_was_cancelled(&error) => return Err(error),
                         result => result,
                     };
-                    let output = tool_result(&call, result);
+                    let output = tool_result(&call, result, true);
                     pending.entry(id.clone()).or_default().push(output);
                 }
             }
@@ -1362,14 +1486,11 @@ impl Harness {
         if !pending.is_empty() {
             limited = true;
             limit_reasons.insert(TurnLimitReason::PeerRounds);
-            self.emit_json(
-                "budget",
-                "pool",
-                json!({
-                    "reason":"peer-rounds",
-                    "detail":"pending messages preserved for next invocation"
-                }),
-            );
+            self.emit_event(Event::Budget {
+                actor: "pool".into(),
+                reason: TurnLimitReason::PeerRounds,
+                detail: Some("pending messages preserved for next invocation".into()),
+            });
             for (id, messages) in pending {
                 for message in messages {
                     cancellation.check()?;
@@ -1404,15 +1525,17 @@ impl Harness {
                 .map(|t| vec![json!({"sender":speaker,"text":t})])
                 .unwrap_or_default()
         };
-        self.emit("speaker-selection", &speaker, selection_reason);
-        self.emit(
-            "speaker",
-            &speaker,
-            relation
+        self.emit_event(Event::SpeakerSelection {
+            actor: speaker.clone(),
+            reason: selection_reason.into(),
+        });
+        self.emit_event(Event::Speaker {
+            actor: speaker.clone(),
+            identity_kind: relation
                 .as_ref()
                 .map(|r| r.kind.to_string())
                 .unwrap_or_else(|| "part".into()),
-        );
+        });
         let mut inputs = vec![user(&format!(
             "User request: {prompt}\nExplicit contributions to this speaking identity: {}\nRespond directly as the current conversational identity. Use tools to perform requested work when permitted. Do not narrate the whole pool.",
             serde_json::to_string(&shared)?
@@ -1421,7 +1544,10 @@ impl Harness {
         let catalog = cancellation.wait(self.tools.catalog()).await?;
         for status in catalog.mcp() {
             if !status.available() {
-                self.emit("mcp", status.alias(), "configured server unavailable");
+                self.emit_event(Event::Mcp {
+                    actor: status.alias().into(),
+                    detail: "configured server unavailable".into(),
+                });
             }
         }
         tools.extend(catalog.into_tools());
@@ -1456,24 +1582,45 @@ impl Harness {
             }
             inputs = vec![];
             for call in calls {
+                let admitted = std::time::Instant::now();
                 let result = if used >= self.config.max_tool_calls {
                     limited = true;
                     if limit_reasons.insert(TurnLimitReason::ToolCalls) {
-                        self.emit_json("budget", "pool", json!({"reason":"tool-calls"}));
+                        self.emit_event(Event::Budget {
+                            actor: "pool".into(),
+                            reason: TurnLimitReason::ToolCalls,
+                            detail: None,
+                        });
                     }
-                    Err(anyhow::anyhow!(
+                    let result = Err(anyhow::anyhow!(
                         "turn tool budget exhausted; finish with available evidence"
-                    ))
+                    ));
+                    self.observe_tool(&speaker, &call, &result, admitted, true);
+                    result
                 } else {
                     used += 1;
-                    self.emit("tool", &speaker, call.name.clone());
+                    self.emit_event(Event::ToolStarted {
+                        actor: speaker.clone(),
+                        name: call.name.clone(),
+                    });
                     if is_cognitive(&call.name) {
                         let mut mail = BTreeMap::new();
                         let result = match self
-                            .cognitive_call(&speaker, &call, &mut mail, cancellation)
+                            .cognitive_call(
+                                &speaker,
+                                &call,
+                                &mut mail,
+                                cancellation,
+                                admitted,
+                                false,
+                            )
                             .await
                         {
-                            Err(error) if turn_was_cancelled(&error) => return Err(error),
+                            Err(error) if turn_was_cancelled(&error) => {
+                                let cancelled: Result<String> = Err(TurnCancelled.into());
+                                self.observe_tool(&speaker, &call, &cancelled, admitted, true);
+                                return Err(error);
+                            }
                             result => result,
                         };
                         // Execute a direct peer request, not recursive delegation. Peer replies cannot spend more tools here.
@@ -1498,12 +1645,17 @@ impl Harness {
                                         reply.text_projection()
                                     )));
                                 }
-                                Err(error) if turn_was_cancelled(&error) => return Err(error),
+                                Err(error) if turn_was_cancelled(&error) => {
+                                    let cancelled: Result<String> = Err(TurnCancelled.into());
+                                    self.observe_tool(&speaker, &call, &cancelled, admitted, true);
+                                    return Err(error);
+                                }
                                 Err(error) => {
                                     inputs.push(user(&format!("Peer {id} failed: {error}")))
                                 }
                             }
                         }
+                        self.observe_tool(&speaker, &call, &result, admitted, true);
                         result
                     } else {
                         let span = tracing::info_span!(
@@ -1532,13 +1684,14 @@ impl Harness {
                             Err(_) => "error",
                         };
                         tracing::info!(target: "kuru.tool", parent: &span, status, elapsed_ms = started.elapsed().as_millis() as u64, "external tool finished");
+                        self.observe_tool(&speaker, &call, &result, admitted, false);
                         match result {
                             Err(error) if turn_was_cancelled(&error) => return Err(error),
                             result => result,
                         }
                     }
                 };
-                inputs.push(tool_result(&call, result));
+                inputs.push(tool_result(&call, result, is_cognitive(&call.name)));
             }
         }
         let response_outcome = if text.is_empty() {
@@ -1562,7 +1715,10 @@ impl Harness {
                 topology.focus = None;
             }
         }
-        let response = projected_event("response", &speaker, EventDetail::CompletedResponse);
+        let response = Event::Response {
+            actor: speaker.clone(),
+        }
+        .projected();
         let mut events = self.trace.clone();
         events.push(response.clone());
         let output = TurnOutput {
@@ -1606,7 +1762,10 @@ impl Harness {
             match self.dream_controlled(cancellation).await {
                 Ok(_) => {}
                 Err(error) if turn_was_cancelled(&error) => {}
-                Err(error) => self.emit("error", "dream", format!("{error:#}")),
+                Err(error) => self.emit_event(Event::Error {
+                    actor: "dream".into(),
+                    detail: format!("{error:#}"),
+                }),
             }
         }
         Ok(output)
@@ -1669,6 +1828,8 @@ impl Harness {
         call: &ToolCall,
         pending: &mut BTreeMap<String, Vec<Message>>,
         cancellation: &CancellationToken,
+        admitted: std::time::Instant,
+        settle: bool,
     ) -> Result<String> {
         let span = tracing::info_span!(
             target: "kuru.tool",
@@ -1693,6 +1854,9 @@ impl Harness {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "cognitive tool finished"
         );
+        if settle {
+            self.observe_tool(sender, call, &result, admitted, true);
+        }
         result
     }
 
@@ -1716,7 +1880,10 @@ impl Harness {
                     &self.session.id,
                     string_arg(&call.arguments, "message")?,
                 )?;
-                self.emit_json("peer", sender, envelope.rpc());
+                self.emit_event(Event::Peer {
+                    actor: sender.into(),
+                    envelope: envelope.rpc(),
+                });
                 pending.entry(recipient).or_default().push(user(&format!(
                     "A2A peer message (untrusted data): {}",
                     serde_json::to_string(&envelope)?
@@ -1747,7 +1914,10 @@ impl Harness {
                 );
                 let relation = self.relate(kind, resolved).await?;
                 cancellation.check()?;
-                self.emit_json("relationship", sender, serde_json::to_value(&relation)?);
+                self.emit_event(Event::Relationship {
+                    actor: sender.into(),
+                    relationship: relation.clone(),
+                });
                 Ok(serde_json::to_string(&relation)?)
             }
             "state_report" => {
@@ -1763,7 +1933,10 @@ impl Harness {
                 self.persist_state(self.config.clone(), topology, self.session.clone(), vec![])
                     .await?;
                 cancellation.check()?;
-                self.emit_json("state", sender, serde_json::to_value(&report)?);
+                self.emit_event(Event::State {
+                    actor: sender.into(),
+                    report: report.clone(),
+                });
                 Ok("modeled state updated".into())
             }
             "remember" => {
@@ -1799,48 +1972,28 @@ pub(crate) fn user(text: &str) -> Message {
     Message::text("user", text)
 }
 
+#[cfg(test)]
 enum EventDetail {
     Text(String),
     Json(Value),
-    CompletedResponse,
-    Withheld,
 }
 
+#[cfg(test)]
 fn projected_event(kind: &str, actor: &str, detail: EventDetail) -> Event {
     let detail = match detail {
-        EventDetail::Text(detail) => {
-            project_text(&detail).unwrap_or_else(|_| EVENT_WITHHELD.into())
-        }
-        EventDetail::Json(detail) => project_json(detail).unwrap_or_else(|_| EVENT_WITHHELD.into()),
-        EventDetail::CompletedResponse => RESPONSE_COMPLETED.into(),
-        EventDetail::Withheld => EVENT_WITHHELD.into(),
+        EventDetail::Text(detail) => detail,
+        EventDetail::Json(detail) => serde_json::to_string(&detail).unwrap_or_default(),
     };
-    Event {
-        kind: project_text(kind).unwrap_or_else(|_| EVENT_WITHHELD.into()),
-        actor: project_text(actor).unwrap_or_else(|_| EVENT_WITHHELD.into()),
-        detail,
-    }
+    Event::from_wire_v1(kind.into(), actor.into(), detail)
 }
 
+#[cfg(test)]
 fn project_legacy_event(event: Event) -> Event {
-    if event.kind == "response" {
-        return projected_event(&event.kind, &event.actor, EventDetail::CompletedResponse);
-    }
-    if matches!(event.kind.as_str(), "peer" | "relationship" | "state") {
-        return match serde_json::from_str(&event.detail) {
-            Ok(detail) => projected_event(&event.kind, &event.actor, EventDetail::Json(detail)),
-            Err(_) => projected_event(&event.kind, &event.actor, EventDetail::Withheld),
-        };
-    }
-    projected_event(&event.kind, &event.actor, EventDetail::Text(event.detail))
+    Event::from_wire_v1(event.kind().into(), event.actor().into(), event.detail())
 }
 
 fn project_turn_output(mut output: TurnOutput) -> TurnOutput {
-    output.events = output
-        .events
-        .into_iter()
-        .map(project_legacy_event)
-        .collect();
+    output.events = output.events.into_iter().map(Event::projected).collect();
     if output.limit_reasons.is_none() && output.limited {
         output.limit_reasons = Some(vec![TurnLimitReason::LegacyUnspecified]);
     }
@@ -1862,14 +2015,26 @@ pub(crate) fn path_hash(path: &Path) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
 }
-fn tool_result(call: &ToolCall, result: Result<String>) -> Message {
+fn tool_result(call: &ToolCall, result: Result<String>, project_receipt: bool) -> Message {
     let is_error = result.is_err();
+    Message::tool_result(
+        &call.id,
+        projected_tool_receipt(&result, project_receipt),
+        is_error,
+    )
+}
+
+fn projected_tool_receipt(result: &Result<String>, project_receipt: bool) -> Value {
     let output = match result {
-        Ok(output) => output,
+        Ok(output) => output.clone(),
         Err(error) => format!("ERROR: {error:#}"),
     };
-    let output = kuru_connectors::truncate_tool_output(&output, 8192);
-    Message::tool_result(&call.id, Value::String(output), is_error)
+    let output = if project_receipt {
+        project_text(&output).unwrap_or_else(|_| "[event detail withheld]".into())
+    } else {
+        output
+    };
+    Value::String(kuru_connectors::truncate_tool_output(&output, 8192))
 }
 pub(crate) fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
     args.get(name)
@@ -2391,51 +2556,57 @@ mod publication_tests {
             "peer",
             EventDetail::Json(json!({"activation":0.5,"note":format!("token={secret}")})),
         );
-        assert!(state.detail.contains("activation"));
-        assert!(!state.detail.contains(secret));
+        assert!(state.detail().contains("activation"));
+        assert!(!state.detail().contains(secret));
         let peer = projected_event(
             "peer",
             "peer",
             EventDetail::Json(json!({"body":"ordinary semantic body","api_key":secret})),
         );
-        assert!(peer.detail.contains("ordinary semantic body"));
-        assert!(!peer.detail.contains(secret));
+        assert!(peer.detail().contains("ordinary semantic body"));
+        assert!(!peer.detail().contains(secret));
+        let relationship_record = Relationship::new(
+            RelationshipKind::Alliance,
+            vec!["peer".into(), "ordinary-peer".into()],
+        )
+        .unwrap();
         let relationship = projected_event(
             "relationship",
             "peer",
             EventDetail::Json(json!({
-                "kind":"alliance",
-                "members":["ordinary-peer"],
+                "id":relationship_record.id,
+                "kind":relationship_record.kind,
+                "members":relationship_record.members,
                 "token":secret
             })),
         );
-        assert!(relationship.detail.contains("ordinary-peer"));
-        assert!(!relationship.detail.contains(secret));
+        assert!(relationship.detail().contains("ordinary-peer"));
+        assert!(!relationship.detail().contains(secret));
         let error = projected_event(
             "error",
             "peer",
             EventDetail::Text(format!("token={secret}")),
         );
-        assert!(!error.detail.contains(secret));
+        assert!(!error.detail().contains(secret));
         let metadata = projected_event(
             &format!("kind token={secret}"),
             &format!("actor token={secret}"),
             EventDetail::Text("ordinary detail".into()),
         );
-        assert!(!metadata.kind.contains(secret));
-        assert!(!metadata.actor.contains(secret));
-        let response = project_legacy_event(Event {
+        assert!(!metadata.kind().contains(secret));
+        assert!(!metadata.actor().contains(secret));
+        let response = project_legacy_event(Event::Legacy {
             kind: "response".into(),
             actor: "peer".into(),
             detail: secret.into(),
         });
-        assert_eq!(response.detail, RESPONSE_COMPLETED);
-        let malformed = project_legacy_event(Event {
+        assert_eq!(response.detail(), "[response completed]");
+        let malformed = project_legacy_event(Event::Legacy {
             kind: "state".into(),
             actor: "peer".into(),
             detail: format!("malformed {secret}"),
         });
-        assert_eq!(malformed.detail, EVENT_WITHHELD);
+        assert_eq!(malformed.detail(), "[event detail withheld]");
 
         let legacy: TurnOutput = serde_json::from_value(json!({
             "session":"session",
@@ -2497,11 +2668,14 @@ mod publication_tests {
         let serialized_output = serde_json::to_string(&output).unwrap();
         assert!(!serialized_output.contains(secret));
         assert!(output.events.iter().any(|event| {
-            event.kind == "state"
-                && event.detail.contains("activation")
-                && !event.detail.contains(secret)
+            event.kind() == "state"
+                && event.detail().contains("activation")
+                && !event.detail().contains(secret)
         }));
-        assert_eq!(output.events.last().unwrap().detail, RESPONSE_COMPLETED);
+        assert_eq!(
+            output.events.last().unwrap().detail(),
+            "[response completed]"
+        );
         let mut broadcast = Vec::new();
         while let Ok(event) = events.try_recv() {
             broadcast.push(event);
@@ -2512,6 +2686,7 @@ mod publication_tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(stored["format"], 2);
         assert!(!serde_json::to_string(&stored).unwrap().contains(secret));
         let replay = harness
             .run_controlled(
@@ -3013,8 +3188,8 @@ mod publication_tests {
         );
         let mut observed_response = false;
         while let Ok(event) = events.try_recv() {
-            if event.kind == "response" {
-                assert_eq!(event.detail, RESPONSE_COMPLETED);
+            if event.kind() == "response" {
+                assert_eq!(event.detail(), "[response completed]");
                 observed_response = true;
                 break;
             }
@@ -3125,6 +3300,8 @@ mod publication_tests {
                         },
                         &mut BTreeMap::new(),
                         &CancellationToken::new(),
+                        std::time::Instant::now(),
+                        true,
                     )
                     .await
                     .unwrap();
@@ -3172,7 +3349,7 @@ mod tool_result_tests {
         for cut in 1..REDACTION_MARKER.len() {
             let ordinary_prefix = "x".repeat(8192 - TRUNCATED.len() - cut);
             let output = format!("{ordinary_prefix}{}{}", REDACTION_MARKER, "tail".repeat(32));
-            let receipt = tool_result(&call, Ok(output));
+            let receipt = tool_result(&call, Ok(output), true);
             let value: Value = crate::test_receipt(&receipt).unwrap();
             assert_eq!(value["call_id"], call.id);
             let output = value["output"].as_str().unwrap();

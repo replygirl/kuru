@@ -199,7 +199,7 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         output
             .events
             .iter()
-            .filter(|event| event.kind == "tool")
+            .filter(|event| event.kind() == "tool")
             .count()
             == replay.calls.len(),
         "not every model request reached the actual tool dispatcher"
