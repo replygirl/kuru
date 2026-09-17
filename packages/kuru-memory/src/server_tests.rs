@@ -547,3 +547,208 @@ async fn closing_an_attached_handle_does_not_establish_quiescence() -> Result<()
     drop(lease);
     Ok(())
 }
+
+fn collision_request(root: &Path, binary: PathBuf) -> Result<Request> {
+    Ok(Request {
+        binary,
+        directory: fs::canonicalize(root)?.join("collision-memory"),
+        project_scope: "project/selected-port-collision".into(),
+        timeout_millis: 20_000,
+        read_only: false,
+        lifecycle_root: None,
+    })
+}
+
+async fn actual_dolt_for_collision() -> Result<PathBuf> {
+    crate::provision::provision(
+        &kuru_core::MemoryConfig {
+            offline: true,
+            ..Default::default()
+        },
+        &crate::store::test_cache(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn selected_port_takeover_retries_actual_dolt_without_touching_holder() -> Result<()> {
+    let root = fixture()?;
+    let request = collision_request(root.path(), actual_dolt_for_collision().await?)?;
+    let directory = request.directory.clone();
+    let holder = Arc::new(StdMutex::new(None::<std::net::TcpListener>));
+    let chosen = Arc::new(StdMutex::new(Vec::<u16>::new()));
+    let observed_holder = holder.clone();
+    let observed_chosen = chosen.clone();
+    let (parent, mut input) = tokio::io::duplex(1024);
+    let (mut output, mut response) = tokio::io::duplex(4096);
+    let supervisor = tokio::spawn(async move {
+        supervise_with_port_hook(request, &mut input, &mut output, move |port| {
+            let mut chosen = observed_chosen.lock().unwrap();
+            chosen.push(port);
+            if chosen.len() == 1 {
+                let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+                *observed_holder.lock().unwrap() = Some(listener);
+            }
+            Ok(())
+        })
+        .await
+    });
+    let ready = tokio::time::timeout(
+        Duration::from_secs(25),
+        read_frame::<_, Response>(&mut response),
+    )
+    .await??;
+    let endpoint = match ready {
+        Response::Ready { endpoint, owned } => {
+            assert!(owned, "collision recovery borrowed an unrelated lifetime");
+            endpoint
+        }
+        Response::Failed(message) => bail!("actual Dolt did not recover: {message}"),
+    };
+    let ports = chosen.lock().unwrap().clone();
+    assert_eq!(
+        ports.len(),
+        2,
+        "exactly one selected-port collision should retry"
+    );
+    assert_ne!(ports[0], ports[1]);
+    assert_eq!(endpoint.port, ports[1]);
+    {
+        let held = holder.lock().unwrap();
+        assert_eq!(
+            held.as_ref()
+                .context("unrelated listener lost")?
+                .local_addr()?
+                .port(),
+            ports[0]
+        );
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", ports[0])).is_err(),
+            "Kuru closed the unrelated port holder"
+        );
+    }
+    let identity = load_identity(&directory, "project/selected-port-collision")?
+        .context("ready Dolt did not publish its identity")?;
+    let pool = connect_pool(&identity, &endpoint, &directory, "main", false, 1).await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru_instance")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 1);
+    pool.close().await;
+    drop(parent);
+    tokio::time::timeout(Duration::from_secs(10), supervisor).await???;
+    assert!(!directory.join("endpoint.json").exists());
+    assert!(holder.lock().unwrap().is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_selected_port_takeovers_exhaust_three_owned_attempts() -> Result<()> {
+    let root = fixture()?;
+    let request = collision_request(root.path(), actual_dolt_for_collision().await?)?;
+    let directory = request.directory.clone();
+    let holders = Arc::new(StdMutex::new(Vec::<std::net::TcpListener>::new()));
+    let retained = holders.clone();
+    let (_parent, mut input) = tokio::io::duplex(1024);
+    let mut output = Vec::new();
+    let error = supervise_with_port_hook(request, &mut input, &mut output, move |port| {
+        retained
+            .lock()
+            .unwrap()
+            .push(std::net::TcpListener::bind(("127.0.0.1", port))?);
+        Ok(())
+    })
+    .await
+    .unwrap_err();
+    let held = holders.lock().unwrap();
+    assert_eq!(
+        held.len(),
+        3,
+        "exact collision retry exceeded its finite attempt bound"
+    );
+    for listener in held.iter() {
+        assert!(std::net::TcpListener::bind(listener.local_addr()?).is_err());
+    }
+    assert!(
+        format!("{error:#}").contains("Dolt exited before readiness"),
+        "{error:#}"
+    );
+    assert!(fs::read_to_string(directory.join("server.log"))?.contains("already in use."));
+    assert!(
+        output.is_empty(),
+        "failed collision published a Ready response"
+    );
+    assert!(!directory.join("endpoint.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unrelated_premature_exit_does_not_retry_or_publish() -> Result<()> {
+    let root = fixture()?;
+    let binary = root.path().join("controlled-noncollision-exit");
+    fs::write(
+        &binary,
+        b"#!/bin/sh\nprintf 'controlled noncollision exit\\n' >&2\nexit 7\n",
+    )?;
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
+    let request = collision_request(root.path(), binary)?;
+    let directory = request.directory.clone();
+    let mut attempts = 0;
+    let (_parent, mut input) = tokio::io::duplex(1024);
+    let mut output = Vec::new();
+    let error = supervise_with_port_hook(request, &mut input, &mut output, |_| {
+        attempts += 1;
+        Ok(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(attempts, 1);
+    assert!(
+        format!("{error:#}").contains("Dolt exited before readiness"),
+        "{error:#}"
+    );
+    assert!(
+        fs::read_to_string(directory.join("server.log"))?.contains("controlled noncollision exit")
+    );
+    assert!(output.is_empty());
+    assert!(!directory.join("endpoint.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn parent_close_during_selected_port_takeover_never_retries() -> Result<()> {
+    let root = fixture()?;
+    let request = collision_request(root.path(), actual_dolt_for_collision().await?)?;
+    let directory = request.directory.clone();
+    let holder = Arc::new(StdMutex::new(None::<std::net::TcpListener>));
+    let observed = holder.clone();
+    let attempts = Arc::new(StdMutex::new(0usize));
+    let counted = attempts.clone();
+    let (selected, chosen) = tokio::sync::oneshot::channel();
+    let mut selected = Some(selected);
+    let (parent, mut input) = tokio::io::duplex(1024);
+    let mut output = Vec::new();
+    let supervisor = tokio::spawn(async move {
+        supervise_with_port_hook(request, &mut input, &mut output, move |port| {
+            *counted.lock().unwrap() += 1;
+            *observed.lock().unwrap() = Some(std::net::TcpListener::bind(("127.0.0.1", port))?);
+            selected
+                .take()
+                .context("port selected more than once after parent close")?
+                .send(())
+                .map_err(|_| anyhow!("port-selection observer closed"))?;
+            Ok(())
+        })
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), chosen).await??;
+    drop(parent);
+    let error = tokio::time::timeout(Duration::from_secs(10), supervisor)
+        .await??
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("parent closed"), "{error:#}");
+    assert_eq!(*attempts.lock().unwrap(), 1);
+    assert!(holder.lock().unwrap().is_some());
+    assert!(!directory.join("endpoint.json").exists());
+    Ok(())
+}
