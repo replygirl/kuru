@@ -3,9 +3,49 @@ use kuru_archive::zip::{Limits, MemberKind, WriteMember, write};
 use kuru_platform::fs::regular_file_info;
 #[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(windows)]
+use std::{
+    io, thread,
+    time::{Duration, Instant},
+};
 
 const EXE: &[u8] = b"MZ fixture bytes, deliberately never executed";
 const NOTICES: &[u8] = b"exact upstream notice fixture";
+
+#[cfg(windows)]
+fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentity) -> Result<()> {
+    let mut retry_deadline = None;
+    loop {
+        let (parent, file) = files::read(binary, Privacy::OwnerOnly)?;
+        ensure!(
+            regular_file_info(&file)?.identity == expected,
+            "fixture cache binary identity changed before invalidation"
+        );
+        match parent.remove_file(files::name(binary)?, file) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if std::error::Error::source(&error)
+                    .and_then(|source| source.downcast_ref::<io::Error>())
+                    .and_then(io::Error::raw_os_error)
+                    == Some(32) =>
+            {
+                let deadline =
+                    *retry_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+                if Instant::now() >= deadline {
+                    return Err(anyhow::Error::new(error).context(
+                        "fixture cache binary invalidation exhausted its bounded OS32 recovery",
+                    ));
+                }
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
+    }
+}
 
 #[tokio::test]
 async fn invalid_memory_config_fails_before_provision_creates_cache() {
@@ -271,6 +311,7 @@ async fn published_engine_reports_failed_stage_cleanup_and_releases_cache_lease(
     let lock_identity = regular_file_info(&lock).unwrap().identity;
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_container = stage.path().parent().unwrap().to_owned();
+    let stage_identity = files::directory(stage.path()).unwrap().identity();
     let candidate = stage.path().join("runtime");
     let bytes = zip();
     with_asset(&bytes, |asset| extract(&bytes, &candidate, asset)).unwrap();
@@ -291,9 +332,20 @@ async fn published_engine_reports_failed_stage_cleanup_and_releases_cache_lease(
     let detail = format!("{error:#}");
     assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
     assert!(detail.contains(&stage_container.display().to_string()));
+    assert!(
+        detail.contains("(os error 32)"),
+        "the persistent no-DELETE holder must retain the native cleanup cause: {detail}"
+    );
     assert_eq!(fs::read(destination.join("dolt.exe")).unwrap(), EXE);
     assert_eq!(fs::read(destination.join("LICENSES")).unwrap(), NOTICES);
     assert!(blocker_path.exists());
+    assert_eq!(
+        files::directory(stage_container.join("private").as_path())
+            .unwrap()
+            .identity(),
+        stage_identity,
+        "the exhausted cleanup must preserve the original private stage"
+    );
     let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
     assert_eq!(
         regular_file_info(&reacquired).unwrap().identity,
@@ -727,7 +779,11 @@ async fn actual_warm_cache_verifies_concurrently_while_installation_lock_is_held
         // Installed Windows payloads are deliberately sealed owner-read/execute.
         // Replace this isolated fixture with private bytes of the expected size
         // rather than weakening the production ACL to make it writable.
-        fs::remove_file(&binary).unwrap();
+        let (_parent, file) = files::read(&binary, Privacy::OwnerOnly).unwrap();
+        let identity = regular_file_info(&file).unwrap().identity;
+        drop(file);
+        drop(_parent);
+        remove_fixture_binary(&binary, identity).unwrap();
         let corrupt = new_private_file(&binary).unwrap();
         corrupt.set_len(BUNDLED_ASSET.executable_bytes).unwrap();
         corrupt.sync_all().unwrap();
@@ -811,7 +867,7 @@ async fn real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_b
         )),
         BUNDLED_ASSET.license_sha256
     );
-    fs::remove_file(&binary).unwrap();
+    remove_fixture_binary(&binary, identity).unwrap();
     let file = new_private_file(&binary).unwrap();
     file.set_len(BUNDLED_ASSET.executable_bytes).unwrap();
     file.sync_all().unwrap();
