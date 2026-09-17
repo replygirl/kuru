@@ -1007,14 +1007,21 @@ impl MemoryStore {
         options.config.offline = true;
         options.supervisor = Some(test_supervisor()?);
         let mut progress = ProgressReporter::silent();
-        Self::open_inner(
+        let retained = Arc::new(directory);
+        let fixture_options = options.clone();
+        let opened = Self::open_inner(
             options,
-            Some(Arc::new(directory)),
+            Some(retained.clone()),
             Some(permit),
             None,
             &mut progress,
         )
-        .await
+        .await;
+        let result = opened
+            .map_err(|error| crate::test_support::fixture_startup_error(&fixture_options, error));
+        // The stage and its server.log must still exist while the error is annotated.
+        drop(retained);
+        result
     }
 
     fn readable(&self) -> Result<()> {
@@ -2125,7 +2132,7 @@ pub(crate) fn identifier(label: &str, value: &str, maximum: usize) -> Result<()>
     ensure!(!value.contains('\0'), "{label} must not contain NUL");
     Ok(())
 }
-fn project_directory(data: &Path, scope: &str) -> Result<PathBuf> {
+pub(crate) fn project_directory(data: &Path, scope: &str) -> Result<PathBuf> {
     let hash = scope
         .strip_prefix("project/")
         .context("memory project scope must start with project/")?;

@@ -7,8 +7,8 @@
 pub use crate::files::PrivateTemp as TempDir;
 #[cfg(windows)]
 pub mod windows;
-use crate::{OpenOptions, files};
-use anyhow::{Context, Result, ensure};
+use crate::{MemoryStore, OpenOptions, files};
+use anyhow::{Context, Error, Result, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy, Publication, seal_private};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +22,9 @@ use std::{
 
 const LIMIT: u64 = 512 * 1024 * 1024;
 const DIRECTORY: &str = "kuru-test-supervisors";
+const STARTUP_LOG_BYTES: u64 = 40 * 1024;
+const STARTUP_TAIL_BYTES: usize = 4 * 1024;
+const MAX_STAGE_ENTRIES: usize = 64;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +62,124 @@ pub fn open_options(data_dir: PathBuf, project_scope: String) -> Result<OpenOpti
     options.config.offline = true;
     options.supervisor = Some(crate::store::test_supervisor()?);
     Ok(options)
+}
+
+/// Open an explicit real-engine fixture with its private startup log available on failure.
+/// Ordinary `MemoryStore::open` retains its production error and log privacy behavior.
+pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
+    let fixture_options = options.clone();
+    MemoryStore::open(options)
+        .await
+        .map_err(|error| fixture_startup_error(&fixture_options, error))
+}
+
+pub(crate) fn fixture_startup_error(options: &OpenOptions, error: Error) -> Error {
+    if !error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.starts_with("Dolt startup/lifetime failed; private diagnostics:")
+            || message.starts_with(
+                "memory server startup failed: Dolt startup/lifetime failed; private diagnostics:",
+            )
+    }) {
+        return error;
+    }
+    match staged_fixture_server_log(options) {
+        Some(log) => error.context(log),
+        None => error,
+    }
+}
+
+fn staged_fixture_server_log(options: &OpenOptions) -> Option<String> {
+    let active = crate::store::project_directory(&options.data_dir, &options.project_scope).ok()?;
+    let parent = active.parent()?;
+    let name = active.file_name()?.to_str()?;
+    let prefix = format!("{name}.staging-");
+    let mut stage = None;
+    for (index, entry) in fs::read_dir(parent).ok()?.enumerate() {
+        if index >= MAX_STAGE_ENTRIES {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let entry_name = entry.file_name();
+        let Some(suffix) = entry_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+        else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(suffix).is_err() {
+            continue;
+        }
+        if !entry.file_type().ok()?.is_dir() || stage.replace(entry.path()).is_some() {
+            return None;
+        }
+    }
+    let log = stage?.join("server.log");
+    let bytes = files::read_bytes(&log, STARTUP_LOG_BYTES).ok()?;
+    let tail = &bytes[bytes.len().saturating_sub(STARTUP_TAIL_BYTES)..];
+    Some(format!(
+        "fixture Dolt server log tail ({}): {}",
+        log.display(),
+        String::from_utf8_lossy(tail)
+    ))
+}
+
+#[cfg(test)]
+mod fixture_diagnostic_tests {
+    use super::*;
+
+    fn startup_error() -> Error {
+        anyhow::anyhow!(
+            "memory server startup failed: Dolt startup/lifetime failed; private diagnostics: fixture/server.log: Dolt exited before readiness"
+        )
+    }
+
+    #[test]
+    fn startup_log_capture_is_opt_in_exact_and_bounded() -> Result<()> {
+        let root = tempdir()?;
+        let options = OpenOptions::new(root.path().join("private"), format!("project/{:064x}", 7));
+        let active = crate::store::project_directory(&options.data_dir, &options.project_scope)?;
+        let stage = active.with_file_name(format!(
+            "{}.staging-{}",
+            active
+                .file_name()
+                .context("fixture project name missing")?
+                .to_string_lossy(),
+            uuid::Uuid::new_v4()
+        ));
+        files::private_dir(&stage)?;
+        let log = stage.join("server.log");
+        files::write(&log, b"fixture-private-log")?;
+
+        let unrelated = anyhow::anyhow!("ordinary fixture error");
+        let unchanged = fixture_startup_error(&options, unrelated);
+        assert_eq!(unchanged.to_string(), "ordinary fixture error");
+        let captured = fixture_startup_error(&options, startup_error());
+        let rendered = format!("{captured:#}");
+        assert!(rendered.contains("fixture-private-log"));
+        assert!(rendered.contains(&log.display().to_string()));
+        assert!(rendered.contains("Dolt exited before readiness"));
+
+        files::write(&log, &vec![b'x'; 8 * 1024])?;
+        let bounded = fixture_startup_error(&options, startup_error()).to_string();
+        assert!(bounded.len() < 5 * 1024, "fixture log tail was not bounded");
+        assert!(bounded.ends_with(&"x".repeat(4 * 1024)));
+        fs::remove_file(&log)?;
+        let missing = fixture_startup_error(&options, startup_error());
+        assert!(!format!("{missing:#}").contains("fixture Dolt server log tail"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_open_keeps_its_error_with_test_support_compiled() -> Result<()> {
+        let root = tempdir()?;
+        let options = OpenOptions::new(root.path().join("private"), "invalid scope".into());
+        let error = MemoryStore::open(options).await.err();
+        let error = error.context("ordinary fixture open unexpectedly succeeded")?;
+        assert!(format!("{error:#}").contains("memory project scope must start with project/"));
+        assert!(!format!("{error:#}").contains("fixture Dolt server log tail"));
+        Ok(())
+    }
 }
 
 /// Commit one invalid state payload for an isolated export-failure fixture.

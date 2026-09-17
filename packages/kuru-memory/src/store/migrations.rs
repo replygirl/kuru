@@ -1308,90 +1308,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn staged_fixture_server_log(options: &super::super::OpenOptions) -> String {
-        const LOG_BYTES: u64 = 40 * 1024;
-        const TAIL_BYTES: usize = 4 * 1024;
-        let unavailable = |reason: &str| format!("fixture Dolt server log unavailable: {reason}");
-        let Ok(active) = super::super::project_directory(&options.data_dir, &options.project_scope)
-        else {
-            return unavailable("invalid fixture project scope");
-        };
-        let Some(parent) = active.parent() else {
-            return unavailable("missing fixture memory directory");
-        };
-        let Some(name) = active.file_name().and_then(std::ffi::OsStr::to_str) else {
-            return unavailable("invalid fixture project name");
-        };
-        let prefix = format!("{name}.staging-");
-        let Ok(entries) = std::fs::read_dir(parent) else {
-            return unavailable("cannot list fixture memory directory");
-        };
-        let mut stage = None;
-        for entry in entries {
-            let Ok(entry) = entry else {
-                return unavailable("cannot inspect fixture memory directory");
-            };
-            let name = entry.file_name();
-            let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
-                continue;
-            };
-            if Uuid::parse_str(suffix).is_err() {
-                continue;
-            }
-            let Ok(kind) = entry.file_type() else {
-                return unavailable("cannot inspect fixture staging entry");
-            };
-            if !kind.is_dir() || stage.replace(entry.path()).is_some() {
-                return unavailable("fixture staging directory is ambiguous");
-            }
-        }
-        let Some(stage) = stage else {
-            return unavailable("matching fixture staging directory is absent");
-        };
-        let log = stage.join("server.log");
-        let Ok(bytes) = crate::files::read_bytes(&log, LOG_BYTES) else {
-            return unavailable("matching fixture server.log is absent or invalid");
-        };
-        let tail = &bytes[bytes.len().saturating_sub(TAIL_BYTES)..];
-        format!(
-            "fixture Dolt server log tail ({}): {}",
-            log.display(),
-            String::from_utf8_lossy(tail)
-        )
-    }
-
-    #[test]
-    fn staged_fixture_log_is_exact_bounded_and_optional() -> Result<()> {
-        let root = crate::test_support::tempdir()?;
-        let options = super::super::OpenOptions::new(
-            root.path().join("private"),
-            format!("project/{:064x}", 7),
-        );
-        let active = super::super::project_directory(&options.data_dir, &options.project_scope)?;
-        let stage = active.with_file_name(format!(
-            "{}.staging-{}",
-            active
-                .file_name()
-                .context("fixture project name missing")?
-                .to_string_lossy(),
-            Uuid::new_v4()
-        ));
-        super::super::private_dir(&stage)?;
-        let log = stage.join("server.log");
-        crate::files::write(&log, b"fixture-private-log")?;
-        let diagnostic = staged_fixture_server_log(&options);
-        assert!(diagnostic.contains("fixture-private-log"));
-        assert!(diagnostic.contains(&log.display().to_string()));
-
-        crate::files::write(&log, &vec![b'x'; 8 * 1024])?;
-        let bounded = staged_fixture_server_log(&options);
-        assert!(bounded.len() < 5 * 1024, "fixture log tail was not bounded");
-        assert!(bounded.ends_with(&"x".repeat(4 * 1024)));
-        std::fs::remove_file(&log)?;
-        assert!(staged_fixture_server_log(&options).contains("unavailable"));
-        Ok(())
-    }
-
     #[derive(Debug, Eq, PartialEq)]
     struct DurableSnapshot {
         head: String,
@@ -1786,9 +1702,7 @@ mod tests {
                 root.path().join("private"),
                 format!("project/{index:064x}"),
             )?;
-            let store = super::super::MemoryStore::open(options.clone())
-                .await
-                .map_err(|error| error.context(staged_fixture_server_log(&options)))?;
+            let store = crate::test_support::open_fixture(options.clone()).await?;
             match corruption {
                 Corruption::MissingReceipt => {
                     bounded_query(
