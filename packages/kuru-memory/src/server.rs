@@ -1226,6 +1226,24 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     input: &mut R,
     output: &mut W,
 ) -> Result<()> {
+    supervise_with_port_hook(request, input, output, |_| Ok(())).await
+}
+
+/// At most this many owned Dolt startup attempts may run, all inside the one
+/// original startup deadline, and only while Dolt itself reports that the
+/// freshly selected loopback port was taken before it could bind.
+const OWNED_START_ATTEMPTS: usize = 3;
+
+async fn supervise_with_port_hook<
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: FnMut(u16) -> Result<()>,
+>(
+    request: Request,
+    input: &mut R,
+    output: &mut W,
+    mut port_selected: F,
+) -> Result<()> {
     ensure!(
         request.timeout_millis > 0 && request.timeout_millis <= 300_000,
         "invalid supervisor startup timeout"
@@ -1302,54 +1320,57 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         private_directory(&request.directory.join(name))?;
     }
     crate::provision::prepare_private_home(&request.directory.join("home"))?;
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .context("reserve a private loopback port for Dolt")?;
-    let port = listener.local_addr()?.port();
-    ensure!(port >= 1024, "unsupported allocated Dolt port");
-    drop(listener);
-    let endpoint = Endpoint {
-        instance: identity.instance.clone(),
-        port,
-    };
-    let yaml = server_yaml(
-        &request.directory,
-        port,
-        Duration::from_millis(request.timeout_millis),
-    )?;
-    let config_path = request.directory.join("server.yaml");
-    write_private(&config_path, yaml.as_bytes())?;
     let mut signals = ShutdownSignals::new()?;
-    let mut child = crate::engine::spawn(
-        &request.binary,
-        &request.directory.join("home"),
-        &request.directory,
-        vec![
-            "sql-server".into(),
-            "--config".into(),
-            config_path.into_os_string(),
-        ],
-        vec![
-            (
-                "DOLT_ROOT_PASSWORD".into(),
-                identity.password.clone().into(),
-            ),
-            ("DOLT_ROOT_HOST".into(), "localhost".into()),
-        ],
-        true,
-    )
-    .await?;
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let stdout = tokio::spawn(drain(
-        child.stdout().context("Dolt stdout missing")?,
-        log.clone(),
-    ));
-    let stderr = tokio::spawn(drain(
-        child.stderr().context("Dolt stderr missing")?,
-        log.clone(),
-    ));
     let mut byte = [0];
-    let run_result = async {
+    let mut attempt = 0usize;
+    loop {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .context("reserve a private loopback port for Dolt")?;
+        let port = listener.local_addr()?.port();
+        ensure!(port >= 1024, "unsupported allocated Dolt port");
+        drop(listener);
+        port_selected(port)?;
+        let endpoint = Endpoint {
+            instance: identity.instance.clone(),
+            port,
+        };
+        let yaml = server_yaml(
+            &request.directory,
+            port,
+            Duration::from_millis(request.timeout_millis),
+        )?;
+        let config_path = request.directory.join("server.yaml");
+        write_private(&config_path, yaml.as_bytes())?;
+        let mut child = crate::engine::spawn(
+            &request.binary,
+            &request.directory.join("home"),
+            &request.directory,
+            vec![
+                "sql-server".into(),
+                "--config".into(),
+                config_path.into_os_string(),
+            ],
+            vec![
+                (
+                    "DOLT_ROOT_PASSWORD".into(),
+                    identity.password.clone().into(),
+                ),
+                ("DOLT_ROOT_HOST".into(), "localhost".into()),
+            ],
+            true,
+        )
+        .await?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stdout = tokio::spawn(drain(
+            child.stdout().context("Dolt stdout missing")?,
+            log.clone(),
+        ));
+        let stderr = tokio::spawn(drain(
+            child.stderr().context("Dolt stderr missing")?,
+            log.clone(),
+        ));
+        let run_result = async {
         tokio::select! {
             ready = start_database(&mut child, &request.directory, &mut identity, &endpoint, deadline) => ready,
             result = input.read(&mut byte) => { result?; Err(anyhow!("memory parent closed during startup")) },
@@ -1362,43 +1383,72 @@ async fn supervise<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             result = input.read(&mut byte) => { result?; Ok(()) },
             _ = signals.recv() => Ok(()),
         }
-    }.await;
-    let stopped = stop_child(&mut child).await;
-    if stopped.is_err() {
-        // The parent has its own bounded close deadline. A failure to reap
-        // cannot make the directory safe to move: retain this supervisor and
-        // its lifecycle lease until the actual owned process has terminated.
-        eprintln!("Dolt cleanup is delayed; retaining the memory lifecycle lease");
-        observe_dolt(&mut child, Child::try_wait).await;
-    }
-    let _ = timeout(Duration::from_secs(1), async {
-        let _ = stdout.await;
-        let _ = stderr.await;
-    })
-    .await;
-    let mut diagnostic = String::from_utf8_lossy(&log.lock().await)
-        .replace(&identity.password, "[redacted]")
-        .replace(&identity.reader_password, "[redacted]");
-    match &stopped {
-        Ok(outcome) => {
-            diagnostic.push_str(&format!("\nKuru engine shutdown: {outcome:?}\n"));
+        }.await;
+        let stopped = stop_child(&mut child).await;
+        if stopped.is_err() {
+            // The parent has its own bounded close deadline. A failure to reap
+            // cannot make the directory safe to move: retain this supervisor and
+            // its lifecycle lease until the actual owned process has terminated.
+            eprintln!("Dolt cleanup is delayed; retaining the memory lifecycle lease");
+            observe_dolt(&mut child, Child::try_wait).await;
         }
-        Err(_) => diagnostic.push_str("\nKuru engine shutdown: observed after cleanup error\n"),
+        let drained = timeout(Duration::from_secs(1), async {
+            stdout.await?;
+            stderr.await?;
+            Ok::<(), tokio::task::JoinError>(())
+        })
+        .await;
+        let mut diagnostic = String::from_utf8_lossy(&log.lock().await)
+            .replace(&identity.password, "[redacted]")
+            .replace(&identity.reader_password, "[redacted]");
+        match &stopped {
+            Ok(outcome) => {
+                diagnostic.push_str(&format!("\nKuru engine shutdown: {outcome:?}\n"));
+            }
+            Err(_) => diagnostic.push_str("\nKuru engine shutdown: observed after cleanup error\n"),
+        }
+        write_private(&request.directory.join("server.log"), diagnostic.as_bytes())?;
+        if let Some(published) = read_record::<Endpoint>(&request.directory.join("endpoint.json"))?
+            && published.instance == endpoint.instance
+            && published.port == endpoint.port
+        {
+            retire_endpoint(&request.directory)?;
+        }
+        stopped?;
+        match run_result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt + 1 < OWNED_START_ATTEMPTS
+                    && error.downcast_ref::<DoltPrematureExit>().is_some()
+                    && drained.is_ok_and(|result| result.is_ok())
+                    && diagnostic.lines().any(|line| {
+                        line.trim_end_matches('\r') == format!("Port {port} already in use.")
+                    })
+                    && Instant::now() < deadline =>
+            {
+                // A parent close or termination may have become ready while
+                // the failed child was being reaped. It must win over retry.
+                tokio::select! {
+                    biased;
+                    result = input.read(&mut byte) => {
+                        result?;
+                        bail!("memory parent closed during startup");
+                    }
+                    _ = signals.recv() => bail!("memory supervisor terminated during startup"),
+                    () = std::future::ready(()) => {}
+                }
+                attempt += 1;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Dolt startup/lifetime failed; private diagnostics: {}",
+                        request.directory.join("server.log").display()
+                    )
+                });
+            }
+        }
     }
-    write_private(&request.directory.join("server.log"), diagnostic.as_bytes())?;
-    if let Some(published) = read_record::<Endpoint>(&request.directory.join("endpoint.json"))?
-        && published.instance == endpoint.instance
-        && published.port == endpoint.port
-    {
-        retire_endpoint(&request.directory)?;
-    }
-    stopped?;
-    run_result.with_context(|| {
-        format!(
-            "Dolt startup/lifetime failed; private diagnostics: {}",
-            request.directory.join("server.log").display()
-        )
-    })
     // `lease` is released only after child cleanup and endpoint retirement.
 }
 
@@ -1509,6 +1559,17 @@ async fn drain<R: AsyncRead + Unpin>(mut reader: R, log: Arc<Mutex<Vec<u8>>>) {
     }
 }
 
+#[derive(Debug)]
+struct DoltPrematureExit(std::process::ExitStatus);
+
+impl std::fmt::Display for DoltPrematureExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Dolt exited before readiness ({})", self.0)
+    }
+}
+
+impl std::error::Error for DoltPrematureExit {}
+
 async fn start_database(
     child: &mut Child,
     directory: &Path,
@@ -1518,7 +1579,7 @@ async fn start_database(
 ) -> Result<()> {
     loop {
         if let Some(status) = child.try_wait()? {
-            bail!("Dolt exited before readiness ({status})");
+            return Err(DoltPrematureExit(status).into());
         }
         ensure!(
             Instant::now() < deadline,
