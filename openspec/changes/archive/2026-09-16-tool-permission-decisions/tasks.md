@@ -19,4 +19,4 @@
 ## 4. Integrated acceptance
 
 - [x] 4.1 Run the declared cross-boundary native file/shell/MCP/A2A effect and trust fixtures plus real PTYs; record observed local outcomes against verification rows 1–3 and distinguish native CI delivery evidence, including Windows, from local acceptance.
-- [ ] 4.2 Run scoped typecheck/lint/format/schema/docs checks, one combined coverage gate and strict cospec validation; record the actual results and resolve independent final review findings before archive.
+- [x] 4.2 Run scoped typecheck/lint/format/schema/docs checks, one combined coverage gate and strict cospec validation; record the actual results and resolve independent final review findings before archive.
