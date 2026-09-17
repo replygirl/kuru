@@ -4,6 +4,12 @@ A framework gives Kuru its starting parts, their roles, and the perspectives the
 
 Choose a framework with <kbd>F4</kbd>, `/mode`, or `--mode`. The choice is independent of the inference provider, model, and tools. Terminal selections are remembered for the current project.
 
+The four built-in frameworks have reference policies for roles, peer contact,
+turn flow, speaker choice, visibility, and memory. These describe decisions
+while Kuru's runtime keeps control of tool permissions, resource limits, and
+private histories. The current modes keep the same behavior; the contract does
+not add a new mode, composition control, or a supervisor.
+
 <FrameworkPortrait />
 
 ## Who speaks

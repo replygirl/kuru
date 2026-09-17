@@ -58,5 +58,8 @@ mod dolt_tests;
 #[cfg(test)]
 mod notes_tests;
 
+#[cfg(test)]
+mod mode_baseline_tests;
+
 #[cfg(all(test, windows))]
 mod windows_tool_tests;

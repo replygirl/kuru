@@ -41,6 +41,17 @@ Stable IDs identify parts. Switching a mode selects a different topology;
 provider/model/effort are independent configuration choices. Adding a framework
 belongs in `kuru-core`, keeping provider code unchanged.
 
+Core defines each built-in mode as a validated reference profile with six
+separable, pure decision components: roles (seeds and coverage), peering
+(eligible edges and relationships), flow (recipients and contribution envelopes),
+facing (speaker choice), visibility (admitted context sources), and memory
+(namespace keys and dream consolidation plan). These components return decisions;
+the runtime still checks live identities and isolation, enforces budgets and tool
+permissions, owns candidate memory, and performs every provider or tool call.
+The current engine, actor, and dream loops retain their existing dispatch logic.
+Routing those loops through the profile is later work; this contract alone does
+not add a mode or a user control.
+
 Speaker selection preserves stronger runtime evidence before consulting a
 framework's authored order. An explicit caller target wins first, followed by an
 existing active runtime focus. Otherwise the greatest activation narrows the
