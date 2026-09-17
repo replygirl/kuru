@@ -139,7 +139,8 @@ pub fn draw(frame: &mut Frame<'_>, view: &View) {
         draw_tiny(frame, view, area);
         return;
     }
-    let control_rows = 1 + if area.width >= 72 {
+    // Chip rows, then the standing cost/context meters, then permissions.
+    let control_rows = 2 + if area.width >= 72 {
         1
     } else if area.width >= 38 {
         2
@@ -791,6 +792,10 @@ fn dock_controls(view: &View, width: u16) -> Vec<Line<'static>> {
         vec![Line::from(model), Line::from(effort), Line::from(mode)]
     };
     rows.push(Line::from(Span::styled(
+        clipped(&dock_meters(view, width), usize::from(width)),
+        style(AMBER),
+    )));
+    rows.push(Line::from(Span::styled(
         clipped(
             &format!(
                 "◈ Permissions · {} session · {} always  F5",
@@ -801,6 +806,83 @@ fn dock_controls(view: &View, width: u16) -> Vec<Line<'static>> {
         style(MINT),
     )));
     rows
+}
+
+fn window_provenance(provenance: &FactProvenance) -> (&'static str, &'static str) {
+    match provenance {
+        FactProvenance::RouteAdvertisement => ("advertised", "adv"),
+        FactProvenance::Pinned { .. } => ("pinned", "pin"),
+        FactProvenance::ConfiguredAssumption => ("configured assumption", "cfg"),
+        FactProvenance::BuiltInAssumption => ("built-in assumption", "assumed"),
+    }
+}
+
+fn compact_tokens(value: u64) -> String {
+    if value < 10_000 {
+        value.to_string()
+    } else if value < 10_000_000 {
+        format!("{}k", value.div_ceil(1_000))
+    } else {
+        format!("{}M", value.div_ceil(1_000_000))
+    }
+}
+
+/// The standing context-use and cost meters. Both stay in the dock for every
+/// frame; the one-line status slot above it keeps carrying transient work.
+///
+/// An unknown price renders as the word `unknown`, never as a zero charge and
+/// never as a quota or subscription amount. A known subtotal that the ledger
+/// could not finish pricing reads as a lower bound, and both forms stay
+/// labelled as an estimate; `/cost` prints the same figure in full.
+fn dock_meters(view: &View, width: u16) -> String {
+    let wide = width >= 40;
+    let context = view.request_context.as_ref().map_or_else(
+        || "ctx not estimated yet".to_owned(),
+        |context| {
+            let budget = &context.estimate.budget;
+            let input = context.estimate.estimated_input_tokens;
+            let reserve = budget.output_reserve_tokens;
+            if wide {
+                let (_, provenance) = window_provenance(&budget.window.provenance);
+                format!(
+                    "ctx ≈{input}+{reserve}/{} {provenance}",
+                    budget.window.value
+                )
+            } else {
+                let assumed = matches!(
+                    budget.window.provenance,
+                    FactProvenance::ConfiguredAssumption | FactProvenance::BuiltInAssumption
+                );
+                format!(
+                    "ctx {}/{}{}",
+                    compact_tokens(input.saturating_add(reserve)),
+                    compact_tokens(budget.window.value),
+                    if assumed { "~" } else { "" }
+                )
+            }
+        },
+    );
+    let cost = view
+        .usage
+        .as_ref()
+        .and_then(|usage| {
+            [&usage.api_standard, &usage.api_equivalent]
+                .into_iter()
+                .find_map(|estimate| {
+                    let known = estimate.known_usd.as_ref()?;
+                    Some(if estimate.incomplete {
+                        format!("≥${known} est")
+                    } else {
+                        format!("≈${known} est")
+                    })
+                })
+        })
+        .unwrap_or_else(|| "cost unknown".to_owned());
+    if wide {
+        format!("◆ {context}  ·  {cost}")
+    } else {
+        format!("◆ {context} {cost}")
+    }
 }
 
 fn draw_permission_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
@@ -952,12 +1034,8 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
             UsagePhase::Consult => "consult",
             UsagePhase::Dream => "dream",
         };
-        let (provenance, short_provenance) = match &context.estimate.budget.window.provenance {
-            FactProvenance::RouteAdvertisement => ("advertised", "adv"),
-            FactProvenance::Pinned { .. } => ("pinned", "pin"),
-            FactProvenance::ConfiguredAssumption => ("configured assumption", "cfg"),
-            FactProvenance::BuiltInAssumption => ("built-in assumption", "assumed"),
-        };
+        let (provenance, short_provenance) =
+            window_provenance(&context.estimate.budget.window.provenance);
         let input = context.estimate.estimated_input_tokens;
         let reserve = context.estimate.budget.output_reserve_tokens;
         let window = context.estimate.budget.window.value;

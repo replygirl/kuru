@@ -902,10 +902,28 @@ fn format_session_usage(usage: &SessionUsage) -> String {
         Some(value) => format!("{name}: {value} known tokens (incomplete)"),
         None => format!("{name}: unknown"),
     };
-    let money = |name: &str, amount: &kuru_core::MoneyEstimate| match &amount.known_usd {
-        Some(value) if !amount.incomplete => format!("{name}: ${value} estimated"),
-        Some(value) => format!("{name}: ${value} known subtotal (incomplete)"),
-        None => format!("{name}: unknown"),
+    // An incomplete estimate names the priced terms it left out so the reader
+    // knows what a reprice would add, rather than only that something is missing.
+    let money = |name: &str, amount: &kuru_core::MoneyEstimate| {
+        let unapplied = if amount.unapplied.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; not applied: {}",
+                amount
+                    .unapplied
+                    .iter()
+                    .map(|term| term.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        match &amount.known_usd {
+            Some(value) if !amount.incomplete => format!("{name}: ${value} estimated"),
+            Some(value) => format!("{name}: ${value} known subtotal (incomplete{unapplied})"),
+            None if unapplied.is_empty() => format!("{name}: unknown"),
+            None => format!("{name}: unknown (incomplete{unapplied})"),
+        }
     };
     let mut lines = vec![
         format!(
@@ -2104,7 +2122,7 @@ mod tests {
     use super::*;
     use kuru_core::{
         ContextBudget, ContextEstimate, Framework, Message, MoneyEstimate, RelationshipKind,
-        Sourced, Usage, UsageCompleteness,
+        Sourced, UnappliedPriceTerm, Usage, UsageCompleteness,
     };
     use ratatui::backend::TestBackend;
 
@@ -2144,18 +2162,41 @@ mod tests {
             api_standard: MoneyEstimate {
                 known_usd: Some("0.000012".into()),
                 incomplete: true,
+                unapplied: vec![
+                    UnappliedPriceTerm::LongContextTier,
+                    UnappliedPriceTerm::CacheWriteRate,
+                ],
             },
             api_equivalent: MoneyEstimate {
                 known_usd: None,
                 incomplete: true,
+                unapplied: vec![UnappliedPriceTerm::InvocationPrice],
             },
         };
         let text = format_session_usage(&usage);
         assert!(text.contains("Input: 0 known tokens (incomplete)"));
         assert!(text.contains("Cached input (subset): unknown"));
-        assert!(text.contains("$0.000012 known subtotal (incomplete)"));
-        assert!(text.contains("API-equivalent estimate (not a subscription charge)"));
+        // An incomplete subtotal names the priced terms it left out.
+        assert!(text.contains(
+            "$0.000012 known subtotal (incomplete; not applied: long-context tier, cache-write rate)"
+        ));
+        assert!(text.contains(
+            "API-equivalent estimate (not a subscription charge): unknown (incomplete; not applied: invocation price)"
+        ));
+        assert!(!text.contains("$0 "));
         assert!(text.contains("Earlier session activity predates usage tracking"));
+
+        let complete = SessionUsage {
+            api_standard: MoneyEstimate {
+                known_usd: Some("0.000012".into()),
+                incomplete: false,
+                unapplied: Vec::new(),
+            },
+            ..usage
+        };
+        let text = format_session_usage(&complete);
+        assert!(text.contains("API-standard estimate: $0.000012 estimated"));
+        assert!(!text.contains("not applied: long-context tier"));
     }
 
     #[test]

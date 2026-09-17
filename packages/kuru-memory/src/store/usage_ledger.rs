@@ -7,7 +7,7 @@
 use super::*;
 use kuru_core::{
     InvocationOutcome, InvocationStart, InvocationUsage, MoneyEstimate, PriceBasis, SessionUsage,
-    Usage, UsageCompleteness, UsageObservation,
+    UnappliedPriceTerm, Usage, UsageCompleteness, UsageObservation,
 };
 use sha2::{Digest, Sha256};
 
@@ -780,8 +780,9 @@ impl SessionFold {
             Some(PriceBasis::ApiStandard { .. }) => &mut self.api_standard,
             Some(PriceBasis::ApiEquivalent { .. }) => &mut self.api_equivalent,
             None => {
-                self.api_standard.incomplete = true;
-                self.api_equivalent.incomplete = true;
+                self.api_standard.mark(UnappliedPriceTerm::InvocationPrice);
+                self.api_equivalent
+                    .mark(UnappliedPriceTerm::InvocationPrice);
                 return Ok(());
             }
         };
@@ -845,18 +846,26 @@ struct EstimateFold {
     usd: f64,
     known: bool,
     incomplete: bool,
+    unapplied: BTreeSet<UnappliedPriceTerm>,
 }
 impl EstimateFold {
+    /// Record an incomplete subtotal together with the term it leaves out, so
+    /// the rendered label can name it instead of reporting a bare gap.
+    fn mark(&mut self, term: UnappliedPriceTerm) {
+        self.incomplete = true;
+        self.unapplied.insert(term);
+    }
+
     fn add(&mut self, record: &InvocationUsage) -> Result<()> {
         let Some(price) = &record.start.price_at_invocation else {
-            self.incomplete = true;
+            self.mark(UnappliedPriceTerm::InvocationPrice);
             return Ok(());
         };
         let (Ok(mut input_rate), Ok(mut output_rate)) = (
             parse_rate(&price.input_per_million_usd),
             parse_rate(&price.output_per_million_usd),
         ) else {
-            self.incomplete = true;
+            self.mark(UnappliedPriceTerm::InvocationPrice);
             return Ok(());
         };
         let input = record.usage.input_tokens;
@@ -869,7 +878,7 @@ impl EstimateFold {
                         parse_rate(&tier.cached_input_multiplier),
                         parse_rate(&tier.output_multiplier),
                     ) else {
-                        self.incomplete = true;
+                        self.mark(UnappliedPriceTerm::LongContextTier);
                         return Ok(());
                     };
                     input_rate *= input_multiplier;
@@ -878,13 +887,15 @@ impl EstimateFold {
                 }
                 Some(_) => {}
                 None => {
-                    self.incomplete = true;
+                    // The tier cannot be decided without the input count, so it
+                    // is named as unapplied rather than half-applied.
+                    self.mark(UnappliedPriceTerm::LongContextTier);
                     return Ok(());
                 }
             }
         }
         if price.cache_write.is_some() {
-            self.incomplete = true;
+            self.mark(UnappliedPriceTerm::CacheWriteRate);
         }
         let mut amount = 0.0;
         let mut known = false;
@@ -892,7 +903,7 @@ impl EstimateFold {
             amount += output as f64 * output_rate / 1_000_000.0;
             known = true;
         } else {
-            self.incomplete = true;
+            self.mark(UnappliedPriceTerm::TokenComponents);
         }
         match (input, record.usage.cached_input_tokens) {
             (Some(input), Some(cached)) if cached <= input => {
@@ -903,12 +914,12 @@ impl EstimateFold {
                         Some(rate) => match parse_rate(rate) {
                             Ok(rate) => rate * cached_multiplier,
                             Err(_) => {
-                                self.incomplete = true;
+                                self.mark(UnappliedPriceTerm::CachedInputRate);
                                 return Ok(());
                             }
                         },
                         None => {
-                            self.incomplete = true;
+                            self.mark(UnappliedPriceTerm::CachedInputRate);
                             0.0
                         }
                     };
@@ -918,15 +929,17 @@ impl EstimateFold {
                     }
                 }
             }
-            (Some(_), Some(_)) | (Some(_), None) | (None, _) => self.incomplete = true,
+            (Some(_), Some(_)) | (Some(_), None) | (None, _) => {
+                self.mark(UnappliedPriceTerm::TokenComponents)
+            }
         }
         if !amount.is_finite() {
-            self.incomplete = true;
+            self.mark(UnappliedPriceTerm::InvocationPrice);
             return Ok(());
         }
         self.usd += amount;
         if !self.usd.is_finite() {
-            self.incomplete = true;
+            self.mark(UnappliedPriceTerm::InvocationPrice);
             return Ok(());
         }
         self.known |= known;
@@ -936,6 +949,7 @@ impl EstimateFold {
         MoneyEstimate {
             known_usd: (self.known && self.usd.is_finite()).then(|| format!("{:.6}", self.usd)),
             incomplete: self.incomplete,
+            unapplied: self.unapplied.into_iter().collect(),
         }
     }
 }
@@ -1340,6 +1354,12 @@ mod tests {
         assert!(!usage.component_complete.input_tokens);
         assert_eq!(usage.api_standard.known_usd.as_deref(), Some("0.013000"));
         assert!(usage.api_standard.incomplete);
+        // The long-context tier applied here; only the unmodelled cache-write
+        // rate is named, so a reader learns what a reprice would still add.
+        assert_eq!(
+            usage.api_standard.unapplied,
+            vec![UnappliedPriceTerm::CacheWriteRate]
+        );
         Ok(())
     }
 
@@ -1397,6 +1417,7 @@ mod tests {
         )?;
         assert_eq!(standard.api_standard.known_usd.as_deref(), Some("0.000140"));
         assert!(!standard.api_standard.incomplete);
+        assert!(standard.api_standard.unapplied.is_empty());
 
         let equivalent = fold_session(
             "fresh",
@@ -1433,6 +1454,8 @@ mod tests {
             Some("0.000140")
         );
         assert!(pre_ledger.api_standard.incomplete);
+        // Pre-ledger history is its own reported gap, not an unapplied price term.
+        assert!(pre_ledger.api_standard.unapplied.is_empty());
 
         let partial_usage = Usage {
             input_tokens: Some(100),
@@ -1456,9 +1479,57 @@ mod tests {
             outcome: Some(InvocationOutcome::Succeeded),
             incomplete: false,
         };
-        let partial = fold_session("fresh", marker, &[partial])?;
+        let partial = fold_session("fresh", marker.clone(), &[partial])?;
         assert_eq!(partial.api_standard.known_usd.as_deref(), Some("0.000130"));
         assert!(partial.api_standard.incomplete);
+        assert_eq!(
+            partial.api_standard.unapplied,
+            vec![UnappliedPriceTerm::CachedInputRate]
+        );
+
+        // A tier that cannot be decided is named, never applied in part: the
+        // raw components and the frozen price stay on the record for a reprice.
+        let undecidable = InvocationUsage {
+            start: InvocationStart {
+                price_at_invocation: Some(price(
+                    PriceBasis::ApiStandard {
+                        api_model: "model".into(),
+                    },
+                    Some("0.5".into()),
+                )),
+                ..start("fresh", "unknown-input-count")
+            },
+            usage: Usage {
+                input_tokens: None,
+                output_tokens: Some(20),
+                cached_input_tokens: Some(0),
+                reasoning_output_tokens: Some(0),
+            },
+            last_usage_sequence: Some(1),
+            terminal_usage: Some(Usage {
+                input_tokens: None,
+                output_tokens: Some(20),
+                cached_input_tokens: Some(0),
+                reasoning_output_tokens: Some(0),
+            }),
+            outcome: Some(InvocationOutcome::Succeeded),
+            incomplete: false,
+        };
+        let undecidable_record = undecidable.clone();
+        let undecidable = fold_session("fresh", marker, &[undecidable])?;
+        assert_eq!(undecidable.api_standard.known_usd, None);
+        assert_eq!(
+            undecidable.api_standard.unapplied,
+            vec![UnappliedPriceTerm::LongContextTier]
+        );
+        assert!(
+            undecidable_record
+                .start
+                .price_at_invocation
+                .as_ref()
+                .is_some_and(|price| price.long_context_tier.is_some())
+        );
+        assert_eq!(undecidable_record.usage.output_tokens, Some(20));
         Ok(())
     }
 }
