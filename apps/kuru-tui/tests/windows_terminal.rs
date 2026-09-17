@@ -536,7 +536,7 @@ struct ProviderState {
 async fn response(
     axum::extract::State(mut state): axum::extract::State<ProviderState>,
     axum::Json(_): axum::Json<Value>,
-) -> axum::Json<Value> {
+) -> impl axum::response::IntoResponse {
     let delayed = !*state.release.borrow();
     state.started.store(true, Ordering::SeqCst);
     if delayed {
@@ -548,8 +548,11 @@ async fn response(
         .unwrap()
         .unwrap();
     }
-    axum::Json(
-        json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":if delayed { "LATE_WINDOWS_RESULT" } else { "FRESH_WINDOWS_RESULT" }}]}]}),
+    let completed = json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":if delayed { "LATE_WINDOWS_RESULT" } else { "FRESH_WINDOWS_RESULT" }}]}]});
+    let event = json!({"type":"response.completed","response":completed});
+    (
+        [("content-type", "text/event-stream")],
+        format!("data: {event}\n\n"),
     )
 }
 
