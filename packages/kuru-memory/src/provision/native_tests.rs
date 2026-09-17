@@ -380,11 +380,7 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
     assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
     assert!(detail.contains(&stage_path.display().to_string()));
     assert!(
-        error.chain().any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.raw_os_error() == Some(32))
-        }),
+        detail.contains("(os error 32)"),
         "the retained no-DELETE probe must be the Windows sharing violation: {detail}"
     );
     assert_eq!(
