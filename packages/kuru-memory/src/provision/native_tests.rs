@@ -24,16 +24,20 @@ fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentit
         match parent.remove_file(files::name(binary)?, file) {
             Ok(()) => return Ok(()),
             Err(error)
-                if std::error::Error::source(&error)
-                    .and_then(|source| source.downcast_ref::<io::Error>())
-                    .and_then(io::Error::raw_os_error)
-                    == Some(32) =>
+                if {
+                    let code = std::error::Error::source(&error)
+                        .and_then(|source| source.downcast_ref::<io::Error>())
+                        .and_then(io::Error::raw_os_error);
+                    code == Some(32)
+                        || (error.phase == kuru_platform::fs::PublicationPhase::Uncertain
+                            && code == Some(5))
+                } =>
             {
                 let deadline =
                     *retry_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
                 if Instant::now() >= deadline {
                     return Err(anyhow::Error::new(error).context(
-                        "fixture cache binary invalidation exhausted its bounded OS32 recovery",
+                        "fixture cache binary invalidation exhausted its bounded native removal recovery",
                     ));
                 }
                 thread::sleep(
