@@ -441,6 +441,37 @@ fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn normalize_tool_elapsed(turn: &mut Value) -> Result<()> {
+    let events = turn["events"]
+        .as_array_mut()
+        .context("turn omitted events")?;
+    let mut observations = 0;
+    for event in events {
+        if event["kind"] != "tool-observation" {
+            continue;
+        }
+        let detail = event["detail"]
+            .as_str()
+            .context("tool observation omitted detail")?;
+        let mut observation: Value = serde_json::from_str(detail)?;
+        ensure!(
+            observation["elapsed_ms"].as_u64().is_some(),
+            "tool observation omitted unsigned elapsed milliseconds"
+        );
+        observation
+            .as_object_mut()
+            .context("tool observation detail must be an object")?
+            .remove("elapsed_ms");
+        event["detail"] = Value::String(serde_json::to_string(&observation)?);
+        observations += 1;
+    }
+    ensure!(
+        observations == 1,
+        "expected one tool observation in CLI turn"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kuru_run_uses_the_owned_shell_and_preserves_the_responses_continuation() -> Result<()> {
     let server = Server::start().await?;
@@ -558,9 +589,11 @@ async fn kuru_run_uses_the_owned_shell_and_preserves_the_responses_continuation(
             .as_object_mut()
             .context("normal turn must be an object")?
             .remove("session");
+        normalize_tool_elapsed(&mut debug_turn)?;
+        normalize_tool_elapsed(&mut normal_turn)?;
         ensure!(
             normal_turn == debug_turn,
-            "--debug changed the JSON turn beyond its newly generated session identity"
+            "--debug changed the JSON turn beyond its session identity and measured tool duration"
         );
         let normal_logs = diagnostics(&normal)?;
         ensure!(
