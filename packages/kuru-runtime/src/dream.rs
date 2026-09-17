@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use futures::future::join_all;
-use kuru_core::{ActorPhase, Config, Mode, Part, ToolSpec, canonical_peer_instruction};
+use kuru_core::{
+    ActorPhase, Config, Mode, Part, ToolSpec, canonical_peer_instruction,
+    validate_consolidation_plan,
+};
 use kuru_memory::{Candidate, MemoryStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -9,8 +12,9 @@ use uuid::Uuid;
 use crate::{
     Event,
     engine::{
-        CancellationToken, Harness, PendingPublication, Session, Topology,
-        read_topology_with_profile, spec, turn_was_cancelled, user, validate_topology_with_profile,
+        CancellationToken, Harness, PendingPublication, Session, Topology, checked_state_keys,
+        prepared_actor_namespaces, read_topology_with_profile, spec, turn_was_cancelled, user,
+        validate_topology_with_profile,
     },
 };
 
@@ -69,25 +73,28 @@ impl Harness {
         cancellation.check()?;
         self.reconcile().await?;
         cancellation.check()?;
+        let active = self
+            .topology
+            .parts
+            .iter()
+            .filter(|part| part.active)
+            .map(|part| part.id.clone())
+            .collect::<Vec<_>>();
+        let plan = self.profile.memory.consolidation_plan(&active);
+        validate_consolidation_plan(&plan, &active.iter().cloned().collect())?;
         self.operation_id = format!("dream-{}", Uuid::new_v4());
         let candidate = self.memory.begin_candidate("dream").await?;
         let outcome = async {
             cancellation.check()?;
             let memory = candidate.view();
             self.emit_event(Event::Dream { actor: "pool".into(), detail: "parts are consolidating their own memories".into() });
-            let ids = self
-                .topology
-                .parts
-                .iter()
-                .filter(|p| p.active)
-                .map(|p| p.id.clone())
-                .collect::<Vec<_>>();
+            let ids = &plan.participants;
             let replies = join_all(ids.iter().map(|id| self.ask_in_controlled(&memory, id,
-                vec![user("Review your own history. Write a concise durable memory summary of useful facts and unresolved concerns. You may suggest a new complementary member of an existing role or retire yourself if your role is redundantly covered. A suggestion is optional; do not manufacture changes. No other tools are available during dreaming.")],
-                ("dream: consolidate your own memory, optionally propose membership changes", ActorPhase::Dream), vec![dream_tool()], cancellation))).await;
+                vec![user(&plan.prompt)],
+                (&plan.phase, ActorPhase::Dream), vec![dream_tool()], cancellation))).await;
             let mut report = DreamReport::default();
             let mut proposals = vec![];
-            for (id, reply) in ids.into_iter().zip(replies) {
+            for (id, reply) in ids.iter().cloned().zip(replies) {
                 match reply {
                     Err(error) if error.is::<crate::actor::MemoryFailure>() || error.is::<crate::actor::AccountingFailure>() => return Err(error),
                     Err(error) if turn_was_cancelled(&error) => return Err(error),
@@ -98,7 +105,7 @@ impl Harness {
                             cancellation.check()?;
                             memory
                                 .append(
-                                    &format!("{}/notes", self.namespace(&id)),
+                                    &format!("{}/notes", self.checked_namespace(&id)?),
                                     "dream",
                                     &crate::actor::truncate_text(&summary, 8192),
                                 )
@@ -107,10 +114,15 @@ impl Harness {
                             report.summaries += 1;
                         }
                         for (index, call) in reply.calls().into_iter().enumerate() {
-                            let result = if index >= 2 {
-                                Err(anyhow::anyhow!(
-                                    "at most two dream proposals are accepted per part"
-                                ))
+                            let result = if index >= plan.max_proposals_per_part {
+                                Err(anyhow::anyhow!(if plan.max_proposals_per_part == 2 {
+                                    "at most two dream proposals are accepted per part".to_string()
+                                } else {
+                                    format!(
+                                        "at most {} dream proposals are accepted per part",
+                                        plan.max_proposals_per_part
+                                    )
+                                }))
                             } else if call.name != "dream_suggest" {
                                 Err(anyhow::anyhow!("only dream_suggest is available"))
                             } else {
@@ -139,7 +151,7 @@ impl Harness {
                             cancellation.check()?;
                             memory
                                 .append(
-                                    &self.namespace(&id),
+                                    &self.checked_namespace(&id)?,
                                     "tool",
                                     &json!({"call_id":call.id,"output":outcome}).to_string(),
                                 )
@@ -192,18 +204,17 @@ impl Harness {
     ) -> Result<()> {
         cancellation.check()?;
         let memory = candidate.view();
+        let keys = checked_state_keys(&self.scope, &self.profile)?;
+        let actor_namespaces = prepared_actor_namespaces(&self.scope, &self.profile, &topology)?;
         let mut extra = vec![(
             format!("{}/{}/last-dream", self.scope, self.config.mode),
             json!({"id":Uuid::new_v4(), "base":candidate.base()}),
         )];
         if !report.accepted.is_empty() {
-            extra.push((
-                format!("{}/{}/dream-undo", self.scope, self.config.mode),
-                serde_json::to_value(&self.topology)?,
-            ));
+            extra.push((keys.dream_undo, serde_json::to_value(&self.topology)?));
         }
         let updates = self
-            .state_updates(&memory, &topology, &self.session, extra)
+            .state_updates(&memory, &self.profile, &topology, &self.session, extra)
             .await?;
         cancellation.check()?;
         memory.put_many(&updates).await?;
@@ -219,6 +230,7 @@ impl Harness {
         self.pending_publication = Some(PendingPublication {
             config: self.config.clone(),
             profile: self.profile.clone(),
+            actor_namespaces,
             topology,
             session: self.session.clone(),
             updates,
@@ -326,10 +338,7 @@ pub async fn undo_dream(
     let undo = prepare_undo_dream(config, scope, memory, resume, None).await?;
     memory
         .put_many(&[
-            (
-                format!("{scope}/{}/topology", undo.mode),
-                serde_json::to_value(&undo.topology)?,
-            ),
+            (undo.topology_key, serde_json::to_value(&undo.topology)?),
             (undo.key, json!(null)),
         ])
         .await?;
@@ -338,7 +347,7 @@ pub async fn undo_dream(
 }
 
 struct UndoDream {
-    mode: Mode,
+    topology_key: String,
     topology: Topology,
     key: String,
 }
@@ -368,7 +377,8 @@ async fn prepare_undo_dream(
         &builtin
     };
     let current = read_topology_with_profile(memory, scope, profile).await?;
-    let key = format!("{scope}/{mode}/dream-undo");
+    let keys = checked_state_keys(scope, profile)?;
+    let key = keys.dream_undo;
     let value = memory
         .get(&key)
         .await?
@@ -379,7 +389,7 @@ async fn prepare_undo_dream(
     let restored = restore_topology(previous, &current);
     validate_topology_with_profile(&restored, &config, profile)?;
     Ok(UndoDream {
-        mode,
+        topology_key: keys.topology,
         topology: restored,
         key,
     })

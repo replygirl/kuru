@@ -69,6 +69,15 @@ mod mode_baseline_tests;
 mod mode_policy_tests;
 
 #[cfg(test)]
+mod mode_visibility_tests;
+
+#[cfg(test)]
+mod mode_memory_tests;
+
+#[cfg(test)]
+mod mode_consolidation_tests;
+
+#[cfg(test)]
 mod progress_tests;
 
 #[cfg(test)]

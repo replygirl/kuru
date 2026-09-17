@@ -9,9 +9,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use kuru_connectors::{Provider, ProviderEvent, ProviderSink, collect_completion};
 use kuru_core::{
-    Completion, CompletionRequest, ContentBlock, ContextBudget, ContextSourceKind,
+    Completion, CompletionRequest, ContentBlock, ContextBudget, ContextSource, ContextSourceKind,
     ContextSourceSize, ContextTooLarge, InvocationOutcome, InvocationStart, Message, ToolSpec,
-    UsageObservation, estimated_tokens_for_bytes,
+    UsageObservation, estimated_tokens_for_bytes, validate_context_sources,
 };
 use kuru_memory::{MemoryStore, UsageLedger};
 use serde_json::Value;
@@ -52,6 +52,7 @@ pub(crate) struct Work {
     pub instructions: String,
     pub instruction_suffix: String,
     pub transcript_key: String,
+    pub context_sources: Vec<ContextSource>,
     pub context_budget: ContextBudget,
     pub context: watch::Sender<ContextSnapshot>,
     pub context_epoch: Arc<AtomicU64>,
@@ -67,6 +68,7 @@ pub(crate) struct Work {
 }
 
 pub(crate) struct Actor {
+    namespace: String,
     pub tx: mpsc::Sender<Work>,
     task: JoinHandle<()>,
 }
@@ -160,6 +162,7 @@ impl ProviderSink for AccountingObserver {
 impl Actor {
     pub fn spawn(namespace: String, provider: Arc<dyn Provider>, permits: Arc<Semaphore>) -> Self {
         let (tx, mut rx) = mpsc::channel::<Work>(16);
+        let captured_namespace = namespace.clone();
         let task = tokio::spawn(async move {
             while let Some(mut work) = rx.recv().await {
                 let span = work.span.clone();
@@ -170,6 +173,65 @@ impl Actor {
                         .cancellation
                         .wait(async { permits.acquire().await.context("actor pool closed") })
                         .await?;
+                    let identity = &work.invocation.actor_id;
+                    validate_context_sources(identity, &work.context_sources)?;
+                    let own_history = work
+                        .context_sources
+                        .contains(&ContextSource::OwnHistory(identity.clone()));
+                    let own_notes = work
+                        .context_sources
+                        .contains(&ContextSource::OwnNotes(identity.clone()));
+                    let public_transcript = work
+                        .context_sources
+                        .contains(&ContextSource::PublicTranscript);
+                    let required = work
+                        .inputs
+                        .iter()
+                        .map(normalize_current_receipt)
+                        .collect::<Result<Vec<_>>>()?;
+                    let (mut optional_private, omitted_private_rows) = if own_history {
+                        let older_limit = work.history_limit.saturating_sub(work.inputs.len());
+                        let window =
+                            read_window(&work.memory, &namespace, older_limit, &work.cancellation)
+                                .await?;
+                        let omitted = window
+                            .total_rows
+                            .saturating_sub(window.messages.len() as u64);
+                        (window.messages, omitted)
+                    } else {
+                        (vec![], 0)
+                    };
+                    let (mut optional_notes, omitted_note_rows) = if own_notes {
+                        let window = read_window(
+                            &work.memory,
+                            &format!("{namespace}/notes"),
+                            16,
+                            &work.cancellation,
+                        )
+                        .await?;
+                        let omitted = window
+                            .total_rows
+                            .saturating_sub(window.messages.len() as u64);
+                        (window.messages, omitted)
+                    } else {
+                        (vec![], 0)
+                    };
+                    let (mut optional_public, omitted_public_rows) = if public_transcript {
+                        let window =
+                            read_window(&work.memory, &work.transcript_key, 16, &work.cancellation)
+                                .await?;
+                        let omitted = window
+                            .total_rows
+                            .saturating_sub(window.messages.len() as u64);
+                        let visible = window
+                            .messages
+                            .into_iter()
+                            .filter(|message| message.role != crate::engine::INTERRUPTION_ROLE)
+                            .collect();
+                        (visible, omitted)
+                    } else {
+                        (vec![], 0)
+                    };
                     for input in &work.inputs {
                         work.cancellation.check()?;
                         work.memory
@@ -178,43 +240,6 @@ impl Actor {
                             .map_err(MemoryFailure)?;
                         work.cancellation.check()?;
                     }
-                    let notes = read_window(
-                        &work.memory,
-                        &format!("{namespace}/notes"),
-                        16,
-                        &work.cancellation,
-                    )
-                    .await?;
-                    let public =
-                        read_window(&work.memory, &work.transcript_key, 16, &work.cancellation)
-                            .await?;
-                    let private = read_window(
-                        &work.memory,
-                        &namespace,
-                        work.history_limit,
-                        &work.cancellation,
-                    )
-                    .await?;
-                    let mut optional_notes = notes.messages;
-                    let omitted_public_rows = public
-                        .total_rows
-                        .saturating_sub(public.messages.len() as u64);
-                    let mut optional_public = public
-                        .messages
-                        .into_iter()
-                        .filter(|message| message.role != crate::engine::INTERRUPTION_ROLE)
-                        .collect::<Vec<_>>();
-                    let current_start = private.messages.len().saturating_sub(work.inputs.len());
-                    let mut optional_private = private.messages[..current_start].to_vec();
-                    let required = private.messages[current_start..]
-                        .iter()
-                        .map(normalize_current_receipt)
-                        .collect::<Result<Vec<_>>>()?;
-                    let omitted_private_rows = private
-                        .total_rows
-                        .saturating_sub(private.messages.len() as u64);
-                    let omitted_note_rows =
-                        notes.total_rows.saturating_sub(optional_notes.len() as u64);
                     let mut observer = AccountingObserver {
                         ledger: work.ledger.clone(),
                         invocation_id: work.invocation.invocation_id.clone(),
@@ -372,7 +397,15 @@ impl Actor {
                 .await;
             }
         });
-        Self { tx, task }
+        Self {
+            namespace: captured_namespace,
+            tx,
+            task,
+        }
+    }
+
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
     }
 
     pub(crate) fn abort(&self) {

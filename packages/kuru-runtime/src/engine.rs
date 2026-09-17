@@ -18,9 +18,10 @@ use kuru_connectors::{
 use kuru_core::{
     ActorPhase, Completion, Config, ContextBudget, FacingInput, InvocationStart, Message, Mode,
     ModeProfile, ModelInfo, ModelMetadata, ModelPreference, ModelRoute, Part, ProjectPreferences,
-    Relationship, RelationshipKind, RelationshipOrigin, SessionUsage, ToolCall, ToolSpec,
-    UsagePhase, enrich_model, load_instructions, validate_contributions, validate_facing,
-    validate_peer_edge, validate_recipients, validate_relationship_members,
+    Relationship, RelationshipKind, RelationshipOrigin, SessionUsage, StateKeys, ToolCall,
+    ToolSpec, UsagePhase, enrich_model, load_instructions, validate_context_sources,
+    validate_contributions, validate_facing, validate_identity_namespace, validate_peer_edge,
+    validate_recipients, validate_relationship_members,
 };
 use kuru_memory::{HistoryWindow, MemoryStatus, MemoryStore, Revision, StoredNote};
 use serde::{Deserialize, Serialize};
@@ -406,6 +407,7 @@ pub struct Harness {
 pub(crate) struct PendingPublication {
     pub config: Config,
     pub profile: ModeProfile,
+    pub actor_namespaces: BTreeMap<String, String>,
     pub topology: Topology,
     pub session: Session,
     pub updates: Vec<(String, Value)>,
@@ -558,6 +560,8 @@ impl Harness {
         profile.validate(config.max_parts)?;
         let topology = read_topology_with_profile(&memory, &scope, &profile).await?;
         validate_topology_with_profile(&topology, &config, &profile)?;
+        let actor_namespaces = prepared_actor_namespaces(&scope, &profile, &topology)?;
+        checked_transcript_key(&scope, &session.id, &profile)?;
         // Recheck the caller-retained workspace before this constructor can
         // publish its initial state. Instructions are already owned bytes and
         // are never reopened here.
@@ -598,7 +602,7 @@ impl Harness {
             #[cfg(test)]
             publication_pause: None,
         };
-        harness.sync_actors();
+        harness.sync_actors_with(&actor_namespaces);
         harness.save().await?;
         Ok(harness)
     }
@@ -723,20 +727,24 @@ impl Harness {
         &self.cwd
     }
     pub async fn history(&self) -> Result<Vec<Message>> {
-        self.memory.history(&self.transcript_key(), 500).await
+        self.memory
+            .history(&self.checked_transcript_key()?, 500)
+            .await
     }
     /// The bounded visible suffix and exact persisted row count for a session.
     pub async fn history_window(&self) -> Result<HistoryWindow> {
         self.memory
-            .history_window(&self.transcript_key(), 500)
+            .history_window(&self.checked_transcript_key()?, 500)
             .await
     }
     pub async fn memory_for(&self, identity: &str) -> Result<Vec<Message>> {
         let id = resolve_human_identity(&self.topology, identity)?;
-        self.memory.history(&self.namespace(&id), 100).await
+        self.memory
+            .history(&self.checked_namespace(&id)?, 100)
+            .await
     }
     pub async fn notes_for(&self, identity: &str, limit: usize) -> Result<NotesView> {
-        read_notes(&self.memory, &self.cwd, self.config.mode, identity, limit).await
+        read_notes_with_profile(&self.memory, &self.cwd, &self.profile, identity, limit).await
     }
     pub async fn sessions(&self) -> Result<Vec<Session>> {
         Ok(self
@@ -766,10 +774,15 @@ impl Harness {
         self.memory.revisions(limit).await
     }
     pub fn namespace(&self, id: &str) -> String {
-        format!("{}/{}/identity/{id}", self.scope, self.config.mode)
+        self.profile
+            .memory
+            .identity_namespace(&self.scope, self.profile.mode, id)
     }
-    fn transcript_key(&self) -> String {
-        format!("{}/transcript/{}", self.scope, self.session.id)
+    pub(crate) fn checked_namespace(&self, id: &str) -> Result<String> {
+        checked_identity_namespace(&self.scope, &self.profile, id)
+    }
+    pub(crate) fn checked_transcript_key(&self) -> Result<String> {
+        checked_transcript_key(&self.scope, &self.session.id, &self.profile)
     }
 
     fn turn_journal_key(&self, id: &str) -> String {
@@ -878,7 +891,7 @@ impl Harness {
             ));
         }
         self.memory
-            .checkpoint(&self.transcript_key(), &[user(prompt)], &updates)
+            .checkpoint(&self.checked_transcript_key()?, &[user(prompt)], &updates)
             .await?;
         Ok(TurnAdmission::Run {
             key,
@@ -943,7 +956,7 @@ impl Harness {
         journal.interruption_marker = true;
         self.memory
             .checkpoint(
-                &self.transcript_key(),
+                &self.checked_transcript_key()?,
                 &messages,
                 &[(key.into(), serde_json::to_value(journal)?)],
             )
@@ -1002,34 +1015,27 @@ impl Harness {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn sync_actors(&mut self) {
-        let ids = self
-            .topology
-            .parts
-            .iter()
-            .filter(|p| p.active)
-            .map(|p| p.id.clone())
-            .chain(
-                self.topology
-                    .relationships
-                    .iter()
-                    .filter(|r| {
-                        r.members
-                            .iter()
-                            .all(|m| self.topology.parts.iter().any(|p| p.active && &p.id == m))
-                    })
-                    .map(|r| r.id.clone()),
-            )
-            .collect::<BTreeSet<_>>();
-        self.actors.retain(|id, _| ids.contains(id));
-        for id in ids {
-            if !self.actors.contains_key(&id) {
+        let namespaces = prepared_actor_namespaces(&self.scope, &self.profile, &self.topology)
+            .expect("test topology has checked actor namespaces");
+        self.sync_actors_with(&namespaces);
+    }
+
+    fn sync_actors_with(&mut self, namespaces: &BTreeMap<String, String>) {
+        self.actors.retain(|id, actor| {
+            namespaces
+                .get(id)
+                .is_some_and(|namespace| actor.namespace() == namespace)
+        });
+        for (id, namespace) in namespaces {
+            if !self.actors.contains_key(id) {
                 let actor = Actor::spawn(
-                    self.namespace(&id),
+                    namespace.clone(),
                     self.provider.clone(),
                     self.permits.clone(),
                 );
-                self.actors.insert(id, actor);
+                self.actors.insert(id.clone(), actor);
             }
         }
     }
@@ -1041,6 +1047,7 @@ impl Harness {
     pub(crate) async fn state_updates(
         &self,
         memory: &MemoryStore,
+        profile: &ModeProfile,
         topology: &Topology,
         session: &Session,
         mut updates: Vec<(String, Value)>,
@@ -1054,11 +1061,13 @@ impl Harness {
             .unwrap_or_default();
         sessions.retain(|s| s.id != session.id);
         sessions.push(session.clone());
+        ensure!(
+            profile.mode == session.mode,
+            "state profile does not match session mode"
+        );
+        let keys = checked_state_keys(&self.scope, profile)?;
         updates.extend([
-            (
-                format!("{}/{}/topology", self.scope, session.mode),
-                serde_json::to_value(topology)?,
-            ),
+            (keys.topology, serde_json::to_value(topology)?),
             (
                 format!("{}/session/{}", self.scope, session.id),
                 serde_json::to_value(session)?,
@@ -1099,12 +1108,14 @@ impl Harness {
         };
         profile.validate(config.max_parts)?;
         validate_topology_with_profile(&topology, &config, &profile)?;
+        let actor_namespaces = prepared_actor_namespaces(&self.scope, &profile, &topology)?;
         let updates = self
-            .state_updates(&self.memory, &topology, &session, updates)
+            .state_updates(&self.memory, &profile, &topology, &session, updates)
             .await?;
         self.pending_publication = Some(PendingPublication {
             config,
             profile,
+            actor_namespaces,
             topology,
             session,
             updates: updates.clone(),
@@ -1155,7 +1166,7 @@ impl Harness {
             self.profile = pending.profile;
             self.topology = pending.topology;
             self.session = pending.session;
-            self.sync_actors();
+            self.sync_actors_with(&pending.actor_namespaces);
         }
     }
 
@@ -1378,7 +1389,7 @@ impl Harness {
     #[cfg(test)]
     async fn public_context(&self, memory: &MemoryStore) -> Result<String> {
         let rows = memory
-            .history_window(&self.transcript_key(), 16)
+            .history_window(&self.checked_transcript_key()?, 16)
             .await?
             .messages;
         Ok(serde_json::to_string(
@@ -1482,6 +1493,13 @@ impl Harness {
     ) -> Result<Completion> {
         control.cancellation.check()?;
         let actor = self.actors.get(id).context("actor is inactive")?;
+        let context_sources = self.profile.visibility.context_sources(id, control.phase);
+        validate_context_sources(id, &context_sources)?;
+        let actor_namespace = checked_identity_namespace(&self.scope, &self.profile, id)?;
+        ensure!(
+            actor.namespace() == actor_namespace,
+            "actor namespace changed before request"
+        );
         let (reply, rx) = oneshot::channel();
         let metadata = control
             .cancellation
@@ -1546,10 +1564,11 @@ impl Harness {
             memory: memory.clone(),
             ledger: self.memory.usage_ledger()?,
             invocation,
+            context_sources,
             inputs,
             instructions,
             instruction_suffix,
-            transcript_key: self.transcript_key(),
+            transcript_key: checked_transcript_key(&self.scope, &self.session.id, &self.profile)?,
             context_budget,
             context: self.context.clone(),
             context_epoch: self.context_epoch.clone(),
@@ -1918,7 +1937,7 @@ impl Harness {
                 for message in messages {
                     cancellation.check()?;
                     self.memory
-                        .append_message(&self.namespace(&id), &message)
+                        .append_message(&self.checked_namespace(&id)?, &message)
                         .await?;
                     cancellation.check()?;
                 }
@@ -2173,22 +2192,28 @@ impl Harness {
         journal.push(TurnTransition::Ended)?;
         journal.output = Some(output.clone());
         let mut updates = self
-            .state_updates(&self.memory, &topology, &session, vec![])
+            .state_updates(&self.memory, &self.profile, &topology, &session, vec![])
             .await?;
         updates.push((journal_key.into(), serde_json::to_value(&*journal)?));
         ensure!(
             self.pending_publication.is_none(),
             "pending memory publication must be reconciled before turn completion"
         );
+        let actor_namespaces = prepared_actor_namespaces(&self.scope, &self.profile, &topology)?;
         self.pending_publication = Some(PendingPublication {
             config: self.config.clone(),
             profile: self.profile.clone(),
+            actor_namespaces,
             topology,
             session,
             updates: updates.clone(),
         });
         self.memory
-            .checkpoint(&self.transcript_key(), &[assistant(&text)], &updates)
+            .checkpoint(
+                &self.checked_transcript_key()?,
+                &[assistant(&text)],
+                &updates,
+            )
             .await?;
         #[cfg(test)]
         self.pause_after_memory_write().await?;
@@ -2338,6 +2363,12 @@ impl Harness {
                         .allows_direct(sender, &recipient, &live),
                     "mode denied peer delivery"
                 );
+                ensure!(
+                    self.profile
+                        .visibility
+                        .allows_delivery(sender, &recipient, &live),
+                    "mode denied peer visibility"
+                );
                 if speaking {
                     let selected = self.profile.flow.consultation_recipients(&recipient, &live);
                     validate_recipients(&selected, &live)?;
@@ -2427,7 +2458,11 @@ impl Harness {
                 let text = string_arg(&call.arguments, "text")?;
                 ensure!(text.len() <= 8192, "memory note too large");
                 self.memory
-                    .append(&format!("{}/notes", self.namespace(sender)), "note", text)
+                    .append(
+                        &format!("{}/notes", self.checked_namespace(sender)?),
+                        "note",
+                        text,
+                    )
                     .await?;
                 cancellation.check()?;
                 Ok("stored in your private durable notes".into())
@@ -2506,6 +2541,73 @@ pub(crate) fn path_hash(path: &Path) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
+}
+
+pub(crate) fn checked_identity_namespace(
+    scope: &str,
+    profile: &ModeProfile,
+    identity: &str,
+) -> Result<String> {
+    let namespace = profile
+        .memory
+        .identity_namespace(scope, profile.mode, identity);
+    validate_identity_namespace(scope, profile.mode, identity, &namespace)?;
+    Ok(namespace)
+}
+
+pub(crate) fn checked_transcript_key(
+    scope: &str,
+    session: &str,
+    profile: &ModeProfile,
+) -> Result<String> {
+    let key = profile.memory.transcript_namespace(scope, session);
+    ensure!(
+        key == format!("{scope}/transcript/{session}"),
+        "mode selected an invalid transcript namespace"
+    );
+    Ok(key)
+}
+
+pub(crate) fn checked_state_keys(scope: &str, profile: &ModeProfile) -> Result<StateKeys> {
+    let keys = profile.memory.state_keys(scope, profile.mode);
+    ensure!(
+        keys.topology == format!("{scope}/{}/topology", profile.mode)
+            && keys.dream_undo == format!("{scope}/{}/dream-undo", profile.mode),
+        "mode selected invalid state keys"
+    );
+    Ok(keys)
+}
+
+pub(crate) fn prepared_actor_namespaces(
+    scope: &str,
+    profile: &ModeProfile,
+    topology: &Topology,
+) -> Result<BTreeMap<String, String>> {
+    let active = topology
+        .parts
+        .iter()
+        .filter(|part| part.active)
+        .map(|part| part.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let ids = active.iter().copied().chain(
+        topology
+            .relationships
+            .iter()
+            .filter(|relation| {
+                relation
+                    .members
+                    .iter()
+                    .all(|id| active.contains(id.as_str()))
+            })
+            .map(|relation| relation.id.as_str()),
+    );
+    ids.map(|id| {
+        Ok((
+            id.to_owned(),
+            checked_identity_namespace(scope, profile, id)?,
+        ))
+    })
+    .collect()
 }
 fn tool_result(call: &ToolCall, result: Result<String>, project_receipt: bool) -> Message {
     let is_error = result.is_err();
@@ -2597,18 +2699,29 @@ pub async fn read_notes(
     identity: &str,
     limit: usize,
 ) -> Result<NotesView> {
+    read_notes_with_profile(memory, cwd, &ModeProfile::builtin(mode), identity, limit).await
+}
+
+pub(crate) async fn read_notes_with_profile(
+    memory: &MemoryStore,
+    cwd: &Path,
+    profile: &ModeProfile,
+    identity: &str,
+    limit: usize,
+) -> Result<NotesView> {
     ensure!(
         (1..=1000).contains(&limit),
         "notes limit must be between 1 and 1000"
     );
-    let (identity, namespace) = resolve_notes_namespace(memory, cwd, mode, identity).await?;
+    let (identity, namespace) =
+        resolve_notes_namespace_with_profile(memory, cwd, profile, identity).await?;
     let mut notes = memory.notes(&namespace, limit + 1).await?;
     let truncated = notes.len() > limit;
     if truncated {
         notes.remove(0);
     }
     Ok(NotesView {
-        mode,
+        mode: profile.mode,
         identity,
         notes,
         requested_limit: limit,
@@ -2626,20 +2739,31 @@ pub async fn forget_note(
     identity: &str,
     sequence: i64,
 ) -> Result<ForgetNoteResult> {
-    let (identity, namespace) = resolve_notes_namespace(memory, cwd, mode, identity).await?;
+    forget_note_with_profile(memory, cwd, &ModeProfile::builtin(mode), identity, sequence).await
+}
+
+pub(crate) async fn forget_note_with_profile(
+    memory: &MemoryStore,
+    cwd: &Path,
+    profile: &ModeProfile,
+    identity: &str,
+    sequence: i64,
+) -> Result<ForgetNoteResult> {
+    let (identity, namespace) =
+        resolve_notes_namespace_with_profile(memory, cwd, profile, identity).await?;
     memory.forget_note(&namespace, sequence).await?;
     Ok(ForgetNoteResult {
-        mode,
+        mode: profile.mode,
         identity,
         sequence,
         history_retained: true,
     })
 }
 
-async fn resolve_notes_namespace(
+async fn resolve_notes_namespace_with_profile(
     memory: &MemoryStore,
     cwd: &Path,
-    mode: Mode,
+    profile: &ModeProfile,
     identity: &str,
 ) -> Result<(String, String)> {
     ensure!(
@@ -2647,15 +2771,19 @@ async fn resolve_notes_namespace(
         "notes inspection requires the live memory branch"
     );
     let scope = project_scope(cwd)?;
+    let keys = checked_state_keys(&scope, profile)?;
     let topology: Topology = memory
-        .get(&format!("{scope}/{mode}/topology"))
+        .get(&keys.topology)
         .await?
         .context("no persisted topology exists for the selected mode")
         .and_then(|value| {
             serde_json::from_value(value).context("invalid persisted topology for selected mode")
         })?;
     let identity = resolve_human_identity(&topology, identity)?;
-    let namespace = format!("{scope}/{mode}/identity/{identity}/notes");
+    let namespace = format!(
+        "{}/notes",
+        checked_identity_namespace(&scope, profile, &identity)?
+    );
     Ok((identity, namespace))
 }
 
@@ -2716,9 +2844,9 @@ pub(crate) async fn read_topology_with_profile(
     scope: &str,
     profile: &ModeProfile,
 ) -> Result<Topology> {
-    let mode = profile.mode;
+    let keys = checked_state_keys(scope, profile)?;
     memory
-        .get(&format!("{scope}/{mode}/topology"))
+        .get(&keys.topology)
         .await?
         .map(serde_json::from_value)
         .transpose()
@@ -3900,7 +4028,13 @@ mod publication_tests {
                 },
             );
             let updates = harness
-                .state_updates(&memory, &topology, &harness.session, vec![])
+                .state_updates(
+                    &memory,
+                    &harness.profile,
+                    &topology,
+                    &harness.session,
+                    vec![],
+                )
                 .await
                 .unwrap();
             memory.put_many(&updates).await.unwrap();
@@ -3908,6 +4042,12 @@ mod publication_tests {
             harness.pending_publication = Some(PendingPublication {
                 config: harness.config.clone(),
                 profile: harness.profile.clone(),
+                actor_namespaces: prepared_actor_namespaces(
+                    &harness.scope,
+                    &harness.profile,
+                    &topology,
+                )
+                .unwrap(),
                 topology,
                 session: harness.session.clone(),
                 updates,

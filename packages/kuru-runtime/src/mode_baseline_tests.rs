@@ -9,7 +9,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use kuru_connectors::Provider;
 use kuru_core::{
-    Completion, CompletionRequest, Config, Framework, Mode, ModelInfo, RelationshipKind, ToolCall,
+    Completion, CompletionRequest, Config, ContextEstimate, ContextSourceKind, Framework, Message,
+    Mode, ModelInfo, RelationshipKind, ToolCall, UsagePhase,
 };
 use kuru_memory::MemoryStore;
 use serde_json::{Value, json};
@@ -444,5 +445,205 @@ async fn all_four_modes_keep_pre_extraction_requests_and_facing_outcomes() {
         );
         assert_eq!(harness.history().await.unwrap().len(), 10);
         harness.shutdown(false).await.unwrap();
+    }
+}
+
+const BUILTIN_DREAM_PROMPT: &str = "Review your own history. Write a concise durable memory summary of useful facts and unresolved concerns. You may suggest a new complementary member of an existing role or retire yourself if your role is redundantly covered. A suggestion is optional; do not manufacture changes. No other tools are available during dreaming.";
+const BUILTIN_DREAM_PHASE: &str =
+    "dream: consolidate your own memory, optionally propose membership changes";
+
+#[derive(Default)]
+struct DreamBaseline {
+    requests: Mutex<Vec<CompletionRequest>>,
+}
+
+#[async_trait]
+impl Provider for DreamBaseline {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> Result<()> {
+        let identity = request.actor.rsplit('/').next().unwrap().to_owned();
+        let body = json!({
+            "instructions": request.instructions,
+            "messages": request.messages,
+            "tools": request.tools,
+        });
+        let estimate = ContextEstimate::for_final_body(
+            request.context_budget.clone().unwrap(),
+            serde_json::to_vec(&body)?.len() as u64,
+            false,
+            vec![],
+        );
+        estimate.ensure_fits()?;
+        sink.emit(kuru_connectors::ProviderEvent::ContextMeasured(estimate))
+            .await?;
+        self.requests.lock().unwrap().push(request);
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            Completion::from_legacy(format!("DREAM-SUMMARY-{identity}"), vec![], 1, 1),
+        ))
+        .await
+    }
+}
+
+#[tokio::test]
+async fn all_four_modes_keep_builtin_dream_requests_and_own_memory_isolation() {
+    for mode in Mode::ALL {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(DreamBaseline::default());
+        let mut harness = Harness::new(
+            config(mode),
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let ids = harness
+            .topology
+            .parts
+            .iter()
+            .filter(|part| part.active)
+            .map(|part| part.id.clone())
+            .collect::<Vec<_>>();
+        let transcript = format!("{}/transcript/{}", harness.scope, harness.session.id);
+        memory
+            .append_message(&transcript, &Message::text("user", "DREAM-PUBLIC-BASELINE"))
+            .await
+            .unwrap();
+        for id in &ids {
+            let namespace = harness.namespace(id);
+            assert_eq!(namespace, format!("{}/{mode}/identity/{id}", harness.scope));
+            memory
+                .append_message(
+                    &namespace,
+                    &Message::text("user", format!("OWN-HISTORY-{id}")),
+                )
+                .await
+                .unwrap();
+            memory
+                .append(
+                    &format!("{namespace}/notes"),
+                    "note",
+                    &format!("OWN-NOTE-{id}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let report = harness.dream().await.unwrap();
+        assert!(
+            report.accepted.is_empty() && report.rejected.is_empty(),
+            "{mode}: {report:?}"
+        );
+        assert_eq!(report.summaries, ids.len(), "{mode}");
+        let requests = provider.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), ids.len(), "{mode}");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.actor.rsplit('/').next().unwrap().to_owned())
+                .collect::<BTreeSet<_>>(),
+            ids.iter().cloned().collect(),
+            "{mode}: every active part dreams exactly once"
+        );
+        for request in &requests {
+            let id = request.actor.rsplit('/').next().unwrap();
+            assert_eq!(
+                request.actor,
+                format!("{}/{mode}/identity/{id}", harness.scope)
+            );
+            assert!(
+                request
+                    .instructions
+                    .contains(&format!("Phase: {BUILTIN_DREAM_PHASE}"))
+            );
+            assert!(request.instructions.contains("DREAM-PUBLIC-BASELINE"));
+            assert!(request.instructions.contains(&format!("OWN-NOTE-{id}")));
+            assert_eq!(request.current_message_count, Some(1));
+            assert_eq!(
+                request.messages.last().unwrap().plain_text(),
+                Some(BUILTIN_DREAM_PROMPT)
+            );
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.plain_text()
+                        == Some(format!("OWN-HISTORY-{id}").as_str()))
+            );
+            assert_eq!(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["dream_suggest"]
+            );
+            let serialized = serde_json::to_string(request).unwrap();
+            for other in &ids {
+                if other != id {
+                    assert!(!serialized.contains(&format!("OWN-HISTORY-{other}")));
+                    assert!(!serialized.contains(&format!("OWN-NOTE-{other}")));
+                }
+            }
+        }
+        assert_eq!(
+            harness.session_usage().await.unwrap().invocation_count,
+            ids.len() as u64
+        );
+        let context = harness.subscribe_context().borrow().latest.clone().unwrap();
+        assert_eq!(context.phase, UsagePhase::Dream);
+        for kind in [
+            ContextSourceKind::PublicTranscript,
+            ContextSourceKind::PrivateHistory,
+            ContextSourceKind::Notes,
+        ] {
+            assert_eq!(
+                context
+                    .runtime_sources
+                    .iter()
+                    .find(|source| source.kind == kind)
+                    .unwrap()
+                    .units,
+                1
+            );
+        }
+        for id in &ids {
+            let notes = memory
+                .history_window(&format!("{}/notes", harness.namespace(id)), 16)
+                .await
+                .unwrap();
+            assert_eq!(notes.total_rows, 2);
+            assert!(notes.messages.iter().any(
+                |message| message.plain_text() == Some(format!("DREAM-SUMMARY-{id}").as_str())
+            ));
+        }
+        assert_eq!(
+            memory
+                .history_window(&transcript, 16)
+                .await
+                .unwrap()
+                .total_rows,
+            1
+        );
+        assert_eq!(
+            harness
+                .topology
+                .parts
+                .iter()
+                .filter(|part| part.active)
+                .count(),
+            ids.len()
+        );
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
     }
 }
