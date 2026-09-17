@@ -483,11 +483,14 @@ async fn held_descendant_releases_after_checked_no_move_and_activation_recovers(
     )
     .await
     .unwrap();
-    let source = files::directory(&candidate).unwrap();
-    let source_identity = source.identity();
+    let source_identity = files::directory(&candidate).unwrap().identity();
     // Even a delete-sharing data handle prevents moving its containing Windows
     // directory. The real probe already exited before this known blocker opens.
-    let (_parent, blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    let (parent, blocker) = files::read(&candidate.join("LICENSES"), Privacy::OwnerOnly).unwrap();
+    // The parent was needed only to establish the checked read. Retaining it
+    // would keep an ancestor of the disposable stage open after the leaf
+    // blocker is released.
+    drop(parent);
     let destination = cache.join("active");
     let lock_path = cache.join(".install.lock");
     let mut blocker = Some(blocker);
