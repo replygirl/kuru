@@ -171,7 +171,20 @@ pub(super) fn remove_tree(
     expected: FileIdentity,
 ) -> Result<(), (PublicationPhase, io::Error)> {
     let mut removed = false;
-    verify_named(parent, name, expected, &mut removed)?;
+    // A root that is already absent is the outcome this removal wants, not a
+    // rejection: an earlier attempt, or the holder of a pending delete, got
+    // there first. Only absence is accepted here; every other failure stands.
+    match verify_named(parent, name, expected, &mut removed) {
+        Ok(()) => {}
+        Err((_, error)) if error.kind() == io::ErrorKind::NotFound => {
+            drop(held);
+            verify_absent(parent, name, &mut removed)?;
+            return parent
+                .sync_all()
+                .map_err(|error| (PublicationPhase::Uncertain, error));
+        }
+        Err(failure) => return Err(failure),
+    }
     remove_children(&held, &mut removed, 0)?;
     verify_named(parent, name, expected, &mut removed)?;
     unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(|error| (phase(removed), error.into()))?;
@@ -252,6 +265,8 @@ fn remove_children(
         if matches!(name.as_bytes(), b"." | b"..") {
             continue;
         }
+        #[cfg(test)]
+        super::enumeration_seam::observe();
         let child = openat(
             directory,
             name,
@@ -273,13 +288,17 @@ fn remove_children(
                 *removed = true;
             }
             Err(error) if error == rustix::io::Errno::NOTDIR => {
-                let child = openat(
+                let child = match openat(
                     directory,
                     name,
                     OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
                     Mode::empty(),
-                )
-                .map_err(|error| (phase(*removed), error.into()))?;
+                ) {
+                    Ok(child) => child,
+                    // The enumerated name disappeared between the two opens.
+                    Err(error) if error == rustix::io::Errno::NOENT => continue,
+                    Err(error) => return Err((phase(*removed), error.into())),
+                };
                 let child = File::from(child);
                 let info = info(&child).map_err(|error| (phase(*removed), error))?;
                 if info.directory {
@@ -291,6 +310,11 @@ fn remove_children(
                 drop(child);
                 *removed = true;
             }
+            // An enumerated name already gone by the time this removal reaches
+            // it is the outcome this loop wants. `removed` stays untouched: we
+            // performed no removal, and the final absence check still proves
+            // the tree's disappearance.
+            Err(error) if error == rustix::io::Errno::NOENT => continue,
             Err(error) => return Err((phase(*removed), error.into())),
         }
     }

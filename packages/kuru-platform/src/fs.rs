@@ -13,6 +13,43 @@ mod native;
 #[path = "fs/windows.rs"]
 mod native;
 
+/// Test-only seam inside checked tree removal, invoked on every enumerated
+/// entry after the enumeration observes its name and before any handle on that
+/// name is opened. It exists so a test can make an enumerated entry disappear
+/// in exactly the window a completing pending delete uses on Windows.
+#[cfg(test)]
+pub(crate) mod enumeration_seam {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static OBSERVER: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Removes the installed observer, keeping the seam local to one test.
+    pub(crate) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            OBSERVER.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    pub(crate) fn install(observer: impl FnMut() + 'static) -> Installed {
+        OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(observer)));
+        Installed
+    }
+
+    pub(crate) fn observe() {
+        OBSERVER.with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut()
+                && let Some(observer) = slot.as_mut()
+            {
+                observer();
+            }
+        });
+    }
+}
+
 /// Full native identity, meaningful while its associated handle remains open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileIdentity {
@@ -108,6 +145,12 @@ impl std::error::Error for PublicationError {
 /// Removal consumes the caller's file handle so Windows can finish ordinary
 /// deletion. An uncertain result requires reconciliation; it never authorizes
 /// deleting a new object which subsequently occupies the same name.
+///
+/// Absence is the intended outcome of a removal, never a rejection: a target
+/// that is already gone when a checked removal reaches it - an enumerated entry
+/// whose pending delete completed, or a root removed by an earlier attempt -
+/// completes that removal. Denied and uncertain results keep their meaning, and
+/// `path` always names the tree root, never the descendant that failed.
 #[derive(Debug)]
 pub struct RemovalError {
     pub phase: PublicationPhase,
@@ -750,6 +793,39 @@ mod tests {
             .write_all(b"outside bytes")
             .unwrap();
         drop(outside);
+
+        root.remove_tree().unwrap();
+        assert!(!temporary.path().join("root").exists());
+        assert_eq!(
+            std::fs::read(temporary.path().join("outside/sentinel")).unwrap(),
+            b"outside bytes"
+        );
+    }
+
+    #[test]
+    fn checked_tree_removal_completes_when_an_enumerated_child_vanishes_first() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Directory::ensure_private(&temporary.path().join("root")).unwrap();
+        for name in ["first", "second"] {
+            root.create_new(OsStr::new(name))
+                .unwrap()
+                .write_all(b"private bytes")
+                .unwrap();
+        }
+        let outside = Directory::ensure_private(&temporary.path().join("outside")).unwrap();
+        outside
+            .create_new(OsStr::new("sentinel"))
+            .unwrap()
+            .write_all(b"outside bytes")
+            .unwrap();
+        drop(outside);
+        // Delete an enumerated entry in the window between enumeration and the
+        // handles this removal opens on it, the window a completing Windows
+        // pending delete uses.
+        let vanishing = temporary.path().join("root/first");
+        let _seam = enumeration_seam::install(move || {
+            let _ = std::fs::remove_file(&vanishing);
+        });
 
         root.remove_tree().unwrap();
         assert!(!temporary.path().join("root").exists());
