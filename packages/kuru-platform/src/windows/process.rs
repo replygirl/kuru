@@ -48,7 +48,7 @@ use windows_sys::Win32::{
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
         Memory::{GetProcessHeap, HeapAlloc, HeapFree},
-        ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::{
             CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
             CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
@@ -560,8 +560,11 @@ pub fn sample_process(handle: &OwnedHandle) -> io::Result<ProcessSample> {
         ..Default::default()
     };
     // SAFETY: `cb` is set to this exact struct's size before the call, as
-    // GetProcessMemoryInfo requires; the handle carries PROCESS_VM_READ.
-    if unsafe { GetProcessMemoryInfo(handle.as_raw_handle(), &mut counters, counters.cb) } == 0 {
+    // K32GetProcessMemoryInfo requires; the handle carries PROCESS_VM_READ.
+    // K32GetProcessMemoryInfo is the kernel32-exported form of psapi's
+    // GetProcessMemoryInfo (identical signature, available since Windows 7);
+    // using it keeps this crate's shipping imports on kernel32 alone.
+    if unsafe { K32GetProcessMemoryInfo(handle.as_raw_handle(), &mut counters, counters.cb) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(ProcessSample {

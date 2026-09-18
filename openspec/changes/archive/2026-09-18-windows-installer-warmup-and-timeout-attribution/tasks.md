@@ -21,7 +21,9 @@
 
 - [x] 2.1 Add `NativeChild::duplicate_diagnostic_handle`,
   `ProcessSample`, and `sample_process` (wrapping `GetProcessTimes` /
-  `GetProcessMemoryInfo`) to `packages/kuru-platform/src/windows/process.rs`,
+  `GetProcessMemoryInfo`, later switched to the kernel32-exported
+  `K32GetProcessMemoryInfo` to keep shipping imports off `psapi.dll`; see
+  PR #44) to `packages/kuru-platform/src/windows/process.rs`,
   refactoring `duplicate_process` onto a shared
   `duplicate_process_with_access` helper with no behavior change for
   existing callers (`duplicate_process_handle`,

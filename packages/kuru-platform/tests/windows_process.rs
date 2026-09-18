@@ -2,7 +2,7 @@
 
 use kuru_platform::windows::{
     pipe::{self, Pipe, PrivateListener},
-    process::{Console, Lifetime, NativeChild, NativeSpawnSpec, Stdio},
+    process::{Console, Lifetime, NativeChild, NativeSpawnSpec, Stdio, sample_process},
 };
 use std::{
     ffi::{OsStr, OsString},
@@ -776,6 +776,38 @@ fn cancelled_connect_does_not_strand_runtime_shutdown() {
         .recv_timeout(LIMIT)
         .expect("cancelled native pipe stranded the Tokio runtime");
     thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn diagnostic_sampling_reports_non_decreasing_resources_and_rejects_insufficient_rights() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = idle(root.path()).await;
+    let diagnostic = child.duplicate_diagnostic_handle().unwrap();
+    let first = sample_process(&diagnostic).unwrap();
+    assert!(
+        first.working_set_bytes > 0,
+        "expected a positive working set"
+    );
+    let second = sample_process(&diagnostic).unwrap();
+    assert!(second.kernel_time >= first.kernel_time);
+    assert!(second.user_time >= first.user_time);
+    assert!(
+        second.working_set_bytes > 0,
+        "expected a positive working set"
+    );
+
+    // Error path without panicking: the wait/query-only duplicate carries no
+    // PROCESS_VM_READ, so GetProcessMemoryInfo is denied. Sampling an actually
+    // closed handle would require an invalid raw HANDLE, which this crate's
+    // deny-by-default unsafe policy correctly keeps out of reach here.
+    let wait_only = child.duplicate_process_handle().unwrap();
+    assert_eq!(
+        sample_process(&wait_only).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+
+    child.terminate().unwrap();
+    assert!(!child.wait(LIMIT).await.unwrap().success());
 }
 
 #[tokio::test]
