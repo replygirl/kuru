@@ -118,9 +118,12 @@ pub struct View {
     pub activity: Vec<String>,
     /// Ephemeral selected-speaker preview; never copied into the transcript.
     pub preview: Option<FacingProgress>,
-    /// Raw catalog name of the facing speaker's in-flight tool call, display
-    /// only. Never an argument; cleared when the call settles or the preview is.
-    pub calling_tool: Option<String>,
+    /// Raw catalog names of the facing speaker's in-flight tool calls, oldest
+    /// first, display only. Never an argument. Each entry carries the actor
+    /// that started it so `ToolSettled` clears it by that recorded actor and
+    /// name rather than by whoever currently speaks; the set empties as calls
+    /// settle, or all at once when the preview clears.
+    pub calling_tool: Vec<(String, String)>,
     pub request_context: Option<RequestContext>,
     facing_context: Option<RequestContext>,
     pub active_operation_id: Option<String>,
@@ -181,7 +184,7 @@ impl View {
             parts: runtime.parts,
             activity: vec![],
             preview: None,
-            calling_tool: None,
+            calling_tool: Vec::new(),
             request_context: None,
             facing_context: None,
             active_operation_id: None,
@@ -275,7 +278,7 @@ impl View {
     fn begin_operation(&mut self) {
         self.busy = true;
         self.preview = None;
-        self.calling_tool = None;
+        self.calling_tool.clear();
         self.completion_locked = false;
         self.notice = None;
         self.operation_start = Some(self.clock_ms);
@@ -314,7 +317,7 @@ impl View {
     fn settle(&mut self) {
         self.operation_start = None;
         self.preview = None;
-        self.calling_tool = None;
+        self.calling_tool.clear();
         self.active_operation_id = None;
         for phase in self.part_activity.values_mut() {
             if phase != "error" {
@@ -409,14 +412,31 @@ impl View {
             Event::ToolStarted { actor, name } => {
                 self.part_activity.insert(actor.clone(), "tool".into());
                 if actor == self.speaker_id {
-                    self.calling_tool = Some(name.clone());
+                    self.calling_tool.push((actor.clone(), name.clone()));
                 }
                 ("tool".into(), actor, name)
             }
             Event::ToolSettled { actor, observation } => {
                 self.part_activity.insert(actor.clone(), "tool".into());
-                if actor == self.speaker_id {
-                    self.calling_tool = None;
+                // Clear by the actor and name recorded at `ToolStarted`, never by
+                // whoever currently speaks: a `Speaker` change mid-call must not
+                // strand this entry, and a matching name from a different actor
+                // must not clear the wrong one.
+                if let Some(pos) = self.calling_tool.iter().position(|(started_actor, name)| {
+                    started_actor == &actor && *name == observation.name
+                }) {
+                    self.calling_tool.remove(pos);
+                    // No facing call remains in flight. The cached preview may
+                    // still read the generic "Calling tool" published while
+                    // this call's arguments were streaming, before the next
+                    // provider delta republishes it — correct it here so the
+                    // rendered label never outlives the call it named.
+                    if self.calling_tool.is_empty()
+                        && let Some(preview) = self.preview.as_mut()
+                    {
+                        preview.activity = "Responding".into();
+                        preview.activity_truncated = false;
+                    }
                 }
                 (
                     "tool-observation".into(),
@@ -507,7 +527,7 @@ impl View {
 
     pub fn complete_turn(&mut self, output: TurnOutput) {
         self.preview = None;
-        self.calling_tool = None;
+        self.calling_tool.clear();
         let outcome = outcome_summary(&output);
         let speaker = output
             .relationship
@@ -1791,7 +1811,7 @@ where
                             approval_rx = None;
                             view.permission_prompt = None;
                             view.preview = None;
-                            view.calling_tool = None;
+                            view.calling_tool.clear();
                             preview_fence.clear();
                             preview_paint.clear();
                             activity_open = activity_still_open(
@@ -1814,7 +1834,7 @@ where
                             approval_rx = None;
                             view.permission_prompt = None;
                             view.preview = None;
-                            view.calling_tool = None;
+                            view.calling_tool.clear();
                             preview_fence.clear();
                             preview_paint.clear();
                             if let Some(cancellation) = cancellation.take() {
@@ -2295,6 +2315,19 @@ mod tests {
         }));
     }
 
+    fn settled(name: &str) -> ToolObservation {
+        ToolObservation {
+            call_id: "call-1".into(),
+            name: name.into(),
+            arguments: serde_json::json!({"activation":0.4,"note":"bounded"}),
+            outcome: kuru_runtime::ToolOutcome::Ok,
+            argument_bytes: 0,
+            result_bytes: 0,
+            result_sha256: None,
+            elapsed_ms: 1,
+        }
+    }
+
     #[test]
     fn facing_tool_call_names_the_activity_and_clears_on_settlement() {
         let mut view = fixture();
@@ -2308,14 +2341,17 @@ mod tests {
             actor: "peer".into(),
             name: "peer_send".into(),
         });
-        assert_eq!(view.calling_tool, None);
+        assert!(view.calling_tool.is_empty());
         assert!(rendered(&view).contains("activity · Calling tool"));
 
         view.event(Event::ToolStarted {
             actor: "facing".into(),
             name: "state_report".into(),
         });
-        assert_eq!(view.calling_tool.as_deref(), Some("state_report"));
+        assert_eq!(
+            view.calling_tool.last().map(|(_, name)| name.as_str()),
+            Some("state_report")
+        );
         let frame = rendered(&view);
         assert!(
             frame.contains("activity · Calling state_report"),
@@ -2325,26 +2361,108 @@ mod tests {
 
         view.event(Event::ToolSettled {
             actor: "facing".into(),
-            observation: ToolObservation {
-                call_id: "call-1".into(),
-                name: "state_report".into(),
-                arguments: serde_json::json!({"activation":0.4,"note":"bounded"}),
-                outcome: kuru_runtime::ToolOutcome::Ok,
-                argument_bytes: 0,
-                result_bytes: 0,
-                result_sha256: None,
-                elapsed_ms: 1,
-            },
+            observation: settled("state_report"),
         });
-        assert_eq!(view.calling_tool, None);
+        // Nothing is running any more: the label must say so truthfully,
+        // never the raw "Calling tool" the provider preview last published
+        // before this settlement reached the view.
+        assert!(view.calling_tool.is_empty());
         let frame = rendered(&view);
-        assert!(frame.contains("activity · Calling tool"));
+        assert!(
+            frame.contains("activity · Responding"),
+            "settled call left a stale activity label: {frame}"
+        );
+        assert!(
+            !frame.contains("Calling tool"),
+            "stale label survived settlement: {frame}"
+        );
         assert!(!frame.contains("Calling state_report"));
 
         // A new turn never inherits a stale name.
-        view.calling_tool = Some("state_report".into());
+        view.calling_tool = vec![("facing".into(), "state_report".into())];
         view.begin_operation();
-        assert_eq!(view.calling_tool, None);
+        assert!(view.calling_tool.is_empty());
+    }
+
+    #[test]
+    fn facing_parallel_tool_calls_track_independently() {
+        let mut view = fixture();
+        view.speaker_id = "facing".into();
+        view.preview = Some(progress("turn", 1, 1));
+
+        view.event(Event::ToolStarted {
+            actor: "facing".into(),
+            name: "tool_a".into(),
+        });
+        view.event(Event::ToolStarted {
+            actor: "facing".into(),
+            name: "tool_b".into(),
+        });
+        assert_eq!(
+            view.calling_tool
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_a", "tool_b"]
+        );
+
+        view.event(Event::ToolSettled {
+            actor: "facing".into(),
+            observation: settled("tool_a"),
+        });
+        let frame = rendered(&view);
+        assert!(
+            frame.contains("activity · Calling tool_b"),
+            "the still-running call must stay named: {frame}"
+        );
+        assert!(!frame.contains("tool_a"));
+
+        view.event(Event::ToolSettled {
+            actor: "facing".into(),
+            observation: settled("tool_b"),
+        });
+        assert!(view.calling_tool.is_empty());
+        let frame = rendered(&view);
+        assert!(
+            frame.contains("activity · Responding"),
+            "the label must clear once every parallel call has settled: {frame}"
+        );
+    }
+
+    #[test]
+    fn tool_settlement_clears_by_the_actor_recorded_at_start() {
+        let mut view = fixture();
+        view.speaker_id = "facing".into();
+        view.preview = Some(progress("turn", 1, 1));
+
+        view.event(Event::ToolStarted {
+            actor: "facing".into(),
+            name: "state_report".into(),
+        });
+        assert!(!view.calling_tool.is_empty());
+
+        // The facing speaker changes mid-call; the current implementation
+        // guarded settlement on `self.speaker_id`, so this used to strand
+        // the entry forever once the speaker moved on.
+        view.event(Event::Speaker {
+            actor: "other".into(),
+            identity_kind: "part".into(),
+        });
+        assert_eq!(view.speaker_id, "other");
+
+        view.event(Event::ToolSettled {
+            actor: "facing".into(),
+            observation: settled("state_report"),
+        });
+        assert!(
+            view.calling_tool.is_empty(),
+            "settlement must clear by the actor recorded at ToolStarted, not the current speaker"
+        );
+        let frame = rendered(&view);
+        assert!(
+            frame.contains("activity · Responding"),
+            "a stranded entry would keep naming a call that already settled: {frame}"
+        );
     }
 
     fn rendered(view: &View) -> String {

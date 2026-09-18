@@ -105,10 +105,12 @@ available. That activity label names what is actually happening: `Responding`
 while facing text or a visible summary is streaming, the generic `Calling
 tool` while a tool call's arguments are still streaming and the provider has
 not yet named it, and `Calling {name}` with the tool's raw catalog name once
-the call is dispatched. It clears back to `Responding` when the call settles.
-Tool arguments are never read, retained or shown. This also works when a
-relationship speaks; private deliberation, peer consultations and dreams
-remain hidden.
+the call is dispatched. When the speaker has more than one call in flight at
+once, the label names whichever was dispatched most recently; it returns to
+`Responding` the moment every one of them has settled, never lagging behind
+on a name whose call already finished. Tool arguments are never read,
+retained or shown. This also works when a relationship speaks; private
+deliberation, peer consultations and dreams remain hidden.
 
 The preview keeps a bounded tail and indicates when earlier text is omitted.
 If tools lead to another speaking round, the next draft replaces the previous
