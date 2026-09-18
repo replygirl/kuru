@@ -101,8 +101,14 @@ peer messages or state notes.
 While the selected speaker responds, a provisional preview shows its latest
 text, including an unfinished line. A separate thinking region shows a
 provider-supplied visible summary or the current activity when no summary is
-available. This also works when a relationship speaks; private deliberation,
-peer consultations and dreams remain hidden.
+available. That activity label names what is actually happening: `Responding`
+while facing text or a visible summary is streaming, the generic `Calling
+tool` while a tool call's arguments are still streaming and the provider has
+not yet named it, and `Calling {name}` with the tool's raw catalog name once
+the call is dispatched. It clears back to `Responding` when the call settles.
+Tool arguments are never read, retained or shown. This also works when a
+relationship speaks; private deliberation, peer consultations and dreams
+remain hidden.
 
 The preview keeps a bounded tail and indicates when earlier text is omitted.
 If tools lead to another speaking round, the next draft replaces the previous
