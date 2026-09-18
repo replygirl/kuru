@@ -1,6 +1,6 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use anyhow::Result;
@@ -21,6 +21,7 @@ struct StagedProvider {
     requests: Mutex<Vec<CompletionRequest>>,
     speaking: AtomicUsize,
     tool_loop: bool,
+    text_after_tool: AtomicBool,
     consult_target: Mutex<Option<String>>,
 }
 
@@ -34,10 +35,17 @@ impl StagedProvider {
                 requests: Mutex::new(Vec::new()),
                 speaking: AtomicUsize::new(0),
                 tool_loop,
+                text_after_tool: AtomicBool::new(false),
                 consult_target: Mutex::new(None),
             }),
             receiver,
         )
+    }
+
+    /// After the round-1 tool call streams, also stream a further facing
+    /// text fragment in the same round, before the round completes.
+    fn resume_with_text_after_tool(&self) {
+        self.text_after_tool.store(true, Ordering::SeqCst);
     }
 
     async fn wait_at(&self, stage: usize) -> Result<()> {
@@ -150,6 +158,16 @@ impl Provider for StagedProvider {
                     arguments_fragment: "{\"activation\":".into(),
                 })
                 .await?;
+                if self.text_after_tool.load(Ordering::SeqCst) {
+                    sink.emit(ProviderEvent::TextDelta {
+                        item_id: format!("facing-{round}"),
+                        output_index: 0,
+                        content_index: 0,
+                        source: TextDeltaSource::OutputText,
+                        text: "-AFTER-TOOL".into(),
+                    })
+                    .await?;
+                }
             }
         }
         let consult_target = self.consult_target.lock().unwrap().clone();
@@ -361,6 +379,53 @@ async fn tool_loop_replaces_preview_and_partial_call_has_no_authority() {
             .get(&target)
             .is_some_and(|state| state.note == "bounded preview")
     );
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_call_followed_by_text_in_same_round_returns_to_responding() {
+    let directory = tempfile::tempdir().unwrap();
+    let memory = MemoryStore::temporary().await.unwrap();
+    let (provider, mut stages) = StagedProvider::new(true);
+    provider.resume_with_text_after_tool();
+    let mut harness = Harness::new(
+        config(),
+        directory.path(),
+        memory.clone(),
+        provider.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let target = harness.topology.parts[0].id.clone();
+    let progress = harness.subscribe_progress();
+    let run_target = target.clone();
+    let run = tokio::spawn(async move {
+        let result = harness
+            .run_local_controlled(
+                "tool request",
+                Some(&run_target),
+                "tool-turn",
+                &CancellationToken::new(),
+            )
+            .await;
+        (harness, result)
+    });
+    stage(&mut stages, 1).await;
+    provider.release();
+    stage(&mut stages, 2).await;
+    let after_text = preview(&progress);
+    // A round can carry a function-call item followed by a message item:
+    // once facing text resumes streaming after the tool call, the label
+    // must leave "Calling tool" rather than staying stuck on it.
+    assert_eq!(after_text.text_tail, "provisional-1-AFTER-TOOL");
+    assert_eq!(after_text.activity, "Responding");
+    provider.release();
+    stage(&mut stages, 3).await;
+    provider.release();
+    let (mut harness, result) = run.await.unwrap();
+    assert_eq!(result.unwrap().output.text, "settled-two");
     harness.shutdown(false).await.unwrap();
     memory.close().await.unwrap();
 }

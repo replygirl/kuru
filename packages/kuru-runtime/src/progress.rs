@@ -168,6 +168,7 @@ impl ProgressObserver {
             TEXT_LIMIT,
             &mut self.text_truncated,
         );
+        self.set_responding();
         self.publish();
     }
 
@@ -178,6 +179,7 @@ impl ProgressObserver {
             SUMMARY_LIMIT,
             &mut self.summary_truncated,
         );
+        self.set_responding();
         self.publish();
     }
 
@@ -190,6 +192,19 @@ impl ProgressObserver {
         self.activity = CALLING_TOOL.into();
         self.activity_truncated = false;
         self.publish();
+    }
+
+    /// A facing text or visible-summary fragment arrived after a tool call
+    /// was streaming (one round can carry a function-call item followed by
+    /// a message item). The activity is not sticky: it must return to
+    /// `Responding` so the label stays truthful for whichever kind of
+    /// output is actually streaming now.
+    fn set_responding(&mut self) {
+        if self.activity == RESPONDING {
+            return;
+        }
+        self.activity = RESPONDING.into();
+        self.activity_truncated = false;
     }
 
     fn publish(&self) {
