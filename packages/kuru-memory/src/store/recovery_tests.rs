@@ -2054,10 +2054,11 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
         proxy.discarded.load(Ordering::Acquire),
         "fixture must discard the durable production migration DOLT_COMMIT reply"
     );
-    assert!(
-        proxy.session_ended.load(Ordering::Acquire),
-        "the proxy must observe the original routed SQL session end before reconciliation"
-    );
+    await_flag(&proxy.session_ended, TEST_DEADLINE)
+        .await
+        .context(
+            "the proxy must observe the original routed SQL session end before reconciliation",
+        )?;
     assert_eq!(
         migrations::version(&store.pool).await?,
         migrations::CURRENT_VERSION
@@ -2138,7 +2139,7 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
         .await
         .context("production migration did not reconcile lost branch reply")???;
     assert!(proxy.discarded.load(Ordering::Acquire));
-    assert!(proxy.session_ended.load(Ordering::Acquire));
+    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
     assert_eq!(
         store.get("branch-reply-source").await?,
         Some(json!("retained"))
@@ -2233,7 +2234,7 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
         .await
         .context("production migration did not reconcile lost fast-forward reply")???;
     assert!(proxy.discarded.load(Ordering::Acquire));
-    assert!(proxy.session_ended.load(Ordering::Acquire));
+    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
     let completed = store.revision().await?;
     let parent: String = sqlx::query_scalar(
         "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
@@ -2341,7 +2342,7 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
         proxy.discarded.load(Ordering::Acquire),
         "fixture must drop the merge request before dispatch: {error:#}"
     );
-    assert!(proxy.session_ended.load(Ordering::Acquire));
+    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
     proxy.close().await;
     options.migration_hooks = None;
 
@@ -2537,6 +2538,27 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
     assert_candidate_unchanged(&candidate).await;
 
     current.close().await.unwrap();
+}
+
+/// Wait for a fixture-owned flag to become true, bounded by `duration`.
+///
+/// `session_ended` is set from the `AckDropProxy`'s own spawned task, a task
+/// distinct from (and unordered with respect to) the task driving
+/// `MemoryStore::open()` that the caller is typically awaiting alongside it.
+/// The flag is set only after the proxy observes the routed SQL session's
+/// actual server-side teardown (`await_session_end`), which can lag the
+/// socket shutdown that unblocks `open()` by an unbounded amount of
+/// wall-clock time — so a bare `.load()` races. Poll instead of asserting
+/// synchronously, mirroring the bounded `durable_observation` poll used
+/// elsewhere in this file for the same out-of-band-condition shape.
+async fn await_flag(flag: &AtomicBool, duration: Duration) -> Result<()> {
+    tokio::time::timeout(duration, async {
+        while !flag.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("fixture flag did not become true")
 }
 
 struct AckDropProxy {
