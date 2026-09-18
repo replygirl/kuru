@@ -36,7 +36,13 @@ use super::{
 use crate::memory_notice::MemoryNotice;
 
 async fn fixture() -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
-    fixture_with_memory(MemoryStore::temporary().await.unwrap()).await
+    fixture_with_memory(temporary_memory().await).await
+}
+
+/// Held across the supervisor and engine spawns; see `crate::spawn_gate`.
+async fn temporary_memory() -> MemoryStore {
+    let _gate = crate::spawn_gate::spawning().await;
+    MemoryStore::temporary().await.unwrap()
 }
 
 async fn fixture_with_memory(memory: MemoryStore) -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
@@ -347,7 +353,7 @@ async fn blocking_fixture(provider: Arc<BlockingProvider>) -> (tempfile::TempDir
             ..Config::default()
         },
         directory.path(),
-        MemoryStore::temporary().await.unwrap(),
+        temporary_memory().await,
         provider,
         None,
     )
@@ -494,11 +500,17 @@ async fn persistent_store() -> (tempfile::TempDir, kuru_memory::OpenOptions, Mem
         format!("project/{}", "1".repeat(64)),
     )
     .unwrap();
-    let store = MemoryStore::open(options.clone()).await.unwrap();
+    let store = {
+        // Held across the supervisor and engine spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        MemoryStore::open(options.clone()).await.unwrap()
+    };
     (root, options, store)
 }
 
 async fn reopen_store(options: kuru_memory::OpenOptions) -> MemoryStore {
+    // Held across the supervisor and engine spawns; see `crate::spawn_gate`.
+    let _gate = crate::spawn_gate::spawning().await;
     MemoryStore::open(options).await.unwrap()
 }
 

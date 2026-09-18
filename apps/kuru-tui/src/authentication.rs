@@ -102,10 +102,14 @@ mod tests {
 
     #[tokio::test]
     async fn desktop_handoff_reports_failure_and_keeps_a_running_browser_alive() {
-        let failed = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "exit 7"])
-            .spawn()
-            .unwrap();
+        // Held across each spawn; see `crate::spawn_gate`.
+        let failed = {
+            let _gate = crate::spawn_gate::spawning().await;
+            tokio::process::Command::new("/bin/sh")
+                .args(["-c", "exit 7"])
+                .spawn()
+                .unwrap()
+        };
         assert!(
             browser_handoff(failed, Duration::from_secs(2))
                 .await
@@ -114,15 +118,18 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("browser-alive");
-        let running = tokio::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                "sleep 0.1; printf desktop > \"$1\"",
-                "browser-fixture",
-            ])
-            .arg(&marker)
-            .spawn()
-            .unwrap();
+        let running = {
+            let _gate = crate::spawn_gate::spawning().await;
+            tokio::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "sleep 0.1; printf desktop > \"$1\"",
+                    "browser-fixture",
+                ])
+                .arg(&marker)
+                .spawn()
+                .unwrap()
+        };
         browser_handoff(running, Duration::from_millis(5))
             .await
             .unwrap();
