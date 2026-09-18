@@ -30,7 +30,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        DUPLICATE_SAME_ACCESS, DuplicateHandle, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE,
         HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
         WAIT_TIMEOUT,
     },
@@ -48,14 +48,16 @@ use windows_sys::Win32::{
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
         Memory::{GetProcessHeap, HeapAlloc, HeapFree},
+        ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::{
             CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
             CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-            GetCurrentProcess, GetExitCodeProcess, GetProcessId, InitializeProcThreadAttributeList,
-            LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE, STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-            TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+            GetCurrentProcess, GetExitCodeProcess, GetProcessId, GetProcessTimes,
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_READ,
+            STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+            UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
     UI::WindowsAndMessaging::SW_HIDE,
@@ -346,6 +348,16 @@ impl NativeChild {
     pub fn duplicate_process_handle(&self) -> io::Result<OwnedHandle> {
         duplicate_process(self.process.as_raw_handle())
     }
+    /// A diagnostics-only duplicate carrying query-and-memory-counters rights
+    /// (`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`), for sampling
+    /// CPU time and working set on an already-slow/timed-out path. It has no
+    /// terminate, suspend, or write authority and confers no PID ownership.
+    pub fn duplicate_diagnostic_handle(&self) -> io::Result<OwnedHandle> {
+        duplicate_process_with_access(
+            self.process.as_raw_handle(),
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+        )
+    }
     pub fn take_stdin(&mut self) -> Option<Pipe> {
         self.stdin.take()
     }
@@ -483,6 +495,13 @@ pub fn duplicate_inherited_process_handle(
 }
 
 fn duplicate_process(handle: HANDLE) -> io::Result<OwnedHandle> {
+    duplicate_process_with_access(
+        handle,
+        PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+    )
+}
+
+fn duplicate_process_with_access(handle: HANDLE, access: u32) -> io::Result<OwnedHandle> {
     let mut duplicate = ptr::null_mut();
     // SAFETY: DuplicateHandle validates an opaque source handle and writes one
     // new handle to our output; failure never transfers ownership of the input.
@@ -492,7 +511,7 @@ fn duplicate_process(handle: HANDLE) -> io::Result<OwnedHandle> {
             handle,
             GetCurrentProcess(),
             &mut duplicate,
-            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            access,
             0,
             0,
         )
@@ -502,6 +521,60 @@ fn duplicate_process(handle: HANDLE) -> io::Result<OwnedHandle> {
     }
     // SAFETY: successful duplication returned a unique owned handle.
     Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+}
+
+/// A cheap point-in-time process resource sample. Diagnostics only: never
+/// consulted for control flow, only appended to failure text.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessSample {
+    pub kernel_time: Duration,
+    pub user_time: Duration,
+    pub working_set_bytes: u64,
+}
+
+/// Sample CPU time (kernel + user) and current working set for a retained
+/// process handle. The handle needs only `PROCESS_QUERY_LIMITED_INFORMATION`
+/// and `PROCESS_VM_READ` (see [`NativeChild::duplicate_diagnostic_handle`]).
+pub fn sample_process(handle: &OwnedHandle) -> io::Result<ProcessSample> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: handle is a retained, still-open process handle with sufficient
+    // query rights; all four output pointers are valid FILETIME locations for
+    // the duration of this call.
+    if unsafe {
+        GetProcessTimes(
+            handle.as_raw_handle(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `cb` is set to this exact struct's size before the call, as
+    // GetProcessMemoryInfo requires; the handle carries PROCESS_VM_READ.
+    if unsafe { GetProcessMemoryInfo(handle.as_raw_handle(), &mut counters, counters.cb) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ProcessSample {
+        kernel_time: filetime_to_duration(kernel),
+        user_time: filetime_to_duration(user),
+        working_set_bytes: counters.WorkingSetSize as u64,
+    })
+}
+
+fn filetime_to_duration(value: FILETIME) -> Duration {
+    let ticks = (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime);
+    // FILETIME ticks are 100-nanosecond intervals.
+    Duration::from_nanos(ticks.saturating_mul(100))
 }
 
 /// Wait on a retained process object, bounded without reopening its numeric PID.

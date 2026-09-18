@@ -727,6 +727,63 @@ async fn install_packaged(
     .await
 }
 
+// The install step's COMMAND_TIMEOUT bounds the install; it must not also
+// have to absorb the stock PowerShell 5.1 engine's own cold-start cost
+// (loading System.Management.Automation.dll, types.ps1xml/format.ps1xml,
+// building the initial runspace), which happens before any script line runs
+// and which -NoProfile/-NonInteractive do not skip. Evidence: 3/35 CI runs
+// stalled at the very first powershell.exe invocation with zero stdout/stderr
+// bytes over the full 100s window and the script's own first checkpoint line
+// (gated only on -Verbose, always passed) never executed — see
+// plan-flake-windows-installer.md. Giving cold start its own generous,
+// distinctly labelled bound here, ahead of the timed install step, also
+// primes the OS/Defender file-scan cache for powershell.exe's assemblies
+// before the install invocation's own fresh COMMAND_TIMEOUT begins.
+#[cfg(windows)]
+const ENGINE_WARM_UP_TIMEOUT: Duration = Duration::from_secs(100);
+
+#[cfg(windows)]
+async fn warm_up_powershell_engine(
+    powershell: &Path,
+    root: &Path,
+    system: &Path,
+    isolated: &Path,
+    empty_path: &Path,
+) -> Result<()> {
+    let mut command = Command::new(powershell);
+    command
+        .env_clear()
+        .env(
+            "SystemRoot",
+            system.parent().context("Windows system root")?,
+        )
+        .env("PROCESSOR_ARCHITECTURE", "AMD64")
+        .env("USERPROFILE", isolated)
+        .env("APPDATA", isolated)
+        .env("LOCALAPPDATA", isolated)
+        .env("TMP", isolated)
+        .env("TEMP", isolated)
+        .env("PATH", empty_path)
+        .current_dir(root)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "[Console]::Error.WriteLine('warm'); exit 0",
+        ]);
+    kuru_delivery::command::output(&mut command, ENGINE_WARM_UP_TIMEOUT)
+        .await
+        .context(
+            "warm up the stock PowerShell 5.1 engine ahead of the timed install step \
+             (distinct from and not counted against the install bound); a stall here \
+             points at PowerShell engine/host cold start, not install.ps1",
+        )?;
+    Ok(())
+}
+
 #[cfg(windows)]
 async fn install_packaged(
     root: &Path,
@@ -742,6 +799,7 @@ async fn install_packaged(
     fs::create_dir(&isolated)?;
     let empty_path = isolated.join("empty PATH");
     fs::create_dir(&empty_path)?;
+    warm_up_powershell_engine(&powershell, root, &system, &isolated, &empty_path).await?;
     let bootstrap = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../packages/kuru-delivery/support/install.ps1");
     let mut command = Command::new(powershell);
