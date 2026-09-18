@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Framework profiles, configuration, and shared contracts for Kuru"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 kuru-platform.workspace = true

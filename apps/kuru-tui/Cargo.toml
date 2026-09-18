@@ -9,7 +9,7 @@ description = "A chat harness with a native pool of persistent peer agents"
 
 [features]
 default = []
-test-support = ["kuru-platform/test-support"]
+test-support = ["kuru-platform/test-support", "kuru-core/test-support"]
 
 [[bin]]
 name = "kuru-terminal-windows-fixture"

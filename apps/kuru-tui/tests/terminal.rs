@@ -552,6 +552,151 @@ fn real_pty_status_bar_holds_all_six_session_facts_at_80_and_120_columns() -> Re
     terminal.assert_restored()
 }
 
+async fn priced_complete(Json(_): Json<Value>) -> Response {
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"priced-fixture",
+                    "status":"completed",
+                    "output":[{"type":"message","content":[{
+                        "type":"output_text", "text":"PRICED_RESPONSE_MARKER"
+                    }]}],
+                    "usage":{
+                        "input_tokens": PRICED_INPUT_TOKENS_PER_INVOCATION,
+                        "output_tokens": PRICED_OUTPUT_TOKENS_PER_INVOCATION,
+                        "input_tokens_details":{"cached_tokens": 0},
+                        "output_tokens_details":{"reasoning_tokens": 0}
+                    }
+                }
+            })
+        ),
+    )
+        .into_response()
+}
+
+// The harness dispatches more than one provider invocation per user turn
+// (speaker selection, per-part contribution, and so on); the exact count is
+// an internal runtime detail this test does not pin down. Every invocation
+// this mock answers reports the same per-invocation counts below, so the
+// expected dollar figure is derived from the *cumulative* totals `/cost`
+// itself reports, not from an assumed invocation count.
+const PRICED_INPUT_TOKENS_PER_INVOCATION: u64 = 8;
+const PRICED_OUTPUT_TOKENS_PER_INVOCATION: u64 = 5;
+const PRICED_INPUT_RATE_PER_MILLION_USD: f64 = 1.00;
+const PRICED_OUTPUT_RATE_PER_MILLION_USD: f64 = 2.00;
+
+/// Reads the token count out of a `/cost` component line such as
+/// `"Input: 64 tokens"`, so the test derives its expected dollar figure from
+/// the session's actual reported totals instead of guessing how many
+/// provider invocations one turn dispatches.
+fn parse_component_tokens(screen: &str, label: &str) -> Result<u64> {
+    let marker = format!("{label}: ");
+    let start = screen
+        .find(&marker)
+        .with_context(|| format!("{label:?} component missing from screen: {screen}"))?
+        + marker.len();
+    let rest = &screen[start..];
+    let end = rest
+        .find(" tokens")
+        .with_context(|| format!("{label:?} token count unparsable: {screen}"))?;
+    rest[..end]
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("{label:?} token count unparsable: {screen}"))
+}
+
+/// T3's residual known-cost branch: `apps/kuru-tui/tests/fixtures/priced-model-catalog.json`
+/// (loaded through the `test-support`-gated `KURU_TEST_MODEL_CATALOG_PATH`
+/// seam in `kuru-core`'s model catalog) gives the mock `responses` provider's
+/// `fixture` model a real price, so a turn against it exercises
+/// `dock_meters`'s known-cost formatting arms end to end instead of only the
+/// "cost unknown" branch every other real-PTY fixture is stuck on. The
+/// expected dollar figure is derived from the same rate/usage inputs the
+/// ledger fold consumes (`EstimateFold::add` in
+/// `kuru-memory/src/store/usage_ledger.rs`), never asserted independently of
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_status_bar_renders_known_cost_from_priced_invocation() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(priced_complete));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("priced-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap()
+    }));
+    let catalog_override =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/priced-model-catalog.json");
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1")
+        .env("KURU_TEST_MODEL_CATALOG_PATH", &catalog_override);
+    let mut terminal = Terminal::spawn(command, 35, 120)?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.send(b"Priced fixture turn\r")?;
+    terminal.wait_composer_frame(&["PRICED_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
+
+    terminal.command("/cost", None)?;
+    terminal.wait_composer_frame(&["enter send"], READY_TIMEOUT)?;
+    let cost_screen = terminal.screen();
+    let total_input = parse_component_tokens(&cost_screen, "Input")?;
+    let total_output = parse_component_tokens(&cost_screen, "Output")?;
+    // Every invocation reported a real (zero) cached-input and
+    // reasoning-output count, so the fold left no term unapplied: the
+    // estimate must be a complete "≈" figure, never a "≥" subtotal.
+    ensure!(
+        cost_screen.contains("Cached input (subset): 0 tokens")
+            && !cost_screen.contains("Reasoning output (subset): unknown"),
+        "fixture usage must report every component so the estimate is complete: {cost_screen}"
+    );
+    let expected_usd = total_input as f64 * PRICED_INPUT_RATE_PER_MILLION_USD / 1_000_000.0
+        + total_output as f64 * PRICED_OUTPUT_RATE_PER_MILLION_USD / 1_000_000.0;
+    let expected_known_usd = format!("{expected_usd:.6}");
+    let expected_dock_token = format!("≈${expected_known_usd} est");
+    let expected_cost_line = format!("API-standard estimate: ${expected_known_usd} estimated");
+    ensure!(
+        cost_screen.contains(&expected_cost_line),
+        "/cost must state the derived known figure {expected_cost_line:?}: {cost_screen}"
+    );
+
+    for (rows, cols) in [(35, 120), (24, 80)] {
+        terminal.resize(rows, cols)?;
+        terminal.command("/cost", None)?;
+        terminal.wait_composer_frame(&["enter send"], READY_TIMEOUT)?;
+        let screen = terminal.screen();
+        let standing = dock(&screen);
+        ensure!(
+            standing.contains(&expected_dock_token),
+            "standing dock must carry the known-cost token {expected_dock_token:?} at {cols}x{rows}: {screen}"
+        );
+        ensure!(
+            screen.contains(&expected_cost_line),
+            "/cost must state the same known figure the dock renders at {cols}x{rows}: {screen}"
+        );
+    }
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
 #[test]
 fn real_pty_reports_actual_optional_context_omission_without_erasing_history() -> Result<()> {
     let sandbox = Sandbox::new()?;
