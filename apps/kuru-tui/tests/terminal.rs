@@ -1276,6 +1276,154 @@ async fn streaming_complete(
         .into_response()
 }
 
+#[derive(Clone)]
+struct ToolActivityState {
+    started: Arc<AtomicBool>,
+    requests: Arc<AtomicUsize>,
+    release: watch::Receiver<bool>,
+}
+
+/// One facing round whose only streamed output is a tool call: the arguments
+/// stay open until released, so the rendered activity line can be inspected
+/// while the call is genuinely in flight.
+async fn tool_activity_complete(
+    State(state): State<ToolActivityState>,
+    Json(request): Json<Value>,
+) -> Response {
+    let speaking = request["instructions"]
+        .as_str()
+        .is_some_and(|instructions| instructions.contains("Phase: speak and act"));
+    let continued = request["input"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    });
+    if !speaking || continued || state.requests.fetch_add(1, Ordering::SeqCst) > 0 {
+        return (
+            [(CONTENT_TYPE, "text/event-stream")],
+            format!(
+                "data: {}\n\n",
+                json!({"type":"response.completed","response":{
+                    "id":"tool-activity-final","status":"completed",
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"FINAL_PUBLIC"}]}],
+                    "usage":{"input_tokens":8,"output_tokens":5}
+                }})
+            ),
+        )
+            .into_response();
+    }
+    state.started.store(true, Ordering::SeqCst);
+    let arguments = json!({"activation":0.4,"note":"PRIVATE_ARGUMENT_SENTINEL"}).to_string();
+    let first = format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-1","output_index":0,"summary_index":0,"delta":"VISIBLE_SUMMARY"}),
+        json!({"type":"response.function_call_arguments.delta","item_id":"tool-1","output_index":1,"delta":arguments}),
+    );
+    let last = format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({"type":"response.function_call_arguments.done","item_id":"tool-1","output_index":1,"name":"state_report","arguments":arguments}),
+        json!({"type":"response.completed","response":{
+            "id":"tool-activity-call","status":"completed",
+            "output":[
+                {"id":"reasoning-1","type":"reasoning","summary":[{"type":"summary_text","text":"VISIBLE_SUMMARY"}]},
+                {"id":"tool-1","type":"function_call","call_id":"tool-activity-1","name":"state_report","arguments":arguments}
+            ],
+            "usage":{"input_tokens":8,"output_tokens":5}
+        }}),
+    );
+    let body = stream::unfold((0u8, state.release), move |(phase, mut release)| {
+        let first = first.clone();
+        let last = last.clone();
+        async move {
+            match phase {
+                0 => Some((Ok::<_, io::Error>(first), (1, release))),
+                1 => {
+                    if !*release.borrow() {
+                        release.wait_for(|ready| *ready).await.ok()?;
+                    }
+                    Some((Ok(last), (2, release)))
+                }
+                _ => None,
+            }
+        }
+    });
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(body),
+    )
+        .into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_activity_line_tracks_a_streaming_tool_call() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let (release, receiver) = watch::channel(false);
+    let started = Arc::new(AtomicBool::new(false));
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(tool_activity_complete))
+        .with_state(ToolActivityState {
+            started: started.clone(),
+            requests: Arc::new(AtomicUsize::new(0)),
+            release: receiver,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("tool-activity-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=2\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 24, 80)?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.send(b"Call a tool\r")?;
+    terminal.wait("selected provider request started", READY_TIMEOUT, |_| {
+        Ok(started.load(Ordering::SeqCst))
+    })?;
+    terminal.wait_composer_frame(
+        &["activity · Calling tool", "VISIBLE_SUMMARY"],
+        READY_TIMEOUT,
+    )?;
+    let streaming = terminal.screen();
+    ensure!(
+        !streaming.contains("Responding"),
+        "activity still claimed plain responding during a tool call: {streaming}"
+    );
+    ensure!(
+        !streaming.contains("PRIVATE_ARGUMENT_SENTINEL") && !streaming.contains("activation"),
+        "tool arguments were rendered: {streaming}"
+    );
+    release.send(true)?;
+    terminal.wait_composer_frame(&["FINAL_PUBLIC", "enter send"], READY_TIMEOUT)?;
+    let settled = terminal.screen();
+    ensure!(
+        !settled.contains("Calling tool") && !settled.contains("Calling state_report"),
+        "a settled turn kept a stale calling label: {settled}"
+    );
+    let output = String::from_utf8_lossy(&terminal.output);
+    ensure!(
+        !output.contains("PRIVATE_ARGUMENT_SENTINEL"),
+        "tool arguments appeared in terminal output"
+    );
+    terminal.send(b"\x03")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_pty_previews_delayed_native_selected_stream_at_three_sizes() -> Result<()> {
     let sandbox = Sandbox::new()?;

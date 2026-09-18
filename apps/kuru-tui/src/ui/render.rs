@@ -227,15 +227,22 @@ fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
             style(LILAC),
         )));
     }
-    if !preview.activity.is_empty() {
-        let prefix = if preview.activity_truncated {
+    // A dispatched tool call carries its raw catalog name; while its arguments
+    // are still streaming the runtime can only say that a call is in flight.
+    let activity = view
+        .calling_tool
+        .as_deref()
+        .map(|name| format!("Calling {name}"))
+        .unwrap_or_else(|| preview.activity.clone());
+    if !activity.is_empty() {
+        let prefix = if view.calling_tool.is_none() && preview.activity_truncated {
             "activity … "
         } else {
             "activity · "
         };
         info.push(Line::from(Span::styled(
             clipped(
-                &format!("{prefix}{}", safe_preview_line(&preview.activity)),
+                &format!("{prefix}{}", safe_preview_line(&activity)),
                 inner.width as usize,
             ),
             style(MUTED),

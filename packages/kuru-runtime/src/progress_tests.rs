@@ -334,6 +334,10 @@ async fn tool_loop_replaces_preview_and_partial_call_has_no_authority() {
     let first = preview(&progress);
     assert_eq!(first.text_tail, "provisional-1");
     assert_eq!(first.summary_tail, "VISIBLE-SUMMARY");
+    // The streaming tool call is observed, not dropped: the activity leaves
+    // "Responding" without ever carrying the partial argument fragment.
+    assert_eq!(first.activity, "Calling tool");
+    assert!(!first.activity.contains("activation"));
     while let Ok(event) = events.try_recv() {
         assert!(!matches!(event, Event::ToolSettled { .. }));
     }
@@ -344,6 +348,8 @@ async fn tool_loop_replaces_preview_and_partial_call_has_no_authority() {
     assert!(second.seq > first.seq);
     assert_eq!(second.text_tail, "provisional-2");
     assert_eq!(second.summary_tail, "");
+    // A fresh round starts back at plain responding.
+    assert_eq!(second.activity, "Responding");
     provider.release();
     let (mut harness, result) = run.await.unwrap();
     assert_eq!(result.unwrap().output.text, "settled-two");

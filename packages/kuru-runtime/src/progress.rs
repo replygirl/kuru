@@ -9,6 +9,12 @@ use tokio::sync::watch;
 
 const TEXT_LIMIT: usize = 8 * 1024;
 const SUMMARY_LIMIT: usize = 2 * 1024;
+/// Activity while the model is producing facing text or a visible summary.
+const RESPONDING: &str = "Responding";
+/// Activity once a tool call is streaming. The provider stream carries no tool
+/// identity while arguments are still arriving, so this stays deliberately
+/// generic; the raw catalog name reaches the view later on `Event::ToolStarted`.
+const CALLING_TOOL: &str = "Calling tool";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FacingProgress {
@@ -96,7 +102,7 @@ impl ProgressTurn {
             turn_id: self.turn_id.clone(),
             request_round,
         };
-        descriptor.publish("", false, "", false, "Responding", false);
+        descriptor.publish("", false, "", false, RESPONDING, false);
         descriptor
     }
 
@@ -121,7 +127,7 @@ impl ProgressDescriptor {
             text_truncated: false,
             summary_tail: String::new(),
             summary_truncated: false,
-            activity: "Responding".into(),
+            activity: RESPONDING.into(),
             activity_truncated: false,
         }
     }
@@ -175,6 +181,17 @@ impl ProgressObserver {
         self.publish();
     }
 
+    /// A tool call is streaming. Only the fact of the call is recorded: the
+    /// argument fragment is never retained or published.
+    pub(crate) fn tool_call(&mut self) {
+        if self.activity == CALLING_TOOL {
+            return;
+        }
+        self.activity = CALLING_TOOL.into();
+        self.activity_truncated = false;
+        self.publish();
+    }
+
     fn publish(&self) {
         self.descriptor.publish(
             &self.text_tail,
@@ -196,8 +213,8 @@ impl ProviderSink for ProgressObserver {
             match event {
                 ProviderEvent::TextDelta { text, .. } => self.text(&text),
                 ProviderEvent::ReasoningSummaryDelta { text, .. } => self.summary(&text),
-                ProviderEvent::ToolCallDelta { .. }
-                | ProviderEvent::ContextMeasured(_)
+                ProviderEvent::ToolCallDelta { .. } => self.tool_call(),
+                ProviderEvent::ContextMeasured(_)
                 | ProviderEvent::Usage(_)
                 | ProviderEvent::Completed(_)
                 | ProviderEvent::Failed { .. } => {}

@@ -118,6 +118,9 @@ pub struct View {
     pub activity: Vec<String>,
     /// Ephemeral selected-speaker preview; never copied into the transcript.
     pub preview: Option<FacingProgress>,
+    /// Raw catalog name of the facing speaker's in-flight tool call, display
+    /// only. Never an argument; cleared when the call settles or the preview is.
+    pub calling_tool: Option<String>,
     pub request_context: Option<RequestContext>,
     facing_context: Option<RequestContext>,
     pub active_operation_id: Option<String>,
@@ -178,6 +181,7 @@ impl View {
             parts: runtime.parts,
             activity: vec![],
             preview: None,
+            calling_tool: None,
             request_context: None,
             facing_context: None,
             active_operation_id: None,
@@ -271,6 +275,7 @@ impl View {
     fn begin_operation(&mut self) {
         self.busy = true;
         self.preview = None;
+        self.calling_tool = None;
         self.completion_locked = false;
         self.notice = None;
         self.operation_start = Some(self.clock_ms);
@@ -309,6 +314,7 @@ impl View {
     fn settle(&mut self) {
         self.operation_start = None;
         self.preview = None;
+        self.calling_tool = None;
         self.active_operation_id = None;
         for phase in self.part_activity.values_mut() {
             if phase != "error" {
@@ -402,10 +408,16 @@ impl View {
             }
             Event::ToolStarted { actor, name } => {
                 self.part_activity.insert(actor.clone(), "tool".into());
+                if actor == self.speaker_id {
+                    self.calling_tool = Some(name.clone());
+                }
                 ("tool".into(), actor, name)
             }
             Event::ToolSettled { actor, observation } => {
                 self.part_activity.insert(actor.clone(), "tool".into());
+                if actor == self.speaker_id {
+                    self.calling_tool = None;
+                }
                 (
                     "tool-observation".into(),
                     actor,
@@ -495,6 +507,7 @@ impl View {
 
     pub fn complete_turn(&mut self, output: TurnOutput) {
         self.preview = None;
+        self.calling_tool = None;
         let outcome = outcome_summary(&output);
         let speaker = output
             .relationship
@@ -1778,6 +1791,7 @@ where
                             approval_rx = None;
                             view.permission_prompt = None;
                             view.preview = None;
+                            view.calling_tool = None;
                             preview_fence.clear();
                             preview_paint.clear();
                             activity_open = activity_still_open(
@@ -1800,6 +1814,7 @@ where
                             approval_rx = None;
                             view.permission_prompt = None;
                             view.preview = None;
+                            view.calling_tool = None;
                             preview_fence.clear();
                             preview_paint.clear();
                             if let Some(cancellation) = cancellation.take() {
@@ -2124,6 +2139,7 @@ mod tests {
         ContextBudget, ContextEstimate, Framework, Message, MoneyEstimate, RelationshipKind,
         Sourced, UnappliedPriceTerm, Usage, UsageCompleteness,
     };
+    use kuru_runtime::ToolObservation;
     use ratatui::backend::TestBackend;
 
     fn progress(turn_id: &str, request_round: u32, seq: u64) -> FacingProgress {
@@ -2277,6 +2293,70 @@ mod tests {
             latest: Some(context),
             latest_facing: None,
         }));
+    }
+
+    #[test]
+    fn facing_tool_call_names_the_activity_and_clears_on_settlement() {
+        let mut view = fixture();
+        view.speaker_id = "facing".into();
+        let mut preview = progress("turn", 1, 1);
+        preview.activity = "Calling tool".into();
+        view.preview = Some(preview);
+
+        // A peer's call never displaces the facing activity.
+        view.event(Event::ToolStarted {
+            actor: "peer".into(),
+            name: "peer_send".into(),
+        });
+        assert_eq!(view.calling_tool, None);
+        assert!(rendered(&view).contains("activity · Calling tool"));
+
+        view.event(Event::ToolStarted {
+            actor: "facing".into(),
+            name: "state_report".into(),
+        });
+        assert_eq!(view.calling_tool.as_deref(), Some("state_report"));
+        let frame = rendered(&view);
+        assert!(
+            frame.contains("activity · Calling state_report"),
+            "activity line did not name the in-flight tool: {frame}"
+        );
+        assert!(!frame.contains("activation"), "arguments rendered: {frame}");
+
+        view.event(Event::ToolSettled {
+            actor: "facing".into(),
+            observation: ToolObservation {
+                call_id: "call-1".into(),
+                name: "state_report".into(),
+                arguments: serde_json::json!({"activation":0.4,"note":"bounded"}),
+                outcome: kuru_runtime::ToolOutcome::Ok,
+                argument_bytes: 0,
+                result_bytes: 0,
+                result_sha256: None,
+                elapsed_ms: 1,
+            },
+        });
+        assert_eq!(view.calling_tool, None);
+        let frame = rendered(&view);
+        assert!(frame.contains("activity · Calling tool"));
+        assert!(!frame.contains("Calling state_report"));
+
+        // A new turn never inherits a stale name.
+        view.calling_tool = Some("state_report".into());
+        view.begin_operation();
+        assert_eq!(view.calling_tool, None);
+    }
+
+    fn rendered(view: &View) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| draw(f, view)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     #[test]
