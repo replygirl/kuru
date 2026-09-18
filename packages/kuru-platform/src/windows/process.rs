@@ -55,9 +55,9 @@ use windows_sys::Win32::{
             GetCurrentProcess, GetExitCodeProcess, GetProcessId, GetProcessTimes,
             InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
-            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_READ,
-            STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-            UpdateProcThreadAttribute, WaitForSingleObject,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, STARTF_USESHOWWINDOW,
+            STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+            WaitForSingleObject,
         },
     },
     UI::WindowsAndMessaging::SW_HIDE,
@@ -348,14 +348,15 @@ impl NativeChild {
     pub fn duplicate_process_handle(&self) -> io::Result<OwnedHandle> {
         duplicate_process(self.process.as_raw_handle())
     }
-    /// A diagnostics-only duplicate carrying query-and-memory-counters rights
-    /// (`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`), for sampling
-    /// CPU time and working set on an already-slow/timed-out path. It has no
-    /// terminate, suspend, or write authority and confers no PID ownership.
+    /// A diagnostics-only duplicate carrying `PROCESS_QUERY_LIMITED_INFORMATION`,
+    /// for sampling CPU time and working set on an already-slow/timed-out path.
+    /// That single right is sufficient for both `GetProcessTimes` and
+    /// `K32GetProcessMemoryInfo`; it has no terminate, suspend, or write
+    /// authority and confers no PID ownership.
     pub fn duplicate_diagnostic_handle(&self) -> io::Result<OwnedHandle> {
         duplicate_process_with_access(
             self.process.as_raw_handle(),
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            PROCESS_QUERY_LIMITED_INFORMATION,
         )
     }
     pub fn take_stdin(&mut self) -> Option<Pipe> {
@@ -534,7 +535,7 @@ pub struct ProcessSample {
 
 /// Sample CPU time (kernel + user) and current working set for a retained
 /// process handle. The handle needs only `PROCESS_QUERY_LIMITED_INFORMATION`
-/// and `PROCESS_VM_READ` (see [`NativeChild::duplicate_diagnostic_handle`]).
+/// (see [`NativeChild::duplicate_diagnostic_handle`]).
 pub fn sample_process(handle: &OwnedHandle) -> io::Result<ProcessSample> {
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
@@ -560,7 +561,8 @@ pub fn sample_process(handle: &OwnedHandle) -> io::Result<ProcessSample> {
         ..Default::default()
     };
     // SAFETY: `cb` is set to this exact struct's size before the call, as
-    // K32GetProcessMemoryInfo requires; the handle carries PROCESS_VM_READ.
+    // K32GetProcessMemoryInfo requires; PROCESS_QUERY_LIMITED_INFORMATION is
+    // sufficient for this call, so the handle need not carry PROCESS_VM_READ.
     // K32GetProcessMemoryInfo is the kernel32-exported form of psapi's
     // GetProcessMemoryInfo (identical signature, available since Windows 7);
     // using it keeps this crate's shipping imports on kernel32 alone.

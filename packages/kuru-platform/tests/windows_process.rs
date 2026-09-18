@@ -779,7 +779,7 @@ fn cancelled_connect_does_not_strand_runtime_shutdown() {
 }
 
 #[tokio::test]
-async fn diagnostic_sampling_reports_non_decreasing_resources_and_rejects_insufficient_rights() {
+async fn diagnostic_sampling_reports_non_decreasing_resources() {
     let root = tempfile::tempdir().unwrap();
     let mut child = idle(root.path()).await;
     let diagnostic = child.duplicate_diagnostic_handle().unwrap();
@@ -794,16 +794,6 @@ async fn diagnostic_sampling_reports_non_decreasing_resources_and_rejects_insuff
     assert!(
         second.working_set_bytes > 0,
         "expected a positive working set"
-    );
-
-    // Error path without panicking: the wait/query-only duplicate carries no
-    // PROCESS_VM_READ, so GetProcessMemoryInfo is denied. Sampling an actually
-    // closed handle would require an invalid raw HANDLE, which this crate's
-    // deny-by-default unsafe policy correctly keeps out of reach here.
-    let wait_only = child.duplicate_process_handle().unwrap();
-    assert_eq!(
-        sample_process(&wait_only).unwrap_err().kind(),
-        io::ErrorKind::PermissionDenied
     );
 
     child.terminate().unwrap();
