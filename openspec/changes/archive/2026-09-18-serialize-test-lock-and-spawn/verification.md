@@ -1,7 +1,7 @@
 ## 1. Serialisation ordering [critical]
 
 - [x] 1.1 @regression (agent) hold the shared spawn guard, start a thread that blocks on the exclusive lock guard, and observe through an injected channel that it has not acquired the guard while the shared holder is live, then that it acquires after release -> the ordering is proven without any wall-clock wait. Observed locally on macOS: `KURU_DOLT_BUNDLE_DIR=/private/tmp/kuru-phase1-bundles cargo test -p kuru --lib --locked spawn_gate` -> `an_in_flight_spawn_excludes_lock_acquisition_until_it_finishes ... ok`, 3/3 consecutive runs. The test is ordering-sensitive, not incidental: pointing `Gate::locking` at an unrelated lock makes it FAIL, and pointing `Gate::spawning` at an unrelated lock makes it FAIL, while the unmutated code passes.
-- [x] 1.2 @unit (agent) let a guard holder panic -> the gate is released and remains usable for later acquisitions. Observed locally in the same run: `a_panicking_holder_releases_the_gate ... ok`; the helpers absorb `PoisonError` for the same reason.
+- [x] 1.2 @unit (agent) let a guard holder panic -> the gate is released and remains usable for later acquisitions. Observed locally in the same run: `a_panicking_holder_releases_the_gate ... ok`; the gate is `tokio::sync::RwLock`, which does not poison, so a panicking holder's guard is simply dropped and the lock is released normally.
 
 ## 2. The flaky failure is gone at its cause
 
