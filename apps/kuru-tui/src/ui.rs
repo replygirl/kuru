@@ -431,6 +431,12 @@ impl View {
                     // this call's arguments were streaming, before the next
                     // provider delta republishes it — correct it here so the
                     // rendered label never outlives the call it named.
+                    // Safe to set directly rather than fence-checking: the outer
+                    // async loop's WakeSource round-robin serves the Progress
+                    // branch immediately after an Activity event, so any
+                    // not-yet-drained "Calling tool" progress snapshot is
+                    // admitted before another Activity event can land (see the
+                    // PreviewFence/next_wake_with_progress plumbing).
                     if self.calling_tool.is_empty()
                         && let Some(preview) = self.preview.as_mut()
                     {
