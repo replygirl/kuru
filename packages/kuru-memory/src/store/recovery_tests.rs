@@ -109,6 +109,8 @@ async fn spawn_process_loss_creator(
             command.env(name, value);
         }
     }
+    // Held across the spawn; see `crate::spawn_gate`.
+    let _gate = crate::spawn_gate::spawning().await;
     Ok(command.spawn()?)
 }
 
@@ -158,6 +160,8 @@ async fn spawn_process_loss_creator(
     command.stderr = NativeStdio::Handle(stderr);
     command.lifetime = Lifetime::TrustedSupervisor;
     command.console = Console::PrivateHidden;
+    // Held across the spawn; see `crate::spawn_gate`.
+    let _gate = crate::spawn_gate::spawning().await;
     Ok(command.spawn().await?)
 }
 
