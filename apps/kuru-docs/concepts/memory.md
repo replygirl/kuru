@@ -133,8 +133,11 @@ automatically. The bundled engine performs bounded, growth-triggered storage
 maintenance while Kuru owns it, but retained history can continue to grow. This
 maintenance is not secure erasure. If a private install stage cannot be removed
 after the engine is published and verified, Kuru keeps that stage with a receipt
-and collects it on a later open; leftover stages are bounded by count and
-reported, and no stage whose removal is still uncertain is deleted.
+and collects it on a later open; leftover stages are counted, and a sweep that
+leaves at least a small cap of them behind is reported to diagnostics. No stage
+whose removal is still uncertain is deleted. If even the receipt cannot be
+written, the startup notice and diagnostics say so: that stage is never collected
+automatically and has to be removed by hand.
 
 An operating-system writer lock prevents two Kuru processes from overwriting the same project's topology. Read-only session listing remains available.
 

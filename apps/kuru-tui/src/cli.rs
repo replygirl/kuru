@@ -412,6 +412,10 @@ fn memory_open_label(stage: MemoryOpenStage) -> &'static str {
         MemoryOpenStage::RetainedInstallStage => {
             "Memory: retained an install stage for later cleanup."
         }
+        MemoryOpenStage::RetainedUnreceiptedInstallStage => {
+            "Memory: retained an install stage, but could not record it; \
+             it needs manual removal (see --debug diagnostics)."
+        }
         _ => "Memory: preparing database…",
     }
 }
@@ -453,9 +457,20 @@ mod memory_progress_output_tests {
             MemoryOpenStage::PreparingDatabase,
             MemoryOpenStage::OpeningDatabase,
             MemoryOpenStage::Ready,
+            MemoryOpenStage::RetainedUnreceiptedInstallStage,
         ] {
             assert_ne!(memory_open_label(stage), text);
         }
+    }
+
+    #[test]
+    fn an_unreceipted_retained_stage_never_promises_a_later_cleanup() {
+        let text = memory_open_label(MemoryOpenStage::RetainedUnreceiptedInstallStage);
+        assert!(
+            !text.contains("for later cleanup"),
+            "an uncollectable stage must not be announced as scheduled: {text}"
+        );
+        assert!(text.contains("manual removal"), "{text}");
     }
 
     #[test]
@@ -502,14 +517,17 @@ async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
     let mut opening = Box::pin(opening);
     let mut output = MemoryProgressOutput::new();
     let mut observed_ready = false;
-    let mut retained_install_stage = false;
+    let mut retained_install_stage = None;
     let mut progress_open = true;
     let result = loop {
         tokio::select! {
             result = &mut opening => break result,
             stage = progress.recv(), if progress_open => match stage {
                 Some(MemoryOpenStage::Ready) => observed_ready = true,
-                Some(MemoryOpenStage::RetainedInstallStage) => retained_install_stage = true,
+                Some(stage @ (MemoryOpenStage::RetainedInstallStage
+                    | MemoryOpenStage::RetainedUnreceiptedInstallStage)) => {
+                    retained_install_stage = Some(stage);
+                }
                 Some(stage) => output.stage(stage),
                 None => progress_open = false,
             },
@@ -519,7 +537,10 @@ async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
     while let Some(stage) = progress.recv().await {
         match stage {
             MemoryOpenStage::Ready => observed_ready = true,
-            MemoryOpenStage::RetainedInstallStage => retained_install_stage = true,
+            stage @ (MemoryOpenStage::RetainedInstallStage
+            | MemoryOpenStage::RetainedUnreceiptedInstallStage) => {
+                retained_install_stage = Some(stage);
+            }
             stage => output.stage(stage),
         }
     }
@@ -533,8 +554,9 @@ async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
             // Retained only after the terminal ready line, and only on a
             // successful open: stdout stays JSON-clean, and an abandoned open
             // never prints this notice.
-            if retained_install_stage {
-                output.notice(memory_open_label(MemoryOpenStage::RetainedInstallStage));
+            // The unreceipted case says so: nothing will collect that stage.
+            if let Some(stage) = retained_install_stage {
+                output.notice(memory_open_label(stage));
             }
             Ok(store)
         }

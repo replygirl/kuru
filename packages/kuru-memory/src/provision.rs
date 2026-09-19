@@ -135,7 +135,7 @@ async fn provision_with_extractor_observed(
     // Collect any stage a past publication receipted before this installer
     // creates its own; the exclusive lock already held here is exactly the
     // serialization point that makes a swept stage safe to remove.
-    let _ = sweep_leftover_stages(&versions, &lock);
+    report_leftover_stage_cap(sweep_leftover_stages(&versions, &lock));
     if destination_exists(&destination)? {
         drop(lock);
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
@@ -183,7 +183,13 @@ async fn provision_with_extractor_observed(
         // bounded removal is receipted for a later collection instead of
         // failing this open.
         let report = record_retained_stage(&versions, asset, failure);
-        progress.report(MemoryOpenStage::RetainedInstallStage);
+        // A stage whose receipt could not be written is not collectable by any
+        // later sweep, so it is never reported as waiting for one.
+        progress.report(if report.receipt_error.is_some() {
+            MemoryOpenStage::RetainedUnreceiptedInstallStage
+        } else {
+            MemoryOpenStage::RetainedInstallStage
+        });
         emit_retained_stage_diagnostic(&report);
     }
     Ok(destination.join(asset.executable_name))
@@ -320,7 +326,24 @@ fn emit_retained_stage_diagnostic(report: &StageCleanupReport) {
         os_error = report.os_error,
         attempts = report.attempts,
         elapsed_ms = report.elapsed.map(|elapsed| elapsed.as_millis() as u64),
+        receipt_error = report.receipt_error.as_deref(),
         "retained private install stage after published engine"
+    );
+}
+
+/// Report a sweep that left at least `LEFTOVER_STAGE_CAP` stages behind.
+///
+/// Reporting only: the cap never decides what to delete. Below it the sweep
+/// is silent — an ordinary open says nothing about an empty `.leftovers`.
+fn report_leftover_stage_cap(outcome: SweepOutcome) {
+    if !outcome.reached_cap {
+        return;
+    }
+    tracing::warn!(
+        target: "kuru.memory",
+        collected = outcome.collected,
+        remaining = outcome.remaining,
+        "retained private install stages reached their reporting cap"
     );
 }
 
@@ -1116,9 +1139,9 @@ fn try_cache_lock(directory: &Path) -> Result<Option<CacheLock>> {
 
 /// Leftover install stages a sweep could not collect, summed across every
 /// receipt it read. Reaching this many changes nothing about removal - the
-/// cap only sets `SweepOutcome::reached_cap` (surfaced by a later change;
-/// see `docs/memory.md`), and no stage whose removal is rejected or
-/// uncertain is ever deleted because of it.
+/// cap only sets `SweepOutcome::reached_cap`, which `report_leftover_stage_cap`
+/// turns into one diagnostics record (see `docs/memory.md`). No stage whose
+/// removal is rejected or uncertain is ever deleted because of it.
 const LEFTOVER_STAGE_CAP: usize = 8;
 
 /// One collection pass over `versions/.leftovers`.
@@ -1126,8 +1149,8 @@ const LEFTOVER_STAGE_CAP: usize = 8;
 pub(crate) struct SweepOutcome {
     pub collected: usize,
     pub remaining: usize,
-    /// `remaining >= LEFTOVER_STAGE_CAP`. Reporting-only: nothing reads this
-    /// yet to decide what to delete, and nothing ever should.
+    /// `remaining >= LEFTOVER_STAGE_CAP`. Reporting-only: it is read to emit
+    /// one diagnostics record, never to decide what to delete.
     pub reached_cap: bool,
 }
 
@@ -1243,8 +1266,9 @@ fn warm_sweep_if_receipted(cache: &Path, versions: &Path) {
         return;
     }
     if let Ok(Some(lock)) = try_cache_lock(cache) {
-        let _ = sweep_leftover_stages(versions, &lock);
+        let outcome = sweep_leftover_stages(versions, &lock);
         drop(lock);
+        report_leftover_stage_cap(outcome);
     }
 }
 

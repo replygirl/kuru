@@ -436,10 +436,12 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
 
     let (probe, (stage, lock)) = probe.probe((stage, lock)).await.unwrap();
     let destination = cache.join("active");
-    let error = activate_staged_after_probe(stage, lock, probe, &candidate, &destination)
+    let failure = activate_staged_after_probe(stage, lock, probe, &candidate, &destination)
         .await
-        .unwrap_err();
-    let detail = format!("{error:#}");
+        .unwrap()
+        .expect("a published engine reports its retained stage instead of failing");
+    assert_eq!(failure.stage, stage_container);
+    let detail = format!("{:#}", failure.cause);
     assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
     assert!(detail.contains(&stage_path.display().to_string()));
     assert!(

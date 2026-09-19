@@ -1300,6 +1300,74 @@ async fn exhausted_stage_cleanup_reports_the_retained_stage_exactly_once() {
     );
 }
 
+#[tokio::test]
+async fn a_stage_whose_receipt_cannot_be_written_is_reported_as_uncollectable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let versions = cache.join(DOLT_VERSION);
+    private_directory(&versions).unwrap();
+    // A plain file where the receipts directory belongs: the receipt write
+    // fails on its own, without touching the retained stage.
+    fs::write(versions.join(LEFTOVER_STAGE_RECEIPTS), b"not a directory").unwrap();
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let binary = {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed_observed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+            &mut reporter,
+        )
+        .await
+        .expect("an unreceipted retained stage must not fail a published open")
+    };
+    drop(reporter);
+
+    assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
+    let stages = observed_stages(&mut progress).await;
+    assert!(
+        stages.contains(&MemoryOpenStage::RetainedUnreceiptedInstallStage),
+        "an unwritable receipt must report its own stage: {stages:?}"
+    );
+    assert!(
+        !stages.contains(&MemoryOpenStage::RetainedInstallStage),
+        "nothing may promise a later collection for an unreceipted stage: {stages:?}"
+    );
+}
+
+#[test]
+fn a_receipt_that_cannot_be_written_is_recorded_on_the_report() {
+    let temporary = tempfile::tempdir().unwrap();
+    let versions = temporary.path().join("2.3.3");
+    private_directory(&versions).unwrap();
+    fs::write(versions.join(LEFTOVER_STAGE_RECEIPTS), b"not a directory").unwrap();
+    let stage = versions.join(".install-Ab12Cd");
+    let failure = crate::files::StageCleanupFailure {
+        stage: stage.clone(),
+        private: stage.join("private"),
+        cause: anyhow::Error::msg("fixture cleanup failure"),
+    };
+
+    let report = record_retained_stage(&versions, VALID_FIXTURE.spec(), failure);
+
+    assert!(
+        report.receipt_error.is_some(),
+        "a failed receipt write must be recorded on the report"
+    );
+    assert!(
+        versions.join(LEFTOVER_STAGE_RECEIPTS).is_file(),
+        "a failed receipt write replaces nothing that was already there"
+    );
+}
+
 fn leftover_receipt_files(receipts: &Path) -> Vec<PathBuf> {
     fs::read_dir(receipts)
         .into_iter()

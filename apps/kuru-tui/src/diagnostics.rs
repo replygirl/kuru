@@ -272,6 +272,9 @@ impl SafeFields {
                 | "published"
                 | "os_error"
                 | "attempts"
+                | "receipt_error"
+                | "collected"
+                | "remaining"
         )
     }
 
@@ -556,7 +559,14 @@ mod tests {
                 os_error = 145_i64,
                 attempts = 88_u64,
                 elapsed_ms = 2003_u64,
+                receipt_error = "write leftover receipt: permission denied",
                 "retained private install stage after published engine"
+            );
+            tracing::warn!(
+                target: "kuru.memory",
+                collected = 0_u64,
+                remaining = 8_u64,
+                "retained private install stages reached their reporting cap"
             );
         });
         ring.finish().unwrap();
@@ -583,6 +593,16 @@ mod tests {
         assert_eq!(retained["os_error"], 145);
         assert_eq!(retained["attempts"], 88);
         assert_eq!(retained["elapsed_ms"], 2003);
+        assert_eq!(
+            retained["receipt_error"], "write leftover receipt: permission denied",
+            "an unwritable receipt must be distinguishable in the ring"
+        );
+        let capped = records
+            .iter()
+            .find(|record| record.get("remaining").is_some())
+            .expect("the leftover-stage cap record must be admitted too");
+        assert_eq!(capped["collected"], 0);
+        assert_eq!(capped["remaining"], 8);
         // No conversation, model, provider-request or memory-write field is
         // present: this record is a diagnostics-only row.
         assert!(retained.get("session").is_none());

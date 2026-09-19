@@ -20,6 +20,10 @@ pub enum MemoryOpenStage {
     /// own bounded removal did not complete; a receipt was written for a
     /// later collection. This never changes the open's success.
     RetainedInstallStage,
+    /// The same retention, except that the receipt itself could not be
+    /// written. No later sweep can find this stage from disk, so it is
+    /// reported separately: nothing here promises a later collection.
+    RetainedUnreceiptedInstallStage,
 }
 
 impl MemoryOpenStage {
@@ -34,6 +38,7 @@ impl MemoryOpenStage {
             Self::OpeningDatabase => 1 << 6,
             Self::Ready => 1 << 7,
             Self::RetainedInstallStage => 1 << 8,
+            Self::RetainedUnreceiptedInstallStage => 1 << 9,
         }
     }
 }
