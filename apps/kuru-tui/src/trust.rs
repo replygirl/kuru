@@ -469,6 +469,7 @@ mod tests {
 
     #[test]
     fn absent_inspection_and_revocation_create_nothing() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new("allow_shell = true\n");
         let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
         assert_eq!(store.inspect(&fixture.manifest()), ApprovalState::Absent);
@@ -478,6 +479,7 @@ mod tests {
 
     #[test]
     fn approval_matches_only_the_complete_manifest_and_native_root() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new("allow_shell = true\n");
         let first = fixture.manifest();
         let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
@@ -496,6 +498,7 @@ mod tests {
 
     #[test]
     fn malformed_oversized_and_hard_linked_records_never_match() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new("allow_shell = true\n");
         let manifest = fixture.manifest();
         let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
@@ -522,6 +525,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_and_permissive_approval_objects_never_match() {
+        let _gate = crate::spawn_gate::locking();
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         let permissive = Fixture::new("allow_shell = true\n");
@@ -561,6 +565,7 @@ mod tests {
 
     #[test]
     fn oversized_claim_sets_and_unreconciled_publications_fail_closed() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new("allow_shell = true\n");
         let manifest = fixture.manifest();
         let store = ApprovalStore::new(&fixture.data, &fixture.workspace);

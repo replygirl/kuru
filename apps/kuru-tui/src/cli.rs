@@ -1332,6 +1332,7 @@ mod permission_tests {
 
     #[tokio::test]
     async fn automatic_permission_claim_is_reviewed_but_trust_does_not_grant_a_call() {
+        let _gate = crate::spawn_gate::locking_async().await;
         let temporary = tempfile::tempdir().unwrap();
         let project = temporary.path().join("project");
         let data = temporary.path().join("data");

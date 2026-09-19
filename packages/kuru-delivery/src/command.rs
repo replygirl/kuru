@@ -478,16 +478,24 @@ pub fn program(command: &Command) -> &std::ffi::OsStr {
 #[cfg(windows)]
 mod windows {
     use kuru_platform::windows::process::{
-        NativeChild, Stdio, configured_command, environment_key_eq,
+        NativeChild, ProcessSample, Stdio, configured_command, environment_key_eq, sample_process,
     };
     use std::{
         ffi::{OsStr, OsString},
+        fmt::Write as _,
         io,
+        os::windows::io::OwnedHandle,
         path::{Path, PathBuf},
         process::Output,
+        sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
     use tokio::io::AsyncReadExt;
+
+    /// Interval between diagnostic CPU-time/working-set samples while a
+    /// native command is still within its timeout window. Diagnostics only;
+    /// never affects the success path or the timeout bound itself.
+    const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 
     pub(super) const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 
@@ -597,6 +605,13 @@ mod windows {
                 .take_stderr()
                 .ok_or_else(|| io::Error::other("missing native stderr"))?;
             let started = Instant::now();
+            // Diagnostics-only duplicate: absence (e.g. denied query rights)
+            // must never affect the timed read/wait below, only the trace
+            // attached to a subsequent timeout's error text.
+            let diagnostic_handle = child.duplicate_diagnostic_handle().ok();
+            let trace: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let sampler =
+                diagnostic_handle.map(|handle| spawn_sampler(handle, started, Arc::clone(&trace)));
             let mut stdout_bytes = Vec::new();
             let mut stderr_bytes = Vec::new();
             let mut stdout_eof = false;
@@ -611,6 +626,12 @@ mod windows {
                 child.wait(Duration::from_secs(5)).await
             })
             .await;
+            // The trace is diagnostic-only and only ever read on the failure
+            // path below; stop sampling as soon as the timed future settles,
+            // on both success and failure, so no sampler task outlives this call.
+            if let Some(sampler) = sampler {
+                sampler.abort();
+            }
             let error = match captured {
                 Ok(Ok(status)) => {
                     return Ok(Output {
@@ -631,18 +652,61 @@ mod windows {
                 stdout.close(Duration::from_secs(5)),
                 stderr.close(Duration::from_secs(5))
             );
+            let samples = trace
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             Err(io::Error::new(
                 error.kind(),
                 format!(
                     "{phase} after {} ms: {error}; stdout_eof={stdout_eof} stderr_eof={stderr_eof}; \
                  cleanup={cleanup:?} stdout_close={stdout_close:?} stderr_close={stderr_close:?}; \
-                 stdout prefix: {}; stderr prefix: {}",
+                 samples=[{}]; stdout prefix: {}; stderr prefix: {}",
                     elapsed.as_millis(),
+                    samples.join(", "),
                     prefix(&stdout_bytes),
                     prefix(&stderr_bytes)
                 ),
             ))
         }
+    }
+
+    /// Poll CPU time and working set roughly every [`SAMPLE_INTERVAL`] and
+    /// append a formatted point to `trace`. Purely diagnostic: a sample
+    /// failure is recorded as text, never returned as an error, and the
+    /// caller aborts this task as soon as the timed operation settles.
+    fn spawn_sampler(
+        handle: OwnedHandle,
+        started: Instant,
+        trace: Arc<Mutex<Vec<String>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // the first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                let mut point = format!("elapsed={}ms", started.elapsed().as_millis());
+                match sample_process(&handle) {
+                    Ok(ProcessSample {
+                        kernel_time,
+                        user_time,
+                        working_set_bytes,
+                    }) => {
+                        let _ = write!(
+                            point,
+                            " cpu={}ms working_set={working_set_bytes}B",
+                            (kernel_time + user_time).as_millis()
+                        );
+                    }
+                    Err(error) => {
+                        let _ = write!(point, " sample_error={error}");
+                    }
+                }
+                if let Ok(mut trace) = trace.lock() {
+                    trace.push(point);
+                }
+            }
+        })
     }
 
     fn prefix(bytes: &[u8]) -> std::borrow::Cow<'_, str> {

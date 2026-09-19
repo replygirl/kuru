@@ -106,7 +106,11 @@ mod tests {
 
     #[tokio::test]
     async fn state_is_pending_until_current_or_newer_and_rejects_malformed_values() {
-        let store = MemoryStore::temporary().await.unwrap();
+        let store = {
+            // Held across the supervisor and engine spawns; see `crate::spawn_gate`.
+            let _gate = crate::spawn_gate::spawning().await;
+            MemoryStore::temporary().await.unwrap()
+        };
         let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
         let directory = format!("{:?}", store.status().await.unwrap().directory);
         assert!(notice.text().contains(&directory));
@@ -160,7 +164,11 @@ mod tests {
     #[tokio::test]
     async fn failed_headless_write_or_flush_does_not_record_the_notice() {
         for fail_flush in [false, true] {
-            let store = MemoryStore::temporary().await.unwrap();
+            let store = {
+                // Held across the supervisor and engine spawns; see `crate::spawn_gate`.
+                let _gate = crate::spawn_gate::spawning().await;
+                MemoryStore::temporary().await.unwrap()
+            };
             let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
             let error = notice
                 .announce_to(&mut FailingNoticeWriter { fail_flush })

@@ -2,7 +2,7 @@
 
 use kuru_platform::windows::{
     pipe::{self, Pipe, PrivateListener},
-    process::{Console, Lifetime, NativeChild, NativeSpawnSpec, Stdio},
+    process::{Console, Lifetime, NativeChild, NativeSpawnSpec, Stdio, sample_process},
 };
 use std::{
     ffi::{OsStr, OsString},
@@ -776,6 +776,28 @@ fn cancelled_connect_does_not_strand_runtime_shutdown() {
         .recv_timeout(LIMIT)
         .expect("cancelled native pipe stranded the Tokio runtime");
     thread.join().unwrap();
+}
+
+#[tokio::test]
+async fn diagnostic_sampling_reports_non_decreasing_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = idle(root.path()).await;
+    let diagnostic = child.duplicate_diagnostic_handle().unwrap();
+    let first = sample_process(&diagnostic).unwrap();
+    assert!(
+        first.working_set_bytes > 0,
+        "expected a positive working set"
+    );
+    let second = sample_process(&diagnostic).unwrap();
+    assert!(second.kernel_time >= first.kernel_time);
+    assert!(second.user_time >= first.user_time);
+    assert!(
+        second.working_set_bytes > 0,
+        "expected a positive working set"
+    );
+
+    child.terminate().unwrap();
+    assert!(!child.wait(LIMIT).await.unwrap().success());
 }
 
 #[tokio::test]
