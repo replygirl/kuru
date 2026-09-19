@@ -12,6 +12,22 @@ use std::{
 const EXE: &[u8] = b"MZ fixture bytes, deliberately never executed";
 const NOTICES: &[u8] = b"exact upstream notice fixture";
 
+/// [`cache_lock`], serialised against this lib's own spawning fixtures; see
+/// `crate::spawn_gate`. A single choke point so every real-cache-lock test
+/// below is covered without gating each call site by hand.
+async fn gated_cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
+    let _gate = crate::spawn_gate::locking_async().await;
+    cache_lock(directory, timeout).await
+}
+
+/// [`verify_version`], serialised against this lib's own advisory-lock
+/// tests; see `crate::spawn_gate`. Only Windows tests below call this today.
+#[cfg(windows)]
+async fn gated_verify_version(binary: &Path, private_home: &Path) -> Result<()> {
+    let _gate = crate::spawn_gate::spawning().await;
+    verify_version(binary, private_home).await
+}
+
 #[cfg(windows)]
 fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentity) -> Result<()> {
     let mut retry_deadline = None;
@@ -199,7 +215,9 @@ async fn rejected_activation_preserves_verified_stage_and_occupied_destination()
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache");
     private_directory(&cache).unwrap();
-    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     let identity = regular_file_info(&lock).unwrap().identity;
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_path = stage.path().to_owned();
@@ -244,7 +262,12 @@ async fn rejected_activation_preserves_verified_stage_and_occupied_destination()
     );
     let contender = open_regular(&cache.join(".install.lock")).unwrap();
     assert_eq!(regular_file_info(&contender).unwrap().identity, identity);
-    contender.try_lock().unwrap();
+    {
+        // Held across the actual flock acquisition this assertion proves
+        // succeeds; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        contender.try_lock().unwrap();
+    }
 }
 
 #[tokio::test]
@@ -252,7 +275,9 @@ async fn activation_source_open_failure_preserves_stage_before_releasing_cache_l
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache");
     private_directory(&cache).unwrap();
-    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     let lock_identity = regular_file_info(&lock).unwrap().identity;
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_path = stage.path().to_owned();
@@ -266,7 +291,9 @@ async fn activation_source_open_failure_preserves_stage_before_releasing_cache_l
     assert!(format!("{error:#}").contains("preserved private stage at"));
     assert!(stage_path.is_dir());
     assert!(!destination.exists());
-    let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let reacquired = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     assert_eq!(
         regular_file_info(&reacquired).unwrap().identity,
         lock_identity
@@ -279,7 +306,9 @@ async fn successful_activation_removes_its_disposable_stage() {
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache");
     private_directory(&cache).unwrap();
-    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_container = stage.path().parent().unwrap().to_owned();
     let candidate = stage.path().join("runtime");
@@ -316,7 +345,9 @@ async fn published_engine_retains_its_failed_stage_cleanup_and_releases_cache_le
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache");
     private_directory(&cache).unwrap();
-    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     let lock_identity = regular_file_info(&lock).unwrap().identity;
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_container = stage.path().parent().unwrap().to_owned();
@@ -357,7 +388,9 @@ async fn published_engine_retains_its_failed_stage_cleanup_and_releases_cache_le
         stage_identity,
         "the exhausted cleanup must preserve the original private stage"
     );
-    let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let reacquired = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     assert_eq!(
         regular_file_info(&reacquired).unwrap().identity,
         lock_identity
@@ -379,7 +412,9 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache café 東京");
     private_directory(&cache).unwrap();
-    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_path = stage.path().to_owned();
     let stage_container = stage_path.parent().unwrap().to_owned();
@@ -471,7 +506,9 @@ async fn held_cold_probe_copy_does_not_block_candidate_activation() {
         blocker.metadata().is_ok(),
         "the isolated no-DELETE probe handle must remain held through activation"
     );
-    let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let reacquired = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     drop(reacquired);
     drop(blocker);
     fs::remove_dir_all(&stage_container).unwrap();
@@ -484,13 +521,15 @@ async fn held_descendant_releases_after_checked_no_move_and_activation_recovers(
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache café 東京");
     private_directory(&cache).unwrap();
-    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     let lock_identity = regular_file_info(&lock).unwrap().identity;
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_path = stage.path().to_owned();
     let candidate = stage_path.join("runtime");
     extract(EMBEDDED_ARCHIVE, &candidate, BUNDLED_ASSET).unwrap();
-    verify_version(
+    gated_verify_version(
         &candidate.join(BUNDLED_ASSET.executable_name),
         &stage_path.join("probe"),
     )
@@ -556,7 +595,12 @@ async fn held_descendant_releases_after_checked_no_move_and_activation_recovers(
         regular_file_info(&contender).unwrap().identity,
         lock_identity
     );
-    contender.try_lock().unwrap();
+    {
+        // Held across the actual flock acquisition this assertion proves
+        // succeeds; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        contender.try_lock().unwrap();
+    }
 }
 
 #[cfg(windows)]
@@ -565,13 +609,15 @@ async fn persistent_held_descendant_exhausts_checked_recovery_and_preserves_stag
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache café 東京");
     private_directory(&cache).unwrap();
-    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     let lock_identity = regular_file_info(&lock).unwrap().identity;
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_path = stage.path().to_owned();
     let candidate = stage_path.join("runtime");
     extract(EMBEDDED_ARCHIVE, &candidate, BUNDLED_ASSET).unwrap();
-    verify_version(
+    gated_verify_version(
         &candidate.join(BUNDLED_ASSET.executable_name),
         &stage_path.join("probe"),
     )
@@ -632,7 +678,12 @@ async fn persistent_held_descendant_exhausts_checked_recovery_and_preserves_stag
         regular_file_info(&contender).unwrap().identity,
         lock_identity
     );
-    contender.try_lock().unwrap();
+    {
+        // Held across the actual flock acquisition this assertion proves
+        // succeeds; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        contender.try_lock().unwrap();
+    }
 }
 
 #[cfg(windows)]
@@ -641,13 +692,15 @@ async fn cancelling_checked_activation_recovery_drops_stage_before_cache_lock() 
     let root = crate::test_support::tempdir().unwrap();
     let cache = root.path().join("cache café 東京");
     private_directory(&cache).unwrap();
-    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     let lock_identity = regular_file_info(&lock).unwrap().identity;
     let stage = PrivateTemp::new(".install-", Some(&cache)).unwrap();
     let stage_path = stage.path().to_owned();
     let candidate = stage_path.join("runtime");
     extract(EMBEDDED_ARCHIVE, &candidate, BUNDLED_ASSET).unwrap();
-    verify_version(
+    gated_verify_version(
         &candidate.join(BUNDLED_ASSET.executable_name),
         &stage_path.join("probe"),
     )
@@ -692,7 +745,12 @@ async fn cancelling_checked_activation_recovery_drops_stage_before_cache_lock() 
         regular_file_info(&contender).unwrap().identity,
         lock_identity
     );
-    contender.try_lock().unwrap();
+    {
+        // Held across the actual flock acquisition this assertion proves
+        // succeeds; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        contender.try_lock().unwrap();
+    }
 }
 
 #[test]
@@ -739,13 +797,13 @@ fn physical_zip_mode_size_inventory_and_payload_pins_are_enforced_before_activat
 #[tokio::test]
 async fn cache_lease_uses_actual_identity_and_retains_contention_until_owner_drops() {
     let root = crate::test_support::tempdir().unwrap();
-    let first = cache_lock(root.path(), Duration::from_secs(1))
+    let first = gated_cache_lock(root.path(), Duration::from_secs(1))
         .await
         .unwrap();
     let identity = regular_file_info(&first).unwrap().identity;
-    assert!(cache_lock(root.path(), Duration::ZERO).await.is_err());
+    assert!(gated_cache_lock(root.path(), Duration::ZERO).await.is_err());
     drop(first);
-    let second = cache_lock(root.path(), Duration::from_secs(1))
+    let second = gated_cache_lock(root.path(), Duration::from_secs(1))
         .await
         .unwrap();
     assert_eq!(regular_file_info(&second).unwrap().identity, identity);
@@ -763,7 +821,9 @@ async fn actual_warm_cache_verifies_concurrently_while_installation_lock_is_held
     let cold_started = std::time::Instant::now();
     let binary = provision(&config, &cache).await.unwrap();
     let cold_elapsed = cold_started.elapsed();
-    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let lock = gated_cache_lock(&cache, Duration::from_secs(1))
+        .await
+        .unwrap();
     let warm_started = std::time::Instant::now();
     let concurrent = tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(provision(&config, &cache), provision(&config, &cache))

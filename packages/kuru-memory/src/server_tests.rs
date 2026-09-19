@@ -58,13 +58,17 @@ fn cleanup_observer_retains_real_child_and_directory_after_query_error_and_deadl
     let path = root.path().to_owned();
     fs::write(path.join("accepted"), b"preserved until exit")?;
     let weak = Arc::downgrade(&root);
-    let mut child = Command::new("/bin/sh")
-        .args(["-c", "IFS= read -r token; exit 0"])
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = {
+        // Held across the spawn; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning_blocking();
+        Command::new("/bin/sh")
+            .args(["-c", "IFS= read -r token; exit 0"])
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?
+    };
     let mut input = child.stdin.take().context("controlled child stdin")?;
     let (observed, observation) = std::sync::mpsc::channel();
     let (finished, completion) = std::sync::mpsc::channel();
@@ -118,23 +122,36 @@ fn owner_drop_transfers_installed_reap_guard_until_real_child_reaps() -> Result<
     private_directory(&locks)?;
     let locks = Directory::open(&locks, Privacy::OwnerOnly, NameRetention::Pinned)?;
     let guard = locks.lock_file(std::ffi::OsStr::new("startup"))?;
-    guard.lock()?;
+    {
+        // Held across the actual flock acquisition; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking();
+        guard.lock()?;
+    }
     let contender = locks.lock_file(std::ffi::OsStr::new("startup"))?;
-    let mut child = Command::new("/bin/sh")
-        .args(["-c", "IFS= read -r token; exit 0"])
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = {
+        // Held across the spawn; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning_blocking();
+        Command::new("/bin/sh")
+            .args(["-c", "IFS= read -r token; exit 0"])
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?
+    };
     let mut release = child.stdin.take().context("controlled child stdin")?;
     let reap_guard = Arc::new(StdMutex::new(Some(guard)));
-    drop(Owner {
-        child: Some(child),
-        lifetime: None,
-        retained: Some(root.clone()),
-        reap_guard,
-    });
+    {
+        // Held across the guard's drop (the actual flock release this test
+        // is exercising); see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking();
+        drop(Owner {
+            child: Some(child),
+            lifetime: None,
+            retained: Some(root.clone()),
+            reap_guard,
+        });
+    }
     let held_before_release =
         matches!(contender.try_lock(), Err(std::fs::TryLockError::WouldBlock));
     let release_result = writeln!(release, "finish").map_err(anyhow::Error::from);
@@ -170,7 +187,11 @@ async fn cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit
     let root = fixture()?;
     let store = root.path().join("store");
     private_directory(&store)?;
-    let lease = Server::quiescence(&store, Duration::from_secs(1)).await?;
+    let lease = {
+        // Held across the actual flock acquisition; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        Server::quiescence(&store, Duration::from_secs(1)).await?
+    };
     let home = root.path().join("home");
     crate::provision::prepare_private_home(&home)?;
     let script = root.path().join("controlled-child");
@@ -189,8 +210,11 @@ async fn cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit
         nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK,
         nix::sys::stat::Mode::empty(),
     )?;
-    let mut child =
-        crate::engine::spawn(&script, &home, root.path(), Vec::new(), Vec::new(), true).await?;
+    let mut child = {
+        // Held across the spawn; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        crate::engine::spawn(&script, &home, root.path(), Vec::new(), Vec::new(), true).await?
+    };
     let (observed, observation) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let mut observed = Some(observed);
@@ -204,6 +228,8 @@ async fn cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit
             child.try_wait()
         })
         .await;
+        // Held across the actual flock release; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
         drop(lease);
     });
     tokio::time::timeout(Duration::from_secs(3), observation).await??;
@@ -216,7 +242,11 @@ async fn cleanup_observation_error_keeps_actual_lifecycle_lease_until_child_exit
     nix::unistd::write(&release, b"finish\n")?;
     tokio::time::timeout(Duration::from_secs(3), task).await??;
     drop(release);
-    drop(Server::quiescence(&store, Duration::from_secs(1)).await?);
+    drop({
+        // Held across the actual flock acquisition; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        Server::quiescence(&store, Duration::from_secs(1)).await?
+    });
     Ok(())
 }
 
@@ -355,27 +385,36 @@ async fn supervisor_rejects_bad_configuration_and_parent_eof_without_spawning() 
     let mut invalid = request();
     invalid.timeout_millis = 0;
     assert!(supervise(invalid, &mut input, &mut output).await.is_err());
-    let lock = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(root.path().join("lifecycle.lock"))?;
-    lock.lock()?;
+    let lock = {
+        // Held across the actual flock acquisition; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        let lock = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(root.path().join("lifecycle.lock"))?;
+        lock.lock()?;
+        lock
+    };
     let error = supervise(request(), &mut input, &mut output)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("parent closed"), "{error:#}");
     assert!(output.is_empty());
-    drop(lock);
+    {
+        // Held across the actual flock release; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        drop(lock);
+    }
     let mut invalid = request();
     invalid.read_only = true;
+    let error = supervise(invalid, &mut input, &mut output)
+        .await
+        .unwrap_err();
     assert!(
-        supervise(invalid, &mut input, &mut output)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("not been initialized")
+        error.to_string().contains("not been initialized"),
+        "{error:#}"
     );
     Ok(())
 }
@@ -402,18 +441,22 @@ async fn open_rejects_invalid_options_before_executable_lookup() -> Result<()> {
     let mut invalid = options();
     invalid.read_only = true;
     assert!(Server::open(invalid).await.is_err());
-    assert!(
-        Server::open(options())
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("supervisor")
-    );
+    let error = {
+        // Held across the attempted (failing) supervisor spawn; see
+        // `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        Server::open(options()).await.unwrap_err()
+    };
+    assert!(error.to_string().contains("supervisor"), "{error:#}");
     Ok(())
 }
 
 #[tokio::test]
 async fn quiescence_waits_for_the_actual_lease_and_holds_it_through_rename() -> Result<()> {
+    // Held for the whole test: every `Server::quiescence` call here either
+    // observes contention or actually acquires/releases the real flock, and
+    // this test never itself spawns; see `crate::spawn_gate`.
+    let _gate = crate::spawn_gate::locking_async().await;
     let root = fixture()?;
     let stage = root.path().join("stage");
     private_directory(&stage)?;
@@ -443,6 +486,8 @@ async fn quiescence_waits_for_the_actual_lease_and_holds_it_through_rename() -> 
 
 #[tokio::test]
 async fn quiescence_rejects_replaced_lock_instead_of_locking_an_orphan_inode() -> Result<()> {
+    // Held for the whole test; see `crate::spawn_gate`.
+    let _gate = crate::spawn_gate::locking_async().await;
     let root = fixture()?;
     let stage = root.path().join("stage");
     private_directory(&stage)?;
@@ -470,6 +515,10 @@ async fn quiescence_rejects_replaced_lock_instead_of_locking_an_orphan_inode() -
 
 #[tokio::test]
 async fn waiting_supervisor_refuses_recreated_stage_after_original_lock_moves() -> Result<()> {
+    // Held for the whole test: its `supervise` call fails before reaching any
+    // spawn (the directory-moved check runs first), and the rest is real
+    // flock acquisition/release; see `crate::spawn_gate`.
+    let _gate = crate::spawn_gate::locking_async().await;
     let root = fixture()?;
     let stage = fs::canonicalize(root.path())?.join("stage");
     private_directory(&stage)?;
@@ -518,7 +567,11 @@ async fn closing_an_attached_handle_does_not_establish_quiescence() -> Result<()
         offline: true,
         ..Default::default()
     };
-    let binary = crate::provision::provision(&config, &crate::store::test_cache()).await?;
+    let binary = {
+        // Held across the version-check spawn; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        crate::provision::provision(&config, &crate::store::test_cache()).await?
+    };
     let options = ServerOptions {
         binary,
         directory: directory.clone(),
@@ -529,22 +582,39 @@ async fn closing_an_attached_handle_does_not_establish_quiescence() -> Result<()
         retained: None,
         lifecycle_root: None,
     };
-    let owner = Server::open(options.clone()).await?;
-    let attached = Server::open(ServerOptions {
-        read_only: true,
-        ..options
-    })
-    .await?;
+    let (owner, attached) = {
+        // Held across both owned-supervisor spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        let owner = Server::open(options.clone()).await?;
+        let attached = Server::open(ServerOptions {
+            read_only: true,
+            ..options
+        })
+        .await?;
+        (owner, attached)
+    };
     attached.close().await?;
-    let premature = Server::quiescence(&directory, Duration::from_millis(20)).await;
+    let premature = {
+        // Held across the actual flock acquisition attempt; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        Server::quiescence(&directory, Duration::from_millis(20)).await
+    };
     owner.close().await?;
     assert!(
         premature.is_err(),
         "attached close incorrectly allowed directory activation"
     );
-    let lease = Server::quiescence(&directory, Duration::from_secs(1)).await?;
+    let lease = {
+        // Held across the actual flock acquisition; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        Server::quiescence(&directory, Duration::from_secs(1)).await?
+    };
     assert!(!directory.join("endpoint.json").exists());
-    drop(lease);
+    {
+        // Held across the actual flock release; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        drop(lease);
+    }
     Ok(())
 }
 
@@ -560,6 +630,9 @@ fn collision_request(root: &Path, binary: PathBuf) -> Result<Request> {
 }
 
 async fn actual_dolt_for_collision() -> Result<PathBuf> {
+    // Held across the version-check spawn; see `crate::spawn_gate`. A single
+    // choke point for every collision test below.
+    let _gate = crate::spawn_gate::spawning().await;
     crate::provision::provision(
         &kuru_core::MemoryConfig {
             offline: true,
@@ -582,6 +655,8 @@ async fn selected_port_takeover_retries_actual_dolt_without_touching_holder() ->
     let (parent, mut input) = tokio::io::duplex(1024);
     let (mut output, mut response) = tokio::io::duplex(4096);
     let supervisor = tokio::spawn(async move {
+        // Held across the real Dolt spawn(s); see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
         supervise_with_port_hook(request, &mut input, &mut output, move |port| {
             let mut chosen = observed_chosen.lock().unwrap();
             chosen.push(port);
@@ -651,15 +726,19 @@ async fn persistent_selected_port_takeovers_exhaust_three_owned_attempts() -> Re
     let retained = holders.clone();
     let (_parent, mut input) = tokio::io::duplex(1024);
     let mut output = Vec::new();
-    let error = supervise_with_port_hook(request, &mut input, &mut output, move |port| {
-        retained
-            .lock()
-            .unwrap()
-            .push(std::net::TcpListener::bind(("127.0.0.1", port))?);
-        Ok(())
-    })
-    .await
-    .unwrap_err();
+    let error = {
+        // Held across the real Dolt spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        supervise_with_port_hook(request, &mut input, &mut output, move |port| {
+            retained
+                .lock()
+                .unwrap()
+                .push(std::net::TcpListener::bind(("127.0.0.1", port))?);
+            Ok(())
+        })
+        .await
+        .unwrap_err()
+    };
     let held = holders.lock().unwrap();
     assert_eq!(
         held.len(),
@@ -696,12 +775,17 @@ async fn unrelated_premature_exit_does_not_retry_or_publish() -> Result<()> {
     let mut attempts = 0;
     let (_parent, mut input) = tokio::io::duplex(1024);
     let mut output = Vec::new();
-    let error = supervise_with_port_hook(request, &mut input, &mut output, |_| {
-        attempts += 1;
-        Ok(())
-    })
-    .await
-    .unwrap_err();
+    let error = {
+        // Held across the spawn of the controlled noncollision-exit binary;
+        // see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        supervise_with_port_hook(request, &mut input, &mut output, |_| {
+            attempts += 1;
+            Ok(())
+        })
+        .await
+        .unwrap_err()
+    };
     assert_eq!(attempts, 1);
     assert!(
         format!("{error:#}").contains("Dolt exited before readiness"),
@@ -729,6 +813,8 @@ async fn parent_close_during_selected_port_takeover_never_retries() -> Result<()
     let (parent, mut input) = tokio::io::duplex(1024);
     let mut output = Vec::new();
     let supervisor = tokio::spawn(async move {
+        // Held across the real Dolt spawn; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
         supervise_with_port_hook(request, &mut input, &mut output, move |port| {
             *counted.lock().unwrap() += 1;
             *observed.lock().unwrap() = Some(std::net::TcpListener::bind(("127.0.0.1", port))?);
