@@ -267,6 +267,11 @@ impl SafeFields {
                 | "bytes"
                 | "delay_ms"
                 | "span"
+                | "stage"
+                | "digest"
+                | "published"
+                | "os_error"
+                | "attempts"
         )
     }
 
@@ -375,7 +380,7 @@ impl JsonLayer {
 fn admitted_target(metadata: &tracing::Metadata<'_>) -> bool {
     matches!(
         metadata.target(),
-        "kuru.runtime" | "kuru.actor" | "kuru.tool" | "kuru.provider"
+        "kuru.runtime" | "kuru.actor" | "kuru.tool" | "kuru.provider" | "kuru.memory"
     )
 }
 
@@ -529,6 +534,59 @@ mod tests {
                 .iter()
                 .all(|record| !record.to_string().contains("secret"))
         );
+    }
+
+    #[test]
+    fn layer_admits_the_retained_install_stage_target_and_its_fixed_fields() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("diagnostics")).unwrap();
+        let root = directory.path().to_path_buf();
+        let ring = Arc::new(Ring::open(directory).unwrap());
+        let subscriber = tracing_subscriber::registry().with(JsonLayer {
+            ring: ring.clone(),
+            debug: false,
+            next_span: AtomicU64::new(1),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "kuru.memory",
+                stage = "/private/cache/versions/1.2.3/.install-Ab12Cd",
+                digest = "deadbeef",
+                published = true,
+                os_error = 145_i64,
+                attempts = 88_u64,
+                elapsed_ms = 2003_u64,
+                "retained private install stage after published engine"
+            );
+        });
+        ring.finish().unwrap();
+        let records = (0..FILE_COUNT)
+            .flat_map(|index| {
+                std::fs::read_to_string(root.join(format!("trace-{index}.jsonl")))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .collect::<Vec<_>>();
+        let retained = records
+            .iter()
+            .find(|record| record["target"] == "kuru.memory")
+            .expect("the kuru.memory target must be admitted into the diagnostics ring");
+        assert_eq!(
+            retained["stage"],
+            "/private/cache/versions/1.2.3/.install-Ab12Cd"
+        );
+        assert_eq!(retained["digest"], "deadbeef");
+        assert_eq!(retained["published"], true);
+        assert_eq!(retained["os_error"], 145);
+        assert_eq!(retained["attempts"], 88);
+        assert_eq!(retained["elapsed_ms"], 2003);
+        // No conversation, model, provider-request or memory-write field is
+        // present: this record is a diagnostics-only row.
+        assert!(retained.get("session").is_none());
+        assert!(retained.get("turn").is_none());
     }
 
     #[test]

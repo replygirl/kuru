@@ -185,7 +185,10 @@ its promotion or explicit abandonment is durably resolved. Unresolved candidates
 conversations, notes and reachable Dolt revisions do not expire automatically.
 The bundled engine performs bounded, growth-triggered storage maintenance while
 Kuru owns it, but retained history can continue to grow. This maintenance is not
-secure erasure.
+secure erasure. If a private install stage cannot be removed after the engine is
+published and verified, Kuru keeps that stage with a receipt and collects it on a
+later open; leftover stages are bounded by count and reported, and no stage whose
+removal is still uncertain is deleted.
 
 ## Backup and recovery
 

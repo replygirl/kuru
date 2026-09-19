@@ -16,10 +16,14 @@ pub enum MemoryOpenStage {
     PreparingDatabase,
     OpeningDatabase,
     Ready,
+    /// A published, verified engine kept its private install stage after its
+    /// own bounded removal did not complete; a receipt was written for a
+    /// later collection. This never changes the open's success.
+    RetainedInstallStage,
 }
 
 impl MemoryOpenStage {
-    const fn bit(self) -> u8 {
+    const fn bit(self) -> u16 {
         match self {
             Self::WaitingForProjectOwnership => 1 << 0,
             Self::WaitingForRuntimeCache => 1 << 1,
@@ -29,6 +33,7 @@ impl MemoryOpenStage {
             Self::PreparingDatabase => 1 << 5,
             Self::OpeningDatabase => 1 << 6,
             Self::Ready => 1 << 7,
+            Self::RetainedInstallStage => 1 << 8,
         }
     }
 }
@@ -50,7 +55,7 @@ impl MemoryOpenProgress {
 
 pub(crate) struct ProgressReporter {
     sender: Option<mpsc::Sender<MemoryOpenStage>>,
-    sent: u8,
+    sent: u16,
 }
 
 impl ProgressReporter {
@@ -62,7 +67,7 @@ impl ProgressReporter {
     }
 
     pub(crate) fn observed() -> (MemoryOpenProgress, Self) {
-        let (sender, receiver) = mpsc::channel(8);
+        let (sender, receiver) = mpsc::channel(16);
         (
             MemoryOpenProgress { receiver },
             Self {

@@ -182,7 +182,9 @@ async fn provision_with_extractor_observed(
         // The engine is published and verified; a stage that outlived its own
         // bounded removal is receipted for a later collection instead of
         // failing this open.
-        let _retained = record_retained_stage(&versions, asset, failure);
+        let report = record_retained_stage(&versions, asset, failure);
+        progress.report(MemoryOpenStage::RetainedInstallStage);
+        emit_retained_stage_diagnostic(&report);
     }
     Ok(destination.join(asset.executable_name))
 }
@@ -297,6 +299,29 @@ fn write_stage_receipt(versions: &Path, report: &StageCleanupReport) -> Result<(
     };
     let bytes = serde_json::to_vec_pretty(&receipt)?;
     files::write(&receipts.join(format!("{}.json", receipt.stage)), &bytes)
+}
+
+/// Emit one structured diagnostics record for a retained install stage.
+///
+/// This is a coarse summary of the typed report, collected only by the
+/// project's own diagnostics ring (`apps/kuru-tui/src/diagnostics.rs`, which
+/// admits exactly this target and these field names). It is never
+/// model-visible and never written to memory: nothing here touches the
+/// conversation, a provider request, or a database write. The full detail —
+/// including the first-cause message — stays in the private receipt on disk
+/// (`write_stage_receipt`); this event carries only the fixed, already
+/// safety-reviewed fields the ring admits.
+fn emit_retained_stage_diagnostic(report: &StageCleanupReport) {
+    tracing::warn!(
+        target: "kuru.memory",
+        stage = %report.stage.display(),
+        digest = %report.executable_sha256,
+        published = report.published,
+        os_error = report.os_error,
+        attempts = report.attempts,
+        elapsed_ms = report.elapsed.map(|elapsed| elapsed.as_millis() as u64),
+        "retained private install stage after published engine"
+    );
 }
 
 fn relative_to(versions: &Path, path: &Path) -> Result<String> {

@@ -1251,6 +1251,55 @@ async fn exhausted_stage_cleanup_publishes_the_engine_and_receipts_the_retained_
     );
 }
 
+#[tokio::test]
+async fn exhausted_stage_cleanup_reports_the_retained_stage_exactly_once() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let binary = {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed_observed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+            &mut reporter,
+        )
+        .await
+        .expect("a published engine must not fail its open because a stage stayed behind")
+    };
+    // A second, redundant report from the same call must not duplicate the
+    // stage in the channel; `ProgressReporter::report` already dedupes by bit.
+    reporter.report(MemoryOpenStage::RetainedInstallStage);
+    drop(reporter);
+
+    assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
+    let stages = observed_stages(&mut progress).await;
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|stage| **stage == MemoryOpenStage::RetainedInstallStage)
+            .count(),
+        1,
+        "the retained-stage notice must report exactly once: {stages:?}"
+    );
+    assert_eq!(
+        stages,
+        [
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::ExtractingEmbeddedRuntime,
+            MemoryOpenStage::CheckingRuntimeVersion,
+            MemoryOpenStage::RetainedInstallStage,
+        ]
+    );
+}
+
 fn leftover_receipt_files(receipts: &Path) -> Vec<PathBuf> {
     fs::read_dir(receipts)
         .into_iter()
