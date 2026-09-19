@@ -1148,3 +1148,591 @@ async fn corrupt_actual_embedded_archive_is_rejected_without_executing_or_activa
     assert!(failure.to_string().contains("checksum mismatch"));
     assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn exhausted_stage_cleanup_publishes_the_engine_and_receipts_the_retained_stage() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    let binary = {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        )
+        .await
+        .expect("a published engine must not fail its open because a stage stayed behind")
+    };
+
+    let versions = cache.canonicalize().unwrap().join(DOLT_VERSION);
+    assert_eq!(binary, versions.join("fixture-target").join("dolt"));
+    assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
+    verify_version(&binary, &temporary.path().join("private home"))
+        .await
+        .expect("the published engine runs");
+
+    let receipts = versions.join(".leftovers");
+    assert_eq!(
+        fs::metadata(&receipts).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let written: Vec<PathBuf> = fs::read_dir(&receipts)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    assert_eq!(written.len(), 1, "one retained stage receipts exactly once");
+    assert_eq!(
+        fs::metadata(&written[0]).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&written[0]).unwrap()).unwrap();
+    let stage = receipt["stage"].as_str().unwrap().to_owned();
+    assert_eq!(
+        written[0].file_name().unwrap().to_string_lossy(),
+        format!("{stage}.json")
+    );
+    assert!(stage.starts_with(".install-"), "{stage}");
+    assert_eq!(receipt["version"], 1);
+    assert_eq!(receipt["private"], format!("{stage}/private"));
+    assert_eq!(receipt["engine_version"], DOLT_VERSION);
+    assert_eq!(receipt["target"], "fixture-target");
+    assert_eq!(
+        receipt["executable_sha256"],
+        fixture.spec().executable_sha256
+    );
+    assert_eq!(receipt["published"], true);
+    assert_eq!(receipt["os_error"], 145);
+    assert_eq!(receipt["attempts"], 88);
+    assert_eq!(receipt["elapsed_ms"], 2003);
+    let cause = receipt["first_cause"].as_str().unwrap();
+    assert!(
+        cause.contains("Dolt engine publication succeeded, but private stage cleanup failed"),
+        "{cause}"
+    );
+    assert!(cause.contains("exhausted its bounded recovery"), "{cause}");
+    assert!(cause.contains("(os error 145)"), "{cause}");
+
+    // The retained stage stays where it is, and a later open neither verifies
+    // nor executes anything inside it.
+    let retained = versions.join(&stage);
+    assert!(retained.join("private").join("probe").is_dir());
+    assert_eq!(
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes)
+        )
+        .await
+        .unwrap(),
+        binary
+    );
+    // A follow-up open takes the warm path and sweeps the stage its receipt
+    // named, now that nothing forces cleanup to fail again.
+    assert!(
+        !retained.exists(),
+        "a follow-up open sweeps the retained stage"
+    );
+    assert!(
+        !written[0].exists(),
+        "a follow-up open collects the receipt once its stage is gone"
+    );
+}
+
+#[tokio::test]
+async fn exhausted_stage_cleanup_reports_the_retained_stage_exactly_once() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let binary = {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed_observed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+            &mut reporter,
+        )
+        .await
+        .expect("a published engine must not fail its open because a stage stayed behind")
+    };
+    // A second, redundant report from the same call must not duplicate the
+    // stage in the channel; `ProgressReporter::report` already dedupes by bit.
+    reporter.report(MemoryOpenStage::RetainedInstallStage);
+    drop(reporter);
+
+    assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
+    let stages = observed_stages(&mut progress).await;
+    assert_eq!(
+        stages
+            .iter()
+            .filter(|stage| **stage == MemoryOpenStage::RetainedInstallStage)
+            .count(),
+        1,
+        "the retained-stage notice must report exactly once: {stages:?}"
+    );
+    assert_eq!(
+        stages,
+        [
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::ExtractingEmbeddedRuntime,
+            MemoryOpenStage::CheckingRuntimeVersion,
+            MemoryOpenStage::RetainedInstallStage,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_stage_whose_receipt_cannot_be_written_is_reported_as_uncollectable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let versions = cache.join(DOLT_VERSION);
+    private_directory(&versions).unwrap();
+    // A plain file where the receipts directory belongs: the receipt write
+    // fails on its own, without touching the retained stage.
+    fs::write(versions.join(LEFTOVER_STAGE_RECEIPTS), b"not a directory").unwrap();
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    let (mut progress, mut reporter) = crate::progress::ProgressReporter::observed();
+    let binary = {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed_observed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+            &mut reporter,
+        )
+        .await
+        .expect("an unreceipted retained stage must not fail a published open")
+    };
+    drop(reporter);
+
+    assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
+    let stages = observed_stages(&mut progress).await;
+    assert!(
+        stages.contains(&MemoryOpenStage::RetainedUnreceiptedInstallStage),
+        "an unwritable receipt must report its own stage: {stages:?}"
+    );
+    assert!(
+        !stages.contains(&MemoryOpenStage::RetainedInstallStage),
+        "nothing may promise a later collection for an unreceipted stage: {stages:?}"
+    );
+}
+
+#[test]
+fn a_receipt_that_cannot_be_written_is_recorded_on_the_report() {
+    let temporary = tempfile::tempdir().unwrap();
+    let versions = temporary.path().join("2.3.3");
+    private_directory(&versions).unwrap();
+    fs::write(versions.join(LEFTOVER_STAGE_RECEIPTS), b"not a directory").unwrap();
+    let stage = versions.join(".install-Ab12Cd");
+    let failure = crate::files::StageCleanupFailure {
+        stage: stage.clone(),
+        private: stage.join("private"),
+        cause: anyhow::Error::msg("fixture cleanup failure"),
+    };
+
+    let report = record_retained_stage(&versions, VALID_FIXTURE.spec(), failure);
+
+    assert!(
+        report.receipt_error.is_some(),
+        "a failed receipt write must be recorded on the report"
+    );
+    assert!(
+        versions.join(LEFTOVER_STAGE_RECEIPTS).is_file(),
+        "a failed receipt write replaces nothing that was already there"
+    );
+}
+
+fn leftover_receipt_files(receipts: &Path) -> Vec<PathBuf> {
+    fs::read_dir(receipts)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn cold_provision_sweeps_a_receipted_stage_before_creating_a_new_one() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        )
+        .await
+        .expect("a published engine must not fail its open because a stage stayed behind");
+    }
+
+    let versions = cache.canonicalize().unwrap().join(DOLT_VERSION);
+    let destination = versions.join(fixture.spec().target);
+    let receipts = versions.join(".leftovers");
+    let before = leftover_receipt_files(&receipts);
+    assert_eq!(before.len(), 1, "exactly one stage was receipted");
+    let stage_name: String = {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&before[0]).unwrap()).unwrap();
+        value["stage"].as_str().unwrap().to_owned()
+    };
+    let stage_path = versions.join(&stage_name);
+    assert!(stage_path.is_dir());
+
+    // Make the next call take the cold path again, as if the published
+    // engine were reinstalled from scratch.
+    fs::remove_dir_all(&destination).unwrap();
+
+    let rebuilt = provision_managed(
+        &config,
+        &cache,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rebuilt, destination.join("dolt"));
+    assert!(
+        !stage_path.exists(),
+        "the cold path sweeps the old receipted stage before installing again"
+    );
+    assert!(leftover_receipt_files(&receipts).is_empty());
+}
+
+#[tokio::test]
+async fn warm_open_skips_the_sweep_when_the_installation_lock_is_busy() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        )
+        .await
+        .unwrap();
+    }
+    let versions = cache.canonicalize().unwrap().join(DOLT_VERSION);
+    let receipts = versions.join(".leftovers");
+    assert_eq!(leftover_receipt_files(&receipts).len(), 1);
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let warm = tokio::time::timeout(
+        Duration::from_secs(2),
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        ),
+    )
+    .await
+    .expect("a busy installation lock must not block a warm open")
+    .unwrap();
+    drop(lock);
+
+    assert_eq!(warm, versions.join("fixture-target").join("dolt"));
+    assert_eq!(
+        leftover_receipt_files(&receipts).len(),
+        1,
+        "a warm open leaves a receipted stage for the next attempt when the lock is busy"
+    );
+}
+
+#[tokio::test]
+async fn sweep_collects_only_receipted_stages() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("2.9.9-fixture");
+    private_directory(&versions).unwrap();
+
+    let receipted = versions.join(".install-receipted");
+    private_directory(&receipted).unwrap();
+    private_directory(&receipted.join("private")).unwrap();
+    let orphan = versions.join(".install-orphan");
+    private_directory(&orphan).unwrap();
+
+    let fixture = &*VALID_FIXTURE;
+    let failure = crate::files::StageCleanupFailure {
+        stage: receipted.clone(),
+        private: receipted.join("private"),
+        cause: anyhow::Error::msg("fixture cleanup failure"),
+    };
+    write_stage_receipt(&versions, &StageCleanupReport::new(failure, fixture.spec())).unwrap();
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let outcome = sweep_leftover_stages(&versions, &lock);
+    drop(lock);
+
+    assert_eq!(outcome.collected, 1);
+    assert_eq!(outcome.remaining, 0);
+    assert!(!receipted.exists(), "a receipted stage is collected");
+    assert!(
+        orphan.is_dir(),
+        "an unreceipted leftover stage is never swept"
+    );
+    assert!(leftover_receipt_files(&versions.join(".leftovers")).is_empty());
+}
+
+#[test]
+fn collect_leftover_receipt_never_counts_a_receipt_it_could_not_remove() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("5.5.5-fixture");
+    private_directory(&versions).unwrap();
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    files::ensure_private_directory(&receipts_path).unwrap();
+    let receipts =
+        files::open_directory(&receipts_path, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+
+    let mut outcome = SweepOutcome::default();
+    // No receipt was ever written at this name: the read must fail, and the
+    // stage it would have named must not be miscounted as collected.
+    collect_leftover_receipt(&receipts, "missing-stage.json", &mut outcome);
+
+    assert_eq!(
+        outcome.collected, 0,
+        "a receipt that could not be read must never count as collected"
+    );
+    assert_eq!(outcome.remaining, 1);
+}
+
+#[tokio::test]
+async fn sweep_leaves_a_stage_and_its_receipt_when_removal_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("3.1.1-fixture");
+    private_directory(&versions).unwrap();
+
+    let stage = versions.join(".install-blocked");
+    private_directory(&stage).unwrap();
+    let outside = versions.join("outside-target");
+    private_directory(&outside).unwrap();
+    symlink(&outside, stage.join("link")).unwrap();
+
+    let fixture = &*VALID_FIXTURE;
+    let failure = crate::files::StageCleanupFailure {
+        stage: stage.clone(),
+        private: stage.join("private"),
+        cause: anyhow::Error::msg("fixture cleanup failure"),
+    };
+    write_stage_receipt(&versions, &StageCleanupReport::new(failure, fixture.spec())).unwrap();
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let outcome = sweep_leftover_stages(&versions, &lock);
+    drop(lock);
+
+    assert_eq!(outcome.collected, 0);
+    assert_eq!(outcome.remaining, 1);
+    assert!(
+        stage.join("link").is_symlink(),
+        "a rejected removal leaves the stage untouched"
+    );
+    assert_eq!(
+        leftover_receipt_files(&versions.join(".leftovers")).len(),
+        1,
+        "a rejected removal leaves the receipt for a later attempt"
+    );
+}
+
+#[tokio::test]
+async fn sweep_reports_the_cap_without_deleting_any_uncollectable_stage() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("4.0.0-fixture");
+    private_directory(&versions).unwrap();
+
+    let fixture = &*VALID_FIXTURE;
+    let mut blocked = Vec::new();
+    for index in 0..LEFTOVER_STAGE_CAP {
+        let stage = versions.join(format!(".install-blocked-{index}"));
+        // A plain file where a directory is expected: the sweep's own guard
+        // must leave it, never a permission trick or a real removal race.
+        fs::write(&stage, b"not a directory").unwrap();
+        let failure = crate::files::StageCleanupFailure {
+            stage: stage.clone(),
+            private: stage.join("private"),
+            cause: anyhow::Error::msg("fixture cleanup failure"),
+        };
+        write_stage_receipt(&versions, &StageCleanupReport::new(failure, fixture.spec())).unwrap();
+        blocked.push(stage);
+    }
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let outcome = sweep_leftover_stages(&versions, &lock);
+    drop(lock);
+
+    assert_eq!(outcome.collected, 0);
+    assert!(
+        outcome.remaining >= LEFTOVER_STAGE_CAP,
+        "the cap is reached: {}",
+        outcome.remaining
+    );
+    assert!(outcome.reached_cap);
+    for stage in &blocked {
+        assert!(
+            stage.is_file(),
+            "reaching the cap never deletes an uncollectable stage"
+        );
+    }
+    assert_eq!(
+        leftover_receipt_files(&versions.join(".leftovers")).len(),
+        LEFTOVER_STAGE_CAP,
+        "reaching the cap never drops a receipt"
+    );
+}
+
+#[tokio::test]
+async fn sweep_leaves_an_oversized_or_unparsable_receipt_as_remaining() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("6.6.6-fixture");
+    private_directory(&versions).unwrap();
+
+    // Both stages exist and are otherwise perfectly collectible; only their
+    // receipts are bad, so a correct sweep must never reach the stage removal
+    // branch for either one.
+    let oversized_stage = versions.join(".install-oversized");
+    private_directory(&oversized_stage).unwrap();
+    let malformed_stage = versions.join(".install-malformed");
+    private_directory(&malformed_stage).unwrap();
+
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    files::ensure_private_directory(&receipts_path).unwrap();
+    // One byte past `LEFTOVER_RECEIPT_LIMIT`: `read_leftover_receipt`'s bounded
+    // `take` must reject it rather than silently truncating and parsing a
+    // partial document.
+    let oversized_bytes = vec![b'a'; (LEFTOVER_RECEIPT_LIMIT + 1) as usize];
+    files::write(
+        &receipts_path.join(".install-oversized.json"),
+        &oversized_bytes,
+    )
+    .unwrap();
+    // Under the limit but not valid JSON at all.
+    files::write(&receipts_path.join(".install-malformed.json"), b"not json").unwrap();
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let outcome = sweep_leftover_stages(&versions, &lock);
+    drop(lock);
+
+    assert_eq!(outcome.collected, 0);
+    assert_eq!(outcome.remaining, 2);
+    assert!(
+        oversized_stage.is_dir(),
+        "an over-limit receipt leaves its stage untouched"
+    );
+    assert!(
+        malformed_stage.is_dir(),
+        "an unparsable receipt leaves its stage untouched"
+    );
+    assert_eq!(
+        leftover_receipt_files(&receipts_path).len(),
+        2,
+        "neither a too-large nor an unparsable receipt is ever deleted"
+    );
+}
+
+#[test]
+fn a_stage_cleanup_report_carries_the_typed_bounded_recovery_detail() {
+    let fixture = &*VALID_FIXTURE;
+    let failure = crate::files::StageCleanupFailure {
+        stage: PathBuf::from("/cache/2.3.3/.install-Ab12Cd"),
+        private: PathBuf::from("/cache/2.3.3/.install-Ab12Cd/private"),
+        cause: anyhow::Error::new(std::io::Error::from_raw_os_error(32))
+            .context(crate::files::StageCleanupExhausted {
+                attempts: 7,
+                elapsed: Duration::from_millis(1990),
+            })
+            .context("Dolt engine publication succeeded, but private stage cleanup failed"),
+    };
+
+    let report = StageCleanupReport::new(failure, fixture.spec());
+
+    assert_eq!(report.attempts, Some(7));
+    assert_eq!(report.elapsed, Some(Duration::from_millis(1990)));
+    assert_eq!(report.os_error, Some(32));
+    assert_eq!(report.engine_version, DOLT_VERSION);
+    assert_eq!(report.target, "fixture-target");
+    assert_eq!(report.executable_sha256, fixture.spec().executable_sha256);
+    assert!(report.published);
+    assert!(report.receipt_error.is_none());
+    assert!(
+        report
+            .first_cause
+            .contains("private stage cleanup failed: private temporary stage cleanup exhausted"),
+        "{}",
+        report.first_cause
+    );
+}
+
+#[test]
+fn a_report_without_the_bounded_exhaustion_records_no_attempts() {
+    let fixture = &*VALID_FIXTURE;
+    let failure = crate::files::StageCleanupFailure {
+        stage: PathBuf::from("/cache/2.3.3/.install-Ef34Gh"),
+        private: PathBuf::from("/cache/2.3.3/.install-Ef34Gh/private"),
+        cause: anyhow::Error::new(std::io::Error::from_raw_os_error(13)),
+    };
+
+    let report = StageCleanupReport::new(failure, fixture.spec());
+
+    assert_eq!(report.attempts, None);
+    assert_eq!(report.elapsed, None);
+    assert_eq!(report.os_error, Some(13));
+}

@@ -267,6 +267,15 @@ impl SafeFields {
                 | "bytes"
                 | "delay_ms"
                 | "span"
+                | "stage"
+                | "digest"
+                | "published"
+                | "first_cause"
+                | "os_error"
+                | "attempts"
+                | "receipt_error"
+                | "collected"
+                | "remaining"
         )
     }
 
@@ -375,7 +384,7 @@ impl JsonLayer {
 fn admitted_target(metadata: &tracing::Metadata<'_>) -> bool {
     matches!(
         metadata.target(),
-        "kuru.runtime" | "kuru.actor" | "kuru.tool" | "kuru.provider"
+        "kuru.runtime" | "kuru.actor" | "kuru.tool" | "kuru.provider" | "kuru.memory"
     )
 }
 
@@ -529,6 +538,81 @@ mod tests {
                 .iter()
                 .all(|record| !record.to_string().contains("secret"))
         );
+    }
+
+    #[test]
+    fn layer_admits_the_retained_install_stage_target_and_its_fixed_fields() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("diagnostics")).unwrap();
+        let root = directory.path().to_path_buf();
+        let ring = Arc::new(Ring::open(directory).unwrap());
+        let subscriber = tracing_subscriber::registry().with(JsonLayer {
+            ring: ring.clone(),
+            debug: false,
+            next_span: AtomicU64::new(1),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "kuru.memory",
+                stage = "/private/cache/versions/1.2.3/.install-Ab12Cd",
+                digest = "deadbeef",
+                published = true,
+                first_cause = "Uncertain removal of a private install stage (os error 145)",
+                os_error = 145_i64,
+                attempts = 88_u64,
+                elapsed_ms = 2003_u64,
+                receipt_error = "write leftover receipt: permission denied",
+                "retained private install stage after published engine"
+            );
+            tracing::warn!(
+                target: "kuru.memory",
+                collected = 0_u64,
+                remaining = 8_u64,
+                "retained private install stages reached their reporting cap"
+            );
+        });
+        ring.finish().unwrap();
+        let records = (0..FILE_COUNT)
+            .flat_map(|index| {
+                std::fs::read_to_string(root.join(format!("trace-{index}.jsonl")))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .collect::<Vec<_>>();
+        let retained = records
+            .iter()
+            .find(|record| record["target"] == "kuru.memory")
+            .expect("the kuru.memory target must be admitted into the diagnostics ring");
+        assert_eq!(
+            retained["stage"],
+            "/private/cache/versions/1.2.3/.install-Ab12Cd"
+        );
+        assert_eq!(retained["digest"], "deadbeef");
+        assert_eq!(retained["published"], true);
+        assert_eq!(
+            retained["first_cause"], "Uncertain removal of a private install stage (os error 145)",
+            "the ruling's required first-cause-with-OS-error detail must reach the ring"
+        );
+        assert_eq!(retained["os_error"], 145);
+        assert_eq!(retained["attempts"], 88);
+        assert_eq!(retained["elapsed_ms"], 2003);
+        assert_eq!(
+            retained["receipt_error"], "write leftover receipt: permission denied",
+            "an unwritable receipt must be distinguishable in the ring"
+        );
+        let capped = records
+            .iter()
+            .find(|record| record.get("remaining").is_some())
+            .expect("the leftover-stage cap record must be admitted too");
+        assert_eq!(capped["collected"], 0);
+        assert_eq!(capped["remaining"], 8);
+        // No conversation, model, provider-request or memory-write field is
+        // present: this record is a diagnostics-only row.
+        assert!(retained.get("session").is_none());
+        assert!(retained.get("turn").is_none());
     }
 
     #[test]

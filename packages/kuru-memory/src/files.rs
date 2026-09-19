@@ -12,11 +12,9 @@ use std::{
 
 #[cfg(windows)]
 use kuru_platform::fs::RemovalError;
+use std::time::Duration;
 #[cfg(windows)]
-use std::{
-    io, thread,
-    time::{Duration, Instant},
-};
+use std::{io, thread, time::Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -353,6 +351,110 @@ impl PrivateTemp {
             .close()
             .with_context(|| format!("remove private temporary stage at {}", path.display()))
     }
+
+    /// Remove the disposable stage, or report that it is still on disk.
+    ///
+    /// The stage is already retained when `close` fails: the Windows branch
+    /// keeps the container before any fallible work, and `TempDir::close`
+    /// consumes and disarms its own cleanup. No second removal is attempted, so
+    /// the disposition equals `keep`'s and nothing whose removal is uncertain is
+    /// deleted.
+    pub(crate) fn close_or_keep(self) -> Result<(), StageCleanupFailure> {
+        let stage = self._container.path().to_owned();
+        let private = self.path.clone();
+        #[cfg(test)]
+        if forced_stage_cleanup_failure() {
+            self.keep();
+            return Err(StageCleanupFailure {
+                stage,
+                private,
+                cause: forced_stage_cleanup_cause(),
+            });
+        }
+        self.close().map_err(|cause| StageCleanupFailure {
+            stage,
+            private,
+            cause,
+        })
+    }
+}
+
+/// A published engine whose private stage is still on disk.
+///
+/// `stage` is the disposable container under the version directory and
+/// `private` its owner-only child. Both are retained, never removed again here.
+#[derive(Debug)]
+pub(crate) struct StageCleanupFailure {
+    pub stage: PathBuf,
+    pub private: PathBuf,
+    pub cause: anyhow::Error,
+}
+
+/// The bounded cleanup window ended with the stage still held.
+///
+/// Carried as the cause's context so a report can read the actual attempt count
+/// and elapsed window instead of parsing a formatted message. Its rendering is
+/// the message this exhaustion has always produced.
+#[derive(Debug)]
+pub(crate) struct StageCleanupExhausted {
+    pub attempts: u32,
+    pub elapsed: Duration,
+}
+
+impl std::fmt::Display for StageCleanupExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { attempts, elapsed } = self;
+        write!(
+            formatter,
+            "private temporary stage cleanup exhausted its bounded recovery after {attempts} reconcile attempts over {elapsed:?}; preserve the published stage for inspection"
+        )
+    }
+}
+
+impl std::error::Error for StageCleanupExhausted {}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_STAGE_CLEANUP_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn forced_stage_cleanup_failure() -> bool {
+    FORCE_STAGE_CLEANUP_FAILURE.with(std::cell::Cell::get)
+}
+
+/// Reproduce an exhausted bounded cleanup on any host, so the non-fatal path is
+/// exercised where the native holder cannot be. Test-only: product builds
+/// contain neither the flag nor its check.
+#[cfg(test)]
+fn forced_stage_cleanup_cause() -> anyhow::Error {
+    anyhow::Error::new(std::io::Error::from_raw_os_error(145))
+        .context("Uncertain removal of the private temporary stage")
+        .context(StageCleanupExhausted {
+            attempts: 88,
+            elapsed: Duration::from_millis(2003),
+        })
+}
+
+/// Force the next private stage cleanup on this thread to fail exactly as an
+/// exhausted Windows bounded recovery does.
+#[cfg(test)]
+pub(crate) struct ForcedStageCleanupFailure;
+
+#[cfg(test)]
+impl ForcedStageCleanupFailure {
+    pub(crate) fn new() -> Self {
+        FORCE_STAGE_CLEANUP_FAILURE.with(|forced| forced.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedStageCleanupFailure {
+    fn drop(&mut self) {
+        FORCE_STAGE_CLEANUP_FAILURE.with(|forced| forced.set(false));
+    }
 }
 
 #[cfg(windows)]
@@ -642,9 +744,7 @@ fn wait_for_cleanup_retry(
         return Err(first_error
             .take()
             .expect("a bounded cleanup retry retains its first cause")
-            .context(format!(
-                "private temporary stage cleanup exhausted its bounded recovery after {attempts} reconcile attempts over {elapsed:?}; preserve the published stage for inspection"
-            )));
+            .context(StageCleanupExhausted { attempts, elapsed }));
     }
     thread::sleep(
         deadline
@@ -657,6 +757,61 @@ fn wait_for_cleanup_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_cleanup_context_renders_its_established_message() {
+        let attempts = 88_u32;
+        let elapsed = Duration::from_millis(2003);
+
+        assert_eq!(
+            StageCleanupExhausted { attempts, elapsed }.to_string(),
+            format!(
+                "private temporary stage cleanup exhausted its bounded recovery after {attempts} reconcile attempts over {elapsed:?}; preserve the published stage for inspection"
+            ),
+            "the typed exhaustion must report exactly the message it replaced"
+        );
+    }
+
+    #[test]
+    fn a_failed_stage_cleanup_retains_the_stage_and_names_its_cause() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateTemp::new("memory-cleanup-forced-", Some(root.path())).unwrap();
+        let private = stage.path().to_owned();
+        let container = private.parent().unwrap().to_owned();
+        let identity = directory(&private).unwrap().identity();
+
+        let forced = ForcedStageCleanupFailure::new();
+        let failure = stage.close_or_keep().unwrap_err();
+        drop(forced);
+
+        assert_eq!(failure.stage, container);
+        assert_eq!(failure.private, private);
+        assert!(
+            container.is_dir(),
+            "a reported cleanup failure retains its stage exactly as keep does"
+        );
+        assert_eq!(directory(&private).unwrap().identity(), identity);
+        let cause = format!("{:#}", failure.cause);
+        assert!(cause.contains("exhausted its bounded recovery"), "{cause}");
+        assert_eq!(
+            failure
+                .cause
+                .downcast_ref::<StageCleanupExhausted>()
+                .map(|exhausted| (exhausted.attempts, exhausted.elapsed)),
+            Some((88, Duration::from_millis(2003)))
+        );
+    }
+
+    #[test]
+    fn a_successful_stage_cleanup_removes_the_stage_without_the_hook() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateTemp::new("memory-cleanup-plain-", Some(root.path())).unwrap();
+        let container = stage.path().parent().unwrap().to_owned();
+
+        stage.close_or_keep().unwrap();
+
+        assert!(!container.exists());
+    }
 
     #[cfg(windows)]
     fn close_private_temp_observed(

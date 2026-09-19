@@ -3,7 +3,7 @@
 use crate::MemoryOpenStage;
 pub use crate::catalog::DOLT_VERSION;
 use crate::catalog::{Asset, BUNDLED_ASSET, EMBEDDED_ARCHIVE, MAX_COMPRESSED, MAX_EXPANDED};
-use crate::files::{self, PrivateTemp};
+use crate::files::{self, PrivateTemp, StageCleanupFailure};
 use crate::progress::ProgressReporter;
 use anyhow::{Context, Result, bail, ensure};
 use flate2::bufread::GzDecoder;
@@ -122,11 +122,20 @@ async fn provision_with_extractor_observed(
     private_directory(&versions)?;
     let destination = versions.join(asset.target);
     if destination_exists(&destination)? {
+        // The common case: an already-published engine. Sweeping here is the
+        // only way a leftover stage from a past publication is ever
+        // collected without a fresh install, so it must stay opportunistic -
+        // no lock is taken unless a receipt exists, and none is waited for.
+        warm_sweep_if_receipted(cache, versions).await;
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
         return verify_existing_cache(&destination, asset, progress).await;
     }
     progress.report(MemoryOpenStage::WaitingForRuntimeCache);
     let lock = cache_lock(&cache, LOCK_TIMEOUT).await?;
+    // Collect any stage a past publication receipted before this installer
+    // creates its own; the exclusive lock already held here is exactly the
+    // serialization point that makes a swept stage safe to remove.
+    report_leftover_stage_cap(sweep_leftover_stages(&versions, &lock));
     if destination_exists(&destination)? {
         drop(lock);
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
@@ -167,8 +176,186 @@ async fn provision_with_extractor_observed(
         }
     };
     let (probe, (staging, lock)) = probe.probe((staging, lock)).await?;
-    activate_staged_after_probe(staging, lock, probe, &candidate, &destination).await?;
+    let cleanup =
+        activate_staged_after_probe(staging, lock, probe, &candidate, &destination).await?;
+    if let Some(failure) = cleanup {
+        // The engine is published and verified; a stage that outlived its own
+        // bounded removal is receipted for a later collection instead of
+        // failing this open.
+        let report = record_retained_stage(&versions, asset, failure);
+        // A stage whose receipt could not be written is not collectable by any
+        // later sweep, so it is never reported as waiting for one.
+        progress.report(if report.receipt_error.is_some() {
+            MemoryOpenStage::RetainedUnreceiptedInstallStage
+        } else {
+            MemoryOpenStage::RetainedInstallStage
+        });
+        emit_retained_stage_diagnostic(&report);
+    }
     Ok(destination.join(asset.executable_name))
+}
+
+/// Receipts naming the retained install stages of one engine version.
+const LEFTOVER_STAGE_RECEIPTS: &str = ".leftovers";
+
+/// What was retained after a published and verified engine could not remove its
+/// own private stage: where it is, why it stayed, and which publication it
+/// belongs to. `attempts` and `elapsed` describe the bounded recovery window
+/// that actually ran, and are absent when the cause is not that exhaustion.
+#[derive(Debug)]
+pub(crate) struct StageCleanupReport {
+    pub stage: PathBuf,
+    pub private: PathBuf,
+    pub engine_version: &'static str,
+    pub target: String,
+    pub executable_sha256: String,
+    pub published: bool,
+    pub first_cause: String,
+    pub os_error: Option<i32>,
+    pub attempts: Option<u32>,
+    pub elapsed: Option<Duration>,
+    pub receipt_error: Option<String>,
+}
+
+impl StageCleanupReport {
+    fn new(failure: StageCleanupFailure, asset: Asset<'_>) -> Self {
+        let StageCleanupFailure {
+            stage,
+            private,
+            cause,
+        } = failure;
+        let exhausted = cause.downcast_ref::<crate::files::StageCleanupExhausted>();
+        Self {
+            stage,
+            private,
+            engine_version: DOLT_VERSION,
+            target: asset.target.to_owned(),
+            executable_sha256: asset.executable_sha256.to_owned(),
+            published: true,
+            attempts: exhausted.map(|exhausted| exhausted.attempts),
+            elapsed: exhausted.map(|exhausted| exhausted.elapsed),
+            os_error: cause
+                .chain()
+                .filter_map(|error| error.downcast_ref::<std::io::Error>())
+                .find_map(std::io::Error::raw_os_error),
+            first_cause: format!("{cause:#}"),
+            receipt_error: None,
+        }
+    }
+}
+
+/// The receipt as it is stored: paths relative to the version directory, so a
+/// moved cache cannot make a receipt name anything outside it.
+#[derive(serde::Serialize)]
+struct StageCleanupReceipt<'a> {
+    version: u32,
+    stage: String,
+    private: String,
+    engine_version: &'a str,
+    target: &'a str,
+    executable_sha256: &'a str,
+    published: bool,
+    first_cause: &'a str,
+    os_error: Option<i32>,
+    attempts: Option<u32>,
+    elapsed_ms: Option<u128>,
+    recorded_at: u64,
+}
+
+/// Record a retained stage so a later open can collect it.
+///
+/// A receipt that cannot be written leaves the stage waiting for an operator;
+/// it never turns a published, verified engine into a failed open.
+fn record_retained_stage(
+    versions: &Path,
+    asset: Asset<'_>,
+    failure: StageCleanupFailure,
+) -> StageCleanupReport {
+    let mut report = StageCleanupReport::new(failure, asset);
+    if let Err(error) = write_stage_receipt(versions, &report) {
+        report.receipt_error = Some(format!("{error:#}"));
+    }
+    report
+}
+
+fn write_stage_receipt(versions: &Path, report: &StageCleanupReport) -> Result<()> {
+    let stage = relative_to(versions, &report.stage)?;
+    ensure!(
+        stage.starts_with(".install-") && !stage.contains(['/', '\\']),
+        "a retained install stage keeps its private staging name"
+    );
+    let receipts = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    files::ensure_private_directory(&receipts)?;
+    let receipt = StageCleanupReceipt {
+        version: 1,
+        private: relative_to(versions, &report.private)?,
+        stage,
+        engine_version: report.engine_version,
+        target: &report.target,
+        executable_sha256: &report.executable_sha256,
+        published: report.published,
+        first_cause: &report.first_cause,
+        os_error: report.os_error,
+        attempts: report.attempts,
+        elapsed_ms: report.elapsed.map(|elapsed| elapsed.as_millis()),
+        recorded_at: std::time::SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map(|since| since.as_secs())
+            .unwrap_or_default(),
+    };
+    let bytes = serde_json::to_vec_pretty(&receipt)?;
+    files::write(&receipts.join(format!("{}.json", receipt.stage)), &bytes)
+}
+
+/// Emit one structured diagnostics record for a retained install stage.
+///
+/// Carries exactly what the roadmap ruling requires be reported: the stage
+/// path, the first cause with its OS error, the bounded-recovery attempts and
+/// elapsed time, and that the engine was published and verified — in one
+/// event, collected only by the project's own diagnostics ring
+/// (`apps/kuru-tui/src/diagnostics.rs`, which admits exactly this target and
+/// these field names, truncating every string field to a bounded length). It
+/// is never model-visible and never written to memory: nothing here touches
+/// the conversation, a provider request, or a database write. The unabridged
+/// receipt (`write_stage_receipt`) remains the durable, on-disk copy of the
+/// same facts.
+fn emit_retained_stage_diagnostic(report: &StageCleanupReport) {
+    tracing::warn!(
+        target: "kuru.memory",
+        stage = %report.stage.display(),
+        digest = %report.executable_sha256,
+        published = report.published,
+        first_cause = %report.first_cause,
+        os_error = report.os_error,
+        attempts = report.attempts,
+        elapsed_ms = report.elapsed.map(|elapsed| elapsed.as_millis() as u64),
+        receipt_error = report.receipt_error.as_deref(),
+        "retained private install stage after published engine"
+    );
+}
+
+/// Report a sweep that left at least `LEFTOVER_STAGE_CAP` stages behind.
+///
+/// Reporting only: the cap never decides what to delete. Below it the sweep
+/// is silent — an ordinary open says nothing about an empty `.leftovers`.
+fn report_leftover_stage_cap(outcome: SweepOutcome) {
+    if !outcome.reached_cap {
+        return;
+    }
+    tracing::warn!(
+        target: "kuru.memory",
+        collected = outcome.collected,
+        remaining = outcome.remaining,
+        "retained private install stages reached their reporting cap"
+    );
+}
+
+fn relative_to(versions: &Path, path: &Path) -> Result<String> {
+    Ok(path
+        .strip_prefix(versions)
+        .context("a retained install stage stays inside its engine version directory")?
+        .to_string_lossy()
+        .into_owned())
 }
 
 fn destination_exists(path: &Path) -> Result<bool> {
@@ -585,7 +772,10 @@ struct StagedActivation {
 }
 
 impl StagedActivation {
-    fn finish_published(self) -> Result<()> {
+    /// The engine is published and verified before this runs, so a stage that
+    /// survives its own bounded removal is reported, not raised: only integrity
+    /// failures fail an open. The returned failure names a retained stage.
+    fn finish_published(self) -> Result<Option<StageCleanupFailure>> {
         let Self {
             source,
             probe,
@@ -594,11 +784,14 @@ impl StagedActivation {
         } = self;
         drop(source);
         drop(probe);
-        let result = staging
-            .close()
-            .context("Dolt engine publication succeeded, but private stage cleanup failed");
+        let result = staging.close_or_keep();
         drop(lock);
-        result
+        Ok(result.err().map(|mut failure| {
+            failure.cause = failure
+                .cause
+                .context("Dolt engine publication succeeded, but private stage cleanup failed");
+            failure
+        }))
     }
 
     fn retain(self, error: anyhow::Error) -> anyhow::Error {
@@ -627,7 +820,7 @@ async fn activate_staged(
     lock: CacheLock,
     candidate: &Path,
     destination: &Path,
-) -> Result<()> {
+) -> Result<Option<StageCleanupFailure>> {
     activate_staged_with(staging, lock, None, candidate, destination, |_| {}).await
 }
 
@@ -637,7 +830,7 @@ async fn activate_staged_after_probe(
     probe: CheckedColdProbe,
     candidate: &Path,
     destination: &Path,
-) -> Result<()> {
+) -> Result<Option<StageCleanupFailure>> {
     activate_staged_with(staging, lock, Some(probe), candidate, destination, |_| {}).await
 }
 
@@ -648,7 +841,7 @@ async fn activate_staged_observed(
     candidate: &Path,
     destination: &Path,
     observer: impl FnMut(bool),
-) -> Result<()> {
+) -> Result<Option<StageCleanupFailure>> {
     activate_staged_with(staging, lock, None, candidate, destination, observer).await
 }
 
@@ -659,7 +852,7 @@ async fn activate_staged_with(
     candidate: &Path,
     destination: &Path,
     mut observer: impl FnMut(bool),
-) -> Result<()> {
+) -> Result<Option<StageCleanupFailure>> {
     let mut activation = StagedActivation {
         source: None,
         probe,
@@ -873,13 +1066,32 @@ impl std::ops::Deref for CacheLock {
     }
 }
 
-async fn cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
+struct LockHandle {
+    directory: Directory,
+    file: File,
+    path: PathBuf,
+}
+
+fn open_lock_handle(directory: &Path) -> Result<LockHandle> {
     let path = directory.join(".install.lock");
     let directory = files::open_directory(directory, Privacy::OwnerOnly, NameRetention::Pinned)?;
     let file = directory
         .lock_file(files::name(&path)?)
         .context("open stable Dolt installation lock")?;
     checked_regular(&path, false)?;
+    Ok(LockHandle {
+        directory,
+        file,
+        path,
+    })
+}
+
+async fn cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
+    let LockHandle {
+        directory,
+        file,
+        path,
+    } = open_lock_handle(directory)?;
     let start = tokio::time::Instant::now();
     loop {
         directory.verify(files::name(&path)?, &file)?;
@@ -902,6 +1114,210 @@ async fn cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
         file,
         _directory: directory,
     })
+}
+
+/// Attempt the exclusive Dolt installation lock without waiting for it.
+/// `Ok(None)` means another installer currently holds it - a warm-open
+/// caller treats that exactly like an error-free skip, never a failure.
+fn try_cache_lock(directory: &Path) -> Result<Option<CacheLock>> {
+    let LockHandle {
+        directory,
+        file,
+        path,
+    } = open_lock_handle(directory)?;
+    directory.verify(files::name(&path)?, &file)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(error) => return Err(error).context("lock Dolt installation"),
+    }
+    directory
+        .verify(files::name(&path)?, &file)
+        .context("Dolt installation lock was replaced while waiting")?;
+    Ok(Some(CacheLock {
+        file,
+        _directory: directory,
+    }))
+}
+
+/// Leftover install stages a sweep could not collect, summed across every
+/// receipt it read. Reaching this many changes nothing about removal - the
+/// cap only sets `SweepOutcome::reached_cap`, which `report_leftover_stage_cap`
+/// turns into one diagnostics record (see `docs/memory.md`). No stage whose
+/// removal is rejected or uncertain is ever deleted because of it.
+const LEFTOVER_STAGE_CAP: usize = 8;
+
+/// One collection pass over `versions/.leftovers`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepOutcome {
+    pub collected: usize,
+    pub remaining: usize,
+    /// `remaining >= LEFTOVER_STAGE_CAP`. Reporting-only: it is read to emit
+    /// one diagnostics record, never to decide what to delete.
+    pub reached_cap: bool,
+}
+
+/// A receipt as read back: only the fields the sweep needs to re-locate and
+/// validate its own stage before touching it. Extra fields (the cause, the
+/// digest, …) are ignored here, never rejected.
+#[derive(serde::Deserialize)]
+struct StoredLeftoverStage {
+    version: u32,
+    stage: String,
+}
+
+/// Collect every retained install stage this `versions` directory has a
+/// receipt for. Runs only while the caller holds the installation lock -
+/// taking `&CacheLock` by reference makes that a type-level fact; this
+/// function never acquires or releases it. Only a receipted `.install-*`
+/// directory is ever touched: a stage nothing has receipted (including one a
+/// concurrent installer is writing right now, since that installer holds the
+/// same lock this caller does) is left exactly alone, and a removal that is
+/// rejected or uncertain leaves both the stage and its receipt for the next
+/// sweep - never a retry loop, never a deletion on uncertainty.
+fn sweep_leftover_stages(versions: &Path, _lock: &CacheLock) -> SweepOutcome {
+    let mut outcome = SweepOutcome::default();
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    let Ok(entries) = fs::read_dir(&receipts_path) else {
+        return outcome; // no `.leftovers` directory: nothing to sweep
+    };
+    let Ok(receipts) =
+        files::open_directory(&receipts_path, Privacy::OwnerOnly, NameRetention::Movable)
+    else {
+        return outcome;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".json") {
+            continue; // e.g. the `staging` directory `files::write` uses
+        }
+        sweep_one_leftover_stage(versions, &receipts, name, &mut outcome);
+    }
+    outcome.reached_cap = outcome.remaining >= LEFTOVER_STAGE_CAP;
+    outcome
+}
+
+/// A stored leftover-stage receipt is a few hundred bytes; anything past this
+/// generous bound is treated the same as unparsable, never read without a limit.
+const LEFTOVER_RECEIPT_LIMIT: u64 = 16 * 1024;
+
+/// Bounded, checked read of one receipt, using the already-open `.leftovers`
+/// directory so this never reopens or re-walks its parent. Mirrors
+/// `files::read_bytes`'s contract (size limit, then identity `verify`) rather
+/// than reading the file directly off the path.
+fn read_leftover_receipt(receipts: &Directory, name: &str) -> Result<Vec<u8>> {
+    let name = std::ffi::OsStr::new(name);
+    let mut file = receipts.read(name)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(LEFTOVER_RECEIPT_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= LEFTOVER_RECEIPT_LIMIT,
+        "retained-stage receipt exceeds its size limit"
+    );
+    receipts.verify(name, &file)?;
+    Ok(bytes)
+}
+
+fn sweep_one_leftover_stage(
+    versions: &Path,
+    receipts: &Directory,
+    name: &str,
+    outcome: &mut SweepOutcome,
+) {
+    let Ok(bytes) = read_leftover_receipt(receipts, name) else {
+        // Over the size limit or otherwise unreadable: leave it, report it,
+        // never delete a receipt (or its stage) blindly.
+        outcome.remaining += 1;
+        return;
+    };
+    let Ok(receipt) = serde_json::from_slice::<StoredLeftoverStage>(&bytes) else {
+        outcome.remaining += 1; // unparsable: leave it, never delete blindly
+        return;
+    };
+    if receipt.version != 1
+        || !receipt.stage.starts_with(".install-")
+        || receipt.stage.contains(['/', '\\'])
+    {
+        outcome.remaining += 1; // a foreign-shaped receipt: leave it
+        return;
+    }
+    let stage = versions.join(&receipt.stage);
+    match fs::symlink_metadata(&stage) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The stage is already gone; only the receipt is left to collect.
+            collect_leftover_receipt(receipts, name, outcome);
+        }
+        Err(_) => outcome.remaining += 1,
+        Ok(metadata) if !metadata.is_dir() => outcome.remaining += 1,
+        Ok(_) => match files::open_directory(&stage, Privacy::OwnerOnly, NameRetention::Movable) {
+            Ok(directory) => match directory.remove_tree() {
+                Ok(()) => collect_leftover_receipt(receipts, name, outcome),
+                Err(_) => outcome.remaining += 1, // Rejected or Uncertain: leave both
+            },
+            Err(_) => outcome.remaining += 1,
+        },
+    }
+}
+
+/// Count a stage as collected only when its receipt is actually removed too -
+/// a stage whose tree is gone (fresh removal or already absent) but whose
+/// receipt read or removal fails is left for the next sweep instead, so
+/// `collected` never overstates what this pass actually reclaimed.
+fn collect_leftover_receipt(receipts: &Directory, name: &str, outcome: &mut SweepOutcome) {
+    let name = std::ffi::OsStr::new(name);
+    let removed = receipts
+        .read(name)
+        .ok()
+        .and_then(|file| receipts.remove_file(name, file).ok())
+        .is_some();
+    if removed {
+        outcome.collected += 1;
+    } else {
+        outcome.remaining += 1;
+    }
+}
+
+/// Best-effort: a leftover-stage sweep never turns a warm open into a failed
+/// one. An absent `.leftovers` directory is the ordinary case and costs one
+/// metadata call on the calling task, so the common warm open never crosses
+/// into a blocking-pool task at all. Only once a receipt might exist does the
+/// rest - the directory scan, the non-blocking lock attempt, and the sweep's
+/// own removals - run through `spawn_blocking`, exactly like the cold path's
+/// extraction and probe work (`provision.rs` above).
+async fn warm_sweep_if_receipted(cache: PathBuf, versions: PathBuf) {
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    let is_leftovers_dir =
+        matches!(fs::symlink_metadata(&receipts_path), Ok(metadata) if metadata.is_dir());
+    if !is_leftovers_dir {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+        let has_receipt = fs::read_dir(&receipts_path)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(".json"))
+                })
+            })
+            .unwrap_or(false);
+        if !has_receipt {
+            return;
+        }
+        if let Ok(Some(lock)) = try_cache_lock(&cache) {
+            let outcome = sweep_leftover_stages(&versions, &lock);
+            drop(lock);
+            report_leftover_stage_cap(outcome);
+        }
+    })
+    .await;
 }
 
 pub(crate) fn private_directory(path: &Path) -> Result<()> {
