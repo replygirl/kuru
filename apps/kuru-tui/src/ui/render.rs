@@ -227,15 +227,25 @@ fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
             style(LILAC),
         )));
     }
-    if !preview.activity.is_empty() {
-        let prefix = if preview.activity_truncated {
+    // A dispatched tool call carries its raw catalog name; while its arguments
+    // are still streaming the runtime can only say that a call is in flight.
+    // The most recently started facing call still running wins; the view
+    // clears its own record (and corrects the cached preview) as each one
+    // settles, so an empty record always falls back to a truthful preview.
+    let activity = view
+        .calling_tool
+        .last()
+        .map(|(_, name)| format!("Calling {name}"))
+        .unwrap_or_else(|| preview.activity.clone());
+    if !activity.is_empty() {
+        let prefix = if view.calling_tool.is_empty() && preview.activity_truncated {
             "activity … "
         } else {
             "activity · "
         };
         info.push(Line::from(Span::styled(
             clipped(
-                &format!("{prefix}{}", safe_preview_line(&preview.activity)),
+                &format!("{prefix}{}", safe_preview_line(&activity)),
                 inner.width as usize,
             ),
             style(MUTED),

@@ -53,12 +53,62 @@ impl ModelCatalog {
     pub fn embedded() -> Result<&'static Self> {
         static CATALOG: OnceLock<Result<ModelCatalog, String>> = OnceLock::new();
         CATALOG
-            .get_or_init(|| Self::from_json(EMBEDDED_CATALOG).map_err(|error| error.to_string()))
+            .get_or_init(|| Self::embedded_uncached().map_err(|error| error.to_string()))
             .as_ref()
             .map_err(|error| anyhow::Error::msg(error.clone()))
     }
 
+    fn embedded_uncached() -> Result<Self> {
+        let catalog = Self::from_json(EMBEDDED_CATALOG)?;
+        #[cfg(feature = "test-support")]
+        let catalog = Self::layer_test_override(catalog)?;
+        Ok(catalog)
+    }
+
+    /// Test-only seam: when `KURU_TEST_MODEL_CATALOG_PATH` names a fixture
+    /// catalog file, its records are layered on top of the embedded catalog
+    /// so a real-PTY fixture can drive a priced invocation end to end. Inert
+    /// unless this feature is compiled in and the env var is set; never
+    /// reachable from an ordinary build.
+    #[cfg(feature = "test-support")]
+    fn layer_test_override(mut catalog: Self) -> Result<Self> {
+        let Ok(path) = std::env::var("KURU_TEST_MODEL_CATALOG_PATH") else {
+            return Ok(catalog);
+        };
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read test model catalog override at {path}"))?;
+        let overlay = Self::from_json_test_override(&text)?;
+        let mut keys: BTreeSet<(ModelRoute, &str)> = catalog
+            .records
+            .iter()
+            .map(|record| (record.route, record.model_id.as_str()))
+            .collect();
+        for record in &overlay.records {
+            ensure!(
+                keys.insert((record.route, record.model_id.as_str())),
+                "test model catalog override duplicates an existing route and model ID"
+            );
+        }
+        catalog.records.extend(overlay.records);
+        Ok(catalog)
+    }
+
     pub fn from_json(input: &str) -> Result<Self> {
+        Self::from_json_checked(input, false)
+    }
+
+    /// Test-only entry point for a fixture catalog layered onto the embedded
+    /// one. Reuses `from_json`'s exact size/schema/citation/price validation;
+    /// the only relaxation is allowing a `custom-responses` route to carry an
+    /// `api-standard` price, which a real fixture provider (an arbitrary
+    /// local `api_base`) always classifies as. Never reachable outside this
+    /// feature, and never widens what `from_json` itself accepts.
+    #[cfg(feature = "test-support")]
+    fn from_json_test_override(input: &str) -> Result<Self> {
+        Self::from_json_checked(input, true)
+    }
+
+    fn from_json_checked(input: &str, allow_custom_responses_price: bool) -> Result<Self> {
         ensure!(
             input.len() <= 64 * 1024,
             "model catalog asset exceeds 64 KiB"
@@ -120,7 +170,9 @@ impl ModelCatalog {
                             ModelRoute::CodexSubscription,
                             PriceBasis::ApiEquivalent { .. }
                         ) | (ModelRoute::OpenAiResponses, PriceBasis::ApiStandard { .. })
-                    ),
+                    ) || (allow_custom_responses_price
+                        && record.route == ModelRoute::CustomResponses
+                        && matches!(prices.basis, PriceBasis::ApiStandard { .. })),
                     "catalog route and price basis do not match"
                 );
                 validate_prices(prices)?;
