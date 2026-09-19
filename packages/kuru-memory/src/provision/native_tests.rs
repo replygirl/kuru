@@ -287,9 +287,13 @@ async fn successful_activation_removes_its_disposable_stage() {
     with_asset(&bytes, |asset| extract(&bytes, &candidate, asset)).unwrap();
     let destination = cache.join("active");
 
-    activate_staged(stage, lock, &candidate, &destination)
-        .await
-        .unwrap();
+    assert!(
+        activate_staged(stage, lock, &candidate, &destination)
+            .await
+            .unwrap()
+            .is_none(),
+        "a removed stage reports no retained leftover"
+    );
 
     assert_eq!(fs::read(destination.join("dolt.exe")).unwrap(), EXE);
     assert_eq!(fs::read(destination.join("LICENSES")).unwrap(), NOTICES);
@@ -306,7 +310,7 @@ async fn successful_activation_removes_its_disposable_stage() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn published_engine_reports_failed_stage_cleanup_and_releases_cache_lease() {
+async fn published_engine_retains_its_failed_stage_cleanup_and_releases_cache_lease() {
     use std::os::windows::fs::OpenOptionsExt;
 
     let root = crate::test_support::tempdir().unwrap();
@@ -331,10 +335,12 @@ async fn published_engine_reports_failed_stage_cleanup_and_releases_cache_lease(
         .unwrap();
     let destination = cache.join("active");
 
-    let error = activate_staged(stage, lock, &candidate, &destination)
+    let failure = activate_staged(stage, lock, &candidate, &destination)
         .await
-        .unwrap_err();
-    let detail = format!("{error:#}");
+        .unwrap()
+        .expect("a published engine reports its retained stage instead of failing");
+    assert_eq!(failure.stage, stage_container);
+    let detail = format!("{:#}", failure.cause);
     assert!(detail.contains("Dolt engine publication succeeded, but private stage cleanup failed"));
     assert!(detail.contains(&stage_container.display().to_string()));
     assert!(
@@ -522,7 +528,7 @@ async fn held_descendant_releases_after_checked_no_move_and_activation_recovers(
         })
         .await;
     tokio::time::resume();
-    result.unwrap();
+    assert!(result.unwrap().is_none());
     assert_eq!(denied, 1, "release only the observed checked rejection");
     assert_eq!(
         files::directory(&destination).unwrap().identity(),

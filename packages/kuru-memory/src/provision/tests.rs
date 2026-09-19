@@ -1148,3 +1148,145 @@ async fn corrupt_actual_embedded_archive_is_rejected_without_executing_or_activa
     assert!(failure.to_string().contains("checksum mismatch"));
     assert_eq!(fs::read_dir(cache.join(DOLT_VERSION)).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn exhausted_stage_cleanup_publishes_the_engine_and_receipts_the_retained_stage() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    let binary = {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        )
+        .await
+        .expect("a published engine must not fail its open because a stage stayed behind")
+    };
+
+    let versions = cache.canonicalize().unwrap().join(DOLT_VERSION);
+    assert_eq!(binary, versions.join("fixture-target").join("dolt"));
+    assert_eq!(fs::read(&binary).unwrap(), SCRIPT);
+    verify_version(&binary, &temporary.path().join("private home"))
+        .await
+        .expect("the published engine runs");
+
+    let receipts = versions.join(".leftovers");
+    assert_eq!(
+        fs::metadata(&receipts).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let written: Vec<PathBuf> = fs::read_dir(&receipts)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect();
+    assert_eq!(written.len(), 1, "one retained stage receipts exactly once");
+    assert_eq!(
+        fs::metadata(&written[0]).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&written[0]).unwrap()).unwrap();
+    let stage = receipt["stage"].as_str().unwrap().to_owned();
+    assert_eq!(
+        written[0].file_name().unwrap().to_string_lossy(),
+        format!("{stage}.json")
+    );
+    assert!(stage.starts_with(".install-"), "{stage}");
+    assert_eq!(receipt["version"], 1);
+    assert_eq!(receipt["private"], format!("{stage}/private"));
+    assert_eq!(receipt["engine_version"], DOLT_VERSION);
+    assert_eq!(receipt["target"], "fixture-target");
+    assert_eq!(
+        receipt["executable_sha256"],
+        fixture.spec().executable_sha256
+    );
+    assert_eq!(receipt["published"], true);
+    assert_eq!(receipt["os_error"], 145);
+    assert_eq!(receipt["attempts"], 88);
+    assert_eq!(receipt["elapsed_ms"], 2003);
+    let cause = receipt["first_cause"].as_str().unwrap();
+    assert!(
+        cause.contains("Dolt engine publication succeeded, but private stage cleanup failed"),
+        "{cause}"
+    );
+    assert!(cause.contains("exhausted its bounded recovery"), "{cause}");
+    assert!(cause.contains("(os error 145)"), "{cause}");
+
+    // The retained stage stays where it is, and a later open neither verifies
+    // nor executes anything inside it.
+    let retained = versions.join(&stage);
+    assert!(retained.join("private").join("probe").is_dir());
+    assert_eq!(
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes)
+        )
+        .await
+        .unwrap(),
+        binary
+    );
+    assert!(retained.is_dir());
+}
+
+#[test]
+fn a_stage_cleanup_report_carries_the_typed_bounded_recovery_detail() {
+    let fixture = &*VALID_FIXTURE;
+    let failure = crate::files::StageCleanupFailure {
+        stage: PathBuf::from("/cache/2.3.3/.install-Ab12Cd"),
+        private: PathBuf::from("/cache/2.3.3/.install-Ab12Cd/private"),
+        cause: anyhow::Error::new(std::io::Error::from_raw_os_error(32))
+            .context(crate::files::StageCleanupExhausted {
+                attempts: 7,
+                elapsed: Duration::from_millis(1990),
+            })
+            .context("Dolt engine publication succeeded, but private stage cleanup failed"),
+    };
+
+    let report = StageCleanupReport::new(failure, fixture.spec());
+
+    assert_eq!(report.attempts, Some(7));
+    assert_eq!(report.elapsed, Some(Duration::from_millis(1990)));
+    assert_eq!(report.os_error, Some(32));
+    assert_eq!(report.engine_version, DOLT_VERSION);
+    assert_eq!(report.target, "fixture-target");
+    assert_eq!(report.executable_sha256, fixture.spec().executable_sha256);
+    assert!(report.published);
+    assert!(report.receipt_error.is_none());
+    assert!(
+        report
+            .first_cause
+            .contains("private stage cleanup failed: private temporary stage cleanup exhausted"),
+        "{}",
+        report.first_cause
+    );
+}
+
+#[test]
+fn a_report_without_the_bounded_exhaustion_records_no_attempts() {
+    let fixture = &*VALID_FIXTURE;
+    let failure = crate::files::StageCleanupFailure {
+        stage: PathBuf::from("/cache/2.3.3/.install-Ef34Gh"),
+        private: PathBuf::from("/cache/2.3.3/.install-Ef34Gh/private"),
+        cause: anyhow::Error::new(std::io::Error::from_raw_os_error(13)),
+    };
+
+    let report = StageCleanupReport::new(failure, fixture.spec());
+
+    assert_eq!(report.attempts, None);
+    assert_eq!(report.elapsed, None);
+    assert_eq!(report.os_error, Some(13));
+}

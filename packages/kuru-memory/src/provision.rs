@@ -3,7 +3,7 @@
 use crate::MemoryOpenStage;
 pub use crate::catalog::DOLT_VERSION;
 use crate::catalog::{Asset, BUNDLED_ASSET, EMBEDDED_ARCHIVE, MAX_COMPRESSED, MAX_EXPANDED};
-use crate::files::{self, PrivateTemp};
+use crate::files::{self, PrivateTemp, StageCleanupFailure};
 use crate::progress::ProgressReporter;
 use anyhow::{Context, Result, bail, ensure};
 use flate2::bufread::GzDecoder;
@@ -167,8 +167,135 @@ async fn provision_with_extractor_observed(
         }
     };
     let (probe, (staging, lock)) = probe.probe((staging, lock)).await?;
-    activate_staged_after_probe(staging, lock, probe, &candidate, &destination).await?;
+    let cleanup =
+        activate_staged_after_probe(staging, lock, probe, &candidate, &destination).await?;
+    if let Some(failure) = cleanup {
+        // The engine is published and verified; a stage that outlived its own
+        // bounded removal is receipted for a later collection instead of
+        // failing this open.
+        let _retained = record_retained_stage(&versions, asset, failure);
+    }
     Ok(destination.join(asset.executable_name))
+}
+
+/// Receipts naming the retained install stages of one engine version.
+const LEFTOVER_STAGE_RECEIPTS: &str = ".leftovers";
+
+/// What was retained after a published and verified engine could not remove its
+/// own private stage: where it is, why it stayed, and which publication it
+/// belongs to. `attempts` and `elapsed` describe the bounded recovery window
+/// that actually ran, and are absent when the cause is not that exhaustion.
+#[derive(Debug)]
+pub(crate) struct StageCleanupReport {
+    pub stage: PathBuf,
+    pub private: PathBuf,
+    pub engine_version: &'static str,
+    pub target: String,
+    pub executable_sha256: String,
+    pub published: bool,
+    pub first_cause: String,
+    pub os_error: Option<i32>,
+    pub attempts: Option<u32>,
+    pub elapsed: Option<Duration>,
+    pub receipt_error: Option<String>,
+}
+
+impl StageCleanupReport {
+    fn new(failure: StageCleanupFailure, asset: Asset<'_>) -> Self {
+        let StageCleanupFailure {
+            stage,
+            private,
+            cause,
+        } = failure;
+        let exhausted = cause.downcast_ref::<crate::files::StageCleanupExhausted>();
+        Self {
+            stage,
+            private,
+            engine_version: DOLT_VERSION,
+            target: asset.target.to_owned(),
+            executable_sha256: asset.executable_sha256.to_owned(),
+            published: true,
+            attempts: exhausted.map(|exhausted| exhausted.attempts),
+            elapsed: exhausted.map(|exhausted| exhausted.elapsed),
+            os_error: cause
+                .chain()
+                .filter_map(|error| error.downcast_ref::<std::io::Error>())
+                .find_map(std::io::Error::raw_os_error),
+            first_cause: format!("{cause:#}"),
+            receipt_error: None,
+        }
+    }
+}
+
+/// The receipt as it is stored: paths relative to the version directory, so a
+/// moved cache cannot make a receipt name anything outside it.
+#[derive(serde::Serialize)]
+struct StageCleanupReceipt<'a> {
+    version: u32,
+    stage: String,
+    private: String,
+    engine_version: &'a str,
+    target: &'a str,
+    executable_sha256: &'a str,
+    published: bool,
+    first_cause: &'a str,
+    os_error: Option<i32>,
+    attempts: Option<u32>,
+    elapsed_ms: Option<u128>,
+    recorded_at: u64,
+}
+
+/// Record a retained stage so a later open can collect it.
+///
+/// A receipt that cannot be written leaves the stage waiting for an operator;
+/// it never turns a published, verified engine into a failed open.
+fn record_retained_stage(
+    versions: &Path,
+    asset: Asset<'_>,
+    failure: StageCleanupFailure,
+) -> StageCleanupReport {
+    let mut report = StageCleanupReport::new(failure, asset);
+    if let Err(error) = write_stage_receipt(versions, &report) {
+        report.receipt_error = Some(format!("{error:#}"));
+    }
+    report
+}
+
+fn write_stage_receipt(versions: &Path, report: &StageCleanupReport) -> Result<()> {
+    let stage = relative_to(versions, &report.stage)?;
+    ensure!(
+        stage.starts_with(".install-") && !stage.contains(['/', '\\']),
+        "a retained install stage keeps its private staging name"
+    );
+    let receipts = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    files::ensure_private_directory(&receipts)?;
+    let receipt = StageCleanupReceipt {
+        version: 1,
+        private: relative_to(versions, &report.private)?,
+        stage,
+        engine_version: report.engine_version,
+        target: &report.target,
+        executable_sha256: &report.executable_sha256,
+        published: report.published,
+        first_cause: &report.first_cause,
+        os_error: report.os_error,
+        attempts: report.attempts,
+        elapsed_ms: report.elapsed.map(|elapsed| elapsed.as_millis()),
+        recorded_at: std::time::SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map(|since| since.as_secs())
+            .unwrap_or_default(),
+    };
+    let bytes = serde_json::to_vec_pretty(&receipt)?;
+    files::write(&receipts.join(format!("{}.json", receipt.stage)), &bytes)
+}
+
+fn relative_to(versions: &Path, path: &Path) -> Result<String> {
+    Ok(path
+        .strip_prefix(versions)
+        .context("a retained install stage stays inside its engine version directory")?
+        .to_string_lossy()
+        .into_owned())
 }
 
 fn destination_exists(path: &Path) -> Result<bool> {
@@ -585,7 +712,10 @@ struct StagedActivation {
 }
 
 impl StagedActivation {
-    fn finish_published(self) -> Result<()> {
+    /// The engine is published and verified before this runs, so a stage that
+    /// survives its own bounded removal is reported, not raised: only integrity
+    /// failures fail an open. The returned failure names a retained stage.
+    fn finish_published(self) -> Result<Option<StageCleanupFailure>> {
         let Self {
             source,
             probe,
@@ -594,11 +724,14 @@ impl StagedActivation {
         } = self;
         drop(source);
         drop(probe);
-        let result = staging
-            .close()
-            .context("Dolt engine publication succeeded, but private stage cleanup failed");
+        let result = staging.close_or_keep();
         drop(lock);
-        result
+        Ok(result.err().map(|mut failure| {
+            failure.cause = failure
+                .cause
+                .context("Dolt engine publication succeeded, but private stage cleanup failed");
+            failure
+        }))
     }
 
     fn retain(self, error: anyhow::Error) -> anyhow::Error {
@@ -627,7 +760,7 @@ async fn activate_staged(
     lock: CacheLock,
     candidate: &Path,
     destination: &Path,
-) -> Result<()> {
+) -> Result<Option<StageCleanupFailure>> {
     activate_staged_with(staging, lock, None, candidate, destination, |_| {}).await
 }
 
@@ -637,7 +770,7 @@ async fn activate_staged_after_probe(
     probe: CheckedColdProbe,
     candidate: &Path,
     destination: &Path,
-) -> Result<()> {
+) -> Result<Option<StageCleanupFailure>> {
     activate_staged_with(staging, lock, Some(probe), candidate, destination, |_| {}).await
 }
 
@@ -648,7 +781,7 @@ async fn activate_staged_observed(
     candidate: &Path,
     destination: &Path,
     observer: impl FnMut(bool),
-) -> Result<()> {
+) -> Result<Option<StageCleanupFailure>> {
     activate_staged_with(staging, lock, None, candidate, destination, observer).await
 }
 
@@ -659,7 +792,7 @@ async fn activate_staged_with(
     candidate: &Path,
     destination: &Path,
     mut observer: impl FnMut(bool),
-) -> Result<()> {
+) -> Result<Option<StageCleanupFailure>> {
     let mut activation = StagedActivation {
         source: None,
         probe,
