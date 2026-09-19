@@ -1636,6 +1636,58 @@ async fn sweep_reports_the_cap_without_deleting_any_uncollectable_stage() {
     );
 }
 
+#[tokio::test]
+async fn sweep_leaves_an_oversized_or_unparsable_receipt_as_remaining() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("6.6.6-fixture");
+    private_directory(&versions).unwrap();
+
+    // Both stages exist and are otherwise perfectly collectible; only their
+    // receipts are bad, so a correct sweep must never reach the stage removal
+    // branch for either one.
+    let oversized_stage = versions.join(".install-oversized");
+    private_directory(&oversized_stage).unwrap();
+    let malformed_stage = versions.join(".install-malformed");
+    private_directory(&malformed_stage).unwrap();
+
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    files::ensure_private_directory(&receipts_path).unwrap();
+    // One byte past `LEFTOVER_RECEIPT_LIMIT`: `read_leftover_receipt`'s bounded
+    // `take` must reject it rather than silently truncating and parsing a
+    // partial document.
+    let oversized_bytes = vec![b'a'; (LEFTOVER_RECEIPT_LIMIT + 1) as usize];
+    files::write(
+        &receipts_path.join(".install-oversized.json"),
+        &oversized_bytes,
+    )
+    .unwrap();
+    // Under the limit but not valid JSON at all.
+    files::write(&receipts_path.join(".install-malformed.json"), b"not json").unwrap();
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let outcome = sweep_leftover_stages(&versions, &lock);
+    drop(lock);
+
+    assert_eq!(outcome.collected, 0);
+    assert_eq!(outcome.remaining, 2);
+    assert!(
+        oversized_stage.is_dir(),
+        "an over-limit receipt leaves its stage untouched"
+    );
+    assert!(
+        malformed_stage.is_dir(),
+        "an unparsable receipt leaves its stage untouched"
+    );
+    assert_eq!(
+        leftover_receipt_files(&receipts_path).len(),
+        2,
+        "neither a too-large nor an unparsable receipt is ever deleted"
+    );
+}
+
 #[test]
 fn a_stage_cleanup_report_carries_the_typed_bounded_recovery_detail() {
     let fixture = &*VALID_FIXTURE;
