@@ -96,6 +96,21 @@ fn powershell_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+// Windows PowerShell 5.1 engine/host cold start (module/format data load, first
+// runspace build) can stall well past a single `tool shell` call's own budget
+// before any script line runs. Warm the exact ToolHost stock-shell launch path
+// once per test-binary process, ahead of the first real `tool shell` command,
+// so that stall lands here (with its own distinct, generous bound) instead of
+// inside a test's real assertion window. See `kuru_connectors::shell_warmup`.
+fn ensure_powershell_warm() {
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build warm-up runtime")
+        .block_on(kuru_connectors::shell_warmup::warm_up_stock_powershell_engine());
+    result.expect("stock PowerShell warm-up");
+}
+
 fn stock_shell_source(
     progress: &Path,
     input: &Path,
@@ -608,6 +623,7 @@ if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -n
 
 #[test]
 fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environment() {
+    ensure_powershell_warm();
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("workspace 日本語");
     let modules = root.path().join("incompatible modules");

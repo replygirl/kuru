@@ -5,6 +5,22 @@ use std::{path::PathBuf, process::Output};
 #[path = "support/memory.rs"]
 mod memory;
 
+// Windows PowerShell 5.1 engine/host cold start (module/format data load, first
+// runspace build) can stall well past a single `tool shell` call's own budget
+// before any script line runs. Warm the exact ToolHost stock-shell launch path
+// once per test-binary process, ahead of the first real `tool shell` command,
+// so that stall lands here (with its own distinct, generous bound) instead of
+// inside a test's real assertion window. See `kuru_connectors::shell_warmup`.
+#[cfg(windows)]
+fn ensure_powershell_warm() {
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build warm-up runtime")
+        .block_on(kuru_connectors::shell_warmup::warm_up_stock_powershell_engine());
+    result.expect("stock PowerShell warm-up");
+}
+
 struct Sandbox {
     root: tempfile::TempDir,
     project: PathBuf,
@@ -12,6 +28,8 @@ struct Sandbox {
 }
 impl Sandbox {
     fn new() -> Self {
+        #[cfg(windows)]
+        ensure_powershell_warm();
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         let data = root.path().join("data");
