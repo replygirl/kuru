@@ -3559,6 +3559,10 @@ mod tests {
 
     #[tokio::test]
     async fn private_paths_and_stable_lock_fail_closed() {
+        // Held for the whole test: every lock acquisition here is a real
+        // flock the assertions below expect to succeed or fail outright, and
+        // this test never itself spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
         let directory = crate::test_support::tempdir().unwrap();
         let scope = format!("project/{}", "a".repeat(64));
         assert!(!MemoryStore::exists(directory.path(), &scope).unwrap());

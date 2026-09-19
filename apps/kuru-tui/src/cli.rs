@@ -301,7 +301,22 @@ pub fn validate_effort(models: &[ModelInfo], model: &str, effort: Option<&str>) 
     Ok(())
 }
 
+/// The real stderr sink: each write locks stderr for the call, matching the
+/// prior direct-`io::stderr()` behavior exactly.
+struct StderrSink;
+
+impl Write for StderrSink {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        io::stderr().lock().write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().lock().flush()
+    }
+}
+
 struct MemoryProgressOutput {
+    sink: Box<dyn Write + Send>,
     terminal: bool,
     enabled: bool,
     width: usize,
@@ -309,10 +324,29 @@ struct MemoryProgressOutput {
 
 impl MemoryProgressOutput {
     fn new() -> Self {
+        Self::with_sink(Box::new(StderrSink), io::stderr().is_terminal())
+    }
+
+    fn with_sink(sink: Box<dyn Write + Send>, terminal: bool) -> Self {
         Self {
-            terminal: io::stderr().is_terminal(),
+            sink,
+            terminal,
             enabled: true,
             width: 0,
+        }
+    }
+
+    /// Write one already-formatted line as a single buffered call, so the
+    /// real stderr sink locks exactly once per line regardless of how many
+    /// fragments the caller's format string had.
+    fn write_line(&mut self, line: &str) {
+        if self
+            .sink
+            .write_all(line.as_bytes())
+            .and_then(|()| self.sink.flush())
+            .is_err()
+        {
+            self.enabled = false;
         }
     }
 
@@ -321,16 +355,14 @@ impl MemoryProgressOutput {
             return;
         }
         let text = memory_open_label(stage);
-        let mut stderr = io::stderr().lock();
-        let result = if self.terminal {
+        let line = if self.terminal {
             let padding = " ".repeat(self.width.saturating_sub(text.len()));
-            write!(stderr, "\r{text}{padding}").and_then(|()| stderr.flush())
+            format!("\r{text}{padding}")
         } else {
-            writeln!(stderr, "{text}").and_then(|()| stderr.flush())
+            format!("{text}\n")
         };
-        if result.is_err() {
-            self.enabled = false;
-        } else {
+        self.write_line(&line);
+        if self.enabled {
             self.width = self.width.max(text.len());
         }
     }
@@ -340,30 +372,30 @@ impl MemoryProgressOutput {
             return;
         }
         let text = memory_open_label(MemoryOpenStage::Ready);
-        let mut stderr = io::stderr().lock();
-        let result = if self.terminal {
+        let line = if self.terminal {
             let padding = " ".repeat(self.width.saturating_sub(text.len()));
-            writeln!(stderr, "\r{text}{padding}")
+            format!("\r{text}{padding}\n")
         } else {
-            writeln!(stderr, "{text}")
-        }
-        .and_then(|()| stderr.flush());
-        if result.is_err() {
-            self.enabled = false;
-        }
+            format!("{text}\n")
+        };
+        self.write_line(&line);
     }
 
     fn abandon(&mut self) {
         if !self.enabled || !self.terminal || self.width == 0 {
             return;
         }
-        let mut stderr = io::stderr().lock();
-        if write!(stderr, "\r{}\r", " ".repeat(self.width))
-            .and_then(|()| stderr.flush())
-            .is_err()
-        {
-            self.enabled = false;
+        self.write_line(&format!("\r{}\r", " ".repeat(self.width)));
+    }
+
+    /// A retained line printed after the terminal `Memory: ready.` line, never
+    /// overwritten by a later transient stage. Stdout stays untouched; this is
+    /// stderr only and never runs when the open failed.
+    fn notice(&mut self, text: &str) {
+        if !self.enabled {
+            return;
         }
+        self.write_line(&format!("{text}\n"));
     }
 }
 
@@ -377,7 +409,106 @@ fn memory_open_label(stage: MemoryOpenStage) -> &'static str {
         MemoryOpenStage::PreparingDatabase => "Memory: preparing database…",
         MemoryOpenStage::OpeningDatabase => "Memory: opening database…",
         MemoryOpenStage::Ready => "Memory: ready.",
+        MemoryOpenStage::RetainedInstallStage => {
+            "Memory: retained an install stage for later cleanup."
+        }
+        MemoryOpenStage::RetainedUnreceiptedInstallStage => {
+            "Memory: retained an install stage, but could not record it; \
+             it needs manual removal (see --debug diagnostics)."
+        }
         _ => "Memory: preparing database…",
+    }
+}
+
+#[cfg(test)]
+mod memory_progress_output_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct BufferSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufferSink {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured(output: MemoryProgressOutput, buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+        drop(output);
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn retained_install_stage_has_its_own_notice_text_distinct_from_every_other_label() {
+        let text = memory_open_label(MemoryOpenStage::RetainedInstallStage);
+        assert_eq!(text, "Memory: retained an install stage for later cleanup.");
+        for stage in [
+            MemoryOpenStage::WaitingForProjectOwnership,
+            MemoryOpenStage::WaitingForRuntimeCache,
+            MemoryOpenStage::VerifyingRuntimeCache,
+            MemoryOpenStage::ExtractingEmbeddedRuntime,
+            MemoryOpenStage::CheckingRuntimeVersion,
+            MemoryOpenStage::PreparingDatabase,
+            MemoryOpenStage::OpeningDatabase,
+            MemoryOpenStage::Ready,
+            MemoryOpenStage::RetainedUnreceiptedInstallStage,
+        ] {
+            assert_ne!(memory_open_label(stage), text);
+        }
+    }
+
+    #[test]
+    fn an_unreceipted_retained_stage_never_promises_a_later_cleanup() {
+        let text = memory_open_label(MemoryOpenStage::RetainedUnreceiptedInstallStage);
+        assert!(
+            !text.contains("for later cleanup"),
+            "an uncollectable stage must not be announced as scheduled: {text}"
+        );
+        assert!(text.contains("manual removal"), "{text}");
+    }
+
+    #[test]
+    fn notice_is_retained_after_the_terminal_ready_line_on_one_non_terminal_stream() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let mut output =
+            MemoryProgressOutput::with_sink(Box::new(BufferSink(buffer.clone())), false);
+        output.stage(MemoryOpenStage::WaitingForProjectOwnership);
+        output.complete();
+        output.notice(memory_open_label(MemoryOpenStage::RetainedInstallStage));
+        let rendered = captured(output, &buffer);
+        assert_eq!(
+            rendered,
+            concat!(
+                "Memory: waiting for project ownership…\n",
+                "Memory: ready.\n",
+                "Memory: retained an install stage for later cleanup.\n",
+            )
+        );
+    }
+
+    #[test]
+    fn notice_never_writes_once_the_sink_has_failed() {
+        struct FailingSink;
+        impl Write for FailingSink {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("fixture sink failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = MemoryProgressOutput::with_sink(Box::new(FailingSink), false);
+        output.complete();
+        assert!(!output.enabled, "a failed write must disable this output");
+        // Disabled output takes no further action; this only proves `notice`
+        // does not panic or attempt a write once disabled.
+        output.notice("must not be sent to a disabled sink");
     }
 }
 
@@ -386,12 +517,17 @@ async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
     let mut opening = Box::pin(opening);
     let mut output = MemoryProgressOutput::new();
     let mut observed_ready = false;
+    let mut retained_install_stage = None;
     let mut progress_open = true;
     let result = loop {
         tokio::select! {
             result = &mut opening => break result,
             stage = progress.recv(), if progress_open => match stage {
                 Some(MemoryOpenStage::Ready) => observed_ready = true,
+                Some(stage @ (MemoryOpenStage::RetainedInstallStage
+                    | MemoryOpenStage::RetainedUnreceiptedInstallStage)) => {
+                    retained_install_stage = Some(stage);
+                }
                 Some(stage) => output.stage(stage),
                 None => progress_open = false,
             },
@@ -399,10 +535,13 @@ async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
     };
     drop(opening);
     while let Some(stage) = progress.recv().await {
-        if stage == MemoryOpenStage::Ready {
-            observed_ready = true;
-        } else {
-            output.stage(stage);
+        match stage {
+            MemoryOpenStage::Ready => observed_ready = true,
+            stage @ (MemoryOpenStage::RetainedInstallStage
+            | MemoryOpenStage::RetainedUnreceiptedInstallStage) => {
+                retained_install_stage = Some(stage);
+            }
+            stage => output.stage(stage),
         }
     }
     match result {
@@ -412,6 +551,13 @@ async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
             // synthetic success line by itself.
             debug_assert!(observed_ready, "successful observed open must report ready");
             output.complete();
+            // Retained only after the terminal ready line, and only on a
+            // successful open: stdout stays JSON-clean, and an abandoned open
+            // never prints this notice.
+            // The unreceipted case says so: nothing will collect that stage.
+            if let Some(stage) = retained_install_stage {
+                output.notice(memory_open_label(stage));
+            }
             Ok(store)
         }
         Err(error) => {
@@ -1332,6 +1478,7 @@ mod permission_tests {
 
     #[tokio::test]
     async fn automatic_permission_claim_is_reviewed_but_trust_does_not_grant_a_call() {
+        let _gate = crate::spawn_gate::locking_async().await;
         let temporary = tempfile::tempdir().unwrap();
         let project = temporary.path().join("project");
         let data = temporary.path().join("data");

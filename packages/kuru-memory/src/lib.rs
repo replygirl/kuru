@@ -6,6 +6,8 @@ mod migration;
 mod progress;
 pub mod provision;
 pub mod server;
+#[cfg(test)]
+mod spawn_gate;
 mod store;
 
 pub use progress::{MemoryOpenProgress, MemoryOpenStage};

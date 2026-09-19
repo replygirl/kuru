@@ -261,6 +261,7 @@ mod tests {
 
     #[test]
     fn absent_inspection_and_revocation_create_no_state() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new();
         let store = fixture.store(&Config::default());
         assert!(store.load(&store.binding).unwrap().is_empty());
@@ -270,6 +271,7 @@ mod tests {
 
     #[test]
     fn independent_handles_preserve_literal_scopes_restart_and_revoke() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new();
         let first = fixture.store(&Config::default());
         let second = fixture.store(&Config::default());
@@ -296,6 +298,7 @@ mod tests {
 
     #[test]
     fn changed_authority_cannot_read_or_modify_prior_grants() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new();
         let first = fixture.store(&Config::default());
         let grant = file_grant(&first, "notes.txt");
@@ -316,6 +319,7 @@ mod tests {
 
     #[test]
     fn corrupt_or_oversized_private_record_is_an_error_not_an_empty_grant_set() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new();
         let store = fixture.store(&Config::default());
         let grant = file_grant(&store, "notes.txt");
@@ -336,6 +340,7 @@ mod tests {
 
     #[test]
     fn invalid_record_scope_and_schema_are_rejected() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new();
         let store = fixture.store(&Config::default());
         let grant = file_grant(&store, "notes.txt");
@@ -358,6 +363,7 @@ mod tests {
 
     #[test]
     fn grant_capacity_failure_preserves_the_previous_record() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new();
         let store = fixture.store(&Config::default());
         let directory = store.create_store().unwrap();
@@ -371,6 +377,7 @@ mod tests {
 
     #[test]
     fn held_store_lock_and_in_workspace_storage_fail_closed() {
+        let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new();
         let store = fixture.store(&Config::default());
         let grant = file_grant(&store, "notes.txt");
@@ -396,6 +403,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn replaced_store_path_cannot_reuse_held_authority() {
+        let _gate = crate::spawn_gate::locking();
         use std::os::unix::fs::symlink;
         let fixture = Fixture::new();
         let store = fixture.store(&Config::default());

@@ -73,6 +73,21 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
         .map_err(|error| fixture_startup_error(&fixture_options, error))
 }
 
+/// [`MemoryStore::open`], serialised against this lib's own advisory-lock
+/// tests; see `crate::spawn_gate`. Every real-engine open in the workspace
+/// behavioral fixtures (`store::recovery_tests`, `store::migration_lifecycle_tests`,
+/// `store::operational_gc_tests`) goes through this single choke point instead
+/// of the raw `MemoryStore::open` so the flock/posix_spawn race those fixtures'
+/// own concurrent spawns can otherwise open stays excluded without gating each
+/// call site by hand. Error text is passed through unchanged (unlike
+/// `open_fixture`), so it stays a drop-in replacement for assertions on the
+/// raw `MemoryStore::open` result.
+#[cfg(test)]
+pub(crate) async fn spawn_gated_open(options: OpenOptions) -> Result<MemoryStore> {
+    let _gate = crate::spawn_gate::spawning().await;
+    MemoryStore::open(options).await
+}
+
 pub(crate) fn fixture_startup_error(options: &OpenOptions, error: Error) -> Error {
     if !error.chain().any(|cause| {
         let message = cause.to_string();
@@ -431,6 +446,10 @@ mod tests {
 
     #[test]
     fn snapshots_survive_source_removal_and_replacement_and_reject_corrupt_private_bytes() {
+        // Held for the whole test: every `snapshot_supervisor` call below
+        // acquires and releases a real flock (`prepare.lock`), and this test
+        // never itself spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking();
         let root = tempdir().unwrap();
         let source = root.path().join("cargo alias");
         fs::write(&source, b"first compiled fixture").unwrap();

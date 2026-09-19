@@ -50,6 +50,7 @@ nix.workspace = true
 [dev-dependencies]
 kuru-memory = { workspace = true, features = ["test-support"] }
 kuru-delivery = { workspace = true, features = ["tooling"] }
+kuru-connectors = { workspace = true, features = ["test-support"] }
 async-trait.workspace = true
 tempfile.workspace = true
 axum.workspace = true

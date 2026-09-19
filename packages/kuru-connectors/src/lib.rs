@@ -13,6 +13,8 @@ mod redaction;
 mod retry;
 mod rpc;
 mod shell_diagnostic;
+#[cfg(any(test, feature = "test-support"))]
+pub mod shell_warmup;
 mod tool_output;
 mod tools;
 #[cfg(unix)]

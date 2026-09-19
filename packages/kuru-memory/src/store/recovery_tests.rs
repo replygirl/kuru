@@ -109,6 +109,8 @@ async fn spawn_process_loss_creator(
             command.env(name, value);
         }
     }
+    // Held across the spawn; see `crate::spawn_gate`.
+    let _gate = crate::spawn_gate::spawning().await;
     Ok(command.spawn()?)
 }
 
@@ -158,6 +160,8 @@ async fn spawn_process_loss_creator(
     command.stderr = NativeStdio::Handle(stderr);
     command.lifetime = Lifetime::TrustedSupervisor;
     command.console = Console::PrivateHidden;
+    // Held across the spawn; see `crate::spawn_gate`.
+    let _gate = crate::spawn_gate::spawning().await;
     Ok(command.spawn().await?)
 }
 
@@ -467,7 +471,7 @@ async fn paused_process_loss_child(root: &std::path::Path, scope: String) -> Res
     let (hooks, control) =
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);
     options.migration_hooks = Some(Arc::new(hooks));
-    let mut opening = tokio::spawn(MemoryStore::open(options));
+    let mut opening = tokio::spawn(crate::test_support::spawn_gated_open(options));
     observe_process_loss_ddl(&mut opening, &control, observation_deadline).await?;
     println!("{PROCESS_LOSS_READY}");
     std::io::stdout().flush()?;
@@ -526,7 +530,7 @@ async fn process_loss_observer_surfaces_open_error_before_ddl_deadline() -> Resu
     let (hooks, control) =
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::AfterDdl);
     options.migration_hooks = Some(Arc::new(hooks));
-    let mut opening = tokio::spawn(MemoryStore::open(options));
+    let mut opening = tokio::spawn(crate::test_support::spawn_gated_open(options));
 
     let error = observe_process_loss_ddl(&mut opening, &control, TEST_DEADLINE)
         .await
@@ -612,7 +616,7 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforeBranch);
     let mut recovery_options = options.clone();
     recovery_options.migration_hooks = Some(Arc::new(hooks));
-    let mut recovering = Box::pin(MemoryStore::open(recovery_options));
+    let mut recovering = Box::pin(crate::test_support::spawn_gated_open(recovery_options));
     std::future::poll_fn(|context| {
         std::task::Poll::Ready(
             match std::future::Future::poll(recovering.as_mut(), context) {
@@ -775,7 +779,11 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
     );
     recovered_candidate.close().await;
     recovered.close().await?;
-    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
+    let reopened = tokio::time::timeout(
+        TEST_DEADLINE,
+        crate::test_support::spawn_gated_open(options),
+    )
+    .await??;
     assert_eq!(reopened.revision().await?, recovered_head);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -868,7 +876,7 @@ async fn fresh_staging_process_loss_after_ddl_is_preserved_and_never_reused() ->
         vec![("kuru_migrations".into(), 0, "new table".into())]
     );
 
-    let store = MemoryStore::open(options.clone()).await?;
+    let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     assert_eq!(
         migrations::version(&store.pool).await?,
         migrations::CURRENT_VERSION
@@ -1120,7 +1128,7 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
         let completion_deadline = migration_observation_deadline(&options);
         let (hooks, control) = migrations::MigrationRunnerHooks::paused(boundary);
         options.migration_hooks = Some(Arc::new(hooks));
-        let opening = tokio::spawn(MemoryStore::open(options.clone()));
+        let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
         tokio::time::timeout(TEST_DEADLINE, control.reached())
             .await
             .context("migration worker did not reach its accepted cancellation boundary")??;
@@ -1131,20 +1139,23 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(80),
-                MemoryStore::open(options.clone())
+                crate::test_support::spawn_gated_open(options.clone())
             )
             .await
             .is_err(),
             "a competing opener acquired writer authority before the accepted worker reaped"
         );
         control.resume();
-        let store = tokio::time::timeout(completion_deadline, MemoryStore::open(options))
-            .await
-            .with_context(|| {
-                format!(
-                    "accepted migration worker did not finish after caller cancellation at {boundary:?}"
-                )
-            })??;
+        let store = tokio::time::timeout(
+            completion_deadline,
+            crate::test_support::spawn_gated_open(options),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "accepted migration worker did not finish after caller cancellation at {boundary:?}"
+            )
+        })??;
         assert_eq!(
             migrations::version(&store.pool).await?,
             migrations::CURRENT_VERSION
@@ -1321,7 +1332,9 @@ async fn lost_commit_reply_recovers_one_durable_update_and_reopens_without_repla
         format!("project/{}", "e".repeat(64)),
     )
     .unwrap();
-    let store = MemoryStore::open(options.clone()).await.unwrap();
+    let store = crate::test_support::spawn_gated_open(options.clone())
+        .await
+        .unwrap();
     let before = store.revision().await.unwrap();
     let proxy = AckDropProxy::start(
         store.pool.clone(),
@@ -1354,7 +1367,9 @@ async fn lost_commit_reply_recovers_one_durable_update_and_reopens_without_repla
     affected.pool.close().await;
     proxy.close().await;
     store.close().await.unwrap();
-    let reopened = MemoryStore::open(options).await.unwrap();
+    let reopened = crate::test_support::spawn_gated_open(options)
+        .await
+        .unwrap();
     assert_eq!(reopened.revision().await.unwrap(), revision);
     assert_eq!(
         reopened.history("conversation", 10).await.unwrap()[0].plain_text(),
@@ -2025,7 +2040,7 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
     let hooks = hooks.with_route(migrations::MigrationBoundary::BeforeCommit, reserved.port);
     let completion_deadline = migration_observation_deadline(&options);
     options.migration_hooks = Some(Arc::new(hooks));
-    let opening = tokio::spawn(MemoryStore::open(options.clone()));
+    let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
 
     let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
         .await
@@ -2054,10 +2069,11 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
         proxy.discarded.load(Ordering::Acquire),
         "fixture must discard the durable production migration DOLT_COMMIT reply"
     );
-    assert!(
-        proxy.session_ended.load(Ordering::Acquire),
-        "the proxy must observe the original routed SQL session end before reconciliation"
-    );
+    await_flag(&proxy.session_ended, TEST_DEADLINE)
+        .await
+        .context(
+            "the proxy must observe the original routed SQL session end before reconciliation",
+        )?;
     assert_eq!(
         migrations::version(&store.pool).await?,
         migrations::CURRENT_VERSION
@@ -2073,9 +2089,12 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
     store.close().await?;
     proxy.close().await;
 
-    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options))
-        .await
-        .context("reopen replayed a migration hook instead of recognizing the durable upgrade")??;
+    let reopened = tokio::time::timeout(
+        TEST_DEADLINE,
+        crate::test_support::spawn_gated_open(options),
+    )
+    .await
+    .context("reopen replayed a migration hook instead of recognizing the durable upgrade")??;
     assert_eq!(reopened.revision().await?, upgraded);
     let commits: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
@@ -2115,7 +2134,7 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforeBranch);
     let hooks = hooks.with_route(migrations::MigrationBoundary::BeforeBranch, reserved.port);
     options.migration_hooks = Some(Arc::new(hooks));
-    let opening = tokio::spawn(MemoryStore::open(options.clone()));
+    let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
     let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
         .await
         .context("production migration did not expose branch-route source")??;
@@ -2138,7 +2157,7 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
         .await
         .context("production migration did not reconcile lost branch reply")???;
     assert!(proxy.discarded.load(Ordering::Acquire));
-    assert!(proxy.session_ended.load(Ordering::Acquire));
+    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
     assert_eq!(
         store.get("branch-reply-source").await?,
         Some(json!("retained"))
@@ -2172,7 +2191,11 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
     let upgraded = store.revision().await?;
     store.close().await?;
     proxy.close().await;
-    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
+    let reopened = tokio::time::timeout(
+        TEST_DEADLINE,
+        crate::test_support::spawn_gated_open(options),
+    )
+    .await??;
     assert_eq!(reopened.revision().await?, upgraded);
     assert_eq!(
         reopened.get("branch-reply-source").await?,
@@ -2210,7 +2233,7 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforePublish);
     let hooks = hooks.with_route(migrations::MigrationBoundary::BeforePublish, reserved.port);
     options.migration_hooks = Some(Arc::new(hooks));
-    let opening = tokio::spawn(MemoryStore::open(options.clone()));
+    let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
     let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
         .await
         .context("production migration did not expose publish-route source")??;
@@ -2233,7 +2256,7 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
         .await
         .context("production migration did not reconcile lost fast-forward reply")???;
     assert!(proxy.discarded.load(Ordering::Acquire));
-    assert!(proxy.session_ended.load(Ordering::Acquire));
+    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
     let completed = store.revision().await?;
     let parent: String = sqlx::query_scalar(
         "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
@@ -2277,7 +2300,11 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
     );
     store.close().await?;
     proxy.close().await;
-    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
+    let reopened = tokio::time::timeout(
+        TEST_DEADLINE,
+        crate::test_support::spawn_gated_open(options),
+    )
+    .await??;
     assert_eq!(reopened.revision().await?, completed);
     assert_eq!(
         reopened.get("fast-forward-reply-source").await?,
@@ -2315,7 +2342,7 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
         migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforePublish);
     let hooks = hooks.with_route(migrations::MigrationBoundary::BeforePublish, reserved.port);
     options.migration_hooks = Some(Arc::new(hooks));
-    let opening = tokio::spawn(MemoryStore::open(options.clone()));
+    let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
     let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
         .await
         .context("production migration did not expose absent-publish route source")??;
@@ -2341,7 +2368,7 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
         proxy.discarded.load(Ordering::Acquire),
         "fixture must drop the merge request before dispatch: {error:#}"
     );
-    assert!(proxy.session_ended.load(Ordering::Acquire));
+    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
     proxy.close().await;
     options.migration_hooks = None;
 
@@ -2360,7 +2387,11 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
     );
     inspection_main.close().await;
     inspection.close().await?;
-    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
+    let reopened = tokio::time::timeout(
+        TEST_DEADLINE,
+        crate::test_support::spawn_gated_open(options),
+    )
+    .await??;
     let completed = reopened.revision().await?;
     let parent: String = sqlx::query_scalar(
         "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
@@ -2537,6 +2568,27 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
     assert_candidate_unchanged(&candidate).await;
 
     current.close().await.unwrap();
+}
+
+/// Wait for a fixture-owned flag to become true, bounded by `duration`.
+///
+/// `session_ended` is set from the `AckDropProxy`'s own spawned task, a task
+/// distinct from (and unordered with respect to) the task driving
+/// `MemoryStore::open()` that the caller is typically awaiting alongside it.
+/// The flag is set only after the proxy observes the routed SQL session's
+/// actual server-side teardown (`await_session_end`), which can lag the
+/// socket shutdown that unblocks `open()` by an unbounded amount of
+/// wall-clock time — so a bare `.load()` races. Poll instead of asserting
+/// synchronously, mirroring the bounded `durable_observation` poll used
+/// elsewhere in this file for the same out-of-band-condition shape.
+async fn await_flag(flag: &AtomicBool, duration: Duration) -> Result<()> {
+    tokio::time::timeout(duration, async {
+        while !flag.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("fixture flag did not become true")
 }
 
 struct AckDropProxy {

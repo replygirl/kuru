@@ -334,18 +334,26 @@ pub(super) fn remove_tree(
 ) -> Result<(), (PublicationPhase, io::Error)> {
     let mut removed = false;
     let _ancestors = pin_ancestors(ancestors, &mut removed)?;
-    let root_pin = pin_directory(path, expected, &mut removed)?;
-    remove_children(path, root_pin, &mut removed, 0)?;
-    remove_empty_directory(path, held, expected).map_err(|(failure, error)| {
-        (
-            if removed {
-                PublicationPhase::Uncertain
-            } else {
-                failure
-            },
-            error,
-        )
-    })?;
+    // A root that is already absent is the outcome this removal wants, not a
+    // rejection: an earlier attempt, or the holder of a pending delete, got
+    // there first. The absence check below still proves the outcome.
+    match pin_directory(path, expected, &mut removed) {
+        Ok(root_pin) => {
+            remove_children(path, root_pin, &mut removed, 0)?;
+            remove_empty_directory(path, held, expected).map_err(|(failure, error)| {
+                (
+                    if removed {
+                        PublicationPhase::Uncertain
+                    } else {
+                        failure
+                    },
+                    error,
+                )
+            })?;
+        }
+        Err((_, error)) if error.kind() == io::ErrorKind::NotFound => drop(held),
+        Err(failure) => return Err(failure),
+    }
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err((PublicationPhase::Uncertain, error)),
@@ -401,6 +409,19 @@ fn pin_directory(
     Ok(current)
 }
 
+/// Map an already-absent target to a completed step; every other failure keeps
+/// its phase and error.
+fn absent_is_done<T>(
+    result: io::Result<T>,
+    removed: bool,
+) -> Result<Option<T>, (PublicationPhase, io::Error)> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err((phase(removed), error)),
+    }
+}
+
 fn remove_children(
     directory: &Path,
     pin: File,
@@ -418,26 +439,47 @@ fn remove_children(
         let name = entry.file_name();
         component(&name).map_err(|error| (phase(*removed), error))?;
         let path = entry.path();
-        let child_pin = open(
-            &path,
-            FILE_READ_ATTRIBUTES | READ_CONTROL,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            NameRetention::Pinned,
-            None,
-        )
-        .map_err(|error| (phase(*removed), error))?;
-        let child_info = info(&child_pin).map_err(|error| (phase(*removed), error))?;
-        let held = open(
-            &path,
-            FILE_READ_ATTRIBUTES | READ_CONTROL,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            NameRetention::Movable,
-            None,
-        )
-        .map_err(|error| (phase(*removed), error))?;
-        let held_info = info(&held).map_err(|error| (phase(*removed), error))?;
+        #[cfg(test)]
+        super::enumeration_seam::observe();
+        // An enumerated name already gone by the time this removal opens it -
+        // a delete-pending entry whose last handle closed after the
+        // enumeration - is the outcome this loop wants, not a rejection.
+        // `removed` stays untouched: we performed no removal here, and the
+        // final absence check still proves the tree's disappearance.
+        let Some(child_pin) = absent_is_done(
+            open(
+                &path,
+                FILE_READ_ATTRIBUTES | READ_CONTROL,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                NameRetention::Pinned,
+                None,
+            ),
+            *removed,
+        )?
+        else {
+            continue;
+        };
+        let Some(child_info) = absent_is_done(info(&child_pin), *removed)? else {
+            continue;
+        };
+        let Some(held) = absent_is_done(
+            open(
+                &path,
+                FILE_READ_ATTRIBUTES | READ_CONTROL,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                NameRetention::Movable,
+                None,
+            ),
+            *removed,
+        )?
+        else {
+            continue;
+        };
+        let Some(held_info) = absent_is_done(info(&held), *removed)? else {
+            continue;
+        };
         if held_info.file.identity != child_info.file.identity
             || held_info.directory != child_info.directory
         {
@@ -491,15 +533,20 @@ fn remove_empty_directory(
             denied("retained directory no longer has the expected identity"),
         ));
     }
-    let deletion = open(
+    // A directory name that is already absent needs no deletion; that is this
+    // removal's outcome, not a rejection.
+    let deletion = match open(
         path,
         DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES,
         OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS,
         NameRetention::Movable,
         None,
-    )
-    .map_err(|error| (PublicationPhase::Rejected, error))?;
+    ) {
+        Ok(deletion) => deletion,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err((PublicationPhase::Rejected, error)),
+    };
     let actual = info(&deletion).map_err(|error| (PublicationPhase::Rejected, error))?;
     if !actual.directory || actual.file.identity != held_info.file.identity {
         return Err((
@@ -770,6 +817,59 @@ mod tests {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => panic!("held root had an unexpected cleanup result: {error}"),
         }
+        assert_eq!(
+            std::fs::symlink_metadata(&root_path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    /// The mapping behind the cold-start cleanup failure: a delete-pending
+    /// entry is still enumerated, and once its last handle closes the name is
+    /// gone, so the removal's own opens see ERROR_FILE_NOT_FOUND. That is this
+    /// removal's outcome, not a rejection.
+    #[test]
+    fn checked_tree_removal_completes_when_a_pending_delete_finishes_after_enumeration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root_path = temporary.path().join("root");
+        let root = Directory::ensure_private(&root_path).unwrap();
+        root.create_new(OsStr::new("pending"))
+            .unwrap()
+            .write_all(b"delete-pending bytes")
+            .unwrap();
+        root.create_new(OsStr::new("retained"))
+            .unwrap()
+            .write_all(b"ordinary bytes")
+            .unwrap();
+        let deletion = open(
+            &root_path.join("pending"),
+            DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: this DELETE-capable handle on the test's own fixture file
+        // stays live for the synchronous disposition request, which follows the
+        // same class and layout as the checked removal above.
+        let status = unsafe {
+            SetFileInformationByHandle(
+                deletion.as_raw_handle(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        assert_ne!(status, 0, "the fixture must reach a delete-pending state");
+        // Close the last handle in the window between enumeration and the
+        // removal's own open, completing the pending delete right there.
+        let mut deletion = Some(deletion);
+        let _seam = crate::fs::enumeration_seam::install(move || {
+            deletion.take();
+        });
+
+        root.remove_tree().unwrap();
         assert_eq!(
             std::fs::symlink_metadata(&root_path).unwrap_err().kind(),
             io::ErrorKind::NotFound

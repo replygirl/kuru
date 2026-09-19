@@ -1,0 +1,6 @@
+## 1. Test-only spawn gate
+
+- [x] 1.1 Add a `#[cfg(test)]` `spawn_gate` module to the `kuru` crate owning one `RwLock<()>`, with an exclusive `locking`/`locking_async` helper for advisory-lock acquisition and a shared `spawning` helper for child-process creation, documented with the `flock` open-file-description and `posix_spawn` descriptor-table rationale, and verify it compiles out of non-test builds.
+- [x] 1.2 Add a deterministic regression test that injects the observation instead of timing it: while the shared guard is held, a thread blocked on the exclusive guard has demonstrably not acquired it, and it acquires only after the shared guard is released; verify the test is ordering-sensitive and never wall-clock dependent.
+- [x] 1.3 Take the exclusive guard in every advisory-lock test in the binary (`permission_store.rs`, `trust.rs`, `cli.rs`) and the shared guard across every child-process creation (`MemoryStore::temporary` and `MemoryStore::open` in `ui/runtime_tests.rs` and `memory_notice.rs`, both `/bin/sh` spawns in `authentication.rs`), and verify no assertion, timeout, retry or `#[ignore]` was introduced.
+- [x] 1.4 Run the owning package's tests repeatedly with the real bundled engine and the package's static checks, record the observed evidence, and validate and archive this change.
