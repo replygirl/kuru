@@ -52,7 +52,7 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
     Directory::ensure_private(&data)?;
     let scope = format!("project/{}", "c".repeat(64));
     let options = crate::test_support::open_options(data, scope.clone())?;
-    let initialized = MemoryStore::open(options.clone()).await?;
+    let initialized = crate::test_support::spawn_gated_open(options.clone()).await?;
     initialized.close().await?;
 
     let directory = project_directory(&options.data_dir, &scope)?;
@@ -68,30 +68,42 @@ async fn interrupted_migration_close_handoff_retains_guard_until_supervisor_quie
         .file_name()
         .context("fixture memory directory has no name")?;
     let guard = locks.lock_file(name)?;
-    match guard.try_lock() {
-        Ok(()) => {}
-        Err(error) => bail!("fixture startup guard was unexpectedly unavailable: {error}"),
+    {
+        // Held only across the actual flock acquisition; see `crate::spawn_gate`.
+        // `guard` is then handed to `Server::open_with_guard` below and held
+        // through its own spawn by design (AGENTS.md: "hold the stable
+        // lifecycle lock through migration/recovery directory moves"), so the
+        // gate must not still be held when that call is reached.
+        let _gate = crate::spawn_gate::locking_async().await;
+        match guard.try_lock() {
+            Ok(()) => {}
+            Err(error) => bail!("fixture startup guard was unexpectedly unavailable: {error}"),
+        }
     }
     let contender = locks.lock_file(name)?;
     let lifecycle_root = cfg!(windows).then(|| options.data_dir.join("memory/lifecycles"));
-    let server = Server::open_with_guard(
-        ServerOptions {
-            binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt"))
-                .await?,
-            directory: directory.clone(),
-            project_scope: scope,
-            supervisor: options
-                .supervisor
-                .clone()
-                .context("close-handoff fixture needs supervisor")?,
-            timeout: Duration::from_secs(options.config.startup_timeout_secs),
-            read_only: false,
-            retained: Some(root.clone()),
-            lifecycle_root: lifecycle_root.clone(),
-        },
-        guard,
-    )
-    .await?;
+    let server = {
+        // Held across the owned supervisor spawn; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::spawning().await;
+        Server::open_with_guard(
+            ServerOptions {
+                binary: provision::provision(&options.config, &options.data_dir.join("tools/dolt"))
+                    .await?,
+                directory: directory.clone(),
+                project_scope: scope,
+                supervisor: options
+                    .supervisor
+                    .clone()
+                    .context("close-handoff fixture needs supervisor")?,
+                timeout: Duration::from_secs(options.config.startup_timeout_secs),
+                read_only: false,
+                retained: Some(root.clone()),
+                lifecycle_root: lifecycle_root.clone(),
+            },
+            guard,
+        )
+        .await?
+    };
     let pool = server.pool("main").await?;
     let mut held = pool.acquire().await?;
     let closing = tokio::spawn(close_migration_worker(server, pool.clone()));
@@ -238,10 +250,13 @@ async fn inspection_owned_old_schema_blocks_writer_without_mutation() -> Result<
 
     options.config.startup_timeout_secs = 1;
     options.config.validate()?;
-    let error = tokio::time::timeout(Duration::from_secs(6), MemoryStore::open(options.clone()))
-        .await
-        .context("contending writer did not reach its bounded ownership result")?
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        Duration::from_secs(6),
+        crate::test_support::spawn_gated_open(options.clone()),
+    )
+    .await
+    .context("contending writer did not reach its bounded ownership result")?
+    .unwrap_err();
     assert!(
         format!("{error:#}").contains("memory lifecycle lock is held; refusing takeover"),
         "unexpected writer contention error: {error:#}"
@@ -268,7 +283,7 @@ async fn inspection_owned_old_schema_blocks_writer_without_mutation() -> Result<
     inspector.close().await?;
 
     options.config.startup_timeout_secs = 30;
-    let upgraded = MemoryStore::open(options).await?;
+    let upgraded = crate::test_support::spawn_gated_open(options).await?;
     assert_current_store(&upgraded).await?;
     upgraded.close().await?;
     Ok(())
@@ -280,7 +295,7 @@ async fn fresh_and_byte_sensitive_wal_import_publish_current_receipts_once() -> 
     let fresh_scope = format!("project/{}", "8".repeat(64));
     let fresh_options =
         crate::test_support::open_options(fresh_root.path().to_owned(), fresh_scope.clone())?;
-    let fresh = MemoryStore::open(fresh_options.clone()).await?;
+    let fresh = crate::test_support::spawn_gated_open(fresh_options.clone()).await?;
     assert_current_store(&fresh).await?;
     let fresh_activation = read_activation(
         &project_directory(&fresh_options.data_dir, &fresh_scope)?,
@@ -338,7 +353,7 @@ async fn fresh_and_byte_sensitive_wal_import_publish_current_receipts_once() -> 
     let snapshot_bytes = fs::read(&prepared.receipt.snapshot)?;
 
     let options = crate::test_support::open_options(import_root.path().to_owned(), scope.clone())?;
-    let imported = MemoryStore::open(options.clone()).await?;
+    let imported = crate::test_support::spawn_gated_open(options.clone()).await?;
     assert_current_store(&imported).await?;
     assert_eq!(
         imported
@@ -376,7 +391,7 @@ async fn fresh_and_byte_sensitive_wal_import_publish_current_receipts_once() -> 
     assert_eq!(fs::read(&source_path)?, source_bytes);
     assert_eq!(fs::read(&wal_path)?, wal_bytes);
     assert_eq!(fs::read(&prepared.receipt.snapshot)?, snapshot_bytes);
-    let reopened = MemoryStore::open(options).await?;
+    let reopened = crate::test_support::spawn_gated_open(options).await?;
     assert_current_store(&reopened).await?;
     assert_eq!(reopened.revision().await?, activation.initial_revision);
     assert_eq!(

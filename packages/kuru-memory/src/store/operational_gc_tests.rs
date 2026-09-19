@@ -155,7 +155,7 @@ async fn dirty_promoting_retry_publishes_the_committed_head_but_preserves_the_re
         directory.path().to_path_buf(),
         format!("project/{}", "9".repeat(64)),
     )?;
-    let store = MemoryStore::open(options.clone()).await?;
+    let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     let candidate = store.begin_candidate("dirty retry").await?;
     candidate
         .view()
@@ -187,7 +187,7 @@ async fn dirty_promoting_retry_publishes_the_committed_head_but_preserves_the_re
     drop(candidate);
     store.close().await?;
 
-    let reopened = MemoryStore::open(options.clone()).await?;
+    let reopened = crate::test_support::spawn_gated_open(options.clone()).await?;
     assert_eq!(reopened.revision().await?, target);
     assert_eq!(
         candidate_heads(&reopened.pool, &names)
@@ -235,7 +235,7 @@ async fn dirty_promoting_retry_publishes_the_committed_head_but_preserves_the_re
     drop(preserved);
     reopened.close().await?;
 
-    let recovered = MemoryStore::open(options).await?;
+    let recovered = crate::test_support::spawn_gated_open(options).await?;
     assert!(candidate_heads(&recovered.pool, &names).await?.is_empty());
     assert_eq!(
         recovered.get("committed candidate write").await?,
@@ -285,7 +285,7 @@ async fn startup_reclaims_only_resolved_status_and_never_finishes_a_pending_prom
         directory.path().to_path_buf(),
         format!("project/{}", "7".repeat(64)),
     )?;
-    let store = MemoryStore::open(options.clone()).await?;
+    let store = crate::test_support::spawn_gated_open(options.clone()).await?;
 
     let unmerged = store.begin_candidate("unmerged").await?;
     unmerged.view().put("unmerged", &json!(true)).await?;
@@ -324,7 +324,7 @@ async fn startup_reclaims_only_resolved_status_and_never_finishes_a_pending_prom
     assert_eq!(store.revision().await?, merged_target);
     store.close().await?;
 
-    let reopened = MemoryStore::open(options).await?;
+    let reopened = crate::test_support::spawn_gated_open(options).await?;
     assert_eq!(reopened.revision().await?, merged_target);
     let unmerged_heads = candidate_heads(&reopened.pool, &unmerged_names).await?;
     assert_eq!(
@@ -362,7 +362,7 @@ async fn startup_reconciles_equal_dual_refs_and_preserves_mismatched_refs() -> R
         directory.path().to_path_buf(),
         format!("project/{}", "6".repeat(64)),
     )?;
-    let store = MemoryStore::open(options.clone()).await?;
+    let store = crate::test_support::spawn_gated_open(options.clone()).await?;
 
     let equal = store.begin_candidate("equal dual refs").await?;
     equal.view().put("equal dual refs", &json!(true)).await?;
@@ -396,7 +396,7 @@ async fn startup_reconciles_equal_dual_refs_and_preserves_mismatched_refs() -> R
     drop(mismatch);
     store.close().await?;
 
-    let reopened = MemoryStore::open(options).await?;
+    let reopened = crate::test_support::spawn_gated_open(options).await?;
     assert!(
         candidate_heads(&reopened.pool, &equal_names)
             .await?
@@ -429,7 +429,7 @@ async fn cancelled_startup_recovery_reaps_before_handoff_and_preserves_pending_i
         directory.path().to_path_buf(),
         format!("project/{}", "8".repeat(64)),
     )?;
-    let store = MemoryStore::open(options.clone()).await?;
+    let store = crate::test_support::spawn_gated_open(options.clone()).await?;
     let base = store.revision().await?;
     let candidate = store.begin_candidate("cancelled recovery").await?;
     candidate.view().put("pending", &json!(true)).await?;
@@ -446,7 +446,7 @@ async fn cancelled_startup_recovery_reaps_before_handoff_and_preserves_pending_i
         reached: reached.clone(),
         resume: resume.clone(),
     }));
-    let opening = tokio::spawn(MemoryStore::open(interrupted));
+    let opening = tokio::spawn(crate::test_support::spawn_gated_open(interrupted));
     let _permit = tokio::time::timeout(TEST_DEADLINE, reached.acquire()).await??;
     opening.abort();
     assert!(
@@ -457,7 +457,11 @@ async fn cancelled_startup_recovery_reaps_before_handoff_and_preserves_pending_i
     );
     resume.add_permits(1);
 
-    let reopened = tokio::time::timeout(TEST_DEADLINE, MemoryStore::open(options)).await??;
+    let reopened = tokio::time::timeout(
+        TEST_DEADLINE,
+        crate::test_support::spawn_gated_open(options),
+    )
+    .await??;
     assert_eq!(reopened.revision().await?, base);
     let heads = candidate_heads(&reopened.pool, &names).await?;
     assert_eq!(heads.get(&names.promoting), Some(&target));
