@@ -122,11 +122,20 @@ async fn provision_with_extractor_observed(
     private_directory(&versions)?;
     let destination = versions.join(asset.target);
     if destination_exists(&destination)? {
+        // The common case: an already-published engine. Sweeping here is the
+        // only way a leftover stage from a past publication is ever
+        // collected without a fresh install, so it must stay opportunistic -
+        // no lock is taken unless a receipt exists, and none is waited for.
+        warm_sweep_if_receipted(&cache, &versions);
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
         return verify_existing_cache(&destination, asset, progress).await;
     }
     progress.report(MemoryOpenStage::WaitingForRuntimeCache);
     let lock = cache_lock(&cache, LOCK_TIMEOUT).await?;
+    // Collect any stage a past publication receipted before this installer
+    // creates its own; the exclusive lock already held here is exactly the
+    // serialization point that makes a swept stage safe to remove.
+    let _ = sweep_leftover_stages(&versions, &lock);
     if destination_exists(&destination)? {
         drop(lock);
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
@@ -1006,13 +1015,32 @@ impl std::ops::Deref for CacheLock {
     }
 }
 
-async fn cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
+struct LockHandle {
+    directory: Directory,
+    file: File,
+    path: PathBuf,
+}
+
+fn open_lock_handle(directory: &Path) -> Result<LockHandle> {
     let path = directory.join(".install.lock");
     let directory = files::open_directory(directory, Privacy::OwnerOnly, NameRetention::Pinned)?;
     let file = directory
         .lock_file(files::name(&path)?)
         .context("open stable Dolt installation lock")?;
     checked_regular(&path, false)?;
+    Ok(LockHandle {
+        directory,
+        file,
+        path,
+    })
+}
+
+async fn cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
+    let LockHandle {
+        directory,
+        file,
+        path,
+    } = open_lock_handle(directory)?;
     let start = tokio::time::Instant::now();
     loop {
         directory.verify(files::name(&path)?, &file)?;
@@ -1035,6 +1063,164 @@ async fn cache_lock(directory: &Path, timeout: Duration) -> Result<CacheLock> {
         file,
         _directory: directory,
     })
+}
+
+/// Attempt the exclusive Dolt installation lock without waiting for it.
+/// `Ok(None)` means another installer currently holds it - a warm-open
+/// caller treats that exactly like an error-free skip, never a failure.
+fn try_cache_lock(directory: &Path) -> Result<Option<CacheLock>> {
+    let LockHandle {
+        directory,
+        file,
+        path,
+    } = open_lock_handle(directory)?;
+    directory.verify(files::name(&path)?, &file)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(error) => return Err(error).context("lock Dolt installation"),
+    }
+    directory
+        .verify(files::name(&path)?, &file)
+        .context("Dolt installation lock was replaced while waiting")?;
+    Ok(Some(CacheLock {
+        file,
+        _directory: directory,
+    }))
+}
+
+/// Leftover install stages a sweep could not collect, summed across every
+/// receipt it read. Reaching this many changes nothing about removal - the
+/// cap only sets `SweepOutcome::reached_cap` (surfaced by a later change;
+/// see `docs/memory.md`), and no stage whose removal is rejected or
+/// uncertain is ever deleted because of it.
+const LEFTOVER_STAGE_CAP: usize = 8;
+
+/// One collection pass over `versions/.leftovers`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepOutcome {
+    pub collected: usize,
+    pub remaining: usize,
+    /// `remaining >= LEFTOVER_STAGE_CAP`. Reporting-only: nothing reads this
+    /// yet to decide what to delete, and nothing ever should.
+    pub reached_cap: bool,
+}
+
+/// A receipt as read back: only the fields the sweep needs to re-locate and
+/// validate its own stage before touching it. Extra fields (the cause, the
+/// digest, …) are ignored here, never rejected.
+#[derive(serde::Deserialize)]
+struct StoredLeftoverStage {
+    version: u32,
+    stage: String,
+}
+
+/// Collect every retained install stage this `versions` directory has a
+/// receipt for. Runs only while the caller holds the installation lock -
+/// taking `&CacheLock` by reference makes that a type-level fact; this
+/// function never acquires or releases it. Only a receipted `.install-*`
+/// directory is ever touched: a stage nothing has receipted (including one a
+/// concurrent installer is writing right now, since that installer holds the
+/// same lock this caller does) is left exactly alone, and a removal that is
+/// rejected or uncertain leaves both the stage and its receipt for the next
+/// sweep - never a retry loop, never a deletion on uncertainty.
+fn sweep_leftover_stages(versions: &Path, _lock: &CacheLock) -> SweepOutcome {
+    let mut outcome = SweepOutcome::default();
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    let Ok(entries) = fs::read_dir(&receipts_path) else {
+        return outcome; // no `.leftovers` directory: nothing to sweep
+    };
+    let Ok(receipts) =
+        files::open_directory(&receipts_path, Privacy::OwnerOnly, NameRetention::Movable)
+    else {
+        return outcome;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".json") {
+            continue; // e.g. the `staging` directory `files::write` uses
+        }
+        sweep_one_leftover_stage(versions, &receipts, name, &mut outcome);
+    }
+    outcome.reached_cap = outcome.remaining >= LEFTOVER_STAGE_CAP;
+    outcome
+}
+
+fn sweep_one_leftover_stage(
+    versions: &Path,
+    receipts: &Directory,
+    name: &str,
+    outcome: &mut SweepOutcome,
+) {
+    let Ok(bytes) = fs::read(receipts.path().join(name)) else {
+        outcome.remaining += 1;
+        return;
+    };
+    let Ok(receipt) = serde_json::from_slice::<StoredLeftoverStage>(&bytes) else {
+        outcome.remaining += 1; // unparsable: leave it, never delete blindly
+        return;
+    };
+    if receipt.version != 1
+        || !receipt.stage.starts_with(".install-")
+        || receipt.stage.contains(['/', '\\'])
+    {
+        outcome.remaining += 1; // a foreign-shaped receipt: leave it
+        return;
+    }
+    let stage = versions.join(&receipt.stage);
+    match fs::symlink_metadata(&stage) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The stage is already gone; only the receipt is left to collect.
+            collect_leftover_receipt(receipts, name, outcome);
+        }
+        Err(_) => outcome.remaining += 1,
+        Ok(metadata) if !metadata.is_dir() => outcome.remaining += 1,
+        Ok(_) => match files::open_directory(&stage, Privacy::OwnerOnly, NameRetention::Movable) {
+            Ok(directory) => match directory.remove_tree() {
+                Ok(()) => collect_leftover_receipt(receipts, name, outcome),
+                Err(_) => outcome.remaining += 1, // Rejected or Uncertain: leave both
+            },
+            Err(_) => outcome.remaining += 1,
+        },
+    }
+}
+
+fn collect_leftover_receipt(receipts: &Directory, name: &str, outcome: &mut SweepOutcome) {
+    if let Ok(file) = receipts.read(std::ffi::OsStr::new(name)) {
+        let _ = receipts.remove_file(std::ffi::OsStr::new(name), file);
+    }
+    outcome.collected += 1;
+}
+
+/// Best-effort: a leftover-stage sweep never turns a warm open into a failed
+/// one. An absent `.leftovers` directory is the ordinary case and costs one
+/// metadata call; the exclusive installation lock is taken only when at
+/// least one receipt exists, and only when it is immediately free.
+fn warm_sweep_if_receipted(cache: &Path, versions: &Path) {
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    let has_receipt = match fs::symlink_metadata(&receipts_path) {
+        Ok(metadata) if metadata.is_dir() => fs::read_dir(&receipts_path)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(".json"))
+                })
+            })
+            .unwrap_or(false),
+        _ => false,
+    };
+    if !has_receipt {
+        return;
+    }
+    if let Ok(Some(lock)) = try_cache_lock(cache) {
+        let _ = sweep_leftover_stages(versions, &lock);
+        drop(lock);
+    }
 }
 
 pub(crate) fn private_directory(path: &Path) -> Result<()> {

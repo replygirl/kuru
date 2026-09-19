@@ -1239,7 +1239,259 @@ async fn exhausted_stage_cleanup_publishes_the_engine_and_receipts_the_retained_
         .unwrap(),
         binary
     );
-    assert!(retained.is_dir());
+    // A follow-up open takes the warm path and sweeps the stage its receipt
+    // named, now that nothing forces cleanup to fail again.
+    assert!(
+        !retained.exists(),
+        "a follow-up open sweeps the retained stage"
+    );
+    assert!(
+        !written[0].exists(),
+        "a follow-up open collects the receipt once its stage is gone"
+    );
+}
+
+fn leftover_receipt_files(receipts: &Path) -> Vec<PathBuf> {
+    fs::read_dir(receipts)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn cold_provision_sweeps_a_receipted_stage_before_creating_a_new_one() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        )
+        .await
+        .expect("a published engine must not fail its open because a stage stayed behind");
+    }
+
+    let versions = cache.canonicalize().unwrap().join(DOLT_VERSION);
+    let destination = versions.join(fixture.spec().target);
+    let receipts = versions.join(".leftovers");
+    let before = leftover_receipt_files(&receipts);
+    assert_eq!(before.len(), 1, "exactly one stage was receipted");
+    let stage_name: String = {
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&before[0]).unwrap()).unwrap();
+        value["stage"].as_str().unwrap().to_owned()
+    };
+    let stage_path = versions.join(&stage_name);
+    assert!(stage_path.is_dir());
+
+    // Make the next call take the cold path again, as if the published
+    // engine were reinstalled from scratch.
+    fs::remove_dir_all(&destination).unwrap();
+
+    let rebuilt = provision_managed(
+        &config,
+        &cache,
+        fixture.spec(),
+        Cow::Borrowed(&fixture.bytes),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rebuilt, destination.join("dolt"));
+    assert!(
+        !stage_path.exists(),
+        "the cold path sweeps the old receipted stage before installing again"
+    );
+    assert!(leftover_receipt_files(&receipts).is_empty());
+}
+
+#[tokio::test]
+async fn warm_open_skips_the_sweep_when_the_installation_lock_is_busy() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    let fixture = &*VALID_FIXTURE;
+    let config = MemoryConfig {
+        offline: true,
+        ..Default::default()
+    };
+
+    {
+        let _forced = crate::files::ForcedStageCleanupFailure::new();
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        )
+        .await
+        .unwrap();
+    }
+    let versions = cache.canonicalize().unwrap().join(DOLT_VERSION);
+    let receipts = versions.join(".leftovers");
+    assert_eq!(leftover_receipt_files(&receipts).len(), 1);
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let warm = tokio::time::timeout(
+        Duration::from_secs(2),
+        provision_managed(
+            &config,
+            &cache,
+            fixture.spec(),
+            Cow::Borrowed(&fixture.bytes),
+        ),
+    )
+    .await
+    .expect("a busy installation lock must not block a warm open")
+    .unwrap();
+    drop(lock);
+
+    assert_eq!(warm, versions.join("fixture-target").join("dolt"));
+    assert_eq!(
+        leftover_receipt_files(&receipts).len(),
+        1,
+        "a warm open leaves a receipted stage for the next attempt when the lock is busy"
+    );
+}
+
+#[tokio::test]
+async fn sweep_collects_only_receipted_stages() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("2.9.9-fixture");
+    private_directory(&versions).unwrap();
+
+    let receipted = versions.join(".install-receipted");
+    private_directory(&receipted).unwrap();
+    private_directory(&receipted.join("private")).unwrap();
+    let orphan = versions.join(".install-orphan");
+    private_directory(&orphan).unwrap();
+
+    let fixture = &*VALID_FIXTURE;
+    let failure = crate::files::StageCleanupFailure {
+        stage: receipted.clone(),
+        private: receipted.join("private"),
+        cause: anyhow::Error::msg("fixture cleanup failure"),
+    };
+    write_stage_receipt(&versions, &StageCleanupReport::new(failure, fixture.spec())).unwrap();
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let outcome = sweep_leftover_stages(&versions, &lock);
+    drop(lock);
+
+    assert_eq!(outcome.collected, 1);
+    assert_eq!(outcome.remaining, 0);
+    assert!(!receipted.exists(), "a receipted stage is collected");
+    assert!(
+        orphan.is_dir(),
+        "an unreceipted leftover stage is never swept"
+    );
+    assert!(leftover_receipt_files(&versions.join(".leftovers")).is_empty());
+}
+
+#[tokio::test]
+async fn sweep_leaves_a_stage_and_its_receipt_when_removal_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("3.1.1-fixture");
+    private_directory(&versions).unwrap();
+
+    let stage = versions.join(".install-blocked");
+    private_directory(&stage).unwrap();
+    let outside = versions.join("outside-target");
+    private_directory(&outside).unwrap();
+    symlink(&outside, stage.join("link")).unwrap();
+
+    let fixture = &*VALID_FIXTURE;
+    let failure = crate::files::StageCleanupFailure {
+        stage: stage.clone(),
+        private: stage.join("private"),
+        cause: anyhow::Error::msg("fixture cleanup failure"),
+    };
+    write_stage_receipt(&versions, &StageCleanupReport::new(failure, fixture.spec())).unwrap();
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let outcome = sweep_leftover_stages(&versions, &lock);
+    drop(lock);
+
+    assert_eq!(outcome.collected, 0);
+    assert_eq!(outcome.remaining, 1);
+    assert!(
+        stage.join("link").is_symlink(),
+        "a rejected removal leaves the stage untouched"
+    );
+    assert_eq!(
+        leftover_receipt_files(&versions.join(".leftovers")).len(),
+        1,
+        "a rejected removal leaves the receipt for a later attempt"
+    );
+}
+
+#[tokio::test]
+async fn sweep_reports_the_cap_without_deleting_any_uncollectable_stage() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("4.0.0-fixture");
+    private_directory(&versions).unwrap();
+
+    let fixture = &*VALID_FIXTURE;
+    let mut blocked = Vec::new();
+    for index in 0..LEFTOVER_STAGE_CAP {
+        let stage = versions.join(format!(".install-blocked-{index}"));
+        // A plain file where a directory is expected: the sweep's own guard
+        // must leave it, never a permission trick or a real removal race.
+        fs::write(&stage, b"not a directory").unwrap();
+        let failure = crate::files::StageCleanupFailure {
+            stage: stage.clone(),
+            private: stage.join("private"),
+            cause: anyhow::Error::msg("fixture cleanup failure"),
+        };
+        write_stage_receipt(&versions, &StageCleanupReport::new(failure, fixture.spec())).unwrap();
+        blocked.push(stage);
+    }
+
+    let lock = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
+    let outcome = sweep_leftover_stages(&versions, &lock);
+    drop(lock);
+
+    assert_eq!(outcome.collected, 0);
+    assert!(
+        outcome.remaining >= LEFTOVER_STAGE_CAP,
+        "the cap is reached: {}",
+        outcome.remaining
+    );
+    assert!(outcome.reached_cap);
+    for stage in &blocked {
+        assert!(
+            stage.is_file(),
+            "reaching the cap never deletes an uncollectable stage"
+        );
+    }
+    assert_eq!(
+        leftover_receipt_files(&versions.join(".leftovers")).len(),
+        LEFTOVER_STAGE_CAP,
+        "reaching the cap never drops a receipt"
+    );
 }
 
 #[test]

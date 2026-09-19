@@ -9,11 +9,11 @@
 
 ## 2. Sweep and cap (U-sweep)
 
-- [ ] 2.1 Add `sweep_leftover_stages(versions, &CacheLock)` using the existing checked `remove_tree` and verify it removes only receipted `.install-*` directories.
-- [ ] 2.2 Leave stage and receipt in place on any `Rejected` or `Uncertain` removal and verify nothing is deleted on uncertainty.
-- [ ] 2.3 Call the sweep on the cold path after the installation lock is acquired and verify a pre-existing receipted stage is collected before the new stage is created.
-- [ ] 2.4 Add the non-blocking `try_cache_lock` and the receipts-present warm-open sweep and verify warm opens take no lock when `versions/.leftovers` is absent and skip the sweep when the lock is busy.
-- [ ] 2.5 Add the documented count-based `LEFTOVER_STAGE_CAP` and verify reaching it only reports and never deletes.
+- [x] 2.1 Add `sweep_leftover_stages(versions, &CacheLock)` using the existing checked `remove_tree` and verify it removes only receipted `.install-*` directories. `sweep_collects_only_receipted_stages` passed 3/3 (an unreceipted `.install-orphan` sibling is left alone).
+- [x] 2.2 Leave stage and receipt in place on any `Rejected` or `Uncertain` removal and verify nothing is deleted on uncertainty. `sweep_leaves_a_stage_and_its_receipt_when_removal_is_rejected` forces a real `RemovalError` (symlink descendant) and passed 3/3; the shared `Err(_)` arm in `sweep_one_leftover_stage` is the same for `Rejected` and `Uncertain`.
+- [x] 2.3 Call the sweep on the cold path after the installation lock is acquired and verify a pre-existing receipted stage is collected before the new stage is created. `cold_provision_sweeps_a_receipted_stage_before_creating_a_new_one` passed 3/3.
+- [x] 2.4 Add the non-blocking `try_cache_lock` and the receipts-present warm-open sweep and verify warm opens take no lock when `versions/.leftovers` is absent and skip the sweep when the lock is busy. Pre-existing `warm_verification_does_not_wait_for_the_installation_lock` (absent case) still passes; new `warm_open_skips_the_sweep_when_the_installation_lock_is_busy` (receipted, busy lock) passed 3/3.
+- [x] 2.5 Add the documented count-based `LEFTOVER_STAGE_CAP` and verify reaching it only reports and never deletes. `sweep_reports_the_cap_without_deleting_any_uncollectable_stage` passed 3/3; `SweepOutcome::reached_cap` is the reporting hook, consumed nowhere yet.
 
 ## 3. Notice and documentation (U-notice-docs)
 

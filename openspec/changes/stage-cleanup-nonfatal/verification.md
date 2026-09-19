@@ -7,11 +7,11 @@
 
 ## 2. Collection
 
-- [ ] 2.1 @integration (agent) open again after a receipted leftover exists -> the sweep removes the stage and its receipt under the installation lock.
-- [ ] 2.2 @unit (agent) make the swept removal fail as `Uncertain` -> stage and receipt both remain and the next open retries once.
-- [ ] 2.3 @unit (agent) place an `.install-*` directory with no receipt beside a receipted one -> only the receipted stage is removed.
-- [ ] 2.4 @integration (agent) warm-open with no `versions/.leftovers` while another process holds the installation lock -> the open completes without acquiring or waiting on the lock.
-- [ ] 2.5 @unit (agent) exceed `LEFTOVER_STAGE_CAP` receipts -> the count is reported and nothing additional is deleted.
+- [x] 2.1 @integration (agent) open again after a receipted leftover exists -> the sweep removes the stage and its receipt under the installation lock. `provision::tests::cold_provision_sweeps_a_receipted_stage_before_creating_a_new_one` (cold path, lock held before `PrivateTemp::new`) and the extended `exhausted_stage_cleanup_publishes_the_engine_and_receipts_the_retained_stage` (warm path, follow-up open) both passed 3/3 on macOS.
+- [x] 2.2 @unit (agent) make the swept removal fail -> stage and receipt both remain. `provision::tests::sweep_leaves_a_stage_and_its_receipt_when_removal_is_rejected` forces a real `RemovalError` via a symlink descendant (the same cross-platform trick `fs.rs`'s `checked_tree_removal_rejects_a_symlink_descendant` already uses), taking the identical `Err(_) => outcome.remaining += 1` arm the sweep gives an `Uncertain` result; passed 3/3. A literal native `Uncertain` phase remains Windows-only and is review-verified (see 1.4/4.2), same as `RemovalError`'s existing Rejected/Uncertain split in `fs.rs`.
+- [x] 2.3 @unit (agent) place an `.install-*` directory with no receipt beside a receipted one -> only the receipted stage is removed. `provision::tests::sweep_collects_only_receipted_stages` passed 3/3.
+- [x] 2.4 @integration (agent) warm-open with no `versions/.leftovers` while another process holds the installation lock -> the open completes without acquiring or waiting on the lock. Pre-existing `provision::tests::warm_verification_does_not_wait_for_the_installation_lock` still passes unchanged; the new `provision::tests::warm_open_skips_the_sweep_when_the_installation_lock_is_busy` covers the receipts-present variant (a busy lock is skipped, not waited on, and the receipt survives for the next attempt) and passed 3/3.
+- [x] 2.5 @unit (agent) exceed `LEFTOVER_STAGE_CAP` receipts -> the count is reported and nothing additional is deleted. `provision::tests::sweep_reports_the_cap_without_deleting_any_uncollectable_stage` passed 3/3: `SweepOutcome::reached_cap` is set and every stage/receipt is left in place.
 
 ## 3. Surfacing and documentation
 
