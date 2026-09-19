@@ -262,7 +262,12 @@ async fn rejected_activation_preserves_verified_stage_and_occupied_destination()
     );
     let contender = open_regular(&cache.join(".install.lock")).unwrap();
     assert_eq!(regular_file_info(&contender).unwrap().identity, identity);
-    contender.try_lock().unwrap();
+    {
+        // Held across the actual flock acquisition this assertion proves
+        // succeeds; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        contender.try_lock().unwrap();
+    }
 }
 
 #[tokio::test]
@@ -582,7 +587,12 @@ async fn held_descendant_releases_after_checked_no_move_and_activation_recovers(
         regular_file_info(&contender).unwrap().identity,
         lock_identity
     );
-    contender.try_lock().unwrap();
+    {
+        // Held across the actual flock acquisition this assertion proves
+        // succeeds; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        contender.try_lock().unwrap();
+    }
 }
 
 #[cfg(windows)]
@@ -660,7 +670,12 @@ async fn persistent_held_descendant_exhausts_checked_recovery_and_preserves_stag
         regular_file_info(&contender).unwrap().identity,
         lock_identity
     );
-    contender.try_lock().unwrap();
+    {
+        // Held across the actual flock acquisition this assertion proves
+        // succeeds; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        contender.try_lock().unwrap();
+    }
 }
 
 #[cfg(windows)]
@@ -722,7 +737,12 @@ async fn cancelling_checked_activation_recovery_drops_stage_before_cache_lock() 
         regular_file_info(&contender).unwrap().identity,
         lock_identity
     );
-    contender.try_lock().unwrap();
+    {
+        // Held across the actual flock acquisition this assertion proves
+        // succeeds; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking_async().await;
+        contender.try_lock().unwrap();
+    }
 }
 
 #[test]

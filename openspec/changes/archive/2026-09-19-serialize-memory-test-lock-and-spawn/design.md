@@ -117,6 +117,28 @@ process, or opens/locks a file, without taking the shared or exclusive guard
 reopens the window for that specific operation; the module documentation
 states this explicitly at the definition.
 
+**2026-09-19 follow-up correction:** the "exhaustive" claim above understated
+its own scope. It covered every test/helper that opens and locks a file
+*through the choke-point helpers* (`spawn_gated_open`, `gated_cache_lock`,
+`gated_verify_version`), but several fixtures also call `File::try_lock`/
+`File::lock` directly on a contender handle to prove a lock was released
+(`provision/native_tests.rs`'s `..._preserves_verified_stage_and_occupied_destination`
+and three Windows-only recovery tests, `store.rs`'s
+`private_paths_and_stable_lock_fail_closed`, `test_support.rs`'s
+`snapshots_survive_source_removal_and_replacement_and_reject_corrupt_private_bytes`).
+These direct acquire-and-expect-success probes are exactly as vulnerable to
+the flock/posix_spawn race as the choke-point sites and were not covered by
+this design's original inventory. CI caught the gap
+(`rejected_activation_preserves_verified_stage_and_occupied_destination`
+failing `contender.try_lock().unwrap()` with a spurious `WouldBlock`); the
+follow-up change `fix/memory-test-spawn-gate` gates each such site
+individually with `locking`/`locking_async`. Probes that instead assert
+`Err(WouldBlock)` (proving a lock **is** held, e.g.
+`held_before_release`/`assert_startup_lock_held`) were correctly left
+ungated: a race-induced spurious `WouldBlock` cannot break an assertion that
+already expects `WouldBlock`, so only success-expecting acquisitions needed
+the gate.
+
 ## Operational surface
 
 None. The gate and its two `#[cfg(test)]` choke-point helpers compile only

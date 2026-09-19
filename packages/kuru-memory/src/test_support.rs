@@ -446,6 +446,10 @@ mod tests {
 
     #[test]
     fn snapshots_survive_source_removal_and_replacement_and_reject_corrupt_private_bytes() {
+        // Held for the whole test: every `snapshot_supervisor` call below
+        // acquires and releases a real flock (`prepare.lock`), and this test
+        // never itself spawns; see `crate::spawn_gate`.
+        let _gate = crate::spawn_gate::locking();
         let root = tempdir().unwrap();
         let source = root.path().join("cargo alias");
         fs::write(&source, b"first compiled fixture").unwrap();
