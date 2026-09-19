@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 use kuru_connectors::ToolHost;
+use kuru_connectors::shell_warmup::warm_up_stock_powershell_engine;
 use kuru_core::{Config, McpConfig};
 use kuru_platform::windows::process::{
     NativeSpawnSpec, Stdio, configured_command, environment_key_eq, merge_environment,
@@ -330,6 +331,11 @@ async fn file_alias_hardlink_and_reparse_guards_preserve_external_data() {
 
 #[tokio::test]
 async fn stock_powershell_unicode_and_terminating_errors_are_observed() {
+    // See `kuru_connectors::shell_warmup`: a cold stock-PowerShell 5.1 engine
+    // start can stall past this test's own `tool shell` timeouts. Warm the
+    // exact ToolHost stock-shell launch path once per process before the
+    // first timed `shell` call below.
+    warm_up_stock_powershell_engine().await.unwrap();
     let root = tempfile::tempdir().unwrap();
     let working = root.path().join("shell cwd café 東京");
     std::fs::create_dir(&working).unwrap();
@@ -384,6 +390,11 @@ async fn stock_powershell_unicode_and_terminating_errors_are_observed() {
 
 #[tokio::test]
 async fn retained_pinned_workspace_denies_replacement_and_keeps_shell_cwd() {
+    // See `kuru_connectors::shell_warmup`: a cold stock-PowerShell 5.1 engine
+    // start can stall past this test's own `tool shell` timeouts. Warm the
+    // exact ToolHost stock-shell launch path once per process before the
+    // timed `shell` call below.
+    warm_up_stock_powershell_engine().await.unwrap();
     let parent = tempfile::tempdir().unwrap();
     let workspace = parent.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
