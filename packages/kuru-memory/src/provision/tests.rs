@@ -1522,6 +1522,31 @@ async fn sweep_collects_only_receipted_stages() {
     assert!(leftover_receipt_files(&versions.join(".leftovers")).is_empty());
 }
 
+#[test]
+fn collect_leftover_receipt_never_counts_a_receipt_it_could_not_remove() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = temporary.path().join("cache");
+    private_directory(&cache).unwrap();
+    let cache = cache.canonicalize().unwrap();
+    let versions = cache.join("5.5.5-fixture");
+    private_directory(&versions).unwrap();
+    let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+    files::ensure_private_directory(&receipts_path).unwrap();
+    let receipts =
+        files::open_directory(&receipts_path, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+
+    let mut outcome = SweepOutcome::default();
+    // No receipt was ever written at this name: the read must fail, and the
+    // stage it would have named must not be miscounted as collected.
+    collect_leftover_receipt(&receipts, "missing-stage.json", &mut outcome);
+
+    assert_eq!(
+        outcome.collected, 0,
+        "a receipt that could not be read must never count as collected"
+    );
+    assert_eq!(outcome.remaining, 1);
+}
+
 #[tokio::test]
 async fn sweep_leaves_a_stage_and_its_receipt_when_removal_is_rejected() {
     let temporary = tempfile::tempdir().unwrap();

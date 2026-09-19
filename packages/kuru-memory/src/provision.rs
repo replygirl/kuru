@@ -126,7 +126,7 @@ async fn provision_with_extractor_observed(
         // only way a leftover stage from a past publication is ever
         // collected without a fresh install, so it must stay opportunistic -
         // no lock is taken unless a receipt exists, and none is waited for.
-        warm_sweep_if_receipted(&cache, &versions);
+        warm_sweep_if_receipted(cache, versions).await;
         progress.report(MemoryOpenStage::VerifyingRuntimeCache);
         return verify_existing_cache(&destination, asset, progress).await;
     }
@@ -309,20 +309,23 @@ fn write_stage_receipt(versions: &Path, report: &StageCleanupReport) -> Result<(
 
 /// Emit one structured diagnostics record for a retained install stage.
 ///
-/// This is a coarse summary of the typed report, collected only by the
-/// project's own diagnostics ring (`apps/kuru-tui/src/diagnostics.rs`, which
-/// admits exactly this target and these field names). It is never
-/// model-visible and never written to memory: nothing here touches the
-/// conversation, a provider request, or a database write. The full detail —
-/// including the first-cause message — stays in the private receipt on disk
-/// (`write_stage_receipt`); this event carries only the fixed, already
-/// safety-reviewed fields the ring admits.
+/// Carries exactly what the roadmap ruling requires be reported: the stage
+/// path, the first cause with its OS error, the bounded-recovery attempts and
+/// elapsed time, and that the engine was published and verified — in one
+/// event, collected only by the project's own diagnostics ring
+/// (`apps/kuru-tui/src/diagnostics.rs`, which admits exactly this target and
+/// these field names, truncating every string field to a bounded length). It
+/// is never model-visible and never written to memory: nothing here touches
+/// the conversation, a provider request, or a database write. The unabridged
+/// receipt (`write_stage_receipt`) remains the durable, on-disk copy of the
+/// same facts.
 fn emit_retained_stage_diagnostic(report: &StageCleanupReport) {
     tracing::warn!(
         target: "kuru.memory",
         stage = %report.stage.display(),
         digest = %report.executable_sha256,
         published = report.published,
+        first_cause = %report.first_cause,
         os_error = report.os_error,
         attempts = report.attempts,
         elapsed_ms = report.elapsed.map(|elapsed| elapsed.as_millis() as u64),
@@ -1197,13 +1200,38 @@ fn sweep_leftover_stages(versions: &Path, _lock: &CacheLock) -> SweepOutcome {
     outcome
 }
 
+/// A stored leftover-stage receipt is a few hundred bytes; anything past this
+/// generous bound is treated the same as unparsable, never read without a limit.
+const LEFTOVER_RECEIPT_LIMIT: u64 = 16 * 1024;
+
+/// Bounded, checked read of one receipt, using the already-open `.leftovers`
+/// directory so this never reopens or re-walks its parent. Mirrors
+/// `files::read_bytes`'s contract (size limit, then identity `verify`) rather
+/// than reading the file directly off the path.
+fn read_leftover_receipt(receipts: &Directory, name: &str) -> Result<Vec<u8>> {
+    let name = std::ffi::OsStr::new(name);
+    let mut file = receipts.read(name)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(LEFTOVER_RECEIPT_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= LEFTOVER_RECEIPT_LIMIT,
+        "retained-stage receipt exceeds its size limit"
+    );
+    receipts.verify(name, &file)?;
+    Ok(bytes)
+}
+
 fn sweep_one_leftover_stage(
     versions: &Path,
     receipts: &Directory,
     name: &str,
     outcome: &mut SweepOutcome,
 ) {
-    let Ok(bytes) = fs::read(receipts.path().join(name)) else {
+    let Ok(bytes) = read_leftover_receipt(receipts, name) else {
+        // Over the size limit or otherwise unreadable: leave it, report it,
+        // never delete a receipt (or its stage) blindly.
         outcome.remaining += 1;
         return;
     };
@@ -1236,21 +1264,41 @@ fn sweep_one_leftover_stage(
     }
 }
 
+/// Count a stage as collected only when its receipt is actually removed too -
+/// a stage whose tree is gone (fresh removal or already absent) but whose
+/// receipt read or removal fails is left for the next sweep instead, so
+/// `collected` never overstates what this pass actually reclaimed.
 fn collect_leftover_receipt(receipts: &Directory, name: &str, outcome: &mut SweepOutcome) {
-    if let Ok(file) = receipts.read(std::ffi::OsStr::new(name)) {
-        let _ = receipts.remove_file(std::ffi::OsStr::new(name), file);
+    let name = std::ffi::OsStr::new(name);
+    let removed = receipts
+        .read(name)
+        .ok()
+        .and_then(|file| receipts.remove_file(name, file).ok())
+        .is_some();
+    if removed {
+        outcome.collected += 1;
+    } else {
+        outcome.remaining += 1;
     }
-    outcome.collected += 1;
 }
 
 /// Best-effort: a leftover-stage sweep never turns a warm open into a failed
 /// one. An absent `.leftovers` directory is the ordinary case and costs one
-/// metadata call; the exclusive installation lock is taken only when at
-/// least one receipt exists, and only when it is immediately free.
-fn warm_sweep_if_receipted(cache: &Path, versions: &Path) {
+/// metadata call on the calling task, so the common warm open never crosses
+/// into a blocking-pool task at all. Only once a receipt might exist does the
+/// rest - the directory scan, the non-blocking lock attempt, and the sweep's
+/// own removals - run through `spawn_blocking`, exactly like the cold path's
+/// extraction and probe work (`provision.rs` above).
+async fn warm_sweep_if_receipted(cache: PathBuf, versions: PathBuf) {
     let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
-    let has_receipt = match fs::symlink_metadata(&receipts_path) {
-        Ok(metadata) if metadata.is_dir() => fs::read_dir(&receipts_path)
+    let is_leftovers_dir =
+        matches!(fs::symlink_metadata(&receipts_path), Ok(metadata) if metadata.is_dir());
+    if !is_leftovers_dir {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        let receipts_path = versions.join(LEFTOVER_STAGE_RECEIPTS);
+        let has_receipt = fs::read_dir(&receipts_path)
             .map(|entries| {
                 entries.flatten().any(|entry| {
                     entry
@@ -1259,17 +1307,17 @@ fn warm_sweep_if_receipted(cache: &Path, versions: &Path) {
                         .is_some_and(|name| name.ends_with(".json"))
                 })
             })
-            .unwrap_or(false),
-        _ => false,
-    };
-    if !has_receipt {
-        return;
-    }
-    if let Ok(Some(lock)) = try_cache_lock(cache) {
-        let outcome = sweep_leftover_stages(versions, &lock);
-        drop(lock);
-        report_leftover_stage_cap(outcome);
-    }
+            .unwrap_or(false);
+        if !has_receipt {
+            return;
+        }
+        if let Ok(Some(lock)) = try_cache_lock(&cache) {
+            let outcome = sweep_leftover_stages(&versions, &lock);
+            drop(lock);
+            report_leftover_stage_cap(outcome);
+        }
+    })
+    .await;
 }
 
 pub(crate) fn private_directory(path: &Path) -> Result<()> {

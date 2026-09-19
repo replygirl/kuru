@@ -270,6 +270,7 @@ impl SafeFields {
                 | "stage"
                 | "digest"
                 | "published"
+                | "first_cause"
                 | "os_error"
                 | "attempts"
                 | "receipt_error"
@@ -556,6 +557,7 @@ mod tests {
                 stage = "/private/cache/versions/1.2.3/.install-Ab12Cd",
                 digest = "deadbeef",
                 published = true,
+                first_cause = "Uncertain removal of a private install stage (os error 145)",
                 os_error = 145_i64,
                 attempts = 88_u64,
                 elapsed_ms = 2003_u64,
@@ -590,6 +592,10 @@ mod tests {
         );
         assert_eq!(retained["digest"], "deadbeef");
         assert_eq!(retained["published"], true);
+        assert_eq!(
+            retained["first_cause"], "Uncertain removal of a private install stage (os error 145)",
+            "the ruling's required first-cause-with-OS-error detail must reach the ring"
+        );
         assert_eq!(retained["os_error"], 145);
         assert_eq!(retained["attempts"], 88);
         assert_eq!(retained["elapsed_ms"], 2003);
