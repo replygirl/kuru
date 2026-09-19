@@ -94,6 +94,56 @@ async fn attempt() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs `future` to completion on a fresh, dedicated OS thread that owns its
+/// own `current_thread` Tokio runtime, then joins that thread and returns the
+/// future's output.
+///
+/// Safe to call whether or not the calling thread is already inside a Tokio
+/// runtime, and regardless of that ambient runtime's flavor. Building and
+/// entering a *second* runtime directly on a thread that is already driving
+/// one panics with "Cannot start a runtime from within a runtime"; the usual
+/// escape hatch, `tokio::task::block_in_place` + `Handle::block_on`, only
+/// works when the ambient runtime is the `multi_thread` flavor, not
+/// `current_thread` (the flavor `#[tokio::test]` defaults to, and the flavor
+/// several call sites build for their own sync-test warm-up). Running on an
+/// entirely separate OS thread sidesteps both constraints: Tokio's
+/// "already inside a runtime" check is thread-local, so a brand-new thread
+/// has no ambient runtime to collide with.
+///
+/// Compiled on Windows (its real caller, [`ensure_stock_powershell_warm`])
+/// and under `cfg(test)` on every platform, so its runtime-nesting logic
+/// stays covered by a non-Windows regression test even though it would
+/// otherwise be dead code on non-Windows release builds.
+#[cfg(any(windows, test))]
+fn block_on_dedicated_thread<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build dedicated warm-up runtime")
+            .block_on(future)
+    })
+    .join()
+    .expect("dedicated warm-up thread panicked")
+}
+
+/// Synchronous, call-site-safe wrapper around
+/// [`warm_up_stock_powershell_engine`] for test helpers that cannot
+/// `.await` directly (plain `fn` tests, and `Sandbox::new()` constructors
+/// shared by sync and async tests). Safe to call from a plain thread or from
+/// inside an already-running Tokio runtime of any flavor; see
+/// [`block_on_dedicated_thread`] for why that is sound. Every call still
+/// shares `warm_up_stock_powershell_engine`'s process-wide once-per-process
+/// semantics.
+#[cfg(windows)]
+pub fn ensure_stock_powershell_warm() {
+    block_on_dedicated_thread(warm_up_stock_powershell_engine()).expect("stock PowerShell warm-up");
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::warm_up_stock_powershell_engine;
@@ -106,5 +156,33 @@ mod tests {
         );
         first.unwrap();
         second.unwrap();
+    }
+}
+
+// `block_on_dedicated_thread` contains no Windows-specific logic — it is the
+// generic fix for nesting a blocking `block_on` inside a call that may
+// already be running on a Tokio runtime. Exercise it on every platform so
+// the core bug (see module docs on the Windows-only callers above) has a
+// non-Windows regression test.
+#[cfg(test)]
+mod dedicated_thread_tests {
+    use super::block_on_dedicated_thread;
+
+    #[test]
+    fn runs_a_plain_future_when_not_already_inside_a_runtime() {
+        let value = block_on_dedicated_thread(async { 6 * 7 });
+        assert_eq!(value, 42);
+    }
+
+    // Mirrors the real bug this module fixes: calling `Runtime::block_on`
+    // directly on a thread that is already inside a `current_thread`-flavor
+    // runtime (the flavor `#[tokio::test]` defaults to) panics with "Cannot
+    // start a runtime from within a runtime", and `block_in_place` cannot be
+    // used on that flavor either. Running the future on a dedicated thread
+    // must succeed here without panicking.
+    #[tokio::test]
+    async fn runs_from_inside_an_existing_current_thread_runtime_without_panicking() {
+        let value = block_on_dedicated_thread(async { "warmed" });
+        assert_eq!(value, "warmed");
     }
 }

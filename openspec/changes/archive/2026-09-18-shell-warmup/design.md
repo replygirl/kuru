@@ -57,11 +57,24 @@ in-process state reuse.
   OS process), each statically linking its own copy of `kuru-connectors`,
   so the module-level static is naturally scoped per test binary without a
   second, redundant `OnceCell`/`OnceLock` wrapper in each `tests/*.rs` file.
-  Each call site is a thin, uncached `fn ensure_powershell_warm()` that just
-  spins a current-thread Tokio runtime (matching the existing
+  Each call site is a thin, uncached `fn ensure_powershell_warm()`.
+  Originally (as first shipped in this change) it directly spun a
+  current-thread Tokio runtime and blocked on it, matching the existing
   `windows_cli.rs:415-418` `Builder::new_current_thread().block_on(...)`
   pattern already used elsewhere in this file for bridging a sync `#[test]`
-  into async code) and calls the shared, cached async function.
+  into async code. That direct pattern panics ("Cannot start a runtime from
+  within a runtime") when the same `Sandbox::new()`/wrapper call happens
+  inside a caller that is itself already on a Tokio runtime — e.g. an
+  `#[tokio::test]` async test constructing a `Sandbox` synchronously — which
+  Windows CI hit for `apps/kuru-tui/tests/cli.rs`. The fix (follow-up on this
+  branch, not a new change) moved the runtime bridging into
+  `kuru_connectors::shell_warmup::ensure_stock_powershell_warm()`, a shared
+  sync wrapper that always runs the warm-up future on a fresh, dedicated OS
+  thread with its own `current_thread` runtime (`block_on_dedicated_thread`)
+  and joins it — safe whether or not the caller's own thread is already
+  inside a Tokio runtime, and regardless of that runtime's flavor. Each test
+  file's `ensure_powershell_warm()` now just calls that shared wrapper
+  instead of building its own runtime.
 - **Warm-up's own PowerShell call requests the shell tool's max
   `timeout_ms` (120 000), wrapped in a distinct outer 130 s bound.** The
   shell tool's own default (30 000 ms) is the exact thing that can be too

@@ -36,12 +36,11 @@ mod terminal;
 // inside a test's real assertion window. See `kuru_connectors::shell_warmup`.
 #[cfg(windows)]
 fn ensure_powershell_warm() {
-    let result = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build warm-up runtime")
-        .block_on(kuru_connectors::shell_warmup::warm_up_stock_powershell_engine());
-    result.expect("stock PowerShell warm-up");
+    // `Sandbox::new()` runs from both plain `fn` tests and from inside
+    // `#[tokio::test(flavor = "multi_thread", ...)]` async tests already
+    // driving a Tokio runtime; the shared helper is safe from either call
+    // site (see `kuru_connectors::shell_warmup::block_on_dedicated_thread`).
+    kuru_connectors::shell_warmup::ensure_stock_powershell_warm();
 }
 
 struct Sandbox {

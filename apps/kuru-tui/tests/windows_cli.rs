@@ -103,12 +103,12 @@ fn powershell_literal(value: &str) -> String {
 // so that stall lands here (with its own distinct, generous bound) instead of
 // inside a test's real assertion window. See `kuru_connectors::shell_warmup`.
 fn ensure_powershell_warm() {
-    let result = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build warm-up runtime")
-        .block_on(kuru_connectors::shell_warmup::warm_up_stock_powershell_engine());
-    result.expect("stock PowerShell warm-up");
+    // Some callers in this file are `#[tokio::test]` async tests already
+    // driving a Tokio runtime (default `current_thread` flavor); the shared
+    // helper is safe from either a plain thread or an existing runtime of
+    // any flavor (see
+    // `kuru_connectors::shell_warmup::block_on_dedicated_thread`).
+    kuru_connectors::shell_warmup::ensure_stock_powershell_warm();
 }
 
 fn stock_shell_source(
