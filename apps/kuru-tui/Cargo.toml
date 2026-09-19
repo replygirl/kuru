@@ -48,6 +48,11 @@ unicode-width.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+# Always compiled in for test builds only (dev-dependencies never reach the
+# shipping binary): unlocks the KURU_TEST_MODEL_CATALOG_PATH fixture seam so
+# `cargo test -p kuru` need not be run with --all-features for tests that
+# depend on it, such as the /cost known-price frame test in tests/terminal.rs.
+kuru-core = { workspace = true, features = ["test-support"] }
 kuru-memory = { workspace = true, features = ["test-support"] }
 kuru-delivery = { workspace = true, features = ["tooling"] }
 kuru-connectors = { workspace = true, features = ["test-support"] }
