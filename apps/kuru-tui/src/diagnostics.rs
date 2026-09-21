@@ -282,6 +282,13 @@ impl SafeFields {
                 | "item_id"
                 | "item_type"
                 | "text_len"
+                // Function-call stream shape: which event carried which
+                // identity, and whether a name, call ID and arguments were
+                // present. Never the arguments themselves.
+                | "event_type"
+                | "has_call_id"
+                | "has_name"
+                | "arguments_len"
         )
     }
 
@@ -711,5 +718,48 @@ mod tests {
         assert_eq!(reconciled["item_id"], "item-1");
         assert_eq!(reconciled["item_type"], "message");
         assert_eq!(reconciled["text_len"], 7);
+    }
+
+    /// The function-call shape fields are admitted; the arguments themselves,
+    /// which can carry actor context and file paths, are not.
+    #[test]
+    fn function_call_trace_admits_shape_fields_but_never_arguments() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("diagnostics")).unwrap();
+        let root = directory.path().to_path_buf();
+        let ring = Arc::new(Ring::open(directory).unwrap());
+        let subscriber = tracing_subscriber::registry().with(JsonLayer {
+            ring: ring.clone(),
+            debug: true,
+            next_span: AtomicU64::new(1),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(
+                target: "kuru.provider",
+                operation = "responses-stream-reconcile",
+                stage = "function-call",
+                event_type = "function_call_arguments.done",
+                item_id = "fc_1",
+                has_call_id = false,
+                has_name = false,
+                arguments_len = 363_u64,
+                arguments = "{\"path\":\"secret-sentinel\"}",
+                "observed function call event"
+            );
+        });
+        ring.finish().unwrap();
+        let records = std::fs::read_to_string(root.join("trace-0.jsonl")).unwrap();
+        assert!(!records.contains("secret-sentinel"), "{records}");
+        let record = records
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["stage"] == "function-call")
+            .expect("the function-call record must be retained");
+        assert_eq!(record["event_type"], "function_call_arguments.done");
+        assert_eq!(record["item_id"], "fc_1");
+        assert_eq!(record["has_call_id"], false);
+        assert_eq!(record["has_name"], false);
+        assert_eq!(record["arguments_len"], 363);
+        assert!(record["arguments"].is_null());
     }
 }
