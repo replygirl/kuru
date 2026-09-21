@@ -604,7 +604,10 @@ impl View {
             return Some(if self.busy { "/cancel" } else { "/quit" }.into());
         }
         if let Some(prompt) = &mut self.permission_prompt {
-            if key.modifiers.contains(KeyModifiers::ALT) {
+            // Alt+1-4 and plain 1-4 are exact aliases: terminals that swallow
+            // Alt (tmux/cmux passthrough, some emulators) would otherwise
+            // strand the user with no way to answer the prompt.
+            if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.is_empty() {
                 let answer = match key.code {
                     KeyCode::Char('1') => Some("/approval-once"),
                     KeyCode::Char('2') if prompt.display.rememberable => Some("/approval-session"),
@@ -2571,7 +2574,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("native file write"));
-        assert!(screen.contains("Alt+2 Session"));
+        assert!(screen.contains("2 session"));
+        assert!(screen.contains("Alt+digit"));
 
         view.permission_prompt
             .as_mut()
@@ -2588,6 +2592,72 @@ mod tests {
             Some("/approval-once".into())
         );
         assert_eq!(view.key(key(KeyCode::Esc)), Some("/cancel".into()));
+    }
+
+    #[test]
+    fn permission_prompt_accepts_plain_digits_as_alt_digit_aliases() {
+        let mut view = fixture();
+        view.permission_prompt = Some(PermissionPrompt {
+            display: PermissionDisplay {
+                label: "native file write".into(),
+                scope: "project file notes/exact.txt".into(),
+                preview: "bounded preview".into(),
+                rememberable: true,
+                remember_disabled_reason: None,
+            },
+            whole_tool: false,
+            scroll: 0,
+        });
+        // Plain digits 1-4 produce the exact same outcome as their Alt+digit
+        // counterparts while the prompt is showing and the scope is
+        // rememberable.
+        assert_eq!(
+            view.key(key(KeyCode::Char('1'))),
+            Some("/approval-once".into())
+        );
+        assert_eq!(
+            view.key(key(KeyCode::Char('2'))),
+            Some("/approval-session".into())
+        );
+        assert_eq!(
+            view.key(key(KeyCode::Char('3'))),
+            Some("/approval-always".into())
+        );
+        assert_eq!(
+            view.key(key(KeyCode::Char('4'))),
+            Some("/approval-deny".into())
+        );
+
+        // When the scope cannot be remembered, plain 2/3 are ignored with
+        // the same notice Alt+2/Alt+3 produce, not typed into the draft.
+        view.permission_prompt
+            .as_mut()
+            .unwrap()
+            .display
+            .rememberable = false;
+        view.notice = None;
+        assert_eq!(view.key(key(KeyCode::Char('2'))), None);
+        assert!(
+            view.notice
+                .as_deref()
+                .unwrap()
+                .contains("Session and Always require")
+        );
+        view.notice = None;
+        assert_eq!(view.key(key(KeyCode::Char('3'))), None);
+        assert!(
+            view.notice
+                .as_deref()
+                .unwrap()
+                .contains("Session and Always require")
+        );
+        assert_eq!(view.input, "");
+
+        // Once no modal is showing, plain digits are ordinary composer
+        // input again.
+        view.permission_prompt = None;
+        view.key(key(KeyCode::Char('2')));
+        assert_eq!(view.input, "2");
     }
 
     #[test]

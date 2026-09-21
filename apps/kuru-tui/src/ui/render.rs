@@ -945,14 +945,14 @@ fn draw_permission_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
     }
     let choices = if prompt.display.rememberable {
         if inner.width >= 62 {
-            "Alt+1 Once   Alt+2 Session   Alt+3 Always   Alt+4 Deny"
+            "1 once · 2 session · 3 always · 4 deny  (also Alt+digit)"
         } else {
-            "Alt+1 Once  Alt+2 Session\nAlt+3 Always  Alt+4 Deny"
+            "1 once · 2 session  (Alt+digit)\n3 always · 4 deny"
         }
     } else if inner.width >= 62 {
-        "Alt+1 Once   Alt+2/3 unavailable   Alt+4 Deny"
+        "1 once · 2/3 unavailable · 4 deny  (also Alt+digit)"
     } else {
-        "Alt+1 Once  Alt+4 Deny\nSession/Always unavailable"
+        "1 once · 4 deny  (Alt+digit)\nSession/Always unavailable"
     };
     frame.render_widget(
         Paragraph::new(choices).style(bold(AMBER)),
