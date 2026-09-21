@@ -17,7 +17,7 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | Alt+Enter | Insert a newline |
 | F2 / F3 / F4 | Select model / effort / framework |
 | F5 or `/permissions` | Inspect session and saved tool grants; Delete revokes the selected scope |
-| Alt+1 / Alt+2 / Alt+3 / Alt+4 | Answer a tool prompt: once / session / always / deny |
+| 1 / 2 / 3 / 4 (or Alt+1–4) | Answer a tool prompt: once / session / always / deny |
 | Type / paste in a picker | Filter the available choices |
 | Escape | Close a picker or cancel active work |
 | Ctrl+C | Cancel active work; quit while idle |
@@ -121,7 +121,8 @@ JSON output remain final-only.
 
 An asked tool pauses for an inline permission decision above the composer. The
 prompt shows the tool, a redacted preview and the exact grant scope. Ordinary
-typing and paste continue to edit your draft; Alt+1–4 answer the prompt.
+typing and paste continue to edit your draft; 1–4 or Alt+1–4 answer the
+prompt (plain digits work in terminals that swallow the Alt modifier).
 Escape or Ctrl+C cancels the active turn without granting the pending tool.
 Once covers this invocation; session and always cover the displayed exact file
 or whole-tool scope. If that scope cannot be shown completely without redaction,

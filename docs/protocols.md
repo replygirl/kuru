@@ -85,6 +85,14 @@ one with nothing streamed is an empty completion. A complete terminal response
 needs no preceding deltas. A failure or interrupted stream never authorizes a
 partial tool call.
 
+A tool call's name and call ID are whatever the stream announced for that item
+ID; argument events carry arguments alone, and a backend may state the identity
+once rather than repeating it on every event. Announcements that contradict
+each other or the terminal response are an error, never a merge. Every tool
+call reaching the runtime carries a name, a call ID and complete arguments: one
+whose name or call ID was never announced, or whose arguments never settled as
+valid JSON, fails the turn instead of dispatching.
+
 Responses completions have a 600-second total operation budget while model
 catalog requests remain bounded to 60 seconds. SSE keeps at most 2 MiB of its
 retained response; deltas and framing also have finite wire and parser limits.

@@ -981,7 +981,8 @@ async fn real_pty_permission_choices_show_exact_file_scope_and_revoke_grants() -
             &[
                 "Permission request",
                 "literal[1].txt",
-                "Alt+1 Once",
+                "1 once",
+                "also Alt+digit",
                 "esc cancel",
             ],
             READY_TIMEOUT,
@@ -1067,7 +1068,8 @@ async fn real_pty_shell_permission_cancel_closes_reply_and_preserves_draft() -> 
             "Permission request",
             "native shell",
             "whole tool",
-            "Alt+4 Deny",
+            "4 deny",
+            "also Alt+digit",
         ],
         READY_TIMEOUT,
     )?;
@@ -1144,7 +1146,12 @@ async fn real_pty_long_literal_permission_scope_survives_resize_and_inspection()
     terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
     terminal.send(b"Long literal path turn\r")?;
     terminal.wait_composer_frame(
-        &["Permission request", "Exact grant scope", "Alt+1 Once"],
+        &[
+            "Permission request",
+            "Exact grant scope",
+            "1 once",
+            "Alt+digit",
+        ],
         READY_TIMEOUT,
     )?;
     ensure!(!marker.exists(), "long-path operation ran before approval");
@@ -1155,7 +1162,8 @@ async fn real_pty_long_literal_permission_scope_survives_resize_and_inspection()
             "Permission request",
             &parent[..16],
             &leaf[..16],
-            "Alt+2 Session",
+            "2 session",
+            "also Alt+digit",
         ],
         READY_TIMEOUT,
     )?;

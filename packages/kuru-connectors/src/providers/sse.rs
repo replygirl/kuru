@@ -97,7 +97,12 @@ struct Decoder {
     text_fragments: BTreeMap<(u64, String, u64, TextDeltaSource), String>,
     summary_fragments: BTreeMap<(u64, String, u64), String>,
     tool_fragments: BTreeMap<(u64, String), String>,
-    tool_done: BTreeMap<(u64, String), (String, String)>,
+    tool_done: BTreeMap<(u64, String), (String, Option<String>)>,
+    // Function-call identity as the backend announces it, keyed by item ID.
+    // The ChatGPT subscription route states a call's name and call ID once, on
+    // `response.output_item.added`, and never repeats them on the argument
+    // events that follow.
+    tool_calls: BTreeMap<String, (Option<String>, Option<String>)>,
     settled: bool,
 }
 
@@ -276,6 +281,13 @@ impl Decoder {
                     arguments_fragment.len() <= MAX_BYTES,
                     "Responses stream delta exceeds retained output limit"
                 );
+                trace_function_event(
+                    "function_call_arguments.delta",
+                    item_id,
+                    event["call_id"].as_str(),
+                    event["name"].as_str(),
+                    arguments_fragment.len(),
+                );
                 append_fragment(
                     &mut self.tool_fragments,
                     (output_index, item_id.into()),
@@ -297,11 +309,19 @@ impl Decoder {
                 let arguments = event["arguments"]
                     .as_str()
                     .context("completed function arguments lack arguments")?;
-                let name = event["name"]
-                    .as_str()
-                    .context("completed function arguments lack name")?;
+                trace_function_event(
+                    "function_call_arguments.done",
+                    item_id,
+                    event["call_id"].as_str(),
+                    event["name"].as_str(),
+                    arguments.len(),
+                );
+                // The name is not part of this event on every backend. It is
+                // resolved from the call's own announced item at dispatch
+                // time; a call that never announced one still fails the turn.
+                let name = event["name"].as_str();
                 ensure!(
-                    arguments.len() <= MAX_BYTES && name.len() <= MAX_BYTES,
+                    arguments.len() <= MAX_BYTES && name.unwrap_or_default().len() <= MAX_BYTES,
                     "Responses completed function arguments exceed retained output limit"
                 );
                 let _: Value =
@@ -310,11 +330,28 @@ impl Decoder {
                     self.tool_done
                         .insert(
                             (output_index, item_id.into()),
-                            (arguments.into(), name.into())
+                            (arguments.into(), name.map(str::to_owned))
                         )
                         .is_none(),
                     "duplicate completed function arguments"
                 );
+            }
+            // Announced but not yet complete. Its arguments are still empty,
+            // but this is where the subscription route states the call's name
+            // and call ID — the only place it ever does.
+            "response.output_item.added" => {
+                if let Some(item) = event.get("item").filter(|value| value.is_object())
+                    && item["type"] == "function_call"
+                {
+                    trace_function_event(
+                        "output_item.added",
+                        item["id"].as_str().unwrap_or(""),
+                        item["call_id"].as_str(),
+                        item["name"].as_str(),
+                        item["arguments"].as_str().map_or(0, str::len),
+                    );
+                    self.announce_function_call(item)?;
+                }
             }
             "response.output_item.done" => {
                 let index = event["output_index"]
@@ -348,6 +385,16 @@ impl Decoder {
                         self.ids.insert(id.to_owned()),
                         "duplicate completed output ID"
                     );
+                }
+                if item["type"] == "function_call" {
+                    trace_function_event(
+                        "output_item.done",
+                        item["id"].as_str().unwrap_or(""),
+                        item["call_id"].as_str(),
+                        item["name"].as_str(),
+                        item["arguments"].as_str().map_or(0, str::len),
+                    );
+                    self.announce_function_call(item)?;
                 }
                 self.retained_output_bytes = retained;
                 self.items.insert(index, item.clone());
@@ -409,6 +456,7 @@ impl Decoder {
                     );
                     response["output"] = json!(items.into_values().collect::<Vec<_>>());
                 }
+                self.settle_function_calls(&mut response)?;
                 self.reconcile_fragments(&response)?;
                 response["status"] = json!("completed");
                 let response_bytes = serde_json::to_vec(&response)
@@ -461,6 +509,92 @@ impl Decoder {
 }
 
 impl Decoder {
+    /// Retain the name and call ID a `function_call` item announces, keyed by
+    /// its item ID. A second announcement of the same item may repeat those
+    /// values but never change them.
+    fn announce_function_call(&mut self, item: &Value) -> Result<()> {
+        let Some(id) = item["id"].as_str().filter(|id| !id.is_empty()) else {
+            return Ok(());
+        };
+        let name = item["name"].as_str().filter(|name| !name.is_empty());
+        let call_id = item["call_id"]
+            .as_str()
+            .filter(|call_id| !call_id.is_empty());
+        ensure!(
+            name.unwrap_or_default().len() <= MAX_BYTES
+                && call_id.unwrap_or_default().len() <= MAX_BYTES,
+            "Responses function call identity exceeds retained output limit"
+        );
+        let announced = self.tool_calls.entry(id.to_owned()).or_insert((None, None));
+        for (announced, observed) in [(&mut announced.0, name), (&mut announced.1, call_id)] {
+            match (announced.as_deref(), observed) {
+                (Some(known), Some(observed)) => ensure!(
+                    known == observed,
+                    "streamed function call identity disagrees with itself"
+                ),
+                (None, Some(observed)) => *announced = Some(observed.to_owned()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Complete every function call in the authoritative output from what the
+    /// backend announced for that exact item ID, then refuse to hand the
+    /// runtime anything it could not honestly dispatch.
+    ///
+    /// The subscription route states a call's name and call ID once, on
+    /// `response.output_item.added`, and its argument events carry arguments
+    /// alone. Filling those fields back in from the same item's own
+    /// announcement is reconciliation, not invention: a name that was never
+    /// announced, a name the terminal output contradicts, or arguments that
+    /// are absent or not complete JSON still fail the turn rather than
+    /// reaching the tool host as an unnamed or truncated call.
+    fn settle_function_calls(&self, response: &mut Value) -> Result<()> {
+        let arguments_by_id: BTreeMap<&str, &str> = self
+            .tool_done
+            .iter()
+            .map(|((_, item_id), (arguments, _))| (item_id.as_str(), arguments.as_str()))
+            .collect();
+        let output = response["output"]
+            .as_array_mut()
+            .context("completed response lacks output")?;
+        for item in output {
+            if item["type"] != "function_call" {
+                continue;
+            }
+            let announced = item["id"]
+                .as_str()
+                .and_then(|id| self.tool_calls.get(id))
+                .cloned()
+                .unwrap_or((None, None));
+            let streamed_arguments = item["id"].as_str().and_then(|id| arguments_by_id.get(id));
+            for (field, announced) in [("name", announced.0), ("call_id", announced.1)] {
+                let present = item[field].as_str().filter(|value| !value.is_empty());
+                match (present, announced.as_deref()) {
+                    (Some(present), Some(announced)) => ensure!(
+                        present == announced,
+                        "completed function call identity disagrees with streamed output"
+                    ),
+                    (None, Some(announced)) => item[field] = json!(announced),
+                    (Some(_), None) => {}
+                    (None, None) => bail!("completed function call lacks {field}"),
+                }
+            }
+            if item["arguments"].as_str().is_none() {
+                let arguments =
+                    streamed_arguments.context("completed function call lacks arguments")?;
+                item["arguments"] = json!(arguments);
+            }
+            let arguments = item["arguments"]
+                .as_str()
+                .context("completed function call lacks arguments")?;
+            let _: Value =
+                serde_json::from_str(arguments).map_err(|_| diagnostics::stream_protocol())?;
+        }
+        Ok(())
+    }
+
     fn reconcile_fragments(&self, response: &Value) -> Result<()> {
         let output = response["output"]
             .as_array()
@@ -549,10 +683,16 @@ impl Decoder {
                 item["type"] == "function_call",
                 "completed function has incompatible final item"
             );
-            ensure!(
-                item["name"].as_str() == Some(name),
-                "completed function name disagrees with final output"
-            );
+            // The name is checked only when the argument event carried one.
+            // When it did not, `settle_function_calls` has already resolved it
+            // from the call's own announced item and failed the turn if none
+            // was ever announced.
+            if let Some(name) = name {
+                ensure!(
+                    item["name"].as_str() == Some(name.as_str()),
+                    "completed function name disagrees with final output"
+                );
+            }
             let final_arguments = item["arguments"]
                 .as_str()
                 .context("completed function arguments lack final arguments")?;
@@ -642,6 +782,30 @@ fn trace_item(stage: &'static str, index: usize, item: &Value) {
         item_type = item["type"].as_str().unwrap_or(""),
         text_len = text_len(item),
         "reconciled output item"
+    );
+}
+
+/// Record the *shape* of one function-call stream event in the bounded
+/// diagnostics ring: the event kind, the item identity, whether that event
+/// carried a call ID and a name, and how long its arguments were. The
+/// arguments themselves, which can contain actor context, are never recorded.
+fn trace_function_event(
+    event_type: &'static str,
+    item_id: &str,
+    call_id: Option<&str>,
+    name: Option<&str>,
+    arguments_len: usize,
+) {
+    tracing::debug!(
+        target: "kuru.provider",
+        operation = "responses-stream-reconcile",
+        stage = "function-call",
+        event_type,
+        item_id,
+        has_call_id = call_id.is_some_and(|value| !value.is_empty()),
+        has_name = name.is_some_and(|value| !value.is_empty()),
+        arguments_len = arguments_len as u64,
+        "observed function call event"
     );
 }
 
@@ -827,6 +991,133 @@ mod tests {
             .collect();
         let result = Decoder::default().push(bytes.as_bytes()).unwrap().unwrap();
         assert_eq!(result["output"], output);
+    }
+
+    /// The event order, ids and field presence below mirror one real
+    /// tool-calling turn on the ChatGPT subscription route, captured from the
+    /// `--debug` diagnostics ring: `response.output_item.added` announces the
+    /// call's name and call ID with empty arguments, every
+    /// `function_call_arguments.delta` and the `function_call_arguments.done`
+    /// that follows carry arguments alone (no name, no call ID), and the
+    /// terminal envelope's `output` is empty. The pre-fix decoder rejected
+    /// this with "completed function arguments lack name" and failed every
+    /// tool-calling turn.
+    #[test]
+    fn accepts_subscription_function_call_announced_only_on_output_item_added() {
+        let call = "fc_0239ab12e7bb1ad8016ab0d46525fc87d1977648d70a0ed18f";
+        let arguments = "{\"path\":\"README.md\"}";
+        let events = [
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "id":call,"type":"function_call","name":"file_read",
+                "call_id":"call_HcZ1sB6hCkG0","arguments":""
+            }}),
+            json!({"type":"response.function_call_arguments.delta","item_id":call,"output_index":0,"delta":"{\"path\":"}),
+            json!({"type":"response.function_call_arguments.delta","item_id":call,"output_index":0,"delta":"\"README.md\"}"}),
+            json!({"type":"response.function_call_arguments.done","item_id":call,"output_index":0,"arguments":arguments}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{
+                "id":call,"type":"function_call","name":"file_read",
+                "call_id":"call_HcZ1sB6hCkG0","arguments":arguments
+            }}),
+            json!({"type":"response.completed","response":{
+                "id":"resp_0239ab12e7bb1ad8016ab0d4649c8887d1","status":"completed","output":[],
+                "usage":{"input_tokens":2041,"output_tokens":24}
+            }}),
+        ];
+        let bytes: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        let result = Decoder::default().push(bytes.as_bytes()).unwrap().unwrap();
+        let output = result["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["id"], json!(call));
+        assert_eq!(output[0]["name"], "file_read");
+        assert_eq!(output[0]["call_id"], "call_HcZ1sB6hCkG0");
+        assert_eq!(output[0]["arguments"], json!(arguments));
+    }
+
+    /// `function_call_arguments.done` is arguments only; the call's identity
+    /// is resolved by item ID from whichever announcement carried it, in
+    /// either order, and a call whose name is never announced fails the turn
+    /// instead of reaching the tool host unnamed.
+    #[test]
+    fn resolves_function_call_identity_by_item_id_or_fails_the_turn() {
+        let arguments = "{\"path\":\"README.md\"}";
+        let done = json!({"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"arguments":arguments});
+        let item = json!({
+            "id":"fc_1","type":"function_call","name":"file_read",
+            "call_id":"call_1","arguments":arguments
+        });
+        let completed = json!({"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}});
+
+        // Arguments settled before the item's own completed announcement.
+        let early = format!(
+            "data: {}\n\ndata: {done}\n\ndata: {}\n\ndata: {completed}\n\n",
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "id":"fc_1","type":"function_call","arguments":""
+            }}),
+            json!({"type":"response.output_item.done","output_index":0,"item":item}),
+        );
+        let result = Decoder::default().push(early.as_bytes()).unwrap().unwrap();
+        assert_eq!(result["output"][0]["name"], "file_read");
+        assert_eq!(result["output"][0]["call_id"], "call_1");
+
+        // A name announced only on `added`, with a terminal item that omits
+        // it, is still dispatchable.
+        let late = format!(
+            "data: {}\n\ndata: {done}\n\ndata: {}\n\ndata: {completed}\n\n",
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "id":"fc_1","type":"function_call","name":"file_read","call_id":"call_1","arguments":""
+            }}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{
+                "id":"fc_1","type":"function_call","arguments":arguments
+            }}),
+        );
+        let result = Decoder::default().push(late.as_bytes()).unwrap().unwrap();
+        assert_eq!(result["output"][0]["name"], "file_read");
+        assert_eq!(result["output"][0]["call_id"], "call_1");
+
+        // A call whose name is never announced anywhere fails the turn.
+        let unnamed = format!(
+            "data: {done}\n\ndata: {}\n\ndata: {completed}\n\n",
+            json!({"type":"response.output_item.done","output_index":0,"item":{
+                "id":"fc_1","type":"function_call","call_id":"call_1","arguments":arguments
+            }}),
+        );
+        let error = Decoder::default().push(unnamed.as_bytes()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("completed function call lacks name"),
+            "{error:#}"
+        );
+
+        // So does one whose announced name the terminal output contradicts.
+        let contradicted = format!(
+            "data: {}\n\ndata: {done}\n\ndata: {}\n\ndata: {completed}\n\n",
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "id":"fc_1","type":"function_call","name":"file_read","call_id":"call_1","arguments":""
+            }}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{
+                "id":"fc_1","type":"function_call","name":"shell","call_id":"call_1","arguments":arguments
+            }}),
+        );
+        let error = Decoder::default()
+            .push(contradicted.as_bytes())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("disagrees"), "{error:#}");
+
+        // And so does one whose arguments never became complete JSON.
+        let truncated = format!(
+            "data: {}\n\ndata: {completed}\n\n",
+            json!({"type":"response.output_item.done","output_index":0,"item":{
+                "id":"fc_1","type":"function_call","name":"file_read","call_id":"call_1",
+                "arguments":"{\"path\":"
+            }}),
+        );
+        let error = Decoder::default().push(truncated.as_bytes()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ChatGPT completion stream contained invalid protocol data"
+        );
     }
 
     #[test]
