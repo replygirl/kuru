@@ -109,7 +109,9 @@ For runtime-owning commands, `--debug` prints one JSON line naming the resolved
 diagnostic ring directory on standard error. The command result on standard
 output is unchanged, including for `run --json`. The directory contains the
 four-file, 64 KiB-per-file operational ring
-`trace-{0..3}.jsonl`; it is separate from durable turn history.
+`trace-{0..3}.jsonl`; it is separate from durable turn history. Its records
+include the shape of each reconciled provider stream — every streamed and
+terminal output item's ID, kind, position and text length, never its text.
 
 `/memory` remains conversation inspection. `/notes` and `kuru memory notes ID`
 return a JSON view with the selected `mode`, canonical `identity`, chronological

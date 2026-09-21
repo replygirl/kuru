@@ -73,10 +73,17 @@ explicitly zero values. These counts are components of the reported totals,
 not additional tokens.
 
 Only a validated completed response authorizes a tool call or a durable
-assistant message. Native item IDs and output indexes reconcile fragments with
+assistant message. Native item IDs reconcile fragments and completed items with
 the native terminal response before it is converted into content blocks; an
-item ID is not a tool call ID. A complete terminal response needs no preceding
-deltas. A failure or interrupted stream never authorizes a partial tool call.
+item ID is not a tool call ID, and a stream's output index never identifies a
+terminal item. A non-empty terminal output is authoritative for ordering and
+presence: reasoning or tool-call items it reorders, replaces or omits are a
+legitimate completion, while text already shown to the user must still be
+present under its item ID and still agree. A terminal envelope that restates no
+output leaves the completed items it already delivered authoritative; an empty
+one with nothing streamed is an empty completion. A complete terminal response
+needs no preceding deltas. A failure or interrupted stream never authorizes a
+partial tool call.
 
 Responses completions have a 600-second total operation budget while model
 catalog requests remain bounded to 60 seconds. SSE keeps at most 2 MiB of its
