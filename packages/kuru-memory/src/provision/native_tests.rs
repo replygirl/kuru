@@ -3,11 +3,10 @@ use kuru_archive::zip::{Limits, MemberKind, WriteMember, write};
 use kuru_platform::fs::regular_file_info;
 #[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
-#[cfg(windows)]
-use std::{
-    io, thread,
-    time::{Duration, Instant},
-};
+// Not windows-gated: `wait_for_fixture_binary_absence` below is exercised by
+// unix-runnable unit tests even though its only production caller is
+// windows-only, since this whole module is already `#[cfg(test)]`.
+use std::{io, thread, time::Instant};
 
 const EXE: &[u8] = b"MZ fixture bytes, deliberately never executed";
 const NOTICES: &[u8] = b"exact upstream notice fixture";
@@ -28,6 +27,14 @@ async fn gated_verify_version(binary: &Path, private_home: &Path) -> Result<()> 
     verify_version(binary, private_home).await
 }
 
+/// Bound both the removal retry below and the post-removal absence wait: the
+/// fixture deletes a cache binary the warm probes just executed, so Windows
+/// may refuse the delete-capable open, refuse the disposition itself, or
+/// leave the name delete-pending after a reported-successful removal while
+/// that image section is torn down. One window covers all three.
+const FIXTURE_CLEANUP_RETRY_LIMIT: Duration = Duration::from_secs(2);
+const FIXTURE_CLEANUP_RETRY_SPACING: Duration = Duration::from_millis(20);
+
 #[cfg(windows)]
 fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentity) -> Result<()> {
     let mut retry_deadline = None;
@@ -38,7 +45,7 @@ fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentit
             "fixture cache binary identity changed before invalidation"
         );
         match parent.remove_file(files::name(binary)?, file) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return wait_for_fixture_binary_absence(binary, &mut retry_deadline),
             // The fixture deletes a cache binary the warm probes just executed,
             // so Windows may refuse either the delete-capable open or the
             // disposition itself while that image section is torn down.
@@ -50,8 +57,8 @@ fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentit
                     Some(5 | 32)
                 ) =>
             {
-                let deadline =
-                    *retry_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
+                let deadline = *retry_deadline
+                    .get_or_insert_with(|| Instant::now() + FIXTURE_CLEANUP_RETRY_LIMIT);
                 if Instant::now() >= deadline {
                     return Err(anyhow::Error::new(error).context(
                         "fixture cache binary invalidation exhausted its bounded native removal recovery",
@@ -60,12 +67,104 @@ fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentit
                 thread::sleep(
                     deadline
                         .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(20)),
+                        .min(FIXTURE_CLEANUP_RETRY_SPACING),
                 );
             }
             Err(error) => return Err(anyhow::Error::new(error)),
         }
     }
+}
+
+/// A reported-successful removal can still leave the name delete-pending: the
+/// just-executed image is torn down asynchronously, and Windows refuses a
+/// later create at the same name (native error 5) until the pending delete
+/// completes. Wait for the name to become genuinely absent — confirmed only
+/// by `NotFound`, never inferred from a successful or a still-denied query —
+/// before a caller creates a replacement at it. Bounded by the same deadline
+/// `remove_fixture_binary` already established for this removal, so the two
+/// waits share one 2-second budget instead of doubling it.
+///
+/// Not windows-gated: on unix a genuine removal is synchronous, so the first
+/// check always observes `NotFound` and this returns immediately. Kept
+/// unconditional so the unit tests below can exercise it directly.
+fn wait_for_fixture_binary_absence(
+    path: &Path,
+    retry_deadline: &mut Option<Instant>,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut attempts = 0u32;
+    loop {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            // Still present, or still refused as delete-pending: neither is
+            // absence. Keep waiting rather than treating a successful stat as
+            // proof the name is gone.
+            Ok(_) | Err(_) => {}
+        }
+        attempts += 1;
+        let deadline =
+            *retry_deadline.get_or_insert_with(|| Instant::now() + FIXTURE_CLEANUP_RETRY_LIMIT);
+        if Instant::now() >= deadline {
+            bail!(
+                "fixture cache binary at {} remained after its reported-successful removal exhausted its bounded native removal recovery, {attempts} reconcile attempts over {:?}",
+                path.display(),
+                started.elapsed(),
+            );
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(FIXTURE_CLEANUP_RETRY_SPACING),
+        );
+    }
+}
+
+#[test]
+fn wait_for_fixture_binary_absence_returns_immediately_for_an_absent_path() {
+    let root = crate::test_support::tempdir().unwrap();
+    let path = root.path().join("never-created");
+    let mut deadline = None;
+    let started = Instant::now();
+    wait_for_fixture_binary_absence(&path, &mut deadline).unwrap();
+    assert!(
+        started.elapsed() < FIXTURE_CLEANUP_RETRY_SPACING,
+        "an already-absent path must not wait at all"
+    );
+}
+
+#[test]
+fn wait_for_fixture_binary_absence_succeeds_once_a_few_polls_observe_absence() {
+    let root = crate::test_support::tempdir().unwrap();
+    let path = root.path().join("goes-away-after-a-few-polls");
+    fs::write(&path, b"present").unwrap();
+    let remover = path.clone();
+    let releaser = thread::spawn(move || {
+        thread::sleep(FIXTURE_CLEANUP_RETRY_SPACING * 2);
+        fs::remove_file(&remover).unwrap();
+    });
+    let mut deadline = None;
+    wait_for_fixture_binary_absence(&path, &mut deadline).unwrap();
+    releaser.join().unwrap();
+    assert!(fs::symlink_metadata(&path).is_err());
+}
+
+#[test]
+fn wait_for_fixture_binary_absence_exhausts_with_the_established_message() {
+    let root = crate::test_support::tempdir().unwrap();
+    let path = root.path().join("stays-forever");
+    fs::write(&path, b"present").unwrap();
+    // Pre-seed an already-elapsed deadline so the bounded window exhausts on
+    // its first check instead of spending the full 2-second production
+    // budget on a deterministic unit test.
+    let mut deadline = Some(Instant::now());
+    let error = wait_for_fixture_binary_absence(&path, &mut deadline).unwrap_err();
+    let rendered = error.to_string();
+    assert!(rendered.contains(&path.display().to_string()), "{rendered}");
+    assert!(rendered.contains("1 reconcile attempts"), "{rendered}");
+    assert!(
+        rendered.contains("exhausted its bounded native removal recovery"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]
