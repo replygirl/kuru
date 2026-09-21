@@ -51,7 +51,10 @@ the turn.
 - `packages/kuru-connectors/src/providers/sse.rs`: `Decoder::event`'s
   `response.completed` arm, new `reconcile_items` / `final_item` /
   `visible_text` / `trace_item` / `text_len` helpers, and `reconcile_fragments`
-  now locating by item ID. Three new decoder tests.
+  now locating by item ID. Two new decoder tests
+  (`accepts_subscription_terminal_envelope_with_empty_output`,
+  `terminal_output_owns_order_and_presence_but_never_drops_visible_text`) and
+  an extended assertion in an existing decoder test.
 - `apps/kuru-tui/src/diagnostics.rs`: `SafeFields` admits `item_index`,
   `item_id`, `item_type`, `text_len`; `on_event` drops below-`INFO` records
   without `--debug`.

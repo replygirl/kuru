@@ -2,6 +2,7 @@
 
 - [x] 1.1 Add a permanent redaction-safe `tracing::debug!` at the reconciliation point recording, for every streamed and terminal item, its ID, type, position and text length only, and verify the admitted field names are added to `SafeFields` in `apps/kuru-tui/src/diagnostics.rs` and that below-`INFO` records are gated on `--debug`.
 - [x] 1.2 Build the binary and run one live `codex`-route turn with `--debug`, and verify the diagnostics ring records the streamed and terminal item shape for every peer.
+- [x] 1.3 Add a unit test in `apps/kuru-tui/src/diagnostics.rs`'s own `mod tests` pinning the debug-level gate directly (independent of the live capture): a `tracing::debug!` event on the admitted `kuru.provider` `responses-stream-reconcile` target/fields is dropped from the ring when `debug: false` and retained with all its fields when `debug: true`, and verify with `mise run //apps/kuru-tui:test -- diagnostics`.
 
 ## 2. Reconcile by item ID
 

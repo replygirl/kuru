@@ -647,4 +647,69 @@ mod tests {
         assert!(records.contains("session-2") && records.contains("digest-2"));
         assert!(!records.contains("span_open") && !records.contains("span_close"));
     }
+
+    #[test]
+    fn debug_level_stream_reconcile_event_is_gated_by_the_debug_flag() {
+        let emit = || {
+            tracing::debug!(
+                target: "kuru.provider",
+                operation = "responses-stream-reconcile",
+                stage = "authoritative",
+                item_index = 0_u64,
+                item_id = "item-1",
+                item_type = "message",
+                text_len = 7_u64,
+                "reconciled output item"
+            );
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("diagnostics")).unwrap();
+        let root = directory.path().to_path_buf();
+        let ring = Arc::new(Ring::open(directory).unwrap());
+        let subscriber = tracing_subscriber::registry().with(JsonLayer {
+            ring: ring.clone(),
+            debug: false,
+            next_span: AtomicU64::new(1),
+        });
+        tracing::subscriber::with_default(subscriber, emit);
+        ring.finish().unwrap();
+        let records = std::fs::read_to_string(root.join("trace-0.jsonl")).unwrap_or_default();
+        assert!(
+            !records.contains("responses-stream-reconcile"),
+            "a debug-level event must be dropped when debug is disabled"
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("diagnostics")).unwrap();
+        let root = directory.path().to_path_buf();
+        let ring = Arc::new(Ring::open(directory).unwrap());
+        let subscriber = tracing_subscriber::registry().with(JsonLayer {
+            ring: ring.clone(),
+            debug: true,
+            next_span: AtomicU64::new(1),
+        });
+        tracing::subscriber::with_default(subscriber, emit);
+        ring.finish().unwrap();
+        let records = (0..FILE_COUNT)
+            .flat_map(|index| {
+                std::fs::read_to_string(root.join(format!("trace-{index}.jsonl")))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+            .collect::<Vec<_>>();
+        let reconciled = records
+            .iter()
+            .find(|record| record["operation"] == "responses-stream-reconcile")
+            .expect("a debug-level event must be retained when debug is enabled");
+        assert_eq!(reconciled["target"], "kuru.provider");
+        assert_eq!(reconciled["stage"], "authoritative");
+        assert_eq!(reconciled["item_index"], 0);
+        assert_eq!(reconciled["item_id"], "item-1");
+        assert_eq!(reconciled["item_type"], "message");
+        assert_eq!(reconciled["text_len"], 7);
+    }
 }
