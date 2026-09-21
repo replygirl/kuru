@@ -244,7 +244,9 @@ checkout; see [installation](install.md).
 Runtime-owning commands keep a private per-project operational ring at
 `<data-dir>/diagnostics/<project-hash>/trace-{0..3}.jsonl`: four files of at most
 64 KiB each. `--debug` adds bounded operational status detail to those files and
-prints the resolved ring directory once on standard error. It does not enable
+prints the resolved ring directory once on standard error. That detail includes
+the shape of each reconciled provider stream — every streamed and terminal
+output item's ID, kind, position and text length, never its text. It does not enable
 `RUST_LOG`, capture prompts, tool arguments/results, credentials, or remote error
 text, and it does not change command stdout or TUI rendering. These files are
 operational diagnostics, not conversation history or semantic turn events.

@@ -276,6 +276,12 @@ impl SafeFields {
                 | "receipt_error"
                 | "collected"
                 | "remaining"
+                // Stream reconciliation shape: identity, kind, position and
+                // text length only. Never model text or tool arguments.
+                | "item_index"
+                | "item_id"
+                | "item_type"
+                | "text_len"
         )
     }
 
@@ -328,6 +334,11 @@ where
 
     fn on_event(&self, event: &Event<'_>, ctx: LayerContext<'_, S>) {
         if !admitted_target(event.metadata()) {
+            return;
+        }
+        // Ordinary runs keep the ring to the informational record. Verbose
+        // diagnostics, such as stream reconciliation shape, need `--debug`.
+        if !self.debug && *event.metadata().level() > tracing::Level::INFO {
             return;
         }
         let mut fields = SafeFields::default();

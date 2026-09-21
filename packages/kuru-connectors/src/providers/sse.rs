@@ -371,26 +371,34 @@ impl Decoder {
                     "Responses completed event contains an error"
                 );
                 let items = std::mem::take(&mut self.items);
-                if let Some(output) = response.get("output") {
-                    let output = output
-                        .as_array()
-                        .context("completed response has invalid output")?;
-                    let mut final_ids = BTreeSet::new();
-                    for item in output {
-                        if let Some(id) = item["id"].as_str() {
-                            ensure!(final_ids.insert(id), "duplicate completed output ID");
+                for (index, item) in &items {
+                    trace_item("streamed", *index, item);
+                }
+                // An empty terminal array alongside items already delivered as
+                // `response.output_item.done` carries no reconciliation
+                // information: the ChatGPT subscription route closes with an
+                // envelope that restates usage but not the output it already
+                // sent. Treat that exactly as an absent array. An empty array
+                // with nothing streamed still means an empty completion and
+                // stays authoritative.
+                let authoritative = match response.get("output") {
+                    Some(output) => {
+                        let output = output
+                            .as_array()
+                            .context("completed response has invalid output")?;
+                        for (position, item) in output.iter().enumerate() {
+                            trace_item("final", position, item);
+                        }
+                        if output.is_empty() && !items.is_empty() {
+                            false
+                        } else {
+                            reconcile_items(output, &items)?;
+                            true
                         }
                     }
-                    for (index, item) in &items {
-                        let final_item = output
-                            .get(*index)
-                            .context("completed response omits streamed output")?;
-                        ensure!(
-                            final_item == item,
-                            "completed response disagrees with streamed output"
-                        );
-                    }
-                } else {
+                    None => false,
+                };
+                if !authoritative {
                     ensure!(
                         !items.is_empty(),
                         "completed response lacks authoritative output"
@@ -457,14 +465,13 @@ impl Decoder {
         let output = response["output"]
             .as_array()
             .context("completed response lacks output")?;
-        for ((index, item_id, content_index, source), fragment) in &self.text_fragments {
-            let item = output
-                .get(*index as usize)
-                .context("stream text fragment lacks final item")?;
-            ensure!(
-                item["id"].as_str() == Some(item_id),
-                "stream text fragment item ID disagrees with final output"
-            );
+        // Fragments are located by item ID, never by stream position: the
+        // terminal output may reorder or drop items. Text the user was shown
+        // must still be found and still agree; a reasoning summary or tool-call
+        // scaffold the terminal output no longer carries has nothing to check.
+        for ((_, item_id, content_index, source), fragment) in &self.text_fragments {
+            let item =
+                final_item(output, item_id).context("stream text fragment lacks final item")?;
             let part = item["content"]
                 .as_array()
                 .and_then(|content| content.get(*content_index as usize))
@@ -491,14 +498,10 @@ impl Decoder {
                 "stream text fragment disagrees with final output"
             );
         }
-        for ((index, item_id, summary_index), fragment) in &self.summary_fragments {
-            let item = output
-                .get(*index as usize)
-                .context("stream summary fragment lacks final item")?;
-            ensure!(
-                item["id"].as_str() == Some(item_id),
-                "stream summary fragment item ID disagrees with final output"
-            );
+        for ((_, item_id, summary_index), fragment) in &self.summary_fragments {
+            let Some(item) = final_item(output, item_id) else {
+                continue;
+            };
             ensure!(
                 item["type"] == "reasoning",
                 "stream summary fragment has incompatible final item"
@@ -520,14 +523,10 @@ impl Decoder {
                 "stream summary fragment disagrees with final output"
             );
         }
-        for ((index, item_id), fragment) in &self.tool_fragments {
-            let item = output
-                .get(*index as usize)
-                .context("stream function fragment lacks final item")?;
-            ensure!(
-                item["id"].as_str() == Some(item_id),
-                "stream function fragment item ID disagrees with final output"
-            );
+        for ((_, item_id), fragment) in &self.tool_fragments {
+            let Some(item) = final_item(output, item_id) else {
+                continue;
+            };
             ensure!(
                 item["type"] == "function_call",
                 "stream function fragment has incompatible final item"
@@ -542,14 +541,10 @@ impl Decoder {
             let _: Value = serde_json::from_str(final_arguments)
                 .map_err(|_| diagnostics::stream_protocol())?;
         }
-        for ((index, item_id), (arguments, name)) in &self.tool_done {
-            let item = output
-                .get(*index as usize)
-                .context("completed function arguments lack final item")?;
-            ensure!(
-                item["id"].as_str() == Some(item_id),
-                "completed function item ID disagrees with final output"
-            );
+        for ((_, item_id), (arguments, name)) in &self.tool_done {
+            let Some(item) = final_item(output, item_id) else {
+                continue;
+            };
             ensure!(
                 item["type"] == "function_call",
                 "completed function has incompatible final item"
@@ -572,6 +567,101 @@ impl Decoder {
         }
         Ok(())
     }
+}
+
+/// Reconcile the items streamed as `response.output_item.done` against a
+/// non-empty terminal `response.output`.
+///
+/// The terminal array is authoritative for ordering and presence: a reasoning
+/// item or tool-call scaffold that the backend drops, replaces or reorders
+/// there is a legitimate completion, not a client error. Text the user was
+/// already shown is the exception — it must still be present, matched by item
+/// ID, and still say the same thing, or the turn fails rather than quietly
+/// contradicting the terminal.
+fn reconcile_items(output: &[Value], items: &BTreeMap<usize, Value>) -> Result<()> {
+    let mut final_ids = BTreeSet::new();
+    for item in output {
+        if let Some(id) = item["id"].as_str() {
+            ensure!(final_ids.insert(id), "duplicate completed output ID");
+        }
+    }
+    for item in items.values() {
+        let streamed = visible_text(item);
+        if streamed.is_empty() {
+            continue;
+        }
+        let final_item = item["id"]
+            .as_str()
+            .and_then(|id| final_item(output, id))
+            .context("completed response omits streamed output")?;
+        ensure!(
+            visible_text(final_item) == streamed,
+            "completed response disagrees with streamed output"
+        );
+    }
+    Ok(())
+}
+
+/// The terminal item carrying one streamed item ID, if the terminal output
+/// kept it. Position in the stream never identifies it.
+fn final_item<'a>(output: &'a [Value], item_id: &str) -> Option<&'a Value> {
+    output
+        .iter()
+        .find(|item| item["id"].as_str() == Some(item_id))
+}
+
+/// The typed text parts a user would have been shown for one item, in order.
+/// Untyped or non-text parts are not user-visible output and are not compared.
+fn visible_text(item: &Value) -> Vec<(&str, &str)> {
+    item["content"]
+        .as_array()
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|part| match part["type"].as_str() {
+                    Some("output_text") => part["text"].as_str().map(|text| ("output_text", text)),
+                    Some("refusal") => part["refusal"].as_str().map(|text| ("refusal", text)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Record the *shape* of one reconciled output item in the bounded diagnostics
+/// ring: identity, kind, position and text length only. Model text, reasoning
+/// summaries, tool arguments and encrypted reasoning payloads are never
+/// recorded, so this trace stays safe to read and attach to a bug report.
+fn trace_item(stage: &'static str, index: usize, item: &Value) {
+    tracing::debug!(
+        target: "kuru.provider",
+        operation = "responses-stream-reconcile",
+        stage,
+        item_index = index as u64,
+        item_id = item["id"].as_str().unwrap_or(""),
+        item_type = item["type"].as_str().unwrap_or(""),
+        text_len = text_len(item),
+        "reconciled output item"
+    );
+}
+
+/// Total length in bytes of the user-visible text an item carries. Never the
+/// text itself.
+fn text_len(item: &Value) -> u64 {
+    item["content"]
+        .as_array()
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|part| {
+                    part["text"]
+                        .as_str()
+                        .or_else(|| part["refusal"].as_str())
+                        .map(|text| text.len() as u64)
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 fn append_fragment<K: Ord>(fragments: &mut BTreeMap<K, String>, key: K, value: &str) -> Result<()> {
@@ -614,6 +704,106 @@ mod tests {
             assert_eq!(result["output"][0]["content"][0]["text"], "échec");
             assert_eq!(result["usage"]["input_tokens"], 7);
         }
+    }
+
+    /// The ids, types, indexes and event order below mirror one real turn on
+    /// the ChatGPT subscription route, captured from the `--debug` diagnostics
+    /// ring: a reasoning item at stream index 0, a message at index 1 whose
+    /// visible text is five bytes, and a terminal envelope whose `output` is a
+    /// present but EMPTY array. The pre-fix decoder rejected this with
+    /// "completed response omits streamed output" and failed every turn.
+    #[test]
+    fn accepts_subscription_terminal_envelope_with_empty_output() {
+        let reasoning = "rs_0068e14ccefb15ec016ab0bc43f01087d1ae431a51ff386b29";
+        let message = "msg_0068e14ccefb15ec016ab0bc44515087d1aa3862980c0b266d";
+        let events = [
+            json!({"type":"response.output_item.done","output_index":0,"item":{
+                "id":reasoning,"type":"reasoning","summary":[],"encrypted_content":"opaque"
+            }}),
+            json!({"type":"response.output_text.delta","item_id":message,"output_index":1,"content_index":0,"delta":"read"}),
+            json!({"type":"response.output_text.delta","item_id":message,"output_index":1,"content_index":0,"delta":"y"}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{
+                "id":message,"type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":"ready"}]
+            }}),
+            json!({"type":"response.completed","response":{
+                "id":"resp_0068e14ccefb15ec016ab0bc43a2b487d1","status":"completed","output":[],
+                "usage":{"input_tokens":1287,"output_tokens":9}
+            }}),
+        ];
+        let bytes: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        let result = Decoder::default().push(bytes.as_bytes()).unwrap().unwrap();
+        let output = result["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["id"], json!(reasoning));
+        assert_eq!(output[1]["id"], json!(message));
+        assert_eq!(output[1]["content"][0]["text"], "ready");
+        assert_eq!(result["usage"]["input_tokens"], 1287);
+        assert_eq!(result["usage"]["output_tokens"], 9);
+    }
+
+    #[test]
+    fn terminal_output_owns_order_and_presence_but_never_drops_visible_text() {
+        let reasoning =
+            json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"});
+        let message = json!({"type":"message","id":"msg_1","content":[{"type":"output_text","text":"ready"}]});
+        let streamed = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+            json!({"type":"response.output_item.done","output_index":1,"item":message}),
+        );
+
+        // Reordered, and the reasoning item replaced by the terminal output:
+        // the terminal array decides, so this succeeds and is retained as sent.
+        let reordered = json!([
+            message,
+            {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"weighed it"}]}
+        ]);
+        let completed =
+            json!({"type":"response.completed","response":{"id":"r1","output":reordered}});
+        let result = Decoder::default()
+            .push(format!("{streamed}data: {completed}\n\n").as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["output"], reordered);
+
+        // A streamed reasoning item the terminal output drops is not an error.
+        let without_reasoning =
+            json!({"type":"response.completed","response":{"id":"r1","output":[message]}});
+        assert_eq!(
+            Decoder::default()
+                .push(format!("{streamed}data: {without_reasoning}\n\n").as_bytes())
+                .unwrap()
+                .unwrap()["output"],
+            json!([message])
+        );
+
+        // A streamed item that carried visible text and has no counterpart by
+        // ID in the terminal output still fails the turn.
+        let without_message =
+            json!({"type":"response.completed","response":{"id":"r1","output":[reasoning]}});
+        let error = Decoder::default()
+            .push(format!("{streamed}data: {without_message}\n\n").as_bytes())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("completed response omits streamed output"),
+            "{error:#}"
+        );
+
+        // So does a counterpart whose visible text disagrees.
+        let rewritten = json!({"type":"response.completed","response":{"id":"r1","output":[
+            {"type":"message","id":"msg_1","content":[{"type":"output_text","text":"not ready"}]}
+        ]}});
+        let error = Decoder::default()
+            .push(format!("{streamed}data: {rewritten}\n\n").as_bytes())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("completed response disagrees with streamed output"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -695,6 +885,17 @@ mod tests {
             Decoder::default()
                 .push(format!("data: {no_output}\n\n").as_bytes())
                 .is_err()
+        );
+
+        // An empty terminal array with nothing streamed is a genuinely empty
+        // completion, not a missing one.
+        let empty_output = json!({"type":"response.completed","response":{"id":"r1","output":[]}});
+        assert_eq!(
+            Decoder::default()
+                .push(format!("data: {empty_output}\n\n").as_bytes())
+                .unwrap()
+                .unwrap()["output"],
+            json!([])
         );
 
         let duplicates = json!({"type":"response.completed","response":{"id":"r1","output":[
