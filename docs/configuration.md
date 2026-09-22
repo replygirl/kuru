@@ -80,9 +80,14 @@ source or branch over these caps is omitted whole; Kuru reports the omission
 before inference and in the effective prompt while retaining other usable
 instructions. It does not silently truncate a source. The reviewed snapshot
 owns the exact active bytes and file/directory identities later placed in
-prompts, so Kuru does not reopen those paths after approval. Instructions in
-nested project subdirectories are not activated by this release's automatic
-ancestor/root discovery; on-demand nested activation is a separate follow-on.
+prompts, so Kuru does not reopen those paths after approval. During an actor
+turn, a checked file tool can also discover instructions in its authorized
+path's nested directories. Kuru composes those sources in the same stable
+outermost-to-most-local order and reviews the new complete manifest before
+exposing the file result or changing it. A denied file path never activates
+its instructions; direct `kuru tool` commands do not inject actor instructions.
+For grep and glob, review covers only the bounded, individually authorized
+candidate files, not the requested search root or denied siblings.
 
 Mode, model and effort choices made in the terminal with F2/F3/F4 or the matching
 slash commands are saved immediately. Relaunching from the same canonical directory
@@ -254,14 +259,16 @@ kuru -C /path/to/project trust revoke
 kuru -C /path/to/project --trust-workspace-once tools
 ```
 
-`trust status` displays the normalized root, automatic ancestor sources, safe
+`trust status` displays the normalized root, automatic project sources, safe
 claim descriptions and whether the complete current manifest matches its stored
 approval. The project-instructions claim lists its bounded source labels in
 outermost-to-most-local order and never prints instruction contents. `trust
 approve` reviews and stores that complete manifest; `--yes` is the explicit
-noninteractive form. Any automatic authority addition, removal or value change,
-or any added, removed, reordered, replaced or changed automatic instruction
-source, invalidates the whole stored approval. A change only to mode, model,
+noninteractive form. Any effective ancestor authority addition, removal or
+value change, or any changed ancestor/root instruction source, invalidates the
+stored base approval. Changed nested sources invalidate their exact nested
+grant and require review when reached; they do not silently widen the base.
+A change only to mode, model,
 effort, budgets, dreaming, memory offline state or timeouts leaves it valid.
 `trust revoke` removes the exact root's record without confirmation. Status and
 an absent revoke create no trust directory, lock or record.
@@ -273,6 +280,21 @@ data and never act as partial grants. Without an approval or the one-time flag,
 noninteractive commands fail with a bounded review and the remedy. Interactive
 TUI startup asks before entering the alternate screen and offers continue once,
 approve the complete configuration, or cancel.
+
+When an actor first reaches nested `AGENTS.md`, `CLAUDE.md`, or their bounded
+imports through an authorized file path, the terminal shows the new complete
+manifest and offers **once**, **persist**, or **deny**. Nested persistent grants
+are bound to the exact active path-source set and complete manifest in the same
+root approval record; they do not widen the root-only startup grant. `trust
+revoke` removes both base and nested grants. A changed or newly reachable
+source needs fresh review. A headless `run` without a matching stored approval
+or `--trust-workspace-once` returns a trust-required tool result with a review
+remedy. A newly instructed write or delete has no effect on its first call:
+Kuru settles that call and asks the actor to replan with the updated prompt.
+Other tool calls from the same pre-discovery provider response also settle
+without effects. An approved read or search can return its reviewed result.
+An unsafe approval record still permits an explicit once choice, while
+persistent approval requires revoking or repairing that record first.
 
 The activation sets are command-specific:
 

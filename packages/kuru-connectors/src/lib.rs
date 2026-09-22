@@ -4,6 +4,7 @@
 mod a2a;
 mod auth;
 mod http;
+mod instruction_review;
 mod mcp;
 pub mod permissions;
 #[cfg(windows)]
@@ -26,6 +27,10 @@ mod test_support;
 
 pub use a2a::a2a_send;
 pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
+pub use instruction_review::{
+    InstructionActivation, InstructionGate, InstructionGateOutcome, InstructionReviewAnswer,
+    InstructionReviewRequest, InstructionReviewSender,
+};
 pub use mcp::McpStatus;
 pub use permissions::{
     ApprovalAnswer, ApprovalRequest, ApprovalSender, GrantInspection, GrantRevocation, GrantScope,
@@ -40,7 +45,7 @@ pub use redaction::{
     ProjectionError, json as project_json, text as project_text, truncate_tool_output,
 };
 pub use tool_output::is_permission_denied;
-pub use tools::{ToolCatalog, ToolHost};
+pub use tools::{ActorToolOutcome, ToolCatalog, ToolHost};
 
 /// Maximum protocol message/body size; limits also apply to chunked responses.
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
