@@ -105,29 +105,33 @@ fn required_release_checks_precede_the_only_publication_job() {
         .unwrap();
     assert!(!execution.contains("GITHUB_TOKEN"));
     assert!(!execution.contains("GH_TOKEN"));
-    assert!(!workflow.contains("verify-published-windows"));
 
     let publication = job("publish");
     assert!(publication.contains("ref: ${{ needs.bump.outputs.sha }}"));
     assert!(publication.contains("name: ${{ needs.assemble-candidate.outputs.artifact_name }}"));
     assert!(!publication.contains("pattern:"));
-    let publish_command = "run: mise run release:tool -- publish --version \"$RELEASE_VERSION\" --sha \"$RELEASE_SHA\" --directory dist --notes RELEASE_NOTES.md";
     assert_eq!(
         workflow.matches("mise run release:tool -- publish").count(),
         1
     );
+    let published = job("verify-published-windows");
+    for required in [
+        "needs: [plan, bump, publish]",
+        "runs-on: windows-2025",
+        "contents: read",
+        "ref: ${{ needs.bump.outputs.sha }}",
+        "RELEASE_VERSION: ${{ needs.plan.outputs.version }}",
+        "RELEASE_SHA: ${{ needs.bump.outputs.sha }}",
+        "KURU_PUBLISHED_WINDOWS_RECEIPT: ${{ runner.temp }}/published-windows-receipt.json",
+        "mise run //packages/kuru-delivery:verify:published-windows",
+        "path: ${{ runner.temp }}/published-windows-receipt.json",
+        "if-no-files-found: error",
+    ] {
+        assert!(published.contains(required), "missing {required}");
+    }
     assert!(
-        workflow.trim_end().ends_with(publish_command),
-        "publication must be the final step of the final job"
-    );
-    assert!(
-        !workflow.lines().any(|line| {
-            line.trim_start().starts_with("needs:")
-                && line
-                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
-                    .any(|value| value == "publish")
-        }),
-        "publication must have no dependent jobs"
+        workflow.trim_end().ends_with("if-no-files-found: error"),
+        "public verification receipt upload must be the final workflow step"
     );
 }
 
