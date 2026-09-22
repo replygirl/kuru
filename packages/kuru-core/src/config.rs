@@ -57,6 +57,8 @@ pub struct SelectionOverrides<'a> {
 /// All invocation inputs captured before workspace authority is reviewed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InvocationOverrides {
+    /// Typed `-c key=value` assignments, in command-line order.
+    pub typed_config: Vec<String>,
     pub mode: Option<Mode>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -445,6 +447,9 @@ pub struct ConfigSnapshot {
     origins: BTreeMap<String, LayerOrigin>,
     local: Option<toml::Value>,
     local_origins: BTreeMap<String, LayerOrigin>,
+    discovered_local: Option<toml::Value>,
+    discovered_local_origins: BTreeMap<String, LayerOrigin>,
+    constraints: Vec<(Vec<String>, toml::Value)>,
     overrides: InvocationOverrides,
     manifest: AuthorityManifest,
     memory: MemoryConfig,
@@ -497,6 +502,20 @@ impl ConfigSnapshot {
         local: Option<&Path>,
         overrides: InvocationOverrides,
     ) -> Result<Self> {
+        Self::parse_with_layers(user, workspace, None, local, None, overrides)
+    }
+
+    /// All file sources are caller-classified before this immutable snapshot is
+    /// built. `discovered_local` must contain the exact checked bytes classified
+    /// by the CLI's Git index check, not a path to reopen later.
+    pub fn parse_with_layers(
+        user: Option<&Path>,
+        workspace: &Path,
+        discovered_local: Option<(&Path, &str)>,
+        local: Option<&Path>,
+        managed: Option<&Path>,
+        overrides: InvocationOverrides,
+    ) -> Result<Self> {
         let workspace = workspace
             .canonicalize()
             .map_err(|_| config_error("read", workspace))?;
@@ -510,6 +529,48 @@ impl ConfigSnapshot {
         let mut origins = BTreeMap::new();
         let mut total_bytes: usize = 0;
         let mut layers = Vec::new();
+        let constraints = if let Some(path) = managed {
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| config_error("read", path))?;
+            ensure!(
+                path.is_absolute() && !canonical.starts_with(&workspace),
+                "managed configuration must be an absolute file outside the workspace"
+            );
+            let source = read_config_bounded(&canonical, true)?
+                .ok_or_else(|| config_error("read", &canonical))?;
+            total_bytes = total_bytes
+                .checked_add(source.len())
+                .ok_or_else(|| config_error("read", &canonical))?;
+            let policy: ManagedDocument = toml::from_str(&source)
+                .map_err(|error| config_parse_error(&canonical, &source, &error))?;
+            let defaults = policy.defaults.unwrap_or_else(empty_table);
+            validate_patch(&defaults, &canonical)?;
+            merge_with_origins(
+                &mut merged,
+                &mut origins,
+                defaults,
+                layer_origin(&canonical, false),
+            );
+            let constraints = policy.constraints.unwrap_or_else(empty_table);
+            validate_patch(&constraints, &canonical)?;
+            let mut locks = Vec::new();
+            collect_constraints(&constraints, &[], &mut locks);
+            let mut normalized = toml::Value::try_from(Config::default())?;
+            merge(&mut normalized, constraints);
+            let typed: Config = normalized
+                .try_into()
+                .map_err(|error| config_type_error(&canonical, &error))?;
+            let normalized = toml::Value::try_from(typed)?;
+            for (path, expected) in &mut locks {
+                *expected = lookup_path(&normalized, path)
+                    .ok_or_else(|| config_error("type", &canonical))?
+                    .clone();
+            }
+            locks
+        } else {
+            Vec::new()
+        };
         if let Some(path) = user {
             layers.push((path.to_path_buf(), true, false));
         }
@@ -542,6 +603,8 @@ impl ConfigSnapshot {
                 .try_into()
                 .map_err(|error| config_type_error(&path, &error))?;
         }
+        let (discovered_local, discovered_local_origins) =
+            parse_captured_patch(discovered_local, &merged, &mut total_bytes)?;
         let (local, local_origins) = if let Some(path) = local {
             let source =
                 read_config_bounded(path, true)?.ok_or_else(|| config_error("read", path))?;
@@ -571,6 +634,9 @@ impl ConfigSnapshot {
             origins,
             local,
             local_origins,
+            discovered_local,
+            discovered_local_origins,
+            constraints,
             overrides,
             manifest: empty_manifest(),
             memory: MemoryConfig::default(),
@@ -588,6 +654,7 @@ impl ConfigSnapshot {
             .map_err(|_| config_error("validation", provisional.workspace()))?;
         permissions::validate_rules(&config.permissions)
             .map_err(|_| config_error("validation", provisional.workspace()))?;
+        provisional.check_constraints(&config, false)?;
         let manifest = derive_manifest(&config, &value_origins, &instruction_sources)?;
         Ok(Self {
             memory: config.memory.clone(),
@@ -648,7 +715,27 @@ impl ConfigSnapshot {
         config
             .validate()
             .map_err(|_| config_error("validation", self.workspace()))?;
+        self.check_constraints(&config, true)?;
         Ok(config)
+    }
+
+    fn check_constraints(&self, config: &Config, include_saved_choices: bool) -> Result<()> {
+        let final_value = toml::Value::try_from(config)?;
+        for (path, expected) in &self.constraints {
+            if !include_saved_choices
+                && path.len() == 1
+                && matches!(path[0].as_str(), "mode" | "model" | "effort")
+            {
+                continue;
+            }
+            let actual = lookup_path(&final_value, path);
+            ensure!(
+                actual == Some(expected),
+                "managed constraint conflicts with final configuration at {}",
+                safe_text(&path.join("."), 128)
+            );
+        }
+        Ok(())
     }
 
     fn value_with_preferences(
@@ -657,11 +744,17 @@ impl ConfigSnapshot {
     ) -> Result<(toml::Value, BTreeMap<String, LayerOrigin>)> {
         let mut value = self.merged.clone();
         let mut origins = self.origins.clone();
+        let mut typed = empty_table();
+        for assignment in &self.overrides.typed_config {
+            merge(&mut typed, typed_assignment(assignment)?);
+        }
         let provider = self
             .overrides
             .provider
             .as_deref()
+            .or_else(|| typed.get("provider")?.as_str())
             .or_else(|| self.local.as_ref()?.get("provider")?.as_str())
+            .or_else(|| self.discovered_local.as_ref()?.get("provider")?.as_str())
             .or_else(|| value.get("provider")?.as_str())
             .ok_or_else(|| config_error("type", self.workspace()))?
             .to_owned();
@@ -669,11 +762,26 @@ impl ConfigSnapshot {
             .overrides
             .model
             .as_deref()
+            .or_else(|| typed.get("model")?.as_str())
             .or_else(|| self.local.as_ref()?.get("model")?.as_str())
+            .or_else(|| self.discovered_local.as_ref()?.get("model")?.as_str())
             .map(str::to_owned);
         preferences
             .overlay(&mut value, &provider, explicit_model.as_deref())
             .map_err(|_| config_error("validation", self.workspace()))?;
+        if let Some(local) = &self.discovered_local {
+            merge_with_origins(
+                &mut value,
+                &mut origins,
+                local.clone(),
+                LayerOrigin {
+                    source: SafeSource("project-local configuration".into()),
+                    source_digest: source_digest(b"project-local configuration"),
+                    automatic: false,
+                },
+            );
+            origins.extend(self.discovered_local_origins.clone());
+        }
         if let Some(local) = &self.local {
             merge_with_origins(
                 &mut value,
@@ -686,6 +794,10 @@ impl ConfigSnapshot {
                 },
             );
             origins.extend(self.local_origins.clone());
+        }
+        for assignment in &self.overrides.typed_config {
+            let patch = typed_assignment(assignment)?;
+            merge_with_origins(&mut value, &mut origins, patch, command_line_origin());
         }
         apply_overrides(&mut value, &mut origins, &self.overrides);
         Ok((value, origins))
@@ -915,6 +1027,113 @@ fn reject_removed_settings(patch: &toml::Value) -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedDocument {
+    defaults: Option<toml::Value>,
+    constraints: Option<toml::Value>,
+}
+
+fn empty_table() -> toml::Value {
+    toml::Value::Table(toml::map::Map::new())
+}
+
+fn validate_patch(patch: &toml::Value, path: &Path) -> Result<()> {
+    ensure!(patch.is_table(), "managed configuration requires tables");
+    reject_removed_settings(patch).map_err(|_| config_error("validation", path))?;
+    let mut checked = toml::Value::try_from(Config::default())?;
+    merge(&mut checked, patch.clone());
+    let _: Config = checked
+        .try_into()
+        .map_err(|error| config_type_error(path, &error))?;
+    Ok(())
+}
+
+fn collect_constraints(
+    value: &toml::Value,
+    prefix: &[String],
+    constraints: &mut Vec<(Vec<String>, toml::Value)>,
+) {
+    if let toml::Value::Table(table) = value
+        && !(prefix.len() >= 2 && prefix[0] == "mcp")
+        && !(!prefix.is_empty() && table.is_empty())
+    {
+        for (key, value) in table {
+            let mut path = prefix.to_vec();
+            path.push(key.clone());
+            collect_constraints(value, &path, constraints);
+        }
+    } else if !prefix.is_empty() {
+        constraints.push((prefix.to_vec(), value.clone()));
+    }
+}
+
+fn lookup_path<'a>(value: &'a toml::Value, path: &[String]) -> Option<&'a toml::Value> {
+    path.iter().try_fold(value, |value, key| value.get(key))
+}
+
+fn parse_captured_patch(
+    captured: Option<(&Path, &str)>,
+    base: &toml::Value,
+    total_bytes: &mut usize,
+) -> Result<(Option<toml::Value>, BTreeMap<String, LayerOrigin>)> {
+    let Some((path, source)) = captured else {
+        return Ok((None, BTreeMap::new()));
+    };
+    ensure!(
+        source.len() <= MAX_FILE_BYTES,
+        "configuration input exceeds 256 KiB"
+    );
+    *total_bytes = total_bytes
+        .checked_add(source.len())
+        .ok_or_else(|| config_error("read", path))?;
+    ensure!(
+        *total_bytes <= MAX_COMBINED_BYTES,
+        "configuration input exceeds 1 MiB"
+    );
+    let patch: toml::Value =
+        toml::from_str(source).map_err(|error| config_parse_error(path, source, &error))?;
+    reject_removed_settings(&patch).map_err(|_| config_error("validation", path))?;
+    let mut checked = base.clone();
+    merge(&mut checked, patch.clone());
+    let _: Config = checked
+        .try_into()
+        .map_err(|error| config_type_error(path, &error))?;
+    let mut origins = BTreeMap::new();
+    record_origins(&patch, "", layer_origin(path, false), &mut origins);
+    Ok((Some(patch), origins))
+}
+
+fn typed_assignment(assignment: &str) -> Result<toml::Value> {
+    let (key, value) = assignment
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("-c expects key=value"))?;
+    let key = key.trim();
+    ensure!(
+        !key.is_empty()
+            && key.len() <= 256
+            && key.split('.').all(|part| {
+                !part.is_empty()
+                    && part.len() <= 64
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+            })
+            && !value.contains(['\r', '\n']),
+        "-c has an invalid key or multiline value"
+    );
+    toml::from_str(&format!("{key}={value}"))
+        .map_err(|_| anyhow::anyhow!("-c has an invalid TOML value"))
+}
+
+fn command_line_origin() -> LayerOrigin {
+    LayerOrigin {
+        source: SafeSource("command line".into()),
+        source_digest: source_digest(b"command line"),
+        automatic: false,
+    }
+}
+
 fn merge(base: &mut toml::Value, patch: toml::Value) {
     match (base, patch) {
         (toml::Value::Table(base), toml::Value::Table(patch)) => {
@@ -1046,11 +1265,7 @@ fn apply_overrides(
     let table = value
         .as_table_mut()
         .expect("configuration default is a table");
-    let cli = || LayerOrigin {
-        source: SafeSource("command line".into()),
-        source_digest: source_digest(b"command line"),
-        automatic: false,
-    };
+    let cli = command_line_origin;
     if let Some(mode) = overrides.mode {
         table.insert(
             "mode".into(),
@@ -1081,6 +1296,8 @@ fn apply_overrides(
     if overrides.no_dream {
         table.insert("dream_every".into(), 0.into());
         table.insert("dream_on_exit".into(), false.into());
+        origins.insert("dream_every".into(), cli());
+        origins.insert("dream_on_exit".into(), cli());
     }
 }
 

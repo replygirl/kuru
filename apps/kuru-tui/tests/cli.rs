@@ -139,6 +139,183 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
 }
 
 #[test]
+fn discovered_local_config_requires_untracked_git_provenance_and_preserves_repo_claims() {
+    let env = Sandbox::new();
+    let git = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&env.project)
+        .output()
+        .unwrap();
+    assert!(
+        git.status.success(),
+        "{}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+    let config_dir = env.project.join(".kuru");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "allow_shell=true\n[mcp.worker]\ncommand='repo-runner'",
+    )
+    .unwrap();
+    let local = config_dir.join("config.local.toml");
+    std::fs::write(&local, "mode='freudian'\nallow_shell=false").unwrap();
+    let output = env.success(&["-c", "max_rounds=4", "config"]);
+    assert!(output.contains("mode = \"freudian\""));
+    assert!(output.contains("allow_shell = false"));
+    assert!(output.contains("max_rounds = 4"));
+    let status = env.success(&["trust", "status"]);
+    assert!(status.contains("worker"), "{status}");
+    assert!(!status.contains("shell enabled"), "{status}");
+    let run = env.run(&["run", "hello"]);
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("workspace authority"));
+
+    let git = std::process::Command::new("git")
+        .args(["add", "--", ".kuru/config.local.toml"])
+        .current_dir(&env.project)
+        .output()
+        .unwrap();
+    assert!(
+        git.status.success(),
+        "{}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+    let rejected = env.run(&["config"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("Git tracks"));
+    let rejected_run = env.run(&["run", "hello"]);
+    assert!(!rejected_run.status.success());
+    assert!(String::from_utf8_lossy(&rejected_run.stderr).contains("Git tracks"));
+
+    let foreign = env.root.path().join("foreign");
+    std::fs::create_dir(&foreign).unwrap();
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&foreign)
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+    std::fs::write(foreign.join("other.toml"), "unrelated=true").unwrap();
+    let added = std::process::Command::new("git")
+        .args(["add", "--", "other.toml"])
+        .current_dir(&foreign)
+        .output()
+        .unwrap();
+    assert!(added.status.success());
+    let redirected_index = env
+        .command()
+        .env("GIT_INDEX_FILE", foreign.join(".git/index"))
+        .arg("config")
+        .output()
+        .unwrap();
+    assert!(!redirected_index.status.success());
+    assert!(String::from_utf8_lossy(&redirected_index.stderr).contains("Git tracks"));
+    let redirected_directory = env
+        .command()
+        .env("GIT_DIR", foreign.join(".git"))
+        .env("GIT_WORK_TREE", &env.project)
+        .arg("config")
+        .output()
+        .unwrap();
+    assert!(!redirected_directory.status.success());
+    assert!(String::from_utf8_lossy(&redirected_directory.stderr).contains("Git tracks"));
+}
+
+#[test]
+fn discovered_local_config_accepts_non_git_roots_and_rejects_ambiguous_index_status() {
+    let env = Sandbox::new();
+    let config_dir = env.project.join(".kuru");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.local.toml"), "mode='freudian'").unwrap();
+    assert!(env.success(&["config"]).contains("mode = \"freudian\""));
+
+    std::fs::create_dir(env.project.join(".git")).unwrap();
+    let rejected = env.run(&["config"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("index status is ambiguous"));
+}
+
+#[test]
+fn managed_locks_and_typed_overrides_apply_before_demo_dispatch() {
+    let env = Sandbox::new();
+    let git = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&env.project)
+        .output()
+        .unwrap();
+    assert!(
+        git.status.success(),
+        "{}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+    let config_dir = env.project.join(".kuru");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.local.toml"),
+        "mode='freudian'\nmax_rounds=3",
+    )
+    .unwrap();
+    let managed = env.root.path().join("managed.toml");
+    std::fs::write(
+        &managed,
+        "[defaults]\nmax_rounds=2\n[constraints]\nallow_shell=false\nmax_tool_calls=12\npermissions=[]",
+    )
+    .unwrap();
+    let output = env
+        .command()
+        .env("KURU_MANAGED_CONFIG", &managed)
+        .args([
+            "-c",
+            "max_rounds=4",
+            "-c",
+            "memory.offline=true",
+            "-c",
+            "mcp.fixture={command='runner',env={TOKEN='fake-secret'}}",
+            "config",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = String::from_utf8(output.stdout).unwrap();
+    assert!(config.contains("max_rounds = 4"));
+    assert!(config.contains("mode = \"freudian\""));
+    assert!(config.contains("offline = true"));
+    assert!(config.contains("[redacted]"));
+    assert!(!config.contains("fake-secret"));
+    let run = env
+        .command()
+        .env("KURU_MANAGED_CONFIG", &managed)
+        .args(["-c", "max_rounds=4", "run", "hello"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8(run.stdout).unwrap().contains("demo"));
+    for args in [
+        vec!["--allow-shell", "config"],
+        vec!["-c", "max_tool_calls=5", "config"],
+        vec!["-c", "unknown_setting=true", "config"],
+        vec!["-c", "max_tool_calls='wrong'", "config"],
+    ] {
+        let output = env
+            .command()
+            .env("KURU_MANAGED_CONFIG", &managed)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+    }
+}
+
+#[test]
 fn cli_turn_id_reuses_only_the_exact_request_in_its_session() {
     let env = Sandbox::new();
     assert!(env.success(&["run", "--help"]).contains("--turn-id"));
