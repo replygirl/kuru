@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -493,6 +493,148 @@ fn real_pty_cost_inspection_survives_120_80_and_40_columns() -> Result<()> {
     terminal.assert_restored()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route(
+            "/v1/responses",
+            post(move |Json(request): Json<Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().unwrap().push(request);
+                    priced_complete(Json(json!({}))).await
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("command-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 48, 120)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+
+    terminal.send(b"/mem\t")?;
+    terminal.wait_composer_frame(&["/memory", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"\t")?;
+    terminal.wait_composer_frame(&["/memory-history", "enter send"], READY_TIMEOUT)?;
+    terminal.send(&[127; 15])?;
+    terminal.wait_composer_frame(
+        &["What shall we explore or build?", "enter send"],
+        READY_TIMEOUT,
+    )?;
+    terminal.command("/help", None)?;
+    terminal.wait_composer_frame(&["/clear", "/status", "enter send"], READY_TIMEOUT)?;
+
+    let before_unknown = requests.lock().unwrap().len();
+    terminal.command("/compact", None)?;
+    terminal.wait_composer_frame(&["Unknown command", "enter send"], READY_TIMEOUT)?;
+    ensure!(
+        requests.lock().unwrap().len() == before_unknown,
+        "an unregistered future command reached the provider"
+    );
+
+    terminal.command("OLDER_VISIBLE_MARKER", None)?;
+    terminal.wait_composer_frame(&["PRICED_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
+    let after_first = requests.lock().unwrap().len();
+    ensure!(
+        after_first > before_unknown,
+        "first turn never reached the provider"
+    );
+    let sessions = sandbox.sessions()?;
+    ensure!(
+        sessions.len() == 1 && sessions[0].turns == 1,
+        "{sessions:?}"
+    );
+    let session = &sessions[0].id;
+
+    terminal.command("/status", None)?;
+    terminal.wait_composer_frame(
+        &[
+            "Session:",
+            session,
+            "Project:",
+            "Model: fixture",
+            "Effort:",
+            "Mode:",
+            "Focus: auto",
+            "Turns: 1",
+            "Session usage",
+        ],
+        READY_TIMEOUT,
+    )?;
+    ensure!(
+        requests.lock().unwrap().len() == after_first,
+        "/status made a provider request"
+    );
+    terminal.send(b"/cle\t")?;
+    terminal.wait_composer_frame(&["/clear", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"\r")?;
+    terminal.wait_composer_frame(&["stored history unchanged", "enter send"], READY_TIMEOUT)?;
+    ensure!(
+        !terminal.screen().contains("OLDER_VISIBLE_MARKER"),
+        "/clear retained old rows on the screen: {}",
+        terminal.screen()
+    );
+    ensure!(
+        requests.lock().unwrap().len() == after_first,
+        "/clear made a provider request"
+    );
+    terminal.command("FOLLOWUP_VISIBLE_MARKER", None)?;
+    terminal.wait_composer_frame(&["PRICED_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
+    let captured = requests.lock().unwrap();
+    ensure!(
+        captured.len() > after_first,
+        "follow-up never reached the provider"
+    );
+    ensure!(
+        captured[after_first..]
+            .iter()
+            .any(|request| request.to_string().contains("OLDER_VISIBLE_MARKER")),
+        "the cleared turn was absent from follow-up provider context"
+    );
+    drop(captured);
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()?;
+
+    let mut resume = sandbox.command("responses");
+    resume
+        .args(["--model", "fixture", "--config"])
+        .arg(&config)
+        .args(["--resume", session])
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut resumed = Terminal::spawn(resume, 48, 120)?;
+    resumed.wait_composer_frame(
+        &["OLDER_VISIBLE_MARKER", "enter send"],
+        sandbox.startup_timeout,
+    )?;
+    resumed.send(b"/quit\r")?;
+    resumed.wait_exit(EXIT_TIMEOUT)?;
+    resumed.assert_restored()
+}
+
 /// T3's coherent surface: one completed frame carries model, effort, mode,
 /// cost, context use and permission state at once, and the cost and permission
 /// figures are the same ones `/cost` and `/permissions` print.
@@ -820,7 +962,8 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         terminal.close_picker(b"\x1b[B\r")?;
         terminal.command("/dream", None)?;
         terminal.command("/unknown", None)?;
-        terminal.wait_text(&["unknown command"], &[])?;
+        terminal
+            .wait_composer_frame(&["Unknown command; use /help", "enter send"], READY_TIMEOUT)?;
         terminal.resize(20, 65)?;
         terminal.send(b"\x1b[200~pasted text\x1b[201~")?;
         terminal.wait_text(&["pasted text", "enter send"], &[])?;

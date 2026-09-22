@@ -22,7 +22,10 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | Escape | Close a picker or cancel active work |
 | Ctrl+C | Cancel active work; quit while idle |
 | Page Up / Page Down | Scroll the transcript |
+| Tab / Shift+Tab | Cycle matching slash-command names before their arguments |
 | `/help` | Show commands |
+| `/clear` | Clear this terminal's visible conversation while retaining stored history and session identity |
+| `/status` | Show local session, project, selections, turns, and known usage without a provider call |
 | `/parts` | Inspect parts and relationships |
 | `/mode ifs` | Change the current framework |
 | `/model MODEL_ID` | Select a model |
@@ -32,6 +35,8 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | `/relate alliance ID,ID` | Activate a relationship of 2–4 parts |
 | `/memory NAME_OR_ID` | Inspect an identity's stored memory |
 | `/notes NAME_OR_ID` | Inspect an identity's durable notes, separate from its conversation |
+| `/memory-status` | Inspect the project's managed memory status |
+| `/memory-history` | Inspect committed memory revisions |
 | `/cost` | Inspect this session's reported usage and estimated API cost |
 | `/retry` | Retry the last local submission when its exact durable turn is safe to reuse |
 | `/dream` | Run bounded memory/topology consolidation |
@@ -57,6 +62,12 @@ its earlier marker remains visible. If external dispatch may have occurred, Kuru
 refuses the retry and explains that entering a new prompt starts new work. Kuru
 never retries automatically and does not provide an arbitrary turn-history
 browser.
+
+Tab completion changes only the command name before the first argument; editing
+the draft starts a new completion cycle. `/clear` drops rendered conversation rows
+from this terminal, not durable turns, usage, or the current session. A resumed
+session still has its stored history. `/status` reports the current local view;
+it does not ask the provider for an update.
 
 `/notes` returns the selected identity's newest 100 durable notes with the
 selected mode, canonical identity, requested limit, and `truncated` metadata.

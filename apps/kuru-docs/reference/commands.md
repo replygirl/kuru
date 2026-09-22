@@ -4,40 +4,47 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 
 ## Terminal keys
 
-| Key                                       | Action                                               |
-| ----------------------------------------- | ---------------------------------------------------- |
-| <kbd>Enter</kbd>                          | Send the input or select the highlighted picker item |
-| <kbd>Alt</kbd>+<kbd>Enter</kbd>           | Insert a newline                                     |
-| <kbd>F2</kbd>                             | Choose a model                                       |
-| <kbd>F3</kbd>                             | Choose reasoning effort                              |
-| <kbd>F4</kbd>                             | Choose a framework                                   |
-| Type or paste in a picker                 | Filter its choices                                   |
-| <kbd>Escape</kbd>                         | Close a picker or cancel active work                 |
-| <kbd>Ctrl</kbd>+<kbd>C</kbd>              | Cancel work; quit while idle                         |
-| <kbd>Page Up</kbd> / <kbd>Page Down</kbd> | Scroll the transcript                                |
+| Key                                              | Action                                                       |
+| ------------------------------------------------ | ------------------------------------------------------------ |
+| <kbd>Enter</kbd>                                 | Send the input or select the highlighted picker item         |
+| <kbd>Alt</kbd>+<kbd>Enter</kbd>                  | Insert a newline                                             |
+| <kbd>F2</kbd>                                    | Choose a model                                               |
+| <kbd>F3</kbd>                                    | Choose reasoning effort                                      |
+| <kbd>F4</kbd>                                    | Choose a framework                                           |
+| Type or paste in a picker                        | Filter its choices                                           |
+| <kbd>Escape</kbd>                                | Close a picker or cancel active work                         |
+| <kbd>Ctrl</kbd>+<kbd>C</kbd>                     | Cancel work; quit while idle                                 |
+| <kbd>Page Up</kbd> / <kbd>Page Down</kbd>        | Scroll the transcript                                        |
+| <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Cycle matching slash-command names before the first argument |
 
 ## Slash commands
 
-| Command              | Action                                                           |
-| -------------------- | ---------------------------------------------------------------- |
-| `/help`              | Show terminal help                                               |
-| `/parts`             | Inspect active parts and relationships                           |
-| `/mode ifs`          | Select `ifs`, `polyvagal`, `freudian`, or `jungian`              |
-| `/model MODEL_ID`    | Select a model and its advertised default effort                 |
-| `/effort LEVEL`      | Select effort; `default` clears an explicit value                |
-| `/focus NAME_OR_ID`  | Select a speaking identity                                       |
-| `/focus auto`        | Return to contextual speaker selection                           |
-| `/relate KIND ID,ID` | Activate protection, polarization, or alliance among 2–4 members |
-| `/memory NAME_OR_ID` | Inspect an identity's stored memory                              |
-| `/notes NAME_OR_ID`  | Inspect an identity's separate bounded durable notes             |
-| `/retry`             | Safely retry the last durably retained local submission          |
-| `/memory-status`     | Inspect the project's memory store and current revision          |
-| `/memory-history`    | List committed memory revisions                                  |
-| `/dream`             | Run bounded consolidation                                        |
-| `/undo-dream`        | Restore the previous accepted topology change                    |
-| `/quit`              | End the session                                                  |
+| Command              | Action                                                                        |
+| -------------------- | ----------------------------------------------------------------------------- |
+| `/help`              | Show terminal help                                                            |
+| `/clear`             | Clear the visible conversation; keep stored turns and the session             |
+| `/status`            | Show the current session, project, selections, turns, and known usage locally |
+| `/parts`             | Inspect active parts and relationships                                        |
+| `/mode ifs`          | Select `ifs`, `polyvagal`, `freudian`, or `jungian`                           |
+| `/model MODEL_ID`    | Select a model and its advertised default effort                              |
+| `/effort LEVEL`      | Select effort; `default` clears an explicit value                             |
+| `/focus NAME_OR_ID`  | Select a speaking identity                                                    |
+| `/focus auto`        | Return to contextual speaker selection                                        |
+| `/relate KIND ID,ID` | Activate protection, polarization, or alliance among 2–4 members              |
+| `/memory NAME_OR_ID` | Inspect an identity's stored memory                                           |
+| `/notes NAME_OR_ID`  | Inspect an identity's separate bounded durable notes                          |
+| `/retry`             | Safely retry the last durably retained local submission                       |
+| `/cost`              | Show this session's reported usage and estimated API cost                     |
+| `/permissions`       | Inspect session and saved tool grants                                         |
+| `/memory-status`     | Inspect the project's memory store and current revision                       |
+| `/memory-history`    | List committed memory revisions                                               |
+| `/dream`             | Run bounded consolidation                                                     |
+| `/undo-dream`        | Restore the previous accepted topology change                                 |
+| `/quit`              | End the session                                                               |
 
 Model, effort, and framework selections made here are [saved for the project](./configuration#remembered-choices). Identity names must be unambiguous; `/parts` provides IDs.
+
+Tab completes only the leading command name and leaves its arguments unchanged. `/clear` affects only the current terminal view: stored conversation, usage, and session identity remain available, including after resume. `/status` uses the local session snapshot and makes no provider request.
 
 ## CLI commands
 
