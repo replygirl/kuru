@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -23,6 +23,9 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
 };
+use grep_regex::RegexMatcher;
+use grep_searcher::{Searcher, sinks::UTF8};
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use kuru_core::{Config, NativeTool, PermissionSelector, ProjectRelativeTarget, ToolSpec};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 #[cfg(windows)]
@@ -65,6 +68,13 @@ const UNIX_SHELL_ENVIRONMENT: &[&str] = &[
     "XDG_STATE_HOME",
     "XDG_RUNTIME_DIR",
 ];
+
+const MAX_SEARCH_FILES: usize = 10_000;
+const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SEARCH_MATCHES: usize = 2_000;
+const MAX_SEARCH_LINE_BYTES: usize = 8 * 1024;
+const MAX_PAGE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PAGE_LINES: usize = 100_000;
 
 #[cfg(windows)]
 const WINDOWS_SHELL_ENVIRONMENT: &[&str] = &[
@@ -320,12 +330,17 @@ impl ToolHost {
             .permissions
             .advertises(&PermissionSelector::native(NativeTool::FileRead))
         {
-            specs.push(spec(
+            let mut file_read = spec(
                 "file_read",
-                "Read a UTF-8 project file with a bounded head-and-tail excerpt.",
+                "Read a UTF-8 project file with a bounded head-and-tail excerpt, or request one-based logical-line pages.",
                 &["path"],
                 &["path"],
-            ));
+            );
+            file_read.parameters["properties"]["offset"] =
+                json!({"type":"integer","minimum":1,"default":1});
+            file_read.parameters["properties"]["limit"] =
+                json!({"type":"integer","minimum":1,"maximum":10000,"default":200});
+            specs.push(file_read);
         }
         if self
             .permissions
@@ -337,6 +352,40 @@ impl ToolHost {
                 &["path"],
                 &[],
             ));
+        }
+        if self
+            .permissions
+            .advertises(&PermissionSelector::native(NativeTool::Grep))
+        {
+            let mut grep = spec(
+                "grep",
+                "Search UTF-8 project files with a bounded ripgrep-compatible regular expression. Hidden and ignored paths are excluded unless requested.",
+                &["pattern"],
+                &["pattern"],
+            );
+            grep.parameters["properties"]["path"] = json!({"type":"string"});
+            grep.parameters["properties"]["include_hidden"] =
+                json!({"type":"boolean","default":false});
+            grep.parameters["properties"]["include_ignored"] =
+                json!({"type":"boolean","default":false});
+            specs.push(grep);
+        }
+        if self
+            .permissions
+            .advertises(&PermissionSelector::native(NativeTool::Glob))
+        {
+            let mut glob = spec(
+                "glob",
+                "Find project paths with bounded ripgrep-compatible glob matching. Hidden and ignored paths are excluded unless requested.",
+                &["pattern"],
+                &["pattern"],
+            );
+            glob.parameters["properties"]["path"] = json!({"type":"string"});
+            glob.parameters["properties"]["include_hidden"] =
+                json!({"type":"boolean","default":false});
+            glob.parameters["properties"]["include_ignored"] =
+                json!({"type":"boolean","default":false});
+            specs.push(glob);
         }
         if self
             .permissions
@@ -398,6 +447,26 @@ impl ToolHost {
         args: Value,
         approval: Option<&ApprovalSender>,
     ) -> Result<String> {
+        // Search discovers many independent file targets. It has no request
+        // root grant: every returned candidate is authorized with the same
+        // foreground sender and exact target before its path or contents can
+        // enter the result.
+        if matches!(name, "grep" | "glob") {
+            let selector = PermissionSelector::native(if name == "grep" {
+                NativeTool::Grep
+            } else {
+                NativeTool::Glob
+            });
+            if !self.permissions.advertises(&selector) {
+                return project_failure(ToolFailure::permission_denied(anyhow::anyhow!(
+                    "tool permission was denied"
+                )));
+            }
+            return match self.execute_inner(name, args, approval).await {
+                Ok(execution) => project_execution(execution),
+                Err(failure) => project_failure(failure),
+            };
+        }
         let result: std::result::Result<ToolExecution, ToolFailure> = async {
             let (selector, target) = self.permission_facts(name, &args).await?;
             let invocation = PermissionInvocation::new(selector, target, &args)
@@ -442,7 +511,7 @@ impl ToolHost {
                 }
                 _ => unreachable!("permission service returned an invalid outcome"),
             }
-            self.execute_inner(name, args).await
+            self.execute_inner(name, args, approval).await
         }
         .await;
         match result {
@@ -591,6 +660,7 @@ impl ToolHost {
         &self,
         name: &str,
         args: Value,
+        approval: Option<&ApprovalSender>,
     ) -> std::result::Result<ToolExecution, ToolFailure> {
         if !args.is_object() {
             return Err(ToolFailure::built_in(anyhow::anyhow!(
@@ -635,6 +705,14 @@ impl ToolHost {
                     let extent = file.metadata()?.len();
                     #[cfg(unix)]
                     let file = file.into_std();
+                    if args.get("offset").is_some() || args.get("limit").is_some() {
+                        return Ok(ToolExecution::Json(page_file_read(
+                            file,
+                            extent,
+                            page_offset(&args)?,
+                            page_limit(&args)?,
+                        )?));
+                    }
                     Ok(ToolExecution::ProjectedText(
                         read_file_output(tokio::fs::File::from_std(file), extent).await?,
                     ))
@@ -642,6 +720,16 @@ impl ToolHost {
                 .await;
                 execution.map_err(ToolFailure::built_in)
             }
+            "glob" => self
+                .glob(&args, approval)
+                .await
+                .map(ToolExecution::Json)
+                .map_err(ToolFailure::built_in),
+            "grep" => self
+                .grep(&args, approval)
+                .await
+                .map(ToolExecution::Json)
+                .map_err(ToolFailure::built_in),
             "file_write" => {
                 let execution = (|| -> Result<ToolExecution> {
                     let content = string(&args, "content")?;
@@ -783,6 +871,189 @@ impl ToolHost {
         }
     }
 
+    async fn glob(&self, args: &Value, approval: Option<&ApprovalSender>) -> Result<Value> {
+        let pattern = bounded_search_pattern(string(args, "pattern")?)?;
+        let mut matches = Vec::new();
+        let mut omitted = SearchOmissions::default();
+        for target in self.search_candidates(args, Some(pattern.as_str()), &mut omitted)? {
+            match self
+                .authorize_search_candidate(NativeTool::Glob, &target, args, approval)
+                .await?
+            {
+                SearchCandidateAccess::Allowed => matches.push(target.as_str().to_owned()),
+                SearchCandidateAccess::Denied => omitted.denied += 1,
+                SearchCandidateAccess::PermissionRequired => omitted.permission_required += 1,
+            }
+            if matches.len() == MAX_SEARCH_MATCHES {
+                omitted.output_limit = true;
+                break;
+            }
+        }
+        Ok(json!({"matches": matches, "omitted": omitted.into_json()}))
+    }
+
+    async fn grep(&self, args: &Value, approval: Option<&ApprovalSender>) -> Result<Value> {
+        let pattern = bounded_search_pattern(string(args, "pattern")?)?;
+        let matcher = RegexMatcher::new_line_matcher(&pattern)
+            .context("grep pattern is not a valid line regular expression")?;
+        let mut matches = Vec::new();
+        let mut omitted = SearchOmissions::default();
+        for target in self.search_candidates(args, None, &mut omitted)? {
+            match self
+                .authorize_search_candidate(NativeTool::Grep, &target, args, approval)
+                .await?
+            {
+                SearchCandidateAccess::Allowed => {}
+                SearchCandidateAccess::Denied => {
+                    omitted.denied += 1;
+                    continue;
+                }
+                SearchCandidateAccess::PermissionRequired => {
+                    omitted.permission_required += 1;
+                    continue;
+                }
+            }
+            self.root_guard.revalidate()?;
+            let (directory, path, _guard) = self.path(target.as_str(), false)?;
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let mut file = directory.open_with(path, &options)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() > MAX_SEARCH_FILE_BYTES {
+                omitted.large_or_non_file += 1;
+                continue;
+            }
+            let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+            Read::by_ref(&mut file)
+                .take(MAX_SEARCH_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
+                omitted.large_or_non_file += 1;
+                continue;
+            }
+            if std::str::from_utf8(&bytes).is_err() {
+                omitted.unreadable += 1;
+                continue;
+            }
+            let target_name = target.as_str().to_owned();
+            let mut searcher = Searcher::new();
+            searcher
+                .search_slice(&matcher, &bytes, UTF8(|line, text| {
+                    if text.len() > MAX_SEARCH_LINE_BYTES {
+                        omitted.oversized_line += 1;
+                        return Ok(true);
+                    }
+                    matches.push(json!({"path": target_name, "line": line, "text": text.trim_end_matches(['\n', '\r'])}));
+                    Ok(matches.len() < MAX_SEARCH_MATCHES)
+                }))
+                .map_err(|error| anyhow::anyhow!("grep search failed: {error}"))?;
+            if matches.len() == MAX_SEARCH_MATCHES {
+                omitted.output_limit = true;
+                break;
+            }
+        }
+        Ok(json!({"matches": matches, "omitted": omitted.into_json()}))
+    }
+
+    fn search_candidates(
+        &self,
+        args: &Value,
+        pattern: Option<&str>,
+        omitted: &mut SearchOmissions,
+    ) -> Result<Vec<ProjectRelativeTarget>> {
+        let root = optional_path(args)?;
+        let _ = self.path(root, false)?;
+        let include_hidden = optional_bool(args, "include_hidden")?;
+        let include_ignored = optional_bool(args, "include_ignored")?;
+        let mut walker = WalkBuilder::new(self.root.join(root));
+        walker
+            .follow_links(false)
+            .hidden(!include_hidden)
+            .ignore(!include_ignored)
+            .git_global(!include_ignored)
+            .git_ignore(!include_ignored)
+            .git_exclude(!include_ignored)
+            // A project need not itself be a Git checkout for its local
+            // `.gitignore` policy to be useful to native search.
+            .require_git(false)
+            .threads(1);
+        let overrides = if let Some(pattern) = pattern {
+            let mut overrides = OverrideBuilder::new(&self.root);
+            overrides.add(pattern).context("glob pattern is invalid")?;
+            Some(overrides.build().context("glob pattern is invalid")?)
+        } else {
+            None
+        };
+        let mut candidates = Vec::new();
+        for entry in walker.build() {
+            let Ok(entry) = entry else {
+                omitted.unreadable += 1;
+                continue;
+            };
+            if !entry.file_type().is_some_and(|type_| type_.is_file()) {
+                continue;
+            }
+            // Walk overrides take precedence over ignore rules. Match the glob
+            // after traversal so a pattern never re-admits ignored files.
+            if let Some(overrides) = &overrides
+                && !overrides.matched(entry.path(), false).is_whitelist()
+            {
+                continue;
+            }
+            let Ok(relative) = entry.path().strip_prefix(&self.root) else {
+                omitted.unreadable += 1;
+                continue;
+            };
+            let Some(relative) = relative.to_str() else {
+                omitted.unreadable += 1;
+                continue;
+            };
+            let relative = relative.replace(std::path::MAIN_SEPARATOR, "/");
+            // An explicit glob override can otherwise admit dot-prefixed paths
+            // after the walker's hidden filter has rejected them.
+            if !include_hidden
+                && relative
+                    .split('/')
+                    .any(|component| component.starts_with('.'))
+            {
+                continue;
+            }
+            let Ok(target) = self.validated_permission_target(&relative, false) else {
+                omitted.protected_or_linked += 1;
+                continue;
+            };
+            candidates.push(target);
+            if candidates.len() == MAX_SEARCH_FILES {
+                omitted.scan_limit = true;
+                break;
+            }
+        }
+        Ok(candidates)
+    }
+
+    async fn authorize_search_candidate(
+        &self,
+        tool: NativeTool,
+        target: &ProjectRelativeTarget,
+        args: &Value,
+        approval: Option<&ApprovalSender>,
+    ) -> Result<SearchCandidateAccess> {
+        let invocation = PermissionInvocation::new(
+            PermissionSelector::native(tool),
+            Some(target.clone()),
+            args,
+        )?;
+        match self.permissions.authorize(&invocation, approval).await? {
+            outcome if outcome.is_authorized() => {
+                self.root_guard.revalidate()?;
+                Ok(SearchCandidateAccess::Allowed)
+            }
+            PermissionOutcome::Denied => Ok(SearchCandidateAccess::Denied),
+            PermissionOutcome::PermissionRequired => Ok(SearchCandidateAccess::PermissionRequired),
+            _ => unreachable!("permission service returned an invalid outcome"),
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         #[cfg(unix)]
         {
@@ -895,6 +1166,39 @@ impl ToolHost {
     }
 }
 
+#[derive(Default)]
+struct SearchOmissions {
+    denied: usize,
+    permission_required: usize,
+    protected_or_linked: usize,
+    unreadable: usize,
+    large_or_non_file: usize,
+    oversized_line: usize,
+    scan_limit: bool,
+    output_limit: bool,
+}
+
+impl SearchOmissions {
+    fn into_json(self) -> Value {
+        json!({
+            "denied": self.denied,
+            "permission_required": self.permission_required,
+            "protected_or_linked": self.protected_or_linked,
+            "unreadable": self.unreadable,
+            "large_or_non_file": self.large_or_non_file,
+            "oversized_line": self.oversized_line,
+            "scan_limit_reached": self.scan_limit,
+            "output_limit_reached": self.output_limit,
+        })
+    }
+}
+
+enum SearchCandidateAccess {
+    Allowed,
+    Denied,
+    PermissionRequired,
+}
+
 fn project_execution(execution: ToolExecution) -> Result<String> {
     match execution {
         ToolExecution::Text(text) => project_text(text),
@@ -963,6 +1267,107 @@ async fn read_file_output(mut file: tokio::fs::File, extent: u64) -> Result<Stri
     }
     ensure!(pending.is_empty(), "file is not UTF-8");
     output.finish().map_err(Into::into)
+}
+
+fn optional_path(args: &Value) -> Result<&str> {
+    args.get("path")
+        .map(|value| value.as_str().context("path must be a string"))
+        .transpose()?
+        .map_or(Ok("."), |path| {
+            ensure!(!path.is_empty(), "path must not be empty");
+            Ok(path)
+        })
+}
+
+fn optional_bool(args: &Value, name: &str) -> Result<bool> {
+    args.get(name)
+        .map(|value| {
+            value
+                .as_bool()
+                .with_context(|| format!("{name} must be a boolean"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(false))
+}
+
+fn bounded_search_pattern(value: &str) -> Result<String> {
+    ensure!(
+        !value.is_empty() && value.chars().count() <= 512 && !value.chars().any(char::is_control),
+        "search pattern must be 1–512 non-control characters"
+    );
+    Ok(value.into())
+}
+
+fn page_offset(args: &Value) -> Result<usize> {
+    let value = args
+        .get("offset")
+        .map(|value| value.as_u64().context("offset must be a positive integer"))
+        .transpose()?
+        .unwrap_or(1);
+    usize::try_from(value)
+        .context("offset is too large")
+        .and_then(|value| {
+            ensure!(value > 0, "offset must be at least 1");
+            Ok(value)
+        })
+}
+
+fn page_limit(args: &Value) -> Result<usize> {
+    let value = args
+        .get("limit")
+        .map(|value| value.as_u64().context("limit must be a positive integer"))
+        .transpose()?
+        .unwrap_or(200);
+    usize::try_from(value)
+        .context("limit is too large")
+        .and_then(|value| {
+            ensure!(
+                (1..=10_000).contains(&value),
+                "limit must be between 1 and 10000"
+            );
+            Ok(value)
+        })
+}
+
+fn page_file_read(
+    mut file: std::fs::File,
+    extent: u64,
+    offset: usize,
+    limit: usize,
+) -> Result<Value> {
+    ensure!(
+        extent <= MAX_PAGE_BYTES,
+        "paged file_read exceeds 2 MiB limit; select a smaller file"
+    );
+    let mut bytes = Vec::with_capacity(usize::try_from(extent).unwrap_or(0));
+    Read::by_ref(&mut file)
+        .take(MAX_PAGE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_PAGE_BYTES,
+        "paged file_read exceeds 2 MiB limit; select a smaller file"
+    );
+    let text = std::str::from_utf8(&bytes).context("file is not UTF-8")?;
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    ensure!(
+        lines.len() <= MAX_PAGE_LINES,
+        "paged file_read exceeds 100000 line limit"
+    );
+    ensure!(
+        offset <= lines.len().saturating_add(1),
+        "offset is beyond the end of the file"
+    );
+    let start = offset - 1;
+    let end = start.saturating_add(limit).min(lines.len());
+    let selected = lines[start..end].concat();
+    Ok(json!({
+        "text": selected,
+        "offset": offset,
+        "limit": limit,
+        "line_count": lines.len(),
+        "next_offset": (end < lines.len()).then_some(end + 1),
+        "omitted_lines": lines.len().saturating_sub(end),
+    }))
 }
 
 fn protected_component(value: &str, writing: bool) -> bool {
@@ -1438,6 +1843,210 @@ mod tests {
         assert!(host.execute("file_read", json!([])).await.is_err());
         assert!(host.execute("unknown", json!({})).await.is_err());
         host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_search_and_paged_read_are_checked_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/utf8.txt"),
+            "first\nβeta needle\nlast\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join(".hidden.txt"), "needle\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.path().join("ignored.txt"), "needle\n").unwrap();
+        std::fs::write(root.path().join("binary.bin"), b"needle\xff").unwrap();
+        std::fs::write(
+            root.path().join("oversized-line.txt"),
+            format!("needle{}\n", "x".repeat(MAX_SEARCH_LINE_BYTES)),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("oversized-file.txt"),
+            "x".repeat(MAX_SEARCH_FILE_BYTES as usize + 1),
+        )
+        .unwrap();
+        let host = ToolHost::new(root.path(), &Config::default()).unwrap();
+
+        let specs = host.specs().await.unwrap();
+        assert!(specs.iter().any(|spec| spec.name == "grep"));
+        assert!(specs.iter().any(|spec| spec.name == "glob"));
+        let read = specs.iter().find(|spec| spec.name == "file_read").unwrap();
+        assert_eq!(read.parameters["properties"]["offset"]["minimum"], 1);
+        assert_eq!(read.parameters["properties"]["limit"]["maximum"], 10_000);
+
+        let grep: Value = serde_json::from_str(
+            &host
+                .execute("grep", json!({"pattern":"needle"}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(grep["matches"][0]["path"], "src/utf8.txt");
+        assert_eq!(grep["matches"][0]["line"], 2);
+        assert_eq!(grep["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(grep["omitted"]["oversized_line"], 1);
+        assert_eq!(grep["omitted"]["large_or_non_file"], 1);
+        assert_eq!(grep["omitted"]["unreadable"], 1);
+
+        let ignored_only: Value = serde_json::from_str(
+            &host
+                .execute("glob", json!({"pattern":"**/*.txt","include_ignored":true}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ignored_only["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == "ignored.txt")
+        );
+        assert!(
+            !ignored_only["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == ".hidden.txt")
+        );
+        let hidden_only: Value = serde_json::from_str(
+            &host
+                .execute("glob", json!({"pattern":"**/*.txt","include_hidden":true}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            hidden_only["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == ".hidden.txt")
+        );
+        assert!(
+            !hidden_only["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == "ignored.txt")
+        );
+
+        let page: Value = serde_json::from_str(
+            &host
+                .execute(
+                    "file_read",
+                    json!({"path":"src/utf8.txt","offset":2,"limit":1}),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page["text"], "βeta needle\n");
+        assert_eq!(page["next_offset"], 3);
+        assert_eq!(page["omitted_lines"], 1);
+        assert!(
+            host.execute("file_read", json!({"path":"binary.bin","limit":1}))
+                .await
+                .is_err()
+        );
+        assert!(
+            host.execute("file_read", json!({"path":"src/utf8.txt","offset":0}))
+                .await
+                .is_err()
+        );
+        assert!(
+            host.execute("file_read", json!({"path":"src/utf8.txt","offset":"two"}))
+                .await
+                .is_err()
+        );
+        assert!(
+            host.execute("file_read", json!({"path":"src/utf8.txt","limit":null}))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_authorizes_each_candidate_without_widening_a_root_request() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("allowed.txt"), "needle\n").unwrap();
+        std::fs::write(root.path().join("denied.txt"), "needle\n").unwrap();
+        let selector = PermissionSelector::native(NativeTool::Glob);
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: selector.clone(),
+                    path: Some("denied.txt".into()),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result: Value = serde_json::from_str(
+            &host
+                .execute("glob", json!({"pattern":"*.txt"}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["matches"], json!(["allowed.txt"]));
+        assert_eq!(result["omitted"]["denied"], 1);
+
+        let asked = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    permissions: vec![PermissionRule {
+                        action: PermissionAction::Ask,
+                        selector,
+                        path: Some("allowed.txt".into()),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let pending = {
+            let asked = Arc::clone(&asked);
+            tokio::spawn(async move {
+                asked
+                    .execute_with_approval(
+                        "glob",
+                        json!({"pattern":"allowed.txt"}),
+                        Some(&crate::ApprovalSender::new(sender)),
+                    )
+                    .await
+            })
+        };
+        let request = receiver.recv().await.unwrap();
+        assert_eq!(request.scope.target().unwrap().as_str(), "allowed.txt");
+        request.reply.send(crate::ApprovalAnswer::Once).unwrap();
+        let approved: Value = serde_json::from_str(&pending.await.unwrap().unwrap()).unwrap();
+        assert_eq!(approved["matches"], json!(["allowed.txt"]));
+
+        let denied = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::native(NativeTool::Glob),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = denied
+            .execute("glob", json!({"pattern":"*.txt"}))
+            .await
+            .unwrap_err();
+        assert!(crate::is_permission_denied(&error));
     }
 
     #[tokio::test]
@@ -2324,6 +2933,8 @@ mod tests {
             vec![
                 "file_read",
                 "file_list",
+                "grep",
+                "glob",
                 "file_write",
                 "file_delete",
                 "shell"
