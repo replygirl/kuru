@@ -65,6 +65,15 @@
     }
   },
   "$defs": {
+    "configValues": { "$ref": "#" },
+    "managed": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "defaults": { "$ref": "#/$defs/configValues" },
+        "constraints": { "$ref": "#/$defs/configValues" }
+      }
+    },
     "permission": {
       "type": "object",
       "additionalProperties": false,

@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{ErrorKind, Read},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -17,6 +17,9 @@ use crate::{
 
 const MAX_FILE_BYTES: usize = 256 * 1024;
 const MAX_COMBINED_BYTES: usize = 1024 * 1024;
+const MAX_INSTRUCTION_PATHS: usize = 128;
+const MAX_IMPORT_DEPTH: usize = 8;
+const MAX_INSTRUCTION_NOTICES: usize = 16;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -57,6 +60,8 @@ pub struct SelectionOverrides<'a> {
 /// All invocation inputs captured before workspace authority is reviewed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InvocationOverrides {
+    /// Typed `-c key=value` assignments, in command-line order.
+    pub typed_config: Vec<String>,
     pub mode: Option<Mode>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -445,10 +450,14 @@ pub struct ConfigSnapshot {
     origins: BTreeMap<String, LayerOrigin>,
     local: Option<toml::Value>,
     local_origins: BTreeMap<String, LayerOrigin>,
+    discovered_local: Option<toml::Value>,
+    discovered_local_origins: BTreeMap<String, LayerOrigin>,
+    constraints: Vec<(Vec<String>, toml::Value)>,
     overrides: InvocationOverrides,
     manifest: AuthorityManifest,
     memory: MemoryConfig,
     instructions: String,
+    instruction_notices: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -462,12 +471,16 @@ struct LayerOrigin {
 #[serde(rename_all = "kebab-case")]
 enum InstructionSourceKind {
     Agents,
+    Claude,
+    Import,
 }
 
 impl InstructionSourceKind {
     const fn prompt_name(self) -> &'static str {
         match self {
             Self::Agents => "AGENTS.md",
+            Self::Claude => "CLAUDE.md",
+            Self::Import => "imported Markdown",
         }
     }
 }
@@ -475,9 +488,9 @@ impl InstructionSourceKind {
 #[derive(Debug, Clone)]
 struct InstructionSource {
     kind: InstructionSourceKind,
-    path: PathBuf,
     safe_source: SafeSource,
     path_digest: [u8; 32],
+    directory_identity: [u8; 24],
     identity: [u8; 24],
     content: String,
 }
@@ -486,6 +499,7 @@ struct InstructionSource {
 struct InstructionClaimEntry<'a> {
     kind: InstructionSourceKind,
     path_digest: &'a [u8; 32],
+    directory_identity: &'a [u8; 24],
     identity: &'a [u8; 24],
     content: &'a str,
 }
@@ -497,19 +511,79 @@ impl ConfigSnapshot {
         local: Option<&Path>,
         overrides: InvocationOverrides,
     ) -> Result<Self> {
+        Self::parse_with_layers(user, workspace, None, local, None, overrides)
+    }
+
+    /// All file sources are caller-classified before this immutable snapshot is
+    /// built. `discovered_local` must contain the exact checked bytes classified
+    /// by the CLI's Git index check, not a path to reopen later.
+    pub fn parse_with_layers(
+        user: Option<&Path>,
+        workspace: &Path,
+        discovered_local: Option<(&Path, &str)>,
+        local: Option<&Path>,
+        managed: Option<&Path>,
+        overrides: InvocationOverrides,
+    ) -> Result<Self> {
         let workspace = workspace
             .canonicalize()
             .map_err(|_| config_error("read", workspace))?;
         if !workspace.is_dir() {
             return Err(config_error("read", &workspace));
         }
-        let instruction_sources = capture_instruction_sources(&workspace)?;
-        let instructions = format_instructions(&instruction_sources);
+        let InstructionCapture {
+            sources: instruction_sources,
+            rendered: instructions,
+            notices: instruction_notices,
+            ..
+        } = capture_instruction_sources(&workspace)?;
         let mut merged =
             toml::Value::try_from(Config::default()).expect("default config serializes");
         let mut origins = BTreeMap::new();
         let mut total_bytes: usize = 0;
         let mut layers = Vec::new();
+        let constraints = if let Some(path) = managed {
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| config_error("read", path))?;
+            ensure!(
+                path.is_absolute() && !canonical.starts_with(&workspace),
+                "managed configuration must be an absolute file outside the workspace"
+            );
+            let source = read_config_bounded(&canonical, true)?
+                .ok_or_else(|| config_error("read", &canonical))?;
+            total_bytes = total_bytes
+                .checked_add(source.len())
+                .ok_or_else(|| config_error("read", &canonical))?;
+            let policy: ManagedDocument = toml::from_str(&source)
+                .map_err(|error| config_parse_error(&canonical, &source, &error))?;
+            let defaults = policy.defaults.unwrap_or_else(empty_table);
+            validate_patch(&defaults, &canonical)?;
+            merge_with_origins(
+                &mut merged,
+                &mut origins,
+                defaults,
+                layer_origin(&canonical, false),
+            );
+            let constraints = policy.constraints.unwrap_or_else(empty_table);
+            validate_patch(&constraints, &canonical)?;
+            let mut locks = Vec::new();
+            collect_constraints(&constraints, &[], &mut locks);
+            let mut normalized = toml::Value::try_from(Config::default())?;
+            merge(&mut normalized, constraints);
+            let typed: Config = normalized
+                .try_into()
+                .map_err(|error| config_type_error(&canonical, &error))?;
+            let normalized = toml::Value::try_from(typed)?;
+            for (path, expected) in &mut locks {
+                *expected = lookup_path(&normalized, path)
+                    .ok_or_else(|| config_error("type", &canonical))?
+                    .clone();
+            }
+            locks
+        } else {
+            Vec::new()
+        };
         if let Some(path) = user {
             layers.push((path.to_path_buf(), true, false));
         }
@@ -542,6 +616,8 @@ impl ConfigSnapshot {
                 .try_into()
                 .map_err(|error| config_type_error(&path, &error))?;
         }
+        let (discovered_local, discovered_local_origins) =
+            parse_captured_patch(discovered_local, &merged, &mut total_bytes)?;
         let (local, local_origins) = if let Some(path) = local {
             let source =
                 read_config_bounded(path, true)?.ok_or_else(|| config_error("read", path))?;
@@ -571,10 +647,14 @@ impl ConfigSnapshot {
             origins,
             local,
             local_origins,
+            discovered_local,
+            discovered_local_origins,
+            constraints,
             overrides,
             manifest: empty_manifest(),
             memory: MemoryConfig::default(),
             instructions,
+            instruction_notices,
         };
         let (value, value_origins) =
             provisional.value_with_preferences(&ProjectPreferences::default())?;
@@ -588,6 +668,7 @@ impl ConfigSnapshot {
             .map_err(|_| config_error("validation", provisional.workspace()))?;
         permissions::validate_rules(&config.permissions)
             .map_err(|_| config_error("validation", provisional.workspace()))?;
+        provisional.check_constraints(&config, false)?;
         let manifest = derive_manifest(&config, &value_origins, &instruction_sources)?;
         Ok(Self {
             memory: config.memory.clone(),
@@ -608,6 +689,11 @@ impl ConfigSnapshot {
     /// Exact automatic project-instruction bytes captured before workspace review.
     pub fn instructions(&self) -> &str {
         &self.instructions
+    }
+
+    /// Bounded, escaped notices for instruction sources omitted during capture.
+    pub fn instruction_notices(&self) -> &[String] {
+        &self.instruction_notices
     }
 
     /// Return an active Responses route without loading saved preferences or memory.
@@ -648,7 +734,27 @@ impl ConfigSnapshot {
         config
             .validate()
             .map_err(|_| config_error("validation", self.workspace()))?;
+        self.check_constraints(&config, true)?;
         Ok(config)
+    }
+
+    fn check_constraints(&self, config: &Config, include_saved_choices: bool) -> Result<()> {
+        let final_value = toml::Value::try_from(config)?;
+        for (path, expected) in &self.constraints {
+            if !include_saved_choices
+                && path.len() == 1
+                && matches!(path[0].as_str(), "mode" | "model" | "effort")
+            {
+                continue;
+            }
+            let actual = lookup_path(&final_value, path);
+            ensure!(
+                actual == Some(expected),
+                "managed constraint conflicts with final configuration at {}",
+                safe_text(&path.join("."), 128)
+            );
+        }
+        Ok(())
     }
 
     fn value_with_preferences(
@@ -657,11 +763,17 @@ impl ConfigSnapshot {
     ) -> Result<(toml::Value, BTreeMap<String, LayerOrigin>)> {
         let mut value = self.merged.clone();
         let mut origins = self.origins.clone();
+        let mut typed = empty_table();
+        for assignment in &self.overrides.typed_config {
+            merge(&mut typed, typed_assignment(assignment)?);
+        }
         let provider = self
             .overrides
             .provider
             .as_deref()
+            .or_else(|| typed.get("provider")?.as_str())
             .or_else(|| self.local.as_ref()?.get("provider")?.as_str())
+            .or_else(|| self.discovered_local.as_ref()?.get("provider")?.as_str())
             .or_else(|| value.get("provider")?.as_str())
             .ok_or_else(|| config_error("type", self.workspace()))?
             .to_owned();
@@ -669,11 +781,26 @@ impl ConfigSnapshot {
             .overrides
             .model
             .as_deref()
+            .or_else(|| typed.get("model")?.as_str())
             .or_else(|| self.local.as_ref()?.get("model")?.as_str())
+            .or_else(|| self.discovered_local.as_ref()?.get("model")?.as_str())
             .map(str::to_owned);
         preferences
             .overlay(&mut value, &provider, explicit_model.as_deref())
             .map_err(|_| config_error("validation", self.workspace()))?;
+        if let Some(local) = &self.discovered_local {
+            merge_with_origins(
+                &mut value,
+                &mut origins,
+                local.clone(),
+                LayerOrigin {
+                    source: SafeSource("project-local configuration".into()),
+                    source_digest: source_digest(b"project-local configuration"),
+                    automatic: false,
+                },
+            );
+            origins.extend(self.discovered_local_origins.clone());
+        }
         if let Some(local) = &self.local {
             merge_with_origins(
                 &mut value,
@@ -686,6 +813,10 @@ impl ConfigSnapshot {
                 },
             );
             origins.extend(self.local_origins.clone());
+        }
+        for assignment in &self.overrides.typed_config {
+            let patch = typed_assignment(assignment)?;
+            merge_with_origins(&mut value, &mut origins, patch, command_line_origin());
         }
         apply_overrides(&mut value, &mut origins, &self.overrides);
         Ok((value, origins))
@@ -915,6 +1046,113 @@ fn reject_removed_settings(patch: &toml::Value) -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedDocument {
+    defaults: Option<toml::Value>,
+    constraints: Option<toml::Value>,
+}
+
+fn empty_table() -> toml::Value {
+    toml::Value::Table(toml::map::Map::new())
+}
+
+fn validate_patch(patch: &toml::Value, path: &Path) -> Result<()> {
+    ensure!(patch.is_table(), "managed configuration requires tables");
+    reject_removed_settings(patch).map_err(|_| config_error("validation", path))?;
+    let mut checked = toml::Value::try_from(Config::default())?;
+    merge(&mut checked, patch.clone());
+    let _: Config = checked
+        .try_into()
+        .map_err(|error| config_type_error(path, &error))?;
+    Ok(())
+}
+
+fn collect_constraints(
+    value: &toml::Value,
+    prefix: &[String],
+    constraints: &mut Vec<(Vec<String>, toml::Value)>,
+) {
+    if let toml::Value::Table(table) = value
+        && !(prefix.len() >= 2 && prefix[0] == "mcp")
+        && !(!prefix.is_empty() && table.is_empty())
+    {
+        for (key, value) in table {
+            let mut path = prefix.to_vec();
+            path.push(key.clone());
+            collect_constraints(value, &path, constraints);
+        }
+    } else if !prefix.is_empty() {
+        constraints.push((prefix.to_vec(), value.clone()));
+    }
+}
+
+fn lookup_path<'a>(value: &'a toml::Value, path: &[String]) -> Option<&'a toml::Value> {
+    path.iter().try_fold(value, |value, key| value.get(key))
+}
+
+fn parse_captured_patch(
+    captured: Option<(&Path, &str)>,
+    base: &toml::Value,
+    total_bytes: &mut usize,
+) -> Result<(Option<toml::Value>, BTreeMap<String, LayerOrigin>)> {
+    let Some((path, source)) = captured else {
+        return Ok((None, BTreeMap::new()));
+    };
+    ensure!(
+        source.len() <= MAX_FILE_BYTES,
+        "configuration input exceeds 256 KiB"
+    );
+    *total_bytes = total_bytes
+        .checked_add(source.len())
+        .ok_or_else(|| config_error("read", path))?;
+    ensure!(
+        *total_bytes <= MAX_COMBINED_BYTES,
+        "configuration input exceeds 1 MiB"
+    );
+    let patch: toml::Value =
+        toml::from_str(source).map_err(|error| config_parse_error(path, source, &error))?;
+    reject_removed_settings(&patch).map_err(|_| config_error("validation", path))?;
+    let mut checked = base.clone();
+    merge(&mut checked, patch.clone());
+    let _: Config = checked
+        .try_into()
+        .map_err(|error| config_type_error(path, &error))?;
+    let mut origins = BTreeMap::new();
+    record_origins(&patch, "", layer_origin(path, false), &mut origins);
+    Ok((Some(patch), origins))
+}
+
+fn typed_assignment(assignment: &str) -> Result<toml::Value> {
+    let (key, value) = assignment
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("-c expects key=value"))?;
+    let key = key.trim();
+    ensure!(
+        !key.is_empty()
+            && key.len() <= 256
+            && key.split('.').all(|part| {
+                !part.is_empty()
+                    && part.len() <= 64
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+            })
+            && !value.contains(['\r', '\n']),
+        "-c has an invalid key or multiline value"
+    );
+    toml::from_str(&format!("{key}={value}"))
+        .map_err(|_| anyhow::anyhow!("-c has an invalid TOML value"))
+}
+
+fn command_line_origin() -> LayerOrigin {
+    LayerOrigin {
+        source: SafeSource("command line".into()),
+        source_digest: source_digest(b"command line"),
+        automatic: false,
+    }
+}
+
 fn merge(base: &mut toml::Value, patch: toml::Value) {
     match (base, patch) {
         (toml::Value::Table(base), toml::Value::Table(patch)) => {
@@ -1046,11 +1284,7 @@ fn apply_overrides(
     let table = value
         .as_table_mut()
         .expect("configuration default is a table");
-    let cli = || LayerOrigin {
-        source: SafeSource("command line".into()),
-        source_digest: source_digest(b"command line"),
-        automatic: false,
-    };
+    let cli = command_line_origin;
     if let Some(mode) = overrides.mode {
         table.insert(
             "mode".into(),
@@ -1081,6 +1315,8 @@ fn apply_overrides(
     if overrides.no_dream {
         table.insert("dream_every".into(), 0.into());
         table.insert("dream_on_exit".into(), false.into());
+        origins.insert("dream_every".into(), cli());
+        origins.insert("dream_on_exit".into(), cli());
     }
 }
 
@@ -1294,6 +1530,7 @@ fn derive_manifest(
             .map(|source| InstructionClaimEntry {
                 kind: source.kind,
                 path_digest: &source.path_digest,
+                directory_identity: &source.directory_identity,
                 identity: &source.identity,
                 content: &source.content,
             })
@@ -1304,7 +1541,13 @@ fn derive_manifest(
             .collect::<Vec<_>>();
         let source_digests = instruction_sources
             .iter()
-            .map(|source| source_digest_with_identity(source.path_digest, source.identity))
+            .map(|source| {
+                source_digest_with_identity(
+                    source.path_digest,
+                    source.directory_identity,
+                    source.identity,
+                )
+            })
             .collect::<Vec<_>>();
         claims.push(AuthorityClaim {
             category: AuthorityClaimCategory::ProjectInstructions,
@@ -1338,10 +1581,15 @@ fn derive_manifest(
     Ok(manifest)
 }
 
-fn source_digest_with_identity(path_digest: [u8; 32], identity: [u8; 24]) -> [u8; 32] {
+fn source_digest_with_identity(
+    path_digest: [u8; 32],
+    directory_identity: [u8; 24],
+    identity: [u8; 24],
+) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"kuru.workspace-trust.instruction-source\0");
     hash.update(path_digest);
+    hash.update(directory_identity);
     hash.update(identity);
     hash.finalize().into()
 }
@@ -1402,88 +1650,311 @@ fn read_bounded(path: &Path, required: bool) -> Result<Option<String>> {
         .with_context(|| format!("{} is not UTF-8", path.display()))
 }
 
-fn capture_instruction_sources(project: &Path) -> Result<Vec<InstructionSource>> {
-    let mut sources = Vec::new();
-    let mut total_bytes: usize = 0;
-    for directory in ancestor_directories(project)? {
-        let path = directory.join("AGENTS.md");
-        let Some((source, identity)) = read_instruction_bounded(&path)? else {
-            continue;
-        };
-        total_bytes = total_bytes
-            .checked_add(source.len())
-            .ok_or_else(|| instruction_error("read", &path))?;
-        ensure!(
-            total_bytes <= MAX_COMBINED_BYTES,
-            "combined AGENTS.md instructions exceed 1 MiB"
-        );
-        sources.push(InstructionSource {
-            kind: InstructionSourceKind::Agents,
-            path_digest: source_digest(path.as_os_str().as_encoded_bytes()),
-            safe_source: safe_source(&path),
-            path,
-            identity,
-            content: source,
-        });
-    }
-    Ok(sources)
+struct InstructionCapture {
+    sources: Vec<InstructionSource>,
+    rendered: String,
+    notices: Vec<String>,
+    seen_paths: BTreeSet<PathBuf>,
+    seen_identities: BTreeSet<[u8; 24]>,
+    active_paths: Vec<PathBuf>,
+    active_identities: Vec<[u8; 24]>,
+    total_bytes: usize,
+    additional_omissions: usize,
 }
 
-fn read_instruction_bounded(path: &Path) -> Result<Option<(String, [u8; 24])>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+struct CheckedInstruction {
+    content: Option<String>,
+    directory_identity: [u8; 24],
+    identity: [u8; 24],
+}
+
+impl InstructionCapture {
+    fn new() -> Self {
+        Self {
+            sources: Vec::new(),
+            rendered: String::new(),
+            notices: Vec::new(),
+            seen_paths: BTreeSet::new(),
+            seen_identities: BTreeSet::new(),
+            active_paths: Vec::new(),
+            active_identities: Vec::new(),
+            total_bytes: 0,
+            additional_omissions: 0,
+        }
+    }
+
+    fn notice(&mut self, path: &Path, reason: &str) {
+        if self.notices.len() < MAX_INSTRUCTION_NOTICES {
+            let message = format!(
+                "Kuru omitted instruction source {}: {reason}",
+                safe_source(path)
+            );
+            self.rendered.push_str(&format!("\n[{message}]\n"));
+            self.notices.push(message);
+        } else {
+            self.additional_omissions += 1;
+        }
+    }
+
+    fn visit(
+        &mut self,
+        path: PathBuf,
+        scope: &Path,
+        kind: InstructionSourceKind,
+        depth: usize,
+        optional: bool,
+    ) -> Result<()> {
+        if optional {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(_) => return Err(instruction_error("read", &path)),
+            }
+        }
+        if self.active_paths.contains(&path) {
+            self.notice(&path, "import cycle");
+            return Ok(());
+        }
+        if self.seen_paths.contains(&path) {
+            return Ok(());
+        }
+        if depth > MAX_IMPORT_DEPTH {
+            self.notice(&path, "eight-edge import depth limit");
+            return Ok(());
+        }
+        if self.seen_paths.len() >= MAX_INSTRUCTION_PATHS {
+            self.notice(&path, "128-source graph limit");
+            return Ok(());
+        }
+        let Some(CheckedInstruction {
+            content,
+            directory_identity,
+            identity,
+        }) = read_checked_instruction(&path, optional)?
+        else {
+            return Ok(());
+        };
+        if self.active_identities.contains(&identity) {
+            self.notice(&path, "import cycle");
+            return Ok(());
+        }
+        self.seen_paths.insert(path.clone());
+        if !self.seen_identities.insert(identity) {
+            return Ok(());
+        }
+        let Some(content) = content else {
+            self.notice(&path, "256 KiB file limit");
+            return Ok(());
+        };
+        if self.total_bytes.saturating_add(content.len()) > MAX_COMBINED_BYTES {
+            self.notice(&path, "1 MiB combined instruction limit");
+            return Ok(());
+        }
+        self.total_bytes += content.len();
+        self.sources.push(InstructionSource {
+            kind,
+            path_digest: source_digest(path.as_os_str().as_encoded_bytes()),
+            safe_source: safe_source(&path),
+            directory_identity,
+            identity,
+            content: content.clone(),
+        });
+        self.active_paths.push(path.clone());
+        self.active_identities.push(identity);
+        self.rendered.push_str(&format!(
+            "\n--- {}: {} ---\n",
+            kind.prompt_name(),
+            safe_source(&path)
+        ));
+        let mut fence: Option<(char, usize)> = None;
+        for line in content.split_inclusive('\n') {
+            let trimmed = line.trim();
+            if let Some((marker, opening_length)) = fence {
+                self.rendered.push_str(line);
+                if instruction_fence(line).is_some_and(|(closing, length, suffix)| {
+                    closing == marker
+                        && length >= opening_length
+                        && suffix
+                            .bytes()
+                            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                }) {
+                    fence = None;
+                }
+                continue;
+            }
+            if let Some((marker, length, suffix)) = instruction_fence(line)
+                && (marker != '`' || !suffix.contains('`'))
+            {
+                fence = Some((marker, length));
+                self.rendered.push_str(line);
+                continue;
+            }
+            if let Some(import) = instruction_import(trimmed) {
+                let imported = resolve_instruction_import(&path, scope, import)?;
+                let before = self.rendered.len();
+                self.visit(
+                    imported,
+                    scope,
+                    InstructionSourceKind::Import,
+                    depth + 1,
+                    false,
+                )?;
+                if self.rendered.len() != before {
+                    self.rendered.push_str(&format!(
+                        "\n--- resume {}: {} ---\n",
+                        kind.prompt_name(),
+                        safe_source(&path)
+                    ));
+                }
+            } else {
+                self.rendered.push_str(line);
+            }
+        }
+        self.active_paths.pop();
+        self.active_identities.pop();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Self {
+        if self.additional_omissions > 0 {
+            let message = format!(
+                "Kuru omitted {} additional instruction sources or branches after the notice limit",
+                self.additional_omissions
+            );
+            self.rendered.push_str(&format!("\n[{message}]\n"));
+            self.notices.push(message);
+        }
+        if !self.sources.is_empty() || !self.notices.is_empty() {
+            self.rendered = format!(
+                "Project instructions follow from outermost to most local. Where instructions conflict, the most local applicable source takes precedence; higher-priority conversation instructions still apply.\n{}",
+                self.rendered
+            );
+        }
+        self
+    }
+}
+
+fn capture_instruction_sources(project: &Path) -> Result<InstructionCapture> {
+    let mut capture = InstructionCapture::new();
+    for directory in ancestor_directories(project)? {
+        capture.visit(
+            directory.join("AGENTS.md"),
+            &directory,
+            InstructionSourceKind::Agents,
+            0,
+            true,
+        )?;
+        capture.visit(
+            directory.join("CLAUDE.md"),
+            &directory,
+            InstructionSourceKind::Claude,
+            0,
+            true,
+        )?;
+    }
+    Ok(capture.finish())
+}
+
+fn read_checked_instruction(path: &Path, optional: bool) -> Result<Option<CheckedInstruction>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound && optional => return Ok(None),
         Err(_) => return Err(instruction_error("read", path)),
-    };
-    ensure!(
-        metadata.is_file(),
-        "{} must be a regular file",
-        safe_source(path)
-    );
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(instruction_error("read", path)),
-    };
-    let info =
-        kuru_platform::fs::regular_file_info(&file).map_err(|_| instruction_error("read", path))?;
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| instruction_error("path", path))?;
+    let directory = kuru_platform::fs::Directory::open(
+        parent,
+        kuru_platform::fs::Privacy::Inherited,
+        kuru_platform::fs::NameRetention::Pinned,
+    )
+    .map_err(|_| instruction_error("path", path))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| instruction_error("path", path))?;
+    let mut file = directory
+        .read(name)
+        .map_err(|_| instruction_error("read", path))?;
+    let identity = kuru_platform::fs::regular_file_info(&file)
+        .map_err(|_| instruction_error("read", path))?
+        .identity
+        .to_bytes();
     let mut bytes = Vec::new();
     file.by_ref()
         .take((MAX_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| instruction_error("read", path))?;
-    if bytes.len() > MAX_FILE_BYTES {
-        return Err(instruction_error("read", path));
+    directory
+        .verify(name, &file)
+        .map_err(|_| instruction_error("changed", path))?;
+    let content = if bytes.len() > MAX_FILE_BYTES {
+        None
+    } else {
+        Some(String::from_utf8(bytes).map_err(|_| instruction_error("encoding", path))?)
+    };
+    Ok(Some(CheckedInstruction {
+        content,
+        directory_identity: directory.identity().to_bytes(),
+        identity,
+    }))
+}
+
+fn instruction_import(line: &str) -> Option<&str> {
+    line.strip_prefix('@')
+        .filter(|path| path.ends_with(".md") && !path.is_empty())
+}
+
+fn instruction_fence(line: &str) -> Option<(char, usize, &str)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
     }
-    let source = String::from_utf8(bytes).map_err(|_| instruction_error("encoding", path))?;
-    Ok(Some((source, info.identity.to_bytes())))
+    let text = &line[indent..];
+    let marker = text.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let length = text
+        .bytes()
+        .take_while(|byte| *byte == marker as u8)
+        .count();
+    (length >= 3).then_some((marker, length, &text[length..]))
+}
+
+fn resolve_instruction_import(source: &Path, scope: &Path, import: &str) -> Result<PathBuf> {
+    let raw = Path::new(import);
+    if raw.is_absolute() {
+        return Err(instruction_error("path", source));
+    }
+    let mut target = source
+        .parent()
+        .ok_or_else(|| instruction_error("path", source))?
+        .to_path_buf();
+    for component in raw.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => target.push(name),
+            Component::ParentDir if target != scope => {
+                target.pop();
+            }
+            _ => return Err(instruction_error("path", source)),
+        }
+    }
+    if !target.starts_with(scope) || target == scope {
+        return Err(instruction_error("path", source));
+    }
+    Ok(target)
 }
 
 fn instruction_error(category: &str, path: &Path) -> anyhow::Error {
     anyhow::anyhow!("instruction {category} error in {}", safe_source(path))
 }
 
-fn format_instructions(sources: &[InstructionSource]) -> String {
-    let mut combined = String::new();
-    if !sources.is_empty() {
-        combined.push_str("Project instructions follow from outermost to most local. Where instructions conflict, the most local applicable AGENTS.md takes precedence; higher-priority conversation instructions still apply.\n");
-    }
-    for source in sources {
-        combined.push_str(&format!(
-            "\n--- {}: {} ---\n",
-            source.kind.prompt_name(),
-            source.path.display()
-        ));
-        combined.push_str(&source.content);
-        combined.push('\n');
-    }
-    combined
-}
-
-/// Include every ancestor AGENTS.md, clearly identifying increasingly local scope.
-/// Source order conveys precedence without attempting to reinterpret instructions.
+/// Compose captured ancestor instructions and checked imports without review.
+/// Application launches use `ConfigSnapshot` and its workspace trust preflight.
 pub fn load_instructions(project: &Path) -> Result<String> {
-    capture_instruction_sources(project).map(|sources| format_instructions(&sources))
+    capture_instruction_sources(project).map(|capture| capture.rendered)
 }
 
 #[cfg(test)]

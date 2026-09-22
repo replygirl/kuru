@@ -1,6 +1,7 @@
 use std::{
+    ffi::OsStr,
     fs::File,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -36,6 +37,8 @@ pub struct Cli {
     pub directory: PathBuf,
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
+    #[arg(short = 'c', global = true, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    pub config_values: Vec<String>,
     #[arg(long, global = true, env = "KURU_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -257,6 +260,7 @@ fn native_data_directory() -> Option<PathBuf> {
 
 fn invocation_overrides(cli: &Cli) -> InvocationOverrides {
     InvocationOverrides {
+        typed_config: cli.config_values.clone(),
         mode: cli.mode,
         provider: cli.provider.clone(),
         model: cli.model.clone(),
@@ -265,6 +269,100 @@ fn invocation_overrides(cli: &Cli) -> InvocationOverrides {
         allow_shell: cli.allow_shell,
         no_dream: cli.no_dream,
     }
+}
+
+/// A local file is user authority only when it is demonstrably absent from a
+/// repository index. This query is fixed and read-only; it never invokes shell.
+async fn discovered_local(root: &Directory) -> Result<Option<(PathBuf, String)>> {
+    let local = root.path().join(".kuru/config.local.toml");
+    let metadata = match std::fs::symlink_metadata(&local) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => bail!("project-local configuration cannot be inspected"),
+    };
+    ensure!(
+        metadata.is_file(),
+        "project-local configuration must be a regular file"
+    );
+    let parent = Directory::open(
+        &root.path().join(".kuru"),
+        Privacy::Inherited,
+        NameRetention::Pinned,
+    )
+    .context("project-local configuration directory is unsafe")?;
+    let mut file = parent
+        .read(OsStr::new("config.local.toml"))
+        .context("project-local configuration file is unsafe")?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(256 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .context("project-local configuration cannot be read")?;
+    ensure!(
+        bytes.len() <= 256 * 1024,
+        "project-local configuration exceeds the 256 KiB file limit"
+    );
+    let captured = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("project-local configuration is not UTF-8"))?;
+    parent
+        .verify(OsStr::new("config.local.toml"), &file)
+        .context("project-local configuration changed during inspection")?;
+    root.revalidate()
+        .context("workspace changed during local configuration inspection")?;
+
+    let repository = root
+        .path()
+        .ancestors()
+        .any(|ancestor| ancestor.join(".git").exists());
+    if repository {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .arg("--no-optional-locks")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/nonexistent",
+            ])
+            .arg("-C")
+            .arg(root.path())
+            .args([
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                ".kuru/config.local.toml",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        // Inherited Git selectors can redirect -C to another index and make a
+        // tracked project file appear untracked. Keep the caller's ordinary
+        // process environment while removing Git's repository/config overlays.
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+            {
+                command.env_remove(key);
+            }
+        }
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), command.status())
+            .await
+            .map_err(|_| anyhow::anyhow!("project-local Git index check timed out"))?
+            .map_err(|_| anyhow::anyhow!("project-local Git index check is unavailable"))?;
+        match status.code() {
+            Some(0) => bail!(
+                "Git tracks .kuru/config.local.toml; remove it from the index or use --config explicitly"
+            ),
+            Some(1) => {}
+            _ => bail!("project-local Git index status is ambiguous; use --config explicitly"),
+        }
+    }
+    parent
+        .verify(OsStr::new("config.local.toml"), &file)
+        .context("project-local configuration changed during Git inspection")?;
+    Ok(Some((local, captured)))
 }
 
 pub async fn select_model(
@@ -659,12 +757,21 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         return Ok(());
     }
 
-    let snapshot = ConfigSnapshot::parse(
+    let local = discovered_local(&root).await?;
+    let managed = std::env::var_os("KURU_MANAGED_CONFIG").map(PathBuf::from);
+    let snapshot = ConfigSnapshot::parse_with_layers(
         user.as_deref(),
         &cwd,
+        local
+            .as_ref()
+            .map(|(path, content)| (path.as_path(), content.as_str())),
         cli.config.as_deref(),
+        managed.as_deref(),
         invocation_overrides(&cli),
     )?;
+    for notice in snapshot.instruction_notices() {
+        eprintln!("{notice}");
+    }
     root.revalidate()
         .context("workspace changed while configuration was being reviewed")?;
     let approval_store = ApprovalStore::new(&data, &root);

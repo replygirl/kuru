@@ -50,6 +50,10 @@ existing boundaries.
 
 Automatic ancestor configuration must pass exact-root workspace trust preflight
 before its configured memory, provider, tool or protocol authority activates.
+Ancestor/root `AGENTS.md`, `CLAUDE.md` and bounded relative Markdown imports
+are captured once as repository-origin prompt authority under that review;
+over-cap sources are omitted whole with visible notices. Nested subtree
+activation remains a separate follow-on.
 Capture all invocation overrides in one immutable configuration snapshot with
 final-leaf provenance; retain the reviewed directory through configured launches.
 Persistent approval binds the complete authority manifest, while a one-invocation

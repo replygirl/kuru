@@ -216,3 +216,31 @@ Every effective permission rule supplied by automatic ancestor configuration SHA
 #### Scenario: Trust is not tool approval
 - **WHEN** a workspace manifest is approved but an invocation's effective decision is ask or deny
 - **THEN** ask still needs a valid foreground/grant decision and deny still performs no effect.
+
+### Requirement: Distinct project-local and managed provenance
+
+Kuru SHALL discover `.kuru/config.local.toml` only at the exact canonical workspace root. The file SHALL be bounded and checked as a regular file, and when the root is inside a Git worktree Kuru SHALL reject the local file if it is tracked or if its untracked status cannot be established. A valid local file SHALL be explicit user-local authority outside the automatic repository trust manifest. Managed configuration SHALL be loaded only from an explicitly provisioned external absolute path outside the workspace. The immutable snapshot SHALL retain final-leaf provenance across these layers, and a local or CLI value MUST NOT reclassify a remaining repository-origin leaf or instruction as user authority.
+
+#### Scenario: Tracked local file
+- **WHEN** a repository tracks `.kuru/config.local.toml`
+- **THEN** Kuru rejects the file as a local override before activation and offers a bounded remedy.
+
+#### Scenario: Untracked local and repo authority coexist
+- **WHEN** an untracked local file changes one leaf and an ancestor config still contributes an effective MCP or tool-permission leaf
+- **THEN** local authority needs no trust approval, while the remaining repository-origin claim still requires applicable workspace review.
+
+#### Scenario: Dead repository authority
+- **WHEN** an explicit local value disables a repository-contributed shell default
+- **THEN** no shell authority claim is required for that now-ineffective repository value.
+
+### Requirement: Imported instruction authority is captured before review
+
+Kuru SHALL derive the applicable project-instruction claim from the rendered encounter order of all active `AGENTS.md`, `CLAUDE.md` and imported sources, binding each full path digest, checked containing-directory and file identity, and exact captured bytes. An omitted over-cap source SHALL NOT activate prompt authority; a subsequently fitting or changed source SHALL produce a newly reviewed manifest. Kuru SHALL inject only the captured projection after the complete applicable workspace manifest passes the existing exact-root once or persistent approval preflight. It MUST NOT reopen an instruction source after that review to build the same invocation's prompt.
+
+#### Scenario: Imported bytes change after approval
+- **WHEN** an imported source changes after approval but before dispatch in the current invocation
+- **THEN** the current invocation uses only its captured reviewed bytes, and a new snapshot sees a different manifest requiring fresh review before the changed bytes can activate.
+
+#### Scenario: Explicit local override does not bless import
+- **WHEN** a user-owned local config overrides a repository setting and a repository `CLAUDE.md` imports another instruction file
+- **THEN** the effective override keeps user provenance while the imported prompt bytes remain a separate repository-origin claim requiring workspace review.

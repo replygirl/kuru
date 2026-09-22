@@ -329,6 +329,9 @@ async fn rejected_activation_preserves_verified_stage_and_occupied_destination()
     files::write(&destination.join("record"), b"unrelated occupant").unwrap();
     let occupied_identity = files::directory(&destination).unwrap().identity();
 
+    // Exclude an in-binary child spawn from copying this flock description
+    // while activation releases it and the contender reacquires it.
+    let _gate = crate::spawn_gate::locking_async().await;
     let mut recovery_observations = 0_u32;
     let error = activate_staged_observed(stage, lock, &candidate, &destination, |_| {
         recovery_observations += 1;
@@ -361,12 +364,7 @@ async fn rejected_activation_preserves_verified_stage_and_occupied_destination()
     );
     let contender = open_regular(&cache.join(".install.lock")).unwrap();
     assert_eq!(regular_file_info(&contender).unwrap().identity, identity);
-    {
-        // Held across the actual flock acquisition this assertion proves
-        // succeeds; see `crate::spawn_gate`.
-        let _gate = crate::spawn_gate::locking_async().await;
-        contender.try_lock().unwrap();
-    }
+    contender.try_lock().unwrap();
 }
 
 #[tokio::test]
@@ -383,6 +381,9 @@ async fn activation_source_open_failure_preserves_stage_before_releasing_cache_l
     let candidate = stage_path.join("missing-runtime");
     let destination = cache.join("active");
 
+    // The same release/reacquire pair must exclude transient inherited flock
+    // copies; the initial lock acquisition above used its own short guard.
+    let _gate = crate::spawn_gate::locking_async().await;
     let error = activate_staged(stage, lock, &candidate, &destination)
         .await
         .unwrap_err();
@@ -390,9 +391,7 @@ async fn activation_source_open_failure_preserves_stage_before_releasing_cache_l
     assert!(format!("{error:#}").contains("preserved private stage at"));
     assert!(stage_path.is_dir());
     assert!(!destination.exists());
-    let reacquired = gated_cache_lock(&cache, Duration::from_secs(1))
-        .await
-        .unwrap();
+    let reacquired = cache_lock(&cache, Duration::from_secs(1)).await.unwrap();
     assert_eq!(
         regular_file_info(&reacquired).unwrap().identity,
         lock_identity

@@ -48,6 +48,256 @@ fn defaults_are_usable_and_preserve_explicit_permission_boundaries() {
 }
 
 #[test]
+fn managed_defaults_and_exact_locks_cover_budget_rules_and_alias_tables() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let managed = dir.path().join("managed.toml");
+    write(
+        &managed,
+        "[defaults]\nmodel='managed-default'\n[constraints]\nmax_tool_calls=4\npermissions=[]\n[constraints.mcp.service]\ncommand='fixed-runner'",
+    );
+    write(project.join(".kuru/config.toml"), "model='project-model'");
+    let snapshot = ConfigSnapshot::parse_with_layers(
+        None,
+        &project,
+        None,
+        None,
+        Some(&managed),
+        InvocationOverrides {
+            typed_config: vec![
+                "max_tool_calls=4".into(),
+                "mcp.service={command='fixed-runner'}".into(),
+            ],
+            ..InvocationOverrides::default()
+        },
+    )
+    .unwrap();
+    let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
+    assert_eq!(config.model, "project-model");
+    assert_eq!(config.max_tool_calls, 4);
+    assert_eq!(
+        config.mcp["service"].command.as_deref(),
+        Some("fixed-runner")
+    );
+    for assignment in [
+        "max_tool_calls=5",
+        "mcp.service={command='different-runner'}",
+        "permissions=[{action='deny',selector={kind='native',name='shell'}}]",
+    ] {
+        let failure = ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides {
+                typed_config: vec![assignment.into()],
+                ..InvocationOverrides::default()
+            },
+        );
+        assert!(failure.is_err(), "{assignment}");
+        assert!(
+            !failure
+                .unwrap_err()
+                .to_string()
+                .contains("different-runner")
+        );
+    }
+}
+
+#[test]
+fn managed_locks_reject_project_local_and_saved_conflicts() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let managed = dir.path().join("managed.toml");
+    write(
+        &managed,
+        "[defaults.mcp.named_service]\ncommand='fixed-runner'\n[constraints]\nallow_write=false\nmode='ifs'\n[constraints.mcp.named_service]\ncommand='fixed-runner'",
+    );
+    write(project.join(".kuru/config.toml"), "allow_write=true");
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+    write(
+        project.join(".kuru/config.toml"),
+        "allow_write=false\n[mcp.named_service]\nargs=['new']",
+    );
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+    write(project.join(".kuru/config.toml"), "allow_write=false");
+    let local = project.join(".kuru/config.local.toml");
+    let local_text = "allow_write=true";
+    write(&local, local_text);
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            Some((&local, local_text)),
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+    let snapshot = ConfigSnapshot::parse_with_layers(
+        None,
+        &project,
+        None,
+        None,
+        Some(&managed),
+        InvocationOverrides::default(),
+    )
+    .unwrap();
+    assert!(
+        snapshot
+            .finalize(&ProjectPreferences {
+                mode: Some(Mode::Freudian),
+                ..ProjectPreferences::default()
+            })
+            .is_err()
+    );
+    snapshot.finalize(&ProjectPreferences::default()).unwrap();
+
+    write(&managed, "[constraints.mcp]");
+    write(
+        project.join(".kuru/config.toml"),
+        "[mcp.worker]\ncommand='repo-runner'",
+    );
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+
+    write(
+        &managed,
+        "[constraints.external_agents]\nprimary='https://example.test/primary'",
+    );
+    write(
+        project.join(".kuru/config.toml"),
+        "[external_agents]\nprimary='https://example.test/primary'\nsecondary='https://example.test/secondary'",
+    );
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_ok()
+    );
+    write(
+        project.join(".kuru/config.toml"),
+        "[external_agents]\nprimary='https://example.test/changed'",
+    );
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn local_and_typed_overrides_keep_remaining_automatic_claims() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    write(
+        project.join(".kuru/config.toml"),
+        "allow_shell=true\n[mcp.worker]\ncommand='repo-runner'",
+    );
+    let local = project.join(".kuru/config.local.toml");
+    write(&local, "allow_shell=false\nmode='freudian'");
+    let snapshot = ConfigSnapshot::parse_with_layers(
+        None,
+        &project,
+        Some((&local, "allow_shell=false\nmode='freudian'")),
+        None,
+        None,
+        InvocationOverrides {
+            typed_config: vec!["max_rounds=4".into()],
+            ..InvocationOverrides::default()
+        },
+    )
+    .unwrap();
+    let claims = snapshot.manifest().claims();
+    assert!(
+        claims
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::McpStdio)
+    );
+    assert!(
+        !claims
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::Shell)
+    );
+    let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
+    assert_eq!(config.mode, Mode::Freudian);
+    assert_eq!(config.max_rounds, 4);
+    assert!(!config.allow_shell);
+
+    let dedicated = ConfigSnapshot::parse_with_layers(
+        None,
+        &project,
+        Some((&local, "allow_shell=false\nmode='freudian'")),
+        None,
+        None,
+        InvocationOverrides {
+            typed_config: vec!["allow_shell=false".into()],
+            allow_shell: true,
+            ..InvocationOverrides::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        dedicated
+            .finalize(&ProjectPreferences::default())
+            .unwrap()
+            .allow_shell
+    );
+    assert!(
+        !dedicated
+            .manifest()
+            .claims()
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::Shell)
+    );
+}
+
+#[test]
 fn snapshot_keeps_only_effective_ancestor_authority_and_redacts_inspection() {
     let dir = TempDir::new().unwrap();
     let project = dir.path().join("project");
@@ -497,40 +747,49 @@ fn bounded_regular_utf8_files_prevent_unlimited_or_malformed_instruction_loading
         error.to_string().contains("configuration read error"),
         "{error:#}"
     );
+    fs::remove_dir(&config).unwrap();
     write(dir.path().join("AGENTS.md"), [0xff]);
     assert!(load_instructions(dir.path()).is_err());
     write(dir.path().join("AGENTS.md"), "x".repeat(256 * 1024 + 1));
-    assert!(load_instructions(dir.path()).is_err());
+    let captured =
+        ConfigSnapshot::parse(None, dir.path(), None, InvocationOverrides::default()).unwrap();
+    assert!(captured.instructions().contains("256 KiB file limit"));
+    assert_eq!(captured.instruction_notices().len(), 1);
+    assert!(!captured.instructions().contains(&"x".repeat(256)));
     let instructions = dir.path().join("AGENTS.md");
     fs::remove_file(&instructions).unwrap();
     fs::create_dir(&instructions).unwrap();
     let error = load_instructions(dir.path()).unwrap_err();
-    assert!(format!("{error:#}").contains("regular file"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("instruction read error"),
+        "{error:#}"
+    );
 }
 
 #[test]
 fn combined_limits_apply_across_many_individually_valid_files() {
     let dir = TempDir::new().unwrap();
     let mut path = dir.path().to_owned();
-    for _ in 0..5 {
+    for index in 0..5 {
         path.push("child");
-        write(path.join("AGENTS.md"), "x".repeat(220_000));
+        write(
+            path.join("AGENTS.md"),
+            format!("SOURCE-{index}\n{}", "x".repeat(220_000)),
+        );
         write(
             path.join(".kuru/config.toml"),
             format!("#{}\n", "x".repeat(220_000)),
         );
     }
-    assert!(
-        load_instructions(&path)
-            .unwrap_err()
-            .to_string()
-            .contains("1 MiB")
-    );
+    let instructions = load_instructions(&path).unwrap();
+    assert!(instructions.contains("1 MiB combined instruction limit"));
+    assert!(instructions.contains("SOURCE-3"));
+    assert!(!instructions.contains("SOURCE-4"));
     assert!(
         Config::load(None, &path, None)
             .unwrap_err()
             .to_string()
-            .contains("combined AGENTS.md instructions exceed 1 MiB")
+            .contains("configuration read error")
     );
 }
 
@@ -572,6 +831,176 @@ fn snapshot_claims_ordered_automatic_instructions_and_freezes_exact_bytes() {
     assert!(snapshot.instructions().contains("OUTER-APPROVED"));
     assert!(snapshot.instructions().contains("ROOT-APPROVED"));
     assert!(!snapshot.instructions().contains("CHANGED"));
+}
+
+#[test]
+fn claude_wrapper_and_imports_render_once_in_order_and_bind_exact_bytes() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    write(project.join("AGENTS.md"), "AGENT-ONLY\n");
+    write(project.join("docs/rules.md"), "IMPORTED-ONLY\n");
+    write(
+        project.join("CLAUDE.md"),
+        "CLAUDE-BEFORE\n@AGENTS.md\n@docs/../AGENTS.md\n@docs/rules.md\nCLAUDE-AFTER\n",
+    );
+    let captured =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let rendered = captured.instructions();
+    assert_eq!(rendered.matches("AGENT-ONLY").count(), 1);
+    assert_eq!(rendered.matches("IMPORTED-ONLY").count(), 1);
+    assert!(!rendered.contains("@AGENTS.md"));
+    assert!(!rendered.contains("@docs/../AGENTS.md"));
+    assert!(rendered.find("AGENT-ONLY").unwrap() < rendered.find("CLAUDE-BEFORE").unwrap());
+    assert!(rendered.find("CLAUDE-BEFORE").unwrap() < rendered.find("IMPORTED-ONLY").unwrap());
+    assert!(rendered.find("IMPORTED-ONLY").unwrap() < rendered.find("CLAUDE-AFTER").unwrap());
+    let claim = captured
+        .manifest()
+        .claims()
+        .iter()
+        .find(|claim| claim.category() == AuthorityClaimCategory::ProjectInstructions)
+        .unwrap();
+    assert_eq!(claim.sources().len(), 3);
+    let reviewed = captured.manifest().full_digest();
+    write(project.join("docs/rules.md"), "CHANGED-IMPORT\n");
+    assert!(captured.instructions().contains("IMPORTED-ONLY"));
+    let changed =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_ne!(reviewed, changed.manifest().full_digest());
+    assert!(changed.instructions().contains("CHANGED-IMPORT"));
+    fs::rename(project.join("docs"), project.join("parked-docs")).unwrap();
+    write(project.join("docs/rules.md"), "CHANGED-IMPORT\n");
+    let replaced_directory =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_ne!(
+        changed.manifest().full_digest(),
+        replaced_directory.manifest().full_digest(),
+        "containing directory identity is part of reviewed authority"
+    );
+}
+
+#[test]
+fn import_cycle_and_fenced_example_report_without_recursive_or_accidental_import() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    write(project.join("AGENTS.md"), "ROOT\n@docs/one.md\n");
+    write(project.join("docs/one.md"), "ONE\n@../AGENTS.md\n");
+    write(project.join("after.md"), "AFTER-FENCE\n");
+    write(
+        project.join("CLAUDE.md"),
+        "````md\n```\n@missing.md\n````\u{a0}\n@not-closed.md\n```\n````\n~~~~md\n@also-missing.md\n~~~~\n@after.md\nordinary @person.md text\n",
+    );
+    let captured =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_eq!(captured.instructions().matches("ROOT").count(), 1);
+    assert_eq!(captured.instructions().matches("ONE").count(), 1);
+    assert!(captured.instructions().contains("@missing.md"));
+    assert!(captured.instructions().contains("@not-closed.md"));
+    assert!(captured.instructions().contains("@also-missing.md"));
+    assert!(captured.instructions().contains("AFTER-FENCE"));
+    assert!(captured.instructions().contains("ordinary @person.md text"));
+    assert_eq!(captured.instruction_notices().len(), 1);
+    assert!(captured.instruction_notices()[0].contains("import cycle"));
+}
+
+#[test]
+fn import_path_escape_and_missing_source_fail_before_activation() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    write(dir.path().join("private.md"), "FAKE-PRIVATE-BYTES");
+    write(project.join("CLAUDE.md"), "@../private.md\n");
+    let error = load_instructions(&project).unwrap_err().to_string();
+    assert!(error.contains("instruction path error"));
+    assert!(!error.contains("FAKE-PRIVATE-BYTES"));
+    write(project.join("CLAUDE.md"), "@missing.md\n");
+    assert!(
+        load_instructions(&project)
+            .unwrap_err()
+            .to_string()
+            .contains("instruction read error")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn imported_symlink_is_rejected_without_reading_its_target() {
+    use std::os::unix::fs::symlink;
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    write(dir.path().join("outside.md"), "FAKE-OUTSIDE-BYTES");
+    write(project.join("CLAUDE.md"), "@linked.md\n");
+    symlink(dir.path().join("outside.md"), project.join("linked.md")).unwrap();
+    let error = load_instructions(&project).unwrap_err().to_string();
+    assert!(error.contains("instruction read error"));
+    assert!(!error.contains("FAKE-OUTSIDE-BYTES"));
+
+    let outside = dir.path().join("outside");
+    write(outside.join("file.md"), "FAKE-NESTED-OUTSIDE-BYTES");
+    write(project.join("CLAUDE.md"), "@linked-dir/file.md\n");
+    symlink(&outside, project.join("linked-dir")).unwrap();
+    let error = load_instructions(&project).unwrap_err().to_string();
+    assert!(error.contains("instruction path error"));
+    assert!(!error.contains("FAKE-NESTED-OUTSIDE-BYTES"));
+}
+
+#[test]
+fn duplicate_imports_do_not_consume_content_budget_twice() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    write(project.join("AGENTS.md"), "@large.md\n".repeat(8));
+    write(project.join("large.md"), "L".repeat(240_000));
+    let captured =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_eq!(
+        captured.instructions().matches(&"L".repeat(1_000)).count(),
+        240
+    );
+    assert_eq!(
+        captured
+            .instructions()
+            .matches("--- resume AGENTS.md")
+            .count(),
+        1
+    );
+    assert!(captured.instruction_notices().is_empty());
+}
+
+#[test]
+fn import_depth_and_graph_caps_omit_whole_branches_with_notices() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    for index in 0..9 {
+        write(
+            project.join(format!("depth/{index}.md")),
+            format!("DEPTH-{index}\n@{}.md\n", index + 1),
+        );
+    }
+    write(project.join("depth/9.md"), "TOO-DEEP-SENTINEL\n");
+    write(project.join("AGENTS.md"), "@depth/0.md\n");
+    let depth =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert!(!depth.instructions().contains("TOO-DEEP-SENTINEL"));
+    assert!(
+        depth
+            .instructions()
+            .contains("eight-edge import depth limit")
+    );
+    let imports = (0..150)
+        .map(|index| format!("@graph/{index}.md\n"))
+        .collect::<String>();
+    write(project.join("AGENTS.md"), imports);
+    for index in 0..150 {
+        write(
+            project.join(format!("graph/{index}.md")),
+            format!("GRAPH-{index}\n"),
+        );
+    }
+    let graph =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert!(graph.instructions().contains("128-source graph limit"));
+    assert!(graph.instructions().contains("GRAPH-126"));
+    assert!(!graph.instructions().contains("GRAPH-149"));
+    assert_eq!(graph.instruction_notices().len(), 17);
+    assert!(graph.instruction_notices()[16].contains("7 additional"));
 }
 
 #[test]
@@ -632,19 +1061,12 @@ fn instructions_preserve_scope_order_content_and_local_precedence() {
     write(project.join("AGENTS.md"), "INNER: 日本語の名前を使う。 🪶");
     let instructions = load_instructions(&project).unwrap();
     assert!(instructions.find("OUTER:").unwrap() < instructions.find("INNER:").unwrap());
-    assert!(instructions.contains("most local applicable AGENTS.md takes precedence"));
+    assert!(instructions.contains("most local applicable source takes precedence"));
     assert!(instructions.contains("higher-priority conversation instructions"));
     assert!(instructions.contains("日本語の名前を使う。 🪶"));
-    assert!(
-        instructions.contains(
-            &project
-                .canonicalize()
-                .unwrap()
-                .join("AGENTS.md")
-                .display()
-                .to_string()
-        )
-    );
+    // The displayed source path is bounded and escapes platform separators;
+    // the source headings still identify both captured scopes.
+    assert_eq!(instructions.matches("\n--- AGENTS.md: ").count(), 2);
 }
 
 #[cfg(unix)]

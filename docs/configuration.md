@@ -1,8 +1,10 @@
 # Configuration
 
-Kuru uses typed TOML. Layers merge in this order: built-in defaults, user defaults,
-ancestor `.kuru/config.toml` files from outermost to innermost directory, remembered
-interactive choices for the project, an explicit `--config` file, and CLI flags.
+Kuru uses typed TOML. Layers merge in this order: built-in defaults, externally
+provisioned managed defaults, user defaults, ancestor `.kuru/config.toml` files
+from outermost to innermost directory, remembered interactive choices for the
+project, `.kuru/config.local.toml` at the exact project root, an explicit
+`--config` file, repeatable `-c key=value` values, and dedicated CLI flags.
 Later values win; tables merge recursively and arrays
 replace. Unknown keys, invalid types, unsupported provider names and invalid
 bounds fail with context. Each configuration file is bounded to 256 KiB and the
@@ -21,20 +23,66 @@ memory. It prints an omission notice on stderr. User defaults are read from
 `$XDG_CONFIG_HOME/kuru/config.toml` when set. Otherwise, Kuru uses
 `~/.config/kuru/config.toml` on macOS/Linux or
 `$env:APPDATA\kuru\config.toml` on Windows. Windows also falls back to
-`$env:USERPROFILE\AppData\Roaming` when `APPDATA` is unset. `--config` selects the
-final local layer. CLI flags take precedence over file values.
+`$env:USERPROFILE\AppData\Roaming` when `APPDATA` is unset. `--config` selects an
+explicit local layer. `-c` accepts TOML values such as `-c max_rounds=4` or
+`-c memory.offline=true`; unknown keys and incorrect types are errors. Dedicated
+CLI flags take final precedence over `-c` and file values.
+
+Kuru automatically reads `.kuru/config.local.toml` only from the canonical `-C`
+directory. It must be a checked regular file and, inside a Git worktree, absent
+from Git's index. A tracked local file is rejected. If Git cannot establish its
+untracked status, use `--config PATH` explicitly; normal operation does not
+require Git when this optional file is absent. Local values are user authority
+outside the repository trust manifest, but they do not approve remaining
+repository-supplied tool, provider or instruction authority.
+
+An administrator or launcher may set `KURU_MANAGED_CONFIG` to an absolute TOML
+path outside the workspace. Its `[defaults]` table uses ordinary configuration
+keys at the lowest file precedence. Its `[constraints]` table locks supported
+configuration values exactly, after all saved choices and overrides. Arrays
+such as `permissions` and each named MCP server table lock as a whole;
+external-agent endpoints lock by alias and allow other aliases. An empty
+managed table locks that table as empty. A conflict
+fails before the affected provider or tool activates; Kuru never substitutes a
+different value silently. For example:
+
+```toml
+[defaults]
+max_rounds = 4
+[constraints]
+allow_shell = false
+max_tool_calls = 12
+permissions = []
+```
+
+The managed document shape is published at
+`configuration.v1.schema.json#/$defs/managed`. Native parsing and semantic
+validation remain authoritative.
 
 When a command opens memory, fixed progress messages appear on standard error
 while Kuru acquires private ownership, verifies or extracts the bundled runtime,
 and opens the database. They describe work in progress, not an estimate or a
 successful open; JSON and other command results remain on standard output.
-Every ancestor `AGENTS.md`, including the project root, can provide automatic
-project instructions. Kuru captures the present files from outermost to most
-local before workspace review, and local instructions have precedence. The
-reviewed snapshot owns the exact bytes later placed in prompts, so Kuru does not
-reopen those paths after approval. Kuru does not automatically follow arbitrary
-links in instruction files; repositories can put their applicable instructions
-in `AGENTS.md` itself.
+Every ancestor directory through the project root can provide `AGENTS.md` and
+`CLAUDE.md` instructions. Kuru reads outermost directories first, then the
+project root; within one directory it reads `AGENTS.md` before `CLAUDE.md`.
+A standalone line such as `@docs/rules.md` imports a relative Markdown file at
+that position. The import must stay within the directory tree of its original
+top-level instruction file. Checked file opens reject links and path escapes.
+Each physical file is included once, so a sibling `CLAUDE.md` containing
+`@AGENTS.md` does not duplicate the `AGENTS.md` text. Import directives inside
+fenced code remain literal. Missing or invalid imports stop instruction capture
+with a bounded source error.
+
+Each file can contribute at most 256 KiB, with 1 MiB of captured instruction
+content in total, at most 128 checked source paths and eight import edges. A
+source or branch over these caps is omitted whole; Kuru reports the omission
+before inference and in the effective prompt while retaining other usable
+instructions. It does not silently truncate a source. The reviewed snapshot
+owns the exact active bytes and file/directory identities later placed in
+prompts, so Kuru does not reopen those paths after approval. Instructions in
+nested project subdirectories are not activated by this release's automatic
+ancestor/root discovery; on-demand nested activation is a separate follow-on.
 
 Mode, model and effort choices made in the terminal with F2/F3/F4 or the matching
 slash commands are saved immediately. Relaunching from the same canonical directory
@@ -185,15 +233,18 @@ fully show.
 ## Workspace trust
 
 Kuru reviews effective process, mutation, endpoint and prompt authority supplied
-by automatically discovered ancestor `.kuru/config.toml` and `AGENTS.md` files
+by automatically discovered ancestor `.kuru/config.toml`, `AGENTS.md`,
+`CLAUDE.md` and their checked imports
 before activating it. This includes an `AGENTS.md` at the project root and any
 automatic source under your home directory; location alone does not make a file
 an explicit caller input. Kuru has no separate global-instruction source.
 The trust subject is the exact canonical `-C` directory and its current native
 directory identity. Approval does not inherit to parent or child directories.
-User defaults, an explicit `--config` file and CLI flags are deliberate caller
-inputs; an effective value supplied by one of those layers does not require
-workspace approval.
+User defaults, managed policy, the untracked project-local file, an explicit
+`--config` file and CLI flags are deliberate caller inputs; an effective value
+supplied by one of those layers does not require workspace approval. A later
+explicit value can disable repository authority that is no longer effective;
+it cannot reclassify a remaining repository-origin claim.
 
 ```sh
 kuru -C /path/to/project trust status

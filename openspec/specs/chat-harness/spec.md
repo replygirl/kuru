@@ -406,3 +406,23 @@ The TUI SHALL provide `/cost` and an estimated context indicator for the relevan
 #### Scenario: Narrow terminal with concurrent status
 - **WHEN** the TUI shows context, cost and permission status in a narrow pane while a request is active
 - **THEN** the current selection and operation controls remain usable and no provisional preview or private continuation becomes durable cost text.
+
+### Requirement: Layered managed and local invocation behavior
+
+Kuru SHALL resolve configuration in the order built-in defaults, managed ordinary defaults, existing user file, outer-to-inner ancestor project files, saved mode/model/effort preferences, discovered project-local file, explicit `--config` file, repeatable `-c` values, and dedicated CLI flags. It SHALL enforce managed constraints on memory and other preflight values before activation, then check saved mode/model/effort against their locks after reading those preferences and before provider, tool or prompt dispatch. `kuru config` SHALL inspect the resolved values without opening memory and SHALL redact MCP environment values from every layer.
+
+#### Scenario: Precedence across local and CLI
+- **WHEN** a user file, project file, untracked project-local file and `-c` each select a different mode
+- **THEN** the `-c` mode is effective and an explicit dedicated `--mode` value supersedes it.
+
+#### Scenario: Constraint after saved preference
+- **WHEN** a remembered model choice or a CLI override conflicts with managed policy
+- **THEN** configuration fails before constructing a configured provider or reading its credentials.
+
+### Requirement: Runtime uses the reviewed instruction projection
+
+The chat harness SHALL receive the immutable composed instruction projection captured and approved for its invocation, including bounded omission notices and excluding resolved import directives and omitted source bodies. It SHALL NOT reread instruction files after construction or reinterpret imports itself.
+
+#### Scenario: Source replacement after capture
+- **WHEN** an applicable source is replaced after snapshot capture and before an actor request
+- **THEN** that request contains the reviewed captured projection and not bytes from the replacement.
