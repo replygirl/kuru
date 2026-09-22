@@ -42,6 +42,8 @@ use sqlx::{
     MySqlPool, Row,
     mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode},
 };
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -101,6 +103,8 @@ struct Owner {
     lifetime: Option<LifetimeSender>,
     retained: Option<Arc<tempfile::TempDir>>,
     reap_guard: Arc<StdMutex<Option<File>>>,
+    #[cfg(test)]
+    reaped_observer: Option<oneshot::Sender<()>>,
 }
 
 impl Drop for Owner {
@@ -197,7 +201,62 @@ enum Response {
     Failed(String),
 }
 
+async fn drain_closed_pools(pools: &[Arc<MySqlPool>]) {
+    // `Pool::close` marks its pool closed before returning the future. Build
+    // all futures first so one slow MySQL QUIT cannot leave a sibling branch
+    // pool admitting work while the exact owner is being reaped.
+    let drains = pools.iter().map(|pool| pool.close()).collect::<Vec<_>>();
+    futures::future::join_all(drains).await;
+}
+
+async fn close_pools_and_owner(pools: &[Arc<MySqlPool>], owner: Option<Owner>) -> Result<()> {
+    // Mark every pool closed and first allow ordinary graceful SQL teardown.
+    // SQLx can stall while gracefully closing an idle MySQL socket even after
+    // the accepted query's server session has ended. Reaping our exact engine
+    // can unblock that close; a timeout alone never authorizes releasing its
+    // lifecycle lease or reporting a completed shutdown.
+    let mut owner = owner;
+    let first_drain = timeout(CLOSE_GRACE, drain_closed_pools(pools)).await;
+    let reaped = if let Some(owned) = owner.as_mut() {
+        finish_owner(owned).await?;
+        true
+    } else {
+        false
+    };
+    if first_drain.is_err() {
+        ensure!(
+            reaped,
+            "memory pool close deadline exceeded without an owned engine to reap"
+        );
+        timeout(CLOSE_GRACE, drain_closed_pools(pools))
+            .await
+            .context(
+                "post-reap memory pool close deadline exceeded after initial graceful drain",
+            )?;
+    }
+    // Retain owner bookkeeping and any startup guard until the final pool
+    // drain settles. The supervisor's lifecycle lease ends at child reap.
+    drop(owner);
+    Ok(())
+}
+
 impl Server {
+    /// Test-only observation after the retained child has actually reaped.
+    /// Unlike acquiring the lifecycle lease, this can fire while a slow pool
+    /// drain correctly keeps store ownership held.
+    #[cfg(test)]
+    pub(crate) async fn observe_next_owner_reap(&self) -> Result<oneshot::Receiver<()>> {
+        let mut owner = self.0.owner.lock().await;
+        let owner = owner.as_mut().context("memory server has no owned child")?;
+        ensure!(
+            owner.reaped_observer.is_none(),
+            "memory owner reap observer is already installed"
+        );
+        let (sender, receiver) = oneshot::channel();
+        owner.reaped_observer = Some(sender);
+        Ok(receiver)
+    }
+
     /// Hold the same stable lease as the supervisor until the caller completes
     /// a stopped-store rename and directory fsync. Closing an attached handle is
     /// not proof of quiescence: only acquiring this lease establishes it.
@@ -323,6 +382,8 @@ impl Server {
                 lifetime: None,
                 retained: options.retained.clone(),
                 reap_guard: reap_guard.clone(),
+                #[cfg(test)]
+                reaped_observer: None,
             };
             let child = owner
                 .child
@@ -381,6 +442,8 @@ impl Server {
                 lifetime: None,
                 retained: options.retained.clone(),
                 reap_guard: reap_guard.clone(),
+                #[cfg(test)]
+                reaped_observer: None,
             };
             let response = timeout(options.timeout + Duration::from_secs(2), async {
                 owner.lifetime = Some(accept.await?);
@@ -539,21 +602,11 @@ impl Server {
         // The owner mutex also makes concurrent close callers wait for reaping.
         let mut owner = self.0.owner.lock().await;
         self.0.closed.store(true, Ordering::Release);
-        let pools = std::mem::take(&mut *self.0.pools.lock().await);
-        let pool_result = timeout(CLOSE_GRACE, async {
-            for pool in pools.values().filter_map(Weak::upgrade) {
-                pool.close().await;
-            }
-        })
-        .await;
-        let stop_result: Result<()> = if let Some(mut owned) = owner.take() {
-            finish_owner(&mut owned).await
-        } else {
-            Ok(())
-        };
-        stop_result?;
-        pool_result.context("memory pool close deadline exceeded")?;
-        Ok(())
+        let pools = std::mem::take(&mut *self.0.pools.lock().await)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        close_pools_and_owner(&pools, owner.take()).await
     }
 
     pub(crate) fn take_reap_guard(&self) -> File {
@@ -568,23 +621,11 @@ impl Server {
     pub(crate) async fn close_installed_guard(&self) -> Result<File> {
         let mut owner = self.0.owner.lock().await;
         self.0.closed.store(true, Ordering::Release);
-        let pools = std::mem::take(&mut *self.0.pools.lock().await);
-        let pool_result = timeout(CLOSE_GRACE, async {
-            for pool in pools.values().filter_map(Weak::upgrade) {
-                pool.close().await;
-            }
-        })
-        .await;
-        let stop_result: Result<()> = if let Some(mut owned) = owner.take() {
-            match finish_owner(&mut owned).await {
-                Ok(()) => Ok(()),
-                Err(error) => return Err(error),
-            }
-        } else {
-            Ok(())
-        };
-        stop_result?;
-        pool_result.context("memory pool close deadline exceeded")?;
+        let pools = std::mem::take(&mut *self.0.pools.lock().await)
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        close_pools_and_owner(&pools, owner.take()).await?;
         Ok(self.take_reap_guard())
     }
 
@@ -641,6 +682,10 @@ async fn finish_owner(owner: &mut Owner) -> Result<()> {
         status.success(),
         "memory supervisor exited unsuccessfully ({status})"
     );
+    #[cfg(test)]
+    if let Some(observer) = owner.reaped_observer.take() {
+        let _ = observer.send(());
+    }
     Ok(())
 }
 

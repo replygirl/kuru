@@ -150,6 +150,7 @@ fn owner_drop_transfers_installed_reap_guard_until_real_child_reaps() -> Result<
             lifetime: None,
             retained: Some(root.clone()),
             reap_guard,
+            reaped_observer: None,
         });
     }
     let held_before_release =

@@ -1324,6 +1324,82 @@ async fn in_flight_disconnect_waits_for_real_query_and_session_teardown() -> Res
     Ok(())
 }
 
+/// A slow pool drain does not make the exact owner reap disposable. Once the
+/// the owned engine has reaped, a returned dead client connection must still
+/// be drained before explicit close reports success.
+#[cfg(unix)]
+#[tokio::test]
+async fn post_reap_pool_drain_finishes_a_returned_real_connection() -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let options = crate::test_support::open_options(
+        root.path().to_path_buf(),
+        format!("project/{}", "a".repeat(64)),
+    )?;
+    let store = crate::test_support::spawn_gated_open(options).await?;
+    let directory = store.shared.directory.clone();
+    let pool = store.pool.clone();
+    let held = pool.acquire().await?;
+    let reaped = store.shared.server.observe_next_owner_reap().await?;
+    let close = tokio::spawn(async move { store.close().await });
+
+    // The held SQLx permit forces the first graceful drain to its deadline.
+    // The test signal is sent only after the retained child actually reaps.
+    // Its lifecycle lease may now be acquired by a successor, while explicit
+    // close still owes completion of the already-closed client pool.
+    tokio::time::timeout(Duration::from_secs(30), reaped)
+        .await
+        .context("owner did not reap while the pool connection was held")??;
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(15), close)
+        .await
+        .context("post-reap pool drain did not finish")???;
+    let lease = crate::server::Server::quiescence(&directory, Duration::from_secs(5)).await?;
+    drop(lease);
+    ensure!(
+        pool.is_closed() && pool.size() == 0,
+        "post-reap pool still retains a connection"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn post_reap_pool_drain_reports_a_connection_that_never_returns() -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let options = crate::test_support::open_options(
+        root.path().to_path_buf(),
+        format!("project/{}", "b".repeat(64)),
+    )?;
+    let store = crate::test_support::spawn_gated_open(options).await?;
+    let directory = store.shared.directory.clone();
+    let pool = store.pool.clone();
+    let held = pool.acquire().await?;
+    let reaped = store.shared.server.observe_next_owner_reap().await?;
+    let close = tokio::spawn(async move { store.close().await });
+
+    tokio::time::timeout(Duration::from_secs(30), reaped)
+        .await
+        .context("owner did not reap before the second pool deadline")??;
+    let error = tokio::time::timeout(Duration::from_secs(15), close)
+        .await
+        .context("persistently held connection exceeded the second shutdown deadline")??
+        .unwrap_err();
+    ensure!(
+        error
+            .to_string()
+            .contains("post-reap memory pool close deadline exceeded"),
+        "persistent pool connection did not retain an actionable error: {error:#}"
+    );
+    let lease = crate::server::Server::quiescence(&directory, Duration::from_secs(5)).await?;
+    drop(lease);
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(10), pool.close())
+        .await
+        .context("held pool connection did not drain after fixture release")?;
+    ensure!(pool.size() == 0, "fixture pool retained a connection");
+    Ok(())
+}
+
 #[tokio::test]
 async fn lost_commit_reply_recovers_one_durable_update_and_reopens_without_replay() {
     let directory = crate::test_support::tempdir().unwrap();
