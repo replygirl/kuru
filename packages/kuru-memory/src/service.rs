@@ -3378,10 +3378,16 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            ensure!(
-                ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_some(),
-                "idle service retained owner authority after endpoint retirement"
-            );
+            // Endpoint retirement happens before the service owner drops its
+            // retained lock. Observe both steps, without mistaking that
+            // brief ordering interval for a leaked owner.
+            while ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_none() {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "idle service did not release owner authority after endpoint retirement"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -3610,10 +3616,13 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            ensure!(
-                ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_some(),
-                "cold-start fixture service retained owner authority after idle cleanup"
-            );
+            while ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_none() {
+                ensure!(
+                    tokio::time::Instant::now() < idle_deadline,
+                    "cold-start fixture service did not release owner authority after endpoint retirement"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             Ok::<(), anyhow::Error>(())
         })
         .await

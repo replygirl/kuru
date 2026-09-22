@@ -28,7 +28,7 @@ async fn write_marker_message(observer: &mut Pipe, message: &ReadyMarkerMessage)
 
 async fn report_marker_startup(
     observer: &mut Pipe,
-    result: Result<crate::MemoryStore>,
+    result: Result<crate::store::MemoryStore>,
 ) -> Result<()> {
     let error = match result {
         Err(error) => error,
