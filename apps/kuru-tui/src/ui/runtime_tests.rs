@@ -527,9 +527,15 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
     }));
     let loop_task = tokio::spawn(async move {
         let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
-        let result =
-            run_loop_with_stream_and_notice(&mut terminal, harness, models, input, Some(notice))
-                .await;
+        let result = run_loop_with_stream_and_notice(
+            &mut terminal,
+            harness,
+            models,
+            input,
+            Some(notice),
+            crate::commands::Registry::default(),
+        )
+        .await;
         let buffer = terminal.backend().buffer();
         let screen = buffer
             .content
@@ -621,10 +627,16 @@ async fn failed_initial_tui_draw_never_marks_the_notice_shown() {
     let (project, harness, models) = fixture_with_memory(store.clone()).await;
     let mut terminal = Terminal::new(FailingBackend::initially_failing(provider)).unwrap();
     let input = Box::pin(stream::empty());
-    let error =
-        run_loop_with_stream_and_notice(&mut terminal, harness, models, input, Some(notice))
-            .await
-            .unwrap_err();
+    let error = run_loop_with_stream_and_notice(
+        &mut terminal,
+        harness,
+        models,
+        input,
+        Some(notice),
+        crate::commands::Registry::default(),
+    )
+    .await
+    .unwrap_err();
     assert!(format!("{error:#}").contains("injected backend failure"));
 
     drop(store);
@@ -652,7 +664,15 @@ async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
     }));
     let loop_task = tokio::spawn(async move {
         let mut terminal = Terminal::new(TestBackend::new(120, 45)).unwrap();
-        run_loop_with_stream_and_notice(&mut terminal, harness, models, input, Some(notice)).await
+        run_loop_with_stream_and_notice(
+            &mut terminal,
+            harness,
+            models,
+            input,
+            Some(notice),
+            crate::commands::Registry::default(),
+        )
+        .await
     });
     for character in "turn reaches provider".chars() {
         input_tx

@@ -29,7 +29,7 @@ pub use a2a::a2a_send;
 pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
 pub use instruction_review::{
     InstructionActivation, InstructionGate, InstructionGateOutcome, InstructionReviewAnswer,
-    InstructionReviewRequest, InstructionReviewSender,
+    InstructionReviewRequest, InstructionReviewSender, SkillGate,
 };
 pub use mcp::McpStatus;
 pub use permissions::{

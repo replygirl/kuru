@@ -1,6 +1,10 @@
 //! The working built-in TUI command catalog. Modal review tokens are private
 //! UI controls and never appear here.
 
+use std::collections::BTreeMap;
+
+use kuru_core::PromptCatalog;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandId {
     Clear,
@@ -150,6 +154,10 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
     },
 ];
 
+pub(crate) fn built_in_names() -> Vec<&'static str> {
+    BUILT_INS.iter().map(|spec| spec.name).collect()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CommandRequest<'a> {
     pub id: CommandId,
@@ -190,9 +198,77 @@ pub(crate) fn help_text() -> String {
     help
 }
 
+/// An invocation-local catalog built only after workspace preflight. Built-in
+/// names remain the single typed source for reserved commands.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Registry {
+    custom: BTreeMap<String, kuru_core::CustomCommand>,
+}
+
+impl Registry {
+    pub(crate) fn from_catalog(catalog: &PromptCatalog) -> Self {
+        let custom = catalog
+            .commands()
+            .filter(|entry| parse(&format!("/{}", entry.name)).is_none())
+            .map(|entry| (entry.name.clone(), entry.clone()))
+            .collect();
+        Self { custom }
+    }
+
+    pub(crate) fn custom<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Option<(&'a kuru_core::CustomCommand, &'a str)> {
+        let (name, args) = text.split_once(' ').unwrap_or((text, ""));
+        if parse(name).is_some() {
+            return None;
+        }
+        self.custom
+            .get(name.strip_prefix('/')?)
+            .map(|entry| (entry, args.trim()))
+    }
+
+    pub(crate) fn names_matching(&self, prefix: &str) -> Vec<String> {
+        let mut names = names_matching(prefix)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if prefix.starts_with('/') && !prefix.chars().any(char::is_whitespace) {
+            names.extend(
+                self.custom
+                    .keys()
+                    .map(|name| format!("/{name}"))
+                    .filter(|name| name.starts_with(prefix)),
+            );
+        }
+        names.sort();
+        names
+    }
+
+    pub(crate) fn help_text(&self) -> String {
+        let mut help = help_text();
+        for entry in self.custom.values() {
+            help.push('\n');
+            help.push('/');
+            help.push_str(&entry.name);
+            help.push_str(" [arguments] · ");
+            help.push_str(&entry.description);
+        }
+        help
+    }
+}
+
+pub(crate) fn expand_custom(entry: &kuru_core::CustomCommand, args: &str) -> String {
+    if args.is_empty() {
+        return entry.body.clone();
+    }
+    format!("{}\n\nArguments (literal text):\n{}", entry.body, args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuru_core::{ConfigSnapshot, InvocationOverrides};
 
     #[test]
     fn catalog_names_are_unique_sorted_and_parse_to_their_dispatch_ids() {
@@ -232,6 +308,49 @@ mod tests {
         assert!(
             parse("/model demo")
                 .is_some_and(|request| request.id == CommandId::Model && request.args == "demo")
+        );
+    }
+
+    #[test]
+    fn effective_custom_catalog_drives_help_completion_and_literal_prompt_expansion() {
+        let project = tempfile::tempdir().unwrap();
+        let commands = project.path().join(".kuru/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(
+            commands.join("review.md"),
+            "---\nname: review\ndescription: Review this change\n---\nExplain the risks.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            commands.join("help.md"),
+            "---\nname: help\ndescription: Fake help\n---\nWrong command.\n",
+        )
+        .unwrap();
+        let snapshot = ConfigSnapshot::parse_with_sources(
+            None,
+            None,
+            project.path(),
+            None,
+            None,
+            None,
+            &built_in_names(),
+            InvocationOverrides::default(),
+        )
+        .unwrap();
+        let registry = Registry::from_catalog(snapshot.prompt_catalog());
+        assert_eq!(registry.names_matching("/rev"), ["/review"]);
+        assert!(
+            registry
+                .help_text()
+                .contains("/review [arguments] · Review this change")
+        );
+        assert!(!registry.help_text().contains("Fake help"));
+        assert!(registry.custom("/help").is_none());
+        let (entry, args) = registry.custom("/review `literal` $HOME").unwrap();
+        assert_eq!(args, "`literal` $HOME");
+        assert_eq!(
+            expand_custom(entry, args),
+            "Explain the risks.\n\n\nArguments (literal text):\n`literal` $HOME"
         );
     }
 }

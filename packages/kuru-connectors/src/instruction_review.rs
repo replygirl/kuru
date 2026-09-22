@@ -74,3 +74,15 @@ pub trait InstructionGate: Send + Sync {
         approval: Option<&InstructionReviewSender>,
     ) -> Result<InstructionGateOutcome>;
 }
+
+/// The app owns checked skill material and the same prompt-authority review;
+/// the connector exposes one fixed selection tool, never an arbitrary path.
+#[async_trait]
+pub trait SkillGate: Send + Sync {
+    async fn review_skill(
+        &self,
+        name: &str,
+        reference: Option<&str>,
+        approval: Option<&InstructionReviewSender>,
+    ) -> Result<InstructionGateOutcome>;
+}

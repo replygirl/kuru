@@ -60,6 +60,9 @@ Persistent approval binds the complete authority manifest, while a one-invocatio
 grant covers only that command's applicable claims. Keep pure inspection and
 fixed account operations independent of unrelated authority. See
 [workspace trust](docs/configuration.md#workspace-trust).
+Project skill metadata and custom prompt commands join that base manifest;
+selected skill bodies and references use the same path-qualified supplemental
+review as nested instructions. Skill text never grants tool capabilities.
 Nested project instructions activate only when an actor reaches an individually
 authorized file path. Review their new complete manifest through the separate
 workspace-trust choice before exposing a result or effect; a newly instructed

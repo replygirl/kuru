@@ -280,6 +280,10 @@ impl<'a> ApprovalStore<'a> {
         }
     }
 
+    pub(crate) fn generation_is_current(&self, reviewed: &ReviewGeneration) -> Result<bool> {
+        Ok(generation_matches(reviewed, self.read_record()?.as_ref()))
+    }
+
     /// Persist one complete current manifest after an explicit user action.
     pub(crate) fn approve_command(&self, manifest: &AuthorityManifest) -> Result<()> {
         self.approve(manifest, ApprovalMethod::Command)

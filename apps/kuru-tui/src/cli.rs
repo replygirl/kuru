@@ -759,17 +759,26 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
 
     let local = discovered_local(&root).await?;
     let managed = std::env::var_os("KURU_MANAGED_CONFIG").map(PathBuf::from);
-    let snapshot = ConfigSnapshot::parse_with_layers(
+    let user_prompt_root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(native_config_directory)
+        .map(|path| path.join("kuru"));
+    let snapshot = ConfigSnapshot::parse_with_sources(
         user.as_deref(),
+        user_prompt_root.as_deref(),
         &cwd,
         local
             .as_ref()
             .map(|(path, content)| (path.as_path(), content.as_str())),
         cli.config.as_deref(),
         managed.as_deref(),
+        &crate::commands::built_in_names(),
         invocation_overrides(&cli),
     )?;
     for notice in snapshot.instruction_notices() {
+        eprintln!("{notice}");
+    }
+    for notice in snapshot.prompt_catalog().notices() {
         eprintln!("{notice}");
     }
     root.revalidate()
@@ -1088,13 +1097,16 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         {
             notice.announce().await?;
         }
+        let prompt_gate = Arc::new(crate::instruction_gate::NestedInstructionGate::new(
+            root.clone(),
+            data.clone(),
+            snapshot.clone(),
+            cli.trust_workspace_once,
+        ));
+        let has_skills = snapshot.prompt_catalog().skills().next().is_some();
         let tools = permission_host(&data, root.clone(), &config, &snapshot)?
-            .with_instruction_gate(Arc::new(crate::instruction_gate::NestedInstructionGate::new(
-                root.clone(),
-                data.clone(),
-                snapshot.clone(),
-                cli.trust_workspace_once,
-            )));
+            .with_instruction_gate(prompt_gate.clone())
+            .with_skill_gate(prompt_gate, has_skills);
         let mut harness = Harness::with_tool_host_and_instructions(
             config,
             &cwd,
@@ -1169,7 +1181,10 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 kuru_runtime::server::serve(listener, app).await?;
                 harness.lock().await.shutdown(false).await?;
             }
-            None => crate::ui::run_with_notice(harness, models, notice).await?,
+            None => {
+                let registry = crate::commands::Registry::from_catalog(snapshot.prompt_catalog());
+                crate::ui::run_with_notice_and_commands(harness, models, notice, registry).await?
+            }
             _ => unreachable!("early-return commands handled above"),
         }
         Ok::<_, anyhow::Error>(())
@@ -1237,6 +1252,9 @@ pub(crate) fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClai
         Category::ResponsesRoute,
         Category::ExternalAgent,
         Category::ProjectInstructions,
+        Category::ProjectSkillMetadata,
+        Category::ProjectSkillMaterial,
+        Category::ProjectCommands,
         Category::ToolPermissions,
     ]
     .into_iter()
@@ -1277,6 +1295,8 @@ fn command_claim_categories(
             Category::ResponsesRoute,
             Category::ExternalAgent,
             Category::ProjectInstructions,
+            Category::ProjectSkillMetadata,
+            Category::ProjectCommands,
         ],
         Some(
             Command::Login { .. }
