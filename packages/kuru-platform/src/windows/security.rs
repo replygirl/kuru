@@ -17,7 +17,8 @@ use windows_sys::Win32::Security::{
     GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetTokenInformation, INHERIT_ONLY_ACE,
     IsValidAcl, IsValidSecurityDescriptor, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_OWNER,
-    TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser, WinCreatorOwnerRightsSid,
+    TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    WinCreatorOwnerRightsSid,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -400,6 +401,245 @@ pub(crate) fn set_private(handle: BorrowedHandle<'_>, access_mask: u32) -> io::R
     }
 }
 
+/// Copy a held regular file's current effective DACL.
+/// The caller keeps the destination behind a checked private directory until
+/// publication, so broad access does not expose staged payload bytes.
+pub(crate) fn file_access_token(source: BorrowedHandle<'_>) -> io::Result<Vec<u8>> {
+    let mut owner = null_mut();
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the retained source handle stays live; the returned component
+    // pointers borrow the one descriptor allocation retained below.
+    let status = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalMemory(descriptor);
+    if descriptor.0.is_null() || owner.is_null() || dacl.is_null() {
+        return Err(denied("file access descriptor is incomplete"));
+    }
+    // SAFETY: GetSecurityInfo returned a complete retained descriptor.
+    if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 || unsafe { IsValidAcl(dacl) } == 0 {
+        return Err(denied("file access descriptor is invalid"));
+    }
+    // SAFETY: the descriptor was validated and remains allocated.
+    let bytes = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
+    if !(size_of::<ACL>()..=131_072).contains(&bytes) {
+        return Err(denied("file access descriptor exceeds bound"));
+    }
+    // SAFETY: bounded_sid validates the complete SID extent in this allocation.
+    unsafe { bounded_sid(owner, descriptor.0.cast(), bytes)? };
+    let sid_len = 8 + (unsafe { *owner.cast::<u8>().add(1) } as usize) * 4;
+    let start = descriptor.0 as usize;
+    let end = start
+        .checked_add(bytes)
+        .ok_or_else(|| denied("file access descriptor extent overflow"))?;
+    let acl_start = dacl as usize;
+    if acl_start < start
+        || acl_start
+            .checked_add(size_of::<ACL>())
+            .is_none_or(|v| v > end)
+    {
+        return Err(denied("file DACL lies outside its descriptor"));
+    }
+    // SAFETY: the fixed ACL header is inside the retained descriptor.
+    let acl_len = unsafe { (*dacl).AclSize } as usize;
+    if acl_len < size_of::<ACL>() || acl_start.checked_add(acl_len).is_none_or(|v| v > end) {
+        return Err(denied("file DACL exceeds its descriptor"));
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: the output slots are writable and the descriptor is retained.
+    checked_bool(unsafe {
+        GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision)
+    })?;
+    let mut token = Vec::with_capacity(1 + 4 + sid_len + 4 + acl_len);
+    token.push(u8::from(control & SE_DACL_PROTECTED != 0));
+    token.extend_from_slice(&(sid_len as u32).to_le_bytes());
+    // SAFETY: bounded_sid validated the SID's complete extent above.
+    token.extend_from_slice(unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), sid_len) });
+    token.extend_from_slice(&(acl_len as u32).to_le_bytes());
+    // SAFETY: the ACL extent was checked against the retained descriptor.
+    token.extend_from_slice(unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), acl_len) });
+    Ok(token)
+}
+
+pub(crate) fn copy_file_dacl(
+    source: BorrowedHandle<'_>,
+    staged: BorrowedHandle<'_>,
+) -> io::Result<()> {
+    require_same_file_owner(source, staged)?;
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the source handle remains live; the component pointer borrows
+    // the single descriptor allocation retained below.
+    let status = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalMemory(descriptor);
+    if descriptor.0.is_null() || dacl.is_null() {
+        return Err(denied("source file has no bounded DACL"));
+    }
+    // SAFETY: GetSecurityInfo returned a complete retained descriptor.
+    if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 || unsafe { IsValidAcl(dacl) } == 0 {
+        return Err(denied("source file has an invalid DACL"));
+    }
+    // SAFETY: both file handles and the descriptor stay live throughout the
+    // call; only the DACL is copied, never ownership. Protect the staged copy
+    // so inheritance from its private parent cannot replace the captured ACEs.
+    let status = unsafe {
+        SetSecurityInfo(
+            staged.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
+fn require_same_file_owner(
+    source: BorrowedHandle<'_>,
+    staged: BorrowedHandle<'_>,
+) -> io::Result<()> {
+    fn owner(handle: BorrowedHandle<'_>) -> io::Result<(LocalMemory, PSID)> {
+        let mut sid = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: the handle stays live and both output pointers borrow the
+        // one descriptor allocation retained immediately below.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut sid,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let descriptor = LocalMemory(descriptor);
+        if descriptor.0.is_null() || sid.is_null() {
+            return Err(denied("file has no checked owner"));
+        }
+        // SAFETY: GetSecurityInfo returned the complete retained descriptor.
+        if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 {
+            return Err(denied("invalid file-owner descriptor"));
+        }
+        // SAFETY: the SID pointer borrows this validated descriptor allocation.
+        let bytes = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
+        unsafe { bounded_sid(sid, descriptor.0.cast(), bytes)? };
+        Ok((descriptor, sid))
+    }
+    let (source_descriptor, source_sid) = owner(source)?;
+    let (staged_descriptor, staged_sid) = owner(staged)?;
+    // SAFETY: both validated SIDs remain inside their retained allocations.
+    let same = unsafe { EqualSid(source_sid, staged_sid) } != 0;
+    drop((source_descriptor, staged_descriptor));
+    if same {
+        Ok(())
+    } else {
+        Err(denied("staged file cannot preserve source owner access"))
+    }
+}
+
+/// Complete the access-policy handoff after the staged file has moved under
+/// its actual destination parent. Protected source ACLs are already final;
+/// unprotected sources must regain inheritance from that destination parent.
+pub(crate) fn restore_file_dacl_inheritance(
+    source: BorrowedHandle<'_>,
+    published: BorrowedHandle<'_>,
+) -> io::Result<()> {
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the source handle stays live and the DACL borrows the one retained
+    // descriptor allocation below.
+    let status = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalMemory(descriptor);
+    if descriptor.0.is_null() || dacl.is_null() {
+        return Err(denied("source file has no bounded DACL"));
+    }
+    // SAFETY: the complete descriptor and DACL remain owned and live here.
+    if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 || unsafe { IsValidAcl(dacl) } == 0 {
+        return Err(denied("source file has an invalid DACL"));
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: control and revision are writable output slots.
+    checked_bool(unsafe {
+        GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision)
+    })?;
+    if control & SE_DACL_PROTECTED != 0 {
+        return Ok(());
+    }
+    // SAFETY: published is the retained WRITE_DAC file handle after the checked
+    // move; setting its unprotected DACL now inherits from the real parent.
+    let status = unsafe {
+        SetSecurityInfo(
+            published.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +895,161 @@ mod tests {
             b"ordinary candidate"
         );
         assert_eq!(security_text(&candidate), before);
+    }
+
+    #[test]
+    fn shielded_stage_copies_effective_acl_before_checked_publication() {
+        use crate::fs::{Publication, copy_file_access, finalize_file_access};
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap();
+        let source = parent.create_new(OsStr::new("original")).unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let broad = descriptor(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"));
+        set_dacl(&source, broad.dacl().unwrap());
+        let original_acl = security_text(&source);
+
+        let private = parent
+            .create_private_directory(OsStr::new(".kuru-edit-stage"))
+            .unwrap();
+        let mut candidate = private.create_new(OsStr::new("payload")).unwrap();
+        candidate.write_all(b"published bytes").unwrap();
+        copy_file_access(&source, &candidate).unwrap();
+        private.revalidate().unwrap();
+        assert!(private.read(OsStr::new("payload")).is_err());
+        assert_eq!(security_text(&candidate), original_acl);
+        let stage =
+            Directory::open(private.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        assert_eq!(stage.identity(), private.identity());
+        parent
+            .publish_file(
+                &stage,
+                OsStr::new("payload"),
+                &candidate,
+                OsStr::new("published"),
+                Publication::New,
+            )
+            .unwrap();
+        finalize_file_access(&source, &candidate).unwrap();
+        assert_eq!(
+            std::fs::read(project.join("published")).unwrap(),
+            b"published bytes"
+        );
+        assert_eq!(security_text(&candidate), original_acl);
+    }
+
+    #[test]
+    fn staged_access_token_rejects_a_held_source_dacl_change() {
+        use crate::fs::{copy_file_access, verify_file_access};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent =
+            Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        let source = parent.create_new(OsStr::new("source")).unwrap();
+        let stage = parent
+            .create_private_directory(OsStr::new("stage"))
+            .unwrap();
+        let candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        let token = copy_file_access(&source, &candidate).unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let changed = descriptor(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"));
+        set_dacl(&source, changed.dacl().unwrap());
+        assert!(verify_file_access(&source, &token).is_err());
+    }
+
+    #[test]
+    fn ordinary_create_and_unprotected_replacement_regain_parent_acl_inheritance() {
+        use crate::fs::{Publication, copy_file_access, finalize_file_access};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC,
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap();
+        let template = parent.create_new(OsStr::new("empty-template")).unwrap();
+        let private = parent
+            .create_private_directory(OsStr::new(".kuru-edit-stage"))
+            .unwrap();
+        let mut candidate = private.create_new(OsStr::new("payload")).unwrap();
+        candidate.write_all(b"payload").unwrap();
+        copy_file_access(&template, &candidate).unwrap();
+        let stage =
+            Directory::open(private.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        parent
+            .publish_file(
+                &stage,
+                OsStr::new("payload"),
+                &candidate,
+                OsStr::new("created"),
+                Publication::New,
+            )
+            .unwrap();
+        finalize_file_access(&template, &candidate).unwrap();
+        let before = security_text(&candidate);
+        assert_eq!(before, security_text(&template));
+
+        let parent_acl = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&project)
+            .unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let changed = descriptor(&format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"));
+        set_dacl(&parent_acl, changed.dacl().unwrap());
+        let after = security_text(&candidate);
+        assert_ne!(
+            after, before,
+            "published file stopped inheriting parent changes"
+        );
+        assert_eq!(
+            after,
+            security_text(&template),
+            "published file inherited differently from ordinary template"
+        );
+
+        let original = parent.create_new(OsStr::new("replace-me")).unwrap();
+        let replacement_stage = parent
+            .create_private_directory(OsStr::new(".kuru-edit-replacement"))
+            .unwrap();
+        let mut replacement = replacement_stage.create_new(OsStr::new("payload")).unwrap();
+        replacement.write_all(b"replacement").unwrap();
+        copy_file_access(&original, &replacement).unwrap();
+        let replacement_source = Directory::open(
+            replacement_stage.path(),
+            Privacy::Inherited,
+            NameRetention::Movable,
+        )
+        .unwrap();
+        parent
+            .publish_file(
+                &replacement_source,
+                OsStr::new("payload"),
+                &replacement,
+                OsStr::new("replace-me"),
+                Publication::ReplaceRegular,
+            )
+            .unwrap();
+        finalize_file_access(&original, &replacement).unwrap();
+        let replacement_before = security_text(&replacement);
+        assert_eq!(replacement_before, security_text(&template));
+
+        let changed_again = descriptor(&format!("O:{sid}D:P(A;OICI;FA;;;{sid})"));
+        set_dacl(&parent_acl, changed_again.dacl().unwrap());
+        let replacement_after = security_text(&replacement);
+        assert_ne!(
+            replacement_after, replacement_before,
+            "unprotected replacement stopped inheriting parent changes"
+        );
+        assert_eq!(
+            replacement_after,
+            security_text(&template),
+            "unprotected replacement inherited differently from ordinary file"
+        );
     }
 
     #[test]

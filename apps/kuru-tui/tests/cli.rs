@@ -623,6 +623,68 @@ async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_proje
 }
 
 #[test]
+fn cli_file_checkpoint_edit_undo_and_prune_survive_process_restart() {
+    let env = Sandbox::new();
+    assert!(!env.data.exists());
+    assert_eq!(env.success(&["file", "list"]), "[]\n");
+    assert!(!env.data.exists(), "inspection created private state");
+    std::fs::write(env.project.join("note.txt"), "alpha\none\n").unwrap();
+    let edited = env.success(&[
+        "--allow-write",
+        "tool",
+        "file_edit",
+        "--args",
+        r#"{"path":"note.txt","hunks":[{"before":"alpha\n","old":"one","after":"\n","replacement":"un"}]}"#,
+    ]);
+    let id = edited
+        .trim()
+        .strip_prefix("file_edit completed; checkpoint ")
+        .expect("file edit reports selected checkpoint");
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("note.txt")).unwrap(),
+        "alpha\nun\n"
+    );
+    let inspected: Value = serde_json::from_str(&env.success(&["file", "inspect", id])).unwrap();
+    assert_eq!(inspected["id"], id);
+    assert_eq!(inspected["path"], "note.txt");
+    assert_eq!(inspected["state"], "applied");
+    assert!(
+        inspected.get("before").is_none(),
+        "private snapshots leaked into inspection"
+    );
+    let malformed_config = env.root.path().join("malformed-file-config.toml");
+    std::fs::write(&malformed_config, "[").unwrap();
+    let independent = env
+        .command()
+        .arg("--config")
+        .arg(&malformed_config)
+        .args(["file", "inspect", id])
+        .output()
+        .unwrap();
+    assert!(
+        independent.status.success(),
+        "checkpoint inspection activated unrelated config: {}",
+        String::from_utf8_lossy(&independent.stderr)
+    );
+    let undone: Value =
+        serde_json::from_str(&env.success(&["--allow-write", "file", "undo", id])).unwrap();
+    assert_eq!(undone["effect"], "undo");
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("note.txt")).unwrap(),
+        "alpha\none\n"
+    );
+    let list: Value = serde_json::from_str(&env.success(&["file", "list"])).unwrap();
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["id"] == id)
+    );
+    assert!(env.success(&["file", "prune", id]).contains("pruned"));
+    assert!(!env.run(&["file", "inspect", id]).status.success());
+}
+
+#[test]
 fn cli_file_crud_and_shell_require_real_capabilities() {
     const TOOL_TOKEN: &str = "sk-proj-abcdefghijklmnop0123456789";
     const ORDINARY_CONTROL: &str = "ordinary-control-remains-exact";

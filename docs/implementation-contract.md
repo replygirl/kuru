@@ -97,7 +97,7 @@ dynamically, preserve unknown effort strings for future models.
 `ToolHost::new(root: &Path, config: &Config) -> Result<Self>` (async if required;
 communicate). `async fn specs(&self) -> Result<Vec<ToolSpec>>`,
 `async fn execute(&self, name: &str, args: Value) -> Result<String>`.
-Built-in tool names: file_read, file_write, file_delete, file_list, shell.
+Built-in tool names: file_read, file_write, file_edit, file_delete, file_list, shell.
 Enforce root/symlink containment for file tools, protected instruction/config and
 memory paths, read/write opt-in, shell opt-in + timeout + output cap. Shell
 permission explicitly means process authority (do not claim cwd is a sandbox).

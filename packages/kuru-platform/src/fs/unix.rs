@@ -1,4 +1,28 @@
 use super::*;
+
+pub(super) fn file_access_token(source: &File) -> io::Result<Vec<u8>> {
+    let metadata = source.metadata()?;
+    let mut token = Vec::with_capacity(12);
+    token.extend_from_slice(&metadata.uid().to_le_bytes());
+    token.extend_from_slice(&metadata.gid().to_le_bytes());
+    token.extend_from_slice(&metadata.mode().to_le_bytes());
+    Ok(token)
+}
+
+pub(super) fn copy_file_access(source: &File, staged: &File) -> io::Result<()> {
+    let source_info = source.metadata()?;
+    let staged_info = staged.metadata()?;
+    if source_info.uid() != staged_info.uid() || source_info.gid() != staged_info.gid() {
+        return Err(denied(
+            "staged file cannot preserve source owner and group access",
+        ));
+    }
+    staged.set_permissions(source_info.permissions())
+}
+
+pub(super) fn finalize_file_access(_: &File, _: &File) -> io::Result<()> {
+    Ok(())
+}
 use rustix::fs::{
     AtFlags, Dir, Mode, OFlags, RenameFlags, mkdirat, openat, renameat, renameat_with, unlinkat,
 };

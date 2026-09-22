@@ -280,6 +280,21 @@ pub(super) fn make_executable(_: &File) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn copy_file_access(source: &File, staged: &File) -> io::Result<()> {
+    // The original read handle includes READ_CONTROL; owner-private newly
+    // created stages retain WRITE_DAC. Keep the source ACL's protected bit.
+    staged.set_permissions(source.metadata()?.permissions())?;
+    security::copy_file_dacl(source.as_handle(), staged.as_handle())
+}
+
+pub(super) fn file_access_token(source: &File) -> io::Result<Vec<u8>> {
+    security::file_access_token(source.as_handle())
+}
+
+pub(super) fn finalize_file_access(source: &File, published: &File) -> io::Result<()> {
+    security::restore_file_dacl_inheritance(source.as_handle(), published.as_handle())
+}
+
 pub(super) fn remove(
     _: &File,
     path: &Path,
@@ -1001,6 +1016,10 @@ mod tests {
         );
 
         let mut permissions = fs::metadata(&file_path).unwrap().permissions();
+        #[allow(
+            clippy::permissions_set_readonly_false,
+            reason = "Windows-only test clears the Windows READONLY attribute before cleanup"
+        )]
         permissions.set_readonly(false);
         fs::set_permissions(&file_path, permissions).unwrap();
         directory.remove_tree().unwrap();

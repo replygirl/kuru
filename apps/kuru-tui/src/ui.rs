@@ -2326,7 +2326,20 @@ async fn dispatch_controlled(
     if command.starts_with('/') && registered.is_none() && custom_prompt.is_none() {
         anyhow::bail!("unknown command; use /help");
     }
-    harness.reconcile().await?;
+    // File checkpoint inspection and explicit recovery use their own checked
+    // private store. An unrelated uncertain memory write must not hide the
+    // evidence or strand a selected file undo/discard action.
+    if !matches!(
+        registered.map(|request| request.id),
+        Some(
+            CommandId::FileCheckpoints
+                | CommandId::FileInspect
+                | CommandId::FilePrune
+                | CommandId::FileUndo
+        )
+    ) {
+        harness.reconcile().await?;
+    }
     let args = registered.map_or("", |request| request.args);
     let feedback = match registered.map(|request| request.id) {
         Some(CommandId::Parts) => serde_json::to_string_pretty(&harness.topology)?,
@@ -2383,6 +2396,59 @@ async fn dispatch_controlled(
             serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?
         }
         Some(CommandId::Cost) => format_session_usage(&harness.session_usage().await?),
+        Some(CommandId::FileCheckpoints) => {
+            ensure!(args.is_empty(), "usage: /file-checkpoints");
+            serde_json::to_string_pretty(&harness.file_checkpoints(100)?)?
+        }
+        Some(CommandId::FileInspect) => {
+            ensure!(
+                !args.is_empty() && !args.contains(char::is_whitespace),
+                "usage: /file-inspect ID"
+            );
+            serde_json::to_string_pretty(
+                &harness
+                    .file_checkpoint(args)?
+                    .context("file checkpoint does not exist")?,
+            )?
+        }
+        Some(CommandId::FileUndo) => {
+            ensure!(
+                !args.is_empty() && !args.contains(char::is_whitespace),
+                "usage: /file-undo ID"
+            );
+            serde_json::to_string_pretty(
+                &harness
+                    .undo_file_checkpoint(args, approval.as_ref())
+                    .await?,
+            )?
+        }
+        Some(CommandId::FilePrune) => {
+            let mut parts = args.split_whitespace();
+            let id = parts
+                .next()
+                .context("usage: /file-prune ID [--discard-uncertain]")?;
+            let discard = match parts.next() {
+                None => false,
+                Some("--discard-uncertain") => true,
+                Some(_) => anyhow::bail!("usage: /file-prune ID [--discard-uncertain]"),
+            };
+            ensure!(
+                parts.next().is_none(),
+                "usage: /file-prune ID [--discard-uncertain]"
+            );
+            let prior = harness
+                .file_checkpoint(id)?
+                .context("file checkpoint does not exist")?;
+            ensure!(
+                harness.prune_file_checkpoint(id, discard)?,
+                "file checkpoint disappeared before pruning"
+            );
+            if prior.state == kuru_connectors::CheckpointState::Applied {
+                "Selected settled file checkpoint pruned; its undo and exact-retry evidence is no longer available.".into()
+            } else {
+                "Selected unresolved file checkpoint discarded; its recovery and undo evidence is no longer available.".into()
+            }
+        }
         Some(CommandId::Retry) => {
             return Ok(DispatchOutcome::Turn(
                 if let (Some(approval), Some(instruction_approval)) =

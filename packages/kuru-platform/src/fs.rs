@@ -77,6 +77,49 @@ pub struct FileInfo {
     pub len: u64,
 }
 
+/// Opaque access-policy capture from one retained regular-file handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileAccessToken(Vec<u8>);
+
+/// Copy the access policy of a checked regular file onto a newly staged file.
+/// Callers must keep the staged file behind a private directory until publish:
+/// this operation can intentionally grant ordinary project access.
+pub fn copy_file_access(source: &File, staged: &File) -> io::Result<FileAccessToken> {
+    checked_file(source)?;
+    checked_file(staged)?;
+    let token = FileAccessToken(native::file_access_token(source)?);
+    native::copy_file_access(source, staged)?;
+    verify_file_access(source, &token)?;
+    Ok(token)
+}
+
+/// Detect a source access-policy change on the same retained handle. A
+/// replaced source may have zero links after publication; any new alias is
+/// still refused. This does not lock out an external ACL writer.
+pub fn verify_file_access(source: &File, expected: &FileAccessToken) -> io::Result<()> {
+    if regular_file_info(source)?.links > 1 {
+        return Err(denied("access source gained another hardlink"));
+    }
+    if native::file_access_token(source)? != expected.0 {
+        return Err(denied("file access policy changed during publication"));
+    }
+    Ok(())
+}
+
+/// After a checked move into the destination parent, restore the source's
+/// inheritance behavior through the still-retained published file handle.
+/// A caller must not settle its effect as applied until this succeeds.
+pub fn finalize_file_access(source: &File, published: &File) -> io::Result<()> {
+    // A replaced source can have zero links after the checked publication,
+    // while its retained handle still carries the access policy we copied.
+    // It was checked before publication; reject any newly linked alias.
+    if regular_file_info(source)?.links > 1 {
+        return Err(denied("access source gained another hardlink"));
+    }
+    checked_file(published)?;
+    native::finalize_file_access(source, published)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Privacy {
     /// Ordinary files inherit their containing directory's access policy.
@@ -771,6 +814,38 @@ impl Directory {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_access_token_rejects_a_held_source_mode_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent =
+            Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        let source = parent.create_new(OsStr::new("source")).unwrap();
+        source
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let stage = parent
+            .create_private_directory(OsStr::new("stage"))
+            .unwrap();
+        let candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        let token = copy_file_access(&source, &candidate).unwrap();
+        source
+            .set_permissions(std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        assert!(verify_file_access(&source, &token).is_err());
+        assert_eq!(
+            std::fs::metadata(stage.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "staged payload directory lost owner-only traversal"
+        );
+    }
 
     #[test]
     fn checked_tree_removal_consumes_only_regular_private_descendants() {
