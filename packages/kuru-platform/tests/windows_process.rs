@@ -1,7 +1,7 @@
 #![cfg(all(windows, feature = "test-support"))]
 
 use kuru_platform::windows::{
-    pipe::{self, Pipe, PrivateListener},
+    pipe::{self, Pipe, PrivateListener, PrivateServiceListener},
     process::{Console, Lifetime, NativeChild, NativeSpawnSpec, Stdio, sample_process},
 };
 use std::{
@@ -16,6 +16,57 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const LIMIT: Duration = Duration::from_secs(8);
 const SHORT: Duration = Duration::from_millis(80);
+
+#[tokio::test]
+async fn private_service_pipe_accepts_multiple_clients_after_cancelled_wait() {
+    let mut listener = PrivateServiceListener::bind().unwrap();
+    let address = listener.address().to_owned();
+    assert!(PrivateServiceListener::bind_at(&address).is_err());
+
+    assert_eq!(
+        listener.accept(SHORT).await.err().unwrap().kind(),
+        io::ErrorKind::TimedOut
+    );
+
+    let mut first_client = pipe::connect(&address, LIMIT).await.unwrap();
+    let mut first_server = listener.accept(LIMIT).await.unwrap();
+    tokio::time::timeout(LIMIT, first_client.write_all(b"first"))
+        .await
+        .expect("first service client write deadline")
+        .unwrap();
+    tokio::time::timeout(LIMIT, first_client.flush())
+        .await
+        .expect("first service client flush deadline")
+        .unwrap();
+    let mut first = [0; 5];
+    tokio::time::timeout(LIMIT, first_server.read_exact(&mut first))
+        .await
+        .expect("first service client read deadline")
+        .unwrap();
+    assert_eq!(&first, b"first");
+
+    let mut second_client = pipe::connect(&address, LIMIT).await.unwrap();
+    let mut second_server = listener.accept(LIMIT).await.unwrap();
+    tokio::time::timeout(LIMIT, second_client.write_all(b"second"))
+        .await
+        .expect("second service client write deadline")
+        .unwrap();
+    tokio::time::timeout(LIMIT, second_client.flush())
+        .await
+        .expect("second service client flush deadline")
+        .unwrap();
+    let mut second = [0; 6];
+    tokio::time::timeout(LIMIT, second_server.read_exact(&mut second))
+        .await
+        .expect("second service client read deadline")
+        .unwrap();
+    assert_eq!(&second, b"second");
+
+    first_client.close(LIMIT).await.unwrap();
+    first_server.close(LIMIT).await.unwrap();
+    second_client.close(LIMIT).await.unwrap();
+    second_server.close(LIMIT).await.unwrap();
+}
 
 fn spec(root: &Path, args: &[&OsStr]) -> NativeSpawnSpec {
     let mut spec = NativeSpawnSpec::new(
