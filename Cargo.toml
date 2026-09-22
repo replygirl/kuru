@@ -67,7 +67,7 @@ scraper = "=0.27.0"
 roxmltree = "=0.21.1"
 windows-sys = { version = "=0.61.2", default-features = false }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
-crc32fast = "=1.5.1"
+crc32fast = "=1.5.2"
 portable-pty = "=0.9.0"
 kuru-core = { path = "packages/kuru-core" }
 kuru-connectors = { path = "packages/kuru-connectors" }
