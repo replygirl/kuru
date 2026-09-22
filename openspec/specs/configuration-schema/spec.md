@@ -89,6 +89,7 @@ native tool names.
   project-relative pattern
 - **THEN** both the JSON schema and native configuration validation accept the
   same rule shape and apply its normal matching semantics.
+
 ### Requirement: Managed configuration policy schema
 
 Kuru SHALL accept a managed TOML document only from an explicitly provisioned absolute path outside the workspace. It SHALL contain optional `defaults` using supported ordinary configuration keys and `constraints` using schema-valid configuration leaves as exact-value locks. Arrays and each named MCP alias table SHALL lock atomically; scalar external-agent endpoints SHALL lock by alias, and empty managed tables SHALL lock the whole empty table. Unknown keys, invalid types and contradictory managed values MUST fail before activation. Ordinary managed defaults SHALL be lower precedence than user and project preferences; constraints SHALL be checked against the final typed configuration after every override and MUST NOT be disabled by those layers.
