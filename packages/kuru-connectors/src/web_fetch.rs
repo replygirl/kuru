@@ -282,6 +282,27 @@ mod tests {
         response: Vec<u8>,
         delay: Duration,
     ) -> (SocketAddr, tokio::task::JoinHandle<String>) {
+        serve_once_inner(response, delay, None).await
+    }
+
+    async fn serve_once_with_request_ready(
+        response: Vec<u8>,
+        delay: Duration,
+    ) -> (
+        SocketAddr,
+        tokio::task::JoinHandle<String>,
+        tokio::sync::oneshot::Receiver<std::result::Result<(), &'static str>>,
+    ) {
+        let (request_ready, ready) = tokio::sync::oneshot::channel();
+        let (address, task) = serve_once_inner(response, delay, Some(request_ready)).await;
+        (address, task, ready)
+    }
+
+    async fn serve_once_inner(
+        response: Vec<u8>,
+        delay: Duration,
+        request_ready: Option<tokio::sync::oneshot::Sender<std::result::Result<(), &'static str>>>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -291,6 +312,7 @@ mod tests {
                 .expect("web fetch fixture timed out accepting a request")
                 .unwrap();
             let mut request = Vec::new();
+            let mut headers_complete = false;
             loop {
                 let mut chunk = [0; 1024];
                 let read = tokio::time::timeout_at(deadline, socket.read(&mut chunk))
@@ -306,8 +328,15 @@ mod tests {
                     "web fetch fixture request headers exceeded {MAX_FIXTURE_REQUEST_BYTES} bytes"
                 );
                 if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    headers_complete = true;
                     break;
                 }
+            }
+            if let Some(request_ready) = request_ready {
+                let _ =
+                    request_ready.send(headers_complete.then_some(()).ok_or(
+                        "web fetch cancellation fixture received incomplete request headers",
+                    ));
             }
             tokio::time::sleep(delay).await;
             let _ = tokio::time::timeout_at(deadline, socket.write_all(&response)).await;
@@ -599,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_stalled_fetch_cannot_publish_a_later_body() {
-        let (address, fixture) = serve_once(
+        let (address, fixture, request_ready) = serve_once_with_request_ready(
             response("200 OK", "Content-Type: text/plain\r\n", "late body"),
             Duration::from_millis(200),
         )
@@ -609,7 +638,11 @@ mod tests {
             let resolver = FixtureResolver::default().route("public.fixture", address);
             fetch_with_resolver(&url, &resolver, Duration::from_secs(1)).await
         });
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        timeout(FIXTURE_TIMEOUT, request_ready)
+            .await
+            .expect("web fetch cancellation fixture did not receive request headers")
+            .expect("web fetch cancellation fixture dropped its request barrier")
+            .expect("web fetch cancellation fixture received incomplete request headers");
         fetch.abort();
         assert!(fetch.await.unwrap_err().is_cancelled());
         assert!(received(fixture).await.starts_with("GET /cancel HTTP/1.1"));
