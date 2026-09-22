@@ -6,9 +6,10 @@ use std::sync::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use kuru_connectors::Provider;
+use kuru_connectors::{Provider, ToolHost};
 use kuru_core::{
-    Completion, CompletionRequest, Config, McpConfig, Mode, ModelInfo, RelationshipKind, ToolCall,
+    Completion, CompletionRequest, Config, ConfigSnapshot, InvocationOverrides, McpConfig, Mode,
+    ModelInfo, RelationshipKind, ToolCall,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -96,6 +97,106 @@ async fn fixture(config: Config, provider: Arc<dyn Provider>) -> (TempDir, Harne
     .await
     .unwrap();
     (dir, harness)
+}
+
+#[tokio::test]
+async fn captured_instruction_graph_reaches_provider_in_reviewed_order() {
+    let root = TempDir::new().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "OUTER-INSTRUCTION\n").unwrap();
+    std::fs::write(project.join("AGENTS.md"), "LOCAL-INSTRUCTION\n").unwrap();
+    std::fs::write(
+        project.join("CLAUDE.md"),
+        "@AGENTS.md\n@details.md\n@omitted.md\nCLAUDE-INSTRUCTION\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("details.md"), "IMPORTED-INSTRUCTION\n").unwrap();
+    std::fs::write(project.join("omitted.md"), "OMITTED-BODY".repeat(22_000)).unwrap();
+    let snapshot =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let provider = RecordingProvider::new(|_| reply("Ready"));
+    let first_config = config(Mode::Freudian);
+    let tools = ToolHost::new(&project, &first_config).unwrap();
+    let harness = Harness::with_tool_host_and_instructions(
+        first_config,
+        &project,
+        snapshot.instructions().to_owned(),
+        MemoryStore::temporary().await.unwrap(),
+        provider.clone(),
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    harness
+        .ask(
+            &harness.topology.parts[0].id,
+            vec![kuru_core::Message::text("user", "inspect")],
+            "inspect",
+            vec![],
+        )
+        .await
+        .unwrap();
+    {
+        let requests = provider.requests.lock().unwrap();
+        let instructions = &requests.last().unwrap().instructions;
+        let outer = instructions.find("OUTER-INSTRUCTION").unwrap();
+        let local = instructions.find("LOCAL-INSTRUCTION").unwrap();
+        let imported = instructions.find("IMPORTED-INSTRUCTION").unwrap();
+        let claude = instructions.find("CLAUDE-INSTRUCTION").unwrap();
+        assert!(outer < local && local < imported && imported < claude);
+        assert_eq!(instructions.matches("LOCAL-INSTRUCTION").count(), 1);
+        assert!(!instructions.contains("@details.md"));
+        assert!(!instructions.contains("OMITTED-BODY"));
+        assert!(instructions.contains("256 KiB file limit"));
+    }
+
+    std::fs::write(project.join("details.md"), "CHANGED-INSTRUCTION\n").unwrap();
+    std::fs::write(project.join("later.md"), "LATER-INSTRUCTION\n").unwrap();
+    std::fs::write(
+        project.join("CLAUDE.md"),
+        "@AGENTS.md\n@details.md\n@later.md\n@omitted.md\nCLAUDE-INSTRUCTION\n",
+    )
+    .unwrap();
+    assert!(snapshot.instructions().contains("IMPORTED-INSTRUCTION"));
+    assert!(!snapshot.instructions().contains("CHANGED-INSTRUCTION"));
+    assert!(!snapshot.instructions().contains("LATER-INSTRUCTION"));
+    let changed =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert!(changed.instructions().contains("CHANGED-INSTRUCTION"));
+    assert!(changed.instructions().contains("LATER-INSTRUCTION"));
+    assert_ne!(
+        snapshot.manifest().full_digest(),
+        changed.manifest().full_digest()
+    );
+    let config = config(Mode::Freudian);
+    let tools = ToolHost::new(&project, &config).unwrap();
+    let changed_harness = Harness::with_tool_host_and_instructions(
+        config,
+        &project,
+        changed.instructions().to_owned(),
+        MemoryStore::temporary().await.unwrap(),
+        provider.clone(),
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    changed_harness
+        .ask(
+            &changed_harness.topology.parts[0].id,
+            vec![kuru_core::Message::text("user", "inspect new graph")],
+            "inspect",
+            vec![],
+        )
+        .await
+        .unwrap();
+    let requests = provider.requests.lock().unwrap();
+    let instructions = &requests.last().unwrap().instructions;
+    assert!(instructions.contains("CHANGED-INSTRUCTION"));
+    assert!(instructions.contains("LATER-INSTRUCTION"));
+    assert!(!instructions.contains("IMPORTED-INSTRUCTION"));
 }
 
 struct OneToolProvider {

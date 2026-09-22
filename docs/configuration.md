@@ -63,13 +63,26 @@ When a command opens memory, fixed progress messages appear on standard error
 while Kuru acquires private ownership, verifies or extracts the bundled runtime,
 and opens the database. They describe work in progress, not an estimate or a
 successful open; JSON and other command results remain on standard output.
-Every ancestor `AGENTS.md`, including the project root, can provide automatic
-project instructions. Kuru captures the present files from outermost to most
-local before workspace review, and local instructions have precedence. The
-reviewed snapshot owns the exact bytes later placed in prompts, so Kuru does not
-reopen those paths after approval. Kuru does not automatically follow arbitrary
-links in instruction files; repositories can put their applicable instructions
-in `AGENTS.md` itself.
+Every ancestor directory through the project root can provide `AGENTS.md` and
+`CLAUDE.md` instructions. Kuru reads outermost directories first, then the
+project root; within one directory it reads `AGENTS.md` before `CLAUDE.md`.
+A standalone line such as `@docs/rules.md` imports a relative Markdown file at
+that position. The import must stay within the directory tree of its original
+top-level instruction file. Checked file opens reject links and path escapes.
+Each physical file is included once, so a sibling `CLAUDE.md` containing
+`@AGENTS.md` does not duplicate the `AGENTS.md` text. Import directives inside
+fenced code remain literal. Missing or invalid imports stop instruction capture
+with a bounded source error.
+
+Each file can contribute at most 256 KiB, with 1 MiB of captured instruction
+content in total, at most 128 checked source paths and eight import edges. A
+source or branch over these caps is omitted whole; Kuru reports the omission
+before inference and in the effective prompt while retaining other usable
+instructions. It does not silently truncate a source. The reviewed snapshot
+owns the exact active bytes and file/directory identities later placed in
+prompts, so Kuru does not reopen those paths after approval. Instructions in
+nested project subdirectories are not activated by this release's automatic
+ancestor/root discovery; on-demand nested activation is a separate follow-on.
 
 Mode, model and effort choices made in the terminal with F2/F3/F4 or the matching
 slash commands are saved immediately. Relaunching from the same canonical directory
@@ -220,7 +233,8 @@ fully show.
 ## Workspace trust
 
 Kuru reviews effective process, mutation, endpoint and prompt authority supplied
-by automatically discovered ancestor `.kuru/config.toml` and `AGENTS.md` files
+by automatically discovered ancestor `.kuru/config.toml`, `AGENTS.md`,
+`CLAUDE.md` and their checked imports
 before activating it. This includes an `AGENTS.md` at the project root and any
 automatic source under your home directory; location alone does not make a file
 an explicit caller input. Kuru has no separate global-instruction source.

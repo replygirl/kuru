@@ -769,6 +769,9 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         managed.as_deref(),
         invocation_overrides(&cli),
     )?;
+    for notice in snapshot.instruction_notices() {
+        eprintln!("{notice}");
+    }
     root.revalidate()
         .context("workspace changed while configuration was being reviewed")?;
     let approval_store = ApprovalStore::new(&data, &root);

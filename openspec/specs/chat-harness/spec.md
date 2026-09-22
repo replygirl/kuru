@@ -418,3 +418,11 @@ Kuru SHALL resolve configuration in the order built-in defaults, managed ordinar
 #### Scenario: Constraint after saved preference
 - **WHEN** a remembered model choice or a CLI override conflicts with managed policy
 - **THEN** configuration fails before constructing a configured provider or reading its credentials.
+
+### Requirement: Runtime uses the reviewed instruction projection
+
+The chat harness SHALL receive the immutable composed instruction projection captured and approved for its invocation, including bounded omission notices and excluding resolved import directives and omitted source bodies. It SHALL NOT reread instruction files after construction or reinterpret imports itself.
+
+#### Scenario: Source replacement after capture
+- **WHEN** an applicable source is replaced after snapshot capture and before an actor request
+- **THEN** that request contains the reviewed captured projection and not bytes from the replacement.

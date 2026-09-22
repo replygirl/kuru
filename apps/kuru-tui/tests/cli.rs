@@ -97,6 +97,61 @@ fn git_fixture(directory: &std::path::Path, args: &[&str]) -> Output {
 }
 
 #[test]
+fn imported_project_instructions_require_exact_workspace_review_before_demo_dispatch() {
+    let env = Sandbox::new();
+    std::fs::create_dir_all(env.project.join("docs")).unwrap();
+    std::fs::write(env.project.join("AGENTS.md"), "AGENT-ONLY\n").unwrap();
+    std::fs::write(env.project.join("docs/rules.md"), "IMPORTED-ONLY\n").unwrap();
+    std::fs::write(
+        env.project.join("CLAUDE.md"),
+        "@AGENTS.md\n@docs/rules.md\nCLAUDE-ONLY\n",
+    )
+    .unwrap();
+    let status = env.success(&["trust", "status"]);
+    assert!(status.contains("3 ordered automatic sources"), "{status}");
+    assert!(status.contains("AGENTS.md"));
+    assert!(status.contains("CLAUDE.md"));
+    assert!(status.contains("rules.md"));
+    let denied = env.run(&["run", "hello"]);
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("workspace authority"));
+    assert!(
+        !env.data.exists(),
+        "preflight must precede memory/provider effects"
+    );
+    let once = env.run(&["--trust-workspace-once", "run", "hello"]);
+    assert!(
+        once.status.success(),
+        "{}",
+        String::from_utf8_lossy(&once.stderr)
+    );
+    env.success(&["trust", "approve", "--yes"]);
+    assert!(env.run(&["run", "hello again"]).status.success());
+    std::fs::write(env.project.join("docs/rules.md"), "CHANGED-IMPORT\n").unwrap();
+    let stale = env.run(&["run", "after change"]);
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("workspace authority"));
+}
+
+#[test]
+fn oversized_instruction_is_reported_before_usable_project_dispatch() {
+    let env = Sandbox::new();
+    std::fs::write(env.project.join("AGENTS.md"), "X".repeat(256 * 1024 + 1)).unwrap();
+    std::fs::write(env.project.join("CLAUDE.md"), "USEFUL-INSTRUCTION\n").unwrap();
+    let status = env.run(&["trust", "status"]);
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("256 KiB file limit"));
+    assert!(String::from_utf8_lossy(&status.stdout).contains("1 ordered automatic source"));
+    let run = env.run(&["--trust-workspace-once", "run", "hello"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stderr).contains("256 KiB file limit"));
+}
+
+#[test]
 fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     let env = Sandbox::new();
     assert!(env.success(&["--help"]).contains("peer"));
