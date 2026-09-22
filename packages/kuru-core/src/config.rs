@@ -458,6 +458,12 @@ pub struct ConfigSnapshot {
     memory: MemoryConfig,
     instructions: String,
     instruction_notices: Vec<String>,
+    instruction_sources: Vec<InstructionSource>,
+    instruction_cache: BTreeMap<PathBuf, Option<CheckedInstruction>>,
+    base_instruction_cache_paths: BTreeSet<PathBuf>,
+    instruction_directories: BTreeSet<PathBuf>,
+    instruction_directory_identities: BTreeMap<PathBuf, [u8; 24]>,
+    base_instruction_paths: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -467,7 +473,7 @@ struct LayerOrigin {
     automatic: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum InstructionSourceKind {
     Agents,
@@ -487,6 +493,7 @@ impl InstructionSourceKind {
 
 #[derive(Debug, Clone)]
 struct InstructionSource {
+    path: PathBuf,
     kind: InstructionSourceKind,
     safe_source: SafeSource,
     path_digest: [u8; 32],
@@ -531,12 +538,18 @@ impl ConfigSnapshot {
         if !workspace.is_dir() {
             return Err(config_error("read", &workspace));
         }
+        let mut instruction_cache = BTreeMap::new();
         let InstructionCapture {
             sources: instruction_sources,
             rendered: instructions,
             notices: instruction_notices,
             ..
-        } = capture_instruction_sources(&workspace)?;
+        } = capture_instruction_sources(&workspace, &[], &mut instruction_cache)?;
+        let base_instruction_paths = instruction_sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect();
+        let base_instruction_cache_paths = instruction_cache.keys().cloned().collect();
         let mut merged =
             toml::Value::try_from(Config::default()).expect("default config serializes");
         let mut origins = BTreeMap::new();
@@ -655,6 +668,12 @@ impl ConfigSnapshot {
             memory: MemoryConfig::default(),
             instructions,
             instruction_notices,
+            instruction_sources: instruction_sources.clone(),
+            instruction_cache,
+            base_instruction_cache_paths,
+            instruction_directories: BTreeSet::new(),
+            instruction_directory_identities: BTreeMap::new(),
+            base_instruction_paths,
         };
         let (value, value_origins) =
             provisional.value_with_preferences(&ProjectPreferences::default())?;
@@ -694,6 +713,176 @@ impl ConfigSnapshot {
     /// Bounded, escaped notices for instruction sources omitted during capture.
     pub fn instruction_notices(&self) -> &[String] {
         &self.instruction_notices
+    }
+
+    /// Derive a new immutable prompt-authority snapshot for checked,
+    /// project-relative target directories. Previously active source bytes and
+    /// identities retain their captured state for this invocation. Directories
+    /// without active nested sources are not retained across tool calls.
+    /// The caller must review the returned manifest before using its prompt.
+    pub fn with_nested_directories(&self, directories: &[PathBuf]) -> Result<(Self, bool)> {
+        ensure!(
+            directories.len() <= 10_000,
+            "nested instruction target set exceeds the 10000-candidate limit"
+        );
+        let root = kuru_platform::fs::Directory::open(
+            &self.workspace,
+            kuru_platform::fs::Privacy::Inherited,
+            kuru_platform::fs::NameRetention::Pinned,
+        )
+        .map_err(|_| instruction_error("path", &self.workspace))?;
+        let mut selected = self.instruction_directories.clone();
+        for relative in directories {
+            ensure!(
+                !relative.is_absolute(),
+                "nested instruction target must be project-relative"
+            );
+            let mut path = self.workspace.clone();
+            for component in relative.components() {
+                match component {
+                    Component::CurDir => continue,
+                    Component::Normal(name) => path.push(name),
+                    _ => return Err(instruction_error("path", relative)),
+                }
+                selected.insert(path.clone());
+            }
+        }
+        for (path, previous) in &self.instruction_directory_identities {
+            let checked = kuru_platform::fs::Directory::open(
+                path,
+                kuru_platform::fs::Privacy::Inherited,
+                kuru_platform::fs::NameRetention::Pinned,
+            )
+            .map_err(|_| instruction_error("path", path))?;
+            ensure!(
+                checked
+                    .is_within(&root)
+                    .map_err(|_| instruction_error("path", path))?
+                    && *previous == checked.identity().to_bytes(),
+                "nested instruction directory changed after capture"
+            );
+        }
+        let mut ordered = selected.iter().cloned().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            left.components()
+                .count()
+                .cmp(&right.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        let mut cache = self.instruction_cache.clone();
+        let capture = capture_instruction_sources(&self.workspace, &ordered, &mut cache)?;
+        let mut active_directories = BTreeSet::new();
+        for source in &capture.sources {
+            let parent = source
+                .path
+                .parent()
+                .ok_or_else(|| instruction_error("path", &source.path))?;
+            let checked = kuru_platform::fs::Directory::open(
+                parent,
+                kuru_platform::fs::Privacy::Inherited,
+                kuru_platform::fs::NameRetention::Pinned,
+            )
+            .map_err(|_| instruction_error("path", parent))?;
+            ensure!(
+                checked.identity().to_bytes() == source.directory_identity,
+                "instruction source directory changed after capture"
+            );
+            if source.kind != InstructionSourceKind::Import
+                && parent.starts_with(&self.workspace)
+                && parent != self.workspace
+            {
+                let relative = parent
+                    .strip_prefix(&self.workspace)
+                    .map_err(|_| instruction_error("path", parent))?;
+                let mut path = self.workspace.clone();
+                for component in relative.components() {
+                    let Component::Normal(name) = component else {
+                        return Err(instruction_error("path", parent));
+                    };
+                    path.push(name);
+                    active_directories.insert(path.clone());
+                }
+            }
+        }
+        let mut directory_identities = BTreeMap::new();
+        for path in &active_directories {
+            let checked = kuru_platform::fs::Directory::open(
+                path,
+                kuru_platform::fs::Privacy::Inherited,
+                kuru_platform::fs::NameRetention::Pinned,
+            )
+            .map_err(|_| instruction_error("path", path))?;
+            ensure!(
+                checked
+                    .is_within(&root)
+                    .map_err(|_| instruction_error("path", path))?,
+                "nested instruction directory escapes the workspace"
+            );
+            directory_identities.insert(path.clone(), checked.identity().to_bytes());
+        }
+        let active_paths = capture
+            .sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect::<BTreeSet<_>>();
+        cache.retain(|path, _| {
+            self.base_instruction_cache_paths.contains(path) || active_paths.contains(path)
+        });
+        let (value, origins) = self.value_with_preferences(&ProjectPreferences::default())?;
+        let config: Config = value
+            .try_into()
+            .map_err(|_| config_error("type", &self.workspace))?;
+        let manifest = derive_manifest(&config, &origins, &capture.sources)?;
+        let new_authority = manifest.full_digest() != self.manifest.full_digest();
+        let mut extended = self.clone();
+        extended.manifest = manifest;
+        extended.instructions = capture.rendered;
+        extended.instruction_notices = capture.notices;
+        extended.instruction_sources = capture.sources;
+        extended.instruction_cache = cache;
+        extended.instruction_directories = active_directories;
+        extended.instruction_directory_identities = directory_identities;
+        Ok((extended, new_authority))
+    }
+
+    /// Recheck the captured nested directory objects before publishing a
+    /// foreground activation. This does not reread or replace captured source
+    /// bytes: later invocations perform their own fresh capture.
+    pub fn revalidate_nested_directories(&self) -> Result<()> {
+        let root = kuru_platform::fs::Directory::open(
+            &self.workspace,
+            kuru_platform::fs::Privacy::Inherited,
+            kuru_platform::fs::NameRetention::Pinned,
+        )
+        .map_err(|_| instruction_error("path", &self.workspace))?;
+        for (path, previous) in &self.instruction_directory_identities {
+            let checked = kuru_platform::fs::Directory::open(
+                path,
+                kuru_platform::fs::Privacy::Inherited,
+                kuru_platform::fs::NameRetention::Pinned,
+            )
+            .map_err(|_| instruction_error("path", path))?;
+            ensure!(
+                checked
+                    .is_within(&root)
+                    .map_err(|_| instruction_error("path", path))?
+                    && checked.identity().to_bytes() == *previous,
+                "nested instruction directory changed after capture"
+            );
+        }
+        Ok(())
+    }
+
+    /// Canonical source-set key for exact nested approval lookup. The complete
+    /// manifest separately binds source bytes, identities and effective config.
+    pub fn nested_instruction_source_paths(&self) -> Vec<[u8; 32]> {
+        self.instruction_sources
+            .iter()
+            .filter(|source| !self.base_instruction_paths.contains(&source.path))
+            .map(|source| source.path_digest)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// Return an active Responses route without loading saved preferences or memory.
@@ -1662,6 +1851,7 @@ struct InstructionCapture {
     additional_omissions: usize,
 }
 
+#[derive(Clone, Debug)]
 struct CheckedInstruction {
     content: Option<String>,
     directory_identity: [u8; 24],
@@ -1703,12 +1893,20 @@ impl InstructionCapture {
         kind: InstructionSourceKind,
         depth: usize,
         optional: bool,
+        cache: &mut BTreeMap<PathBuf, Option<CheckedInstruction>>,
     ) -> Result<()> {
         if optional {
-            match fs::symlink_metadata(&path) {
-                Ok(_) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-                Err(_) => return Err(instruction_error("read", &path)),
+            match cache.get(&path) {
+                Some(None) => return Ok(()),
+                Some(Some(_)) => {}
+                None => match fs::symlink_metadata(&path) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        cache.insert(path, None);
+                        return Ok(());
+                    }
+                    Err(_) => return Err(instruction_error("read", &path)),
+                },
             }
         }
         if self.active_paths.contains(&path) {
@@ -1726,11 +1924,18 @@ impl InstructionCapture {
             self.notice(&path, "128-source graph limit");
             return Ok(());
         }
+        let checked = if let Some(cached) = cache.get(&path) {
+            cached.clone()
+        } else {
+            let checked = read_checked_instruction(&path, optional)?;
+            cache.insert(path.clone(), checked.clone());
+            checked
+        };
         let Some(CheckedInstruction {
             content,
             directory_identity,
             identity,
-        }) = read_checked_instruction(&path, optional)?
+        }) = checked
         else {
             return Ok(());
         };
@@ -1752,6 +1957,7 @@ impl InstructionCapture {
         }
         self.total_bytes += content.len();
         self.sources.push(InstructionSource {
+            path: path.clone(),
             kind,
             path_digest: source_digest(path.as_os_str().as_encoded_bytes()),
             safe_source: safe_source(&path),
@@ -1798,6 +2004,7 @@ impl InstructionCapture {
                     InstructionSourceKind::Import,
                     depth + 1,
                     false,
+                    cache,
                 )?;
                 if self.rendered.len() != before {
                     self.rendered.push_str(&format!(
@@ -1834,7 +2041,11 @@ impl InstructionCapture {
     }
 }
 
-fn capture_instruction_sources(project: &Path) -> Result<InstructionCapture> {
+fn capture_instruction_sources(
+    project: &Path,
+    nested_directories: &[PathBuf],
+    cache: &mut BTreeMap<PathBuf, Option<CheckedInstruction>>,
+) -> Result<InstructionCapture> {
     let mut capture = InstructionCapture::new();
     for directory in ancestor_directories(project)? {
         capture.visit(
@@ -1843,6 +2054,7 @@ fn capture_instruction_sources(project: &Path) -> Result<InstructionCapture> {
             InstructionSourceKind::Agents,
             0,
             true,
+            cache,
         )?;
         capture.visit(
             directory.join("CLAUDE.md"),
@@ -1850,6 +2062,25 @@ fn capture_instruction_sources(project: &Path) -> Result<InstructionCapture> {
             InstructionSourceKind::Claude,
             0,
             true,
+            cache,
+        )?;
+    }
+    for directory in nested_directories {
+        capture.visit(
+            directory.join("AGENTS.md"),
+            directory,
+            InstructionSourceKind::Agents,
+            0,
+            true,
+            cache,
+        )?;
+        capture.visit(
+            directory.join("CLAUDE.md"),
+            directory,
+            InstructionSourceKind::Claude,
+            0,
+            true,
+            cache,
         )?;
     }
     Ok(capture.finish())
@@ -1954,7 +2185,7 @@ fn instruction_error(category: &str, path: &Path) -> anyhow::Error {
 /// Compose captured ancestor instructions and checked imports without review.
 /// Application launches use `ConfigSnapshot` and its workspace trust preflight.
 pub fn load_instructions(project: &Path) -> Result<String> {
-    capture_instruction_sources(project).map(|capture| capture.rendered)
+    capture_instruction_sources(project, &[], &mut BTreeMap::new()).map(|capture| capture.rendered)
 }
 
 #[cfg(test)]

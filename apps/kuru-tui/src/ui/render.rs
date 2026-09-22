@@ -196,7 +196,9 @@ pub fn draw(frame: &mut Frame<'_>, view: &View) {
         area.width.saturating_sub(2),
         rows[3].bottom().saturating_sub(rows[1].y),
     );
-    if view.permission_prompt.is_some() {
+    if view.instruction_prompt.is_some() {
+        draw_instruction_prompt(frame, view, overlay);
+    } else if view.permission_prompt.is_some() {
         draw_permission_prompt(frame, view, overlay);
     } else if view.permission_rows.is_some() {
         draw_permission_inspector(frame, view, overlay);
@@ -954,6 +956,53 @@ fn draw_permission_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
         "1 once · 2/3 unavailable · 4 deny  (also Alt+digit)"
     } else {
         "1 once · 4 deny  (Alt+digit)\nSession/Always unavailable"
+    };
+    frame.render_widget(
+        Paragraph::new(choices).style(bold(AMBER)),
+        Rect::new(
+            inner.x,
+            inner.bottom().saturating_sub(choices_height),
+            inner.width,
+            choices_height,
+        ),
+    );
+}
+
+fn draw_instruction_prompt(frame: &mut Frame<'_>, view: &View, area: Rect) {
+    let Some(prompt) = &view.instruction_prompt else {
+        return;
+    };
+    if area.width < 8 || area.height < 5 {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let title = "Workspace instruction review · ↑↓ claims";
+    let inner = panel(title, AMBER).inner(area);
+    frame.render_widget(panel(title, AMBER), area);
+    if inner.height < 2 {
+        return;
+    }
+    let choices_height = if inner.width >= 48 { 1 } else { 2 };
+    let body = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(choices_height),
+    );
+    frame.render_widget(
+        Paragraph::new(prompt.display.as_str())
+            .wrap(Wrap { trim: false })
+            .scroll((prompt.scroll, 0)),
+        body,
+    );
+    let choices = if !prompt.persistent_allowed && choices_height == 1 {
+        "1 once · 2 persistent unavailable · 3 deny"
+    } else if !prompt.persistent_allowed {
+        "1 continue once · 3 deny\nPersistent approval unavailable"
+    } else if choices_height == 1 {
+        "1 continue once · 2 approve complete manifest · 3 deny"
+    } else {
+        "1 continue once · 2 approve complete manifest\n3 deny"
     };
     frame.render_widget(
         Paragraph::new(choices).style(bold(AMBER)),
