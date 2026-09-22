@@ -111,8 +111,10 @@ mod tests {
             let _gate = crate::spawn_gate::spawning().await;
             MemoryStore::temporary().await.unwrap()
         };
+        let shutdown = store.clone();
         let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
-        let directory = format!("{:?}", store.status().await.unwrap().directory);
+        let cleanup_directory = store.status().await.unwrap().directory;
+        let directory = format!("{cleanup_directory:?}");
         assert!(notice.text().contains(&directory));
         for control in [
             "kuru memory notes ID",
@@ -159,6 +161,8 @@ mod tests {
             .err()
             .expect("malformed state");
         assert!(format!("{error:#}").contains("numeric version"));
+        shutdown.close().await.unwrap();
+        assert!(!cleanup_directory.exists());
     }
 
     #[tokio::test]
@@ -169,6 +173,8 @@ mod tests {
                 let _gate = crate::spawn_gate::spawning().await;
                 MemoryStore::temporary().await.unwrap()
             };
+            let shutdown = store.clone();
+            let cleanup_directory = store.status().await.unwrap().directory;
             let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
             let error = notice
                 .announce_to(&mut FailingNoticeWriter { fail_flush })
@@ -176,6 +182,8 @@ mod tests {
                 .unwrap_err();
             assert!(format!("{error:#}").contains("notice"));
             assert!(MemoryNotice::pending(store).await.unwrap().is_some());
+            shutdown.close().await.unwrap();
+            assert!(!cleanup_directory.exists());
         }
     }
 }
