@@ -48,6 +48,256 @@ fn defaults_are_usable_and_preserve_explicit_permission_boundaries() {
 }
 
 #[test]
+fn managed_defaults_and_exact_locks_cover_budget_rules_and_alias_tables() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let managed = dir.path().join("managed.toml");
+    write(
+        &managed,
+        "[defaults]\nmodel='managed-default'\n[constraints]\nmax_tool_calls=4\npermissions=[]\n[constraints.mcp.service]\ncommand='fixed-runner'",
+    );
+    write(project.join(".kuru/config.toml"), "model='project-model'");
+    let snapshot = ConfigSnapshot::parse_with_layers(
+        None,
+        &project,
+        None,
+        None,
+        Some(&managed),
+        InvocationOverrides {
+            typed_config: vec![
+                "max_tool_calls=4".into(),
+                "mcp.service={command='fixed-runner'}".into(),
+            ],
+            ..InvocationOverrides::default()
+        },
+    )
+    .unwrap();
+    let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
+    assert_eq!(config.model, "project-model");
+    assert_eq!(config.max_tool_calls, 4);
+    assert_eq!(
+        config.mcp["service"].command.as_deref(),
+        Some("fixed-runner")
+    );
+    for assignment in [
+        "max_tool_calls=5",
+        "mcp.service={command='different-runner'}",
+        "permissions=[{action='deny',selector={kind='native',name='shell'}}]",
+    ] {
+        let failure = ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides {
+                typed_config: vec![assignment.into()],
+                ..InvocationOverrides::default()
+            },
+        );
+        assert!(failure.is_err(), "{assignment}");
+        assert!(
+            !failure
+                .unwrap_err()
+                .to_string()
+                .contains("different-runner")
+        );
+    }
+}
+
+#[test]
+fn managed_locks_reject_project_local_and_saved_conflicts() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let managed = dir.path().join("managed.toml");
+    write(
+        &managed,
+        "[defaults.mcp.named_service]\ncommand='fixed-runner'\n[constraints]\nallow_write=false\nmode='ifs'\n[constraints.mcp.named_service]\ncommand='fixed-runner'",
+    );
+    write(project.join(".kuru/config.toml"), "allow_write=true");
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+    write(
+        project.join(".kuru/config.toml"),
+        "allow_write=false\n[mcp.named_service]\nargs=['new']",
+    );
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+    write(project.join(".kuru/config.toml"), "allow_write=false");
+    let local = project.join(".kuru/config.local.toml");
+    let local_text = "allow_write=true";
+    write(&local, local_text);
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            Some((&local, local_text)),
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+    let snapshot = ConfigSnapshot::parse_with_layers(
+        None,
+        &project,
+        None,
+        None,
+        Some(&managed),
+        InvocationOverrides::default(),
+    )
+    .unwrap();
+    assert!(
+        snapshot
+            .finalize(&ProjectPreferences {
+                mode: Some(Mode::Freudian),
+                ..ProjectPreferences::default()
+            })
+            .is_err()
+    );
+    snapshot.finalize(&ProjectPreferences::default()).unwrap();
+
+    write(&managed, "[constraints.mcp]");
+    write(
+        project.join(".kuru/config.toml"),
+        "[mcp.worker]\ncommand='repo-runner'",
+    );
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+
+    write(
+        &managed,
+        "[constraints.external_agents]\nprimary='https://example.test/primary'",
+    );
+    write(
+        project.join(".kuru/config.toml"),
+        "[external_agents]\nprimary='https://example.test/primary'\nsecondary='https://example.test/secondary'",
+    );
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_ok()
+    );
+    write(
+        project.join(".kuru/config.toml"),
+        "[external_agents]\nprimary='https://example.test/changed'",
+    );
+    assert!(
+        ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn local_and_typed_overrides_keep_remaining_automatic_claims() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    write(
+        project.join(".kuru/config.toml"),
+        "allow_shell=true\n[mcp.worker]\ncommand='repo-runner'",
+    );
+    let local = project.join(".kuru/config.local.toml");
+    write(&local, "allow_shell=false\nmode='freudian'");
+    let snapshot = ConfigSnapshot::parse_with_layers(
+        None,
+        &project,
+        Some((&local, "allow_shell=false\nmode='freudian'")),
+        None,
+        None,
+        InvocationOverrides {
+            typed_config: vec!["max_rounds=4".into()],
+            ..InvocationOverrides::default()
+        },
+    )
+    .unwrap();
+    let claims = snapshot.manifest().claims();
+    assert!(
+        claims
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::McpStdio)
+    );
+    assert!(
+        !claims
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::Shell)
+    );
+    let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
+    assert_eq!(config.mode, Mode::Freudian);
+    assert_eq!(config.max_rounds, 4);
+    assert!(!config.allow_shell);
+
+    let dedicated = ConfigSnapshot::parse_with_layers(
+        None,
+        &project,
+        Some((&local, "allow_shell=false\nmode='freudian'")),
+        None,
+        None,
+        InvocationOverrides {
+            typed_config: vec!["allow_shell=false".into()],
+            allow_shell: true,
+            ..InvocationOverrides::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        dedicated
+            .finalize(&ProjectPreferences::default())
+            .unwrap()
+            .allow_shell
+    );
+    assert!(
+        !dedicated
+            .manifest()
+            .claims()
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::Shell)
+    );
+}
+
+#[test]
 fn snapshot_keeps_only_effective_ancestor_authority_and_redacts_inspection() {
     let dir = TempDir::new().unwrap();
     let project = dir.path().join("project");

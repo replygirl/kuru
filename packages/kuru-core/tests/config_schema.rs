@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use kuru_core::Config;
+use kuru_core::{Config, ConfigSnapshot, InvocationOverrides};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -8,6 +8,22 @@ const SCHEMA: &str = include_str!("../../../apps/kuru-docs/public/configuration.
 
 fn schema() -> jsonschema::Validator {
     jsonschema::validator_for(&serde_json::from_str(SCHEMA).unwrap()).unwrap()
+}
+
+fn managed_schema() -> jsonschema::Validator {
+    let mut schema: Value = serde_json::from_str(SCHEMA).unwrap();
+    let properties = schema["properties"].clone();
+    schema["$defs"]["configValues"] = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+    });
+    let root = schema.as_object_mut().unwrap();
+    root.remove("properties");
+    root.remove("additionalProperties");
+    root.remove("type");
+    root.insert("$ref".into(), "#/$defs/managed".into());
+    jsonschema::validator_for(&schema).unwrap()
 }
 
 fn json_from_toml(text: &str) -> Value {
@@ -35,6 +51,38 @@ fn published_schema_accepts_defaults_and_documented_configuration() {
     let value = json_from_toml(example);
     assert!(validator.is_valid(&value));
     parse_config(example).unwrap();
+}
+
+#[test]
+fn managed_schema_and_native_parser_accept_typed_locks_and_reject_unknown_keys() {
+    let validator = managed_schema();
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let managed = dir.path().join("managed.toml");
+    for (text, accepted) in [
+        (
+            "[defaults]\nmax_rounds=4\n[constraints]\nallow_shell=false\nmax_tool_calls=12\npermissions=[]",
+            true,
+        ),
+        ("[constraints]\nunknown_rule=true", false),
+        ("[constraints]\nmax_tool_calls='wrong'", false),
+        ("[defaults.memory]\nstartup_timeout_secs=0", false),
+    ] {
+        write(&managed, text);
+        let valid_schema = validator.is_valid(&json_from_toml(text));
+        let valid_native = ConfigSnapshot::parse_with_layers(
+            None,
+            &project,
+            None,
+            None,
+            Some(&managed),
+            InvocationOverrides::default(),
+        )
+        .is_ok();
+        assert_eq!(valid_schema, accepted, "schema: {text}");
+        assert_eq!(valid_native, accepted, "native: {text}");
+    }
 }
 
 #[test]

@@ -1,8 +1,10 @@
 # Configuration
 
-Kuru uses typed TOML. Layers merge in this order: built-in defaults, user defaults,
-ancestor `.kuru/config.toml` files from outermost to innermost directory, remembered
-interactive choices for the project, an explicit `--config` file, and CLI flags.
+Kuru uses typed TOML. Layers merge in this order: built-in defaults, externally
+provisioned managed defaults, user defaults, ancestor `.kuru/config.toml` files
+from outermost to innermost directory, remembered interactive choices for the
+project, `.kuru/config.local.toml` at the exact project root, an explicit
+`--config` file, repeatable `-c key=value` values, and dedicated CLI flags.
 Later values win; tables merge recursively and arrays
 replace. Unknown keys, invalid types, unsupported provider names and invalid
 bounds fail with context. Each configuration file is bounded to 256 KiB and the
@@ -21,8 +23,41 @@ memory. It prints an omission notice on stderr. User defaults are read from
 `$XDG_CONFIG_HOME/kuru/config.toml` when set. Otherwise, Kuru uses
 `~/.config/kuru/config.toml` on macOS/Linux or
 `$env:APPDATA\kuru\config.toml` on Windows. Windows also falls back to
-`$env:USERPROFILE\AppData\Roaming` when `APPDATA` is unset. `--config` selects the
-final local layer. CLI flags take precedence over file values.
+`$env:USERPROFILE\AppData\Roaming` when `APPDATA` is unset. `--config` selects an
+explicit local layer. `-c` accepts TOML values such as `-c max_rounds=4` or
+`-c memory.offline=true`; unknown keys and incorrect types are errors. Dedicated
+CLI flags take final precedence over `-c` and file values.
+
+Kuru automatically reads `.kuru/config.local.toml` only from the canonical `-C`
+directory. It must be a checked regular file and, inside a Git worktree, absent
+from Git's index. A tracked local file is rejected. If Git cannot establish its
+untracked status, use `--config PATH` explicitly; normal operation does not
+require Git when this optional file is absent. Local values are user authority
+outside the repository trust manifest, but they do not approve remaining
+repository-supplied tool, provider or instruction authority.
+
+An administrator or launcher may set `KURU_MANAGED_CONFIG` to an absolute TOML
+path outside the workspace. Its `[defaults]` table uses ordinary configuration
+keys at the lowest file precedence. Its `[constraints]` table locks supported
+configuration values exactly, after all saved choices and overrides. Arrays
+such as `permissions` and each named MCP server table lock as a whole;
+external-agent endpoints lock by alias and allow other aliases. An empty
+managed table locks that table as empty. A conflict
+fails before the affected provider or tool activates; Kuru never substitutes a
+different value silently. For example:
+
+```toml
+[defaults]
+max_rounds = 4
+[constraints]
+allow_shell = false
+max_tool_calls = 12
+permissions = []
+```
+
+The managed document shape is published at
+`configuration.v1.schema.json#/$defs/managed`. Native parsing and semantic
+validation remain authoritative.
 
 When a command opens memory, fixed progress messages appear on standard error
 while Kuru acquires private ownership, verifies or extracts the bundled runtime,
@@ -180,9 +215,11 @@ automatic source under your home directory; location alone does not make a file
 an explicit caller input. Kuru has no separate global-instruction source.
 The trust subject is the exact canonical `-C` directory and its current native
 directory identity. Approval does not inherit to parent or child directories.
-User defaults, an explicit `--config` file and CLI flags are deliberate caller
-inputs; an effective value supplied by one of those layers does not require
-workspace approval.
+User defaults, managed policy, the untracked project-local file, an explicit
+`--config` file and CLI flags are deliberate caller inputs; an effective value
+supplied by one of those layers does not require workspace approval. A later
+explicit value can disable repository authority that is no longer effective;
+it cannot reclassify a remaining repository-origin claim.
 
 ```sh
 kuru -C /path/to/project trust status

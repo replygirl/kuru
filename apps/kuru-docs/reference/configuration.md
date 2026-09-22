@@ -7,13 +7,32 @@ Kuru uses typed TOML. Run `kuru config` to inspect configured values and CLI ove
 Later layers take precedence:
 
 1. Built-in defaults.
-2. User defaults at `$XDG_CONFIG_HOME/kuru/config.toml` when set; otherwise `~/.config/kuru/config.toml` on macOS/Linux or `$env:APPDATA\kuru\config.toml` on Windows.
-3. Ancestor `.kuru/config.toml` files, from outermost to nearest directory.
-4. Remembered interactive choices for the project.
-5. An explicit `--config PATH` file.
-6. Command-line flags.
+2. Externally provisioned managed defaults from `KURU_MANAGED_CONFIG`.
+3. User defaults at `$XDG_CONFIG_HOME/kuru/config.toml` when set; otherwise `~/.config/kuru/config.toml` on macOS/Linux or `$env:APPDATA\kuru\config.toml` on Windows.
+4. Ancestor `.kuru/config.toml` files, from outermost to nearest directory.
+5. Remembered interactive choices for the project.
+6. Untracked `.kuru/config.local.toml` at the canonical project root.
+7. An explicit `--config PATH` file.
+8. Repeatable typed `-c key=value` values.
+9. Dedicated command-line flags.
 
 Tables merge recursively; arrays replace earlier arrays. Each configuration file is limited to 256 KiB, and combined input to 1 MiB.
+
+The automatic local file must be a checked regular file and, inside a Git
+worktree, absent from Git's index. Tracked files are rejected. If Git cannot
+establish untracked status, use explicit `--config PATH`; ordinary Kuru use
+does not require Git when the optional local file is absent. `-c` accepts TOML
+values, for example `-c max_rounds=4 -c memory.offline=true`, and rejects
+unknown keys or invalid types.
+
+`KURU_MANAGED_CONFIG` must identify an absolute file outside the workspace.
+Its `[defaults]` table uses ordinary keys as lower-priority preferences. Its
+`[constraints]` table locks schema-valid values exactly after saved choices,
+local files and CLI overrides; arrays and each named MCP server table lock
+atomically. An external-agent endpoint locks by alias, so other aliases may be
+added. An empty managed table locks that table as empty. A
+conflict is an error before the affected authority activates. See the
+[managed schema](/configuration.v1.schema.json#/$defs/managed).
 
 [Configuration Schema v1](/configuration.v1.schema.json) describes the
 JSON-equivalent structure for editor and tooling support. Kuru's TOML parser and
@@ -25,7 +44,7 @@ Ancestor `AGENTS.md` files provide project instructions, with nearer files takin
 
 ## Workspace trust
 
-Kuru reviews effective process, mutation, executable, credential-route, and endpoint authority supplied by automatic ancestor `.kuru/config.toml` files before activation. The trust subject is the exact canonical `-C` directory and its current native identity; approval does not cover a parent, child, or replacement directory. User defaults, explicit `--config`, and CLI flags are deliberate inputs and authorize their own effective values.
+Kuru reviews effective process, mutation, executable, credential-route, and endpoint authority supplied by automatic ancestor `.kuru/config.toml` files before activation. The trust subject is the exact canonical `-C` directory and its current native identity; approval does not cover a parent, child, or replacement directory. User defaults, externally managed policy, an untracked project-local file, explicit `--config`, and CLI flags are deliberate inputs and authorize their own effective values. They do not approve any remaining repository-origin claims.
 
 ```sh
 kuru -C /path/to/project trust status
