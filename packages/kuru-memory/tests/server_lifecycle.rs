@@ -266,10 +266,11 @@ async fn writable_open_waits_for_a_cold_reader_then_owns_its_lifetime() -> Resul
     .await?;
     let mut pending = Box::pin(Server::open(opts.clone()));
     let early = tokio::time::timeout(Duration::from_millis(150), pending.as_mut()).await;
-    // Close the cold reader before any assertion, even on the old attach path.
-    reader.close().await?;
     let writer = match early {
         Ok(result) => {
+            // Close the cold reader before any assertion, even on the old
+            // attach path.
+            reader.close().await?;
             let diagnostic = format!("{result:?}");
             if let Ok(writer) = result {
                 writer.close().await?;
@@ -278,7 +279,15 @@ async fn writable_open_waits_for_a_cold_reader_then_owns_its_lifetime() -> Resul
                 "writable open completed while a cold reader still owned the server: {diagnostic}"
             );
         }
-        Err(_) => pending.await?,
+        Err(_) => {
+            // Keep polling the already-started writer while the reader's
+            // supervisor reaps. Its parent-side readiness deadline is live
+            // throughout predecessor cleanup and must observe the successor's
+            // response instead of being left dormant until after the deadline.
+            let (closed, writer) = tokio::join!(reader.close(), pending);
+            closed?;
+            writer?
+        }
     };
     let pool = writer.pool("main").await?;
     sqlx::query("CREATE TABLE writer_lifetime (id INT PRIMARY KEY)")
