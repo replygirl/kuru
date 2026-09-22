@@ -19,6 +19,8 @@ A [`[[permissions]]` rule](./configuration#tool-permissions) can `allow`, `ask`,
 | ------------- | -------------------------------- | -------------------------------- |
 | `file_read`   | `path`                           | Always allowed (project read)    |
 | `file_list`   | `path`                           | Always allowed (project listing) |
+| `grep`        | `pattern`, optional `path`       | Per-candidate project read       |
+| `glob`        | `pattern`, optional `path`       | Per-candidate project discovery  |
 | `file_write`  | `path`, `content`                | `allow_write` → ask              |
 | `file_delete` | `path`                           | `allow_write` → ask              |
 | `shell`       | `command`, optional `timeout_ms` | `allow_shell` → ask              |
@@ -36,6 +38,21 @@ kuru --allow-write tool file_write \
 `web_fetch` retrieves a UTF-8 document from a public HTTP(S) address only after the normal permission decision. It rejects URLs with credentials and rechecks every connection and redirect target, refusing loopback, private, link-local, multicast, unspecified, IPv4-mapped IPv6, carrier-grade NAT, and other special-purpose destinations. It follows at most five redirects, uses a 20-second operation deadline, accepts at most 2 MiB of response bytes, and returns at most 64 KiB. Its result records total `body_bytes`, retained `content_bytes`, `truncated`, and `untrusted: true`. Proxy, provider, and MCP credentials or headers are never forwarded.
 
 Fetched text is untrusted tool data. It can inform the current response but cannot add instructions, change workspace trust, widen permissions, or authorize later tool calls. Kuru currently refuses compressed content rather than accepting an unbounded decompressor.
+
+## Concurrent independent reads
+
+If a provider proposes several independent reads that are already authorized,
+Kuru can run `file_read`, `file_list`, `grep`, `glob`, and `web_fetch` calls
+concurrently up to `max_parallel`. Permission and nested-instruction admission
+still happen for each call in provider order. Progress can finish in a different
+order, while the provider receives the final tool results in its original call
+order and with the original call IDs.
+
+A fresh approval or newly discovered instruction boundary stays on the normal
+foreground path before later calls continue. File mutations, shell, MCP, skill
+activation, cognition, and unknown tools remain serial. Kuru rechecks the
+workspace, exact target, permission, and instruction scope before each read; a
+change refuses that call instead of exposing data under stale authority.
 
 ## File boundaries
 

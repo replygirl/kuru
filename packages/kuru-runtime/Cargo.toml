@@ -20,6 +20,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+kuru-connectors = { workspace = true, features = ["test-support"] }
 kuru-memory = { workspace = true, features = ["test-support"] }
 kuru-platform.workspace = true
 async-trait.workspace = true

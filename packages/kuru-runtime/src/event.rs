@@ -144,6 +144,7 @@ pub enum Event {
     },
     ToolStarted {
         actor: String,
+        call_id: String,
         name: String,
     },
     ToolSettled {
@@ -281,8 +282,9 @@ impl Event {
                 actor,
                 identity_kind: project_detail(identity_kind),
             },
-            Self::ToolStarted { name, .. } => Self::ToolStarted {
+            Self::ToolStarted { call_id, name, .. } => Self::ToolStarted {
                 actor,
+                call_id: project_detail(call_id),
                 name: project_detail(name),
             },
             Self::ToolSettled { observation, .. } => Self::ToolSettled {
@@ -373,6 +375,7 @@ impl Event {
             },
             "tool" => Self::ToolStarted {
                 actor,
+                call_id: String::new(),
                 name: detail,
             },
             "mcp" => Self::Mcp { actor, detail },
@@ -592,6 +595,23 @@ mod tests {
         assert_eq!(wire["kind"], "speaker-selection");
         assert_eq!(wire["actor"], "part");
         assert_eq!(wire["detail"], "caller-target");
+
+        let started = Event::ToolStarted {
+            actor: "part".into(),
+            call_id: "provider-call-7".into(),
+            name: "file_read".into(),
+        }
+        .projected();
+        assert!(matches!(
+            &started,
+            Event::ToolStarted { call_id, .. } if call_id == "provider-call-7"
+        ));
+        let wire = serde_json::to_value(started).unwrap();
+        assert_eq!(wire.as_object().unwrap().len(), 3);
+        assert_eq!(wire["kind"], "tool");
+        assert_eq!(wire["actor"], "part");
+        assert_eq!(wire["detail"], "file_read");
+        assert!(!wire.to_string().contains("provider-call-7"));
     }
 
     #[test]

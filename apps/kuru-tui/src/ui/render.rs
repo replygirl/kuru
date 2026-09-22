@@ -237,7 +237,13 @@ fn draw_preview(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let activity = view
         .calling_tool
         .last()
-        .map(|(_, name)| format!("Calling {name}"))
+        .map(|(_, _, name)| {
+            if view.calling_tool.len() == 1 {
+                format!("Calling {name}")
+            } else {
+                format!("Calling {name} · {} active", view.calling_tool.len())
+            }
+        })
         .unwrap_or_else(|| preview.activity.clone());
     if !activity.is_empty() {
         let prefix = if view.calling_tool.is_empty() && preview.activity_truncated {
