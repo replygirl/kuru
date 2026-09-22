@@ -695,7 +695,10 @@ pub async fn run() -> Result<()> {
 
 /// Binary-only entrypoint. Library callers remain subscriber-neutral.
 pub async fn run_with_diagnostics() -> Result<()> {
-    execute_inner(Cli::parse(), true).await
+    let future = execute_inner(Cli::parse(), true);
+    #[cfg(windows)]
+    windows_shell_stack_size("cli-inner-future-bytes", std::mem::size_of_val(&future));
+    future.await
 }
 
 pub async fn execute(cli: Cli) -> Result<()> {
@@ -712,6 +715,19 @@ fn windows_shell_stack_stage(stage: &'static str) {
             .open(path)
     {
         let _ = writeln!(file, "{stage}");
+    }
+}
+
+#[cfg(windows)]
+fn windows_shell_stack_size(stage: &'static str, bytes: usize) {
+    if cfg!(debug_assertions)
+        && let Some(path) = std::env::var_os("KURU_WINDOWS_SHELL_STACK_STAGE")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = writeln!(file, "{stage}={bytes}");
     }
 }
 
@@ -1035,7 +1051,12 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                     let arguments = serde_json::from_str(args)?;
                     let catalog = host.catalog().await?;
                     report_mcp_statuses(catalog.mcp());
-                    let output = host.execute(name, arguments).await;
+                    let future = host.execute(name, arguments);
+                    #[cfg(windows)]
+                    if name == "shell" {
+                        windows_shell_stack_size("host-execute-future-bytes", std::mem::size_of_val(&future));
+                    }
+                    let output = future.await;
                     #[cfg(windows)]
                     if name == "shell" {
                         windows_shell_stack_stage("cli-tool-returned");

@@ -92,6 +92,19 @@ fn windows_shell_stack_stage(stage: &'static str) {
 }
 
 #[cfg(windows)]
+fn windows_shell_stack_size(stage: &'static str, bytes: usize) {
+    if cfg!(debug_assertions)
+        && let Some(path) = std::env::var_os("KURU_WINDOWS_SHELL_STACK_STAGE")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = writeln!(file, "{stage}={bytes}");
+    }
+}
+
+#[cfg(windows)]
 const WINDOWS_SHELL_ENVIRONMENT: &[&str] = &[
     "PATH",
     "HOME",
@@ -1471,7 +1484,9 @@ async fn shell(
     command: &str,
     duration: Duration,
 ) -> Result<String> {
-    let result = shell_inner(root_guard, root, command, duration).await;
+    let future = shell_inner(root_guard, root, command, duration);
+    windows_shell_stack_size("shell-inner-future-bytes", std::mem::size_of_val(&future));
+    let result = future.await;
     match result {
         Err(error) if error.downcast_ref::<ProjectedShellDiagnostic>().is_some() => Err(error),
         Err(_) => Err(shell_failure(
@@ -1508,6 +1523,7 @@ async fn shell_inner(
     command: &str,
     duration: Duration,
 ) -> Result<String> {
+    windows_shell_stack_stage("shell-inner-entered");
     use base64::Engine;
     use kuru_platform::windows::process::{
         Stdio, configured_command, system_directory, wait_process_handle,
@@ -1583,15 +1599,20 @@ async fn shell_inner(
         .spawn()
         .await
         .context("cannot start Windows PowerShell")?;
+    windows_shell_stack_stage("shell-child-started");
     let mut stdout = child.take_stdout().context("missing shell stdout")?;
     let mut stderr = child.take_stderr().context("missing shell stderr")?;
     let mut out = ShellCapture::new();
     let mut err = ShellCapture::new();
     let operation = async {
+        windows_shell_stack_stage("shell-stream-read-started");
         tokio::try_join!(out.read(&mut stdout), err.read(&mut stderr))?;
+        windows_shell_stack_stage("shell-streams-read");
         out.finish()?;
         err.finish()?;
+        windows_shell_stack_stage("shell-capture-finished");
         let status = child.wait(duration).await?;
+        windows_shell_stack_stage("shell-child-waited");
         Ok::<_, anyhow::Error>(status)
     };
     let result = match timeout(duration, operation).await {
@@ -1599,6 +1620,7 @@ async fn shell_inner(
         Ok(Ok(status)) => Ok(status),
         Ok(Err(_)) => Err(ShellFailureCategory::CaptureFailed),
     };
+    windows_shell_stack_stage("shell-operation-settled");
     let mut cleanup_unconfirmed = false;
     let result = match result {
         Ok(status) => Ok(status),
@@ -1631,15 +1653,18 @@ async fn shell_inner(
         }
     };
     let cleanup = async {
+        windows_shell_stack_stage("shell-stream-close-started");
         let (out, err) = tokio::join!(
             stdout.close(Duration::from_secs(5)),
             stderr.close(Duration::from_secs(5)),
         );
+        windows_shell_stack_stage("shell-stream-close-joined");
         out?;
         err?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    windows_shell_stack_stage("shell-cleanup-settled");
     match result {
         Ok(status) => {
             cleanup?;
