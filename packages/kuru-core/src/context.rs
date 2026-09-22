@@ -1,8 +1,8 @@
 //! Non-content measurements for an estimated per-request context fit.
 //!
-//! The byte-derived estimate is deliberately labelled: it is not a tokenizer
-//! or an upper bound on provider tokens. Serialized transport limits remain a
-//! separate connector check.
+//! Estimates are deliberately labelled: a local tokenizer does not know the
+//! provider's full envelope, and bytes are not an upper bound on provider
+//! tokens. Serialized transport limits remain a separate connector check.
 
 use std::fmt;
 
@@ -122,10 +122,33 @@ pub struct ContextEstimate {
     pub budget: ContextBudget,
     pub final_body_bytes: u64,
     pub estimated_input_tokens: u64,
+    #[serde(default)]
+    pub sizing: ContextSizing,
     /// Native pending input/output and matching receipts cannot be sliced to
     /// make this request fit.
     pub native_continuation_mandatory: bool,
     pub sources: Vec<ContextSourceSize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSizing {
+    #[default]
+    LegacyByteEstimate,
+    ConservativeByteFallback,
+    O200kBaseEstimate,
+    MixedNativeEstimate,
+}
+
+impl ContextSizing {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LegacyByteEstimate => "byte estimate",
+            Self::ConservativeByteFallback => "byte fallback",
+            Self::O200kBaseEstimate => "o200k estimate",
+            Self::MixedNativeEstimate => "mixed native estimate",
+        }
+    }
 }
 
 impl ContextEstimate {
@@ -141,6 +164,25 @@ impl ContextEstimate {
             budget,
             final_body_bytes,
             estimated_input_tokens: estimated_tokens_for_bytes(final_body_bytes),
+            sizing: ContextSizing::LegacyByteEstimate,
+            native_continuation_mandatory,
+            sources,
+        }
+    }
+
+    pub fn from_measured_final_body(
+        budget: ContextBudget,
+        final_body_bytes: u64,
+        estimated_input_tokens: u64,
+        sizing: ContextSizing,
+        native_continuation_mandatory: bool,
+        sources: Vec<ContextSourceSize>,
+    ) -> Self {
+        Self {
+            budget,
+            final_body_bytes,
+            estimated_input_tokens,
+            sizing,
             native_continuation_mandatory,
             sources,
         }

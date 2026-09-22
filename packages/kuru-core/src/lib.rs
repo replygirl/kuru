@@ -23,14 +23,17 @@ pub use config::{
     SelectionOverrides, load_instructions,
 };
 pub use context::{
-    ContextBudget, ContextEstimate, ContextSourceKind, ContextSourceSize, ContextTooLarge,
-    DEFAULT_OUTPUT_RESERVE_TOKENS, MAX_CONFIGURED_OUTPUT_RESERVE_TOKENS,
+    ContextBudget, ContextEstimate, ContextSizing, ContextSourceKind, ContextSourceSize,
+    ContextTooLarge, DEFAULT_OUTPUT_RESERVE_TOKENS, MAX_CONFIGURED_OUTPUT_RESERVE_TOKENS,
     estimated_tokens_for_bytes,
 };
 pub use framework::{
     Framework, Mode, Part, Relationship, RelationshipKind, canonical_peer_instruction,
 };
-pub use model_catalog::{ModelCatalog, ModelRoute, advertised_metadata, enrich_model};
+pub use model_catalog::{
+    ModelCatalog, ModelRoute, TokenizerEncoding, advertised_metadata, enrich_model,
+    tokenizer_for_model,
+};
 pub use permissions::{
     NativeTool, PermissionAction, PermissionRule, PermissionSelector, ProjectRelativeTarget,
 };

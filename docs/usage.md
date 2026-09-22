@@ -82,8 +82,12 @@ an API-equivalent estimate is a comparison with API prices, not a bill or a
 measure of remaining subscription quota.
 
 The context indicator describes one request, preferring the facing speaker when
-available. It is not a shared context window for the whole pool. Token estimates,
-assumed window limits and omitted history are labelled. The composer keeps a
+available. It is not a shared context window for the whole pool. Token estimates
+name whether they use local `o200k` tokenization or a byte fallback; neither is
+an exact provider count. Matching common prompt prefixes do not establish a cache
+hit. Only a provider's reported cached-input tokens count as observed cache use,
+and an absent report remains unknown. Assumed window limits and omitted history
+are labelled. The composer keeps a
 standing row with that context estimate and the session cost estimate, beside the
 model, effort, framework and permission controls, so one frame carries all six.
 Its figures are the ones `/cost` and `/permissions` report. Earlier conversation
@@ -251,3 +255,6 @@ output item's ID, kind, position and text length, never its text. It does not en
 `RUST_LOG`, capture prompts, tool arguments/results, credentials, or remote error
 text, and it does not change command stdout or TUI rendering. These files are
 operational diagnostics, not conversation history or semantic turn events.
+For native provider requests, debug records pair the local input-token estimate
+and final body byte length with the provider's reported input and cached subset;
+they do not record the request body or imply that a matching prefix was cached.

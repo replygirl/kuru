@@ -20,6 +20,7 @@
     {
       "route": "open-ai-responses",
       "model_id": "gpt-5.6-sol",
+      "tokenizer": {"encoding": "o200k_base", "source": {"url": "https://github.com/openai/tiktoken/blob/212b893ba940cba53476851103d2e5c1d0020c6e/tiktoken/model.py", "checked_on": "2026-09-22"}},
       "context_window_tokens": 1050000,
       "max_output_tokens": 128000,
       "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol", "checked_on": "2026-09-16"},
@@ -37,6 +38,7 @@
     {
       "route": "open-ai-responses",
       "model_id": "gpt-5.6-terra",
+      "tokenizer": {"encoding": "o200k_base", "source": {"url": "https://github.com/openai/tiktoken/blob/212b893ba940cba53476851103d2e5c1d0020c6e/tiktoken/model.py", "checked_on": "2026-09-22"}},
       "context_window_tokens": 1050000,
       "max_output_tokens": 128000,
       "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra", "checked_on": "2026-09-16"},
@@ -53,6 +55,7 @@
     {
       "route": "open-ai-responses",
       "model_id": "gpt-5.6-luna",
+      "tokenizer": {"encoding": "o200k_base", "source": {"url": "https://github.com/openai/tiktoken/blob/212b893ba940cba53476851103d2e5c1d0020c6e/tiktoken/model.py", "checked_on": "2026-09-22"}},
       "context_window_tokens": 1050000,
       "max_output_tokens": 128000,
       "source": {"url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna", "checked_on": "2026-09-16"},
@@ -85,6 +88,7 @@
     {
       "route": "codex-subscription",
       "model_id": "gpt-5.6-sol",
+      "tokenizer": {"encoding": "o200k_base", "source": {"url": "https://github.com/openai/tiktoken/blob/212b893ba940cba53476851103d2e5c1d0020c6e/tiktoken/model.py", "checked_on": "2026-09-22"}},
       "context_window_tokens": 272000,
       "extended_context_window_tokens": 872000,
       "source": {"url": "https://github.com/openai/codex/blob/3a589370a49ddf197de8e5ae03a92615bcad58bf/codex-rs/models-manager/models.json", "checked_on": "2026-09-16"},
@@ -102,6 +106,7 @@
     {
       "route": "codex-subscription",
       "model_id": "gpt-5.6-terra",
+      "tokenizer": {"encoding": "o200k_base", "source": {"url": "https://github.com/openai/tiktoken/blob/212b893ba940cba53476851103d2e5c1d0020c6e/tiktoken/model.py", "checked_on": "2026-09-22"}},
       "context_window_tokens": 272000,
       "extended_context_window_tokens": 872000,
       "source": {"url": "https://github.com/openai/codex/blob/3a589370a49ddf197de8e5ae03a92615bcad58bf/codex-rs/models-manager/models.json", "checked_on": "2026-09-16"},
@@ -118,6 +123,7 @@
     {
       "route": "codex-subscription",
       "model_id": "gpt-5.6-luna",
+      "tokenizer": {"encoding": "o200k_base", "source": {"url": "https://github.com/openai/tiktoken/blob/212b893ba940cba53476851103d2e5c1d0020c6e/tiktoken/model.py", "checked_on": "2026-09-22"}},
       "context_window_tokens": 272000,
       "extended_context_window_tokens": 872000,
       "source": {"url": "https://github.com/openai/codex/blob/3a589370a49ddf197de8e5ae03a92615bcad58bf/codex-rs/models-manager/models.json", "checked_on": "2026-09-16"},

@@ -855,8 +855,9 @@ fn dock_meters(view: &View, width: u16) -> String {
             if wide {
                 let (_, provenance) = window_provenance(&budget.window.provenance);
                 format!(
-                    "ctx ≈{input}+{reserve}/{} {provenance}",
-                    budget.window.value
+                    "ctx ≈{input}+{reserve}/{} {provenance} · {}",
+                    budget.window.value,
+                    context.estimate.sizing.label(),
                 )
             } else {
                 let assumed = matches!(
@@ -1053,9 +1054,10 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
             format!("≈{input}+{reserve}/{window} {short_provenance}")
         } else {
             format!(
-                "≈{input}+{reserve}/{window} tokens · {} {} · {provenance}",
+                "≈{input}+{reserve}/{window} tokens · {} {} · {provenance} · {}",
                 view.actor_name(&context.actor_id),
                 phase,
+                context.estimate.sizing.label(),
             )
         }
     });

@@ -6,6 +6,12 @@ The Dolt change checked SQLx 0.9.0, UUID 1.26.1 and full Dolt 2.3.3 on
 2026-09-10. The memory package's catalog records the measured native archive,
 executable and license digests for each cataloged target. The Windows change
 also pins the native API bindings, strict ZIP codec and ConPTY test driver below.
+The offline tokenizer addition checked `tiktoken-rs` 0.12.0 on 2026-09-22;
+its embedded `o200k_base.tiktoken` SHA-256 matches [OpenAI's published
+asset hash](https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py),
+`446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d`.
+The connector package carries the crate and asset MIT attributions in
+`THIRD_PARTY_NOTICES.md`.
 
 ## Rust dependencies
 
@@ -22,6 +28,7 @@ also pins the native API bindings, strict ZIP codec and ConPTY test driver below
 | `sha2` | `0.11.0` | [sparse index](https://index.crates.io/sh/a2/sha2) |
 | `tokio` | `1.53.1` | [sparse index](https://index.crates.io/to/ki/tokio) |
 | `reqwest` | `0.13.5` | [sparse index](https://index.crates.io/re/qw/reqwest) |
+| `tiktoken-rs` | `0.12.0` | [sparse index](https://index.crates.io/ti/kt/tiktoken-rs) |
 | `futures` | `0.3.34` | [sparse index](https://index.crates.io/fu/tu/futures) |
 | `axum` | `0.8.9` | [sparse index](https://index.crates.io/ax/um/axum) |
 | `tower` | `0.5.3` | [sparse index](https://index.crates.io/to/we/tower) |

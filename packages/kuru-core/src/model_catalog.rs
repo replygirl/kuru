@@ -33,8 +33,21 @@ struct CatalogRecord {
     extended_context_window_tokens: Option<u64>,
     source: Option<SourceCitation>,
     prices: Option<CatalogPriceSchedule>,
+    tokenizer: Option<CatalogTokenizer>,
     #[serde(default)]
     capabilities: std::collections::BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub enum TokenizerEncoding {
+    #[serde(rename = "o200k_base")]
+    O200kBase,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CatalogTokenizer {
+    encoding: TokenizerEncoding,
+    source: SourceCitation,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,6 +190,16 @@ impl ModelCatalog {
                 );
                 validate_prices(prices)?;
             }
+            if let Some(tokenizer) = &record.tokenizer {
+                ensure!(
+                    matches!(
+                        record.route,
+                        ModelRoute::CodexSubscription | ModelRoute::OpenAiResponses
+                    ),
+                    "catalog tokenizer requires an official native route"
+                );
+                validate_citation(&tokenizer.source)?;
+            }
         }
         Ok(catalog)
     }
@@ -225,10 +248,29 @@ impl ModelCatalog {
         }
         model
     }
+
+    pub fn tokenizer(
+        &self,
+        route: ModelRoute,
+        model_id: &str,
+    ) -> Option<Sourced<TokenizerEncoding>> {
+        self.records
+            .iter()
+            .find(|record| record.route == route && record.model_id == model_id)
+            .and_then(|record| record.tokenizer.as_ref())
+            .map(|tokenizer| Sourced::pinned(tokenizer.encoding, tokenizer.source.clone()))
+    }
 }
 
 pub fn enrich_model(route: ModelRoute, model: ModelInfo) -> Result<ModelInfo> {
     Ok(ModelCatalog::embedded()?.enrich(route, model))
+}
+
+pub fn tokenizer_for_model(
+    route: ModelRoute,
+    model_id: &str,
+) -> Result<Option<Sourced<TokenizerEncoding>>> {
+    Ok(ModelCatalog::embedded()?.tokenizer(route, model_id))
 }
 
 fn fill_compatible_limits(

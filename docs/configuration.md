@@ -85,9 +85,20 @@ strings. The API key itself never belongs in configuration.
 
 Kuru estimates each provider request after its native continuation and tool
 results have been assembled. The estimate includes instructions, tool schemas,
-current input, history and private continuation. It uses serialized bytes divided
-by two, rounded up; this is an estimate, not the provider's tokenizer or a
-guaranteed token upper bound. The status display labels it accordingly.
+current input, history and private continuation. For catalogued GPT-5.6 models
+on the official OpenAI Responses and ChatGPT subscription routes, Kuru counts
+the final serialized request locally with the embedded `o200k_base` tokenizer
+and adds an allowance for provider structure. This remains an estimate: the
+provider's token accounting can differ from local JSON tokenization. Unknown
+models and custom Responses endpoints retain the historical bytes/2 heuristic
+plus a small structural allowance. For a mapped route with native tool
+continuation, Kuru tokenizes the visible serialized body and uses that same
+byte heuristic for only the saved native output items. This mixed method
+retains every pending item in the request. All methods are labelled estimates,
+not guaranteed upper bounds. The offline demo retains its earlier bytes/2
+estimate.
+Sizing makes no extra provider request and does not imply a cache hit. The
+status display names the estimate method.
 
 Model windows come from validated route metadata or the pinned catalog. When
 neither provides a window, Kuru assumes 128,000 tokens and labels that assumption.
