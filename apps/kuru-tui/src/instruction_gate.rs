@@ -6,8 +6,8 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Result, bail, ensure};
 use async_trait::async_trait;
 use kuru_connectors::{
-    CheckpointStore, InstructionActivation, InstructionGate, InstructionGateOutcome,
-    InstructionReviewAnswer, InstructionReviewSender, SkillGate, ToolInvocationContext,
+    InstructionActivation, InstructionGate, InstructionGateOutcome, InstructionReviewAnswer,
+    InstructionReviewSender, SkillGate,
 };
 use kuru_core::{ConfigSnapshot, ProjectRelativeTarget};
 use kuru_platform::fs::Directory;
@@ -253,7 +253,9 @@ impl InstructionActivation for ProposedActivation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuru_connectors::{InstructionReviewRequest, ToolHost};
+    use kuru_connectors::{
+        CheckpointStore, InstructionReviewRequest, ToolHost, ToolInvocationContext,
+    };
     use kuru_core::{
         Config, InvocationOverrides, NativeTool, PermissionAction, PermissionRule,
         PermissionSelector,
