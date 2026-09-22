@@ -21,6 +21,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 kuru-memory = { workspace = true, features = ["test-support"] }
+kuru-platform.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

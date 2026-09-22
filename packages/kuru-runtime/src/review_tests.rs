@@ -6,11 +6,12 @@ use std::sync::{
 
 use anyhow::Result;
 use async_trait::async_trait;
-use kuru_connectors::{Provider, ToolHost};
+use kuru_connectors::{CheckpointState, CheckpointStore, Provider, ToolHost};
 use kuru_core::{
     Completion, CompletionRequest, Config, ConfigSnapshot, InvocationOverrides, McpConfig, Mode,
     ModelInfo, RelationshipKind, ToolCall,
 };
+use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -97,6 +98,34 @@ async fn fixture(config: Config, provider: Arc<dyn Provider>) -> (TempDir, Harne
     .await
     .unwrap();
     (dir, harness)
+}
+
+async fn checkpoint_fixture(
+    config: Config,
+    provider: Arc<dyn Provider>,
+) -> (TempDir, TempDir, Harness) {
+    let project = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let root = Arc::new(
+        Directory::open(project.path(), Privacy::Inherited, NameRetention::Pinned).unwrap(),
+    );
+    let tools = ToolHost::with_retained_root(root.clone(), &config)
+        .unwrap()
+        .with_checkpoint_store(Arc::new(
+            CheckpointStore::new(&data.path().join("checkpoints"), root).unwrap(),
+        ))
+        .unwrap();
+    let harness = Harness::with_tool_host(
+        config,
+        project.path(),
+        MemoryStore::temporary().await.unwrap(),
+        provider,
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    (project, data, harness)
 }
 
 #[tokio::test]
@@ -478,7 +507,7 @@ async fn accepted_file_mutation_survives_cancellation_without_replay() {
         "file_write",
         json!({"path":"accepted.txt","content":"one durable write"}),
     ));
-    let (project, mut harness) = fixture(
+    let (project, _checkpoint_data, mut harness) = checkpoint_fixture(
         Config {
             allow_write: true,
             ..config(Mode::Freudian)
@@ -504,9 +533,22 @@ async fn accepted_file_mutation_survives_cancellation_without_replay() {
         .await
         .expect("provider did not observe the accepted file receipt")
         .unwrap();
-    assert!(receipt.messages.iter().any(|message| {
-        message.role == "tool" && message.text_projection().contains("Wrote 17 bytes")
-    }));
+    let receipt = receipt
+        .messages
+        .iter()
+        .find_map(|message| {
+            (message.role == "tool")
+                .then(|| crate::test_receipt(message).ok())
+                .flatten()
+        })
+        .expect("accepted file effect did not produce a tool receipt");
+    assert_eq!(receipt["call_id"], "accepted-file-write");
+    assert_eq!(receipt["is_error"], false);
+    let output = receipt["output"].as_str().unwrap();
+    let checkpoint = output
+        .strip_prefix("file_write completed; checkpoint ")
+        .expect("accepted file receipt does not name its durable checkpoint")
+        .to_owned();
     assert_eq!(
         std::fs::read_to_string(project.path().join("accepted.txt")).unwrap(),
         "one durable write"
@@ -518,6 +560,12 @@ async fn accepted_file_mutation_survives_cancellation_without_replay() {
             .expect("cancelled post-file turn did not settle")
             .unwrap();
     assert!(turn_was_cancelled(&result.unwrap_err()));
+    let checkpoint = harness
+        .file_checkpoint(&checkpoint)
+        .unwrap()
+        .expect("accepted file checkpoint disappeared after cancellation");
+    assert_eq!(checkpoint.state, CheckpointState::Applied);
+    assert_eq!(checkpoint.path, "accepted.txt");
     assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
     let retry = harness
         .run_controlled(

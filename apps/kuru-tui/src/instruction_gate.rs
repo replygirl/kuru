@@ -6,8 +6,8 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Result, bail, ensure};
 use async_trait::async_trait;
 use kuru_connectors::{
-    InstructionActivation, InstructionGate, InstructionGateOutcome, InstructionReviewAnswer,
-    InstructionReviewSender, SkillGate,
+    CheckpointStore, InstructionActivation, InstructionGate, InstructionGateOutcome,
+    InstructionReviewAnswer, InstructionReviewSender, SkillGate, ToolInvocationContext,
 };
 use kuru_core::{ConfigSnapshot, ProjectRelativeTarget};
 use kuru_platform::fs::Directory;
@@ -628,6 +628,15 @@ mod tests {
             )
             .unwrap(),
         );
+        let checkpoints =
+            Arc::new(CheckpointStore::new(&data.path().join("checkpoints"), root.clone()).unwrap());
+        let context = |call_id: &str| ToolInvocationContext {
+            session_id: "instruction-gate-session".into(),
+            turn_id: "instruction-gate-turn".into(),
+            actor_id: "instruction-gate-actor".into(),
+            invocation_id: "instruction-gate-invocation".into(),
+            call_id: call_id.into(),
+        };
         let snapshot = ConfigSnapshot::parse(
             None,
             project.path(),
@@ -644,6 +653,8 @@ mod tests {
         };
         let gated = ToolHost::with_retained_root(root.clone(), &config)
             .unwrap()
+            .with_checkpoint_store(checkpoints.clone())
+            .unwrap()
             .with_instruction_gate(Arc::new(NestedInstructionGate::new(
                 root.clone(),
                 state.clone(),
@@ -651,11 +662,12 @@ mod tests {
                 false,
             )));
         let refused = gated
-            .execute_for_actor(
+            .execute_for_actor_with_context(
                 "file_write",
                 json!({"path":"src/blocked.txt","content":"no effect"}),
                 None,
                 None,
+                &context("blocked"),
             )
             .await;
         assert!(
@@ -680,15 +692,18 @@ mod tests {
 
         let once = ToolHost::with_retained_root(root.clone(), &config)
             .unwrap()
+            .with_checkpoint_store(checkpoints)
+            .unwrap()
             .with_instruction_gate(Arc::new(NestedInstructionGate::new(
                 root, state, snapshot, true,
             )));
         let first = once
-            .execute_for_actor(
+            .execute_for_actor_with_context(
                 "file_write",
                 json!({"path":"src/approved.txt","content":"approved"}),
                 None,
                 None,
+                &context("approved-plan"),
             )
             .await;
         assert!(first.replan_required);
@@ -697,11 +712,12 @@ mod tests {
         assert!(instructions.contains("src instruction"));
         assert!(!instructions.contains("sibling instruction"));
         let second = once
-            .execute_for_actor(
+            .execute_for_actor_with_context(
                 "file_write",
                 json!({"path":"src/approved.txt","content":"approved"}),
                 None,
                 None,
+                &context("approved-effect"),
             )
             .await;
         assert!(!second.replan_required);
