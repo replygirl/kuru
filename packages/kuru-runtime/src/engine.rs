@@ -10,10 +10,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use futures::future::join_all;
+use futures::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use kuru_connectors::{
-    ApprovalSender, CheckpointSummary, InstructionReviewSender, PermissionService, Provider,
-    ToolHost, a2a_send, is_permission_denied, project_text,
+    ApprovalSender, CheckpointSummary, InstructionReviewSender, ParallelReadAdmission,
+    ParallelReadCancellation, PermissionService, PreparedRead, Provider, ToolHost, a2a_send,
+    is_permission_denied, project_text,
 };
 use kuru_core::{
     ActorPhase, Completion, Config, ContextBudget, FacingInput, InvocationStart, Message, Mode,
@@ -129,6 +133,13 @@ struct CognitiveSettlement {
     admitted: std::time::Instant,
     observe: bool,
     speaking: bool,
+}
+
+struct PreparedToolCall {
+    position: usize,
+    call: ToolCall,
+    admitted: std::time::Instant,
+    read: Box<PreparedRead>,
 }
 
 impl std::fmt::Display for TurnCancelled {
@@ -408,7 +419,7 @@ pub struct Harness {
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) actors: BTreeMap<String, Actor>,
     pub(crate) permits: Arc<Semaphore>,
-    tools: ToolHost,
+    tools: Arc<ToolHost>,
     cwd: PathBuf,
     instructions: String,
     events: broadcast::Sender<Event>,
@@ -581,6 +592,7 @@ impl Harness {
             tools,
             profile: override_profile,
         } = authority;
+        let tools = Arc::new(tools);
         config.validate()?;
         let cwd = cwd.canonicalize()?;
         ensure!(
@@ -1123,6 +1135,72 @@ impl Harness {
         let event = event.projected();
         let _ = self.events.send(event.clone());
         self.trace.push(event);
+    }
+
+    async fn execute_parallel_reads(
+        &mut self,
+        actor: &str,
+        wave: Vec<PreparedToolCall>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(ToolCall, Result<String>)>> {
+        let result_count = wave.len();
+        let mut results = std::iter::repeat_with(|| None)
+            .take(result_count)
+            .collect::<Vec<_>>();
+        let mut running = FuturesUnordered::new();
+        let wave_cancellation = ParallelReadCancellation::default();
+        for prepared in wave {
+            self.emit_event(Event::ToolStarted {
+                actor: actor.into(),
+                call_id: prepared.call.id.clone(),
+                name: prepared.call.name.clone(),
+            });
+            let tools = self.tools.clone();
+            let read_cancellation = wave_cancellation.clone();
+            running.push(async move {
+                let outcome = prepared.read.execute(tools, read_cancellation).await;
+                (
+                    prepared.position,
+                    prepared.call,
+                    prepared.admitted,
+                    outcome.result,
+                )
+            });
+        }
+
+        let mut cancelled = false;
+        while !running.is_empty() {
+            let settled = if cancelled {
+                running.next().await
+            } else {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        cancelled = true;
+                        wave_cancellation.cancel();
+                        None
+                    }
+                    settled = running.next() => settled,
+                }
+            };
+            let Some((position, call, admitted, result)) = settled else {
+                continue;
+            };
+            if cancelled {
+                let cancelled_result: Result<String> = Err(TurnCancelled.into());
+                self.observe_tool(actor, &call, &cancelled_result, admitted, false);
+            } else {
+                self.observe_tool(actor, &call, &result, admitted, false);
+            }
+            results[position] = Some((call, result));
+        }
+        if cancelled || cancellation.is_cancelled() {
+            return Err(TurnCancelled.into());
+        }
+        results
+            .into_iter()
+            .map(|result| result.context("parallel tool wave lost a settled call"))
+            .collect()
     }
 
     fn observe_tool(
@@ -2579,8 +2657,82 @@ impl Harness {
             }
             inputs = vec![];
             let mut instructions_refreshed = false;
-            for call in calls {
+            let mut call_index = 0;
+            while call_index < calls.len() {
+                cancellation.check()?;
                 let admitted = std::time::Instant::now();
+                if used < self.config.max_tool_calls && !instructions_refreshed {
+                    let call = &calls[call_index];
+                    if !is_cognitive(&call.name) {
+                        let context = kuru_connectors::ToolInvocationContext {
+                            session_id: self.session.id.clone(),
+                            turn_id: turn_id.to_owned(),
+                            actor_id: speaker.clone(),
+                            invocation_id: invocation_id.clone(),
+                            call_id: call.id.clone(),
+                        };
+                        if let ParallelReadAdmission::Ready(read) = self
+                            .tools
+                            .prepare_parallel_read(&call.name, call.arguments.clone(), context)
+                            .await
+                        {
+                            cancellation.check()?;
+                            let mut wave = vec![PreparedToolCall {
+                                position: 0,
+                                call: call.clone(),
+                                admitted,
+                                read,
+                            }];
+                            used += 1;
+                            call_index += 1;
+                            while call_index < calls.len()
+                                && used < self.config.max_tool_calls
+                                && wave.len() < self.config.max_parallel
+                            {
+                                let next = &calls[call_index];
+                                let next_admitted = std::time::Instant::now();
+                                if is_cognitive(&next.name) {
+                                    break;
+                                }
+                                let ParallelReadAdmission::Ready(read) = self
+                                    .tools
+                                    .prepare_parallel_read(
+                                        &next.name,
+                                        next.arguments.clone(),
+                                        kuru_connectors::ToolInvocationContext {
+                                            session_id: self.session.id.clone(),
+                                            turn_id: turn_id.to_owned(),
+                                            actor_id: speaker.clone(),
+                                            invocation_id: invocation_id.clone(),
+                                            call_id: next.id.clone(),
+                                        },
+                                    )
+                                    .await
+                                else {
+                                    break;
+                                };
+                                cancellation.check()?;
+                                wave.push(PreparedToolCall {
+                                    position: wave.len(),
+                                    call: next.clone(),
+                                    admitted: next_admitted,
+                                    read,
+                                });
+                                used += 1;
+                                call_index += 1;
+                            }
+                            for (call, result) in self
+                                .execute_parallel_reads(&speaker, wave, cancellation)
+                                .await?
+                            {
+                                inputs.push(tool_result(&call, result, false));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                let call = calls[call_index].clone();
+                call_index += 1;
                 let result = if used >= self.config.max_tool_calls {
                     limited = true;
                     if limit_reasons.insert(TurnLimitReason::ToolCalls) {
@@ -2599,6 +2751,7 @@ impl Harness {
                     used += 1;
                     self.emit_event(Event::ToolStarted {
                         actor: speaker.clone(),
+                        call_id: call.id.clone(),
                         name: call.name.clone(),
                     });
                     if instructions_refreshed {

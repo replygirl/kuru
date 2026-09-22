@@ -374,6 +374,9 @@ surfaces provider validation errors; it does not select an arbitrary audio or
 embedding model from that catalog.
 
 `max_rounds` is 1–64, `max_tool_calls` 1–1024 and `max_parallel` 1–64.
+`max_parallel` bounds both peer work and concurrently running independent native
+read calls; permission or instruction decisions can still force a call onto the
+serial foreground path.
 `max_parts` must fit the built-in topology and cannot exceed 128.
 `dream_every = 0` disables periodic dreaming; explicit and session-end dreaming
 remain separate. Set `dream_on_exit = false` to disable exit dreaming.

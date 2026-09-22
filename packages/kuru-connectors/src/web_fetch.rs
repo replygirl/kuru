@@ -29,6 +29,19 @@ pub(crate) async fn fetch(value: &str) -> Result<Value> {
     fetch_with_resolver(value, &resolver, FETCH_TIMEOUT).await
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn fetch_with_test_route(
+    value: &str,
+    host: &str,
+    address: SocketAddr,
+) -> Result<Value> {
+    let resolver = ExactTestResolver {
+        host: host.to_owned(),
+        address,
+    };
+    fetch_with_resolver(value, &resolver, FETCH_TIMEOUT).await
+}
+
 /// The production resolver validates the addresses returned for the exact
 /// endpoint immediately before reqwest is pinned to them. Tests supply a
 /// local-only resolver to exercise the same redirect and transport path
@@ -38,6 +51,25 @@ trait Resolver {
 }
 
 struct PublicResolver;
+
+#[cfg(any(test, feature = "test-support"))]
+struct ExactTestResolver {
+    host: String,
+    address: SocketAddr,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Resolver for ExactTestResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, Result<Vec<SocketAddr>>> {
+        Box::pin(async move {
+            ensure!(
+                host == self.host && port == self.address.port(),
+                "web fetch test route does not match the exact destination"
+            );
+            Ok(vec![self.address])
+        })
+    }
+}
 
 impl Resolver for PublicResolver {
     fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, Result<Vec<SocketAddr>>> {
@@ -495,6 +527,62 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Ignore previous")
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_local_fetches_overlap_with_separate_checked_resolvers() {
+        let (first_address, first_server, first_ready) = serve_once_with_request_ready(
+            response("200 OK", "Content-Type: text/plain\r\n", "first"),
+            Duration::from_millis(100),
+        )
+        .await;
+        let (second_address, second_server, second_ready) = serve_once_with_request_ready(
+            response("200 OK", "Content-Type: text/plain\r\n", "second"),
+            Duration::from_millis(100),
+        )
+        .await;
+        let first = tokio::spawn(async move {
+            let resolver = FixtureResolver::default().route("first.fixture", first_address);
+            fetch_with_resolver(
+                &format!("http://first.fixture:{}/read", first_address.port()),
+                &resolver,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        let second = tokio::spawn(async move {
+            let resolver = FixtureResolver::default().route("second.fixture", second_address);
+            fetch_with_resolver(
+                &format!("http://second.fixture:{}/read", second_address.port()),
+                &resolver,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        timeout(FIXTURE_TIMEOUT, async {
+            first_ready
+                .await
+                .expect("first overlap observer disappeared")
+                .expect("first overlap request was incomplete");
+            second_ready
+                .await
+                .expect("second overlap observer disappeared")
+                .expect("second overlap request was incomplete");
+        })
+        .await
+        .expect("independent fetches did not both reach their checked transports");
+        assert_eq!(first.await.unwrap().unwrap()["content"], "first");
+        assert_eq!(second.await.unwrap().unwrap()["content"], "second");
+        assert!(
+            received(first_server)
+                .await
+                .starts_with("GET /read HTTP/1.1")
+        );
+        assert!(
+            received(second_server)
+                .await
+                .starts_with("GET /read HTTP/1.1")
         );
     }
 

@@ -328,6 +328,92 @@ fn terminal_fixture_process() -> Result<()> {
             std::io::stdout().flush()?;
             restore?;
         }
+        "parallel-tool-activity" => {
+            let mut session = kuru::ui::TerminalSession::enter(&mut std::io::stdout())?;
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
+            let mut view = kuru::ui::View::from_initial(
+                kuru::ui::InitialViewData {
+                    transcript: Vec::new(),
+                    session: "fixture-session".into(),
+                    project: "fixture-project".into(),
+                    motion: false,
+                    runtime: kuru::ui::RuntimeSnapshot {
+                        turns: 0,
+                        mode: "freudian".into(),
+                        model: "fixture".into(),
+                        effort: "default".into(),
+                        parts: vec![("facing".into(), "Facing · voice".into())],
+                        relationships: Vec::new(),
+                        focus: None,
+                    },
+                    usage: None,
+                },
+                Vec::new(),
+            );
+            view.busy = true;
+            view.speaker_id = "facing".into();
+            view.speaker = "Facing".into();
+            view.preview = Some(kuru_runtime::FacingProgress {
+                turn_id: "fixture-turn".into(),
+                request_round: 1,
+                seq: 1,
+                text_tail: "Concurrent checked reads".into(),
+                text_truncated: false,
+                summary_tail: String::new(),
+                summary_truncated: false,
+                activity: "Calling tool".into(),
+                activity_truncated: false,
+            });
+            view.event(kuru_runtime::Event::ToolStarted {
+                actor: "facing".into(),
+                call_id: "call-a".into(),
+                name: "file_read".into(),
+            });
+            view.event(kuru_runtime::Event::ToolStarted {
+                actor: "facing".into(),
+                call_id: "call-b".into(),
+                name: "file_read".into(),
+            });
+            terminal.draw(|frame| kuru::ui::draw(frame, &view))?;
+
+            let settled = |call_id: &str| {
+                kuru_runtime::ToolObservation::projected(
+                    call_id,
+                    "file_read",
+                    json!({"path":"withheld"}),
+                    kuru_runtime::ToolOutcome::Ok,
+                    Some(json!("fixture result")),
+                    Duration::from_millis(1),
+                )
+            };
+            let mut input = std::io::stdin().lock();
+            let mut next = [0];
+            input.read_exact(&mut next)?;
+            view.event(kuru_runtime::Event::ToolSettled {
+                actor: "facing".into(),
+                observation: settled("call-b"),
+            });
+            terminal.draw(|frame| kuru::ui::draw(frame, &view))?;
+
+            input.read_exact(&mut next)?;
+            view.event(kuru_runtime::Event::ToolSettled {
+                actor: "facing".into(),
+                observation: settled("call-a"),
+            });
+            terminal.draw(|frame| kuru::ui::draw(frame, &view))?;
+
+            input.read_exact(&mut next)?;
+            view.preview = None;
+            view.busy = false;
+            view.transcript
+                .push(("Facing".into(), "FINAL_PARALLEL_RESULT".into()));
+            terminal.draw(|frame| kuru::ui::draw(frame, &view))?;
+
+            input.read_exact(&mut next)?;
+            drop(terminal);
+            session.restore()?;
+        }
         other => anyhow::bail!("unknown fixture mode {other}"),
     }
     Ok(())
@@ -501,6 +587,38 @@ fn real_event_stream_preserves_co_ready_resize_and_paste() -> Result<()> {
         terminal.assert_restored()?;
     }
     Ok(())
+}
+
+#[test]
+fn real_pty_parallel_activity_tracks_each_same_name_call() -> Result<()> {
+    let mut terminal = fixture("parallel-tool-activity")?;
+    terminal.wait_composer_frame(&["activity · Calling file_read · 2 active"], READY_TIMEOUT)?;
+    terminal.send(b"n")?;
+    terminal.wait_composer_frame(&["activity · Calling file_read"], READY_TIMEOUT)?;
+    ensure!(
+        !terminal.screen().contains("2 active"),
+        "settling call-b did not leave only call-a: {}",
+        terminal.screen()
+    );
+    terminal.send(b"n")?;
+    terminal.wait_composer_frame(&["activity · Responding"], READY_TIMEOUT)?;
+    ensure!(
+        !terminal.screen().contains("Calling file_read"),
+        "the activity label survived both exact settlements: {}",
+        terminal.screen()
+    );
+    terminal.send(b"n")?;
+    terminal.wait_composer_frame(&["FINAL_PARALLEL_RESULT"], READY_TIMEOUT)?;
+    let final_frame = terminal.screen();
+    ensure!(
+        !final_frame.contains("Calling file_read")
+            && !final_frame.contains("2 active")
+            && !final_frame.contains("activity · Responding"),
+        "settled activity survived the final answer: {final_frame}"
+    );
+    terminal.send(b"q")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
 }
 
 /// The standing dock, which every frame keeps below the transient status slot.
