@@ -26,6 +26,7 @@ pub(crate) async fn unconfigured(
         lifetime: None,
         retained: None,
         reap_guard: Arc::new(StdMutex::new(None)),
+        reaped_observer: None,
     };
     let result = async {
         owner.lifetime = Some(
@@ -81,6 +82,7 @@ pub(crate) async fn partial_readiness(
         lifetime: None,
         retained: None,
         reap_guard: Arc::new(StdMutex::new(None)),
+        reaped_observer: None,
     };
     let result = async {
         owner.lifetime = Some(
