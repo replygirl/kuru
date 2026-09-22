@@ -133,11 +133,12 @@ async fn newly_activated_instructions_settle_stale_parallel_calls_without_effect
     assert_eq!(output.text, "replanned");
     assert!(!project.path().join("src/first.txt").exists());
     assert!(!project.path().join("src/second.txt").exists());
-    let requests = provider.speaking_requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert!(!requests[0].contains("new path-qualified instruction"));
-    assert!(requests[1].contains("new path-qualified instruction"));
-    drop(requests);
+    {
+        let requests = provider.speaking_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].contains("new path-qualified instruction"));
+        assert!(requests[1].contains("new path-qualified instruction"));
+    }
     let file_results = output.events.iter().filter(|event| matches!(event, Event::ToolSettled { observation, .. } if observation.name == "file_write")).count();
     assert_eq!(file_results, 2);
     harness.shutdown(false).await?;
