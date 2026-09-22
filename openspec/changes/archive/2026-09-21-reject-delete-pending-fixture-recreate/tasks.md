@@ -1,0 +1,17 @@
+## 1. Bounded absence wait after fixture binary removal
+
+- [x] 1.1 Fold a bounded post-removal absence wait into `remove_fixture_binary` itself (remove → wait for absence), reusing the same 2-second/20-millisecond window the function already uses for its own removal retry via one shared pair of named constants, and verify both existing call sites (the corrupt-cache and the offline-reinstall fixtures) go through it unchanged.
+- [x] 1.2 Confirm the wait treats only `symlink_metadata` reporting `NotFound` as proof of absence, never a successful or still-denied query, and on exhaustion reports the path, the reconcile attempt count and the elapsed window, mirroring the established `StageCleanupExhausted` message shape.
+- [x] 1.3 Grep `native_tests.rs`, `files.rs` tests, `store/*tests.rs` and `test_support.rs` for every other site that recreates or reopens a name it just removed, and verify none shares this just-executed-image race shape (the two `remove_fixture_binary` call sites are the only sites affected).
+
+## 2. Regression coverage for the wait helper
+
+- [x] 2.1 Add unix-runnable unit tests for `wait_for_fixture_binary_absence` — an already-absent path returns immediately, a path that becomes absent after a few polls succeeds, and a never-absent path exhausts with the established message — and verify all three pass on this host, which a windows-only fixture cannot.
+
+## 3. Verification
+
+- [x] 3.1 Run scoped formatting, memory typecheck and lint, and the host-runnable `provision::` and `files::` test suites (including the three new unit tests), and verify each reports clean; record Windows execution of `remove_fixture_binary`'s own callers as pending until native CI.
+- [x] 3.2 Type-check the changed Windows-only call site against `x86_64-pc-windows-msvc` and verify the result, recording that a full cross-target check of `kuru-memory` is impossible on this host.
+- [x] 3.3 Archive the change before the final branch commit and verify the archive directory exists.
+
+Observed: `remove_fixture_binary` now waits for genuine post-removal absence via `wait_for_fixture_binary_absence`, sharing its deadline and named constants with the existing removal retry; both call sites (`concurrent_cold_windows_provision_publishes_one_verified_native_identity`'s corrupt-cache fixture and `real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_before_execution`) are unchanged apart from that. `mise run //:format:rust` and `cargo fmt --all -- --check` report clean; `mise run //packages/kuru-memory:typecheck` and `:lint` (`--all-targets --all-features -D warnings`) both passed on macOS. `cargo test -p kuru-memory --lib -- provision::` passed 46/46 across three consecutive runs (no flake), including the three new `wait_for_fixture_binary_absence_*` unit tests; `cargo test -p kuru-memory --lib -- files::` passed 6/6. `cargo check --target x86_64-pc-windows-msvc -p kuru-memory --lib --tests` is impossible on this host (`libsqlite3-sys` fails compiling `sqlite3.c` for the MSVC target: no MSVC-compatible `stdlib.h` in the Xcode Clang toolchain), so the changed Windows-only call site in `remove_fixture_binary` was type-checked as an isolated `rustc --target x86_64-pc-windows-msvc --edition 2021 --emit=metadata` snippet reproducing `wait_for_fixture_binary_absence` and the call-site shape, which compiled clean. Windows execution of `real_embedded_windows_engine_installs_offline_and_corrupt_cache_fails_before_execution` and its sibling stays pending native CI.
