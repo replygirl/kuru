@@ -1181,7 +1181,7 @@ mod tests {
 
     #[cfg(windows)]
     fn windows_service_fixture() -> Result<(
-        tempfile::TempDir,
+        crate::test_support::TempDir,
         PathBuf,
         crate::store::OpenOptions,
         PathBuf,
