@@ -44,6 +44,9 @@ sha2.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+kuru-platform = { workspace = true, features = ["test-support"] }
+
 [target.'cfg(unix)'.build-dependencies]
 nix.workspace = true
 

@@ -257,6 +257,10 @@ impl Server {
         Ok(receiver)
     }
 
+    pub(crate) fn instance(&self) -> &str {
+        &self.0.identity.instance
+    }
+
     /// Hold the same stable lease as the supervisor until the caller completes
     /// a stopped-store rename and directory fsync. Closing an attached handle is
     /// not proof of quiescence: only acquiring this lease establishes it.

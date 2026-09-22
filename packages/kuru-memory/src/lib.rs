@@ -6,6 +6,7 @@ mod migration;
 mod progress;
 pub mod provision;
 pub mod server;
+pub mod service;
 #[cfg(test)]
 mod spawn_gate;
 mod store;

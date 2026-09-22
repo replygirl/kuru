@@ -125,6 +125,68 @@ async fn unlocked(path: &Path) {
 }
 
 #[tokio::test]
+async fn independent_service_breaks_away_from_permitting_job_after_starter_exits() {
+    let root = tempfile::tempdir().unwrap();
+    let lock_path = root.path().join("independent.lock");
+    let release = root.path().join("release");
+    let mut starter = spec(
+        root.path(),
+        &[
+            OsStr::new("independent-starter"),
+            lock_path.as_os_str(),
+            release.as_os_str(),
+        ],
+    );
+    starter.lifetime = Lifetime::FixtureBreakawayJob;
+    starter.stdout = Stdio::Pipe;
+    let mut starter = starter.spawn().await.unwrap();
+    let mut reader = BufReader::new(starter.take_stdout().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(LIMIT, reader.read_line(&mut line))
+        .await
+        .expect("independent starter readiness deadline")
+        .unwrap();
+    assert_eq!(line, "starter-exited\n");
+    assert!(starter.wait(LIMIT).await.unwrap().success());
+    drop(starter); // closes the containing kill-on-close Job
+    let held = File::options()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    assert!(matches!(held.try_lock(), Err(TryLockError::WouldBlock)));
+    drop(held);
+    fs::write(&release, b"release").unwrap();
+    unlocked(&lock_path).await;
+}
+
+#[tokio::test]
+async fn independent_service_rejects_a_job_that_forbids_breakaway() {
+    let root = tempfile::tempdir().unwrap();
+    let lock_path = root.path().join("forbidden.lock");
+    let release = root.path().join("release");
+    let mut starter = spec(
+        root.path(),
+        &[
+            OsStr::new("independent-starter"),
+            lock_path.as_os_str(),
+            release.as_os_str(),
+        ],
+    );
+    starter.lifetime = Lifetime::OwnedJob;
+    let mut starter = starter.spawn().await.unwrap();
+    assert!(
+        !starter.wait(LIMIT).await.unwrap().success(),
+        "a denied breakaway must fail before the independent service starts"
+    );
+    drop(starter);
+    assert!(
+        !lock_path.exists(),
+        "denied breakaway unexpectedly launched an independent leaf"
+    );
+}
+
+#[tokio::test]
 async fn native_arguments_environment_stdio_and_working_directory_round_trip() {
     let root = tempfile::Builder::new()
         .prefix("kuru native λ ")

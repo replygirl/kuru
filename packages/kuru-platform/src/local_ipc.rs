@@ -13,6 +13,43 @@ use std::{
 };
 use tokio::net::{UnixListener, UnixStream};
 
+/// A checked, short owner-private socket directory. Unix-domain socket names
+/// have a fixed native path limit, so a configured data directory cannot be
+/// used as the socket parent. `locator` is only a short routing hint; callers
+/// must authenticate the complete project and live service generation.
+pub fn prepare_short_directory(locator: &str) -> io::Result<Directory> {
+    Directory::ensure_private(&short_directory_path(locator)?)
+}
+
+/// Open an existing short socket directory without creating it on a cold
+/// client probe. Existing symlinks and nonprivate names are rejected.
+pub fn open_short_directory(locator: &str) -> io::Result<Directory> {
+    Directory::open(
+        &short_directory_path(locator)?,
+        Privacy::OwnerOnly,
+        NameRetention::Pinned,
+    )
+}
+
+fn short_directory_path(locator: &str) -> io::Result<PathBuf> {
+    if locator.len() != 24
+        || !locator
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid private service socket locator",
+        ));
+    }
+    Ok(PathBuf::from("/tmp")
+        .join(format!(
+            "kuru-service-{}",
+            rustix::process::geteuid().as_raw()
+        ))
+        .join(locator))
+}
+
 pub struct PrivateServiceListener {
     directory: Directory,
     name: OsString,
