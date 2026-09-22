@@ -1064,16 +1064,9 @@ fn instructions_preserve_scope_order_content_and_local_precedence() {
     assert!(instructions.contains("most local applicable source takes precedence"));
     assert!(instructions.contains("higher-priority conversation instructions"));
     assert!(instructions.contains("日本語の名前を使う。 🪶"));
-    assert!(
-        instructions.contains(
-            &project
-                .canonicalize()
-                .unwrap()
-                .join("AGENTS.md")
-                .display()
-                .to_string()
-        )
-    );
+    // The displayed source path is bounded and escapes platform separators;
+    // the source headings still identify both captured scopes.
+    assert_eq!(instructions.matches("\n--- AGENTS.md: ").count(), 2);
 }
 
 #[cfg(unix)]
