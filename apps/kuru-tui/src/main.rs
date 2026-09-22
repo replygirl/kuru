@@ -1,5 +1,26 @@
+#[cfg(not(windows))]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    Box::pin(dispatch()).await
+}
+
+#[cfg(windows)]
+fn main() -> anyhow::Result<()> {
+    const DISPATCH_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+    let worker = std::thread::Builder::new()
+        .name("kuru-dispatch".into())
+        .stack_size(DISPATCH_STACK_BYTES)
+        .spawn(windows_dispatch)
+        .map_err(|error| anyhow::anyhow!("start Kuru Windows dispatch worker: {error}"))?;
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("Kuru Windows dispatch worker panicked"))?
+}
+
+#[cfg(windows)]
+#[tokio::main]
+async fn windows_dispatch() -> anyhow::Result<()> {
     Box::pin(dispatch()).await
 }
 

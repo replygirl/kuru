@@ -1480,6 +1480,36 @@ mod tests {
         }
     }
 
+    /// A published endpoint does not prove that this particular attempt has
+    /// obtained a Windows pipe instance. Keep that fixture-only readiness
+    /// observation inside the caller's named outer deadline; product
+    /// attachment still treats a connect timeout as an error and never
+    /// silently retries an ambiguous request.
+    async fn try_attach_fixture_stage(
+        data: &Path,
+        scope: &str,
+        project: &Path,
+        stage: &'static str,
+    ) -> Result<Option<ServiceAttachment>> {
+        match try_attach(data, scope, project).await {
+            Ok(attached) => Ok(attached),
+            #[cfg(windows)]
+            Err(error) if is_private_pipe_connect_timeout(&error) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("{stage} attachment failed")),
+        }
+    }
+
+    #[cfg(windows)]
+    fn is_private_pipe_connect_timeout(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .any(|cause| {
+                cause.kind() == io::ErrorKind::TimedOut
+                    && cause.to_string() == "private pipe connect timed out"
+            })
+    }
+
     #[tokio::test]
     async fn inspection_waits_for_a_booting_owner_without_starting_dolt() -> Result<()> {
         let root = crate::test_support::tempdir()?;
@@ -2543,7 +2573,10 @@ mod tests {
             ));
             let mut original = tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
-                    if let Some(attached) = try_attach(&data, &scope, &project).await? {
+                    if let Some(attached) =
+                        try_attach_fixture_stage(&data, &scope, &project, "initial owner readiness")
+                            .await?
+                    {
                         break Ok::<_, anyhow::Error>(attached);
                     }
                     if let Some(status) = process.0.try_wait()? {
@@ -2582,8 +2615,18 @@ mod tests {
 
             let mut sibling = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
-                    if let Some(attached) = try_attach(&data, &scope, &project).await? {
+                    if let Some(attached) = try_attach_fixture_stage(
+                        &data,
+                        &scope,
+                        &project,
+                        "original-owner sibling readiness",
+                    )
+                    .await?
+                    {
                         break Ok::<_, anyhow::Error>(attached);
+                    }
+                    if let Some(status) = process.0.try_wait()? {
+                        bail!("fixture service exited before sibling readiness: {status}");
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
