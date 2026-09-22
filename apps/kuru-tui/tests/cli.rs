@@ -97,6 +97,25 @@ fn git_fixture(directory: &std::path::Path, args: &[&str]) -> Output {
 }
 
 #[test]
+fn tools_command_projects_the_shared_catalog_without_starting_memory_or_a_provider() {
+    let env = Sandbox::new();
+    kuru_platform::fs::Directory::ensure_private(&env.data).unwrap();
+    std::fs::write(env.data.join("memory"), b"hostile memory path").unwrap();
+    let catalog: Value = serde_json::from_str(&env.success(&["tools"])).unwrap();
+    assert!(
+        catalog["tools"]
+            .as_array()
+            .is_some_and(|tools| { tools.iter().any(|tool| tool["name"] == "file_read") })
+    );
+    assert_eq!(catalog["mcp"], serde_json::json!([]));
+    assert_eq!(
+        std::fs::read(env.data.join("memory")).unwrap(),
+        b"hostile memory path",
+        "catalog inspection must not inspect or initialize project memory"
+    );
+}
+
+#[test]
 fn imported_project_instructions_require_exact_workspace_review_before_demo_dispatch() {
     let env = Sandbox::new();
     std::fs::create_dir_all(env.project.join("docs")).unwrap();

@@ -26,6 +26,7 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | `/help` | Show commands |
 | `/clear` | Clear this terminal's visible conversation while retaining stored history and session identity |
 | `/status` | Show local session, project, selections, turns, and known usage without a provider call |
+| `/tools` | Inspect filtered tools and disabled/live/stale/degraded MCP aliases without a provider call |
 | `/parts` | Inspect parts and relationships |
 | `/mode ifs` | Change the current framework |
 | `/model MODEL_ID` | Select a model |
@@ -242,9 +243,11 @@ kuru -C /path/to/project --allow-write tool file_edit \
   --args '{"path":"notes.txt","hunks":[{"before":"A ","old":"working","after":" note.","replacement":"revised"}]}'
 ```
 
-`tools` discovers built-ins and configured MCP tools. Use the returned stable
-namespaced identifier when calling an MCP tool. Discovery and calls fail
-clearly when a configured server is unavailable. Ask-capable tools remain
+`tools` and the TUI's `/tools` command inspect one shared catalog: built-ins,
+filtered MCP metadata, and each configured alias's `disabled`, `live`, `stale`,
+or `degraded` state. Stale metadata is descriptive only and cannot be called.
+Use a returned stable namespaced identifier from a live alias when calling an
+MCP tool. Discovery and calls fail clearly when a configured server is unavailable. Ask-capable tools remain
 discoverable. Direct CLI calls use the same rules and saved grants as the TUI,
 but an unresolved ask refuses immediately instead of opening a prompt. Shell
 uses your process permissions; it is not a sandbox. See

@@ -376,6 +376,7 @@ fn mcp_config(stdio: &NativeMcpFixture, http: &HttpMcpFixture) -> String {
                 args: stdio.args.clone(),
                 url: None,
                 env: BTreeMap::new(),
+                ..Default::default()
             },
         ),
         (
@@ -385,6 +386,7 @@ fn mcp_config(stdio: &NativeMcpFixture, http: &HttpMcpFixture) -> String {
                 args: Vec::new(),
                 url: Some(http.url.clone()),
                 env: BTreeMap::new(),
+                ..Default::default()
             },
         ),
     ]);
@@ -399,6 +401,7 @@ fn http_mcp_config(http: &HttpMcpFixture) -> String {
             args: Vec::new(),
             url: Some(http.url.clone()),
             env: BTreeMap::new(),
+            ..Default::default()
         },
     )]);
     toml::to_string(&BTreeMap::from([("mcp", mcp)])).unwrap()
@@ -420,6 +423,7 @@ fn mixed_manifest_config(stdio: &NativeMcpFixture, http: &HttpMcpFixture) -> Str
                     args: stdio.args.clone(),
                     url: None,
                     env: BTreeMap::new(),
+                    ..Default::default()
                 },
             ),
             (
@@ -429,6 +433,7 @@ fn mixed_manifest_config(stdio: &NativeMcpFixture, http: &HttpMcpFixture) -> Str
                     args: Vec::new(),
                     url: Some(http.url.clone()),
                     env: BTreeMap::new(),
+                    ..Default::default()
                 },
             ),
         ]),

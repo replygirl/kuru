@@ -168,6 +168,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "enabled": { "type": "boolean", "default": true },
         "command": {
           "type": ["string", "null"],
           "minLength": 1,
@@ -181,11 +182,63 @@
           "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,255}$" },
           "additionalProperties": { "type": "string" },
           "default": {}
+        },
+        "allow_tools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[^\\[\\]\\{\\}\\u0000-\\u001F\\u007F-\\u009F]+$"
+          },
+          "maxItems": 128,
+          "default": []
+        },
+        "deny_tools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^[^\\[\\]\\{\\}\\u0000-\\u001F\\u007F-\\u009F]+$"
+          },
+          "maxItems": 128,
+          "default": []
+        },
+        "header_env": {
+          "type": "object",
+          "maxProperties": 32,
+          "propertyNames": {
+            "allOf": [
+              { "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$" },
+              {
+                "not": {
+                  "pattern": "(?i)^(accept|connection|content-length|content-type|host|mcp-protocol-version|mcp-session-id|te|trailer|transfer-encoding|upgrade)$"
+                }
+              }
+            ]
+          },
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,255}$"
+          },
+          "default": {}
         }
       },
       "oneOf": [
-        { "required": ["command"], "not": { "required": ["url"] } },
-        { "required": ["url"], "not": { "required": ["command"] } }
+        {
+          "required": ["command"],
+          "not": { "required": ["url"] },
+          "properties": { "header_env": { "maxProperties": 0 } }
+        },
+        {
+          "required": ["url"],
+          "not": { "required": ["command"] },
+          "properties": {
+            "args": { "maxItems": 0 },
+            "env": { "maxProperties": 0 }
+          }
+        }
       ]
     }
   }

@@ -29,6 +29,7 @@ pub(crate) enum CommandId {
     Relate,
     Retry,
     Status,
+    Tools,
     UndoDream,
 }
 
@@ -175,6 +176,12 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
         summary: "Show this session's current status",
     },
     CommandSpec {
+        id: CommandId::Tools,
+        name: "/tools",
+        usage: "/tools",
+        summary: "Inspect filtered tools and MCP server state",
+    },
+    CommandSpec {
         id: CommandId::UndoDream,
         name: "/undo-dream",
         usage: "/undo-dream",
@@ -312,7 +319,6 @@ mod tests {
             "/new",
             "/sessions",
             "/resume",
-            "/tools",
             "/config",
             "/export",
             "/compact",

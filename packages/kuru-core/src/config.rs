@@ -25,13 +25,50 @@ const MAX_INSTRUCTION_PATHS: usize = 128;
 const MAX_IMPORT_DEPTH: usize = 8;
 const MAX_INSTRUCTION_NOTICES: usize = 16;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
+    pub enabled: bool,
     pub command: Option<String>,
     pub args: Vec<String>,
     pub url: Option<String>,
     pub env: BTreeMap<String, String>,
+    pub allow_tools: Vec<String>,
+    pub deny_tools: Vec<String>,
+    /// HTTP header names mapped to environment-variable names. Resolved header
+    /// values never enter the configuration snapshot.
+    pub header_env: BTreeMap<String, String>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: None,
+            args: Vec::new(),
+            url: None,
+            env: BTreeMap::new(),
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
+            header_env: BTreeMap::new(),
+        }
+    }
+}
+
+impl McpConfig {
+    /// Apply deny-first original MCP tool-name filtering. This is catalog
+    /// admission only; it is never an execution grant.
+    pub fn admits_tool(&self, name: &str) -> bool {
+        !self
+            .deny_tools
+            .iter()
+            .any(|pattern| mcp_tool_glob_matches(pattern, name))
+            && (self.allow_tools.is_empty()
+                || self
+                    .allow_tools
+                    .iter()
+                    .any(|pattern| mcp_tool_glob_matches(pattern, name)))
+    }
 }
 
 /// Interactive choices belong to the canonical project, independent of chats
@@ -1312,6 +1349,25 @@ impl Config {
                     "MCP environment values cannot contain NUL characters"
                 );
             }
+            ensure!(
+                mcp.allow_tools.len() <= 128 && mcp.deny_tools.len() <= 128,
+                "MCP tool filters are limited to 128 allow and 128 deny globs"
+            );
+            for pattern in mcp.allow_tools.iter().chain(&mcp.deny_tools) {
+                validate_mcp_tool_glob(pattern)?;
+            }
+            ensure!(
+                mcp.header_env.len() <= 32,
+                "HTTP MCP static headers are limited to 32 entries"
+            );
+            ensure!(
+                mcp.command.is_none() || mcp.header_env.is_empty(),
+                "stdio MCP servers cannot specify HTTP headers"
+            );
+            for (header, environment) in &mcp.header_env {
+                validate_mcp_header_name(header)?;
+                environment_name("MCP header environment reference", environment)?;
+            }
         }
         for (name, url) in &self.external_agents {
             alias("external agent", name)?;
@@ -1357,6 +1413,69 @@ fn environment_name(label: &str, value: &str) -> Result<()> {
                 || byte.is_ascii_alphabetic()
                 || (i > 0 && byte.is_ascii_digit())),
         "{label} must be a portable environment variable name"
+    );
+    Ok(())
+}
+
+fn validate_mcp_tool_glob(pattern: &str) -> Result<()> {
+    ensure!(
+        !pattern.is_empty()
+            && pattern.chars().count() <= 256
+            && !pattern.chars().any(char::is_control)
+            && !pattern
+                .chars()
+                .any(|character| matches!(character, '[' | ']' | '{' | '}')),
+        "MCP tool globs must be 1–256 non-control characters and support only * and ? wildcards"
+    );
+    Ok(())
+}
+
+fn mcp_tool_glob_matches(pattern: &str, name: &str) -> bool {
+    let name = name.chars().collect::<Vec<_>>();
+    let mut previous = vec![false; name.len() + 1];
+    previous[0] = true;
+    for pattern_character in pattern.chars() {
+        let mut next = vec![false; previous.len()];
+        if pattern_character == '*' {
+            next[0] = previous[0];
+        }
+        for index in 1..next.len() {
+            next[index] = match pattern_character {
+                '*' => previous[index] || next[index - 1],
+                '?' => previous[index - 1],
+                ordinary => previous[index - 1] && ordinary == name[index - 1],
+            };
+        }
+        previous = next;
+    }
+    previous[name.len()]
+}
+
+fn validate_mcp_header_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 128
+            && name
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte) }),
+        "MCP static header names must be valid bounded HTTP field names"
+    );
+    ensure!(
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "accept"
+                | "connection"
+                | "content-length"
+                | "content-type"
+                | "host"
+                | "mcp-protocol-version"
+                | "mcp-session-id"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        ),
+        "MCP static header name is reserved for HTTP or MCP protocol ownership"
     );
     Ok(())
 }
@@ -1828,6 +1947,9 @@ fn derive_manifest(
         }
     }
     for (name, mcp) in &config.mcp {
+        if !mcp.enabled {
+            continue;
+        }
         let path = format!("mcp.{name}");
         let mcp_origins = automatic_origins(origins, &path);
         if !mcp_origins.is_empty() {
@@ -1841,7 +1963,14 @@ fn derive_manifest(
                 push_claim(
                     &mut claims,
                     category,
-                    (name, &mcp.command, &mcp.args, &mcp.env),
+                    (
+                        name,
+                        &mcp.command,
+                        &mcp.args,
+                        &mcp.env,
+                        &mcp.allow_tools,
+                        &mcp.deny_tools,
+                    ),
                     &mcp_origins,
                     format!("{display_name}: configured executable"),
                 )?;
@@ -1849,7 +1978,13 @@ fn derive_manifest(
                 push_claim(
                     &mut claims,
                     category,
-                    (name, &mcp.url),
+                    (
+                        name,
+                        &mcp.url,
+                        &mcp.allow_tools,
+                        &mcp.deny_tools,
+                        &mcp.header_env,
+                    ),
                     &mcp_origins,
                     format!("{display_name}: HTTP endpoint"),
                 )?;

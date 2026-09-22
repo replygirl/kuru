@@ -9,7 +9,9 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use kuru_connectors::permissions::{PermissionBinding, PermissionService};
-use kuru_connectors::{CheckpointStore, McpStatus, Provider, ToolHost, provider};
+use kuru_connectors::{
+    CheckpointStore, McpAvailability, McpCatalogStore, McpStatus, Provider, ToolHost, provider,
+};
 use kuru_core::{
     AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
     ProjectPreferences, SafeManifest,
@@ -928,6 +930,22 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         return result;
     }
 
+    // Catalog inspection needs the reviewed tool/MCP authority, but it must
+    // remain independent of project memory and its configured runtime. Use
+    // defaults for memory-backed preferences and return before deriving a
+    // memory scope, lease, or store path.
+    if matches!(cli.command, Some(Command::Tools)) {
+        let config = snapshot.finalize(&ProjectPreferences::default())?;
+        let host = permission_host(&data, root.clone(), &config, &snapshot, false)?;
+        let catalog = host.catalog().await;
+        let cleanup = host.shutdown().await;
+        let catalog = catalog?;
+        report_mcp_statuses(catalog.mcp());
+        println!("{}", serde_json::to_string_pretty(&catalog)?);
+        cleanup?;
+        return Ok(());
+    }
+
     let scope = kuru_runtime::project_scope(&cwd)?;
     let memory_config = snapshot.memory_config().clone();
     let writer = matches!(
@@ -1123,16 +1141,6 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 cleanup?;
                 return Ok(());
             }
-            Some(Command::Tools) => {
-                let host = permission_host(&data, root.clone(), &config, &snapshot, false)?;
-                let catalog = host.catalog().await;
-                let cleanup = host.shutdown().await;
-                let catalog = catalog?;
-                report_mcp_statuses(catalog.mcp());
-                println!("{}", serde_json::to_string_pretty(catalog.tools())?);
-                cleanup?;
-                return Ok(());
-            }
             Some(Command::File { command }) => {
                 match command {
                     FileCommand::Undo { id } => {
@@ -1314,10 +1322,16 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
 
 fn report_mcp_statuses(statuses: &[McpStatus]) {
     for status in statuses {
-        if status.available() {
+        if status.available() && status.diagnostic().is_none() {
             continue;
         }
-        eprintln!("MCP {}: configured server unavailable", status.alias());
+        let state = match status.availability() {
+            McpAvailability::Disabled => "disabled",
+            McpAvailability::Live => "live; cache update unavailable",
+            McpAvailability::Stale => "stale cached metadata; server unavailable",
+            McpAvailability::Degraded => "configured server unavailable",
+        };
+        eprintln!("MCP {}: {state}", status.alias());
         if let Some(diagnostic) = status.diagnostic() {
             eprintln!("{diagnostic}");
         }
@@ -1334,7 +1348,12 @@ fn permission_host(
     let binding = PermissionBinding::checked(&root, snapshot.manifest().full_digest(), config)?;
     let store = Arc::new(GrantStore::new(data, root.clone(), binding.clone())?);
     let permissions = Arc::new(PermissionService::new(config.clone(), binding, store)?);
-    let host = ToolHost::with_permission_service(root.clone(), config, permissions)?;
+    let host = ToolHost::with_permission_service(root.clone(), config, permissions)?
+        .with_mcp_catalog_store(Arc::new(McpCatalogStore::new(
+            data,
+            root.clone(),
+            snapshot.manifest().full_digest(),
+        )?))?;
     if checkpoints {
         host.with_checkpoint_store(Arc::new(CheckpointStore::new(data, root)?))
     } else {
@@ -1381,7 +1400,14 @@ fn command_claim_categories(
             Category::MemoryCacheDir,
             Category::ResponsesRoute,
         ],
-        Some(Command::Tool { .. } | Command::Tools) => &[
+        Some(Command::Tools) => &[
+            Category::WorkspaceWrite,
+            Category::Shell,
+            Category::ToolPermissions,
+            Category::McpStdio,
+            Category::McpHttp,
+        ],
+        Some(Command::Tool { .. }) => &[
             Category::WorkspaceWrite,
             Category::Shell,
             Category::ToolPermissions,
@@ -1714,6 +1740,18 @@ async fn build_windows_source(source: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod permission_tests {
     use super::*;
+
+    #[test]
+    fn tools_inspection_activates_tool_authority_without_unrelated_memory_claims() {
+        let command = Command::Tools;
+        let claims = command_claim_categories(Some(&command));
+        assert!(claims.contains(&AuthorityClaimCategory::ToolPermissions));
+        assert!(claims.contains(&AuthorityClaimCategory::McpStdio));
+        assert!(claims.contains(&AuthorityClaimCategory::McpHttp));
+        assert!(!claims.contains(&AuthorityClaimCategory::MemoryDoltBinary));
+        assert!(!claims.contains(&AuthorityClaimCategory::MemoryCacheDir));
+        assert!(!claims.contains(&AuthorityClaimCategory::ResponsesRoute));
+    }
 
     #[tokio::test]
     async fn automatic_permission_claim_is_reviewed_but_trust_does_not_grant_a_call() {

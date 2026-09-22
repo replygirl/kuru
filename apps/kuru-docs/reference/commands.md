@@ -73,7 +73,7 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru memory export`                    | Export every application record from one committed active-memory snapshot                   |
 | `kuru dream`                            | Run explicit consolidation                                                                  |
 | `kuru undo-dream`                       | Restore the previous topology change                                                        |
-| `kuru tools`                            | Discover built-in and configured MCP tools                                                  |
+| `kuru tools`                            | Inspect filtered tools and disabled/live/stale/degraded MCP aliases                         |
 | `kuru tool NAME --args '{}'`            | Invoke a tool with JSON arguments                                                           |
 | `kuru serve`                            | Start authenticated loopback [A2A ingress](./a2a)                                           |
 | `kuru update`                           | [Install an explicit release or source checkout](/guide/installation#update-deliberately)   |

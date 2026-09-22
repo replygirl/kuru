@@ -1327,6 +1327,8 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
 
     if full {
         terminal.command("/help", None)?;
+        terminal.command("/tools", None)?;
+        terminal.wait_composer_frame(&["\"mcp\": []", "enter send"], READY_TIMEOUT)?;
         let resume = terminal.pause_for(Duration::from_secs(1))?;
         terminal.command("hello from a terminal", None)?;
         drop(resume);

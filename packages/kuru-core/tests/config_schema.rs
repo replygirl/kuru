@@ -167,6 +167,46 @@ fn native_validation_keeps_cross_field_rules_authoritative() {
 }
 
 #[test]
+fn mcp_catalog_controls_keep_native_and_schema_validation_in_parity() {
+    let validator = schema();
+    for text in [
+        "[mcp.remote]\nurl='https://example.test/mcp'\nenabled=false\nallow_tools=['read_*']\ndeny_tools=['read_secret']\nheader_env={Authorization='MCP_AUTH'}",
+        "[mcp.local]\ncommand='runner'\nenabled=true\nallow_tools=['inspect?']",
+    ] {
+        assert!(validator.is_valid(&json_from_toml(text)), "schema: {text}");
+        parse_config(text).unwrap();
+    }
+
+    for text in [
+        "[mcp.local]\ncommand='runner'\nheader_env={Authorization='MCP_AUTH'}",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={Host='MCP_HOST'}",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={'bad name'='MCP_AUTH'}",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={Authorization='BAD-NAME'}",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nallow_tools=['bad[set]']",
+        "[mcp.remote]\nurl='https://example.test/mcp'\ndeny_tools=['']",
+    ] {
+        assert!(!validator.is_valid(&json_from_toml(text)), "schema: {text}");
+        assert!(parse_config(text).is_err(), "parser: {text}");
+    }
+
+    let too_many = (0..129)
+        .map(|index| format!("'tool{index}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let text = format!("[mcp.remote]\nurl='https://example.test/mcp'\nallow_tools=[{too_many}]");
+    assert!(!validator.is_valid(&json_from_toml(&text)));
+    assert!(parse_config(&text).is_err());
+
+    let too_many = (0..33)
+        .map(|index| format!("X-Header-{index}='MCP_HEADER_{index}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let text = format!("[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={{{too_many}}}");
+    assert!(!validator.is_valid(&json_from_toml(&text)));
+    assert!(parse_config(&text).is_err());
+}
+
+#[test]
 fn permission_schema_and_parser_agree_on_documented_and_invalid_rules() {
     let validator = schema();
     let documented = concat!(

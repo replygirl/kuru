@@ -2336,9 +2336,9 @@ async fn dispatch_controlled(
     if command.starts_with('/') && registered.is_none() && custom_prompt.is_none() {
         anyhow::bail!("unknown command; use /help");
     }
-    // File checkpoint inspection and explicit recovery use their own checked
-    // private store. An unrelated uncertain memory write must not hide the
-    // evidence or strand a selected file undo/discard action.
+    // File checkpoint inspection/recovery and the tool catalog use their own
+    // checked stores and authority. An unrelated uncertain memory write must
+    // not hide their evidence or strand an explicit recovery action.
     if !matches!(
         registered.map(|request| request.id),
         Some(
@@ -2346,6 +2346,7 @@ async fn dispatch_controlled(
                 | CommandId::FileInspect
                 | CommandId::FilePrune
                 | CommandId::FileUndo
+                | CommandId::Tools
         )
     ) {
         harness.reconcile().await?;
@@ -2406,6 +2407,10 @@ async fn dispatch_controlled(
             serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?
         }
         Some(CommandId::Cost) => format_session_usage(&harness.session_usage().await?),
+        Some(CommandId::Tools) => {
+            ensure!(args.is_empty(), "usage: /tools");
+            serde_json::to_string_pretty(&harness.tool_catalog().await?)?
+        }
         Some(CommandId::FileCheckpoints) => {
             ensure!(args.is_empty(), "usage: /file-checkpoints");
             serde_json::to_string_pretty(&harness.file_checkpoints(100)?)?

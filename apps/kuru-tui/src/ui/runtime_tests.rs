@@ -169,6 +169,16 @@ async fn assert_runtime_projection(view: &View, harness: &Arc<tokio::sync::Mutex
 async fn slash_commands_change_real_runtime_state_and_validate_errors() {
     let (_dir, mut h, models) = fixture().await;
     assert!(command_text(dispatch(&mut h, &models, "/parts").await.unwrap()).contains("manager"));
+    let tools: serde_json::Value = serde_json::from_str(&command_text(
+        dispatch(&mut h, &models, "/tools").await.unwrap(),
+    ))
+    .unwrap();
+    assert!(
+        tools["tools"]
+            .as_array()
+            .is_some_and(|tools| { tools.iter().any(|tool| tool["name"] == "file_read") })
+    );
+    assert_eq!(tools["mcp"], serde_json::json!([]));
     dispatch(&mut h, &models, "/mode freudian").await.unwrap();
     assert_eq!(h.config.mode, Mode::Freudian);
     dispatch(&mut h, &models, "/model demo").await.unwrap();
