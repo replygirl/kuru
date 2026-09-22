@@ -652,6 +652,7 @@ const fn native_label(name: NativeTool) -> &'static str {
         NativeTool::FileWrite => "file write",
         NativeTool::FileDelete => "file delete",
         NativeTool::Shell => "shell",
+        NativeTool::WebFetch => "web fetch",
     }
 }
 

@@ -13,7 +13,7 @@ kuru -C /path/to/project tool file_read --args '{"path":"README.md"}'
 
 ## Built-in tools
 
-A [`[[permissions]]` rule](./configuration#tool-permissions) can `allow`, `ask`, or `deny` any of these by exact name, and can additionally pattern-match the two file-mutation tools by anchored, project-relative path. Absent a matching rule, reads and listing stay allowed; `file_write`/`file_delete` fall back to `allow_write` and `shell` falls back to `allow_shell` — both now mean _ask_, not a hard block. Add an explicit `deny` rule to refuse a tool outright.
+A [`[[permissions]]` rule](./configuration#tool-permissions) can `allow`, `ask`, or `deny` any of these by exact name, and can additionally pattern-match the two file-mutation tools by anchored, project-relative path. Absent a matching rule, reads and listing stay allowed; `file_write`/`file_delete` fall back to `allow_write`, while `shell` and `web_fetch` ask for approval. Add an explicit `deny` rule to refuse a tool outright.
 
 | Tool          | Arguments                        | Permission fallback              |
 | ------------- | -------------------------------- | -------------------------------- |
@@ -22,6 +22,7 @@ A [`[[permissions]]` rule](./configuration#tool-permissions) can `allow`, `ask`,
 | `file_write`  | `path`, `content`                | `allow_write` → ask              |
 | `file_delete` | `path`                           | `allow_write` → ask              |
 | `shell`       | `command`, optional `timeout_ms` | `allow_shell` → ask              |
+| `web_fetch`   | `url`                            | Ask                              |
 
 For an explicit write:
 
@@ -29,6 +30,12 @@ For an explicit write:
 kuru --allow-write tool file_write \
   --args '{"path":"notes.txt","content":"A working note."}'
 ```
+
+## Web fetch authority
+
+`web_fetch` retrieves a UTF-8 document from a public HTTP(S) address only after the normal permission decision. It rejects URLs with credentials and rechecks every connection and redirect target, refusing loopback, private, link-local, multicast, unspecified, IPv4-mapped IPv6, carrier-grade NAT, and other special-purpose destinations. It follows at most five redirects, uses a 20-second operation deadline, accepts at most 2 MiB of response bytes, and returns at most 64 KiB. Its result records total `body_bytes`, retained `content_bytes`, `truncated`, and `untrusted: true`. Proxy, provider, and MCP credentials or headers are never forwarded.
+
+Fetched text is untrusted tool data. It can inform the current response but cannot add instructions, change workspace trust, widen permissions, or authorize later tool calls. Kuru currently refuses compressed content rather than accepting an unbounded decompressor.
 
 ## File boundaries
 

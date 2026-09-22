@@ -150,7 +150,7 @@ selector = { kind = "a2a", alias = "research_peer" }
 ```
 
 Selectors use exact native names (`file_read`, `file_list`, `file_write`,
-`file_delete`, `shell`), an MCP configuration alias and original server tool
+`file_delete`, `shell`, `web_fetch`), an MCP configuration alias and original server tool
 name, or an outbound A2A configuration alias. MCP's provider-facing hashed tool
 name is not a permission selector. File patterns are anchored to the validated
 project-relative path; they cannot authorize an outside or protected target.
