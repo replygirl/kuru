@@ -23,4 +23,4 @@
 
 ## 5. Delivery verification [critical]
 
-- [x] 5.1 @regression (agent) run the sole normal workspace coverage writer on the final source -> the 702.55-second writer succeeds and saves `target/coverage.lcov`.
+- [ ] 5.1 @regression (agent) run the sole normal workspace coverage writer on the corrected final source -> the prior 702.55-second writer succeeded, but Windows job `106709090309` exposed a test-only closed-listener timing variance: its fixed coarse timeout is also valid alongside its fixed coarse connection failure. The reviewed assertion now accepts only those two outcomes and the qualified focused fixture passed 1/1 locally; corrected normal writer and exact-head native CI remain pending.

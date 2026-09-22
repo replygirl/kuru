@@ -631,7 +631,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.to_string(), "web fetch connection failed");
+        assert!(matches!(
+            error.to_string().as_str(),
+            "web fetch connection failed" | "web fetch timed out"
+        ));
         assert!(!format!("{error:#}").contains("do-not-project"));
     }
 
