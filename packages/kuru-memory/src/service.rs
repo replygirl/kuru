@@ -856,7 +856,10 @@ impl EndpointRecord {
         let directory = crate::files::open_directory(
             &Self::directory(data_dir, &self.authority.project_scope)?,
             Privacy::OwnerOnly,
-            NameRetention::Pinned,
+            // Windows needs the retained endpoint handle to share deletion with
+            // the checked DELETE handle opened by remove_file. The owner lock
+            // and exact generation/secret check still guard this name.
+            NameRetention::Movable,
         )?;
         let name = OsStr::new("endpoint.json");
         let mut file = match directory.read(name) {

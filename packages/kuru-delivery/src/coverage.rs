@@ -728,9 +728,18 @@ pub async fn dispatch_test(
     }
     #[cfg(windows)]
     let status = {
-        use kuru_platform::windows::process::{NativeSpawnSpec, StandardStream, inherited_stdio};
+        use kuru_platform::windows::process::{
+            Lifetime, NativeSpawnSpec, StandardStream, inherited_stdio,
+        };
 
         let mut spec = NativeSpawnSpec::new(executable_path, std::env::current_dir()?);
+        // Only the verified memory test artifact exercises an owner that must
+        // outlive its starter. Its test process remains in a kill-on-close Job,
+        // but that Job permits the service's explicit native breakaway. All
+        // other test artifacts retain the ordinary owned Job policy.
+        if needs_independent_service_lifetime(artifact) {
+            spec.lifetime = Lifetime::FixtureBreakawayJob;
+        }
         spec.args = args.iter().map(OsString::from).collect();
         spec.environment = std::env::vars_os().collect();
         spec.stdin = inherited_stdio(StandardStream::Input)?;
@@ -765,6 +774,14 @@ pub async fn dispatch_test(
         },
     )?;
     Ok(Some(status))
+}
+
+#[cfg(windows)]
+fn needs_independent_service_lifetime(artifact: &Artifact) -> bool {
+    artifact.package == "kuru-memory"
+        && artifact.package_root == "packages/kuru-memory"
+        && artifact.target_kind.len() == 1
+        && artifact.target_kind[0] == "lib"
 }
 
 pub fn validate_run_ledger(
@@ -1575,6 +1592,19 @@ mod tests {
             filenames: vec![format!("debug/deps/{package}.exe")],
             executable: Some(format!("debug/deps/{package}.exe")),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn coverage_breakaway_is_limited_to_the_verified_memory_library_artifact() {
+        let mut memory = receipt_artifact("kuru-memory");
+        assert!(needs_independent_service_lifetime(&memory));
+        memory.target_kind = vec!["test".to_owned()];
+        assert!(!needs_independent_service_lifetime(&memory));
+        let mut runtime = receipt_artifact("kuru-runtime");
+        assert!(!needs_independent_service_lifetime(&runtime));
+        runtime.package = "kuru-memory".to_owned();
+        assert!(!needs_independent_service_lifetime(&runtime));
     }
 
     struct AggregateFixture {
