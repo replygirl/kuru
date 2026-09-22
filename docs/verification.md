@@ -44,7 +44,11 @@ loopback release metadata, verifies its bundled engine, and exercises an offline
 conversation and durable reopen. This proves staged installation and runtime
 behavior; it is not a test of downloading the release from public GitHub.
 Documentation builds in parallel with staged acceptance. Documentation deployment
-must succeed before the final publication job. See [release operations](release.md)
+must succeed before publication. A separate post-publication Windows job checks
+the exact immutable public download through ordinary mise installation and a
+cold offline conversation/reopen, retaining its cleanup-confirmed receipt as an
+Actions artifact. Its failure is visible without mutating the release; retry
+that job on the same release run. See [release operations](release.md)
 for the complete ordering and recovery contract.
 
 The following evidence applies to v0.3.2 at

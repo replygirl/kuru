@@ -4,7 +4,8 @@ Kuru releases use one manually dispatched workflow with a version bump as its
 only input. The workflow validates the source, creates a signed version commit
 when necessary, builds all five native archives, generates Communiqué notes,
 assembles and tests the complete candidate, deploys documentation from that exact
-commit, and publishes the release only from its final job.
+commit, and publishes the release only after those gates succeed. A separate
+post-publication Windows job then verifies the immutable public download.
 Pushes and tags do not start release publication or deploy documentation.
 
 ## One-time setup
@@ -35,7 +36,7 @@ The app token also allows normal push CI to run for the version commit.
 
 Configure Pages to use GitHub Actions. Documentation builds and publishes through
 the `build-docs` and `deploy-docs` jobs of `.github/workflows/release.yml` before
-the final public-release job.
+the public-release job.
 The build job has `contents: read` and `pages: read`; only the deploy job receives
 `pages: write` and `id-token: write`. There is no standalone Pages workflow.
 
@@ -121,7 +122,7 @@ runtime is involved.
 7. Run `deploy-docs` only after both staged Windows acceptance and `build-docs`
    succeed. Pages deployment and GitHub release promotion are separate service
    operations; this ordering does not claim they update atomically.
-8. Run `publish` as the sole final job. It consumes the same candidate, rechecks
+8. Run `publish` after the acceptance gates. It consumes the same candidate, rechecks
    the five archives and existing `SHA256SUMS`, creates or reuses the immutable
    annotated tag, stages notes and release assets in a draft, verifies uploaded
    digests, and only then promotes the release. A matching complete published
@@ -176,18 +177,28 @@ JSON on stdout. This proves the exact staged package through the native mise
 path, not availability or download behavior from the public GitHub release.
 
 `deploy-docs` depends on this native check and the independent docs build. The
-final `publish` job depends on successful deployment and has no child jobs, so a
+`publish` job depends on successful deployment, so a
 candidate, Windows, docs-build or docs-deployment failure leaves no public Kuru
 release. If Pages deploys and final publication then fails, rerun the failed
 publication work in the same Release run; the workflow does not claim that Pages
 and GitHub Releases commit atomically.
 
-The delivery package retains `verify:published-windows` as an optional maintainer
-diagnostic after publication. It resolves the actual public tag and asset
-inventory, installs through the unmodified public mise route, verifies the
-published bytes and bundled runtime, and writes its bounded cleanup-confirmed
-receipt. This diagnostic is not a required Release workflow gate and must not be
-inferred from successful staged loopback acceptance.
+After `publish` succeeds, `verify-published-windows` runs on Windows from the
+same selected release commit. It invokes the delivery package's existing
+`verify:published-windows` task with the exact version, expected commit and run
+URL. It resolves the public tag and asset inventory, verifies checksums, installs
+through the unmodified public mise route, and exercises a cold offline
+conversation and durable reopen with the bundled engine. Its cleanup-confirmed
+receipt is retained as the `published-windows-<version>-<attempt>` Actions artifact.
+
+This job has read-only repository permissions and no publication credentials.
+A failed download or runtime check makes the release run fail visibly, while the
+already published release remains unchanged. Publication and public-download
+verification are separate results: staged acceptance cannot prove public
+availability, and a later availability failure does not undo publication.
+Rerun the failed job on the same Release run to retain its original version and
+commit; do not dispatch another release or replace immutable assets to repeat
+the check. The package task also remains available for manual diagnostics.
 
 ## Notes model and configuration
 
