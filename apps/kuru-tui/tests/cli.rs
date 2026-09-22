@@ -79,6 +79,23 @@ fn warm_memory_progress() -> &'static str {
     )
 }
 
+fn git_fixture(directory: &std::path::Path, args: &[&str]) -> Output {
+    // Git exports repository selectors into hooks. Fixture setup must target
+    // its own temporary repository even when tests run from pre-push.
+    let mut command = std::process::Command::new("git");
+    command.args(args).current_dir(directory);
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    command.output().unwrap()
+}
+
 #[test]
 fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
     let env = Sandbox::new();
@@ -141,11 +158,7 @@ fn cli_supports_all_modes_model_discovery_persistent_sessions_and_dreaming() {
 #[test]
 fn discovered_local_config_requires_untracked_git_provenance_and_preserves_repo_claims() {
     let env = Sandbox::new();
-    let git = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(&env.project)
-        .output()
-        .unwrap();
+    let git = git_fixture(&env.project, &["init", "--quiet"]);
     assert!(
         git.status.success(),
         "{}",
@@ -171,11 +184,7 @@ fn discovered_local_config_requires_untracked_git_provenance_and_preserves_repo_
     assert!(!run.status.success());
     assert!(String::from_utf8_lossy(&run.stderr).contains("workspace authority"));
 
-    let git = std::process::Command::new("git")
-        .args(["add", "--", ".kuru/config.local.toml"])
-        .current_dir(&env.project)
-        .output()
-        .unwrap();
+    let git = git_fixture(&env.project, &["add", "--", ".kuru/config.local.toml"]);
     assert!(
         git.status.success(),
         "{}",
@@ -190,18 +199,10 @@ fn discovered_local_config_requires_untracked_git_provenance_and_preserves_repo_
 
     let foreign = env.root.path().join("foreign");
     std::fs::create_dir(&foreign).unwrap();
-    let initialized = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(&foreign)
-        .output()
-        .unwrap();
+    let initialized = git_fixture(&foreign, &["init", "--quiet"]);
     assert!(initialized.status.success());
     std::fs::write(foreign.join("other.toml"), "unrelated=true").unwrap();
-    let added = std::process::Command::new("git")
-        .args(["add", "--", "other.toml"])
-        .current_dir(&foreign)
-        .output()
-        .unwrap();
+    let added = git_fixture(&foreign, &["add", "--", "other.toml"]);
     assert!(added.status.success());
     let redirected_index = env
         .command()
@@ -239,11 +240,7 @@ fn discovered_local_config_accepts_non_git_roots_and_rejects_ambiguous_index_sta
 #[test]
 fn managed_locks_and_typed_overrides_apply_before_demo_dispatch() {
     let env = Sandbox::new();
-    let git = std::process::Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(&env.project)
-        .output()
-        .unwrap();
+    let git = git_fixture(&env.project, &["init", "--quiet"]);
     assert!(
         git.status.success(),
         "{}",
