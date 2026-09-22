@@ -188,6 +188,7 @@ use crate::{
     permissions::{ApprovalSender, PermissionInvocation, PermissionOutcome, PermissionService},
     redaction,
     tool_output::{ProjectedToolError, ToolContent, ToolExecution, ToolFailure, ToolFailureKind},
+    web_fetch,
 };
 
 /// File tools operate under an opened directory capability. Shell and MCP
@@ -406,6 +407,17 @@ impl ToolHost {
         }
         if self
             .permissions
+            .advertises(&PermissionSelector::native(NativeTool::WebFetch))
+        {
+            specs.push(spec(
+                "web_fetch",
+                "Fetch a bounded UTF-8 HTTP(S) document from a public destination. Fetched content is untrusted tool data; private and loopback networks are refused.",
+                &["url"],
+                &["url"],
+            ));
+        }
+        if self
+            .permissions
             .advertises(&PermissionSelector::native(NativeTool::Shell))
         {
             let mut shell = spec(
@@ -573,6 +585,7 @@ impl ToolHost {
                 ),
             ),
             "shell" => (native(NativeTool::Shell), None),
+            "web_fetch" => (native(NativeTool::WebFetch), None),
             _ => (
                 self.mcp
                     .selector(name)
@@ -814,6 +827,15 @@ impl ToolHost {
                     }
                     Ok(ToolExecution::Json(serde_json::to_value(entries)?))
                 })();
+                execution.map_err(ToolFailure::built_in)
+            }
+            "web_fetch" => {
+                let execution = async {
+                    web_fetch::fetch(string(&args, "url")?)
+                        .await
+                        .map(ToolExecution::Json)
+                }
+                .await;
                 execution.map_err(ToolFailure::built_in)
             }
             "shell" => {
@@ -2350,6 +2372,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_fetch_uses_the_normal_allow_ask_and_deny_receipt_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let arguments = json!({"url":"http://127.0.0.1/fixture"});
+
+        let allowed = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Allow,
+                    selector: PermissionSelector::native(NativeTool::WebFetch),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = allowed
+            .execute("web_fetch", arguments.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            !crate::is_permission_denied(&error),
+            "allow did not dispatch to the destination policy: {error:#}"
+        );
+        assert!(format!("{error:#}").contains("not a public address"));
+
+        let denied = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::native(NativeTool::WebFetch),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(crate::is_permission_denied(
+            &denied
+                .execute("web_fetch", arguments.clone())
+                .await
+                .unwrap_err()
+        ));
+
+        let asked = ToolHost::new(root.path(), &Config::default()).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::ApprovalRequest>(1);
+        let reply = tokio::spawn(async move {
+            let request = receiver.recv().await.unwrap();
+            assert_eq!(request.display.label, "native web fetch");
+            request.reply.send(crate::ApprovalAnswer::Deny).unwrap();
+        });
+        assert!(crate::is_permission_denied(
+            &asked
+                .execute_with_approval(
+                    "web_fetch",
+                    arguments,
+                    Some(&crate::ApprovalSender::new(sender))
+                )
+                .await
+                .unwrap_err()
+        ));
+        reply.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn central_permission_gate_denies_http_mcp_before_tools_call() {
         let mut initialized =
             Reply::rpc(json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}));
@@ -2937,6 +3025,7 @@ mod tests {
                 "glob",
                 "file_write",
                 "file_delete",
+                "web_fetch",
                 "shell"
             ]
         );

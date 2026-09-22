@@ -71,8 +71,19 @@ fn overlapping_rules_ignore_array_order_and_legacy_flags_are_only_fallbacks() {
             PermissionAction::Ask
         );
     }
+    for name in [NativeTool::Shell, NativeTool::WebFetch] {
+        assert_eq!(
+            config.permission_decision(&PermissionSelector::native(name), None),
+            PermissionAction::Ask
+        );
+    }
+    config.allow_shell = true;
     assert_eq!(
         config.permission_decision(&PermissionSelector::native(NativeTool::Shell), None),
+        PermissionAction::Allow
+    );
+    assert_eq!(
+        config.permission_decision(&PermissionSelector::native(NativeTool::WebFetch), None),
         PermissionAction::Ask
     );
     for name in [NativeTool::FileRead, NativeTool::FileList] {

@@ -37,11 +37,12 @@ pub enum NativeTool {
     FileWrite,
     FileDelete,
     Shell,
+    WebFetch,
 }
 
 impl NativeTool {
     pub const fn is_file(self) -> bool {
-        !matches!(self, Self::Shell)
+        !matches!(self, Self::Shell | Self::WebFetch)
     }
 }
 
@@ -309,6 +310,9 @@ pub fn decide(
                 PermissionAction::Ask
             }
         }
+        PermissionSelector::Native {
+            name: NativeTool::WebFetch,
+        } => PermissionAction::Ask,
         _ => PermissionAction::Allow,
     })
 }

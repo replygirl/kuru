@@ -113,7 +113,8 @@
                 "glob",
                 "file_write",
                 "file_delete",
-                "shell"
+                "shell",
+                "web_fetch"
               ]
             }
           }

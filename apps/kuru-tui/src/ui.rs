@@ -816,6 +816,7 @@ fn grant_scope_label(scope: &GrantScope) -> String {
             NativeTool::FileWrite => "native file write".to_owned(),
             NativeTool::FileDelete => "native file delete".to_owned(),
             NativeTool::Shell => "native shell (whole tool)".to_owned(),
+            NativeTool::WebFetch => "native web fetch (whole tool)".to_owned(),
         },
         PermissionSelector::Mcp { alias, tool } => format!("MCP {alias}/{tool} (whole tool)"),
         PermissionSelector::A2a { alias } => format!("external agent {alias} (whole tool)"),

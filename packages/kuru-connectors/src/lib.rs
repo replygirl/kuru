@@ -19,6 +19,7 @@ mod tool_output;
 mod tools;
 #[cfg(unix)]
 mod unix_shell;
+mod web_fetch;
 
 #[cfg(test)]
 mod test_support;
