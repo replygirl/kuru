@@ -148,7 +148,7 @@ pub struct StoredNote {
 /// A bounded suffix of one retained namespace together with its exact durable
 /// row count. Callers can report omission from the actual source, rather than
 /// inferring it from a requested limit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct HistoryWindow {
     pub messages: Vec<Message>,
     pub total_rows: u64,
@@ -655,6 +655,10 @@ pub use export::{ActiveExportSnapshot, ExportCursor, ExportPage, ExportProvenanc
 pub use usage_ledger::UsageLedger;
 
 impl MemoryStore {
+    pub(crate) fn service_instance(&self) -> &str {
+        self.shared.server.instance()
+    }
+
     pub fn exists(data_dir: &Path, project_scope: &str) -> Result<bool> {
         purge::ensure_open_allowed(data_dir, project_scope)?;
         let path = project_directory(data_dir, project_scope)?;
@@ -1100,7 +1104,7 @@ impl MemoryStore {
         .await
     }
 
-    async fn schema_version(&self) -> Result<i32> {
+    pub(crate) async fn schema_version(&self) -> Result<i32> {
         self.readable()?;
         if self.branch == "main" {
             Ok(migrations::CURRENT_VERSION)
