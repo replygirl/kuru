@@ -1,5 +1,9 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    Box::pin(dispatch()).await
+}
+
+async fn dispatch() -> anyhow::Result<()> {
     #[cfg(windows)]
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new("--internal-update-helper"))
