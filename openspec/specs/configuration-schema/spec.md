@@ -76,3 +76,16 @@ P7 SHALL reuse the existing bounded `assumed_context_window_tokens` setting and 
 #### Scenario: Invalid bound
 - **WHEN** the window or reserve is outside documented bounds or uses an unsupported key
 - **THEN** native validation and published schema both reject the configuration.
+
+### Requirement: Native search selector schema parity
+
+The published configuration schema and native parser SHALL recognize `grep`
+and `glob` as exact native permission-selector names. They SHALL retain the
+existing bounded optional native-file path-pattern grammar and reject unknown
+native tool names.
+
+#### Scenario: Search permission rule is published and parsed
+- **WHEN** a configuration permits or denies `grep` or `glob` with an anchored
+  project-relative pattern
+- **THEN** both the JSON schema and native configuration validation accept the
+  same rule shape and apply its normal matching semantics.

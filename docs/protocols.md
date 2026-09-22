@@ -149,8 +149,10 @@ conversation is not evidence of live OpenAI authentication or inference.
 
 | Tool | Inputs | Authority |
 | --- | --- | --- |
-| `file_read` | `path` | Workspace read |
+| `file_read` | `path`, optional `offset`, `limit` | Workspace read |
 | `file_list` | `path` | Workspace listing |
+| `grep` | `pattern`, optional `path`, `include_hidden`, `include_ignored` | Checked project search |
+| `glob` | `pattern`, optional `path`, `include_hidden`, `include_ignored` | Checked project path discovery |
 | `file_write` | `path`, `content` | Requires an effective allow decision or approval |
 | `file_delete` | `path` | Requires an effective allow decision or approval |
 | `shell` | `command` | Requires an effective allow decision or approval |
@@ -182,6 +184,30 @@ slot until cleanup confirms root reap and process-group absence; retained
 observations back off from 100 milliseconds to a one-second maximum without
 abandoning ownership or using stale-PID signaling.
 Windows retains its existing Job-based cleanup.
+
+`grep` and `glob` use Kuru's bundled Rust search components; they never invoke
+an installed `rg` executable. They search only regular UTF-8 project files and
+exclude hidden and repository-ignored paths by default. Set
+`include_hidden` or `include_ignored` independently when that discovery is
+intentional. Search never follows links; it caps candidate files at 10,000,
+individual file snapshots at 2 MiB, matched lines at 8 KiB, and returned
+matches at 2,000. A binary, unreadable, protected, linked, denied, oversized,
+or over-limit target is omitted without exposing its path or content; the
+result's `omitted` object counts the applicable category, including oversized
+matched lines. Each discovered candidate receives its own exact native
+permission evaluation. Search does not request or grant the supplied directory
+as a subtree, so an allow cannot override a more-specific deny. An unresolved
+foreground ask is reported in the result's omission counts and does not disclose
+that candidate.
+
+`file_read` keeps its existing text response when called with only `path`.
+Supplying either `offset` or `limit` selects a page of one-based logical UTF-8
+text lines. The JSON page has `text`, `offset`, `limit`, `line_count`,
+`next_offset` when more lines remain, and `omitted_lines`; pass `next_offset`
+as the next request's `offset`. A supplied offset or limit must be a positive
+integer. Offset zero, a limit outside 1–10,000, an out-of-range page, binary
+text, more than 100,000 lines, or a file over 2 MiB fails without returning
+partial page metadata.
 
 If a built-in shell cannot complete its normal capture or cleanup path, Kuru
 returns one fixed operational category and a 4 KiB credential-projected stderr

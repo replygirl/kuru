@@ -21,6 +21,10 @@ repository = "https://github.com/replygirl/kuru"
 [workspace.dependencies]
 anyhow = "=1.0.104"
 base64 = "=0.23.1"
+ignore = "=0.4.33"
+grep-regex = "=0.1.14"
+grep-matcher = "=0.1.9"
+grep-searcher = "=0.1.17"
 async-trait = "=0.1.92"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

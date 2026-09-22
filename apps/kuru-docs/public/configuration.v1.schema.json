@@ -87,7 +87,9 @@
               "selector": {
                 "properties": {
                   "kind": { "const": "native" },
-                  "name": { "enum": ["file_read", "file_list", "file_write", "file_delete"] }
+                  "name": {
+                    "enum": ["file_read", "file_list", "grep", "glob", "file_write", "file_delete"]
+                  }
                 }
               }
             }
@@ -103,7 +105,17 @@
           "required": ["kind", "name"],
           "properties": {
             "kind": { "const": "native" },
-            "name": { "enum": ["file_read", "file_list", "file_write", "file_delete", "shell"] }
+            "name": {
+              "enum": [
+                "file_read",
+                "file_list",
+                "grep",
+                "glob",
+                "file_write",
+                "file_delete",
+                "shell"
+              ]
+            }
           }
         },
         {

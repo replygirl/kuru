@@ -647,6 +647,8 @@ const fn native_label(name: NativeTool) -> &'static str {
     match name {
         NativeTool::FileRead => "file read",
         NativeTool::FileList => "file list",
+        NativeTool::Grep => "grep",
+        NativeTool::Glob => "glob",
         NativeTool::FileWrite => "file write",
         NativeTool::FileDelete => "file delete",
         NativeTool::Shell => "shell",

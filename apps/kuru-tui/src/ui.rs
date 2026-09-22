@@ -811,6 +811,8 @@ fn grant_scope_label(scope: &GrantScope) -> String {
         PermissionSelector::Native { name } => match name {
             NativeTool::FileRead => "native file read".to_owned(),
             NativeTool::FileList => "native file list".to_owned(),
+            NativeTool::Grep => "native grep".to_owned(),
+            NativeTool::Glob => "native glob".to_owned(),
             NativeTool::FileWrite => "native file write".to_owned(),
             NativeTool::FileDelete => "native file delete".to_owned(),
             NativeTool::Shell => "native shell (whole tool)".to_owned(),
@@ -2537,6 +2539,20 @@ mod tests {
                 metadata: Default::default(),
             }],
         )
+    }
+
+    #[test]
+    fn native_search_grants_name_the_exact_candidate() {
+        for (name, expected) in [
+            (NativeTool::Grep, "native grep · project file notes.txt"),
+            (NativeTool::Glob, "native glob · project file notes.txt"),
+        ] {
+            let scope = GrantScope::ExactFile {
+                selector: PermissionSelector::native(name),
+                target: kuru_core::ProjectRelativeTarget::parse("notes.txt").unwrap(),
+            };
+            assert_eq!(grant_scope_label(&scope), expected);
+        }
     }
 
     #[test]

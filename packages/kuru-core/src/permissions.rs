@@ -32,6 +32,8 @@ impl PermissionAction {
 pub enum NativeTool {
     FileRead,
     FileList,
+    Grep,
+    Glob,
     FileWrite,
     FileDelete,
     Shell,
