@@ -1,3 +1,5 @@
+#[cfg(all(windows, test))]
+use std::io::Write;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
