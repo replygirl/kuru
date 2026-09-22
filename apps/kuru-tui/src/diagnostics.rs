@@ -263,6 +263,8 @@ impl SafeFields {
                 | "attempt"
                 | "elapsed_ms"
                 | "input_tokens"
+                | "cached_input_tokens"
+                | "allowance_tokens"
                 | "output_tokens"
                 | "bytes"
                 | "delay_ms"

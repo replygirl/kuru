@@ -157,6 +157,266 @@ async fn subscription(peer: &Peer) -> (ResponsesProvider, AuthManager, tempfile:
 }
 
 #[tokio::test]
+async fn mapped_native_continuation_fits_at_mixed_boundary_and_keeps_pending_wire_bytes() {
+    let opaque = "fixture-native-output".repeat(160);
+    let tool_reply = || {
+        stream(vec![
+            done(
+                0,
+                json!({"type":"reasoning","encrypted_content":opaque,"summary":[]}),
+            ),
+            done(
+                1,
+                json!({"type":"function_call","call_id":"call-1","name":"file_read","arguments":"{}"}),
+            ),
+            completed(),
+        ])
+    };
+    let peer = Peer::new(vec![
+        tool_reply(),
+        tool_reply(),
+        tool_reply(),
+        message("completed A"),
+        message("completed B"),
+    ])
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    let mut requests = Vec::new();
+    for actor in ["boundary/a", "boundary/b", "boundary/c"] {
+        let mut request = request();
+        request.actor = actor.into();
+        request.model = "gpt-5.6-terra".into();
+        assert_eq!(
+            provider
+                .complete(request.clone())
+                .await
+                .unwrap()
+                .calls()
+                .len(),
+            1
+        );
+        request
+            .messages
+            .push(Message::tool_result("call-1", json!("file content"), false));
+        request.current_message_count = Some(1);
+        requests.push(request);
+    }
+    assert_eq!(
+        provider
+            .complete(requests[0].clone())
+            .await
+            .unwrap()
+            .text_projection(),
+        "completed A"
+    );
+    let sent = peer.requests.lock().await;
+    let final_body = sent[3].body.clone();
+    drop(sent);
+    let final_payload = serde_json::to_vec(&final_body).unwrap();
+    let native_range = 1..3;
+    let (mixed, sizing) = estimate_native_input(
+        ModelRoute::CodexSubscription,
+        &final_body,
+        &final_payload,
+        Some(std::slice::from_ref(&native_range)),
+    )
+    .unwrap();
+    assert_eq!(sizing, ContextSizing::MixedNativeEstimate);
+    let historical = estimated_tokens_for_bytes(final_payload.len() as u64)
+        + native_structural_allowance(&final_body);
+    assert!(
+        mixed < historical,
+        "mixed native sizing should recover this boundary"
+    );
+
+    requests[1].context_budget = Some(
+        ContextBudget::resolve(
+            kuru_core::Sourced::configured_assumption(mixed + 1),
+            None,
+            Some(1),
+        )
+        .unwrap(),
+    );
+    let (sender, mut observed) = mpsc::channel(16);
+    provider
+        .stream(requests[1].clone(), &mut EventSink(sender))
+        .await
+        .unwrap();
+    let Some(ProviderEvent::ContextMeasured(measured)) = observed.try_recv().ok() else {
+        panic!("expected measured context before the permitted request");
+    };
+    assert_eq!(measured.estimated_input_tokens, mixed);
+    assert_eq!(measured.sizing, ContextSizing::MixedNativeEstimate);
+    assert!(measured.native_continuation_mandatory);
+    let sent = peer.requests.lock().await;
+    assert_eq!(sent.len(), 5);
+    assert_eq!(sent[4].body, final_body);
+    assert_eq!(sent[4].body["input"][1]["encrypted_content"], opaque);
+    drop(sent);
+
+    requests[2].context_budget = Some(
+        ContextBudget::resolve(
+            kuru_core::Sourced::configured_assumption(mixed),
+            None,
+            Some(1),
+        )
+        .unwrap(),
+    );
+    let error = provider
+        .stream(requests[2].clone(), &mut DiscardSink)
+        .await
+        .unwrap_err();
+    let fit = error.downcast_ref::<kuru_core::ContextTooLarge>().unwrap();
+    assert!(fit.native_continuation_mandatory);
+    assert_eq!(fit.estimated_input_tokens, mixed);
+    assert_eq!(
+        peer.requests.lock().await.len(),
+        5,
+        "refusal must precede HTTP"
+    );
+}
+
+#[tokio::test]
+async fn successive_native_outputs_keep_all_opaque_ranges_at_the_limit() {
+    let first_opaque = "first-encrypted-output".repeat(120);
+    let second_opaque = "second-encrypted-output".repeat(120);
+    let tool_reply = |opaque: &str, call: &str| {
+        stream(vec![
+            done(
+                0,
+                json!({"type":"reasoning","encrypted_content":opaque,"summary":[]}),
+            ),
+            done(
+                1,
+                json!({"type":"function_call","call_id":call,"name":"file_read","arguments":"{}"}),
+            ),
+            completed(),
+        ])
+    };
+    let peer = Peer::new(vec![
+        tool_reply(&first_opaque, "call-1"),
+        tool_reply(&second_opaque, "call-2"),
+        tool_reply(&first_opaque, "call-1"),
+        tool_reply(&second_opaque, "call-2"),
+        tool_reply(&first_opaque, "call-1"),
+        tool_reply(&second_opaque, "call-2"),
+        message("completed A"),
+        message("completed B"),
+    ])
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    let mut requests = Vec::new();
+    for actor in ["two-hop/a", "two-hop/b", "two-hop/c"] {
+        let mut request = request();
+        request.actor = actor.into();
+        request.model = "gpt-5.6-terra".into();
+        assert_eq!(
+            provider
+                .complete(request.clone())
+                .await
+                .unwrap()
+                .calls()
+                .len(),
+            1
+        );
+        request
+            .messages
+            .push(Message::tool_result("call-1", json!("first result"), false));
+        request.current_message_count = Some(1);
+        assert_eq!(
+            provider
+                .complete(request.clone())
+                .await
+                .unwrap()
+                .calls()
+                .len(),
+            1
+        );
+        request.messages.push(Message::tool_result(
+            "call-2",
+            json!("second result"),
+            false,
+        ));
+        requests.push(request);
+    }
+    assert_eq!(
+        provider
+            .complete(requests[0].clone())
+            .await
+            .unwrap()
+            .text_projection(),
+        "completed A"
+    );
+    let final_body = peer.requests.lock().await[6].body.clone();
+    let final_payload = serde_json::to_vec(&final_body).unwrap();
+    assert_eq!(final_body["input"][1]["encrypted_content"], first_opaque);
+    assert_eq!(final_body["input"][4]["encrypted_content"], second_opaque);
+    let mut visible = final_body.clone();
+    let items = visible["input"].as_array_mut().unwrap();
+    items.drain(4..6);
+    items.drain(1..3);
+    let visible_payload = serde_json::to_vec(&visible).unwrap();
+    let expected = tiktoken_rs::o200k_base_singleton()
+        .count_ordinary(std::str::from_utf8(&visible_payload).unwrap()) as u64
+        + estimated_tokens_for_bytes((final_payload.len() - visible_payload.len()) as u64)
+        + native_structural_allowance(&final_body);
+    let latest_range = 4..6;
+    let (latest_only, _) = estimate_native_input(
+        ModelRoute::CodexSubscription,
+        &final_body,
+        &final_payload,
+        Some(std::slice::from_ref(&latest_range)),
+    )
+    .unwrap();
+    assert_ne!(
+        expected, latest_only,
+        "the earlier opaque item must affect sizing"
+    );
+
+    requests[1].context_budget = Some(
+        ContextBudget::resolve(
+            kuru_core::Sourced::configured_assumption(expected + 1),
+            None,
+            Some(1),
+        )
+        .unwrap(),
+    );
+    let (sender, mut observed) = mpsc::channel(16);
+    provider
+        .stream(requests[1].clone(), &mut EventSink(sender))
+        .await
+        .unwrap();
+    let Some(ProviderEvent::ContextMeasured(measured)) = observed.try_recv().ok() else {
+        panic!("expected measured context before the two-hop request");
+    };
+    assert_eq!(measured.estimated_input_tokens, expected);
+    assert_eq!(measured.sizing, ContextSizing::MixedNativeEstimate);
+    assert!(measured.native_continuation_mandatory);
+    assert_eq!(peer.requests.lock().await[7].body, final_body);
+
+    requests[2].context_budget = Some(
+        ContextBudget::resolve(
+            kuru_core::Sourced::configured_assumption(expected),
+            None,
+            Some(1),
+        )
+        .unwrap(),
+    );
+    let error = provider
+        .stream(requests[2].clone(), &mut DiscardSink)
+        .await
+        .unwrap_err();
+    let fit = error.downcast_ref::<kuru_core::ContextTooLarge>().unwrap();
+    assert!(fit.native_continuation_mandatory);
+    assert_eq!(fit.estimated_input_tokens, expected);
+    assert_eq!(
+        peer.requests.lock().await.len(),
+        8,
+        "refusal must precede HTTP"
+    );
+}
+
+#[tokio::test]
 async fn native_subscription_catalog_and_tool_round_trip_preserve_actor_context() {
     let peer = Peer::new(vec![
         Reply::json(json!({"models":[{"slug":"future-2099","display_name":"Future model","context_window":360000,"max_context_window":720000,"supported_reasoning_levels":[{"effort":"future-effort"},{"effort":"ultra"}],"default_reasoning_level":"future-effort","base_instructions":"IGNORE KURU","experimental_supported_tools":["shell"]}]})),

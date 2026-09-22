@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    ops::Range,
     path::Path,
     pin::Pin,
     sync::Arc,
@@ -11,8 +12,9 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use kuru_core::{
     Completion, CompletionRequest, Config, ContentBlock, ContextBudget, ContextEstimate,
-    ContextSourceKind, ContextSourceSize, Message, ModelInfo, ModelMetadata, ModelRoute, Usage,
-    advertised_metadata, enrich_model, estimated_tokens_for_bytes,
+    ContextSizing, ContextSourceKind, ContextSourceSize, Message, ModelInfo, ModelMetadata,
+    ModelRoute, TokenizerEncoding, Usage, advertised_metadata, enrich_model,
+    estimated_tokens_for_bytes, tokenizer_for_model,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -32,6 +34,88 @@ const SUBSCRIPTION_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
 // This describes the audited catalog wire contract, not Kuru's identity.
 const CATALOG_COMPATIBILITY: &str = "0.154.0";
+
+/// Local BPE counts serialized text, while the provider charges for its own
+/// request envelope. A small positive reserve covers role and tool framing
+/// without claiming to reproduce the provider's undocumented token format.
+/// Short native GPT-5.6 calibration samples found that the serialized BPE
+/// count itself exceeded reported usage, so a large added margin would discard
+/// useful context without improving those observed fits.
+fn native_structural_allowance(body: &Value) -> u64 {
+    let input_items = body["input"].as_array().map_or(0, Vec::len) as u64;
+    let tools = body["tools"].as_array().map_or(0, Vec::len) as u64;
+    64u64
+        .saturating_add(input_items.saturating_mul(8))
+        .saturating_add(tools.saturating_mul(8))
+}
+
+fn estimate_native_input(
+    route: ModelRoute,
+    body: &Value,
+    payload: &[u8],
+    native_output_ranges: Option<&[Range<usize>]>,
+) -> Result<(u64, ContextSizing)> {
+    let allowance = native_structural_allowance(body);
+    let mapping = tokenizer_for_model(
+        route,
+        body["model"]
+            .as_str()
+            .context("Responses body lacks model")?,
+    )?;
+    if matches!(
+        mapping.map(|value| value.value),
+        Some(TokenizerEncoding::O200kBase)
+    ) {
+        let (visible_payload, opaque_bytes, sizing) = if let Some(ranges) = native_output_ranges {
+            // Pending native output is kept byte-for-byte in the actual request.
+            // Only the local sizing copy excludes those items: Kuru already
+            // knows their exact ranges from every saved protocol continuation.
+            // The provider's opaque token representation is unknown, so use
+            // the prior byte heuristic for that range alone.
+            let mut visible = body.clone();
+            let items = visible["input"]
+                .as_array_mut()
+                .context("Responses body input is not an array")?;
+            let mut next_end = items.len();
+            for range in ranges.iter().rev() {
+                ensure!(
+                    range.start <= range.end && range.end <= next_end,
+                    "native output range exceeds Responses input"
+                );
+                next_end = range.start;
+                items.drain(range.clone());
+            }
+            let visible_payload = serde_json::to_vec(&visible)?;
+            ensure!(
+                visible_payload.len() <= payload.len(),
+                "native output removal enlarged Responses body"
+            );
+            let opaque_bytes = (payload.len() - visible_payload.len()) as u64;
+            (
+                visible_payload,
+                opaque_bytes,
+                ContextSizing::MixedNativeEstimate,
+            )
+        } else {
+            (payload.to_vec(), 0, ContextSizing::O200kBaseEstimate)
+        };
+        let serialized =
+            std::str::from_utf8(&visible_payload).context("Responses body is not UTF-8")?;
+        let visible_tokens = tiktoken_rs::o200k_base_singleton().count_ordinary(serialized) as u64;
+        return Ok((
+            visible_tokens
+                .saturating_add(estimated_tokens_for_bytes(opaque_bytes))
+                .saturating_add(allowance),
+            sizing,
+        ));
+    }
+    // Unknown routes preserve the historical byte heuristic plus the small
+    // structural reserve. Neither term is a guaranteed provider-token bound.
+    Ok((
+        estimated_tokens_for_bytes(payload.len() as u64).saturating_add(allowance),
+        ContextSizing::ConservativeByteFallback,
+    ))
+}
 
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -310,6 +394,8 @@ impl Provider for DemoProvider {
 #[derive(Clone)]
 struct Pending {
     input: Vec<Value>,
+    /// Exact positions of older native outputs already retained in `input`.
+    native_output_ranges: Vec<Range<usize>>,
     output: Vec<Value>,
     calls: Vec<String>,
 }
@@ -579,11 +665,18 @@ fn text_message(message: &Message) -> Result<Value> {
     }
 }
 
+struct SelectedInput {
+    items: Vec<Value>,
+    /// `Some` means a live native tool continuation; each range is an exact
+    /// saved provider-output segment in `items`, including prior hops.
+    native_output_ranges: Option<Vec<Range<usize>>>,
+}
+
 fn input_items_selected(
     messages: &[Message],
     pending: Option<&Pending>,
     current_message_count: Option<usize>,
-) -> Result<(Vec<Value>, bool)> {
+) -> Result<SelectedInput> {
     // Validate every block before selecting native continuation records: a
     // matching tool receipt must not let an earlier unsupported block vanish
     // from validation and reach a provider dispatch.
@@ -593,20 +686,20 @@ fn input_items_selected(
     // An absent boundary is a legacy/direct request. Never infer native
     // continuation from historical text or receipt adjacency.
     let Some(current_message_count) = current_message_count else {
-        return Ok((
-            messages.iter().map(text_message).collect::<Result<_>>()?,
-            false,
-        ));
+        return Ok(SelectedInput {
+            items: messages.iter().map(text_message).collect::<Result<_>>()?,
+            native_output_ranges: None,
+        });
     };
     ensure!(
         current_message_count <= messages.len(),
         "current model input boundary exceeds message history"
     );
     let Some(pending) = pending else {
-        return Ok((
-            messages.iter().map(text_message).collect::<Result<_>>()?,
-            false,
-        ));
+        return Ok(SelectedInput {
+            items: messages.iter().map(text_message).collect::<Result<_>>()?,
+            native_output_ranges: None,
+        });
     };
     let current = &messages[messages.len() - current_message_count..];
     let mut found = BTreeMap::new();
@@ -655,23 +748,29 @@ fn input_items_selected(
     // A fresh user turn has no current receipt and starts a new protocol
     // context. Historical receipts remain ordinary safe history.
     if found.is_empty() {
-        return Ok((
-            messages.iter().map(text_message).collect::<Result<_>>()?,
-            false,
-        ));
+        return Ok(SelectedInput {
+            items: messages.iter().map(text_message).collect::<Result<_>>()?,
+            native_output_ranges: None,
+        });
     }
     ensure!(
         found.len() == pending.calls.len(),
         "missing function outputs for pending Responses calls"
     );
     let mut input = pending.input.clone();
+    let mut ranges = pending.native_output_ranges.clone();
+    let output_start = input.len();
     input.extend(pending.output.clone());
+    ranges.push(output_start..input.len());
     for call in &pending.calls {
         let output = &found[call];
         input.push(json!({"type":"function_call_output","call_id":call,"output":output.as_str().map(str::to_owned).unwrap_or_else(|| output.to_string())}));
     }
     input.extend(other_current);
-    Ok((input, true))
+    Ok(SelectedInput {
+        items: input,
+        native_output_ranges: Some(ranges),
+    })
 }
 
 #[cfg(test)]
@@ -680,7 +779,7 @@ fn input_items(
     pending: Option<&Pending>,
     current_message_count: Option<usize>,
 ) -> Result<Vec<Value>> {
-    input_items_selected(messages, pending, current_message_count).map(|(items, _)| items)
+    input_items_selected(messages, pending, current_message_count).map(|selected| selected.items)
 }
 
 fn completion(value: &Value, operation: diagnostics::Operation) -> Result<Completion> {
@@ -869,13 +968,24 @@ impl ResponsesProvider {
         );
         let actor = self.actor(&request.actor).await?;
         let mut pending = actor.lock().await;
-        let (input, native_continuation_mandatory) = input_items_selected(
+        let SelectedInput {
+            items: input,
+            native_output_ranges,
+        } = input_items_selected(
             &request.messages,
             pending.as_ref(),
             request.current_message_count,
         )?;
+        let native_continuation_mandatory = native_output_ranges.is_some();
         let input_bytes = serde_json::to_vec(&input)?.len() as u64;
-        let mut body = json!({"model":request.model,"instructions":request.instructions,"input":input,"store":false,"include":["reasoning.encrypted_content"],"tools":request.tools.iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false})).collect::<Vec<_>>()});
+        let mut tools = request.tools.iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false})).collect::<Vec<_>>();
+        tools.sort_by(|left, right| {
+            left["name"]
+                .as_str()
+                .cmp(&right["name"].as_str())
+                .then_with(|| left.to_string().cmp(&right.to_string()))
+        });
+        let mut body = json!({"model":request.model,"instructions":request.instructions,"input":input,"store":false,"include":["reasoning.encrypted_content"],"tools":tools});
         if let Some(effort) = request.effort {
             body["reasoning"] = json!({"effort":effort});
         }
@@ -905,9 +1015,17 @@ impl ResponsesProvider {
             .context_budget
             .unwrap_or_else(ContextBudget::legacy_default);
         effective_budget.validate()?;
-        let context = ContextEstimate::for_final_body(
+        let (estimated_input_tokens, sizing) = estimate_native_input(
+            self.model_route(),
+            &body,
+            &payload,
+            native_output_ranges.as_deref(),
+        )?;
+        let context = ContextEstimate::from_measured_final_body(
             effective_budget,
             payload.len() as u64,
+            estimated_input_tokens,
+            sizing,
             native_continuation_mandatory,
             vec![
                 source(
@@ -940,6 +1058,15 @@ impl ResponsesProvider {
                 ),
             ],
         );
+        tracing::debug!(
+            target: "kuru.provider",
+            stage = "context_estimate",
+            status = context.sizing.label(),
+            input_tokens = context.estimated_input_tokens,
+            allowance_tokens = native_structural_allowance(&body),
+            bytes = context.final_body_bytes,
+            "native input estimate"
+        );
         sink.emit(ProviderEvent::ContextMeasured(context.clone()))
             .await?;
         context.ensure_fits()?;
@@ -961,11 +1088,22 @@ impl ResponsesProvider {
         )
         .await?;
         let result = completion(&value, operation)?;
+        if let Some(input_tokens) = result.usage.input_tokens {
+            tracing::debug!(
+                target: "kuru.provider",
+                stage = "provider_usage",
+                input_tokens,
+                cached_input_tokens = result.usage.cached_input_tokens.unwrap_or(0),
+                status = if result.usage.cached_input_tokens.is_some() { "cached_reported" } else { "cached_unknown" },
+                "native provider usage"
+            );
+        }
         *pending = if result.calls().is_empty() {
             None
         } else {
             Some(Pending {
                 input,
+                native_output_ranges: native_output_ranges.unwrap_or_default(),
                 output: value["output"]
                     .as_array()
                     .context("missing output")?
@@ -981,6 +1119,157 @@ impl ResponsesProvider {
 mod tests {
     use super::*;
     use crate::test_support::{HttpFixture, Reply, request};
+
+    #[test]
+    fn final_wire_tokenizer_eligibility_and_fallback_are_explicit() {
+        // OpenAI Cookbook, How_to_count_tokens_with_tiktoken.ipynb, checked
+        // 2026-09-22: these o200k_base text examples have six and seven tokens.
+        let tokenizer = tiktoken_rs::o200k_base_singleton();
+        assert_eq!(tokenizer.count_ordinary("tiktoken is great!"), 6);
+        assert_eq!(tokenizer.count_ordinary("2 + 2 = 4"), 7);
+        for input in [
+            "こんにちは、世界。مرحبا بالعالم",
+            "fn answer(input: &[u8]) -> Result<Vec<u8>> { Ok(input.to_vec()) }",
+            "{\"tools\":[{\"name\":\"file_read\",\"parameters\":{\"type\":\"object\"}}]}",
+        ] {
+            let body = json!({"model":"gpt-5.6-sol","instructions":input,"input":[{"role":"user","content":input}],"tools":[]});
+            let payload = serde_json::to_vec(&body).unwrap();
+            let allowance = native_structural_allowance(&body);
+            let expected =
+                tokenizer.count_ordinary(std::str::from_utf8(&payload).unwrap()) as u64 + allowance;
+            assert_eq!(
+                estimate_native_input(ModelRoute::OpenAiResponses, &body, &payload, None).unwrap(),
+                (expected, ContextSizing::O200kBaseEstimate)
+            );
+            assert_eq!(
+                estimate_native_input(ModelRoute::CustomResponses, &body, &payload, None).unwrap(),
+                (
+                    estimated_tokens_for_bytes(payload.len() as u64) + allowance,
+                    ContextSizing::ConservativeByteFallback
+                )
+            );
+            let unknown_body = json!({"model":"gpt-6-astra","instructions":input,"input":[{"role":"user","content":input}],"tools":[]});
+            let unknown_payload = serde_json::to_vec(&unknown_body).unwrap();
+            assert_eq!(
+                estimate_native_input(
+                    ModelRoute::OpenAiResponses,
+                    &unknown_body,
+                    &unknown_payload,
+                    None
+                )
+                .unwrap(),
+                (
+                    estimated_tokens_for_bytes(unknown_payload.len() as u64)
+                        + native_structural_allowance(&unknown_body),
+                    ContextSizing::ConservativeByteFallback
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn mapped_native_output_uses_mixed_estimate_without_changing_wire_body() {
+        let opaque = "encrypted-native-output".repeat(128);
+        let body = json!({
+            "model": "gpt-5.6-terra",
+            "instructions": "Shared instructions",
+            "input": [
+                {"role":"user","content":"こんにちは fn main() {}"},
+                {"type":"reasoning","encrypted_content":opaque},
+                {"type":"function_call","call_id":"call-1","name":"file_read","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call-1","output":"done"}
+            ],
+            "tools": []
+        });
+        let payload = serde_json::to_vec(&body).unwrap();
+        let original = payload.clone();
+        let mut visible = body.clone();
+        visible["input"].as_array_mut().unwrap().drain(1..3);
+        let visible_payload = serde_json::to_vec(&visible).unwrap();
+        let removed_bytes = (payload.len() - visible_payload.len()) as u64;
+        let expected = tiktoken_rs::o200k_base_singleton()
+            .count_ordinary(std::str::from_utf8(&visible_payload).unwrap())
+            as u64
+            + estimated_tokens_for_bytes(removed_bytes)
+            + native_structural_allowance(&body);
+        let native_range = 1..3;
+        assert_eq!(
+            estimate_native_input(
+                ModelRoute::CodexSubscription,
+                &body,
+                &payload,
+                Some(std::slice::from_ref(&native_range))
+            )
+            .unwrap(),
+            (expected, ContextSizing::MixedNativeEstimate)
+        );
+        assert_eq!(payload, original, "sizing must leave the wire bytes intact");
+        assert_eq!(body["input"][1]["encrypted_content"], opaque);
+        assert!(
+            expected
+                < estimated_tokens_for_bytes(payload.len() as u64)
+                    + native_structural_allowance(&body),
+            "this opaque fixture should recover usable context over whole-body fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_custom_wire_matches_preflight_and_stable_tool_order() {
+        let peer = HttpFixture::new(vec![
+            Reply::json(json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"one"}]}]})),
+            Reply::json(json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"two"}]}]})),
+        ]).await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        let mut first = request();
+        first.model = "gpt-5.6-sol".into();
+        first.messages = vec![Message::text("user", "こんにちは fn main() {}")];
+        first.current_message_count = Some(1);
+        first.tools.push(kuru_core::ToolSpec {
+            name: "alpha".into(),
+            description: "First".into(),
+            parameters: json!({"type":"object"}),
+        });
+        let mut second = first.clone();
+        second.actor = "other/part".into();
+        second.tools.reverse();
+        let mut first_events = Events::default();
+        provider.stream(first, &mut first_events).await.unwrap();
+        let mut second_events = Events::default();
+        provider.stream(second, &mut second_events).await.unwrap();
+        let sent = peer.requests.lock().await;
+        assert_eq!(sent[0].body["tools"], sent[1].body["tools"]);
+        assert_eq!(sent[0].body["tools"][0]["name"], "alpha");
+        for (recorded, events) in sent.iter().zip([first_events, second_events]) {
+            let Some(ProviderEvent::ContextMeasured(measured)) = events.0.first() else {
+                panic!("expected measured context before provider response");
+            };
+            let payload = serde_json::to_vec(&recorded.body).unwrap();
+            assert_eq!(measured.final_body_bytes, payload.len() as u64);
+            assert_eq!(measured.sizing, ContextSizing::ConservativeByteFallback);
+            assert_eq!(
+                measured.estimated_input_tokens,
+                estimated_tokens_for_bytes(payload.len() as u64)
+                    + native_structural_allowance(&recorded.body)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_usage_keeps_missing_zero_and_positive_cached_input_distinct() {
+        let replies = [
+            json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"absent"}]}],"usage":{"input_tokens":20,"output_tokens":2}}),
+            json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"zero"}]}],"usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":0},"output_tokens":2}}),
+            json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"positive"}]}],"usage":{"input_tokens":20,"input_tokens_details":{"cached_tokens":8},"output_tokens":2}}),
+        ];
+        let peer = HttpFixture::new(replies.into_iter().map(Reply::json).collect()).await;
+        let provider = ResponsesProvider::new(&peer.url, "").unwrap();
+        for expected in [None, Some(0), Some(8)] {
+            let completed = provider.complete(request()).await.unwrap();
+            assert_eq!(completed.usage.input_tokens, Some(20));
+            assert_eq!(completed.usage.cached_input_tokens, expected);
+        }
+        assert_eq!(peer.requests.lock().await.len(), 3);
+    }
 
     struct ScriptedProvider(Vec<ProviderEvent>);
     #[async_trait]
@@ -1815,6 +2104,7 @@ mod tests {
         }
         let pending = Pending {
             input: vec![],
+            native_output_ranges: vec![],
             output: vec![],
             calls: vec!["a".into(), "b".into()],
         };

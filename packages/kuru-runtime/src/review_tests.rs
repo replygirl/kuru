@@ -1443,6 +1443,103 @@ async fn a_different_speaker_sees_public_answers_but_not_private_memories() {
 }
 
 #[tokio::test]
+async fn different_actors_share_leading_instructions_before_private_identity() {
+    let provider = RecordingProvider::new(|_| reply("Ready"));
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "Shared synthetic project rule for both actors.",
+    )
+    .unwrap();
+    let mut harness = Harness::new(
+        config(Mode::Freudian),
+        dir.path(),
+        MemoryStore::temporary().await.unwrap(),
+        provider.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let first = harness.topology.parts[0].id.clone();
+    let second = harness.topology.parts[1].id.clone();
+    harness.run_for("First task", Some(&first)).await.unwrap();
+    harness.run_for("Second task", Some(&second)).await.unwrap();
+    fn before_identity(instructions: &str) -> &str {
+        instructions
+            .split_once("\nYou are ")
+            .expect("actor identity follows common rules")
+            .0
+    }
+    let common = {
+        let requests = provider.requests.lock().unwrap();
+        let first_request = requests
+            .iter()
+            .find(|request| request.actor.ends_with(&first))
+            .unwrap();
+        let second_request = requests
+            .iter()
+            .find(|request| request.actor.ends_with(&second))
+            .unwrap();
+        assert_eq!(
+            before_identity(&first_request.instructions),
+            before_identity(&second_request.instructions)
+        );
+        assert!(
+            before_identity(&first_request.instructions).contains("Shared synthetic project rule")
+        );
+        assert!(first_request.instructions.contains(&format!("ID {first}")));
+        assert!(
+            second_request
+                .instructions
+                .contains(&format!("ID {second}"))
+        );
+        assert!(
+            first_request
+                .instructions
+                .find(&format!("ID {first}"))
+                .unwrap()
+                > before_identity(&first_request.instructions).len()
+        );
+        assert_eq!(first_request.tools, second_request.tools);
+        let first_actor_phases = requests
+            .iter()
+            .filter(|request| request.actor.ends_with(&first))
+            .collect::<Vec<_>>();
+        assert!(
+            first_actor_phases
+                .iter()
+                .any(|request| request.instructions.contains("Phase: deliberate"))
+        );
+        assert!(
+            first_actor_phases
+                .iter()
+                .any(|request| request.instructions.contains("Phase: speak"))
+        );
+        for request in first_actor_phases {
+            assert_eq!(
+                before_identity(&request.instructions),
+                before_identity(&first_request.instructions)
+            );
+        }
+        before_identity(&first_request.instructions).to_owned()
+    };
+    harness.topology.parts[0].name.push_str(" renamed");
+    harness
+        .ask(
+            &first,
+            vec![kuru_core::Message::text("user", "Topology-only probe")],
+            "speak",
+            vec![],
+        )
+        .await
+        .unwrap();
+    let requests = provider.requests.lock().unwrap();
+    let renamed = requests.last().unwrap();
+    assert_eq!(before_identity(&renamed.instructions), common);
+    assert!(renamed.instructions.contains(" renamed"));
+}
+
+#[tokio::test]
 async fn shared_transcript_keeps_whole_unicode_rows_without_byte_slicing() {
     let provider = RecordingProvider::new(|_| reply("Ready"));
     let (_dir, harness) = fixture(config(Mode::Freudian), provider.clone()).await;

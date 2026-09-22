@@ -6,7 +6,7 @@ values beside their shortcuts. Project and session context sit in the header.
 The status line carries active work, elapsed time, cancellations, failures and
 brief saved-setting confirmations. It stays quiet on an untouched welcome screen.
 Request context is labelled as an estimate for the facing or active request,
-with window provenance and actual omission counts. The composer keeps its own
+with the local sizing method, window provenance and actual omission counts. The composer keeps its own
 standing meter row beside the model, effort, framework and permission controls:
 the last prepared request's context estimate with its window provenance, and a
 labelled session cost estimate. An unknown price reads as `cost unknown`, never

@@ -64,6 +64,13 @@ receipts and native continuation remain mandatory; omitting older context does
 not delete it. Relationship actors use their own private namespace and explicitly
 shared contributions.
 
+The request builder puts common Kuru rules and reviewed project instructions
+before the speaking actor's identity, phase and changing public transcript.
+This makes a common prefix available for provider caching without mixing
+private actor histories. Tool schemas use a stable order. Kuru records cache use
+only when the provider reports cached input; a matching prefix alone is not a
+cache-hit claim.
+
 Memory selects checked identity namespaces, transcript and state keys, and each
 dream's consolidation plan. The runtime validates those paths against the actual
 project and identity before use. Actor tasks follow the namespace of the

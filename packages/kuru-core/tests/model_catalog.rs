@@ -1,6 +1,6 @@
 use kuru_core::{
     FactProvenance, ModelCatalog, ModelInfo, ModelMetadata, ModelRoute, PriceBasis, Sourced,
-    advertised_metadata,
+    TokenizerEncoding, advertised_metadata,
 };
 
 fn model(id: &str) -> ModelInfo {
@@ -11,6 +11,31 @@ fn model(id: &str) -> ModelInfo {
         default_effort: Some("unfamiliar-effort".into()),
         metadata: ModelMetadata::default(),
     }
+}
+
+#[test]
+fn tokenizer_mapping_is_sourced_and_exactly_route_and_catalog_scoped() {
+    let catalog = ModelCatalog::embedded().unwrap();
+    for route in [ModelRoute::OpenAiResponses, ModelRoute::CodexSubscription] {
+        for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let mapping = catalog.tokenizer(route, id).unwrap();
+            assert_eq!(mapping.value, TokenizerEncoding::O200kBase);
+            assert!(matches!(mapping.provenance, FactProvenance::Pinned { .. }));
+        }
+        assert!(catalog.tokenizer(route, "gpt-6-astra").is_none());
+        assert!(catalog.tokenizer(route, "gpt-5.6-fictional").is_none());
+    }
+    assert!(
+        catalog
+            .tokenizer(ModelRoute::CustomResponses, "gpt-5.6-sol")
+            .is_none()
+    );
+    assert!(
+        ModelCatalog::from_json(
+            r#"{"schema_version":1,"records":[{"route":"custom-responses","model_id":"gpt-5.6-sol","tokenizer":{"encoding":"o200k_base","source":{"url":"https://example.test","checked_on":"2026-09-22"}}}]}"#
+        )
+        .is_err()
+    );
 }
 
 #[test]
