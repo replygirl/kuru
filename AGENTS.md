@@ -60,6 +60,11 @@ Persistent approval binds the complete authority manifest, while a one-invocatio
 grant covers only that command's applicable claims. Keep pure inspection and
 fixed account operations independent of unrelated authority. See
 [workspace trust](docs/configuration.md#workspace-trust).
+Nested project instructions activate only when an actor reaches an individually
+authorized file path. Review their new complete manifest through the separate
+workspace-trust choice before exposing a result or effect; a newly instructed
+mutation must return for actor replanning before changing the file. Direct
+`kuru tool` commands do not activate actor prompt instructions.
 
 Full Dolt is the live memory backend. Keep its pinned runtime, provisioning and
 actual database fixtures in `kuru-memory`; SQLite is only a read-only migration

@@ -1088,7 +1088,13 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         {
             notice.announce().await?;
         }
-        let tools = permission_host(&data, root.clone(), &config, &snapshot)?;
+        let tools = permission_host(&data, root.clone(), &config, &snapshot)?
+            .with_instruction_gate(Arc::new(crate::instruction_gate::NestedInstructionGate::new(
+                root.clone(),
+                data.clone(),
+                snapshot.clone(),
+                cli.trust_workspace_once,
+            )));
         let mut harness = Harness::with_tool_host_and_instructions(
             config,
             &cwd,
@@ -1219,7 +1225,7 @@ fn permission_host(
     ToolHost::with_permission_service(root, config, permissions)
 }
 
-fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClaimCategory> {
+pub(crate) fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClaimCategory> {
     use AuthorityClaimCategory as Category;
     [
         Category::WorkspaceWrite,
@@ -1329,7 +1335,7 @@ fn show_manifest(root: &Directory, manifest: &SafeManifest, state: Option<Approv
     println!("{}", manifest_text(root, manifest, state));
 }
 
-fn manifest_text(
+pub(crate) fn manifest_text(
     root: &Directory,
     manifest: &SafeManifest,
     state: Option<ApprovalState>,
@@ -1350,9 +1356,9 @@ fn manifest_text(
         text.push_str(&format!("\nStatus: {label}"));
     }
     if manifest.sources().is_empty() {
-        text.push_str("\nAutomatic ancestor sources: none");
+        text.push_str("\nAutomatic project instruction sources: none");
     } else {
-        text.push_str("\nAutomatic ancestor sources:");
+        text.push_str("\nAutomatic project instruction sources:");
         for source in manifest.sources() {
             text.push_str(&format!("\n  - {source}"));
         }

@@ -76,6 +76,23 @@ const MAX_SEARCH_LINE_BYTES: usize = 8 * 1024;
 const MAX_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PAGE_LINES: usize = 100_000;
 
+/// Instruction scope follows the directory containing a file. Listing a
+/// directory acts on that directory itself; checked file targets never cause
+/// capture to probe a synthetic `file/AGENTS.md` path.
+fn instruction_directory(
+    target: &ProjectRelativeTarget,
+    directory_target: bool,
+) -> Result<ProjectRelativeTarget> {
+    if directory_target || target.as_str() == "." {
+        return Ok(target.clone());
+    }
+    let parent = target
+        .as_str()
+        .rsplit_once('/')
+        .map_or(".", |(parent, _)| parent);
+    ProjectRelativeTarget::parse(parent.to_owned())
+}
+
 #[cfg(windows)]
 const WINDOWS_SHELL_ENVIRONMENT: &[&str] = &[
     "PATH",
@@ -184,6 +201,7 @@ fn windows_shell_environment(
 
 use crate::{
     MAX_BYTES,
+    instruction_review::{InstructionGate, InstructionGateOutcome, InstructionReviewSender},
     mcp::{McpExecution, McpHosts, McpStatus},
     permissions::{ApprovalSender, PermissionInvocation, PermissionOutcome, PermissionService},
     redaction,
@@ -198,6 +216,7 @@ pub struct ToolHost {
     directory: Dir,
     root_guard: Arc<Directory>,
     permissions: Arc<PermissionService>,
+    instruction_gate: Option<Arc<dyn InstructionGate>>,
     mcp: McpHosts,
     #[cfg(unix)]
     shells: ShellRegistry,
@@ -206,6 +225,14 @@ pub struct ToolHost {
 pub struct ToolCatalog {
     tools: Vec<ToolSpec>,
     mcp: Vec<McpStatus>,
+}
+
+/// One actor call and an optional reviewed prompt update. The runtime settles
+/// the original call once and installs the update before its next inference.
+pub struct ActorToolOutcome {
+    pub result: Result<String>,
+    pub instructions: Option<String>,
+    pub replan_required: bool,
 }
 
 impl ToolCatalog {
@@ -261,9 +288,15 @@ impl ToolHost {
             directory,
             root_guard,
             permissions,
+            instruction_gate: None,
             #[cfg(unix)]
             shells: ShellRegistry::new(),
         })
+    }
+
+    pub fn with_instruction_gate(mut self, gate: Arc<dyn InstructionGate>) -> Self {
+        self.instruction_gate = Some(gate);
+        self
     }
 
     /// Verify the held workspace identity without reopening a replacement.
@@ -459,6 +492,33 @@ impl ToolHost {
         args: Value,
         approval: Option<&ApprovalSender>,
     ) -> Result<String> {
+        self.execute_dispatch(name, args, approval, None, false)
+            .await
+            .result
+    }
+
+    /// Actor calls additionally review any newly applicable instruction graph.
+    pub async fn execute_for_actor(
+        &self,
+        name: &str,
+        args: Value,
+        permission_approval: Option<&ApprovalSender>,
+        instruction_approval: Option<&InstructionReviewSender>,
+    ) -> ActorToolOutcome {
+        self.execute_dispatch(name, args, permission_approval, instruction_approval, true)
+            .await
+    }
+
+    async fn execute_dispatch(
+        &self,
+        name: &str,
+        args: Value,
+        approval: Option<&ApprovalSender>,
+        instruction_approval: Option<&InstructionReviewSender>,
+        actor: bool,
+    ) -> ActorToolOutcome {
+        let mut instructions = None;
+        let mut replan_required = false;
         // Search discovers many independent file targets. It has no request
         // root grant: every returned candidate is authorized with the same
         // foreground sender and exact target before its path or contents can
@@ -470,13 +530,32 @@ impl ToolHost {
                 NativeTool::Glob
             });
             if !self.permissions.advertises(&selector) {
-                return project_failure(ToolFailure::permission_denied(anyhow::anyhow!(
-                    "tool permission was denied"
-                )));
+                return ActorToolOutcome {
+                    result: project_failure(ToolFailure::permission_denied(anyhow::anyhow!(
+                        "tool permission was denied"
+                    ))),
+                    instructions,
+                    replan_required,
+                };
             }
-            return match self.execute_inner(name, args, approval).await {
+            let result = match self
+                .execute_inner(
+                    name,
+                    args,
+                    approval,
+                    instruction_approval,
+                    actor,
+                    &mut instructions,
+                )
+                .await
+            {
                 Ok(execution) => project_execution(execution),
                 Err(failure) => project_failure(failure),
+            };
+            return ActorToolOutcome {
+                result,
+                instructions,
+                replan_required,
             };
         }
         let result: std::result::Result<ToolExecution, ToolFailure> = async {
@@ -510,6 +589,61 @@ impl ToolHost {
                     self.root_guard
                         .revalidate()
                         .map_err(|error| ToolFailure::built_in(error.into()))?;
+                    if actor && let (Some(gate), Some(target)) =
+                        (&self.instruction_gate, invocation.target())
+                    {
+                        let directory = instruction_directory(
+                            target,
+                            matches!(
+                                invocation.selector(),
+                                PermissionSelector::Native { name: NativeTool::FileList }
+                            ),
+                        )
+                        .map_err(ToolFailure::built_in)?;
+                        let proposed = match gate
+                            .review(std::slice::from_ref(&directory), instruction_approval)
+                            .await
+                            .map_err(ToolFailure::built_in)?
+                        {
+                            InstructionGateOutcome::Unchanged => None,
+                            InstructionGateOutcome::Proposed(proposal) => Some(proposal),
+                            InstructionGateOutcome::Denied => {
+                                return Err(ToolFailure::permission_denied(anyhow::anyhow!(
+                                    "nested instruction authority was denied"
+                                )));
+                            }
+                            InstructionGateOutcome::Required(detail) => {
+                                return Err(ToolFailure::permission_required(anyhow::anyhow!(detail)));
+                            }
+                        };
+                        // A foreground answer can span a target replacement.
+                        let (current_selector, current_target) =
+                            self.permission_facts(name, &args).await?;
+                        if current_selector != *invocation.selector()
+                            || current_target.as_ref() != invocation.target()
+                        {
+                            return Err(ToolFailure::permission_denied(anyhow::anyhow!(
+                                "tool permission target changed while instruction review was pending"
+                            )));
+                        }
+                        self.root_guard
+                            .revalidate()
+                            .map_err(|error| ToolFailure::built_in(error.into()))?;
+                        if let Some(proposal) = proposed {
+                            instructions = Some(proposal.publish().await.map_err(ToolFailure::built_in)?);
+                            if matches!(
+                                invocation.selector(),
+                                PermissionSelector::Native {
+                                    name: NativeTool::FileWrite | NativeTool::FileDelete
+                                }
+                            ) {
+                                replan_required = true;
+                                return Ok(ToolExecution::ProjectedText(
+                                    "New path-specific instructions were activated. Replan this file change before executing it; the original call made no change.".into(),
+                                ));
+                            }
+                        }
+                    }
                 }
                 PermissionOutcome::Denied => {
                     return Err(ToolFailure::permission_denied(anyhow::anyhow!(
@@ -523,12 +657,17 @@ impl ToolHost {
                 }
                 _ => unreachable!("permission service returned an invalid outcome"),
             }
-            self.execute_inner(name, args, approval).await
+            self.execute_inner(name, args, approval, instruction_approval, actor, &mut instructions).await
         }
         .await;
-        match result {
+        let result = match result {
             Ok(execution) => project_execution(execution),
             Err(failure) => project_failure(failure),
+        };
+        ActorToolOutcome {
+            result,
+            instructions,
+            replan_required,
         }
     }
 
@@ -674,6 +813,9 @@ impl ToolHost {
         name: &str,
         args: Value,
         approval: Option<&ApprovalSender>,
+        instruction_approval: Option<&InstructionReviewSender>,
+        actor: bool,
+        instructions: &mut Option<String>,
     ) -> std::result::Result<ToolExecution, ToolFailure> {
         if !args.is_object() {
             return Err(ToolFailure::built_in(anyhow::anyhow!(
@@ -734,15 +876,13 @@ impl ToolHost {
                 execution.map_err(ToolFailure::built_in)
             }
             "glob" => self
-                .glob(&args, approval)
+                .glob(&args, approval, instruction_approval, actor, instructions)
                 .await
-                .map(ToolExecution::Json)
-                .map_err(ToolFailure::built_in),
+                .map(ToolExecution::Json),
             "grep" => self
-                .grep(&args, approval)
+                .grep(&args, approval, instruction_approval, actor, instructions)
                 .await
-                .map(ToolExecution::Json)
-                .map_err(ToolFailure::built_in),
+                .map(ToolExecution::Json),
             "file_write" => {
                 let execution = (|| -> Result<ToolExecution> {
                     let content = string(&args, "content")?;
@@ -893,88 +1033,184 @@ impl ToolHost {
         }
     }
 
-    async fn glob(&self, args: &Value, approval: Option<&ApprovalSender>) -> Result<Value> {
-        let pattern = bounded_search_pattern(string(args, "pattern")?)?;
-        let mut matches = Vec::new();
+    async fn glob(
+        &self,
+        args: &Value,
+        approval: Option<&ApprovalSender>,
+        instruction_approval: Option<&InstructionReviewSender>,
+        actor: bool,
+        instructions: &mut Option<String>,
+    ) -> std::result::Result<Value, ToolFailure> {
+        let pattern =
+            bounded_search_pattern(string(args, "pattern").map_err(ToolFailure::built_in)?)
+                .map_err(ToolFailure::built_in)?;
         let mut omitted = SearchOmissions::default();
-        for target in self.search_candidates(args, Some(pattern.as_str()), &mut omitted)? {
-            match self
-                .authorize_search_candidate(NativeTool::Glob, &target, args, approval)
-                .await?
-            {
-                SearchCandidateAccess::Allowed => matches.push(target.as_str().to_owned()),
-                SearchCandidateAccess::Denied => omitted.denied += 1,
-                SearchCandidateAccess::PermissionRequired => omitted.permission_required += 1,
-            }
-            if matches.len() == MAX_SEARCH_MATCHES {
-                omitted.output_limit = true;
-                break;
-            }
-        }
+        let targets = self
+            .admitted_search_targets(
+                NativeTool::Glob,
+                args,
+                Some(&pattern),
+                approval,
+                &mut omitted,
+            )
+            .await
+            .map_err(ToolFailure::built_in)?;
+        self.review_search_targets(&targets, instruction_approval, actor, instructions)
+            .await?;
+        let matches: Vec<_> = targets
+            .iter()
+            .map(|target| target.as_str().to_owned())
+            .collect();
         Ok(json!({"matches": matches, "omitted": omitted.into_json()}))
     }
 
-    async fn grep(&self, args: &Value, approval: Option<&ApprovalSender>) -> Result<Value> {
-        let pattern = bounded_search_pattern(string(args, "pattern")?)?;
+    async fn grep(
+        &self,
+        args: &Value,
+        approval: Option<&ApprovalSender>,
+        instruction_approval: Option<&InstructionReviewSender>,
+        actor: bool,
+        instructions: &mut Option<String>,
+    ) -> std::result::Result<Value, ToolFailure> {
+        let pattern =
+            bounded_search_pattern(string(args, "pattern").map_err(ToolFailure::built_in)?)
+                .map_err(ToolFailure::built_in)?;
         let matcher = RegexMatcher::new_line_matcher(&pattern)
-            .context("grep pattern is not a valid line regular expression")?;
-        let mut matches = Vec::new();
+            .context("grep pattern is not a valid line regular expression")
+            .map_err(ToolFailure::built_in)?;
         let mut omitted = SearchOmissions::default();
-        for target in self.search_candidates(args, None, &mut omitted)? {
+        let targets = self
+            .admitted_search_targets(NativeTool::Grep, args, None, approval, &mut omitted)
+            .await
+            .map_err(ToolFailure::built_in)?;
+        self.review_search_targets(&targets, instruction_approval, actor, instructions)
+            .await?;
+        (|| -> Result<Value> {
+            let mut matches = Vec::new();
+            for target in targets {
+                self.root_guard.revalidate()?;
+                let (directory, path, _guard) = self.path(target.as_str(), false)?;
+                let mut options = OpenOptions::new();
+                options.read(true).follow(FollowSymlinks::No);
+                let mut file = directory.open_with(path, &options)?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file() || metadata.len() > MAX_SEARCH_FILE_BYTES {
+                    omitted.large_or_non_file += 1;
+                    continue;
+                }
+                let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+                Read::by_ref(&mut file)
+                    .take(MAX_SEARCH_FILE_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
+                    omitted.large_or_non_file += 1;
+                    continue;
+                }
+                if std::str::from_utf8(&bytes).is_err() {
+                    omitted.unreadable += 1;
+                    continue;
+                }
+                let target_name = target.as_str().to_owned();
+                let mut searcher = Searcher::new();
+                searcher
+                    .search_slice(&matcher, &bytes, UTF8(|line, text| {
+                        if text.len() > MAX_SEARCH_LINE_BYTES {
+                            omitted.oversized_line += 1;
+                            return Ok(true);
+                        }
+                        matches.push(json!({"path": target_name, "line": line, "text": text.trim_end_matches(['\n', '\r'])}));
+                        Ok(matches.len() < MAX_SEARCH_MATCHES)
+                    }))
+                    .map_err(|error| anyhow::anyhow!("grep search failed: {error}"))?;
+                if matches.len() == MAX_SEARCH_MATCHES {
+                    omitted.output_limit = true;
+                    break;
+                }
+            }
+            Ok(json!({"matches": matches, "omitted": omitted.into_json()}))
+        })()
+        .map_err(ToolFailure::built_in)
+    }
+
+    async fn admitted_search_targets(
+        &self,
+        tool: NativeTool,
+        args: &Value,
+        pattern: Option<&str>,
+        approval: Option<&ApprovalSender>,
+        omitted: &mut SearchOmissions,
+    ) -> Result<Vec<ProjectRelativeTarget>> {
+        let mut allowed = Vec::new();
+        for target in self.search_candidates(args, pattern, omitted)? {
             match self
-                .authorize_search_candidate(NativeTool::Grep, &target, args, approval)
+                .authorize_search_candidate(tool, &target, args, approval)
                 .await?
             {
-                SearchCandidateAccess::Allowed => {}
-                SearchCandidateAccess::Denied => {
-                    omitted.denied += 1;
-                    continue;
-                }
-                SearchCandidateAccess::PermissionRequired => {
-                    omitted.permission_required += 1;
-                    continue;
-                }
+                SearchCandidateAccess::Allowed => allowed.push(target),
+                SearchCandidateAccess::Denied => omitted.denied += 1,
+                SearchCandidateAccess::PermissionRequired => omitted.permission_required += 1,
             }
-            self.root_guard.revalidate()?;
-            let (directory, path, _guard) = self.path(target.as_str(), false)?;
-            let mut options = OpenOptions::new();
-            options.read(true).follow(FollowSymlinks::No);
-            let mut file = directory.open_with(path, &options)?;
-            let metadata = file.metadata()?;
-            if !metadata.is_file() || metadata.len() > MAX_SEARCH_FILE_BYTES {
-                omitted.large_or_non_file += 1;
-                continue;
-            }
-            let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-            Read::by_ref(&mut file)
-                .take(MAX_SEARCH_FILE_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
-                omitted.large_or_non_file += 1;
-                continue;
-            }
-            if std::str::from_utf8(&bytes).is_err() {
-                omitted.unreadable += 1;
-                continue;
-            }
-            let target_name = target.as_str().to_owned();
-            let mut searcher = Searcher::new();
-            searcher
-                .search_slice(&matcher, &bytes, UTF8(|line, text| {
-                    if text.len() > MAX_SEARCH_LINE_BYTES {
-                        omitted.oversized_line += 1;
-                        return Ok(true);
-                    }
-                    matches.push(json!({"path": target_name, "line": line, "text": text.trim_end_matches(['\n', '\r'])}));
-                    Ok(matches.len() < MAX_SEARCH_MATCHES)
-                }))
-                .map_err(|error| anyhow::anyhow!("grep search failed: {error}"))?;
-            if matches.len() == MAX_SEARCH_MATCHES {
+            if tool == NativeTool::Glob && allowed.len() == MAX_SEARCH_MATCHES {
                 omitted.output_limit = true;
                 break;
             }
         }
-        Ok(json!({"matches": matches, "omitted": omitted.into_json()}))
+        Ok(allowed)
+    }
+
+    async fn review_search_targets(
+        &self,
+        targets: &[ProjectRelativeTarget],
+        approval: Option<&InstructionReviewSender>,
+        actor: bool,
+        instructions: &mut Option<String>,
+    ) -> std::result::Result<(), ToolFailure> {
+        if !actor || targets.is_empty() {
+            return Ok(());
+        }
+        let Some(gate) = &self.instruction_gate else {
+            return Ok(());
+        };
+        let directories = targets
+            .iter()
+            .map(|target| instruction_directory(target, false))
+            .collect::<Result<Vec<_>>>()
+            .map_err(ToolFailure::built_in)?;
+        let proposed = match gate
+            .review(&directories, approval)
+            .await
+            .map_err(ToolFailure::built_in)?
+        {
+            InstructionGateOutcome::Unchanged => None,
+            InstructionGateOutcome::Proposed(proposal) => Some(proposal),
+            InstructionGateOutcome::Denied => {
+                return Err(ToolFailure::permission_denied(anyhow::anyhow!(
+                    "nested instruction authority was denied"
+                )));
+            }
+            InstructionGateOutcome::Required(detail) => {
+                return Err(ToolFailure::permission_required(anyhow::anyhow!(detail)));
+            }
+        };
+        // The foreground answer can span a link or parent replacement. Never
+        // publish reviewed bytes from a path whose checked target has changed.
+        for target in targets {
+            let current = self
+                .validated_permission_target(target.as_str(), false)
+                .map_err(ToolFailure::built_in)?;
+            if current != *target {
+                return Err(ToolFailure::permission_denied(anyhow::anyhow!(
+                    "search candidate changed while instruction review was pending"
+                )));
+            }
+        }
+        self.root_guard
+            .revalidate()
+            .map_err(|error| ToolFailure::built_in(error.into()))?;
+        if let Some(proposal) = proposed {
+            *instructions = Some(proposal.publish().await.map_err(ToolFailure::built_in)?);
+        }
+        Ok(())
     }
 
     fn search_candidates(
@@ -1663,6 +1899,27 @@ mod tests {
     use crate::test_support::{StdioFixture, Step};
     use kuru_core::{McpConfig, PermissionAction, PermissionRule};
 
+    struct RecordInstructionDirectories(std::sync::Mutex<Vec<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl InstructionGate for RecordInstructionDirectories {
+        async fn review(
+            &self,
+            targets: &[ProjectRelativeTarget],
+            _approval: Option<&InstructionReviewSender>,
+        ) -> Result<InstructionGateOutcome> {
+            self.0.lock().unwrap().push(
+                targets
+                    .iter()
+                    .map(|target| target.as_str().to_owned())
+                    .collect(),
+            );
+            Ok(InstructionGateOutcome::Required(
+                "review before search exposure".into(),
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_shell_capture_preserves_received_bytes_until_actual_eof() {
         use tokio::io::AsyncWriteExt;
@@ -2069,6 +2326,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(crate::is_permission_denied(&error));
+    }
+
+    #[tokio::test]
+    async fn actor_search_reviews_only_allowed_candidate_directories_before_exposure() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::create_dir(root.path().join("sibling")).unwrap();
+        std::fs::write(root.path().join("src/allowed.txt"), "needle\n").unwrap();
+        std::fs::write(root.path().join("sibling/denied.txt"), "needle\n").unwrap();
+        let gate = Arc::new(RecordInstructionDirectories(std::sync::Mutex::new(
+            Vec::new(),
+        )));
+        let host = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: [NativeTool::Glob, NativeTool::Grep]
+                    .into_iter()
+                    .map(|tool| PermissionRule {
+                        action: PermissionAction::Deny,
+                        selector: PermissionSelector::native(tool),
+                        path: Some("sibling/denied.txt".into()),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_instruction_gate(gate.clone());
+        for (name, args) in [
+            ("glob", json!({"pattern":"**/*.txt"})),
+            ("grep", json!({"pattern":"needle"})),
+        ] {
+            let result = host.execute_for_actor(name, args, None, None).await;
+            assert!(
+                result
+                    .result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("review before search exposure")
+            );
+            assert!(result.instructions.is_none());
+        }
+        assert_eq!(
+            *gate.0.lock().unwrap(),
+            vec![vec!["src".to_owned()], vec!["src".to_owned()]]
+        );
     }
 
     #[tokio::test]

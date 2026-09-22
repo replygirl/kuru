@@ -15,6 +15,7 @@ use crossterm::{
 };
 use futures::{Stream, StreamExt};
 use kuru_connectors::{
+    InstructionReviewAnswer, InstructionReviewRequest, InstructionReviewSender,
     permissions::{
         ApprovalAnswer, ApprovalRequest, ApprovalSender, GrantScope, PermissionDisplay,
         PermissionService,
@@ -67,6 +68,13 @@ pub struct PermissionRow {
 pub struct PermissionPrompt {
     pub display: PermissionDisplay,
     pub whole_tool: bool,
+    pub scroll: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstructionPrompt {
+    pub display: String,
+    pub persistent_allowed: bool,
     pub scroll: u16,
 }
 
@@ -133,6 +141,7 @@ pub struct View {
     pub speaker: String,
     pub picker: Option<Picker>,
     pub permission_prompt: Option<PermissionPrompt>,
+    pub instruction_prompt: Option<InstructionPrompt>,
     pub permission_rows: Option<Vec<PermissionRow>>,
     pub permission_selected: usize,
     pub permission_detail_scroll: u16,
@@ -194,6 +203,7 @@ impl View {
             speaker: "pool".into(),
             picker: None,
             permission_prompt: None,
+            instruction_prompt: None,
             permission_rows: None,
             permission_selected: 0,
             permission_detail_scroll: 0,
@@ -602,6 +612,28 @@ impl View {
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Some(if self.busy { "/cancel" } else { "/quit" }.into());
+        }
+        if let Some(prompt) = &mut self.instruction_prompt {
+            if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Char('1') => return Some("/instruction-once".into()),
+                    KeyCode::Char('2') if prompt.persistent_allowed => {
+                        return Some("/instruction-persist".into());
+                    }
+                    KeyCode::Char('2') => {
+                        self.notify("Persistent approval needs a safe current approval record; choose Once or revoke the old record.");
+                        return None;
+                    }
+                    KeyCode::Char('3') | KeyCode::Esc => return Some("/instruction-deny".into()),
+                    _ => {}
+                }
+            }
+            match key.code {
+                KeyCode::Up => prompt.scroll = prompt.scroll.saturating_sub(1),
+                KeyCode::Down => prompt.scroll = prompt.scroll.saturating_add(1),
+                _ => {}
+            }
+            return None;
         }
         if let Some(prompt) = &mut self.permission_prompt {
             // Alt+1-4 and plain 1-4 are exact aliases: terminals that swallow
@@ -1264,6 +1296,7 @@ enum Wake {
 
 enum LoopWake {
     Approval(Option<ApprovalRequest>),
+    Instruction(Option<InstructionReviewRequest>),
     Context(Result<(), watch::error::RecvError>),
     Regular(Wake),
 }
@@ -1712,6 +1745,8 @@ where
     let mut cancellation: Option<CancellationToken> = None;
     let mut approval_rx: Option<mpsc::Receiver<ApprovalRequest>> = None;
     let mut pending_approval: Option<ApprovalRequest> = None;
+    let mut instruction_rx: Option<mpsc::Receiver<InstructionReviewRequest>> = None;
+    let mut pending_instruction: Option<InstructionReviewRequest> = None;
     let mut quit_pending = false;
     let mut generation = 0u64;
     let mut preview_fence = PreviewFence::default();
@@ -1745,6 +1780,7 @@ where
 
             let wake = tokio::select! {
                 request = async { approval_rx.as_mut().expect("guarded approval receiver").recv().await }, if approval_rx.is_some() => LoopWake::Approval(request),
+                request = async { instruction_rx.as_mut().expect("guarded instruction receiver").recv().await }, if instruction_rx.is_some() => LoopWake::Instruction(request),
                 update = context.changed(), if context_open => LoopWake::Context(update),
                 wake = next_wake_with_progress(
                     &scheduler,
@@ -1779,6 +1815,22 @@ where
                     approval_rx = None;
                     continue;
                 }
+                LoopWake::Instruction(Some(request)) => {
+                    if view.busy && pending_instruction.is_none() {
+                        view.instruction_prompt = Some(InstructionPrompt {
+                            display: request.display.clone(),
+                            persistent_allowed: request.persistent_allowed,
+                            scroll: 0,
+                        });
+                        pending_instruction = Some(request);
+                        dirty = true;
+                    }
+                    continue;
+                }
+                LoopWake::Instruction(None) => {
+                    instruction_rx = None;
+                    continue;
+                }
                 LoopWake::Context(Ok(())) => {
                     if view.accept_context(context.borrow_and_update().clone()) {
                         dirty = true;
@@ -1799,6 +1851,17 @@ where
                     dirty |= redraw;
                     if let Some(command) = command {
                         if let Some(answer) = match command.as_str() {
+                            "/instruction-once" => Some(InstructionReviewAnswer::Once),
+                            "/instruction-persist" => Some(InstructionReviewAnswer::Persist),
+                            "/instruction-deny" => Some(InstructionReviewAnswer::Deny),
+                            _ => None,
+                        } {
+                            if let Some(request) = pending_instruction.take() {
+                                let _ = request.reply.send(answer);
+                                view.instruction_prompt = None;
+                                dirty = true;
+                            }
+                        } else if let Some(answer) = match command.as_str() {
                             "/approval-once" => Some(ApprovalAnswer::Once),
                             "/approval-session" => Some(ApprovalAnswer::Session),
                             "/approval-always" => Some(ApprovalAnswer::Always),
@@ -1822,6 +1885,9 @@ where
                             pending_approval = None;
                             approval_rx = None;
                             view.permission_prompt = None;
+                            pending_instruction = None;
+                            instruction_rx = None;
+                            view.instruction_prompt = None;
                             view.preview = None;
                             view.calling_tool.clear();
                             preview_fence.clear();
@@ -1845,6 +1911,9 @@ where
                             pending_approval = None;
                             approval_rx = None;
                             view.permission_prompt = None;
+                            pending_instruction = None;
+                            instruction_rx = None;
+                            view.instruction_prompt = None;
                             view.preview = None;
                             view.calling_tool.clear();
                             preview_fence.clear();
@@ -1920,6 +1989,8 @@ where
                             cancellation = Some(operation_cancellation.clone());
                             let (approval_tx, receiver) = mpsc::channel(1);
                             approval_rx = Some(receiver);
+                            let (instruction_tx, receiver) = mpsc::channel(1);
+                            instruction_rx = Some(receiver);
                             job = Some(tokio::spawn(async move {
                                 let result = dispatch_controlled(
                                     &mut *harness.lock().await,
@@ -1928,6 +1999,7 @@ where
                                     &operation_cancellation,
                                     turn_id.as_deref(),
                                     Some(ApprovalSender::new(approval_tx)),
+                                    Some(InstructionReviewSender::new(instruction_tx)),
                                 )
                                 .await;
                                 let _ = tx.send((generation, result)).await;
@@ -1951,6 +2023,9 @@ where
                         pending_approval = None;
                         approval_rx = None;
                         view.permission_prompt = None;
+                        pending_instruction = None;
+                        instruction_rx = None;
+                        view.instruction_prompt = None;
                         cancellation = None;
                         preview_fence.clear();
                         preview_paint.clear();
@@ -2040,6 +2115,8 @@ where
     .await;
     drop(pending_approval);
     drop(approval_rx);
+    drop(pending_instruction);
+    drop(instruction_rx);
     finish_loop(
         result,
         &mut job,
@@ -2057,7 +2134,7 @@ pub(crate) async fn dispatch(
     command: &str,
 ) -> Result<DispatchOutcome> {
     let cancellation = CancellationToken::new();
-    dispatch_controlled(harness, models, command, &cancellation, None, None).await
+    dispatch_controlled(harness, models, command, &cancellation, None, None, None).await
 }
 
 async fn dispatch_controlled(
@@ -2067,6 +2144,7 @@ async fn dispatch_controlled(
     cancellation: &CancellationToken,
     turn_id: Option<&str>,
     approval: Option<ApprovalSender>,
+    instruction_approval: Option<InstructionReviewSender>,
 ) -> Result<DispatchOutcome> {
     harness.reconcile().await?;
     let (name, args) = command.split_once(' ').unwrap_or((command, ""));
@@ -2122,7 +2200,13 @@ async fn dispatch_controlled(
         "/cost" => format_session_usage(&harness.session_usage().await?),
         "/retry" => {
             return Ok(DispatchOutcome::Turn(
-                if let Some(approval) = approval.clone() {
+                if let (Some(approval), Some(instruction_approval)) =
+                    (approval.clone(), instruction_approval.clone())
+                {
+                    harness
+                        .retry_last_with_reviews(cancellation, approval, instruction_approval)
+                        .await?
+                } else if let Some(approval) = approval.clone() {
                     harness
                         .retry_last_with_approval(cancellation, approval)
                         .await?
@@ -2145,21 +2229,36 @@ async fn dispatch_controlled(
                 generated = uuid::Uuid::new_v4().to_string();
                 &generated
             };
-            return Ok(DispatchOutcome::Turn(if let Some(approval) = approval {
-                harness
-                    .run_local_controlled_with_approval(
-                        command,
-                        None,
-                        turn_id,
-                        cancellation,
-                        approval,
-                    )
-                    .await?
-            } else {
-                harness
-                    .run_local_controlled(command, None, turn_id, cancellation)
-                    .await?
-            }));
+            return Ok(DispatchOutcome::Turn(
+                if let (Some(approval), Some(instruction_approval)) =
+                    (approval.clone(), instruction_approval)
+                {
+                    harness
+                        .run_local_controlled_with_reviews(
+                            command,
+                            None,
+                            turn_id,
+                            cancellation,
+                            approval,
+                            instruction_approval,
+                        )
+                        .await?
+                } else if let Some(approval) = approval {
+                    harness
+                        .run_local_controlled_with_approval(
+                            command,
+                            None,
+                            turn_id,
+                            cancellation,
+                            approval,
+                        )
+                        .await?
+                } else {
+                    harness
+                        .run_local_controlled(command, None, turn_id, cancellation)
+                        .await?
+                },
+            ));
         }
     };
     Ok(DispatchOutcome::Command(feedback))
@@ -2609,6 +2708,52 @@ mod tests {
             Some("/approval-once".into())
         );
         assert_eq!(view.key(key(KeyCode::Esc)), Some("/cancel".into()));
+    }
+
+    #[test]
+    fn instruction_review_keeps_permission_grants_distinct_and_disables_unsafe_persistence() {
+        let mut view = fixture();
+        view.busy = true;
+        view.input = "draft stays".into();
+        view.instruction_prompt = Some(InstructionPrompt {
+            display: "Workspace: project\nManifest: v1 complete".into(),
+            persistent_allowed: true,
+            scroll: 0,
+        });
+        assert_eq!(
+            view.key(key(KeyCode::Char('1'))),
+            Some("/instruction-once".into())
+        );
+        assert_eq!(
+            view.key(key(KeyCode::Char('2'))),
+            Some("/instruction-persist".into())
+        );
+        assert_eq!(
+            view.key(key(KeyCode::Char('3'))),
+            Some("/instruction-deny".into())
+        );
+        view.key(key(KeyCode::Down));
+        assert_eq!(view.instruction_prompt.as_ref().unwrap().scroll, 1);
+        assert_eq!(view.input, "draft stays");
+        view.instruction_prompt.as_mut().unwrap().persistent_allowed = false;
+        assert_eq!(view.key(key(KeyCode::Char('2'))), None);
+        assert!(
+            view.notice
+                .as_deref()
+                .unwrap()
+                .contains("Persistent approval")
+        );
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(72, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &view)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Workspace instruction review"));
+        assert!(screen.contains("persistent unavailable"));
     }
 
     #[test]

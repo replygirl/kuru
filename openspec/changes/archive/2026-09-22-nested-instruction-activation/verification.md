@@ -1,0 +1,41 @@
+## 1. Nested instructions activate only for authorized path use [critical]
+
+- [x] 1.1 @integration (agent) run a prompt-bearing fake-provider turn through checked file-read targets in two sibling subtrees -> real PTY fixture `real_pty_nested_read_and_search_activate_only_used_subtrees` passed 1/1: request 1 had no nested source, request 2 had only `src`, and later requests had the canonical `src`+`sibling` union after two foreground reviews; the earlier PTY fixture passed AGENTS→import→CLAUDE ordering.
+- [x] 1.2 @integration (agent) deny one target with an exact permission rule and attempt the same tool call -> connector package passed 208/208 including `actor_search_reviews_only_allowed_candidate_directories_before_exposure`: denied sibling never reached instruction gate or result exposure; TUI headless fixture separately proved direct tools remain independent.
+- [x] 1.3 @unit (agent) cover nested import cycle, physical duplicate, link/escape, changed bytes, and aggregate/source/depth caps -> core package tests passed with each case, whole-source omission notices, deterministic order and preserved captured bytes.
+- [x] 1.4 @eval (agent) run a fixed offline fake-provider path-use corpus with sibling instructions, read, write, and search turns -> PTY read/sibling/grep 1/1 and PTY write once/deny within the full TUI suite passed; grep's provider continuation carried both allowed file paths, while the first write had no effect and replanned.
+
+## 2. New instructions gate effects and force a fresh plan [critical]
+
+- [x] 2.1 @integration (agent) issue a mutating file call from a fake provider before first nested discovery -> runtime fake-provider suite passed 143/143 including the first and stale parallel writes settling without effect; real PTY once/deny fixture also observed no file effect before or after the initial review and the next inference contained reviewed instructions.
+- [x] 2.2 @integration (agent) issue a read-only call before discovery and repeat a mutating call after activation -> real PTY read fixture withheld continuation until review; the TUI headless unit test passed 3/3 and showed a first write replans, while the repeated same-subtree write succeeds without a second replan.
+
+## 3. Foreground and headless trust decisions are honest [critical]
+
+- [x] 3.1 @e2e (agent) drive a temporary-project real PTY TUI through nested discovery and the existing foreground review surface -> TUI package test exited 0 including real PTY once/deny fixture: review preceded the write, once continued in-process with instructions, deny produced neither effect nor prompt authority.
+- [x] 3.2 @integration (agent) run a headless temporary-project call with no nested trust, then with the explicit one-invocation grant -> focused TUI gate test passed 3/3: trust-required returned before effect and the once grant activated only the used subtree.
+- [x] 3.3 @integration (agent) mutate a previously captured instruction file between review and continuation -> focused foreground test passed 3/3: published prompt retained old captured bytes, and fresh capture of changed bytes no longer matched the stored nested manifest; directory replacement instead failed before publication.
+- [x] 3.4 @integration (agent) persist one nested manifest, restart at the same root, change its bytes, and revoke while another review is pending -> focused trust tests passed 10/10: matching base startup and nested lookup, changed-byte re-review, fresh-generation compare and revoke/recreate prevention.
+- [x] 3.5 @unit (agent) load a legacy v1 approval record, add a nested grant, and inspect malformed or oversized v2 records -> focused trust tests passed 10/10 with v1 migration, exact bounded v2 entries and invalid-record fail-closed behavior.
+
+## 4. Search reviews only a bounded allowed candidate union [critical]
+
+- [x] 4.1 @integration (agent) run native grep and glob over mixed allowed/denied nested paths with fake permission and trust surfaces -> connector package passed 208/208, including both actor grep/glob candidate gate checks and exact denied-file omission; real PTY grep continuation contained only the reviewed sibling union.
+- [x] 4.2 @integration (agent) reach traversal/output and instruction caps under hidden/ignore variants -> connector native-search fixtures passed independent hidden/ignore choices, bounded result and omission counts; core cap fixtures passed source/aggregate/depth/graph notices, and actor-search fixture confirmed the gate runs before exposing the admitted candidate set. These are cross-layer checks, not one combined cap/flag fixture.
+
+## 5. Repository checks
+
+- [x] 5.1 @regression (agent) run owning core, connector, runtime, and TUI package tests, lint/typecheck, format, docs check, strict Cospec validation/apply, and diff check -> all owning suites and final focused checks passed as recorded below; TUI all-target lint/typecheck, full format, docs, strict Cospec validation/apply and diff checks passed. Archive is the following workflow step, before commit.
+- [~] 5.2 @runtime (agent) let the normal pre-push coverage hook and native CI run at the reviewed head -> defer: these run only after archive, branch commit and delivery push; record actual hook/native outcomes on the PR, with no claim of Windows pass from macOS checks.
+
+## Observed evidence while implementation is in progress
+
+- `mise run cospec -- validate nested-instruction-activation --strict` and the actual `apply --json` gate exited 0 before source edits.
+- `mise run //packages/kuru-core:test` passed with the verified offline bundle after the nested source-cache and path-union fixtures, including changed/replaced directories, newly appearing sources, source/aggregate/depth/graph caps, imports and deterministic order.
+- `mise run //packages/kuru-connectors:test` passed 208/208. Its actor-search fixture proves only allowed grep/glob candidate directories reach the instruction gate before exposure; existing native-search fixtures cover independent hidden/ignore choices, bounded output and omission counts.
+- With the owning memory `prefetch` task prepared and the verified offline bundle mirror selected, `mise exec -- cargo test -p kuru --lib trust::tests --all-features --locked` passed 10/10 focused trust tests, including v1/v2 migration, exact source sets, stale-base replacement, revoke/recreate and concurrent generation checks.
+- `mise run //packages/kuru-runtime:test` passed 143/143. Its fake-provider stale-call fixture observes one newly instructed write and a second same-response call settling without effects; the next provider request sees the new instructions. The first restricted loopback attempt could not bind in the sandbox; the authorized native rerun passed.
+- `mise run //apps/kuru-tui:test` exited 0, including real PTY once/deny review, foreground deferred publication, headless trust-required/once and CLI regressions. After the final test edits, focused `mise exec -- cargo test -p kuru --lib instruction_gate::tests --all-features --locked` passed 3/3 and the new `--test terminal real_pty_nested_read_and_search_activate_only_used_subtrees -- --exact --nocapture` passed 1/1. Both used the verified offline bundle and the already prepared owning supervisor.
+- `mise run docs:check` passed, including the public site build and link/content checks. The first restricted invocation failed during mise's Node setup while it attempted to lock `.git/config`; the authorized rerun passed. Public docs describe only this nested-instruction slice, not future command/skill activation.
+- `mise run format:rust:fix`, `mise run format:check`, `mise run //apps/kuru-tui:lint`, `mise run //apps/kuru-tui:typecheck`, `git diff --check`, strict Cospec validation and actual apply gate passed after final source edits. Initial TUI Clippy found two new `too_many_arguments` runtime methods and one test Boolean comparison; the typed private review-channel group and direct Boolean assertion resolved them, and the final all-target lint passed.
+- The normal pre-push coverage hook and native CI have not run for this P01c head. In particular, macOS tests are not Windows behavior evidence.

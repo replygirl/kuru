@@ -24,6 +24,7 @@ required-features = ["test-support"]
 [dependencies]
 kuru-delivery.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 crossterm = { workspace = true, features = ["event-stream", "use-dev-tty"] }
 futures.workspace = true
@@ -56,7 +57,6 @@ kuru-core = { workspace = true, features = ["test-support"] }
 kuru-memory = { workspace = true, features = ["test-support"] }
 kuru-delivery = { workspace = true, features = ["tooling"] }
 kuru-connectors = { workspace = true, features = ["test-support"] }
-async-trait.workspace = true
 tempfile.workspace = true
 axum.workspace = true
 reqwest.workspace = true

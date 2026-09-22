@@ -1013,6 +1013,284 @@ async fn real_pty_permission_choices_show_exact_file_scope_and_revoke_grants() -
     Ok(())
 }
 
+#[derive(Clone)]
+struct NestedInstructionProvider {
+    seen_instructions: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+async fn nested_instruction_complete(
+    State(state): State<NestedInstructionProvider>,
+    Json(request): Json<Value>,
+) -> Response {
+    let instructions = request["instructions"].as_str().unwrap_or_default();
+    let speaking = instructions.contains("Phase: speak and act");
+    let continued = request["input"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    });
+    if speaking {
+        state
+            .seen_instructions
+            .lock()
+            .unwrap()
+            .push(instructions.to_owned());
+    }
+    let output = if speaking && !continued {
+        json!([{"type":"function_call","call_id":"nested-write", "name":"file_write",
+            "arguments":json!({"path":"src/reviewed.txt","content":"must not run before replanning"}).to_string()}])
+    } else {
+        json!([{"type":"message","content":[{"type":"output_text","text":"NESTED_FINAL"}]}])
+    };
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.completed",
+                "response":{"id":"nested-response","status":"completed","output":output,
+                    "usage":{"input_tokens":8,"output_tokens":5}}
+            })
+        ),
+    )
+        .into_response()
+}
+
+async fn nested_read_search_complete(
+    State(state): State<NestedInstructionProvider>,
+    Json(request): Json<Value>,
+) -> Response {
+    let instructions = request["instructions"].as_str().unwrap_or_default();
+    let speaking = instructions.contains("Phase: speak and act");
+    let call = if speaking {
+        let mut seen = state.seen_instructions.lock().unwrap();
+        seen.push(instructions.to_owned());
+        seen.len()
+    } else {
+        0
+    };
+    let output = match call {
+        1 => json!([{"type":"function_call","call_id":"nested-read-src", "name":"file_read",
+            "arguments":json!({"path":"src/one.txt"}).to_string()}]),
+        2 => json!([{"type":"function_call","call_id":"nested-read-sibling", "name":"file_read",
+            "arguments":json!({"path":"sibling/two.txt"}).to_string()}]),
+        3 => json!([{"type":"function_call","call_id":"nested-search", "name":"grep",
+            "arguments":json!({"pattern":"needle"}).to_string()}]),
+        _ => {
+            let search = request["input"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "nested-search"
+                })
+                .and_then(|item| item["output"].as_str())
+                .unwrap_or_default();
+            let result = if search.contains("one.txt") && search.contains("two.txt") {
+                "NESTED_READ_FINAL"
+            } else {
+                "SEARCH_RESULT_MISSING"
+            };
+            json!([{"type":"message","content":[{"type":"output_text","text":result}]}])
+        }
+    };
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.completed",
+                "response":{"id":"nested-read-response","status":"completed","output":output,
+                    "usage":{"input_tokens":8,"output_tokens":5}}
+            })
+        ),
+    )
+        .into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_nested_read_and_search_activate_only_used_subtrees() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    for (directory, instruction, file) in [
+        ("src", "src instruction", "one.txt"),
+        ("sibling", "sibling instruction", "two.txt"),
+    ] {
+        std::fs::create_dir(sandbox.project.join(directory))?;
+        std::fs::write(
+            sandbox.project.join(directory).join("AGENTS.md"),
+            instruction,
+        )?;
+        std::fs::write(sandbox.project.join(directory).join(file), "needle\n")?;
+    }
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(nested_read_search_complete))
+        .with_state(NestedInstructionProvider {
+            seen_instructions: seen.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("nested-read-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=5\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap()
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--mode", "freudian", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 35, 120)?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.send(b"Nested path reads\r")?;
+    terminal.wait_composer_frame(
+        &["Workspace instruction review", "src/AGENTS.md"],
+        READY_TIMEOUT,
+    )?;
+    ensure!(
+        seen.lock().unwrap().len() == 1,
+        "provider continued before src review"
+    );
+    terminal.send(b"1")?;
+    terminal.wait_composer_frame(
+        &["Workspace instruction review", "sibling/AGENTS.md"],
+        READY_TIMEOUT,
+    )?;
+    ensure!(
+        seen.lock().unwrap().len() == 2,
+        "provider continued before sibling review"
+    );
+    terminal.send(b"1")?;
+    terminal.wait_text(&["NESTED_READ_FINAL"], &["Workspace instruction review"])?;
+    let requests = seen.lock().unwrap();
+    ensure!(
+        requests.len() >= 4,
+        "read/search continuation did not reach provider"
+    );
+    ensure!(!requests[0].contains("src instruction"));
+    ensure!(!requests[0].contains("sibling instruction"));
+    ensure!(requests[1].contains("src instruction"));
+    ensure!(!requests[1].contains("sibling instruction"));
+    ensure!(requests[2].contains("src instruction"));
+    ensure!(requests[2].contains("sibling instruction"));
+    ensure!(requests[3].contains("src instruction"));
+    ensure!(requests[3].contains("sibling instruction"));
+    drop(requests);
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_nested_instruction_review_is_separate_and_precedes_write() -> Result<()> {
+    for (answer, granted) in [(b"1".as_slice(), true), (b"3".as_slice(), false)] {
+        let sandbox = Sandbox::new()?;
+        std::fs::create_dir(sandbox.project.join("src"))?;
+        std::fs::write(
+            sandbox.project.join("src/AGENTS.md"),
+            "nested AGENTS first\n@rules.md\n",
+        )?;
+        std::fs::write(sandbox.project.join("src/rules.md"), "nested import second")?;
+        std::fs::write(sandbox.project.join("src/CLAUDE.md"), "nested CLAUDE third")?;
+        let marker = sandbox.project.join("src/reviewed.txt");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+            )
+            .route("/v1/responses", post(nested_instruction_complete))
+            .with_state(NestedInstructionProvider {
+                seen_instructions: seen.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = sandbox.root.path().join("nested-provider.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=3\n",
+                listener.local_addr()?
+            ),
+        )?;
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        let mut command = sandbox.command("responses");
+        command
+            .args([
+                "--model",
+                "fixture",
+                "--mode",
+                "freudian",
+                "--allow-write",
+                "--config",
+            ])
+            .arg(&config)
+            .env("KURU_FIXTURE_KEY", "fixture")
+            .env("KURU_REDUCED_MOTION", "1");
+        let mut terminal = Terminal::spawn(command, 35, 120)?;
+        terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+        terminal.send(b"Nested instruction turn\r")?;
+        terminal.wait_composer_frame(
+            &[
+                "Workspace instruction review",
+                "src/AGENTS.md",
+                "1 continue once",
+                "3 deny",
+            ],
+            READY_TIMEOUT,
+        )?;
+        ensure!(!marker.exists(), "nested write ran before workspace review");
+        terminal.send(answer)?;
+        terminal.wait_text(&["NESTED_FINAL"], &["Workspace instruction review"])?;
+        ensure!(
+            !marker.exists(),
+            "pre-discovery write must replan or be denied"
+        );
+        let requests = seen.lock().unwrap();
+        ensure!(
+            requests.len() >= 2,
+            "provider did not receive the tool continuation"
+        );
+        ensure!(!requests[0].contains("nested AGENTS first"));
+        ensure!(
+            requests[1].contains("nested AGENTS first") == granted,
+            "provider instruction authority did not match the review answer"
+        );
+        if granted {
+            let agents = requests[1]
+                .find("nested AGENTS first")
+                .context("AGENTS missing")?;
+            let imported = requests[1]
+                .find("nested import second")
+                .context("import missing")?;
+            let claude = requests[1]
+                .find("nested CLAUDE third")
+                .context("CLAUDE missing")?;
+            ensure!(
+                agents < imported && imported < claude,
+                "nested instruction order changed"
+            );
+        }
+        drop(requests);
+        terminal.send(b"/quit\r")?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        terminal.assert_restored()?;
+    }
+    Ok(())
+}
+
 fn ensure_eq_marker(path: &std::path::Path, expected: bool) -> Result<()> {
     ensure!(
         path.exists() == expected,

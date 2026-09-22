@@ -68,7 +68,7 @@ kuru --allow-write --allow-shell
 
 Shell commands use your account's process permissions, including access beyond the project. [Tools and permissions](/reference/tools) explains these boundaries and configured MCP tools.
 
-Kuru reads applicable ancestor `AGENTS.md` files, with nearer instructions taking precedence. Put the relevant instructions in those files; Kuru does not automatically follow arbitrary linked instruction documents.
+Kuru reads applicable ancestor and project-root `AGENTS.md` and `CLAUDE.md` files, with nearer instructions taking precedence. Checked `@relative/file.md` imports can add bounded Markdown sources. When an actor first reaches nested project instructions through an authorized file path, Kuru asks for separate workspace trust before using them. A newly instructed write pauses for replanning before changing the file. See [configuration and workspace trust](/reference/configuration).
 
 ## Return to the work
 

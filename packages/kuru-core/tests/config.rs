@@ -879,6 +879,155 @@ fn claude_wrapper_and_imports_render_once_in_order_and_bind_exact_bytes() {
 }
 
 #[test]
+fn nested_instruction_union_is_path_scoped_ordered_and_keeps_captured_bytes() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    write(project.join("AGENTS.md"), "ROOT-ORIGINAL\n");
+    write(project.join("src/AGENTS.md"), "SRC-ORIGINAL\n");
+    write(project.join("tests/CLAUDE.md"), "TESTS-ORIGINAL\n");
+    let base = ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert!(!base.instructions().contains("SRC-ORIGINAL"));
+    assert!(!base.instructions().contains("TESTS-ORIGINAL"));
+
+    let (src, changed) = base.with_nested_directories(&["src".into()]).unwrap();
+    assert!(changed);
+    assert!(src.instructions().contains("SRC-ORIGINAL"));
+    assert!(!src.instructions().contains("TESTS-ORIGINAL"));
+    assert_eq!(src.nested_instruction_source_paths().len(), 1);
+
+    let (both, changed) = src.with_nested_directories(&["tests".into()]).unwrap();
+    assert!(changed);
+    let (reverse, _) = base
+        .with_nested_directories(&["tests".into(), "src".into()])
+        .unwrap();
+    assert_eq!(both.instructions(), reverse.instructions());
+    assert_eq!(
+        both.manifest().full_digest(),
+        reverse.manifest().full_digest()
+    );
+    assert_eq!(
+        both.nested_instruction_source_paths(),
+        reverse.nested_instruction_source_paths()
+    );
+
+    write(project.join("AGENTS.md"), "ROOT-CHANGED\n");
+    write(project.join("src/AGENTS.md"), "SRC-CHANGED\n");
+    write(project.join("src/CLAUDE.md"), "NEW-CLAUDE\n");
+    write(project.join("src/sub/AGENTS.md"), "SUB-NEW\n");
+    let (still_captured, changed) = both.with_nested_directories(&["src/sub".into()]).unwrap();
+    assert!(
+        changed,
+        "newly appearing nested sources require a new review"
+    );
+    assert!(still_captured.instructions().contains("ROOT-ORIGINAL"));
+    assert!(still_captured.instructions().contains("SRC-ORIGINAL"));
+    assert!(still_captured.instructions().contains("SUB-NEW"));
+    assert!(!still_captured.instructions().contains("ROOT-CHANGED"));
+    assert!(!still_captured.instructions().contains("SRC-CHANGED"));
+    assert!(still_captured.instructions().contains("NEW-CLAUDE"));
+    let fresh =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let (fresh, _) = fresh.with_nested_directories(&["src/sub".into()]).unwrap();
+    assert!(fresh.instructions().contains("ROOT-CHANGED"));
+    assert!(fresh.instructions().contains("SRC-CHANGED"));
+    assert!(fresh.instructions().contains("NEW-CLAUDE"));
+    assert_ne!(
+        still_captured.manifest().full_digest(),
+        fresh.manifest().full_digest()
+    );
+}
+
+#[test]
+fn nested_sources_share_the_existing_whole_source_cap() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    write(
+        project.join("AGENTS.md"),
+        (0..4)
+            .map(|index| format!("@large/{index}.md\n"))
+            .collect::<String>(),
+    );
+    for index in 0..4 {
+        write(
+            project.join(format!("large/{index}.md")),
+            "L".repeat(240_000),
+        );
+    }
+    write(project.join("a/AGENTS.md"), "A".repeat(100_000));
+    write(project.join("b/AGENTS.md"), "B".repeat(32_000));
+    let base = ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let (nested, _) = base
+        .with_nested_directories(&["b".into(), "a".into()])
+        .unwrap();
+    assert!(!nested.instructions().contains(&"A".repeat(1_000)));
+    assert!(nested.instructions().contains(&"B".repeat(1_000)));
+    assert!(
+        nested
+            .instruction_notices()
+            .iter()
+            .any(|notice| notice.contains("1 MiB combined instruction limit"))
+    );
+    assert_eq!(nested.nested_instruction_source_paths().len(), 1);
+}
+
+#[test]
+fn replaced_active_nested_directory_cannot_reuse_reviewed_bytes() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    write(project.join("src/AGENTS.md"), "OLD-SOURCE\n");
+    write(project.join("tests/file.txt"), "two");
+    let base = ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let (used, changed) = base.with_nested_directories(&["src".into()]).unwrap();
+    assert!(changed);
+    fs::rename(project.join("src"), project.join("old-src")).unwrap();
+    write(project.join("src/AGENTS.md"), "NEW-SOURCE\n");
+    assert!(used.with_nested_directories(&["src".into()]).is_err());
+    assert!(used.with_nested_directories(&["tests".into()]).is_err());
+    let fresh =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let (fresh, changed) = fresh.with_nested_directories(&["src".into()]).unwrap();
+    assert!(changed);
+    assert!(fresh.instructions().contains("NEW-SOURCE"));
+}
+
+#[test]
+fn nested_absence_does_not_accumulate_or_hide_a_later_source() {
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    write(project.join("src/file.txt"), "one");
+    let base = ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let (used, changed) = base.with_nested_directories(&["src".into()]).unwrap();
+    assert!(!changed);
+    write(project.join("src/AGENTS.md"), "NEW-SOURCE\n");
+    let (again, changed) = used.with_nested_directories(&["src".into()]).unwrap();
+    assert!(changed);
+    assert!(again.instructions().contains("NEW-SOURCE"));
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_directory_links_and_traversal_are_rejected_before_source_read() {
+    use std::os::unix::fs::symlink;
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    let outside = dir.path().join("outside");
+    write(outside.join("AGENTS.md"), "FAKE-OUTSIDE-NESTED-BYTES");
+    fs::create_dir_all(&project).unwrap();
+    symlink(&outside, project.join("linked")).unwrap();
+    let base = ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let linked = base
+        .with_nested_directories(&["linked".into()])
+        .unwrap_err()
+        .to_string();
+    assert!(linked.contains("instruction path error"));
+    assert!(!linked.contains("FAKE-OUTSIDE-NESTED-BYTES"));
+    assert!(
+        base.with_nested_directories(&["../outside".into()])
+            .is_err()
+    );
+}
+
+#[test]
 fn import_cycle_and_fenced_example_report_without_recursive_or_accidental_import() {
     let dir = TempDir::new().unwrap();
     let project = dir.path().join("project");

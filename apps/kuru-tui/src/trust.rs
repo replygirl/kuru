@@ -14,15 +14,18 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use kuru_core::AuthorityManifest;
 use kuru_platform::fs::{
-    Directory, NameRetention, Privacy, Publication, PublicationPhase, regular_file_info,
-    seal_private,
+    Directory, FileIdentity, NameRetention, Privacy, Publication, PublicationPhase,
+    regular_file_info, seal_private,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const STORE_SCHEMA: u16 = 1;
+const LEGACY_STORE_SCHEMA: u16 = 1;
+const STORE_SCHEMA: u16 = 2;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
 const MAX_CLAIMS: usize = 512;
+const MAX_NESTED_APPROVALS: usize = 64;
+const MAX_NESTED_SOURCES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ApprovalState {
@@ -34,12 +37,12 @@ pub(crate) enum ApprovalState {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ApprovalMethod {
+pub(crate) enum ApprovalMethod {
     Command,
     InteractiveTui,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApprovalRecord {
     store_schema: u16,
@@ -63,7 +66,7 @@ impl ApprovalRecord {
             .context("system clock precedes the Unix epoch")?
             .as_secs();
         Ok(Self {
-            store_schema: STORE_SCHEMA,
+            store_schema: LEGACY_STORE_SCHEMA,
             manifest_schema: manifest.schema_version(),
             root_digest: root_digest(root),
             root_identity: hex(&root.identity().to_bytes()),
@@ -75,7 +78,7 @@ impl ApprovalRecord {
     }
 
     fn structurally_valid(&self) -> bool {
-        self.store_schema == STORE_SCHEMA
+        self.store_schema == LEGACY_STORE_SCHEMA
             && self.root_digest.len() == 64
             && is_lower_hex(&self.root_digest)
             && self.root_identity.len() == 48
@@ -100,6 +103,107 @@ impl ApprovalRecord {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NestedApproval {
+    /// SHA-256 digests of the canonical, active nested source paths.
+    source_paths: Vec<String>,
+    /// The complete extended authority manifest, not just the added claims.
+    approval: ApprovalRecord,
+}
+
+impl NestedApproval {
+    fn structurally_valid(&self) -> bool {
+        !self.source_paths.is_empty()
+            && self.source_paths.len() <= MAX_NESTED_SOURCES
+            && self
+                .source_paths
+                .iter()
+                .all(|digest| digest.len() == 64 && is_lower_hex(digest))
+            && self.source_paths.windows(2).all(|pair| pair[0] < pair[1])
+            && self.approval.structurally_valid()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalRecordV2 {
+    store_schema: u16,
+    generation: String,
+    base: ApprovalRecord,
+    nested: Vec<NestedApproval>,
+}
+
+impl ApprovalRecordV2 {
+    fn structurally_valid(&self) -> bool {
+        self.store_schema == STORE_SCHEMA
+            && uuid::Uuid::parse_str(&self.generation)
+                .is_ok_and(|value| value.get_version_num() == 4)
+            && self.base.structurally_valid()
+            && self.nested.len() <= MAX_NESTED_APPROVALS
+            && self.nested.iter().all(NestedApproval::structurally_valid)
+            && self
+                .nested
+                .windows(2)
+                .all(|pair| pair[0].source_paths < pair[1].source_paths)
+            && self.nested.iter().all(|entry| {
+                entry.approval.root_digest == self.base.root_digest
+                    && entry.approval.root_identity == self.base.root_identity
+                    && entry.approval.manifest_schema == self.base.manifest_schema
+            })
+    }
+}
+
+#[derive(Clone, Debug)]
+enum StoredRecord {
+    Legacy(ApprovalRecord),
+    Current(ApprovalRecordV2),
+    Invalid,
+}
+
+impl StoredRecord {
+    fn parse(bytes: &[u8]) -> Self {
+        // Parse directly into strict structs: a generic JSON Value would erase
+        // duplicate keys before the record shape can reject them.
+        if let Ok(record) = serde_json::from_slice::<ApprovalRecordV2>(bytes) {
+            Self::Current(record)
+        } else if let Ok(record) = serde_json::from_slice::<ApprovalRecord>(bytes) {
+            Self::Legacy(record)
+        } else {
+            Self::Invalid
+        }
+    }
+
+    fn structurally_valid(&self) -> bool {
+        match self {
+            Self::Legacy(record) => record.structurally_valid(),
+            Self::Current(record) => record.structurally_valid(),
+            Self::Invalid => false,
+        }
+    }
+
+    fn base(&self) -> Option<&ApprovalRecord> {
+        match self {
+            Self::Legacy(record) => Some(record),
+            Self::Current(record) => Some(&record.base),
+            Self::Invalid => None,
+        }
+    }
+}
+
+struct CheckedRecord {
+    record: StoredRecord,
+    identity: FileIdentity,
+}
+
+/// Exact pre-review state; publication rejects a revoked or replaced base.
+#[derive(Clone, Debug)]
+pub(crate) enum ReviewGeneration {
+    Absent,
+    Legacy(FileIdentity),
+    Current(String),
+}
+
 pub(crate) struct ApprovalStore<'a> {
     data: &'a Path,
     root: &'a Directory,
@@ -114,9 +218,65 @@ impl<'a> ApprovalStore<'a> {
     pub(crate) fn inspect(&self, manifest: &AuthorityManifest) -> ApprovalState {
         match self.read_record() {
             Ok(None) => ApprovalState::Absent,
-            Ok(Some(record)) if record.matches(self.root, manifest) => ApprovalState::Matching,
-            Ok(Some(record)) if record.structurally_valid() => ApprovalState::Stale,
+            Ok(Some(checked))
+                if checked.record.structurally_valid()
+                    && checked
+                        .record
+                        .base()
+                        .is_some_and(|base| base.matches(self.root, manifest)) =>
+            {
+                ApprovalState::Matching
+            }
+            Ok(Some(checked)) if checked.record.structurally_valid() => ApprovalState::Stale,
             Ok(Some(_)) | Err(_) => ApprovalState::Invalid,
+        }
+    }
+
+    /// Inspect a path-qualified complete approval and retain its publication generation.
+    pub(crate) fn inspect_nested(
+        &self,
+        base: &AuthorityManifest,
+        extended: &AuthorityManifest,
+        source_paths: &[[u8; 32]],
+    ) -> (ApprovalState, Option<ReviewGeneration>) {
+        if !valid_source_paths(source_paths) {
+            return (ApprovalState::Invalid, None);
+        }
+        let source_paths = hex_source_paths(source_paths);
+        match self.read_record() {
+            Ok(None) => (ApprovalState::Absent, Some(ReviewGeneration::Absent)),
+            Ok(Some(checked)) if checked.record.structurally_valid() => {
+                let generation = match &checked.record {
+                    StoredRecord::Legacy(_) => ReviewGeneration::Legacy(checked.identity),
+                    StoredRecord::Current(record) => {
+                        ReviewGeneration::Current(record.generation.clone())
+                    }
+                    StoredRecord::Invalid => unreachable!("guarded by structural validity"),
+                };
+                if !checked
+                    .record
+                    .base()
+                    .is_some_and(|record| record.matches(self.root, base))
+                {
+                    return (ApprovalState::Stale, Some(generation));
+                }
+                let matching = match &checked.record {
+                    StoredRecord::Current(record) => record.nested.iter().any(|entry| {
+                        entry.source_paths == source_paths
+                            && entry.approval.matches(self.root, extended)
+                    }),
+                    StoredRecord::Legacy(_) | StoredRecord::Invalid => false,
+                };
+                (
+                    if matching {
+                        ApprovalState::Matching
+                    } else {
+                        ApprovalState::Absent
+                    },
+                    Some(generation),
+                )
+            }
+            Ok(Some(_)) | Err(_) => (ApprovalState::Invalid, None),
         }
     }
 
@@ -136,7 +296,110 @@ impl<'a> ApprovalStore<'a> {
             .map_err(|_| anyhow::anyhow!("workspace approval storage is unavailable or unsafe"))?;
         let _lock = lock(&directory, &lock_name(self.root))
             .map_err(|_| anyhow::anyhow!("workspace approval storage is busy or unsafe"))?;
-        let record = ApprovalRecord::current(self.root, manifest, method)?;
+        let previous = self.read_record()?;
+        let base = ApprovalRecord::current(self.root, manifest, method)?;
+        let nested = match previous {
+            Some(CheckedRecord {
+                record: StoredRecord::Current(current),
+                ..
+            }) if current.structurally_valid() && current.base.matches(self.root, manifest) => {
+                current.nested
+            }
+            _ => Vec::new(),
+        };
+        self.publish_record(
+            &directory,
+            ApprovalRecordV2 {
+                store_schema: STORE_SCHEMA,
+                generation: uuid::Uuid::new_v4().to_string(),
+                base,
+                nested,
+            },
+        )
+    }
+
+    pub(crate) fn approve_nested(
+        &self,
+        base: &AuthorityManifest,
+        extended: &AuthorityManifest,
+        source_paths: &[[u8; 32]],
+        reviewed: &ReviewGeneration,
+        method: ApprovalMethod,
+    ) -> Result<()> {
+        ensure!(
+            valid_source_paths(source_paths),
+            "invalid nested instruction source set"
+        );
+        let source_paths = hex_source_paths(source_paths);
+        ensure_outside_root(self.data, self.root)?;
+        let directory = self
+            .create_store()
+            .map_err(|_| anyhow::anyhow!("workspace approval storage is unavailable or unsafe"))?;
+        let _lock = lock(&directory, &lock_name(self.root))
+            .map_err(|_| anyhow::anyhow!("workspace approval storage is busy or unsafe"))?;
+        let current = self.read_record()?;
+        ensure!(
+            generation_matches(reviewed, current.as_ref()),
+            "workspace approval changed during review; review current authority again"
+        );
+        let mut record = match current {
+            Some(CheckedRecord {
+                record: StoredRecord::Current(record),
+                ..
+            }) if record.structurally_valid() && record.base.matches(self.root, base) => record,
+            Some(CheckedRecord {
+                record: StoredRecord::Current(record),
+                ..
+            }) if record.structurally_valid() => ApprovalRecordV2 {
+                store_schema: STORE_SCHEMA,
+                generation: String::new(),
+                base: ApprovalRecord::current(self.root, base, method)?,
+                nested: Vec::new(),
+            },
+            Some(CheckedRecord {
+                record: StoredRecord::Legacy(record),
+                ..
+            }) if record.matches(self.root, base) => ApprovalRecordV2 {
+                store_schema: STORE_SCHEMA,
+                generation: String::new(),
+                base: record,
+                nested: Vec::new(),
+            },
+            Some(CheckedRecord {
+                record: StoredRecord::Legacy(_),
+                ..
+            }) => ApprovalRecordV2 {
+                store_schema: STORE_SCHEMA,
+                generation: String::new(),
+                base: ApprovalRecord::current(self.root, base, method)?,
+                nested: Vec::new(),
+            },
+            None if matches!(reviewed, ReviewGeneration::Absent) => ApprovalRecordV2 {
+                store_schema: STORE_SCHEMA,
+                generation: String::new(),
+                base: ApprovalRecord::current(self.root, base, method)?,
+                nested: Vec::new(),
+            },
+            _ => bail!(
+                "workspace base approval changed during review; review current authority again"
+            ),
+        };
+        let entry = NestedApproval {
+            source_paths,
+            approval: ApprovalRecord::current(self.root, extended, method)?,
+        };
+        match record
+            .nested
+            .binary_search_by(|existing| existing.source_paths.cmp(&entry.source_paths))
+        {
+            Ok(index) => record.nested[index] = entry,
+            Err(index) => record.nested.insert(index, entry),
+        }
+        record.generation = uuid::Uuid::new_v4().to_string();
+        self.publish_record(&directory, record)
+    }
+
+    fn publish_record(&self, directory: &Directory, record: ApprovalRecordV2) -> Result<()> {
         ensure!(
             record.structurally_valid(),
             "workspace authority manifest exceeds approval-record limits"
@@ -146,7 +409,7 @@ impl<'a> ApprovalStore<'a> {
             bytes.len() <= MAX_RECORD_BYTES,
             "workspace approval record exceeds its size limit"
         );
-        publish(&directory, &record_name(self.root), &bytes)
+        publish(directory, &record_name(self.root), &bytes)
             .map_err(|_| anyhow::anyhow!("workspace approval could not be published safely"))
     }
 
@@ -190,7 +453,7 @@ impl<'a> ApprovalStore<'a> {
         Ok(removed)
     }
 
-    fn read_record(&self) -> Result<Option<ApprovalRecord>> {
+    fn read_record(&self) -> Result<Option<CheckedRecord>> {
         let Some(directory) = self.open_store()? else {
             return Ok(None);
         };
@@ -200,22 +463,24 @@ impl<'a> ApprovalStore<'a> {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        ensure!(
-            regular_file_info(&file)?.len <= MAX_RECORD_BYTES as u64,
-            "approval record exceeds its size limit"
-        );
+        let info = regular_file_info(&file)?;
         let mut bytes = Vec::new();
-        (&file)
-            .take((MAX_RECORD_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() <= MAX_RECORD_BYTES,
-            "approval record exceeds its size limit"
-        );
+        if info.len <= MAX_RECORD_BYTES as u64 {
+            (&file)
+                .take((MAX_RECORD_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+        }
         // Keep the opened object authoritative across the read. An atomic
         // replacement after open must not let detached stale bytes grant.
         directory.verify(&name, &file)?;
-        Ok(Some(serde_json::from_slice(&bytes)?))
+        Ok(Some(CheckedRecord {
+            record: if info.len > MAX_RECORD_BYTES as u64 || bytes.len() > MAX_RECORD_BYTES {
+                StoredRecord::Invalid
+            } else {
+                StoredRecord::parse(&bytes)
+            },
+            identity: info.identity,
+        }))
     }
 
     fn open_store(&self) -> Result<Option<Directory>> {
@@ -409,6 +674,37 @@ fn claim_digests(manifest: &AuthorityManifest) -> Vec<String> {
     digests
 }
 
+fn valid_source_paths(paths: &[[u8; 32]]) -> bool {
+    !paths.is_empty()
+        && paths.len() <= MAX_NESTED_SOURCES
+        && paths.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn hex_source_paths(paths: &[[u8; 32]]) -> Vec<String> {
+    paths.iter().map(|path| hex(path)).collect()
+}
+
+fn generation_matches(reviewed: &ReviewGeneration, current: Option<&CheckedRecord>) -> bool {
+    match (reviewed, current) {
+        (ReviewGeneration::Absent, None) => true,
+        (
+            ReviewGeneration::Legacy(expected),
+            Some(CheckedRecord {
+                record: StoredRecord::Legacy(_),
+                identity,
+            }),
+        ) => expected == identity,
+        (
+            ReviewGeneration::Current(expected),
+            Some(CheckedRecord {
+                record: StoredRecord::Current(record),
+                ..
+            }),
+        ) => expected == &record.generation,
+        _ => false,
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -497,6 +793,298 @@ mod tests {
     }
 
     #[test]
+    fn nested_approval_keeps_base_and_binds_exact_sources_and_manifest() {
+        let _gate = crate::spawn_gate::locking();
+        let fixture = Fixture::new("allow_shell = true\n");
+        let base = fixture.manifest();
+        let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
+        store.approve_command(&base).unwrap();
+        std::fs::create_dir(fixture.project.join("src")).unwrap();
+        std::fs::write(fixture.project.join("src/AGENTS.md"), "READ\n").unwrap();
+        let snapshot =
+            ConfigSnapshot::parse(None, &fixture.project, None, InvocationOverrides::default())
+                .unwrap();
+        let (nested, _) = snapshot.with_nested_directories(&["src".into()]).unwrap();
+        let paths = nested.nested_instruction_source_paths();
+        let (state, generation) = store.inspect_nested(&base, nested.manifest(), &paths);
+        assert_eq!(state, ApprovalState::Absent);
+        store
+            .approve_nested(
+                &base,
+                nested.manifest(),
+                &paths,
+                &generation.unwrap(),
+                ApprovalMethod::InteractiveTui,
+            )
+            .unwrap();
+        assert_eq!(store.inspect(&base), ApprovalState::Matching);
+        assert_eq!(
+            store.inspect_nested(&base, nested.manifest(), &paths).0,
+            ApprovalState::Matching
+        );
+
+        let mut wrong_paths = paths.clone();
+        wrong_paths.push([0xff; 32]);
+        assert_eq!(
+            store
+                .inspect_nested(&base, nested.manifest(), &wrong_paths)
+                .0,
+            ApprovalState::Absent
+        );
+        std::fs::write(fixture.project.join("src/AGENTS.md"), "CHANGED\n").unwrap();
+        let changed =
+            ConfigSnapshot::parse(None, &fixture.project, None, InvocationOverrides::default())
+                .unwrap();
+        let (changed, _) = changed.with_nested_directories(&["src".into()]).unwrap();
+        assert_eq!(
+            store
+                .inspect_nested(
+                    &base,
+                    changed.manifest(),
+                    &changed.nested_instruction_source_paths()
+                )
+                .0,
+            ApprovalState::Absent
+        );
+
+        store.approve_tui(&base).unwrap();
+        assert_eq!(
+            store.inspect_nested(&base, nested.manifest(), &paths).0,
+            ApprovalState::Matching,
+            "identical base reapproval preserves nested grants"
+        );
+        std::fs::write(
+            fixture.project.join(".kuru/config.toml"),
+            "allow_shell = true\nallow_write = true\n",
+        )
+        .unwrap();
+        store.approve_command(&fixture.manifest()).unwrap();
+        assert_eq!(
+            store.inspect_nested(&base, nested.manifest(), &paths).0,
+            ApprovalState::Stale
+        );
+    }
+
+    #[test]
+    fn complete_nested_review_can_replace_a_stale_base_atomically() {
+        let _gate = crate::spawn_gate::locking();
+        let fixture = Fixture::new("allow_shell = true\n");
+        let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
+        let old_base = fixture.manifest();
+        store.approve_command(&old_base).unwrap();
+        std::fs::create_dir(fixture.project.join("src")).unwrap();
+        std::fs::write(fixture.project.join("src/AGENTS.md"), "local instruction").unwrap();
+        std::fs::write(
+            fixture.project.join(".kuru/config.toml"),
+            "allow_shell = true\nallow_write = true\n",
+        )
+        .unwrap();
+        let current =
+            ConfigSnapshot::parse(None, &fixture.project, None, InvocationOverrides::default())
+                .unwrap();
+        let (nested, _) = current.with_nested_directories(&["src".into()]).unwrap();
+        let paths = nested.nested_instruction_source_paths();
+        let (state, reviewed) = store.inspect_nested(current.manifest(), nested.manifest(), &paths);
+        assert_eq!(state, ApprovalState::Stale);
+        store
+            .approve_nested(
+                current.manifest(),
+                nested.manifest(),
+                &paths,
+                &reviewed.unwrap(),
+                ApprovalMethod::InteractiveTui,
+            )
+            .unwrap();
+        assert_eq!(store.inspect(current.manifest()), ApprovalState::Matching);
+        assert_eq!(store.inspect(&old_base), ApprovalState::Stale);
+        assert_eq!(
+            store
+                .inspect_nested(current.manifest(), nested.manifest(), &paths)
+                .0,
+            ApprovalState::Matching
+        );
+    }
+
+    #[test]
+    fn pending_nested_review_cannot_resurrect_revoked_or_recreated_base() {
+        let _gate = crate::spawn_gate::locking();
+        let fixture = Fixture::new("allow_shell = true\n");
+        std::fs::create_dir(fixture.project.join("src")).unwrap();
+        std::fs::write(fixture.project.join("src/AGENTS.md"), "READ\n").unwrap();
+        let base = fixture.manifest();
+        let snapshot =
+            ConfigSnapshot::parse(None, &fixture.project, None, InvocationOverrides::default())
+                .unwrap();
+        let (nested, _) = snapshot.with_nested_directories(&["src".into()]).unwrap();
+        let paths = nested.nested_instruction_source_paths();
+        let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
+        store.approve_command(&base).unwrap();
+        let (_, stale) = store.inspect_nested(&base, nested.manifest(), &paths);
+        let stale = stale.unwrap();
+        assert!(store.revoke().unwrap());
+        assert!(
+            store
+                .approve_nested(
+                    &base,
+                    nested.manifest(),
+                    &paths,
+                    &stale,
+                    ApprovalMethod::InteractiveTui
+                )
+                .is_err()
+        );
+        store.approve_command(&base).unwrap();
+        assert!(
+            store
+                .approve_nested(
+                    &base,
+                    nested.manifest(),
+                    &paths,
+                    &stale,
+                    ApprovalMethod::InteractiveTui
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.inspect_nested(&base, nested.manifest(), &paths).0,
+            ApprovalState::Absent
+        );
+    }
+
+    #[test]
+    fn checked_legacy_base_upgrades_without_losing_startup_authority() {
+        let _gate = crate::spawn_gate::locking();
+        let fixture = Fixture::new("allow_shell = true\n");
+        let base = fixture.manifest();
+        let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
+        store.approve_command(&base).unwrap();
+        let directory = store.open_store().unwrap().unwrap();
+        let legacy =
+            ApprovalRecord::current(&fixture.workspace, &base, ApprovalMethod::Command).unwrap();
+        replace_record(
+            &directory,
+            &record_name(&fixture.workspace),
+            &serde_json::to_vec(&legacy).unwrap(),
+        );
+        assert_eq!(store.inspect(&base), ApprovalState::Matching);
+        std::fs::create_dir(fixture.project.join("src")).unwrap();
+        std::fs::write(fixture.project.join("src/AGENTS.md"), "READ\n").unwrap();
+        let snapshot =
+            ConfigSnapshot::parse(None, &fixture.project, None, InvocationOverrides::default())
+                .unwrap();
+        let (nested, _) = snapshot.with_nested_directories(&["src".into()]).unwrap();
+        let paths = nested.nested_instruction_source_paths();
+        let (state, generation) = store.inspect_nested(&base, nested.manifest(), &paths);
+        assert_eq!(state, ApprovalState::Absent);
+        store
+            .approve_nested(
+                &base,
+                nested.manifest(),
+                &paths,
+                &generation.unwrap(),
+                ApprovalMethod::InteractiveTui,
+            )
+            .unwrap();
+        assert_eq!(store.inspect(&base), ApprovalState::Matching);
+        assert_eq!(
+            store.inspect_nested(&base, nested.manifest(), &paths).0,
+            ApprovalState::Matching
+        );
+    }
+
+    #[test]
+    fn absent_nested_review_publishes_base_and_old_reader_fails_closed() {
+        let _gate = crate::spawn_gate::locking();
+        let fixture = Fixture::new("allow_shell = true\n");
+        std::fs::create_dir(fixture.project.join("src")).unwrap();
+        std::fs::write(fixture.project.join("src/AGENTS.md"), "READ\n").unwrap();
+        let base = fixture.manifest();
+        let snapshot =
+            ConfigSnapshot::parse(None, &fixture.project, None, InvocationOverrides::default())
+                .unwrap();
+        let (nested, _) = snapshot.with_nested_directories(&["src".into()]).unwrap();
+        let paths = nested.nested_instruction_source_paths();
+        let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
+        let (state, generation) = store.inspect_nested(&base, nested.manifest(), &paths);
+        assert_eq!(state, ApprovalState::Absent);
+        store
+            .approve_nested(
+                &base,
+                nested.manifest(),
+                &paths,
+                &generation.unwrap(),
+                ApprovalMethod::InteractiveTui,
+            )
+            .unwrap();
+        assert_eq!(store.inspect(&base), ApprovalState::Matching);
+        assert_eq!(
+            store.inspect_nested(&base, nested.manifest(), &paths).0,
+            ApprovalState::Matching
+        );
+        let directory = store.open_store().unwrap().unwrap();
+        let name = record_name(&fixture.workspace);
+        let mut file = directory.read(&name).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        directory.verify(&name, &file).unwrap();
+        assert!(serde_json::from_slice::<ApprovalRecord>(&bytes).is_err());
+    }
+
+    #[test]
+    fn separate_nested_publication_invalidates_a_pending_generation() {
+        let _gate = crate::spawn_gate::locking();
+        let fixture = Fixture::new("allow_shell = true\n");
+        std::fs::create_dir(fixture.project.join("src")).unwrap();
+        std::fs::create_dir(fixture.project.join("tests")).unwrap();
+        std::fs::write(fixture.project.join("src/AGENTS.md"), "SRC\n").unwrap();
+        std::fs::write(fixture.project.join("tests/AGENTS.md"), "TESTS\n").unwrap();
+        let base = fixture.manifest();
+        let snapshot =
+            ConfigSnapshot::parse(None, &fixture.project, None, InvocationOverrides::default())
+                .unwrap();
+        let (src, _) = snapshot.with_nested_directories(&["src".into()]).unwrap();
+        let (tests, _) = snapshot.with_nested_directories(&["tests".into()]).unwrap();
+        let store = ApprovalStore::new(&fixture.data, &fixture.workspace);
+        store.approve_command(&base).unwrap();
+        let (_, generation) = store.inspect_nested(
+            &base,
+            tests.manifest(),
+            &tests.nested_instruction_source_paths(),
+        );
+        let generation = generation.unwrap();
+        store
+            .approve_nested(
+                &base,
+                src.manifest(),
+                &src.nested_instruction_source_paths(),
+                &generation,
+                ApprovalMethod::InteractiveTui,
+            )
+            .unwrap();
+        assert!(
+            store
+                .approve_nested(
+                    &base,
+                    tests.manifest(),
+                    &tests.nested_instruction_source_paths(),
+                    &generation,
+                    ApprovalMethod::InteractiveTui
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .inspect_nested(
+                    &base,
+                    src.manifest(),
+                    &src.nested_instruction_source_paths()
+                )
+                .0,
+            ApprovalState::Matching
+        );
+    }
+
+    #[test]
     fn malformed_oversized_and_hard_linked_records_never_match() {
         let _gate = crate::spawn_gate::locking();
         let fixture = Fixture::new("allow_shell = true\n");
@@ -507,8 +1095,21 @@ mod tests {
         let name = record_name(&fixture.workspace);
         replace_record(&directory, &name, b"{\"unknown\":true}");
         assert_eq!(store.inspect(&manifest), ApprovalState::Invalid);
+        store.approve_command(&manifest).unwrap();
+        assert_eq!(store.inspect(&manifest), ApprovalState::Matching);
+        let valid = std::fs::read(directory.path().join(&name)).unwrap();
+        let duplicated = String::from_utf8(valid).unwrap().replacen(
+            "\"store_schema\":2",
+            "\"store_schema\":2,\"store_schema\":2",
+            1,
+        );
+        replace_record(&directory, &name, duplicated.as_bytes());
+        assert_eq!(store.inspect(&manifest), ApprovalState::Invalid);
+        store.approve_command(&manifest).unwrap();
         replace_record(&directory, &name, &vec![b'x'; MAX_RECORD_BYTES + 1]);
         assert_eq!(store.inspect(&manifest), ApprovalState::Invalid);
+        store.approve_command(&manifest).unwrap();
+        assert_eq!(store.inspect(&manifest), ApprovalState::Matching);
 
         #[cfg(unix)]
         {
@@ -519,6 +1120,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(store.inspect(&manifest), ApprovalState::Invalid);
+            assert!(store.approve_command(&manifest).is_err());
         }
     }
 
@@ -540,6 +1142,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.inspect(&manifest), ApprovalState::Invalid);
+        assert!(store.approve_command(&manifest).is_err());
 
         let linked = Fixture::new("allow_shell = true\n");
         let manifest = linked.manifest();
@@ -575,6 +1178,25 @@ mod tests {
                 .unwrap();
         record.claim_digests = vec!["00".repeat(32); MAX_CLAIMS + 1];
         assert!(!record.structurally_valid());
+
+        let base = ApprovalRecord::current(&fixture.workspace, &manifest, ApprovalMethod::Command)
+            .unwrap();
+        let entry = NestedApproval {
+            source_paths: vec!["01".repeat(32)],
+            approval: base.clone(),
+        };
+        let mut current = ApprovalRecordV2 {
+            store_schema: STORE_SCHEMA,
+            generation: uuid::Uuid::new_v4().to_string(),
+            base,
+            nested: vec![entry.clone()],
+        };
+        assert!(current.structurally_valid());
+        current.nested = vec![entry; MAX_NESTED_APPROVALS + 1];
+        assert!(!current.structurally_valid());
+        current.nested.truncate(1);
+        current.generation = "reused-content-digest".into();
+        assert!(!current.structurally_valid());
 
         let directory = store.open_store().unwrap().unwrap();
         let expected_name = OsStr::new("expected-candidate");

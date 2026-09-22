@@ -8,18 +8,142 @@ use anyhow::Result;
 use async_trait::async_trait;
 use axum::{Json, Router, routing::post};
 use kuru_connectors::{
-    ApprovalAnswer, ApprovalRequest, ApprovalSender, PermissionInvocation, PermissionOutcome,
+    ApprovalAnswer, ApprovalRequest, ApprovalSender, InstructionActivation, InstructionGate,
+    InstructionGateOutcome, InstructionReviewSender, PermissionInvocation, PermissionOutcome,
     Provider, ProviderEvent, ProviderSink, ToolHost,
 };
 use kuru_core::{
     Completion, CompletionRequest, Config, ContentBlock, Mode, ModelInfo, NativeTool,
-    PermissionAction, PermissionRule, PermissionSelector, ToolCall,
+    PermissionAction, PermissionRule, PermissionSelector, ProjectRelativeTarget, ToolCall,
 };
 use kuru_memory::MemoryStore;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{CancellationToken, Event, Harness, ToolOutcome};
+
+struct FirstPathInstructions {
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PublishPathInstructions(Arc<std::sync::atomic::AtomicBool>);
+
+#[async_trait]
+impl InstructionActivation for PublishPathInstructions {
+    async fn publish(self: Box<Self>) -> Result<String> {
+        self.0.store(true, Ordering::SeqCst);
+        Ok("new path-qualified instruction".into())
+    }
+}
+
+#[async_trait]
+impl InstructionGate for FirstPathInstructions {
+    async fn review(
+        &self,
+        directories: &[ProjectRelativeTarget],
+        _approval: Option<&InstructionReviewSender>,
+    ) -> Result<InstructionGateOutcome> {
+        assert_eq!(directories, &[ProjectRelativeTarget::parse("src")?]);
+        Ok(if self.active.load(Ordering::SeqCst) {
+            InstructionGateOutcome::Unchanged
+        } else {
+            InstructionGateOutcome::Proposed(Box::new(PublishPathInstructions(self.active.clone())))
+        })
+    }
+}
+
+struct TwoStaleFileCalls {
+    speaking_requests: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Provider for TwoStaleFileCalls {
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
+        let completion = if request.instructions.contains("Phase: deliberate") {
+            Completion::from_legacy("ready", vec![], 0, 0)
+        } else {
+            let mut requests = self.speaking_requests.lock().unwrap();
+            requests.push(request.instructions.clone());
+            if requests.len() == 1 {
+                Completion::from_legacy(
+                    "",
+                    ["first", "second"]
+                        .into_iter()
+                        .map(|id| ToolCall {
+                            id: id.into(),
+                            name: "file_write".into(),
+                            arguments: json!({"path":format!("src/{id}.txt"),"content":"stale"}),
+                        })
+                        .collect(),
+                    0,
+                    0,
+                )
+            } else {
+                Completion::from_legacy("replanned", vec![], 0, 0)
+            }
+        };
+        sink.emit(ProviderEvent::Completed(completion)).await
+    }
+}
+
+#[tokio::test]
+async fn newly_activated_instructions_settle_stale_parallel_calls_without_effects() -> Result<()> {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    let config = Config {
+        mode: Mode::Freudian,
+        provider: "demo".into(),
+        model: "demo".into(),
+        allow_write: true,
+        max_rounds: 1,
+        dream_every: 0,
+        dream_on_exit: false,
+        ..Config::default()
+    };
+    let gate = Arc::new(FirstPathInstructions {
+        active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let tools = ToolHost::new(project.path(), &config)?.with_instruction_gate(gate);
+    let provider = Arc::new(TwoStaleFileCalls {
+        speaking_requests: Mutex::new(Vec::new()),
+    });
+    let mut harness = Harness::with_tool_host_and_instructions(
+        config,
+        project.path(),
+        String::new(),
+        MemoryStore::temporary().await?,
+        provider.clone(),
+        None,
+        tools,
+    )
+    .await?;
+    let target = harness.topology.parts[0].id.clone();
+    let output = harness
+        .run_controlled(
+            "write after review",
+            Some(&target),
+            "nested-replan",
+            &CancellationToken::new(),
+        )
+        .await?;
+    assert_eq!(output.text, "replanned");
+    assert!(!project.path().join("src/first.txt").exists());
+    assert!(!project.path().join("src/second.txt").exists());
+    let requests = provider.speaking_requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0].contains("new path-qualified instruction"));
+    assert!(requests[1].contains("new path-qualified instruction"));
+    drop(requests);
+    let file_results = output.events.iter().filter(|event| matches!(event, Event::ToolSettled { observation, .. } if observation.name == "file_write")).count();
+    assert_eq!(file_results, 2);
+    harness.shutdown(false).await?;
+    harness.memory.close().await?;
+    Ok(())
+}
 
 struct OneExternalCall {
     issued: Mutex<bool>,

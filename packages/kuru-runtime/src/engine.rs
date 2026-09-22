@@ -12,8 +12,8 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use futures::future::join_all;
 use kuru_connectors::{
-    ApprovalSender, PermissionService, Provider, ToolHost, a2a_send, is_permission_denied,
-    project_text,
+    ApprovalSender, InstructionReviewSender, PermissionService, Provider, ToolHost, a2a_send,
+    is_permission_denied, project_text,
 };
 use kuru_core::{
     ActorPhase, Completion, Config, ContextBudget, FacingInput, InvocationStart, Message, Mode,
@@ -99,6 +99,12 @@ pub enum ResponseOutcome {
 pub struct ControlledTurnOutput {
     pub output: TurnOutput,
     pub reused: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TurnReviewChannels<'a> {
+    permission: Option<&'a ApprovalSender>,
+    instructions: Option<&'a InstructionReviewSender>,
 }
 
 #[derive(Clone, Default)]
@@ -1616,8 +1622,15 @@ impl Harness {
         turn_id: &str,
         cancellation: &CancellationToken,
     ) -> Result<ControlledTurnOutput> {
-        self.run_controlled_inner(prompt, target, turn_id, true, cancellation, None)
-            .await
+        self.run_controlled_inner(
+            prompt,
+            target,
+            turn_id,
+            true,
+            cancellation,
+            TurnReviewChannels::default(),
+        )
+        .await
     }
 
     /// Run one attached foreground submission with an operation-scoped prompt.
@@ -1629,8 +1642,43 @@ impl Harness {
         cancellation: &CancellationToken,
         approval: ApprovalSender,
     ) -> Result<ControlledTurnOutput> {
-        self.run_controlled_inner(prompt, target, turn_id, true, cancellation, Some(&approval))
-            .await
+        self.run_controlled_inner(
+            prompt,
+            target,
+            turn_id,
+            true,
+            cancellation,
+            TurnReviewChannels {
+                permission: Some(&approval),
+                instructions: None,
+            },
+        )
+        .await
+    }
+
+    /// Foreground turns keep tool permission and instruction trust reviews on
+    /// distinct channels, both scoped to this attached submission.
+    pub async fn run_local_controlled_with_reviews(
+        &mut self,
+        prompt: &str,
+        target: Option<&str>,
+        turn_id: &str,
+        cancellation: &CancellationToken,
+        approval: ApprovalSender,
+        instruction_approval: InstructionReviewSender,
+    ) -> Result<ControlledTurnOutput> {
+        self.run_controlled_inner(
+            prompt,
+            target,
+            turn_id,
+            true,
+            cancellation,
+            TurnReviewChannels {
+                permission: Some(&approval),
+                instructions: Some(&instruction_approval),
+            },
+        )
+        .await
     }
 
     /// Retry the last locally admitted submission without changing its tuple.
@@ -1638,7 +1686,7 @@ impl Harness {
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<ControlledTurnOutput> {
-        self.retry_last_inner(cancellation, None).await
+        self.retry_last_inner(cancellation, None, None).await
     }
 
     /// Retry an attached foreground submission; completed retries reuse their
@@ -1648,13 +1696,25 @@ impl Harness {
         cancellation: &CancellationToken,
         approval: ApprovalSender,
     ) -> Result<ControlledTurnOutput> {
-        self.retry_last_inner(cancellation, Some(&approval)).await
+        self.retry_last_inner(cancellation, Some(&approval), None)
+            .await
+    }
+
+    pub async fn retry_last_with_reviews(
+        &mut self,
+        cancellation: &CancellationToken,
+        approval: ApprovalSender,
+        instruction_approval: InstructionReviewSender,
+    ) -> Result<ControlledTurnOutput> {
+        self.retry_last_inner(cancellation, Some(&approval), Some(&instruction_approval))
+            .await
     }
 
     async fn retry_last_inner(
         &mut self,
         cancellation: &CancellationToken,
         approval: Option<&ApprovalSender>,
+        instruction_approval: Option<&InstructionReviewSender>,
     ) -> Result<ControlledTurnOutput> {
         let submission: LastLocalSubmission = serde_json::from_value(
             self.memory
@@ -1673,7 +1733,10 @@ impl Harness {
             &submission.id,
             false,
             cancellation,
-            approval,
+            TurnReviewChannels {
+                permission: approval,
+                instructions: instruction_approval,
+            },
         )
         .await
     }
@@ -1690,7 +1753,14 @@ impl Harness {
         cancellation: &CancellationToken,
     ) -> Result<TurnOutput> {
         Ok(self
-            .run_controlled_inner(prompt, target, turn_id, false, cancellation, None)
+            .run_controlled_inner(
+                prompt,
+                target,
+                turn_id,
+                false,
+                cancellation,
+                TurnReviewChannels::default(),
+            )
             .await?
             .output)
     }
@@ -1702,7 +1772,7 @@ impl Harness {
         turn_id: &str,
         remember_local: bool,
         cancellation: &CancellationToken,
-        approval: Option<&ApprovalSender>,
+        reviews: TurnReviewChannels<'_>,
     ) -> Result<ControlledTurnOutput> {
         self.reconcile().await?;
         ensure!(
@@ -1742,7 +1812,7 @@ impl Harness {
                 &key,
                 &mut journal,
                 cancellation,
-                approval,
+                reviews,
             )
             .instrument(span.clone()),
         )
@@ -1777,7 +1847,7 @@ impl Harness {
         journal_key: &str,
         journal: &mut TurnJournal,
         cancellation: &CancellationToken,
-        approval: Option<&ApprovalSender>,
+        reviews: TurnReviewChannels<'_>,
     ) -> Result<TurnOutput> {
         self.trace.clear();
         self.reset_context_snapshot();
@@ -1906,7 +1976,7 @@ impl Harness {
                                 observe: true,
                                 speaking: false,
                             },
-                            approval,
+                            reviews.permission,
                         )
                         .await
                     };
@@ -2019,6 +2089,7 @@ impl Harness {
                 break;
             }
             inputs = vec![];
+            let mut instructions_refreshed = false;
             for call in calls {
                 let admitted = std::time::Instant::now();
                 let result = if used >= self.config.max_tool_calls {
@@ -2041,7 +2112,11 @@ impl Harness {
                         actor: speaker.clone(),
                         name: call.name.clone(),
                     });
-                    if is_cognitive(&call.name) {
+                    if instructions_refreshed {
+                        let result = Ok("New path-specific instructions were activated. Replan this call before executing it; the original call made no change.".to_owned());
+                        self.observe_tool(&speaker, &call, &result, admitted, true);
+                        result
+                    } else if is_cognitive(&call.name) {
                         let mut mail = BTreeMap::new();
                         let result = match self
                             .cognitive_call(
@@ -2054,7 +2129,7 @@ impl Harness {
                                     observe: false,
                                     speaking: true,
                                 },
-                                approval,
+                                reviews.permission,
                             )
                             .await
                         {
@@ -2112,13 +2187,26 @@ impl Harness {
                         );
                         let started = std::time::Instant::now();
                         let result = cancellation
-                            .wait(self.tools.execute_with_approval(
-                                &call.name,
-                                call.arguments.clone(),
-                                approval,
-                            ))
+                            .wait(async {
+                                Ok(self
+                                    .tools
+                                    .execute_for_actor(
+                                        &call.name,
+                                        call.arguments.clone(),
+                                        reviews.permission,
+                                        reviews.instructions,
+                                    )
+                                    .await)
+                            })
                             .instrument(span.clone())
-                            .await;
+                            .await
+                            .and_then(|outcome| {
+                                if let Some(instructions) = outcome.instructions {
+                                    self.instructions = instructions;
+                                    instructions_refreshed = true;
+                                }
+                                outcome.result
+                            });
                         let status = match &result {
                             Ok(output)
                                 if call.name == "shell"
