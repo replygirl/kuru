@@ -10,6 +10,10 @@ async fn main() -> anyhow::Result<()> {
         Some("--internal-memory-service-client-fixture") => {
             kuru_memory::service::client_fixture_entry(std::env::args_os().skip(2)).await
         }
+        #[cfg(all(windows, feature = "test-support"))]
+        Some("--internal-memory-service-held-client-fixture") => {
+            kuru_memory::service::held_client_fixture_entry(std::env::args_os().skip(2)).await
+        }
         #[cfg(feature = "test-support")]
         Some("prefetch") => {
             // Cargo may republish its top-level binary alias after this task

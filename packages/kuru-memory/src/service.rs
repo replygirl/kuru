@@ -116,6 +116,39 @@ pub async fn client_fixture_entry(arguments: impl IntoIterator<Item = OsString>)
     Ok(())
 }
 
+/// Native Windows fixture: the caller places this starter in a containing
+/// Job, then observes the owner through a distinct client after it exits.
+#[cfg(all(windows, feature = "test-support"))]
+pub async fn held_client_fixture_entry(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<()> {
+    let mut arguments: Vec<_> = arguments.into_iter().collect();
+    let release = PathBuf::from(arguments.pop().context("missing fixture release marker")?);
+    let ready = PathBuf::from(arguments.pop().context("missing fixture ready marker")?);
+    let (project, options) = parse_service_arguments(arguments)?;
+    let executable = std::env::current_exe()?;
+    let mut client = attach_or_start(&options, &project, &executable).await?;
+    ensure!(matches!(
+        client
+            .call(ServiceCall::AppendMessage {
+                namespace: "starter-exit-fixture".into(),
+                message: kuru_core::Message::text("user", "starter committed"),
+            })
+            .await?,
+        ServiceValue::Unit
+    ));
+    std::fs::write(&ready, client.generation())?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !release.exists() {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "memory service starter release deadline exceeded"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub type LocalStream = tokio::net::UnixStream;
 #[cfg(windows)]
@@ -327,7 +360,7 @@ async fn spawn_service(
     use kuru_platform::windows::process::{Console, Lifetime, NativeSpawnSpec};
     let mut command = NativeSpawnSpec::new(executable.to_owned(), project.to_owned());
     command.args = service_arguments(options, project);
-    command.lifetime = Lifetime::TrustedSupervisor;
+    command.lifetime = Lifetime::IndependentService;
     command.console = Console::PrivateHidden;
     let system = kuru_platform::windows::process::system_directory()?;
     let windows = system
@@ -343,10 +376,9 @@ async fn spawn_service(
             .environment
             .push(("LLVM_PROFILE_FILE".into(), profile));
     }
-    command
-        .spawn()
-        .await
-        .context("start project memory service")
+    command.spawn().await.context(
+        "start independent project memory service; a containing Windows Job must allow breakaway",
+    )
 }
 
 #[cfg(unix)]
@@ -1119,6 +1151,229 @@ pub fn is_peer_closed(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[cfg(windows)]
+    fn windows_starter_fixture(
+        project: &Path,
+        options: &crate::store::OpenOptions,
+        executable: &Path,
+        ready: &Path,
+        release: &Path,
+        lifetime: kuru_platform::windows::process::Lifetime,
+    ) -> kuru_platform::windows::process::NativeSpawnSpec {
+        use kuru_platform::windows::process::NativeSpawnSpec;
+        let mut command = NativeSpawnSpec::new(executable.to_owned(), project.to_owned());
+        command.args = service_arguments(options, project);
+        command.args[0] = "--internal-memory-service-held-client-fixture".into();
+        command.args.push(ready.as_os_str().to_owned());
+        command.args.push(release.as_os_str().to_owned());
+        command.lifetime = lifetime;
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            command.environment.push(("SystemRoot".into(), root));
+        }
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command
+                .environment
+                .push(("LLVM_PROFILE_FILE".into(), profile));
+        }
+        command
+    }
+
+    #[cfg(windows)]
+    fn windows_service_fixture() -> Result<(
+        tempfile::TempDir,
+        PathBuf,
+        crate::store::OpenOptions,
+        PathBuf,
+    )> {
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let mut options = crate::store::OpenOptions::new(root.path().join("private"), scope);
+        options.config.cache_dir = Some(crate::store::test_cache());
+        options.config.offline = true;
+        let executable = crate::store::test_supervisor()?;
+        options.supervisor = Some(executable.clone());
+        Ok((root, project, options, executable))
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn starter_job_exit_preserves_independent_owner_and_surviving_client() -> Result<()> {
+        use kuru_platform::windows::process::Lifetime;
+        tokio::time::timeout(Duration::from_secs(110), async {
+            let (root, project, options, executable) = windows_service_fixture()?;
+            let ready = root.path().join("starter-ready");
+            let release = root.path().join("starter-release");
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut starter = windows_starter_fixture(
+                &project,
+                &options,
+                &executable,
+                &ready,
+                &release,
+                Lifetime::FixtureBreakawayJob,
+            )
+            .spawn()
+            .await?;
+            let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+            while !ready.exists() {
+                if let Some(status) = starter.try_wait()? {
+                    bail!("contained memory starter exited before readiness: {status}");
+                }
+                ensure!(
+                    tokio::time::Instant::now() < ready_deadline,
+                    "contained memory starter did not publish readiness"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let generation = std::fs::read_to_string(&ready)?;
+            let mut survivor = try_attach(&options.data_dir, &options.project_scope, &project)
+                .await?
+                .context("independent survivor could not attach to starter's owner")?;
+            ensure!(
+                survivor.generation() == generation,
+                "survivor generation changed"
+            );
+            std::fs::write(&release, b"release")?;
+            ensure!(
+                starter.wait(Duration::from_secs(10)).await?.success(),
+                "contained starter failed while exiting"
+            );
+            drop(starter); // closes the containing kill-on-close Job
+            ensure!(matches!(
+                survivor
+                    .call(ServiceCall::AppendMessage {
+                        namespace: "starter-exit-fixture".into(),
+                        message: kuru_core::Message::text("user", "survivor committed"),
+                    })
+                    .await?,
+                ServiceValue::Unit
+            ));
+            let ServiceValue::HistoryWindow(window) = survivor
+                .call(ServiceCall::HistoryWindow {
+                    namespace: "starter-exit-fixture".into(),
+                    limit: 4,
+                })
+                .await?
+            else {
+                bail!("surviving client received the wrong history result");
+            };
+            ensure!(
+                window.total_rows == 2 && window.messages.len() == 2,
+                "surviving client lost a committed row"
+            );
+            drop(survivor);
+            let idle_deadline =
+                tokio::time::Instant::now() + SERVICE_IDLE_TIMEOUT + Duration::from_secs(20);
+            while EndpointRecord::read(&options.data_dir, &options.project_scope)?.is_some() {
+                ensure!(
+                    tokio::time::Instant::now() < idle_deadline,
+                    "independent owner did not retire before fixture cleanup"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            while ServiceLock::try_acquire(
+                &options.data_dir,
+                &options.project_scope,
+                ServiceLockKind::Owner,
+            )?
+            .is_none()
+            {
+                ensure!(
+                    tokio::time::Instant::now() < idle_deadline,
+                    "independent owner did not release its lifecycle lock after Dolt reap"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("Windows independent owner fixture exceeded 110 seconds")??;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn denying_job_rejects_independent_owner_before_publication() -> Result<()> {
+        use kuru_platform::windows::process::{Lifetime, Stdio};
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(Duration::from_secs(40), async {
+            let (root, project, options, executable) = windows_service_fixture()?;
+            let ready = root.path().join("denied-ready");
+            let release = root.path().join("denied-release");
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut command = windows_starter_fixture(
+                &project,
+                &options,
+                &executable,
+                &ready,
+                &release,
+                Lifetime::OwnedJob,
+            );
+            command.stderr = Stdio::Pipe;
+            let mut starter = command.spawn().await?;
+            let mut stderr = starter.take_stderr().context("missing starter stderr")?;
+            let drain = async move {
+                let mut diagnostic = Vec::new();
+                let mut truncated = false;
+                let mut block = [0u8; 4096];
+                loop {
+                    let count = stderr.read(&mut block).await?;
+                    if count == 0 {
+                        break;
+                    }
+                    let retained = (16 * 1024usize).saturating_sub(diagnostic.len()).min(count);
+                    diagnostic.extend_from_slice(&block[..retained]);
+                    truncated |= retained < count;
+                }
+                Ok::<_, anyhow::Error>((
+                    String::from_utf8_lossy(&diagnostic).into_owned(),
+                    truncated,
+                ))
+            };
+            let (status, diagnostic) = tokio::join!(starter.wait(Duration::from_secs(30)), drain);
+            let status = status?;
+            ensure!(
+                !status.success(),
+                "denied breakaway unexpectedly started owner"
+            );
+            let (diagnostic, truncated) = diagnostic?;
+            ensure!(!truncated, "denied breakaway diagnostic exceeded 16 KiB");
+            ensure!(
+                diagnostic.contains("containing Windows Job must allow breakaway"),
+                "denied breakaway lacked containment diagnosis: {diagnostic}"
+            );
+            drop(starter);
+            ensure!(!ready.exists(), "denied starter published readiness");
+            ensure!(
+                EndpointRecord::read(&options.data_dir, &options.project_scope)?.is_none(),
+                "denied owner published an endpoint"
+            );
+            ensure!(
+                ServiceLock::try_acquire(
+                    &options.data_dir,
+                    &options.project_scope,
+                    ServiceLockKind::Owner,
+                )?
+                .is_some(),
+                "denied owner retained the lifecycle lock"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("Windows denied-breakaway fixture exceeded 40 seconds")??;
+        Ok(())
+    }
 
     fn authority() -> EndpointAuthority {
         EndpointAuthority {

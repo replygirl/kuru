@@ -42,7 +42,7 @@ use windows_sys::Win32::{
             STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
         },
         JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
@@ -50,10 +50,10 @@ use windows_sys::Win32::{
         Memory::{GetProcessHeap, HeapAlloc, HeapFree},
         ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::{
-            CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
-            CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-            GetCurrentProcess, GetExitCodeProcess, GetProcessId, GetProcessTimes,
-            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP,
+            CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+            EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessId,
+            GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, STARTF_USESHOWWINDOW,
             STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
@@ -71,6 +71,13 @@ pub enum Lifetime {
     /// Caller supplies an explicit lifetime protocol and must await cleanup.
     /// Drop closes the process handle without terminating this child.
     TrustedSupervisor,
+    /// A service that must outlive its starter requests native Job breakaway.
+    /// A containing Job that forbids breakaway rejects the launch; no fallback
+    /// may silently tie the service to that Job's kill-on-close lifetime.
+    IndependentService,
+    /// Native fixture only: a kill-on-close Job permitting explicit breakaway.
+    #[cfg(feature = "test-support")]
+    FixtureBreakawayJob,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -245,10 +252,11 @@ impl NativeSpawnSpec {
                 return Err(io::Error::last_os_error());
             }
         }
-        let job = if self.lifetime == Lifetime::OwnedJob {
-            Some(create_job()?)
-        } else {
-            None
+        let job = match self.lifetime {
+            Lifetime::OwnedJob => Some(create_job(false)?),
+            #[cfg(feature = "test-support")]
+            Lifetime::FixtureBreakawayJob => Some(create_job(true)?),
+            Lifetime::TrustedSupervisor | Lifetime::IndependentService => None,
         };
         let attributes = Attributes::new(if job.is_some() { 2 } else { 1 })?;
         attributes.add(
@@ -276,6 +284,9 @@ impl NativeSpawnSpec {
         startup.StartupInfo.hStdError = handles[2];
         startup.lpAttributeList = attributes.pointer;
         let mut flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+        if self.lifetime == Lifetime::IndependentService {
+            flags |= CREATE_BREAKAWAY_FROM_JOB;
+        }
         match self.console {
             Console::Inherit => (),
             Console::NewProcessGroup => flags |= CREATE_NEW_PROCESS_GROUP,
@@ -646,7 +657,7 @@ pub(super) fn process_is_running(process: &OwnedHandle) -> io::Result<bool> {
     }
 }
 
-fn create_job() -> io::Result<OwnedHandle> {
+fn create_job(allow_breakaway: bool) -> io::Result<OwnedHandle> {
     // SAFETY: unnamed Job, null security attributes makes handle non-inheritable.
     let raw = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
     if raw.is_null() {
@@ -657,6 +668,9 @@ fn create_job() -> io::Result<OwnedHandle> {
     // SAFETY: zeroed optional job settings, exact class/size supplied below.
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if allow_breakaway {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    }
     if unsafe {
         SetInformationJobObject(
             job.as_raw_handle(),

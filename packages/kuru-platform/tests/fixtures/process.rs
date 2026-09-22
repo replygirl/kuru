@@ -117,6 +117,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::io::stdout().flush()?;
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
+        "independent-leaf" => {
+            let lock = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&args[1])?;
+            lock.lock()?;
+            println!("independent-ready");
+            std::io::stdout().flush()?;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !std::path::Path::new(&args[2]).exists() {
+                if Instant::now() >= deadline {
+                    return Err("independent leaf release timed out".into());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        "independent-starter" => {
+            let mut child = child_spec()?;
+            child.args = vec!["independent-leaf".into(), args[1].clone(), args[2].clone()];
+            child.lifetime = Lifetime::IndependentService;
+            child.stdout = Stdio::Pipe;
+            let mut child = child.spawn().await?;
+            let mut lines =
+                BufReader::new(child.take_stdout().ok_or("missing leaf output")?).lines();
+            if lines.next_line().await?.as_deref() != Some("independent-ready") {
+                return Err("independent leaf did not reach readiness".into());
+            }
+            println!("starter-exited");
+            std::io::stdout().flush()?;
+        }
         "capture-stall" => {
             println!("fixture stdout");
             eprintln!("fixture stderr");
