@@ -301,12 +301,14 @@ impl Pipe {
 
     async fn accept_connection(&mut self, timeout: Duration) -> io::Result<()> {
         let resources = self.resources.as_mut().ok_or_else(closed)?;
-        resources.connect = Some(Operation::start(
-            resources.raw(),
-            Kind::Connect,
-            Vec::new(),
-            0,
-        )?);
+        if resources.connect.is_none() {
+            resources.connect = Some(Operation::start(
+                resources.raw(),
+                Kind::Connect,
+                Vec::new(),
+                0,
+            )?);
+        }
         tokio::time::timeout(
             timeout,
             poll_fn(|cx| {
@@ -492,7 +494,13 @@ impl Drop for Pipe {
     }
 }
 
-fn server(address: &OsStr, read: bool, write: bool) -> io::Result<Pipe> {
+fn server_with_instances(
+    address: &OsStr,
+    read: bool,
+    write: bool,
+    first: bool,
+    instances: u32,
+) -> io::Result<Pipe> {
     check_address(address)?;
     let descriptor = PrivateSecurity::new(GENERIC_READ | GENERIC_WRITE, false)?;
     let attributes = descriptor.attributes();
@@ -507,9 +515,15 @@ fn server(address: &OsStr, read: bool, write: bool) -> io::Result<Pipe> {
     let raw = unsafe {
         CreateNamedPipeW(
             name.as_ptr(),
-            access | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            access
+                | FILE_FLAG_OVERLAPPED
+                | if first {
+                    FILE_FLAG_FIRST_PIPE_INSTANCE
+                } else {
+                    0
+                },
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-            1,
+            instances,
             65536,
             65536,
             0,
@@ -525,6 +539,59 @@ fn server(address: &OsStr, read: bool, write: bool) -> io::Result<Pipe> {
         read,
         write,
     ))
+}
+
+fn server(address: &OsStr, read: bool, write: bool) -> io::Result<Pipe> {
+    server_with_instances(address, read, write, true, 1)
+}
+
+/// Private local listener for a long-lived service. Unlike `PrivateListener`,
+/// it accepts successive clients whose process identities are not known at
+/// bind time. The caller must authenticate each connection at the protocol
+/// layer; the DACL protects against other users, not a process with the same
+/// user's access to the endpoint record.
+pub struct PrivateServiceListener {
+    address: OsString,
+    next: Option<Pipe>,
+}
+
+impl PrivateServiceListener {
+    pub fn bind() -> io::Result<Self> {
+        Self::bind_at(&address())
+    }
+
+    pub fn bind_at(address: &OsStr) -> io::Result<Self> {
+        Ok(Self {
+            address: address.to_owned(),
+            next: Some(server_with_instances(address, true, true, true, 255)?),
+        })
+    }
+
+    pub fn address(&self) -> &OsStr {
+        &self.address
+    }
+
+    pub async fn accept(&mut self, timeout: Duration) -> io::Result<Pipe> {
+        if self.next.is_none() {
+            self.next = Some(server_with_instances(
+                &self.address,
+                true,
+                true,
+                false,
+                255,
+            )?);
+        }
+        self.next
+            .as_mut()
+            .expect("private service pipe instance")
+            .accept_connection(timeout)
+            .await?;
+        let connected = self.next.take().expect("connected service pipe instance");
+        // A failure to create the next instance does not discard the accepted
+        // client. The following accept retries creation with the same address.
+        self.next = server_with_instances(&self.address, true, true, false, 255).ok();
+        Ok(connected)
+    }
 }
 
 pub struct PrivateListener {

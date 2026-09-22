@@ -10,6 +10,9 @@
 pub mod fs;
 
 #[cfg(unix)]
+pub mod local_ipc;
+
+#[cfg(unix)]
 pub mod unix;
 
 #[cfg(windows)]
