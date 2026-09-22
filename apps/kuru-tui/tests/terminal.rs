@@ -962,7 +962,8 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         terminal.close_picker(b"\x1b[B\r")?;
         terminal.command("/dream", None)?;
         terminal.command("/unknown", None)?;
-        terminal.wait_text(&["unknown command"], &[])?;
+        terminal
+            .wait_composer_frame(&["Unknown command; use /help", "enter send"], READY_TIMEOUT)?;
         terminal.resize(20, 65)?;
         terminal.send(b"\x1b[200~pasted text\x1b[201~")?;
         terminal.wait_text(&["pasted text", "enter send"], &[])?;
