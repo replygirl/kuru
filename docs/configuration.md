@@ -89,6 +89,46 @@ its instructions; direct `kuru tool` commands do not inject actor instructions.
 For grep and glob, review covers only the bounded, individually authorized
 candidate files, not the requested search root or denied siblings.
 
+## Skills and custom prompts
+
+Kuru discovers skill metadata in `.agents/skills/NAME/SKILL.md` under the
+project and `skills/NAME/SKILL.md` under Kuru's user configuration directory.
+Each file starts with YAML `name` and `description` between `---` lines. Names
+use lowercase ASCII letters, digits and single interior hyphens and must match
+the directory. Startup reads only the checked frontmatter, then lists effective
+names and descriptions in the actor prompt. A project skill takes precedence
+over a user skill of the same name. The actor's fixed `skill_load` tool can
+select one catalog name and optionally one direct `references/FILE.md` beneath
+that skill. Selection captures the full body and requested reference before
+exposing either. It never runs files under `scripts/`; `allowed-tools` and
+other skill prose do not grant file, shell, MCP or network permission.
+
+Project skill metadata is part of the base workspace manifest. Selecting its
+body or reference extends the complete path-qualified manifest and uses the
+same once/persist/deny review as nested instructions. A denied selection returns
+no skill text. A headless selection without an existing matching grant or
+`--trust-workspace-once` returns a trust-required result. The reviewed bytes
+remain fixed for the current invocation; later launches recapture changed
+sources. User-configuration skills are caller inputs outside repository trust
+but follow the same checked file and size rules.
+
+Custom terminal prompt commands live at `.kuru/commands/NAME.md` in the project
+or `commands/NAME.md` under Kuru's user configuration directory. They use the
+same frontmatter fields followed by nonempty Markdown prompt text. Built-ins
+win name collisions, then project commands, then user commands. Effective
+project command files join the base manifest; unapproved project names do not
+enter `/help` or Tab completion. A custom command expands to a normal user
+turn with optional literal arguments, without process execution or extra tool
+authority.
+
+Discovery checks at most 256 directory entries and keeps at most 64 effective
+skills and 64 commands. Skill frontmatter is limited to 8 KiB per file and
+64 KiB total; command files are limited to 64 KiB each and 256 KiB total.
+Selected skill bodies and direct references are limited to 256 KiB per file,
+128 sources and 1 MiB across the active selection. Invalid, linked, escaping
+or over-limit sources are omitted from discovery or rejected at selection with
+a bounded notice or tool error; Kuru never presents a partial selected body.
+
 Mode, model and effort choices made in the terminal with F2/F3/F4 or the matching
 slash commands are saved immediately. Relaunching from the same canonical directory
 and data store restores those choices in a new conversation. A symlink to that

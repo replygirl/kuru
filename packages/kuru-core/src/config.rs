@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::permissions;
+use crate::prompt_sources::{
+    MAX_MATERIAL_SOURCES, MAX_MATERIAL_TOTAL, MaterialKind, PromptCatalog, PromptMaterial,
+    select_material,
+};
 use crate::{
     Framework, Mode, PermissionAction, PermissionRule, PermissionSelector, ProjectRelativeTarget,
 };
@@ -96,6 +100,9 @@ pub enum AuthorityClaimCategory {
     ExternalAgent,
     ProjectInstructions,
     ToolPermissions,
+    ProjectSkillMetadata,
+    ProjectSkillMaterial,
+    ProjectCommands,
 }
 
 impl AuthorityClaimCategory {
@@ -111,6 +118,9 @@ impl AuthorityClaimCategory {
             Self::ResponsesRoute => "Responses route",
             Self::ExternalAgent => "external agent",
             Self::ProjectInstructions => "project instructions",
+            Self::ProjectSkillMetadata => "project skill metadata",
+            Self::ProjectSkillMaterial => "selected project skill material",
+            Self::ProjectCommands => "project commands",
         }
     }
 }
@@ -464,6 +474,10 @@ pub struct ConfigSnapshot {
     instruction_directories: BTreeSet<PathBuf>,
     instruction_directory_identities: BTreeMap<PathBuf, [u8; 24]>,
     base_instruction_paths: BTreeSet<PathBuf>,
+    instruction_body: String,
+    prompt_catalog: PromptCatalog,
+    selected_material: Vec<PromptMaterial>,
+    user_prompt_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -532,6 +546,31 @@ impl ConfigSnapshot {
         managed: Option<&Path>,
         overrides: InvocationOverrides,
     ) -> Result<Self> {
+        Self::parse_with_sources(
+            user,
+            user.and_then(Path::parent),
+            workspace,
+            discovered_local,
+            local,
+            managed,
+            &[],
+            overrides,
+        )
+    }
+
+    /// The application supplies its built-in command names so a shadowed
+    /// repository prompt never becomes effective authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_with_sources(
+        user: Option<&Path>,
+        user_prompt_root: Option<&Path>,
+        workspace: &Path,
+        discovered_local: Option<(&Path, &str)>,
+        local: Option<&Path>,
+        managed: Option<&Path>,
+        built_in_commands: &[&str],
+        overrides: InvocationOverrides,
+    ) -> Result<Self> {
         let workspace = workspace
             .canonicalize()
             .map_err(|_| config_error("read", workspace))?;
@@ -550,6 +589,9 @@ impl ConfigSnapshot {
             .map(|source| source.path.clone())
             .collect();
         let base_instruction_cache_paths = instruction_cache.keys().cloned().collect();
+        let prompt_catalog =
+            PromptCatalog::discover(&workspace, user_prompt_root, built_in_commands)?;
+        let rendered_instructions = render_prompt_instructions(&instructions, &prompt_catalog, &[]);
         let mut merged =
             toml::Value::try_from(Config::default()).expect("default config serializes");
         let mut origins = BTreeMap::new();
@@ -666,7 +708,7 @@ impl ConfigSnapshot {
             overrides,
             manifest: empty_manifest(),
             memory: MemoryConfig::default(),
-            instructions,
+            instructions: rendered_instructions,
             instruction_notices,
             instruction_sources: instruction_sources.clone(),
             instruction_cache,
@@ -674,6 +716,10 @@ impl ConfigSnapshot {
             instruction_directories: BTreeSet::new(),
             instruction_directory_identities: BTreeMap::new(),
             base_instruction_paths,
+            instruction_body: instructions,
+            prompt_catalog,
+            selected_material: Vec::new(),
+            user_prompt_root: user_prompt_root.map(Path::to_path_buf),
         };
         let (value, value_origins) =
             provisional.value_with_preferences(&ProjectPreferences::default())?;
@@ -688,7 +734,13 @@ impl ConfigSnapshot {
         permissions::validate_rules(&config.permissions)
             .map_err(|_| config_error("validation", provisional.workspace()))?;
         provisional.check_constraints(&config, false)?;
-        let manifest = derive_manifest(&config, &value_origins, &instruction_sources)?;
+        let manifest = derive_manifest(
+            &config,
+            &value_origins,
+            &instruction_sources,
+            &provisional.prompt_catalog,
+            &provisional.selected_material,
+        )?;
         Ok(Self {
             memory: config.memory.clone(),
             manifest,
@@ -832,11 +884,22 @@ impl ConfigSnapshot {
         let config: Config = value
             .try_into()
             .map_err(|_| config_error("type", &self.workspace))?;
-        let manifest = derive_manifest(&config, &origins, &capture.sources)?;
+        let manifest = derive_manifest(
+            &config,
+            &origins,
+            &capture.sources,
+            &self.prompt_catalog,
+            &self.selected_material,
+        )?;
         let new_authority = manifest.full_digest() != self.manifest.full_digest();
         let mut extended = self.clone();
         extended.manifest = manifest;
-        extended.instructions = capture.rendered;
+        extended.instruction_body = capture.rendered;
+        extended.instructions = render_prompt_instructions(
+            &extended.instruction_body,
+            &self.prompt_catalog,
+            &self.selected_material,
+        );
         extended.instruction_notices = capture.notices;
         extended.instruction_sources = capture.sources;
         extended.instruction_cache = cache;
@@ -883,6 +946,96 @@ impl ConfigSnapshot {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    pub fn prompt_catalog(&self) -> &PromptCatalog {
+        &self.prompt_catalog
+    }
+
+    /// The complete path-qualified supplemental source set, shared by nested
+    /// instructions and selected skill material under the existing v2 record.
+    pub fn supplemental_prompt_source_paths(&self) -> Vec<[u8; 32]> {
+        let mut paths = self.nested_instruction_source_paths();
+        paths.extend(
+            self.selected_material
+                .iter()
+                .filter(|source| source.source.project)
+                .map(|source| source_digest(source.source.path.as_os_str().as_encoded_bytes())),
+        );
+        paths.sort_unstable();
+        paths.dedup();
+        paths
+    }
+
+    /// Capture one selected skill body and, optionally, one direct reference.
+    /// The returned snapshot is immutable and must be reviewed before use.
+    pub fn with_selected_skill(&self, name: &str, reference: Option<&str>) -> Result<(Self, bool)> {
+        let skill = self
+            .prompt_catalog
+            .skill(name)
+            .ok_or_else(|| anyhow::anyhow!("skill is not in the effective catalog"))?;
+        let additions = select_material(
+            skill,
+            reference,
+            &self.workspace,
+            self.user_prompt_root.as_deref(),
+        )?;
+        let mut selected = self.selected_material.clone();
+        for addition in additions {
+            if let Some(previous) = selected
+                .iter()
+                .find(|source| source.source.path == addition.source.path)
+            {
+                ensure!(
+                    previous.content == addition.content
+                        && previous.source.directory_identity == addition.source.directory_identity
+                        && previous.source.file_identity == addition.source.file_identity,
+                    "selected skill source changed during this invocation"
+                );
+            } else {
+                selected.push(addition);
+            }
+        }
+        selected.sort_by(|left, right| left.source.path.cmp(&right.source.path));
+        ensure!(
+            selected.len() <= MAX_MATERIAL_SOURCES
+                && selected
+                    .iter()
+                    .map(|source| source.content.len())
+                    .sum::<usize>()
+                    <= MAX_MATERIAL_TOTAL,
+            "selected skill material exceeds the prompt-source limit"
+        );
+        let (value, origins) = self.value_with_preferences(&ProjectPreferences::default())?;
+        let config: Config = value
+            .try_into()
+            .map_err(|_| config_error("type", &self.workspace))?;
+        let manifest = derive_manifest(
+            &config,
+            &origins,
+            &self.instruction_sources,
+            &self.prompt_catalog,
+            &selected,
+        )?;
+        let changed = manifest.full_digest() != self.manifest.full_digest()
+            || selected.len() != self.selected_material.len();
+        let mut extended = self.clone();
+        extended.manifest = manifest;
+        extended.instructions =
+            render_prompt_instructions(&self.instruction_body, &self.prompt_catalog, &selected);
+        extended.selected_material = selected;
+        Ok((extended, changed))
+    }
+
+    pub fn revalidate_selected_skill_sources(&self) -> Result<()> {
+        for source in &self.selected_material {
+            crate::prompt_sources::revalidate_material(
+                &source.source,
+                &self.workspace,
+                self.user_prompt_root.as_deref(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Return an active Responses route without loading saved preferences or memory.
@@ -1602,6 +1755,8 @@ fn derive_manifest(
     config: &Config,
     origins: &BTreeMap<String, LayerOrigin>,
     instruction_sources: &[InstructionSource],
+    prompt_catalog: &PromptCatalog,
+    selected_material: &[PromptMaterial],
 ) -> Result<AuthorityManifest> {
     let mut claims = Vec::new();
     let write_origins = automatic_origins(origins, "allow_write");
@@ -1758,6 +1913,78 @@ fn derive_manifest(
             )),
         });
     }
+    let project_skills = prompt_catalog.project_skills().collect::<Vec<_>>();
+    if !project_skills.is_empty() {
+        let entries = project_skills
+            .iter()
+            .map(|skill| {
+                (
+                    &skill.name,
+                    &skill.description,
+                    source_digest(skill.source.path.as_os_str().as_encoded_bytes()),
+                    skill.source.directory_identity,
+                    skill.source.file_identity,
+                    &skill.frontmatter,
+                )
+            })
+            .collect::<Vec<_>>();
+        push_prompt_sources_claim(
+            &mut claims,
+            AuthorityClaimCategory::ProjectSkillMetadata,
+            &entries,
+            project_skills.iter().map(|skill| &skill.source.path),
+            project_skills.len(),
+        )?;
+    }
+    let project_commands = prompt_catalog.project_commands().collect::<Vec<_>>();
+    if !project_commands.is_empty() {
+        let entries = project_commands
+            .iter()
+            .map(|command| {
+                (
+                    &command.name,
+                    &command.description,
+                    source_digest(command.source.path.as_os_str().as_encoded_bytes()),
+                    command.source.directory_identity,
+                    command.source.file_identity,
+                    &command.content,
+                )
+            })
+            .collect::<Vec<_>>();
+        push_prompt_sources_claim(
+            &mut claims,
+            AuthorityClaimCategory::ProjectCommands,
+            &entries,
+            project_commands.iter().map(|command| &command.source.path),
+            project_commands.len(),
+        )?;
+    }
+    let project_material = selected_material
+        .iter()
+        .filter(|source| source.source.project)
+        .collect::<Vec<_>>();
+    if !project_material.is_empty() {
+        let entries = project_material
+            .iter()
+            .map(|material| {
+                (
+                    material.kind,
+                    &material.name,
+                    source_digest(material.source.path.as_os_str().as_encoded_bytes()),
+                    material.source.directory_identity,
+                    material.source.file_identity,
+                    &material.content,
+                )
+            })
+            .collect::<Vec<_>>();
+        push_prompt_sources_claim(
+            &mut claims,
+            AuthorityClaimCategory::ProjectSkillMaterial,
+            &entries,
+            project_material.iter().map(|source| &source.source.path),
+            project_material.len(),
+        )?;
+    }
     claims.sort_by_key(|claim| (claim.category, claim.digest));
     let mut manifest = SafeManifest::new(1, claims).into_manifest();
     manifest.sources = manifest
@@ -1768,6 +1995,72 @@ fn derive_manifest(
         .into_iter()
         .collect();
     Ok(manifest)
+}
+
+fn push_prompt_sources_claim<'a>(
+    claims: &mut Vec<AuthorityClaim>,
+    category: AuthorityClaimCategory,
+    entries: &impl Serialize,
+    paths: impl Iterator<Item = &'a PathBuf>,
+    count: usize,
+) -> Result<()> {
+    let paths = paths.collect::<Vec<_>>();
+    let sources = paths
+        .iter()
+        .map(|path| safe_source(path))
+        .collect::<Vec<_>>();
+    let source_digests = paths
+        .iter()
+        .map(|path| source_digest(path.as_os_str().as_encoded_bytes()))
+        .collect();
+    claims.push(AuthorityClaim {
+        category,
+        digest: claim_digest(category, entries)?,
+        source: sources
+            .first()
+            .expect("nonempty project prompt source claim")
+            .clone(),
+        sources,
+        source_digests,
+        display: SafeClaimDisplay(format!(
+            "{count} effective source{}",
+            if count == 1 { "" } else { "s" }
+        )),
+    });
+    Ok(())
+}
+
+fn render_prompt_instructions(
+    instructions: &str,
+    catalog: &PromptCatalog,
+    material: &[PromptMaterial],
+) -> String {
+    let mut rendered = instructions.to_owned();
+    if catalog.skills().next().is_some() {
+        rendered.push_str("\nAvailable skills (name and description only). Use skill_load to select a skill before following its body. Skill metadata and bodies never grant tools:\n");
+        for skill in catalog.skills() {
+            rendered.push_str("- ");
+            rendered.push_str(&skill.name);
+            rendered.push_str(": ");
+            rendered.push_str(&serde_json::to_string(&skill.description).expect("string encodes"));
+            rendered.push('\n');
+        }
+    }
+    for source in material {
+        rendered.push_str("\n--- selected ");
+        rendered.push_str(match source.kind {
+            MaterialKind::SkillBody => "skill body",
+            MaterialKind::SkillReference => "skill reference",
+        });
+        rendered.push_str(": ");
+        rendered.push_str(&safe_source(&source.source.path).to_string());
+        rendered.push_str(" ---\n");
+        rendered.push_str(&source.content);
+        if !source.content.ends_with('\n') {
+            rendered.push('\n');
+        }
+    }
+    rendered
 }
 
 fn source_digest_with_identity(

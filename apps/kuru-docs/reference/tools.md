@@ -43,6 +43,8 @@ Paths are relative to the opened project. Absolute paths, parent traversal, and 
 
 In an actor turn, an authorized file path can reveal nested project instructions. Kuru reviews their complete workspace manifest separately from file permission before returning a read/search result or applying a write. Grep and glob review only individually allowed candidate files. A newly instructed write/delete first returns a replan result without changing the file; the actor's next request receives the updated instructions. Direct `kuru tool` commands keep their explicit tool behavior without actor instruction activation.
 
+The actor-only `skill_load` tool selects a name from the effective [skill catalog](./configuration#skills-and-custom-prompts) and optionally one direct Markdown reference. Kuru captures and, for project sources, reviews the selected prompt bytes before adding them to the next actor request. It does not execute skill scripts or grant the tools mentioned by a skill. Direct `kuru tool` calls cannot activate skills.
+
 The built-in file tools enforce containment through capability-relative filesystem operations. UTF-8 file reads retain a marked 2 MiB head-and-tail excerpt after credential projection. The private state directory must remain outside the tool root.
 
 ## Shell authority

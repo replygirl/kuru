@@ -69,6 +69,19 @@ from this terminal, not durable turns, usage, or the current session. A resumed
 session still has its stored history. `/status` reports the current local view;
 it does not ask the provider for an update.
 
+You can add a terminal prompt command as `.kuru/commands/NAME.md` in the project
+or `commands/NAME.md` under Kuru's user configuration directory. The Markdown
+file begins with YAML `name` and `description` fields between `---` lines;
+`name` must match the lowercase file stem. Its remaining text is the prompt.
+For example, `.kuru/commands/review.md` registers `/review`. Running
+`/review some notes` sends that captured prompt plus the separately labeled,
+literal `some notes` as a normal user turn in the current session. Arguments
+are optional; the command never runs a shell. `/help` and Tab show the effective
+entries after workspace
+trust; built-in names win collisions, then project entries, then user entries.
+Malformed or oversized entries are omitted with a bounded notice. See
+[prompt-source bounds and approval](configuration.md#skills-and-custom-prompts).
+
 `/notes` returns the selected identity's newest 100 durable notes with the
 selected mode, canonical identity, requested limit, and `truncated` metadata.
 It does not show that identity's conversation; use `/memory` for that history.
