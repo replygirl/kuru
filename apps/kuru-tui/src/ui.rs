@@ -43,7 +43,11 @@ use tokio::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::{cli::validate_effort, memory_notice::MemoryNotice};
+use crate::{
+    cli::validate_effort,
+    commands::{self, CommandId},
+    memory_notice::MemoryNotice,
+};
 
 mod render;
 #[cfg(test)]
@@ -51,7 +55,6 @@ mod runtime_tests;
 mod scene;
 pub use render::draw;
 
-const HELP: &str = "Enter send · Alt+Enter newline · F2 models · F3 effort · F4 mode · F5 permissions · Esc cancel\n/help · /parts · /mode ifs|polyvagal|freudian|jungian · /model ID · /effort LEVEL\n/focus NAME|ID|auto · /relate KIND ID,ID · /memory ID · /notes ID · /retry · /dream · /undo-dream · /quit\n/memory-status · /memory-history · /cost · /permissions\nApproval: Alt+1 Once · Alt+2 Session · Alt+3 Always · Alt+4 Deny.\nModel, effort and mode selections are remembered for this project.";
 const ACTIVITY_DRAIN_CAP: usize = 256;
 const PREVIEW_PAINT_INTERVAL: Duration = Duration::from_millis(80);
 const INTERRUPTION_REFRESH_NOTICE: &str =
@@ -76,6 +79,14 @@ pub struct InstructionPrompt {
     pub display: String,
     pub persistent_allowed: bool,
     pub scroll: u16,
+}
+
+#[derive(Debug, Clone)]
+struct CommandCompletion {
+    original_prefix: String,
+    matches: Vec<&'static str>,
+    selected: usize,
+    rendered: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,6 +129,7 @@ pub struct View {
     completion_metadata: BTreeMap<usize, String>,
     pub input: String,
     pub cursor: usize,
+    command_completion: Option<CommandCompletion>,
     pub mode: String,
     pub model: String,
     pub effort: String,
@@ -186,6 +198,7 @@ impl View {
             transcript,
             input: String::new(),
             cursor: 0,
+            command_completion: None,
             mode: runtime.mode,
             model: runtime.model,
             effort: runtime.effort,
@@ -293,6 +306,76 @@ impl View {
         self.notice = None;
         self.operation_start = Some(self.clock_ms);
         self.operation_ms = 0;
+    }
+
+    fn clear_visible_conversation(&mut self) {
+        self.transcript.clear();
+        self.completion_metadata.clear();
+        self.scroll = 0;
+        self.show_scene = true;
+        self.status = "View cleared · stored history unchanged".into();
+        self.notify("View cleared · stored history unchanged");
+    }
+
+    fn current_session_status(&self) -> String {
+        let usage = self
+            .usage
+            .as_ref()
+            .map_or_else(|| "Usage: unavailable".to_owned(), format_session_usage);
+        format!(
+            "Session: {}\nProject: {}\nModel: {}\nEffort: {}\nMode: {}\nFocus: {}\nTurns: {}\n{}",
+            self.session,
+            self.project,
+            self.model,
+            self.effort,
+            self.mode,
+            self.focus.as_deref().unwrap_or("auto"),
+            self.turns,
+            usage,
+        )
+    }
+
+    fn complete_command(&mut self, backwards: bool) {
+        if self.busy || !self.input.starts_with('/') {
+            self.command_completion = None;
+            return;
+        }
+        let token_end = self
+            .input
+            .find(char::is_whitespace)
+            .unwrap_or(self.input.len());
+        if self.cursor > token_end {
+            self.command_completion = None;
+            return;
+        }
+        let completion = self
+            .command_completion
+            .take()
+            .filter(|previous| previous.rendered == self.input);
+        let (original_prefix, matches, selected) = if let Some(previous) = completion {
+            let selected = if backwards {
+                (previous.selected + previous.matches.len() - 1) % previous.matches.len()
+            } else {
+                (previous.selected + 1) % previous.matches.len()
+            };
+            (previous.original_prefix, previous.matches, selected)
+        } else {
+            let prefix = self.input[..self.cursor].to_owned();
+            let matches = commands::names_matching(&prefix);
+            if matches.is_empty() {
+                return;
+            }
+            let selected = if backwards { matches.len() - 1 } else { 0 };
+            (prefix, matches, selected)
+        };
+        self.input.replace_range(0..token_end, matches[selected]);
+        self.cursor = matches[selected].len();
+        self.command_completion = Some(CommandCompletion {
+            original_prefix,
+            matches,
+            selected,
+            rendered: self.input.clone(),
+        });
     }
 
     pub fn apply_runtime(&mut self, runtime: RuntimeSnapshot) {
@@ -722,7 +805,12 @@ impl View {
             }
             return None;
         }
+        if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.command_completion = None;
+        }
         match key.code {
+            KeyCode::Tab if !self.busy => self.complete_command(false),
+            KeyCode::BackTab if !self.busy => self.complete_command(true),
             KeyCode::F(5) if !self.busy => return Some("/permissions".into()),
             KeyCode::F(2) => {
                 self.open_picker(Picker::Models);
@@ -746,6 +834,7 @@ impl View {
             KeyCode::Enter if !self.busy => {
                 let text = std::mem::take(&mut self.input);
                 self.cursor = 0;
+                self.command_completion = None;
                 if !text.trim().is_empty() {
                     return Some(text);
                 }
@@ -781,6 +870,7 @@ impl View {
     }
 
     pub fn paste(&mut self, text: &str) {
+        self.command_completion = None;
         if self.picker.is_some() {
             for c in text.chars().filter(|c| !c.is_control()) {
                 if self.query.len() + c.len_utf8() > 256 {
@@ -1850,6 +1940,9 @@ where
                     let (redraw, command) = view.terminal_event(event);
                     dirty |= redraw;
                     if let Some(command) = command {
+                        let registered = commands::parse(&command);
+                        let command_id = registered.map(|request| request.id);
+                        let no_args = registered.is_some_and(|request| request.args.is_empty());
                         if let Some(answer) = match command.as_str() {
                             "/instruction-once" => Some(InstructionReviewAnswer::Once),
                             "/instruction-persist" => Some(InstructionReviewAnswer::Persist),
@@ -1873,7 +1966,7 @@ where
                                 view.permission_prompt = None;
                                 dirty = true;
                             }
-                        } else if command == "/permissions" && !view.busy {
+                        } else if command_id == Some(CommandId::Permissions) && no_args && !view.busy {
                             open_permission_inspector(&permission_service, &mut view)?;
                             dirty = true;
                         } else if command == "/permissions-revoke" && !view.busy {
@@ -1907,7 +2000,7 @@ where
                                 .await?,
                             );
                             dirty = true;
-                        } else if command == "/quit" {
+                        } else if command_id == Some(CommandId::Quit) && no_args {
                             pending_approval = None;
                             approval_rx = None;
                             view.permission_prompt = None;
@@ -1942,19 +2035,51 @@ where
                                     .map(|()| DispatchOutcome::Command(String::new()));
                                 let _ = tx.send((generation, result)).await;
                             }));
-                        } else if command == "/help" {
-                            view.transcript.push(("help".into(), HELP.into()));
+                        } else if command_id == Some(CommandId::Help) && no_args {
+                            view.transcript.push(("help".into(), commands::help_text()));
                             view.show_scene = false;
+                        } else if command_id == Some(CommandId::Clear) && no_args && !view.busy {
+                            view.clear_visible_conversation();
+                        } else if command_id == Some(CommandId::Status) && no_args && !view.busy {
+                            view.transcript.push(("status".into(), view.current_session_status()));
+                            view.show_scene = false;
+                            view.scroll = 0;
+                        } else if !no_args
+                            && matches!(
+                                command_id,
+                                Some(
+                                    CommandId::Clear
+                                        | CommandId::Help
+                                        | CommandId::Permissions
+                                        | CommandId::Quit
+                                        | CommandId::Status
+                                )
+                            )
+                            && !view.busy
+                        {
+                            view.transcript.push((
+                                "kuru".into(),
+                                format!(
+                                    "{} takes no arguments",
+                                    command.split_whitespace().next().unwrap_or("command")
+                                ),
+                            ));
+                            view.show_scene = false;
+                            view.scroll = 0;
+                        } else if command.starts_with('/') && command_id.is_none() && !view.busy {
+                            view.transcript.push(("kuru".into(), "Unknown command; use /help".into()));
+                            view.show_scene = false;
+                            view.scroll = 0;
                         } else if !view.busy {
-                            if command == "/model" {
+                            if command_id == Some(CommandId::Model) && no_args {
                                 view.open_picker(Picker::Models);
                                 continue;
                             }
-                            if command == "/effort" {
+                            if command_id == Some(CommandId::Effort) && no_args {
                                 view.open_picker(Picker::Efforts);
                                 continue;
                             }
-                            if command == "/mode" {
+                            if command_id == Some(CommandId::Mode) && no_args {
                                 view.open_picker(Picker::Modes);
                                 continue;
                             }
@@ -2146,16 +2271,19 @@ async fn dispatch_controlled(
     approval: Option<ApprovalSender>,
     instruction_approval: Option<InstructionReviewSender>,
 ) -> Result<DispatchOutcome> {
+    let registered = commands::parse(command);
+    if command.starts_with('/') && registered.is_none() {
+        anyhow::bail!("unknown command; use /help");
+    }
     harness.reconcile().await?;
-    let (name, args) = command.split_once(' ').unwrap_or((command, ""));
-    let args = args.trim();
-    let feedback = match name {
-        "/parts" => serde_json::to_string_pretty(&harness.topology)?,
-        "/mode" => {
+    let args = registered.map_or("", |request| request.args);
+    let feedback = match registered.map(|request| request.id) {
+        Some(CommandId::Parts) => serde_json::to_string_pretty(&harness.topology)?,
+        Some(CommandId::Mode) => {
             harness.set_mode(args.parse::<Mode>()?).await?;
             format!("Mode: {args}")
         }
-        "/model" => {
+        Some(CommandId::Model) => {
             ensure!(!args.is_empty(), "model ID required");
             let effort = models
                 .iter()
@@ -2164,7 +2292,7 @@ async fn dispatch_controlled(
             harness.set_model(args, effort).await?;
             format!("Model: {args}")
         }
-        "/effort" => {
+        Some(CommandId::Effort) => {
             let effort = if args == "default" {
                 None
             } else {
@@ -2175,13 +2303,13 @@ async fn dispatch_controlled(
             harness.set_effort(effort.map(str::to_owned)).await?;
             format!("Effort: {args}")
         }
-        "/focus" => {
+        Some(CommandId::Focus) => {
             harness
                 .focus(if args == "auto" { None } else { Some(args) })
                 .await?;
             format!("Speaking focus: {args}")
         }
-        "/relate" => {
+        Some(CommandId::Relate) => {
             let (kind, members) = args
                 .split_once(' ')
                 .context("usage: /relate alliance ID,ID")?;
@@ -2193,12 +2321,18 @@ async fn dispatch_controlled(
                 .await?;
             format!("Activated {} · {}", relation.kind, relation.id)
         }
-        "/memory" => serde_json::to_string_pretty(&harness.memory_for(args).await?)?,
-        "/notes" => serde_json::to_string_pretty(&harness.notes_for(args, 100).await?)?,
-        "/memory-status" => serde_json::to_string_pretty(&harness.memory_status().await?)?,
-        "/memory-history" => serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?,
-        "/cost" => format_session_usage(&harness.session_usage().await?),
-        "/retry" => {
+        Some(CommandId::Memory) => serde_json::to_string_pretty(&harness.memory_for(args).await?)?,
+        Some(CommandId::Notes) => {
+            serde_json::to_string_pretty(&harness.notes_for(args, 100).await?)?
+        }
+        Some(CommandId::MemoryStatus) => {
+            serde_json::to_string_pretty(&harness.memory_status().await?)?
+        }
+        Some(CommandId::MemoryHistory) => {
+            serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?
+        }
+        Some(CommandId::Cost) => format_session_usage(&harness.session_usage().await?),
+        Some(CommandId::Retry) => {
             return Ok(DispatchOutcome::Turn(
                 if let (Some(approval), Some(instruction_approval)) =
                     (approval.clone(), instruction_approval.clone())
@@ -2215,13 +2349,23 @@ async fn dispatch_controlled(
                 },
             ));
         }
-        "/dream" => serde_json::to_string_pretty(&harness.dream_controlled(cancellation).await?)?,
-        "/undo-dream" => {
+        Some(CommandId::Dream) => {
+            serde_json::to_string_pretty(&harness.dream_controlled(cancellation).await?)?
+        }
+        Some(CommandId::UndoDream) => {
             harness.undo_dream().await?;
             "Previous membership restored.".into()
         }
-        _ if command.starts_with('/') => anyhow::bail!("unknown command; use /help"),
-        _ => {
+        Some(
+            CommandId::Clear
+            | CommandId::Help
+            | CommandId::Permissions
+            | CommandId::Quit
+            | CommandId::Status,
+        ) => {
+            anyhow::bail!("this command requires the interactive view")
+        }
+        None => {
             let generated;
             let turn_id = if let Some(turn_id) = turn_id {
                 turn_id
@@ -2639,6 +2783,138 @@ mod tests {
                 metadata: Default::default(),
             }],
         )
+    }
+
+    #[test]
+    fn slash_completion_cycles_names_without_touching_arguments_or_modal_input() {
+        let mut view = fixture();
+        view.input = "/mem".into();
+        view.cursor = view.input.len();
+        assert_eq!(view.key(key(KeyCode::Tab)), None);
+        assert_eq!(view.input, "/memory");
+        assert_eq!(view.key(key(KeyCode::Tab)), None);
+        assert_eq!(view.input, "/memory-history");
+        assert_eq!(view.key(key(KeyCode::BackTab)), None);
+        assert_eq!(view.input, "/memory");
+        view.key(key(KeyCode::Char('x')));
+        assert_eq!(view.input, "/memoryx");
+        view.key(key(KeyCode::Tab));
+        assert_eq!(
+            view.input, "/memoryx",
+            "editing resets completion candidates"
+        );
+
+        view.input = "/mo child".into();
+        view.cursor = 3;
+        view.key(key(KeyCode::Tab));
+        assert_eq!(view.input, "/mode child");
+        assert_eq!(&view.input[view.cursor..], " child");
+        view.key(key(KeyCode::Tab));
+        assert_eq!(view.input, "/model child");
+
+        view.input = "plain ".into();
+        view.cursor = view.input.len();
+        view.key(key(KeyCode::Char('2')));
+        assert_eq!(view.input, "plain 2");
+        view.busy = true;
+        view.instruction_prompt = Some(InstructionPrompt {
+            display: "reviewed source".into(),
+            persistent_allowed: true,
+            scroll: 0,
+        });
+        assert_eq!(view.key(key(KeyCode::Tab)), None);
+        assert_eq!(view.input, "plain 2");
+        assert_eq!(
+            view.key(key(KeyCode::Char('1'))),
+            Some("/instruction-once".into())
+        );
+
+        view.instruction_prompt = None;
+        view.permission_prompt = Some(PermissionPrompt {
+            display: PermissionDisplay {
+                label: "native file read".into(),
+                scope: "project file notes.txt".into(),
+                preview: "bounded preview".into(),
+                rememberable: true,
+                remember_disabled_reason: None,
+            },
+            whole_tool: false,
+            scroll: 0,
+        });
+        view.input = "/mem".into();
+        view.cursor = view.input.len();
+        view.key(key(KeyCode::Tab));
+        assert_eq!(view.input, "/mem");
+        assert_eq!(
+            view.key(key(KeyCode::Char('1'))),
+            Some("/approval-once".into())
+        );
+
+        view.permission_prompt = None;
+        view.busy = false;
+        view.picker = Some(Picker::Models);
+        view.key(key(KeyCode::Tab));
+        assert_eq!(view.input, "/mem");
+    }
+
+    #[test]
+    fn local_clear_and_status_preserve_current_session_facts() {
+        let mut view = fixture();
+        view.transcript.push(("user".into(), "older turn".into()));
+        view.completion_metadata.insert(0, "known usage".into());
+        view.scroll = 3;
+        view.turns = 7;
+        view.focus = Some("actor-1".into());
+        view.usage = Some(SessionUsage {
+            session_id: view.session.clone(),
+            historical_complete: true,
+            invocation_count: 1,
+            incomplete_invocations: 0,
+            known_usage: kuru_core::Usage {
+                input_tokens: Some(12),
+                ..kuru_core::Usage::default()
+            },
+            component_complete: kuru_core::UsageCompleteness {
+                input_tokens: true,
+                output_tokens: false,
+                cached_input_tokens: false,
+                reasoning_output_tokens: false,
+            },
+            api_standard: kuru_core::MoneyEstimate {
+                known_usd: None,
+                incomplete: true,
+                unapplied: vec![],
+            },
+            api_equivalent: kuru_core::MoneyEstimate {
+                known_usd: None,
+                incomplete: true,
+                unapplied: vec![],
+            },
+        });
+        let session = view.session.clone();
+        let usage = view.usage.clone();
+        let status = view.current_session_status();
+        for expected in [
+            "plain-session",
+            "plain-project",
+            "Model: demo",
+            "Mode:",
+            "Focus: actor-1",
+            "Turns: 7",
+            "Input: 12 tokens",
+        ] {
+            assert!(status.contains(expected), "missing {expected}: {status}");
+        }
+        view.clear_visible_conversation();
+        assert!(view.transcript.is_empty());
+        assert!(view.completion_metadata.is_empty());
+        assert_eq!(view.scroll, 0);
+        assert!(view.show_scene);
+        assert_eq!(view.session, session);
+        assert_eq!(view.turns, 7);
+        assert_eq!(view.usage, usage);
+        assert_eq!(view.focus.as_deref(), Some("actor-1"));
+        assert!(view.status.contains("stored history unchanged"));
     }
 
     #[test]

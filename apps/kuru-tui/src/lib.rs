@@ -1,5 +1,6 @@
 mod authentication;
 pub mod cli;
+mod commands;
 mod diagnostics;
 mod instruction_gate;
 mod memory_export;
