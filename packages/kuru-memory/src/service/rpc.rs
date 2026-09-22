@@ -20,10 +20,11 @@ use uuid::Uuid;
 
 use super::{EndpointAuthority, read_frame, write_frame};
 use crate::{
-    ExportProvenance, HistoryWindow, Revision, StoredNote,
+    CandidateInventoryPage, CandidateRefStatus, ExportProvenance, HistoryWindow, Revision,
+    StoredNote,
     store::{
-        ActiveExportSnapshot, Candidate, CandidateLookup, ExportCursor, ExportPage, MemoryStore,
-        UsageProof,
+        ActiveExportSnapshot, Candidate, CandidateLookup, CandidateRefRefusal,
+        CandidateRefRejected, ExportCursor, ExportPage, MemoryStore, UsageProof,
     },
 };
 
@@ -105,6 +106,25 @@ pub enum ServiceCall {
         base: String,
         target: String,
     },
+    SelectedAbandonOutcome {
+        original_id: Uuid,
+        original_generation: String,
+        branch: String,
+        base: String,
+        target: String,
+    },
+    CandidateInventory {
+        after: Option<String>,
+        limit: usize,
+    },
+    CandidateRefStatus {
+        branch: String,
+    },
+    AbandonCandidateRef {
+        branch: String,
+        base: String,
+        target: String,
+    },
     Ledger {
         operation: Box<LedgerOperation>,
     },
@@ -131,6 +151,7 @@ impl ServiceCall {
             | Self::BeginCandidate { .. }
             | Self::PromoteCandidate { .. }
             | Self::AbandonCandidate { .. } => true,
+            Self::AbandonCandidateRef { .. } => true,
             Self::View { operation, .. } => matches!(
                 operation,
                 ViewOperation::Append { .. }
@@ -149,6 +170,9 @@ impl ServiceCall {
             | Self::Outcome { .. }
             | Self::CandidateOutcome { .. }
             | Self::CandidateTransitionOutcome { .. }
+            | Self::SelectedAbandonOutcome { .. }
+            | Self::CandidateInventory { .. }
+            | Self::CandidateRefStatus { .. }
             | Self::LedgerOutcome { .. }
             | Self::BeginExport
             | Self::ExportPage { .. } => false,
@@ -353,6 +377,8 @@ pub enum ServiceValue {
     },
     CandidateOutcome(CandidateCreationOutcome),
     CandidateTransitionOutcome(CandidateTransitionResult),
+    CandidateInventory(CandidateInventoryPage),
+    CandidateRefStatus(CandidateRefStatus),
     ExportStarted {
         handle: Uuid,
         provenance: ExportProvenance,
@@ -414,6 +440,7 @@ pub enum ServiceFault {
     StorageFailed,
     CandidateConflict,
     ReceiptConflict,
+    CandidateRefRejected(CandidateRefRefusal),
 }
 
 #[derive(Default)]
@@ -531,6 +558,7 @@ impl Drop for RunningReceipt {
 pub(super) struct Retirement {
     active: AtomicUsize,
     requested: AtomicBool,
+    candidate_resolution: AtomicBool,
     notify: Notify,
 }
 
@@ -540,11 +568,29 @@ impl Retirement {
     }
 
     pub(super) fn attached(self: &Arc<Self>) -> Option<RetainedAttachment> {
-        if self.requested() {
+        if self.requested() || self.candidate_resolution.load(Ordering::Acquire) {
             return None;
         }
         self.active.fetch_add(1, Ordering::AcqRel);
+        if self.requested() || self.candidate_resolution.load(Ordering::Acquire) {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
         Some(RetainedAttachment(self.clone()))
+    }
+
+    fn reserve_candidate_resolution(&self) -> Result<CandidateResolutionReservation<'_>> {
+        if self.requested() {
+            return Err(CandidateRefRejected(CandidateRefRefusal::Active).into());
+        }
+        self.candidate_resolution
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::Active))?;
+        if self.requested() || self.active.load(Ordering::Acquire) != 1 {
+            self.candidate_resolution.store(false, Ordering::Release);
+            return Err(CandidateRefRejected(CandidateRefRefusal::Active).into());
+        }
+        Ok(CandidateResolutionReservation(&self.candidate_resolution))
     }
 
     pub(super) fn notified(&self) -> impl std::future::Future<Output = ()> + '_ {
@@ -552,7 +598,9 @@ impl Retirement {
     }
 
     fn request_if_idle(&self) -> bool {
-        if self.active.load(Ordering::Acquire) != 1 {
+        if self.candidate_resolution.load(Ordering::Acquire)
+            || self.active.load(Ordering::Acquire) != 1
+        {
             return false;
         }
         if self.requested.swap(true, Ordering::AcqRel) {
@@ -560,6 +608,14 @@ impl Retirement {
         }
         self.notify.notify_one();
         true
+    }
+}
+
+struct CandidateResolutionReservation<'a>(&'a AtomicBool);
+
+impl Drop for CandidateResolutionReservation<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -778,6 +834,28 @@ async fn respond<S: AsyncWrite + Unpin>(
                         &branch,
                         &base,
                         &target,
+                        false,
+                    )
+                    .await
+                }
+                ServiceCall::SelectedAbandonOutcome {
+                    original_id,
+                    original_generation,
+                    branch,
+                    base,
+                    target,
+                } => {
+                    candidate_transition_outcome(
+                        store,
+                        authority,
+                        progress,
+                        original_id,
+                        &original_generation,
+                        CandidateTransitionKind::Abandon,
+                        &branch,
+                        &base,
+                        &target,
+                        true,
                     )
                     .await
                 }
@@ -800,6 +878,8 @@ async fn respond<S: AsyncWrite + Unpin>(
                         .is_some()
                     {
                         ServiceFault::ReceiptConflict
+                    } else if let Some(rejected) = error.downcast_ref::<CandidateRefRejected>() {
+                        ServiceFault::CandidateRefRejected(rejected.0)
                     } else {
                         ServiceFault::StorageFailed
                     },
@@ -858,6 +938,17 @@ fn receipt_progress_key(
             id,
         }));
     }
+    if let ServiceCall::AbandonCandidateRef {
+        branch,
+        base,
+        target,
+    } = call
+    {
+        return Ok(Some(ReceiptKey {
+            view: selected_abandon_progress_view(branch, base, target),
+            id,
+        }));
+    }
     if call.unit_receipt_method().is_none() {
         return Ok(None);
     }
@@ -875,6 +966,21 @@ fn receipt_progress_key(
         _ => "main".to_owned(),
     };
     Ok(Some(ReceiptKey { view, id }))
+}
+
+fn selected_abandon_progress_view(branch: &str, base: &str, target: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"kuru.selected-abandon.progress.v1\0");
+    for field in [branch, base, target] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    let digest: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("selected-abandon:{digest}")
 }
 
 async fn ledger_outcome(
@@ -934,6 +1040,7 @@ async fn candidate_transition_outcome(
     branch: &str,
     base: &str,
     target: &str,
+    selected: bool,
 ) -> Result<ServiceValue> {
     use crate::store::CandidateTransitionObservation as Observation;
 
@@ -942,7 +1049,11 @@ async fn candidate_transition_outcome(
         "invalid original service generation"
     );
     let key = ReceiptKey {
-        view: branch.to_owned(),
+        view: if selected {
+            selected_abandon_progress_view(branch, base, target)
+        } else {
+            branch.to_owned()
+        },
         id,
     };
     let progress = progress.status(&key);
@@ -965,10 +1076,15 @@ async fn candidate_transition_outcome(
             },
             CandidateTransitionKind::Abandon => CandidateTransitionResult::PreservedConflict,
         },
+        Ok(Ok(Observation::Abandoned | Observation::AbandonedReclaimed)) if settled => match kind {
+            CandidateTransitionKind::Abandon => CandidateTransitionResult::Abandoned,
+            CandidateTransitionKind::Promote => CandidateTransitionResult::PreservedConflict,
+        },
         Ok(Ok(Observation::Abandoned)) => match kind {
             CandidateTransitionKind::Abandon => CandidateTransitionResult::Abandoned,
             CandidateTransitionKind::Promote => CandidateTransitionResult::PreservedConflict,
         },
+        Ok(Ok(Observation::AbandonedReclaimed)) => CandidateTransitionResult::StillUncertain,
         Ok(Ok(Observation::OpenUnchanged)) if settled => CandidateTransitionResult::OpenUnchanged,
         Ok(Ok(Observation::OpenConflict)) if settled => CandidateTransitionResult::OpenConflict,
         Ok(Ok(
@@ -1137,14 +1253,15 @@ pub(super) async fn exchange_attached_with_id<S: AsyncRead + AsyncWrite + Unpin>
 /// A per-attachment test barrier after a complete request frame, before the
 /// client reads the reply. Dropping the call future then exercises the real
 /// facade cancellation path without changing owner dispatch or persistence.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct ReplyPause {
     pub sent: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
+    pub promotion_sent: AtomicBool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn exchange_attached_with_id_paused<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     authority: &EndpointAuthority,
@@ -1152,6 +1269,10 @@ pub(super) async fn exchange_attached_with_id_paused<S: AsyncRead + AsyncWrite +
     call: ServiceCall,
     pause: &ReplyPause,
 ) -> Result<ServiceResponse> {
+    pause.promotion_sent.store(
+        matches!(&call, ServiceCall::PromoteCandidate { .. }),
+        Ordering::Release,
+    );
     let request = ServiceRequest::with_id(&authority.service_generation, id, call);
     write_frame(stream, &request, OPERATION_FRAME_LIMIT, OPERATION_TIMEOUT).await?;
     pause.sent.notify_one();
@@ -1177,10 +1298,13 @@ pub(super) fn resolve_response(response: ServiceResponse) -> Result<ServiceValue
             bail!("memory service storage operation failed")
         }
         ServiceResponse::Rejected(ServiceFault::CandidateConflict) => {
-            bail!("dream candidate is stale: live memory changed since its base")
+            Err(crate::store::CandidateConflict.into())
         }
         ServiceResponse::Rejected(ServiceFault::ReceiptConflict) => {
             bail!("logical mutation ID conflicts with a different operation on this memory view")
+        }
+        ServiceResponse::Rejected(ServiceFault::CandidateRefRejected(reason)) => {
+            Err(CandidateRefRejected(reason).into())
         }
     }
 }
@@ -1246,6 +1370,29 @@ async fn dispatch(
         }
         ServiceCall::CandidateTransitionOutcome { .. } => {
             unreachable!("candidate transition outcome queries are handled before dispatch")
+        }
+        ServiceCall::SelectedAbandonOutcome { .. } => {
+            unreachable!("selected abandonment outcome queries are handled before dispatch")
+        }
+        ServiceCall::CandidateInventory { after, limit } => ServiceValue::CandidateInventory(
+            store.candidate_inventory(after.as_deref(), limit).await?,
+        ),
+        ServiceCall::CandidateRefStatus { branch } => {
+            ServiceValue::CandidateRefStatus(store.candidate_ref_status(&branch).await?)
+        }
+        ServiceCall::AbandonCandidateRef {
+            branch,
+            base,
+            target,
+        } => {
+            if !state.candidates.is_empty() || !state.exports.is_empty() {
+                return Err(CandidateRefRejected(CandidateRefRefusal::Active).into());
+            }
+            let _reservation = retirement
+                .context("selected candidate abandonment requires a managed owner")?
+                .reserve_candidate_resolution()?;
+            store.abandon_candidate_ref(&branch, &base, &target).await?;
+            ServiceValue::Unit
         }
         ServiceCall::View {
             candidate,
@@ -1439,6 +1586,23 @@ async fn dispatch_ledger(store: &MemoryStore, operation: LedgerOperation) -> Res
 mod tests {
     use super::*;
     use tokio::io::{AsyncWriteExt, duplex};
+
+    #[test]
+    fn selected_candidate_resolution_temporarily_excludes_new_attachments() -> Result<()> {
+        let retirement = Arc::new(Retirement::default());
+        let requester = retirement.attached().context("requester attachment")?;
+        let second = retirement.attached().context("second attachment")?;
+        assert!(retirement.reserve_candidate_resolution().is_err());
+        drop(second);
+        let reserved = retirement.reserve_candidate_resolution()?;
+        assert!(retirement.attached().is_none());
+        assert!(!retirement.request_if_idle());
+        drop(reserved);
+        let later = retirement.attached().context("later attachment")?;
+        drop(later);
+        drop(requester);
+        Ok(())
+    }
 
     #[test]
     fn candidate_receipt_fingerprint_uses_pinned_view_not_attachment_handle() -> Result<()> {

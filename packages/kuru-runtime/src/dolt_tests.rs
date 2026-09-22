@@ -845,6 +845,7 @@ async fn reconciliation_publishes_only_durable_choices_before_the_next_mutation(
         topology: harness.topology.clone(),
         session: harness.session.clone(),
         updates: updates.clone(),
+        proof: super::engine::PublicationProof::LiveValues,
     });
     memory.put_many(&updates).await.unwrap();
     assert_eq!(harness.config.model, "demo");
@@ -865,6 +866,7 @@ async fn reconciliation_publishes_only_durable_choices_before_the_next_mutation(
         topology: harness.topology.clone(),
         session: harness.session.clone(),
         updates: vec![("missing-write".into(), json!(true))],
+        proof: super::engine::PublicationProof::LiveValues,
     });
     harness.reconcile().await.unwrap();
     assert_eq!(harness.config.model, "durable-model");

@@ -4,7 +4,7 @@
 //! Transport privacy excludes other OS users; a same-user process able to read
 //! the private endpoint record is within the account's local authority.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use std::{
     ffi::{OsStr, OsString},
@@ -24,7 +24,9 @@ pub(crate) mod rpc;
 pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, ServiceValue};
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 1;
+// Exact-ref inventory and selected-abandon outcome calls require this owner
+// version. Older owners reject the new client before a mutating frame.
+pub const PROTOCOL_MINOR: u16 = 2;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SERVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -163,7 +165,7 @@ pub struct ServiceAttachment {
     authority: EndpointAuthority,
     locator: Option<AttachmentLocator>,
     last_fault: Option<rpc::ServiceFault>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     reply_pause: Option<Arc<rpc::ReplyPause>>,
 }
 
@@ -198,7 +200,7 @@ impl AttachmentFactory {
             authority: self.authority.clone(),
             locator: Some(self.locator.clone()),
             last_fault: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             reply_pause: None,
         })
     }
@@ -238,14 +240,14 @@ impl ServiceAttachment {
             .take()
             .context("memory service attachment is closed")?;
         self.last_fault = None;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let response = if let Some(pause) = self.reply_pause.take() {
             rpc::exchange_attached_with_id_paused(&mut stream, &self.authority, id, call, &pause)
                 .await?
         } else {
             rpc::exchange_attached_with_id(&mut stream, &self.authority, id, call).await?
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let response =
             rpc::exchange_attached_with_id(&mut stream, &self.authority, id, call).await?;
         self.last_fault = match &response {
@@ -277,7 +279,7 @@ impl ServiceAttachment {
         self.stream = None;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn pause_after_next_send(&mut self, pause: Arc<rpc::ReplyPause>) {
         self.reply_pause = Some(pause);
     }
@@ -445,7 +447,16 @@ async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<S
         }
         Err(error) => return Err(error),
     };
-    connect_handshake(&mut stream, &record.authority).await?;
+    match connect_handshake(&mut stream, &record.authority).await {
+        Ok(()) => {}
+        // Endpoint retirement and final transport close are distinct steps.
+        // A client can connect to the retiring endpoint just before the owner
+        // closes it; let the existing election loop re-read discovery and
+        // owner authority instead of treating that closed peer as a protocol
+        // failure. Decoded rejection replies remain fatal below.
+        Err(error) if is_peer_closed(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    }
     Ok(Some(ServiceAttachment {
         stream: Some(stream),
         authority: record.authority,
@@ -454,7 +465,7 @@ async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<S
             address: record.address,
         }),
         last_fault: None,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         reply_pause: None,
     }))
 }
@@ -1019,7 +1030,7 @@ async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<
         authority: record.authority,
         locator: None,
         last_fault: None,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         reply_pause: None,
     };
     connect_handshake(
@@ -1742,6 +1753,47 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn retiring_endpoint_close_during_handshake_is_transient() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let data = root.path().join("private");
+            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+            options.config.cache_dir = Some(crate::store::test_cache());
+            options.config.offline = true;
+            options.supervisor = Some(crate::store::test_supervisor()?);
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options, &project).await?;
+            let closed_peer = async {
+                let stream = owner.accept(HANDSHAKE_TIMEOUT).await?;
+                drop(stream);
+                Ok::<(), anyhow::Error>(())
+            };
+            let (attached, closed) = tokio::join!(try_attach(&data, &scope, &project), closed_peer);
+            closed?;
+            ensure!(
+                attached?.is_none(),
+                "closed retiring handshake produced a live attachment"
+            );
+            owner.close().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("retiring-handshake fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
     #[cfg(windows)]
     fn windows_starter_fixture(
         project: &Path,
@@ -2032,6 +2084,10 @@ mod tests {
             format!("{error:#}").contains("protocol is incompatible"),
             "older owner had no actionable compatibility result: {error:#}"
         );
+        ensure!(
+            !is_peer_closed(&error),
+            "protocol incompatibility was mistaken for a retired transport"
+        );
         Ok(())
     }
 
@@ -2091,6 +2147,7 @@ mod tests {
         .expect("rejected handshake deadline")
         .unwrap_err();
         assert!(format!("{error:#}").contains("another project"));
+        assert!(!is_peer_closed(&error));
         assert_eq!(server_task.await.unwrap(), Err(HandshakeRejection::Project));
     }
 

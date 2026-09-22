@@ -14,13 +14,15 @@ mod store;
 
 pub use facade::{
     ActiveExportSnapshot, Candidate, CandidateTransitionRecovery, CandidateTransitionResolution,
-    CandidateUnitRecovery, ExportCursor, ExportPage, MemoryStore, MemoryView, UsageLedger,
+    CandidateUnitRecovery, ExportCursor, ExportPage, MemoryStore, MemoryView,
+    SelectedAbandonResolution, SelectedAbandonUncertain, UsageLedger,
 };
 pub use progress::{MemoryOpenProgress, MemoryOpenStage};
 pub use store::purge::PurgeOutcome;
 pub use store::{
-    ExportProvenance, HistoryWindow, MemoryStatus, OpenOptions, Revision, StorageRecord,
-    StoredNote, UsageProof,
+    CandidateConflict, CandidateInventoryPage, CandidateRefRefusal, CandidateRefRejected,
+    CandidateRefState, CandidateRefStatus, ExportProvenance, HistoryWindow, MemoryStatus,
+    OpenOptions, Revision, StorageRecord, StoredNote, UsageProof,
 };
 
 #[cfg(any(test, feature = "test-support"))]

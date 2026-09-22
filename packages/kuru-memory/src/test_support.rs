@@ -17,8 +17,32 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
+    time::Duration,
 };
+
+/// A one-shot test barrier after a complete typed service request frame and
+/// before the client reads its reply. The owner continues independently.
+#[derive(Clone, Default)]
+pub struct ReplyBarrier {
+    pub(crate) inner: Arc<crate::service::rpc::ReplyPause>,
+}
+
+impl ReplyBarrier {
+    pub async fn wait_sent(&self) {
+        self.inner.sent.notified().await;
+    }
+
+    pub fn promotion_sent(&self) -> bool {
+        self.inner
+            .promotion_sent
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn release(&self) {
+        self.inner.release.notify_one();
+    }
+}
 
 const LIMIT: u64 = 512 * 1024 * 1024;
 const DIRECTORY: &str = "kuru-test-supervisors";
@@ -71,6 +95,30 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
     MemoryStore::open(options)
         .await
         .map_err(|error| fixture_startup_error(&fixture_options, error))
+}
+
+/// Retire the exact idle managed owner after fixture clients release their
+/// transports. The maintenance permit is dropped before a successor starts.
+pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
+    let permit = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match crate::service::acquire_maintenance_permit(options).await {
+                Ok(permit) => break Ok(permit),
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("memory service has active clients") =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => break Err(error),
+            }
+        }
+    })
+    .await
+    .context("idle managed owner did not retire within 10 seconds")??;
+    drop(permit);
+    Ok(())
 }
 
 #[cfg(test)]

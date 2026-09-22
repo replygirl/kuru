@@ -21,6 +21,8 @@ Mise applies a release-age cooldown when resolving latest; a full `major.minor.p
 
 Before publication, each release's exact Windows package is tested through native mise on Windows, including its bundled Dolt runtime and reopening a saved offline conversation from empty application and engine caches. Installation still needs no compiler or separate database.
 
+Ordinary Kuru commands start or attach to a private per-project memory service from the installed executable. It is not registered as an operating-system service, requires no separately installed database daemon, and exits after a bounded idle grace once clients and accepted work have drained.
+
 ## Install with the shell bootstrap
 
 On macOS or Linux:

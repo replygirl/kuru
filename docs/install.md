@@ -174,7 +174,10 @@ the Windows bootstrap.
 
 The executable includes its verified full-Dolt engine and upstream licenses.
 First memory use extracts them locally, so an offline installation also supports
-a first offline demo conversation. See [memory storage](memory.md).
+a first offline demo conversation. Ordinary commands start or attach to a
+private per-project memory service from that same executable; no database daemon
+or operating-system service is installed. It exits after a bounded idle grace
+once clients and accepted work have drained. See [memory storage](memory.md).
 
 ## Build from source
 

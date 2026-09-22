@@ -79,6 +79,93 @@ fn warm_memory_progress() -> &'static str {
     )
 }
 
+#[tokio::test]
+async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
+    let env = Sandbox::new();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope).unwrap();
+    let memory = kuru_memory::test_support::open_fixture(options.clone())
+        .await
+        .unwrap();
+    let candidate = memory
+        .begin_candidate("retained CLI candidate")
+        .await
+        .unwrap();
+    let branch = candidate.branch().to_owned();
+    let base = candidate.base().to_owned();
+    let view = candidate.view();
+    view.append("fixture/candidate", "user", "private CLI value")
+        .await
+        .unwrap();
+    let head = view.revision().await.unwrap();
+    drop(view);
+    drop(candidate);
+    memory.close().await.unwrap();
+
+    let run_json = |args: &[&str]| -> anyhow::Result<Value> {
+        let output = env.run(args);
+        anyhow::ensure!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let commands = (|| -> anyhow::Result<(Output, Value, Value, Value, Value)> {
+        Ok((
+            env.run(&[
+                "memory",
+                "candidate-abandon",
+                &branch,
+                "--base",
+                &base,
+                "--head",
+                &base,
+            ]),
+            run_json(&["memory", "candidates", "--limit", "1"])?,
+            run_json(&["memory", "candidate-status", &branch])?,
+            run_json(&[
+                "memory",
+                "candidate-abandon",
+                &branch,
+                "--base",
+                &base,
+                "--head",
+                &head,
+            ])?,
+            run_json(&["memory", "candidate-status", &branch])?,
+        ))
+    })();
+    let retirement = kuru_memory::test_support::retire_idle_service(&options).await;
+    let (rejected, inventory, status, abandoned, missing) = commands.unwrap();
+    retirement.unwrap();
+
+    assert!(!rejected.status.success());
+    let rejection = String::from_utf8(rejected.stderr).unwrap();
+    assert!(
+        rejection.contains("selected candidate ref changed or its outcome is unproved"),
+        "{rejection}"
+    );
+    assert!(!rejection.contains("retained request identity"));
+    assert!(!rejection.contains("outcome recovery"));
+    assert_eq!(inventory["candidates"][0]["branch"], branch);
+    assert_eq!(inventory["candidates"][0]["base"], base);
+    assert_eq!(inventory["candidates"][0]["head"], head);
+    assert_eq!(inventory["candidates"][0]["state"], "open_unchanged");
+
+    assert_eq!(status["candidate"]["branch"], branch);
+    assert_eq!(status["candidate"]["base"], base);
+    assert_eq!(status["candidate"]["head"], head);
+    assert_eq!(status["candidate"]["state"], "open_unchanged");
+    assert_eq!(status["operation_outcome"], "not_queried");
+
+    assert_eq!(abandoned["branch"], branch);
+    assert_eq!(abandoned["state"], "abandoned");
+
+    assert_eq!(missing["candidate"]["state"], "missing");
+    assert_eq!(missing["operation_outcome"], "unproved");
+}
+
 fn git_fixture(directory: &std::path::Path, args: &[&str]) -> Output {
     // Git exports repository selectors into hooks. Fixture setup must target
     // its own temporary repository even when tests run from pre-push.

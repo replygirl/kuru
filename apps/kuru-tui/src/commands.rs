@@ -4,6 +4,9 @@
 use std::collections::BTreeMap;
 
 use kuru_core::PromptCatalog;
+use kuru_memory::{CandidateRefState, CandidateRefStatus};
+
+pub(crate) const CANDIDATE_PAGE_LIMIT: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandId {
@@ -265,6 +268,17 @@ pub(crate) fn expand_custom(entry: &kuru_core::CustomCommand, args: &str) -> Str
     format!("{}\n\nArguments (literal text):\n{}", entry.body, args)
 }
 
+pub(crate) fn candidate_status_json(status: &CandidateRefStatus) -> serde_json::Value {
+    serde_json::json!({
+        "candidate": status,
+        "operation_outcome": if status.state == CandidateRefState::Missing {
+            "unproved"
+        } else {
+            "not_queried"
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +366,18 @@ mod tests {
             expand_custom(entry, args),
             "Explain the risks.\n\n\nArguments (literal text):\n`literal` $HOME"
         );
+    }
+
+    #[test]
+    fn missing_candidate_keeps_operation_outcome_unproved() {
+        let status = CandidateRefStatus {
+            branch: "candidate_00000000000000000000000000000000".into(),
+            head: None,
+            base: None,
+            state: CandidateRefState::Missing,
+        };
+        let projected = candidate_status_json(&status);
+        assert_eq!(projected["candidate"]["state"], "missing");
+        assert_eq!(projected["operation_outcome"], "unproved");
     }
 }
