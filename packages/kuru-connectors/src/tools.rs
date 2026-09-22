@@ -76,6 +76,21 @@ const MAX_SEARCH_LINE_BYTES: usize = 8 * 1024;
 const MAX_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PAGE_LINES: usize = 100_000;
 
+// Temporary, content-free native diagnostic for the two Windows CLI shell
+// fixtures. The probe is inactive in release builds.
+#[cfg(windows)]
+fn windows_shell_stack_stage(stage: &'static str) {
+    if cfg!(debug_assertions)
+        && let Some(path) = std::env::var_os("KURU_WINDOWS_SHELL_STACK_STAGE")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = writeln!(file, "{stage}");
+    }
+}
+
 #[cfg(windows)]
 const WINDOWS_SHELL_ENVIRONMENT: &[&str] = &[
     "PATH",
@@ -436,7 +451,12 @@ impl ToolHost {
     }
 
     pub async fn execute(&self, name: &str, args: Value) -> Result<String> {
-        self.execute_with_approval(name, args, None).await
+        let result = self.execute_with_approval(name, args, None).await;
+        #[cfg(windows)]
+        if name == "shell" {
+            windows_shell_stack_stage("host-execute-returned");
+        }
+        result
     }
 
     /// Execute one native or MCP invocation after the central permission gate.
@@ -514,6 +534,10 @@ impl ToolHost {
             self.execute_inner(name, args, approval).await
         }
         .await;
+        #[cfg(windows)]
+        if name == "shell" {
+            windows_shell_stack_stage("tool-execution-ready");
+        }
         match result {
             Ok(execution) => project_execution(execution),
             Err(failure) => project_failure(failure),
@@ -848,6 +872,8 @@ impl ToolHost {
                         Duration::from_millis(duration),
                     )
                     .await?;
+                    #[cfg(windows)]
+                    windows_shell_stack_stage("shell-wrapper-returned");
                     Ok(ToolExecution::ProjectedJson(
                         serde_json::from_str(&result).context("shell emitted invalid result")?,
                     ))
@@ -1617,6 +1643,7 @@ async fn shell_inner(
     match result {
         Ok(status) => {
             cleanup?;
+            windows_shell_stack_stage("shell-inner-finished");
             Ok(json!({"exit_code":status.code(),"success":status.success(),"stdout":out.text(),"stderr":err.text()}).to_string())
         }
         Err(category) => {

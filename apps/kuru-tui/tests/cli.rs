@@ -685,7 +685,15 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
     for name in ["shell-entered", "shell-completed"] {
         assert!(!env.project.join(name).exists());
     }
-    let output = env.run(&["--allow-shell", "tool", "shell", "--args", shell_args]);
+    let mut command = env.command();
+    #[cfg(windows)]
+    let stack_stage_path = env.project.join("shell-stack-stage");
+    #[cfg(windows)]
+    command.env("KURU_WINDOWS_SHELL_STACK_STAGE", &stack_stage_path);
+    let output = command
+        .args(["--allow-shell", "tool", "shell", "--args", shell_args])
+        .output()
+        .unwrap();
     // Observe only this fixture's bounded markers after the actual CLI returns.
     // They distinguish source progress from captured pipe output, without a
     // second shell invocation or changing the original Console.Write call.
@@ -698,6 +706,15 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
             Ok(bytes)
         })
     });
+    #[cfg(windows)]
+    let stack_stages = {
+        use std::io::Read;
+        std::fs::File::open(&stack_stage_path).and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(512).read_to_end(&mut bytes)?;
+            String::from_utf8(bytes).map_err(std::io::Error::other)
+        })
+    };
     let diagnostic = format!(
         "status {}; stdout {:?}; stderr {:?}",
         output.status,
@@ -705,7 +722,9 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
         String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(4096)]),
     );
     #[cfg(windows)]
-    let diagnostic = format!("{diagnostic}; source entry/completion markers: {markers:?}");
+    let diagnostic = format!(
+        "{diagnostic}; source entry/completion markers: {markers:?}; Kuru stages: {stack_stages:?}"
+    );
     assert!(output.status.success(), "{diagnostic}");
     assert!(output.stderr.is_empty(), "{diagnostic}");
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();

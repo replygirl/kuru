@@ -702,6 +702,19 @@ pub async fn execute(cli: Cli) -> Result<()> {
     execute_inner(cli, false).await
 }
 
+#[cfg(windows)]
+fn windows_shell_stack_stage(stage: &'static str) {
+    if cfg!(debug_assertions)
+        && let Some(path) = std::env::var_os("KURU_WINDOWS_SHELL_STACK_STAGE")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = writeln!(file, "{stage}");
+    }
+}
+
 async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     if let Some(Command::Update {
         version,
@@ -1022,11 +1035,24 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                     let arguments = serde_json::from_str(args)?;
                     let catalog = host.catalog().await?;
                     report_mcp_statuses(catalog.mcp());
-                    host.execute(name, arguments).await
+                    let output = host.execute(name, arguments).await;
+                    #[cfg(windows)]
+                    if name == "shell" {
+                        windows_shell_stack_stage("cli-tool-returned");
+                    }
+                    output
                 }
                 .await;
                 let cleanup = host.shutdown().await;
+                #[cfg(windows)]
+                if name == "shell" {
+                    windows_shell_stack_stage("cli-shutdown-returned");
+                }
                 println!("{}", result?);
+                #[cfg(windows)]
+                if name == "shell" {
+                    windows_shell_stack_stage("cli-output-written");
+                }
                 cleanup?;
                 return Ok(());
             }

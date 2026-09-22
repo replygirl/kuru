@@ -727,14 +727,18 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     // The first Kuru request must exercise the unwrapped source. Observation
     // wrappers can alter discovery; a diagnostic retry cannot establish a pass.
     let arguments = serde_json::json!({ "command": kuru_source }).to_string();
+    let stack_stage = root.path().join("kuru-shell-stack-stage");
     let output = child(Path::new(env!("CARGO_BIN_EXE_kuru")))
+        .env("KURU_WINDOWS_SHELL_STACK_STAGE", &stack_stage)
         .arg("-C")
         .arg(&project)
         .args(["--allow-shell", "tool", "shell", "--args", &arguments])
         .output();
     let kuru_stages = shell_marker(&kuru_progress, 256);
-    let output =
-        output.unwrap_or_else(|error| panic!("Kuru shell failed: {error}; stages={kuru_stages:?}"));
+    let stack_stages = shell_marker(&stack_stage, 512);
+    let output = output.unwrap_or_else(|error| {
+        panic!("Kuru shell failed: {error}; stages={kuru_stages:?}; Kuru stages={stack_stages:?}")
+    });
     let trace = if !output.status.success()
         && String::from_utf8_lossy(&output.stderr).contains("shell timed out")
     {
@@ -744,7 +748,7 @@ fn built_in_shell_reconstructs_stock_module_paths_without_losing_other_environme
     };
     assert!(
         output.status.success(),
-        "{}\n{}\nstages={kuru_stages:?}\nmachine_environment={machine_environment}\n{trace}",
+        "{}\n{}\nstages={kuru_stages:?}\nKuru stages={stack_stages:?}\nmachine_environment={machine_environment}\n{trace}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
