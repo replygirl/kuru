@@ -164,9 +164,13 @@ than assume every content string is ordinary prose. JSON preserves the stored
 payload, and Markdown identifies structured records. This does not add an
 export-import command or rewrite existing user exports.
 
-An older Kuru binary that does not understand schema 3 refuses the upgraded
-store. Replacing the executable with an older release does not downgrade memory;
-use a compatible Kuru to reopen it. Original legacy SQLite data remains intact.
+Schema 4 retains compact indexed operation receipts across later writes for
+exact internal write-outcome checks. Existing
+schema-1-through-3 candidate branches keep their historical schema and remain
+inspectable; they are not rewritten or promoted across an upgraded main. An
+older Kuru binary that does not understand schema 4 refuses the upgraded store.
+Replacing the executable with an older release does not downgrade memory; use
+a compatible Kuru to reopen it. Original legacy SQLite data remains intact.
 
 The SQL schema version is independent from the format-1 `ready.json` activation
 record, the database identity record, and the supervisor protocol. An old dream
@@ -180,8 +184,10 @@ topology changes become active together after validation. A candidate based on a
 outdated live revision cannot overwrite newer conversations. Undo records a new
 revision restoring prior membership, while preserving later chats and preferences.
 
-Kuru replaces internal write receipts and reclaims a dream candidate only after
-its promotion or explicit abandonment is durably resolved. Unresolved candidates,
+Current writable branches retain compact internal operation receipts for exact
+lost-reply reconciliation. Historical schema-1-through-3 branches keep their
+older receipt shape. Kuru reclaims a dream candidate only after its promotion
+or explicit abandonment is durably resolved. Unresolved candidates,
 conversations, notes and reachable Dolt revisions do not expire automatically.
 The bundled engine performs bounded, growth-triggered storage maintenance while
 Kuru owns it, but retained history can continue to grow. This maintenance is not

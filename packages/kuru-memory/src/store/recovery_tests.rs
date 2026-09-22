@@ -24,6 +24,14 @@ use tokio::{
 
 const TEST_DEADLINE: Duration = Duration::from_secs(10);
 const FRAME_LIMIT: usize = 128 * 1024;
+
+struct AbortUpgradeOnDrop(JoinHandle<Result<()>>);
+
+impl Drop for AbortUpgradeOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 #[cfg(any(unix, windows))]
 const PROCESS_OUTPUT_LIMIT: usize = 8 * 1024;
 
@@ -733,14 +741,14 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(recovered.pool.as_ref())
             .await?,
-        2
+        i64::from(migrations::CURRENT_VERSION - 1)
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_branches WHERE LEFT(BINARY name, 15) = BINARY 'kuru_migration_'")
             .fetch_one(recovered.pool.as_ref())
             .await?,
-        3,
-        "cold recovery retains the failed branch and both ordered migration attempts"
+        4,
+        "cold recovery retains the failed branch and all three ordered migration attempts"
     );
     let retained_failed = recovered.shared.server.pool(&failed_branch).await?;
     assert_eq!(revision(&retained_failed).await?, failed_head);
@@ -765,6 +773,15 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
         .await?,
         1,
         "cold recovery must publish the v3 migration exactly once"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 4%'"
+        )
+        .fetch_one(recovered.pool.as_ref())
+        .await?,
+        1,
+        "cold recovery must publish the v4 migration exactly once"
     );
     let recovered_candidate = recovered.shared.server.pool(&candidate).await?;
     assert_eq!(revision(&recovered_candidate).await?, candidate_head);
@@ -1169,7 +1186,7 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
                 .fetch_one(store.pool.as_ref())
                 .await?,
-            2
+            3
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -1177,7 +1194,7 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
             )
             .fetch_one(store.pool.as_ref())
             .await?,
-            2
+            3
         );
         store.close().await?;
     }
@@ -1194,6 +1211,7 @@ async fn live_original_session_blocks_receipt_reconciliation_even_after_commit()
         &operation,
         "barrier",
         Mutation::State(vec![("settled".into(), "true".into())]),
+        None,
     )
     .await
     .unwrap();
@@ -1604,6 +1622,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
         }),
         pool,
         branch: "main".into(),
+        logical_receipt: None,
     }
 }
 
@@ -1698,6 +1717,7 @@ async fn exact_base_schema_branch(store: &MemoryStore) -> SchemaBranch {
             shared: store.shared.clone(),
             pool,
             branch,
+            logical_receipt: None,
         },
         base,
     }
@@ -2247,7 +2267,7 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(store.pool.as_ref())
             .await?,
-        2
+        i64::from(migrations::CURRENT_VERSION - 1)
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -2279,6 +2299,195 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
     );
     reopened.close().await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn usage_upgrade_reconciles_lost_publication_reply_without_replacing_legacy_receipt()
+-> Result<()> {
+    usage_upgrade_publication_fixture(true).await
+}
+
+#[tokio::test]
+async fn usage_upgrade_preserves_ready_attempt_when_publication_never_dispatches() -> Result<()> {
+    usage_upgrade_publication_fixture(false).await
+}
+
+async fn usage_upgrade_publication_fixture(accepted: bool) -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let options = crate::test_support::open_options(
+        root.path().to_owned(),
+        format!("project/{}", Uuid::new_v4().simple().to_string().repeat(2)),
+    )?;
+    super::tests::released_v1(&options).await?;
+    let server = super::tests::released_server(&options).await?;
+    let main = server.pool("main").await?;
+    migrations::upgrade(&server, &main).await?;
+    let v3_branches: Vec<String> = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT name FROM dolt_branches WHERE LEFT(BINARY name, 27) = BINARY 'kuru_migration_v0000000003_' LIMIT 2")
+            .fetch_all(main.as_ref()),
+    )
+    .await
+    .context("usage migration fixture v3 branch lookup deadline exceeded")??;
+    ensure!(
+        v3_branches.len() == 1,
+        "usage migration fixture needs one exact v3 migration branch"
+    );
+    let v3 = server.pool(&v3_branches[0]).await?;
+    let v3_head = revision(&v3).await?;
+    v3.close().await;
+    let usage_name = usage_ledger::BRANCH;
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            .bind(usage_name)
+            .bind(&v3_head)
+            .fetch_all(main.as_ref()),
+    )
+    .await
+    .context("usage migration fixture branch creation deadline exceeded")??;
+    let usage = server.pool(usage_name).await?;
+    let legacy_id = Uuid::new_v4().hyphenated().to_string();
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
+            .bind(&legacy_id)
+            .bind("pre-upgrade usage receipt")
+            .execute(usage.as_ref()),
+    )
+    .await
+    .context("usage migration fixture legacy receipt deadline exceeded")??;
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'Usage before retained receipts', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(usage.as_ref()),
+    )
+    .await
+    .context("usage migration fixture legacy commit deadline exceeded")??;
+    let prior_usage_head = revision(&usage).await?;
+    assert_eq!(migrations::version(&usage).await?, 3);
+
+    let reserved = ReservedAckDropProxy::reserve().await;
+    let (hooks, control) =
+        migrations::MigrationRunnerHooks::paused(migrations::MigrationBoundary::BeforePublish);
+    let hooks = hooks.with_route(migrations::MigrationBoundary::BeforePublish, reserved.port);
+    let migrating_server = server.clone();
+    let migrating_usage = usage.clone();
+    let mut upgrading = AbortUpgradeOnDrop(tokio::spawn(async move {
+        migrations::upgrade_usage_with_hooks(&migrating_server, &migrating_usage, &hooks).await
+    }));
+    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
+        .await
+        .context("usage upgrade did not expose publication route")??;
+    let target = control.publication_target()?;
+    let attempt = control.branch_name()?;
+    let observation = DurableObservation::MainAtTarget {
+        target: target.clone(),
+    };
+    let proxy = if accepted {
+        reserved.start(source, "CALL DOLT_MERGE", observation)
+    } else {
+        reserved.start_absent(source, observation)
+    };
+    control.resume_route();
+    tokio::time::timeout(TEST_DEADLINE, control.reached())
+        .await
+        .context("usage upgrade did not reach publication boundary")??;
+    assert_eq!(revision(&usage).await?, prior_usage_head);
+    assert_eq!(migrations::version(&usage).await?, 3);
+    control.resume();
+    let upgrade_result = tokio::time::timeout(TEST_DEADLINE, &mut upgrading.0)
+        .await
+        .context("usage upgrade did not settle its publication attempt")??;
+    if accepted {
+        upgrade_result?;
+    } else {
+        let error = upgrade_result.expect_err("undispatched usage publication appeared committed");
+        ensure!(
+            format!("{error:#}").contains("Dolt migration fast-forward failed"),
+            "unexpected absent usage publication result: {error:#}"
+        );
+    }
+    ensure!(
+        proxy.discarded.load(Ordering::Acquire),
+        "usage fixture did not discard the selected publication packet"
+    );
+    await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
+    let observed_usage_head = revision(&usage).await?;
+    assert_eq!(
+        observed_usage_head,
+        if accepted {
+            target.as_str()
+        } else {
+            prior_usage_head.as_str()
+        }
+    );
+    if accepted {
+        migrations::validate_usage(&server, &usage).await?;
+    } else {
+        assert_eq!(migrations::version(&usage).await?, 3);
+    }
+    let attempt_head: String = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT hash FROM dolt_branches WHERE BINARY name = BINARY ?")
+            .bind(&attempt)
+            .fetch_one(main.as_ref()),
+    )
+    .await
+    .context("usage migration fixture retained attempt lookup deadline exceeded")??;
+    assert_eq!(attempt_head, target);
+    usage.close().await;
+    main.close().await;
+    server.close().await?;
+    proxy.close().await;
+
+    let reopened = tokio::time::timeout(
+        migration_observation_deadline(&options),
+        crate::test_support::spawn_gated_open(options),
+    )
+    .await
+    .context("reopened usage owner did not finish its bounded migration validation")??;
+    let ledger = reopened.usage_ledger()?;
+    let upgraded_usage = reopened
+        .shared
+        .usage_pool
+        .lock()
+        .expect("usage pool lock")
+        .clone()
+        .context("reopened usage pool missing")?;
+    assert_eq!(migrations::version(&upgraded_usage).await?, 4);
+    assert_eq!(revision(&upgraded_usage).await?, target);
+    let legacy: (String, i32) = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_as("SELECT label, receipt_format FROM operations WHERE id = ?")
+            .bind(&legacy_id)
+            .fetch_one(upgraded_usage.as_ref()),
+    )
+    .await
+    .context("reopened usage legacy receipt lookup deadline exceeded")??;
+    assert_eq!(legacy, ("pre-upgrade usage receipt".to_owned(), 0));
+    ledger.mark_new_session("after-usage-upgrade").await?;
+    let count: i64 = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT COUNT(*) FROM operations").fetch_one(upgraded_usage.as_ref()),
+    )
+    .await
+    .context("usage migration fixture retained receipt count deadline exceeded")??;
+    assert_eq!(count, 2, "reopen erased or duplicated a usage receipt");
+    let upgrades: i64 = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 4%'",
+        )
+        .fetch_one(upgraded_usage.as_ref()),
+    )
+    .await
+    .context("usage migration fixture upgrade log deadline exceeded")??;
+    assert_eq!(upgrades, 1, "reopen rebuilt the same usage migration");
+    drop(ledger);
+    drop(upgraded_usage);
+    reopened.close().await
 }
 
 #[tokio::test]
@@ -2334,15 +2543,14 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
     assert!(proxy.discarded.load(Ordering::Acquire));
     await_flag(&proxy.session_ended, TEST_DEADLINE).await?;
     let completed = store.revision().await?;
-    let parent: String = sqlx::query_scalar(
-        "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-    )
-    .bind(&completed)
-    .fetch_one(store.pool.as_ref())
-    .await?;
+    let published_ancestor: String = sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
+        .bind(&target)
+        .bind(&completed)
+        .fetch_one(store.pool.as_ref())
+        .await?;
     assert_eq!(
-        parent, target,
-        "v3 must descend from the reconciled v2 target"
+        published_ancestor, target,
+        "current schema must descend from the reconciled v2 target"
     );
     assert_eq!(
         store.get("fast-forward-reply-source").await?,
@@ -2357,7 +2565,7 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(store.pool.as_ref())
             .await?,
-        2
+        i64::from(migrations::CURRENT_VERSION - 1)
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -2469,15 +2677,14 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
     )
     .await??;
     let completed = reopened.revision().await?;
-    let parent: String = sqlx::query_scalar(
-        "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
-    )
-    .bind(&completed)
-    .fetch_one(reopened.pool.as_ref())
-    .await?;
+    let published_ancestor: String = sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
+        .bind(&target)
+        .bind(&completed)
+        .fetch_one(reopened.pool.as_ref())
+        .await?;
     assert_eq!(
-        parent, target,
-        "v3 must descend from the retained ready v2 target"
+        published_ancestor, target,
+        "current schema must descend from the retained ready v2 target"
     );
     assert_eq!(
         reopened.get("absent-fast-forward-source").await?,
@@ -2491,7 +2698,7 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(reopened.pool.as_ref())
             .await?,
-        2
+        i64::from(migrations::CURRENT_VERSION - 1)
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT hash FROM dolt_branches WHERE name = ?")
@@ -2629,6 +2836,7 @@ async fn isolated_schema_retry_keeps_main_clean_and_reconciles_lost_fast_forward
         pool: shared.server.pool("main").await.unwrap(),
         shared,
         branch: "main".into(),
+        logical_receipt: None,
     };
     assert_schema_commit(&current, &base, &source_history, &receipt).await;
     assert_eq!(
@@ -2790,6 +2998,7 @@ impl AckDropProxy {
             shared: store.shared.clone(),
             pool: Arc::new(pool),
             branch: store.branch.clone(),
+            logical_receipt: None,
         }
     }
 

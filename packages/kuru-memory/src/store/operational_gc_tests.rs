@@ -4,7 +4,7 @@ use serde_json::json;
 const TEST_DEADLINE: Duration = Duration::from_secs(10);
 
 #[tokio::test]
-async fn lost_receipt_reply_settles_before_replacement_and_preserves_revisions() -> Result<()> {
+async fn lost_receipt_reply_settles_and_remains_indexed_after_later_write() -> Result<()> {
     let store = MemoryStore::temporary().await?;
     store.put("first", &json!(1)).await?;
     let first_revision = store.revision().await?;
@@ -16,6 +16,7 @@ async fn lost_receipt_reply_settles_before_replacement_and_preserves_revisions()
         &operation,
         "lost acknowledgement",
         Mutation::State(vec![("second".into(), "2".into())]),
+        None,
     )
     .await?;
     let second_revision = store.revision().await?;
@@ -57,8 +58,8 @@ async fn lost_receipt_reply_settles_before_replacement_and_preserves_revisions()
     let receipts: Vec<String> = sqlx::query_scalar("SELECT id FROM operations")
         .fetch_all(store.pool.as_ref())
         .await?;
-    assert_eq!(receipts.len(), 1);
-    assert_ne!(receipts[0], operation);
+    assert_eq!(receipts.len(), 3);
+    assert!(receipts.contains(&operation));
     assert_eq!(store.get("first").await?, Some(json!(1)));
     assert_eq!(store.get("second").await?, Some(json!(2)));
     assert_eq!(store.get("third").await?, Some(json!(3)));
