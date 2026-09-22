@@ -374,7 +374,8 @@ jobs:
           # A deploy-only retry retains the prior successful build's output.
           artifact_name: ${{ needs.build-docs.outputs.artifact_name }}
 
-  # Public promotion is the final operation, after every required gate succeeds.
+  # Public promotion follows every acceptance gate. Public-download verification
+  # below observes the immutable release and never rolls publication back.
   publish:
     needs: [plan, bump, assemble-candidate, verify-staged-windows, deploy-docs]
     runs-on: ubuntu-24.04
@@ -404,3 +405,39 @@ jobs:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
           RELEASE_SHA: ${{ needs.bump.outputs.sha }}
         run: mise run release:tool -- publish --version "$RELEASE_VERSION" --sha "$RELEASE_SHA" --directory dist --notes RELEASE_NOTES.md
+
+  verify-published-windows:
+    name: Verify published Windows download
+    needs: [plan, bump, publish]
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      MISE_NO_HOOKS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          install_args: rust
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Verify the exact public download and cold offline reopen
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_SHA: ${{ needs.bump.outputs.sha }}
+          RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          KURU_PUBLISHED_WINDOWS_RECEIPT: ${{ runner.temp }}/published-windows-receipt.json
+        run: mise run //packages/kuru-delivery:verify:published-windows
+      - name: Retain public-download verification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: published-windows-${{ needs.plan.outputs.version }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/published-windows-receipt.json
+          if-no-files-found: error

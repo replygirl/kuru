@@ -253,7 +253,10 @@ there; no credentials belong in source or generated artifacts.
 Build and publish docs only through the `build-docs` and `deploy-docs` jobs inside
 that Release workflow and from the exact selected release commit. The staged
 Windows candidate acceptance and documentation deployment must succeed before
-the sole final job can promote the public release. For recovery, rerun the failed
+the publication job can promote the public release. A separate post-publication
+Windows job verifies the immutable public download against the exact released
+commit and retains its acceptance receipt. Its failure is reported on the run;
+it never changes or unpublishes the release. For recovery, rerun the failed
 jobs on the existing release run; Pages deployment and GitHub release promotion
 are ordered but are not one atomic service operation. Do not add or dispatch a
 standalone Pages workflow, including for initial site setup; merging a PR is not
