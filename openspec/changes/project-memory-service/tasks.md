@@ -20,5 +20,5 @@
 
 ## 4. Cross-surface acceptance
 
-- [ ] 4.1 Record observed evidence for every verification-ledger row, including native Windows/macOS/Linux memory and packaged offline install/update checks; name any genuinely unrun check and its reason.
+- [x] 4.1 Record observed evidence for every verification-ledger row, including native Windows/macOS/Linux memory and packaged offline install/update checks; name any genuinely unrun check and its reason. Reconciled 2026-09-22: local and inherited observed evidence is marked complete; exact-P27-head hosted permission, packaged install/update, and normal combined-coverage gates are explicitly deferred in the ledger.
 - [ ] 4.2 Run relevant package checks, combined coverage and strict Cospec validation, resolve failures, then archive the change and verify its archive exists before the final branch commit.

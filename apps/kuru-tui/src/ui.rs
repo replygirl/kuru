@@ -2893,7 +2893,7 @@ mod tests {
         assert_eq!(view.key(key(KeyCode::Tab)), None);
         assert_eq!(view.input, "/memory");
         assert_eq!(view.key(key(KeyCode::Tab)), None);
-        assert_eq!(view.input, "/memory-history");
+        assert_eq!(view.input, "/memory-candidate-abandon");
         assert_eq!(view.key(key(KeyCode::BackTab)), None);
         assert_eq!(view.input, "/memory");
         view.key(key(KeyCode::Char('x')));

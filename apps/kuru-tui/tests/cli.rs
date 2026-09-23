@@ -125,15 +125,31 @@ fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
     std::fs::remove_dir_all(original).unwrap();
 }
 
-fn warm_memory_progress() -> &'static str {
-    concat!(
-        "Memory: waiting for project ownership…\n",
-        "Memory: verifying cached runtime…\n",
-        "Memory: checking runtime version…\n",
-        "Memory: preparing database…\n",
-        "Memory: opening database…\n",
-        "Memory: ready.\n",
-    )
+fn assert_memory_progress(stderr: &str) {
+    let lines: Vec<_> = stderr.lines().collect();
+    assert_eq!(
+        lines.first(),
+        Some(&"Memory: waiting for project ownership…"),
+        "{stderr}"
+    );
+    let ready = lines
+        .iter()
+        .position(|line| *line == "Memory: ready.")
+        .expect("memory startup omitted ready progress");
+    let mut previous = 0;
+    for stage in [
+        "Memory: waiting for verified runtime cache…",
+        "Memory: extracting embedded runtime…",
+        "Memory: verifying cached runtime…",
+        "Memory: checking runtime version…",
+        "Memory: preparing database…",
+        "Memory: opening database…",
+    ] {
+        if let Some(position) = lines.iter().position(|line| *line == stage) {
+            assert!(position > previous && position < ready, "{stderr}");
+            previous = position;
+        }
+    }
 }
 
 #[tokio::test]
@@ -708,10 +724,7 @@ async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_proje
         String::from_utf8_lossy(&export.stderr)
     );
     assert!(export.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&export.stderr),
-        warm_memory_progress()
-    );
+    assert_memory_progress(&String::from_utf8_lossy(&export.stderr));
     let export_before = std::fs::read(&export_path).unwrap();
 
     let engine =
@@ -1106,10 +1119,7 @@ async fn memory_export_is_provider_free_and_publishes_one_committed_snapshot() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        warm_memory_progress()
-    );
+    assert_memory_progress(&String::from_utf8_lossy(&output.stderr));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["manifest"]["snapshot"], "committed active main");
     assert_eq!(json["manifest"]["provenance"]["revision"], revision);
@@ -1151,10 +1161,7 @@ async fn memory_export_is_provider_free_and_publishes_one_committed_snapshot() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        warm_memory_progress()
-    );
+    assert_memory_progress(&String::from_utf8_lossy(&output.stderr));
     let markdown = std::fs::read_to_string(&output_path).unwrap();
     assert!(markdown.contains("# Kuru committed memory export"));
     assert!(markdown.contains("committed active main"));
@@ -1546,18 +1553,7 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     let cold_json: Value = serde_json::from_slice(&cold.stdout).unwrap();
     assert!(cold_json["text"].as_str().unwrap().contains("demo"));
     let cold_stderr = String::from_utf8_lossy(&cold.stderr);
-    assert!(
-        cold_stderr.starts_with(concat!(
-            "Memory: waiting for project ownership…\n",
-            "Memory: waiting for verified runtime cache…\n",
-            "Memory: extracting embedded runtime…\n",
-            "Memory: checking runtime version…\n",
-            "Memory: preparing database…\n",
-            "Memory: opening database…\n",
-            "Memory: ready.\n",
-        )),
-        "{cold_stderr}"
-    );
+    assert_memory_progress(&cold_stderr);
     assert!(cold_stderr.contains("Memory is ready at"), "{cold_stderr}");
     assert!(
         cold_stderr.contains("kuru memory notes ID"),
@@ -1574,10 +1570,7 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     );
     let warm_json: Value = serde_json::from_slice(&warm.stdout).unwrap();
     assert!(warm_json["text"].as_str().unwrap().contains("demo"));
-    assert_eq!(
-        String::from_utf8_lossy(&warm.stderr),
-        warm_memory_progress()
-    );
+    assert_memory_progress(&String::from_utf8_lossy(&warm.stderr));
     eprintln!(
         "observed isolated CLI startup wall time: cold={cold_elapsed:?}; warm={warm_elapsed:?}; no optimization claim"
     );

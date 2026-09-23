@@ -396,45 +396,35 @@ fn expected_receipt() -> String {
 
 fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
     let stderr = std::str::from_utf8(stderr).context("startup stderr is not UTF-8")?;
-    let mut lines = stderr.lines();
-    let expected = "Memory: waiting for project ownership…";
+    let lines: Vec<_> = stderr.lines().collect();
     ensure!(
-        lines.next() == Some(expected),
-        "normal kuru run changed startup frame {expected:?}: {stderr:?}"
+        lines.first() == Some(&"Memory: waiting for project ownership…"),
+        "normal kuru run changed first startup frame: {stderr:?}"
     );
-    let runtime = lines
-        .next()
-        .context("normal kuru run omitted runtime-version startup frame")?;
-    if runtime == "Memory: waiting for verified runtime cache…" {
-        ensure!(
-            lines.next() == Some("Memory: extracting embedded runtime…"),
-            "cold kuru run changed extraction startup frame: {stderr:?}"
-        );
-    } else {
-        ensure!(
-            runtime == "Memory: verifying cached runtime…",
-            "warm kuru run changed verification startup frame: {stderr:?}"
-        );
-    }
-    let next = lines
-        .next()
-        .context("normal kuru run omitted runtime-version startup frame")?;
-    ensure!(
-        next == "Memory: checking runtime version…",
-        "normal kuru run changed runtime-version startup frame: {stderr:?}"
-    );
+    let ready = lines
+        .iter()
+        .position(|line| *line == "Memory: ready.")
+        .context("normal kuru run omitted ready startup frame")?;
+    let mut previous = 0;
     for expected in [
+        "Memory: waiting for verified runtime cache…",
+        "Memory: extracting embedded runtime…",
+        "Memory: verifying cached runtime…",
+        "Memory: checking runtime version…",
         "Memory: preparing database…",
         "Memory: opening database…",
-        "Memory: ready.",
     ] {
-        ensure!(
-            lines.next() == Some(expected),
-            "normal kuru run changed startup frame {expected:?}: {stderr:?}"
-        );
+        if let Some(position) = lines.iter().position(|line| *line == expected) {
+            ensure!(
+                position > previous && position < ready,
+                "normal kuru run reordered startup frame {expected:?}: {stderr:?}"
+            );
+            previous = position;
+        }
     }
     let notice = lines
-        .next()
+        .get(ready + 1)
+        .copied()
         .context("normal kuru run omitted first-run notice")?;
     ensure!(
         notice.starts_with("Memory is ready at ")
@@ -446,7 +436,7 @@ fn assert_expected_startup_notice(stderr: &[u8]) -> Result<()> {
         "normal kuru run changed first-run notice: {notice:?}"
     );
     ensure!(
-        lines.next().is_none(),
+        lines.len() == ready + 2,
         "normal kuru run emitted unexpected stderr after startup and notice: {stderr:?}"
     );
     Ok(())

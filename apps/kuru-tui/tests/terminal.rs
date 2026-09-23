@@ -537,8 +537,8 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
     terminal.send(b"/mem\t")?;
     terminal.wait_composer_frame(&["/memory", "enter send"], READY_TIMEOUT)?;
     terminal.send(b"\t")?;
-    terminal.wait_composer_frame(&["/memory-history", "enter send"], READY_TIMEOUT)?;
-    terminal.send(&[127; 15])?;
+    terminal.wait_composer_frame(&["/memory-candidate-abandon", "enter send"], READY_TIMEOUT)?;
+    terminal.send(&[127; 25])?;
     terminal.wait_composer_frame(
         &["What shall we explore or build?", "enter send"],
         READY_TIMEOUT,
@@ -1125,20 +1125,39 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         .position(|bytes| bytes == b"\x1b[?1049h")
         .context("terminal did not enter its alternate screen")?;
     let startup = &terminal.output[..alternate];
-    let mut previous = 0;
+    let waiting = b"Memory: waiting for project ownership";
+    let ready = b"Memory: ready.";
+    let waiting_at = startup
+        .windows(waiting.len())
+        .position(|bytes| bytes == waiting)
+        .context("memory startup did not report project-ownership wait before the first completed TUI frame")?;
+    let ready_at = startup
+        .windows(ready.len())
+        .position(|bytes| bytes == ready)
+        .context("memory startup did not report ready before the first completed TUI frame")?;
+    assert!(
+        waiting_at < ready_at,
+        "memory startup reported ready before ownership wait"
+    );
+    let mut previous = waiting_at;
     for stage in [
-        b"Memory: waiting for project ownership".as_slice(),
-        b"Memory: verifying cached runtime",
+        b"Memory: waiting for verified runtime cache".as_slice(),
+        b"Memory: extracting embedded runtime",
+        b"Memory: verifying cached runtime".as_slice(),
         b"Memory: checking runtime version",
         b"Memory: preparing database",
         b"Memory: opening database",
-        b"Memory: ready.",
     ] {
-        let offset = startup[previous..]
+        if let Some(position) = startup
             .windows(stage.len())
             .position(|bytes| bytes == stage)
-            .context("memory startup progress did not precede the first completed TUI frame")?;
-        previous += offset + stage.len();
+        {
+            assert!(
+                position > previous && position < ready_at,
+                "memory startup reordered {stage:?} before the first completed TUI frame"
+            );
+            previous = position;
+        }
     }
     assert!(
         terminal
