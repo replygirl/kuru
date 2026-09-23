@@ -864,7 +864,7 @@ fn cancelled_partial_frame_closes_pipe_and_reaps_peer_before_runtime_shutdown() 
 }
 
 #[test]
-fn cancelled_connect_does_not_strand_runtime_shutdown() {
+fn missing_and_busy_connects_preserve_distinct_terminal_states() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let thread = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -879,15 +879,28 @@ fn cancelled_connect_does_not_strand_runtime_shutdown() {
                     .err()
                     .unwrap()
                     .kind(),
+                io::ErrorKind::NotFound
+            );
+
+            let listener = PrivateListener::bind().unwrap();
+            let first = pipe::connect(listener.address(), LIMIT).await.unwrap();
+            assert_eq!(
+                pipe::connect(listener.address(), SHORT)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
                 io::ErrorKind::TimedOut
             );
+            drop(first);
+            drop(listener);
         });
         drop(runtime);
         sender.send(()).unwrap();
     });
     receiver
         .recv_timeout(LIMIT)
-        .expect("cancelled native pipe stranded the Tokio runtime");
+        .expect("terminal native pipe connect states stranded the Tokio runtime");
     thread.join().unwrap();
 }
 

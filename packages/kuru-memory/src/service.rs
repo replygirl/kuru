@@ -1571,6 +1571,64 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stale_pipe_does_not_replace_a_live_service_owner() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        options.config.startup_timeout_secs = 1;
+        let owner = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire service owner lock")?;
+        let mut endpoint_authority = authority();
+        endpoint_authority.project_path = project_path_bytes(&project);
+        endpoint_authority.project_scope = scope.clone();
+        let endpoint = EndpointRecord {
+            authority: endpoint_authority,
+            address: format!(r"\\.\pipe\kuru-{}", uuid::Uuid::new_v4()),
+        };
+        endpoint.publish(&data, &owner)?;
+
+        let executable = project.join("must-not-spawn.exe");
+        let error = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT.saturating_mul(3),
+            attach_or_start(&options, &project, &executable),
+        )
+        .await
+        .context("live-owner fixture exceeded its outer deadline")?
+        .expect_err("stale transport must not authorize replacing a live owner");
+        ensure!(
+            format!("{error:#}").contains("existing memory service owner did not publish"),
+            "live owner refusal lost its authoritative stage: {error:#}"
+        );
+        ensure!(
+            EndpointRecord::read(&data, &scope)?.is_some(),
+            "refused replacement retired the live owner's endpoint"
+        );
+        ensure!(
+            ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_none(),
+            "refused replacement displaced the live owner's lock"
+        );
+        drop(owner);
+        endpoint.retire(
+            &data,
+            &ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+                .context("fixture did not reacquire owner lock for cleanup")?,
+        )?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn purge_refuses_a_live_service_owner_before_writing_intent() -> Result<()> {
         let data = crate::test_support::tempdir()?;
