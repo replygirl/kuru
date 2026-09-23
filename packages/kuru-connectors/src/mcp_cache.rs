@@ -266,7 +266,7 @@ fn names(alias: &str) -> Names {
     }
 }
 
-fn ensure_outside_root(data: &Directory, root: &Directory) -> Result<()> {
+pub(crate) fn ensure_outside_root(data: &Directory, root: &Directory) -> Result<()> {
     ensure!(
         !data.is_within(root)? && !root.is_within(data)?,
         "MCP catalog data directory overlaps the workspace"

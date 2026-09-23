@@ -312,8 +312,20 @@ and their prior routes dispatch nothing. A later explicit discovery can recover
 an alias after its complete catalog validates.
 
 The adapter is a tools client. It does not implement every optional MCP surface,
-such as prompts/resources UI, elicitation, sampling, or a remote OAuth login
-manager. Configure supported server credentials outside shared files.
+such as prompts/resources UI, elicitation or sampling. For HTTP authorization,
+Kuru applies the MCP 2026-07-28 authorization contract over the existing
+negotiated transport without claiming full 2026 stateless-wire support. It
+validates protected-resource and authorization-server discovery, resource
+binding, PKCE, state, RFC 9207 issuer responses, challenge-authoritative scopes,
+configured/CIMD/DCR client registration and advertised device flow.
+
+Kuru stores its own alias-bound OAuth records only in the native secret store.
+Refresh rotates the stored generation before use. An invalid-token discovery may
+refresh and retry discovery once; tool calls and ambiguous rotating refreshes are
+never replayed. Static authorization headers and OAuth are mutually exclusive on
+one alias. `mcp login|status|logout` and `/mcp login|status|logout` share the same
+connector operations. Logout always deletes local state and reports remote
+revocation independently.
 
 ## A2A
 

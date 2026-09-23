@@ -38,6 +38,7 @@ pub struct McpConfig {
     /// HTTP header names mapped to environment-variable names. Resolved header
     /// values never enter the configuration snapshot.
     pub header_env: BTreeMap<String, String>,
+    pub oauth: Option<McpOAuthConfig>,
 }
 
 impl Default for McpConfig {
@@ -51,8 +52,19 @@ impl Default for McpConfig {
             allow_tools: Vec::new(),
             deny_tools: Vec::new(),
             header_env: BTreeMap::new(),
+            oauth: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpOAuthConfig {
+    pub enabled: bool,
+    pub client_id: Option<String>,
+    pub client_secret_env: Option<String>,
+    pub client_metadata_url: Option<String>,
+    pub scopes: Vec<String>,
 }
 
 impl McpConfig {
@@ -1368,6 +1380,32 @@ impl Config {
                 validate_mcp_header_name(header)?;
                 environment_name("MCP header environment reference", environment)?;
             }
+            if let Some(oauth) = &mcp.oauth {
+                ensure!(
+                    mcp.command.is_none(),
+                    "stdio MCP servers cannot enable OAuth"
+                );
+                validate_mcp_oauth(oauth)?;
+                if oauth.enabled {
+                    let url = Url::parse(
+                        mcp.url
+                            .as_deref()
+                            .context("OAuth MCP server requires an HTTPS URL")?,
+                    )
+                    .context("OAuth MCP server URL is invalid")?;
+                    ensure!(
+                        url.scheme() == "https",
+                        "OAuth MCP server URL must use HTTPS"
+                    );
+                    ensure!(
+                        !mcp.header_env.keys().any(|header| matches!(
+                            header.to_ascii_lowercase().as_str(),
+                            "authorization" | "proxy-authorization"
+                        )),
+                        "OAuth MCP servers cannot configure static authorization headers"
+                    );
+                }
+            }
         }
         for (name, url) in &self.external_agents {
             alias("external agent", name)?;
@@ -1477,6 +1515,56 @@ fn validate_mcp_header_name(name: &str) -> Result<()> {
         ),
         "MCP static header name is reserved for HTTP or MCP protocol ownership"
     );
+    Ok(())
+}
+
+fn validate_mcp_oauth(oauth: &McpOAuthConfig) -> Result<()> {
+    ensure!(
+        !(oauth.client_id.is_some() && oauth.client_metadata_url.is_some()),
+        "MCP OAuth configured client and client metadata identity are mutually exclusive"
+    );
+    ensure!(
+        oauth.client_secret_env.is_none() || oauth.client_id.is_some(),
+        "MCP OAuth client secret environment reference requires a configured client"
+    );
+    if let Some(client_id) = &oauth.client_id {
+        nonempty("MCP OAuth client_id", client_id, 2048)?;
+        ensure!(
+            !client_id.chars().any(char::is_control),
+            "MCP OAuth client_id contains control characters"
+        );
+    }
+    if let Some(environment) = &oauth.client_secret_env {
+        environment_name("MCP OAuth client secret environment reference", environment)?;
+    }
+    if let Some(metadata_url) = &oauth.client_metadata_url {
+        endpoint("MCP OAuth client metadata URL", metadata_url)?;
+        let parsed =
+            Url::parse(metadata_url).context("MCP OAuth client metadata URL is invalid")?;
+        ensure!(
+            parsed.scheme() == "https",
+            "MCP OAuth client metadata URL must use HTTPS"
+        );
+    }
+    ensure!(
+        oauth.scopes.len() <= 64,
+        "MCP OAuth scope allowlist is limited to 64 entries"
+    );
+    let mut scopes = BTreeSet::new();
+    for scope in &oauth.scopes {
+        ensure!(
+            !scope.is_empty()
+                && scope.len() <= 256
+                && scope.bytes().all(|byte| {
+                    byte == b'!' || (b'#'..=b'[').contains(&byte) || (b']'..=b'~').contains(&byte)
+                }),
+            "MCP OAuth scopes must be bounded OAuth scope-token values"
+        );
+        ensure!(
+            scopes.insert(scope),
+            "MCP OAuth scope allowlist contains a duplicate"
+        );
+    }
     Ok(())
 }
 
@@ -1984,6 +2072,7 @@ fn derive_manifest(
                         &mcp.allow_tools,
                         &mcp.deny_tools,
                         &mcp.header_env,
+                        &mcp.oauth,
                     ),
                     &mcp_origins,
                     format!("{display_name}: HTTP endpoint"),

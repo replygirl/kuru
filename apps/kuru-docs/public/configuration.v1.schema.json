@@ -223,13 +223,62 @@
             "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,255}$"
           },
           "default": {}
+        },
+        "oauth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "client_id": {
+              "type": ["string", "null"],
+              "minLength": 1,
+              "maxLength": 2048,
+              "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$",
+              "default": null
+            },
+            "client_secret_env": {
+              "type": ["string", "null"],
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,255}$",
+              "default": null
+            },
+            "client_metadata_url": {
+              "type": ["string", "null"],
+              "format": "uri",
+              "pattern": "(?i)^https://",
+              "default": null
+            },
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[\\u0021\\u0023-\\u005B\\u005D-\\u007E]+$"
+              },
+              "maxItems": 64,
+              "uniqueItems": true,
+              "default": []
+            }
+          },
+          "allOf": [
+            {
+              "not": {
+                "required": ["client_id", "client_metadata_url"]
+              }
+            },
+            {
+              "if": { "required": ["client_secret_env"] },
+              "then": { "required": ["client_id"] }
+            }
+          ]
         }
       },
       "oneOf": [
         {
           "required": ["command"],
           "not": { "required": ["url"] },
-          "properties": { "header_env": { "maxProperties": 0 } }
+          "properties": { "header_env": { "maxProperties": 0 } },
+          "allOf": [{ "not": { "required": ["oauth"] } }]
         },
         {
           "required": ["url"],
@@ -237,7 +286,30 @@
           "properties": {
             "args": { "maxItems": 0 },
             "env": { "maxProperties": 0 }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": ["oauth"],
+                "properties": {
+                  "oauth": {
+                    "required": ["enabled"],
+                    "properties": { "enabled": { "const": true } }
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "url": { "pattern": "(?i)^https://" },
+                  "header_env": {
+                    "propertyNames": {
+                      "not": { "pattern": "(?i)^(authorization|proxy-authorization)$" }
+                    }
+                  }
+                }
+              }
+            }
+          ]
         }
       ]
     }

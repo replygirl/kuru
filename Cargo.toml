@@ -67,6 +67,7 @@ flate2 = "=1.1.10"
 scraper = "=0.27.0"
 roxmltree = "=0.21.1"
 windows-sys = { version = "=0.61.2", default-features = false }
+keyring = { version = "=4.2.0", default-features = false }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
 crc32fast = "=1.5.2"
 portable-pty = "=0.9.0"

@@ -209,8 +209,12 @@ use crate::{
     instruction_review::{
         InstructionGate, InstructionGateOutcome, InstructionReviewSender, SkillGate,
     },
-    mcp::{McpCatalog, McpExecution, McpHosts, McpStatus},
+    mcp::{
+        McpBrowserLogin, McpCatalog, McpDeviceLogin, McpExecution, McpHosts, McpOAuthAliasStatus,
+        McpOAuthLogout, McpStatus,
+    },
     mcp_cache::McpCatalogStore,
+    mcp_credentials::McpCredentialStore,
     permissions::{ApprovalSender, PermissionInvocation, PermissionOutcome, PermissionService},
     redaction,
     tool_output::{ProjectedToolError, ToolContent, ToolExecution, ToolFailure, ToolFailureKind},
@@ -389,6 +393,12 @@ impl ToolHost {
     /// catalogs but never install an executable MCP route.
     pub fn with_mcp_catalog_store(self, store: Arc<McpCatalogStore>) -> Result<Self> {
         self.mcp.install_cache(store)?;
+        Ok(self)
+    }
+
+    /// Attach app-owned private nonsecret locks for native MCP credentials.
+    pub fn with_mcp_credential_store(self, store: Arc<McpCredentialStore>) -> Result<Self> {
+        self.mcp.install_credentials(store)?;
         Ok(self)
     }
 
@@ -581,6 +591,26 @@ impl ToolHost {
     /// Canonical pathname paired with the retained root capability.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub async fn begin_mcp_oauth_browser(&self, alias: &str) -> Result<McpBrowserLogin> {
+        self.revalidate_root()?;
+        self.mcp.begin_oauth_browser(alias).await
+    }
+
+    pub async fn begin_mcp_oauth_device(&self, alias: &str) -> Result<McpDeviceLogin> {
+        self.revalidate_root()?;
+        self.mcp.begin_oauth_device(alias).await
+    }
+
+    pub async fn mcp_oauth_status(&self, alias: &str) -> Result<McpOAuthAliasStatus> {
+        self.revalidate_root()?;
+        self.mcp.oauth_status(alias).await
+    }
+
+    pub async fn mcp_oauth_logout(&self, alias: &str) -> Result<McpOAuthLogout> {
+        self.revalidate_root()?;
+        self.mcp.oauth_logout(alias).await
     }
 
     pub async fn specs(&self) -> Result<Vec<ToolSpec>> {

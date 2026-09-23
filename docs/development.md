@@ -368,7 +368,11 @@ tests cannot establish this Windows behavior.
 The demo provider allows offline process smoke tests. Authentication and
 provider fixtures use local OAuth and HTTP peers with synthetic credentials,
 including callback validation, token refresh and Responses SSE framing. MCP
-and A2A fixtures exercise their own wire protocols. Use temporary project,
+OAuth fixtures additionally use isolated, alias-derived native secret entries;
+they must delete every test-owned generation and never inspect an existing
+credential account. Interruption cases cover callback/device cancellation,
+accepted-response publication settlement and manifest recovery. MCP and A2A
+fixtures exercise their own wire protocols. Use temporary project,
 auth and memory directories; never inspect or copy another application's
 credential store to construct a fixture.
 

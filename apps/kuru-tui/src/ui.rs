@@ -563,6 +563,11 @@ impl View {
                     ),
                 )
             }
+            Event::Mcp { actor, detail } if actor == "kuru-auth" => {
+                self.transcript.push(("mcp".into(), detail));
+                self.show_scene = false;
+                ("mcp".into(), actor, "authorization guidance shown".into())
+            }
             Event::Mcp { actor, detail } => ("mcp".into(), actor, detail),
             Event::Dream { actor, detail } => ("dream".into(), actor, detail),
             Event::Peer { actor, envelope } => {
@@ -2346,6 +2351,7 @@ async fn dispatch_controlled(
                 | CommandId::FileInspect
                 | CommandId::FilePrune
                 | CommandId::FileUndo
+                | CommandId::Mcp
                 | CommandId::Tools
         )
     ) {
@@ -2407,6 +2413,56 @@ async fn dispatch_controlled(
             serde_json::to_string_pretty(&harness.memory_revisions(20).await?)?
         }
         Some(CommandId::Cost) => format_session_usage(&harness.session_usage().await?),
+        Some(CommandId::Mcp) => match commands::parse_mcp(args)? {
+            commands::McpRequest::Status { alias } => {
+                serde_json::to_string_pretty(&harness.mcp_oauth_status(alias).await?)?
+            }
+            commands::McpRequest::Logout { alias } => {
+                serde_json::to_string_pretty(&harness.mcp_oauth_logout(alias).await?)?
+            }
+            commands::McpRequest::Login {
+                alias,
+                device: true,
+                ..
+            } => {
+                let login = harness.begin_mcp_oauth_device(alias).await?;
+                harness.publish_mcp_login_guidance(format!(
+                    "Open {}\nEnter code: {}",
+                    login.verification_url(),
+                    login.user_code()
+                ));
+                harness.finish_mcp_device_login(login, cancellation).await?;
+                format!("Signed in to MCP {alias}.")
+            }
+            commands::McpRequest::Login {
+                alias, no_browser, ..
+            } => {
+                let login = harness.begin_mcp_oauth_browser(alias).await?;
+                let guidance = if no_browser {
+                    format!(
+                        "Sign in to MCP {alias}:\n{}\n{}",
+                        login.authorization_url(),
+                        login.callback_guidance()
+                    )
+                } else {
+                    format!("Sign in to MCP {alias}:\n{}", login.authorization_url())
+                };
+                harness.publish_mcp_login_guidance(guidance);
+                if !no_browser
+                    && crate::authentication::open_browser(login.authorization_url())
+                        .await
+                        .is_err()
+                {
+                    harness.publish_mcp_login_guidance(
+                        "Browser handoff failed; open the authorization URL shown above.".into(),
+                    );
+                }
+                harness
+                    .finish_mcp_browser_login(login, cancellation)
+                    .await?;
+                format!("Signed in to MCP {alias}.")
+            }
+        },
         Some(CommandId::Tools) => {
             ensure!(args.is_empty(), "usage: /tools");
             serde_json::to_string_pretty(&harness.tool_catalog().await?)?
