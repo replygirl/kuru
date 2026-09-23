@@ -821,9 +821,213 @@ fn replace_open_destination(
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
+    use std::io::{Read, Write};
+    use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformationEx, NtSetInformationFile};
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    #[derive(Clone, Copy)]
+    enum RenameProbeApi {
+        Win32Legacy,
+        Win32Extended,
+        NativeExtended,
+    }
+
+    // Temporary native diagnostic: keep all attempts on isolated fixture
+    // objects, then include the complete outcome matrix if the required
+    // replacement contract fails. This distinguishes a malformed record or
+    // relative-root issue from a Win32 information-class boundary.
+    fn probe_rename(api: RenameProbeApi, cross_directory: bool, root: bool) -> String {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_dir = Directory::ensure_private(&temporary.path().join("source")).unwrap();
+        let target_dir = Directory::ensure_private(&temporary.path().join("target")).unwrap();
+        let destination_dir = if cross_directory {
+            &target_dir
+        } else {
+            &source_dir
+        };
+        let source_path = source_dir.path().join("candidate");
+        let destination_path = destination_dir.path().join("published");
+        let mut candidate = source_dir.create_new(OsStr::new("candidate")).unwrap();
+        candidate.write_all(b"new bytes").unwrap();
+        let replacing = !matches!(api, RenameProbeApi::Win32Legacy);
+        if replacing {
+            let mut old = destination_dir.create_new(OsStr::new("published")).unwrap();
+            old.write_all(b"old bytes").unwrap();
+        }
+        let mut old_held = replacing.then(|| {
+            open(
+                &destination_path,
+                FILE_GENERIC_READ | FILE_READ_ATTRIBUTES,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                NameRetention::Movable,
+                None,
+            )
+            .unwrap()
+        });
+        let old_identity = old_held
+            .as_ref()
+            .map(|held| info(held).unwrap().file.identity);
+        let parent = open(
+            destination_dir.path(),
+            FILE_ADD_FILE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let replacement = prepare_file_replacement(&candidate).unwrap().unwrap();
+        let name: Vec<u16> = OsStr::new("published").encode_wide().collect();
+        let name_bytes = name.len() * size_of::<u16>();
+        let record_bytes = size_of::<FILE_RENAME_INFO>() + name_bytes;
+        let mut record = vec![0usize; record_bytes.div_ceil(size_of::<usize>())];
+        let record_ptr = record.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: this aligned record has room for the full variable-length
+        // name, and both retained handles outlive the synchronous call below.
+        unsafe {
+            (*record_ptr).Anonymous.Flags =
+                FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+            (*record_ptr).RootDirectory = if root {
+                parent.as_raw_handle()
+            } else {
+                null_mut()
+            };
+            (*record_ptr).FileNameLength = name_bytes as u32;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                record
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(std::mem::offset_of!(FILE_RENAME_INFO, FileName))
+                    as *mut u16,
+                name.len(),
+            );
+        }
+        let status = match api {
+            RenameProbeApi::Win32Legacy | RenameProbeApi::Win32Extended => {
+                let class = if matches!(api, RenameProbeApi::Win32Legacy) {
+                    windows_sys::Win32::Storage::FileSystem::FileRenameInfo
+                } else {
+                    FileRenameInfoEx
+                };
+                // SAFETY: same checked source handle and bounded record as the
+                // production call, with a class selected by this fixture.
+                let ok = unsafe {
+                    SetFileInformationByHandle(
+                        replacement.as_raw_handle(),
+                        class,
+                        record.as_ptr().cast(),
+                        record_bytes as u32,
+                    )
+                };
+                if ok == 0 {
+                    format!(
+                        "win32:{}",
+                        io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                    )
+                } else {
+                    "ok".to_owned()
+                }
+            }
+            RenameProbeApi::NativeExtended => {
+                let mut io_status = Box::new(IO_STATUS_BLOCK::default());
+                // SAFETY: the source was synchronously opened without
+                // FILE_FLAG_OVERLAPPED; record and status block remain live
+                // through completion, including a possible pending return.
+                let mut result = unsafe {
+                    NtSetInformationFile(
+                        replacement.as_raw_handle(),
+                        io_status.as_mut(),
+                        record.as_ptr().cast(),
+                        record_bytes as u32,
+                        FileRenameInformationEx,
+                    )
+                };
+                if result == 0x103 {
+                    // The synchronous fixture should not pend. Bound the
+                    // observation; on timeout, retain kernel-referenced
+                    // storage/handles until this test process exits.
+                    let waited =
+                        unsafe { WaitForSingleObject(replacement.as_raw_handle(), 30_000) };
+                    if waited != WAIT_OBJECT_0 {
+                        std::mem::forget(io_status);
+                        std::mem::forget(record);
+                        std::mem::forget(replacement);
+                        std::mem::forget(parent);
+                        std::mem::forget(candidate);
+                        std::mem::forget(old_held);
+                        std::mem::forget(source_dir);
+                        std::mem::forget(target_dir);
+                        std::mem::forget(temporary);
+                        return format!("nt:pending-wait:{waited:#x}");
+                    }
+                    // SAFETY: the completed wait publishes the IO_STATUS_BLOCK.
+                    result = unsafe { io_status.Anonymous.Status };
+                }
+                if result == 0 {
+                    "ok".to_owned()
+                } else {
+                    format!("nt:{result:#010x}")
+                }
+            }
+        };
+        let target_bytes = fs::read(&destination_path).ok();
+        let source_bytes = fs::read(&source_path).ok();
+        let new_identity = open(
+            &destination_path,
+            FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NameRetention::Movable,
+            None,
+        )
+        .ok()
+        .map(|file| info(&file).unwrap().file.identity);
+        let mut old_bytes = Vec::new();
+        if let Some(ref mut held) = old_held {
+            held.read_to_end(&mut old_bytes).unwrap();
+        }
+        let success = status == "ok";
+        let intact = if success {
+            target_bytes.as_deref() == Some(b"new bytes".as_slice())
+                && source_bytes.is_none()
+                && old_identity.is_none_or(|old| new_identity != Some(old))
+                && (!replacing || old_bytes == b"old bytes")
+        } else {
+            source_bytes.as_deref() == Some(b"new bytes".as_slice())
+                && target_bytes.as_deref()
+                    == if replacing {
+                        Some(b"old bytes".as_slice())
+                    } else {
+                        None
+                    }
+                && new_identity == old_identity
+                && (!replacing || old_bytes == b"old bytes")
+        };
+        format!(
+            "api={} cross={cross_directory} root={root} status={status} intact={intact}",
+            match api {
+                RenameProbeApi::Win32Legacy => "win32-legacy",
+                RenameProbeApi::Win32Extended => "win32-ex",
+                RenameProbeApi::NativeExtended => "nt-ex",
+            }
+        )
+    }
+
+    fn rename_probe_matrix() -> [String; 5] {
+        [
+            probe_rename(RenameProbeApi::Win32Legacy, false, false),
+            probe_rename(RenameProbeApi::Win32Extended, false, true),
+            probe_rename(RenameProbeApi::Win32Extended, false, false),
+            probe_rename(RenameProbeApi::Win32Extended, true, true),
+            probe_rename(RenameProbeApi::NativeExtended, true, true),
+        ]
+    }
 
     #[test]
     fn separator_conversion_preserves_raw_utf16_and_explicit_verbatim_policy() {
@@ -1219,7 +1423,10 @@ mod tests {
                 OsStr::new("published"),
                 Publication::ReplaceRegular,
             )
-            .unwrap();
+            .unwrap_or_else(|error| {
+                let matrix = rename_probe_matrix();
+                panic!("native replacement failed: {error:?}; rename differential: {matrix:#?}");
+            });
         assert_eq!(
             std::fs::read(directory.path().join("published")).unwrap(),
             b"new"
