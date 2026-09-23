@@ -299,7 +299,10 @@ pub async fn attach_or_start(
     );
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
-    if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project).await? {
+    if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
+        .await
+        .context("attach before memory service start election")?
+    {
         return Ok(attached);
     }
     let _start = loop {
@@ -314,14 +317,18 @@ pub async fn attach_or_start(
             tokio::time::Instant::now() < deadline,
             "memory service election deadline exceeded"
         );
-        if let Some(attached) =
-            try_attach(&options.data_dir, &options.project_scope, project).await?
+        if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
+            .await
+            .context("attach while waiting for memory service start election")?
         {
             return Ok(attached);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project).await? {
+    if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
+        .await
+        .context("attach after acquiring memory service start election")?
+    {
         return Ok(attached);
     }
     loop {
@@ -340,19 +347,35 @@ pub async fn attach_or_start(
             tokio::time::Instant::now() < deadline,
             "existing memory service owner did not publish a valid endpoint"
         );
-        if let Some(attached) =
-            try_attach(&options.data_dir, &options.project_scope, project).await?
+        if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
+            .await
+            .context("attach while the elected memory service owner is still active")?
         {
             return Ok(attached);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut child = ServiceProcess::new(spawn_service(options, project, executable).await?);
+    let mut child = ServiceProcess::new(
+        spawn_service(options, project, executable)
+            .await
+            .context("spawn elected memory service owner")?,
+    );
     loop {
-        if let Some(attached) =
-            try_attach(&options.data_dir, &options.project_scope, project).await?
-        {
-            return Ok(attached);
+        match try_attach(&options.data_dir, &options.project_scope, project).await {
+            Ok(Some(attached)) => return Ok(attached),
+            Ok(None) => {}
+            Err(error) => {
+                let child_state = match child.try_wait() {
+                    Ok(Some(status)) => format!("exited with {status}"),
+                    Ok(None) => "remained running".into(),
+                    Err(status_error) => {
+                        format!("status observation failed with {status_error}")
+                    }
+                };
+                return Err(error).with_context(|| {
+                    format!("attach after starting the elected memory service; child {child_state}")
+                });
+            }
         }
         if let Some(status) = child.try_wait()? {
             bail!("memory service exited before readiness: {status}");
@@ -2679,7 +2702,9 @@ mod tests {
             .await
             .context("crashed service process was not reaped")??;
 
-            let mut successor = attach_or_start(&options, &project, &executable).await?;
+            let mut successor = attach_or_start(&options, &project, &executable)
+                .await
+                .context("successor election and readiness after crashed endpoint retirement")?;
             ensure!(successor.generation() != generation);
             let query = |original_id| ServiceCall::Outcome {
                 original_id,
@@ -2689,11 +2714,17 @@ mod tests {
                 argument_digest: argument_digest.clone(),
             };
             ensure!(matches!(
-                successor.call(query(request_id)).await?,
+                successor
+                    .call(query(request_id))
+                    .await
+                    .context("successor could not recover the accepted receipt")?,
                 ServiceValue::Outcome(rpc::OutcomeStatus::Committed)
             ));
             ensure!(matches!(
-                successor.call(query(uuid::Uuid::new_v4())).await?,
+                successor
+                    .call(query(uuid::Uuid::new_v4()))
+                    .await
+                    .context("successor could not classify an unrelated request")?,
                 ServiceValue::Outcome(rpc::OutcomeStatus::Absent)
             ));
             ensure!(matches!(
@@ -2705,7 +2736,8 @@ mod tests {
                             message: kuru_core::Message::text("user", "accepted before crash"),
                         },
                     )
-                    .await?,
+                    .await
+                    .context("successor could not retry the exact accepted request")?,
                 ServiceValue::Unit
             ));
             ensure!(
@@ -2728,13 +2760,16 @@ mod tests {
                     namespace: "crashed-owner-receipt".into(),
                     limit: 4,
                 })
-                .await?
+                .await
+                .context("successor could not read history after receipt recovery")?
             else {
                 bail!("successor history returned the wrong response")
             };
             ensure!(window.total_rows == 2 && window.messages.len() == 2);
             drop(successor);
-            let permit = acquire_maintenance_permit(&options).await?;
+            let permit = acquire_maintenance_permit(&options)
+                .await
+                .context("successor did not retire for fixture maintenance")?;
             drop(permit);
             Ok::<(), anyhow::Error>(())
         })
