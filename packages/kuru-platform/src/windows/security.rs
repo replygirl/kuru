@@ -6,7 +6,7 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LocalFree};
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
@@ -19,6 +19,10 @@ use windows_sys::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_OWNER,
     TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
     WinCreatorOwnerRightsSid,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, ReOpenFile, WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -479,7 +483,11 @@ pub(crate) fn copy_file_dacl(
     source: BorrowedHandle<'_>,
     staged: BorrowedHandle<'_>,
 ) -> io::Result<()> {
+    let (source_owner_descriptor, source_owner) = file_owner(source)?;
+    // SAFETY: file_owner validated source_owner inside the retained descriptor.
+    unsafe { assign_staged_owner(staged, source_owner)? };
     require_same_file_owner(source, staged)?;
+    drop(source_owner_descriptor);
     let mut dacl = null_mut();
     let mut descriptor = null_mut();
     // SAFETY: the source handle remains live; the component pointer borrows
@@ -528,45 +536,109 @@ pub(crate) fn copy_file_dacl(
     }
 }
 
+fn file_owner(handle: BorrowedHandle<'_>) -> io::Result<(LocalMemory, PSID)> {
+    let mut sid = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the handle stays live and both output pointers borrow the one
+    // descriptor allocation retained immediately below.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut sid,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalMemory(descriptor);
+    if descriptor.0.is_null() || sid.is_null() {
+        return Err(denied("file has no checked owner"));
+    }
+    // SAFETY: GetSecurityInfo returned the complete retained descriptor.
+    if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 {
+        return Err(denied("invalid file-owner descriptor"));
+    }
+    // SAFETY: the SID pointer borrows this validated descriptor allocation.
+    let bytes = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
+    unsafe { bounded_sid(sid, descriptor.0.cast(), bytes)? };
+    Ok((descriptor, sid))
+}
+
+/// `owner` must be a validated SID retained for the duration of this call.
+unsafe fn require_assignable_file_owner(owner: PSID) -> io::Result<()> {
+    let user = CurrentUser::read()?;
+    let default_owner = CurrentUser::owner()?;
+    // SAFETY: callers retain and validate the owner SID; both token queries
+    // validate and retain their complete SID allocations.
+    if unsafe { EqualSid(owner, user.sid()?) } != 0
+        || unsafe { EqualSid(owner, default_owner.sid()?) } != 0
+    {
+        Ok(())
+    } else {
+        Err(denied(
+            "source file owner is not assignable by the current process token",
+        ))
+    }
+}
+
+/// `source_owner` must be a validated SID retained through this handoff.
+unsafe fn assign_staged_owner(staged: BorrowedHandle<'_>, source_owner: PSID) -> io::Result<()> {
+    // The original staged handle deliberately lacks WRITE_OWNER. It still
+    // proves that this exact object is private before a short-lived reopen adds
+    // only the authority needed for the owner handoff.
+    require_private(staged, false)?;
+    // SAFETY: the caller retains the validated source SID through this call.
+    unsafe { require_assignable_file_owner(source_owner)? };
+    // SAFETY: ReOpenFile derives the new handle from the retained exact file
+    // object, not a pathname. The original movable handle already shares read,
+    // write and delete; the reopened handle is immediately RAII-owned.
+    let owner_handle = unsafe {
+        ReOpenFile(
+            staged.as_raw_handle(),
+            WRITE_OWNER,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if owner_handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful ReOpenFile transfers one unique owned handle.
+    let owner_handle = unsafe { OwnedHandle::from_raw_handle(owner_handle) };
+    // SAFETY: the retained source descriptor owns source_owner through this
+    // call; only this exact staged object's owner is changed.
+    let status = unsafe {
+        SetSecurityInfo(
+            owner_handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            source_owner,
+            null_mut(),
+            null_mut(),
+            null(),
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    drop(owner_handle);
+    // A distinct TokenOwner is accepted only when the staged DACL still has
+    // the effective OWNER RIGHTS suppression required by private_status.
+    require_private(staged, false)
+}
+
 fn require_same_file_owner(
     source: BorrowedHandle<'_>,
     staged: BorrowedHandle<'_>,
 ) -> io::Result<()> {
-    fn owner(handle: BorrowedHandle<'_>) -> io::Result<(LocalMemory, PSID)> {
-        let mut sid = null_mut();
-        let mut descriptor = null_mut();
-        // SAFETY: the handle stays live and both output pointers borrow the
-        // one descriptor allocation retained immediately below.
-        let status = unsafe {
-            GetSecurityInfo(
-                handle.as_raw_handle(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                &mut sid,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                &mut descriptor,
-            )
-        };
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(status as i32));
-        }
-        let descriptor = LocalMemory(descriptor);
-        if descriptor.0.is_null() || sid.is_null() {
-            return Err(denied("file has no checked owner"));
-        }
-        // SAFETY: GetSecurityInfo returned the complete retained descriptor.
-        if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 {
-            return Err(denied("invalid file-owner descriptor"));
-        }
-        // SAFETY: the SID pointer borrows this validated descriptor allocation.
-        let bytes = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
-        unsafe { bounded_sid(sid, descriptor.0.cast(), bytes)? };
-        Ok((descriptor, sid))
-    }
-    let (source_descriptor, source_sid) = owner(source)?;
-    let (staged_descriptor, staged_sid) = owner(staged)?;
+    let (source_descriptor, source_sid) = file_owner(source)?;
+    let (staged_descriptor, staged_sid) = file_owner(staged)?;
     // SAFETY: both validated SIDs remain inside their retained allocations.
     let same = unsafe { EqualSid(source_sid, staged_sid) } != 0;
     drop((source_descriptor, staged_descriptor));
@@ -669,11 +741,31 @@ mod tests {
     }
 
     fn set_dacl(file: &File, dacl: *const ACL) {
-        // SAFETY: the fixture owns a WRITE_DAC handle and keeps the descriptor
-        // alive; a null pointer intentionally constructs a real null-DACL case.
+        use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+
+        // The production source handle intentionally needs only READ_CONTROL.
+        // Reopen this retained exact fixture object with the one additional
+        // test right instead of changing production source-open authority.
+        // SAFETY: ReOpenFile derives the new handle from this retained object.
+        let dacl_handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        assert_ne!(
+            dacl_handle, INVALID_HANDLE_VALUE,
+            "fixture ReOpenFile failed"
+        );
+        // SAFETY: successful ReOpenFile transfers one unique owned handle.
+        let dacl_handle = unsafe { OwnedHandle::from_raw_handle(dacl_handle) };
+        // SAFETY: the fixture retains the exact WRITE_DAC handle and keeps the
+        // descriptor alive; null intentionally constructs a null-DACL case.
         let result = unsafe {
             SetSecurityInfo(
-                file.as_raw_handle(),
+                dacl_handle.as_raw_handle(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 null_mut(),
@@ -724,6 +816,15 @@ mod tests {
             std::slice::from_raw_parts(text, length.saturating_sub(1) as usize)
         })
         .unwrap()
+    }
+
+    fn owners_equal(left: &File, right: &File) -> bool {
+        let (left_descriptor, left_owner) = file_owner(left.as_handle()).unwrap();
+        let (right_descriptor, right_owner) = file_owner(right.as_handle()).unwrap();
+        // SAFETY: both validated SIDs remain inside the retained descriptors.
+        let equal = unsafe { EqualSid(left_owner, right_owner) } != 0;
+        drop((left_descriptor, right_descriptor));
+        equal
     }
 
     fn default_owned_file(directory: &Directory) -> (File, bool) {
@@ -906,7 +1007,9 @@ mod tests {
         let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap();
         let source = parent.create_new(OsStr::new("original")).unwrap();
         let sid = CurrentUser::read().unwrap().sid_string().unwrap();
-        let broad = descriptor(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"));
+        let broad = descriptor(&format!(
+            "O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)(A;;FR;;;OW)"
+        ));
         set_dacl(&source, broad.dacl().unwrap());
         let original_acl = security_text(&source);
 
@@ -916,6 +1019,7 @@ mod tests {
         let mut candidate = private.create_new(OsStr::new("payload")).unwrap();
         candidate.write_all(b"published bytes").unwrap();
         copy_file_access(&source, &candidate).unwrap();
+        assert!(owners_equal(&source, &candidate));
         private.revalidate().unwrap();
         assert!(private.read(OsStr::new("payload")).is_err());
         assert_eq!(security_text(&candidate), original_acl);
@@ -959,6 +1063,31 @@ mod tests {
     }
 
     #[test]
+    fn staged_owner_assignment_rejects_a_non_token_owner_without_changing_the_stage() {
+        use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let candidate = private.create_new(OsStr::new("payload")).unwrap();
+        let before = security_text(&candidate);
+        let foreign = descriptor("O:WDD:P(A;;FA;;;WD)");
+        let mut owner = null_mut();
+        let mut defaulted = 0;
+        // SAFETY: the fixture descriptor remains live and output slots are writable.
+        checked_bool(unsafe {
+            GetSecurityDescriptorOwner(foreign.descriptor.0, &mut owner, &mut defaulted)
+        })
+        .unwrap();
+        let bytes = unsafe { GetSecurityDescriptorLength(foreign.descriptor.0) } as usize;
+        // SAFETY: the fixture descriptor remains live and owns the returned SID.
+        unsafe { bounded_sid(owner, foreign.descriptor.0.cast(), bytes) }.unwrap();
+        // SAFETY: the owner SID was just bounded inside the retained descriptor.
+        assert!(unsafe { assign_staged_owner(candidate.as_handle(), owner) }.is_err());
+        assert_eq!(security_text(&candidate), before);
+        require_private(candidate.as_handle(), true).unwrap();
+    }
+
+    #[test]
     fn ordinary_create_and_unprotected_replacement_regain_parent_acl_inheritance() {
         use crate::fs::{Publication, copy_file_access, finalize_file_access};
         use std::os::windows::fs::OpenOptionsExt;
@@ -976,7 +1105,15 @@ mod tests {
             .unwrap();
         let mut candidate = private.create_new(OsStr::new("payload")).unwrap();
         candidate.write_all(b"payload").unwrap();
+        let default_matches_user = {
+            let user = CurrentUser::read().unwrap();
+            let default_owner = CurrentUser::owner().unwrap();
+            // SAFETY: both token query buffers retain validated SIDs.
+            (unsafe { EqualSid(user.sid().unwrap(), default_owner.sid().unwrap()) }) != 0
+        };
+        assert_eq!(owners_equal(&template, &candidate), default_matches_user);
         copy_file_access(&template, &candidate).unwrap();
+        assert!(owners_equal(&template, &candidate));
         let stage =
             Directory::open(private.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
         parent
