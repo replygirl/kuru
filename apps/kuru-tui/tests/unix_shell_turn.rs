@@ -44,7 +44,7 @@ const DIAGNOSTIC_FILE_BYTES: u64 = 64 * 1024;
 const DIAGNOSTIC_FILE_COUNT: usize = 4;
 
 struct Sandbox {
-    root: tempfile::TempDir,
+    root: memory::ServiceCleanup,
     project: PathBuf,
     data: PathBuf,
     provider_config: PathBuf,
@@ -69,7 +69,7 @@ impl Sandbox {
             ),
         )?;
         Ok(Self {
-            root,
+            root: memory::ServiceCleanup::new(root, &data),
             project,
             data,
             provider_config,

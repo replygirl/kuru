@@ -28,6 +28,7 @@ fn writer_lease_rejects_a_second_process_and_releases_on_close() {
     let project = root.path().join("project");
     let data = root.path().join("data");
     std::fs::create_dir_all(&project).unwrap();
+    let _root = memory::ServiceCleanup::new(root, &data);
     let directory = Directory::ensure_private(&data.join("locks")).unwrap();
     let project = project.canonicalize().unwrap();
     let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
@@ -84,6 +85,7 @@ fn listing_sessions_does_not_create_new_sessions() {
     let project = root.path().join("project");
     let data = root.path().join("data");
     std::fs::create_dir_all(&project).unwrap();
+    let _root = memory::ServiceCleanup::new(root, &data);
     let args = arguments(&project, &data);
     for _ in 0..2 {
         let output = Command::new(env!("CARGO_BIN_EXE_kuru"))
@@ -151,6 +153,7 @@ fn symlink_lock_directory_cannot_redirect_project_locks() {
     for path in [&project, &outside] {
         std::fs::create_dir_all(path).unwrap();
     }
+    let _root = memory::ServiceCleanup::new(root, &data);
     Directory::ensure_private(&data).unwrap();
     std::os::unix::fs::symlink(&outside, data.join("locks")).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_kuru"))

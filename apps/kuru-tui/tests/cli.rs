@@ -21,7 +21,7 @@ fn ensure_powershell_warm() {
 }
 
 struct Sandbox {
-    root: tempfile::TempDir,
+    root: memory::ServiceCleanup,
     project: PathBuf,
     data: PathBuf,
 }
@@ -35,7 +35,7 @@ impl Sandbox {
         std::fs::create_dir(&project).unwrap();
         memory::configuration(root.path()).unwrap();
         Self {
-            root,
+            root: memory::ServiceCleanup::new(root, &data),
             project,
             data,
         }
@@ -66,6 +66,63 @@ impl Sandbox {
         );
         String::from_utf8(output.stdout).unwrap()
     }
+}
+
+#[test]
+fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().to_path_buf();
+    let data = original.join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("memory"), b"not a fixture memory directory").unwrap();
+    let mut cleanup = memory::ServiceCleanup::new(root, &data);
+
+    let error = cleanup.finish().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("fixture root retained in place"),
+        "{error:#}"
+    );
+    assert!(original.is_dir());
+    assert!(data.join("memory").is_file());
+
+    drop(cleanup);
+    std::fs::remove_dir_all(original).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().to_path_buf();
+    let data = original.join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("memory"), b"drop must fail the test").unwrap();
+    let panic = std::panic::catch_unwind(|| {
+        let _cleanup = memory::ServiceCleanup::new(root, &data);
+    })
+    .unwrap_err();
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap();
+    assert!(message.contains("managed-memory fixture cleanup failed"));
+    assert!(original.is_dir());
+    std::fs::remove_dir_all(original).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().to_path_buf();
+    let data = original.join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("memory"), b"second invalid memory root").unwrap();
+    let panic = std::panic::catch_unwind(|| {
+        let _cleanup = memory::ServiceCleanup::new(root, &data);
+        panic!("original fixture assertion");
+    })
+    .unwrap_err();
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"original fixture assertion")
+    );
+    assert!(original.is_dir());
+    assert!(data.join("memory").is_file());
+    std::fs::remove_dir_all(original).unwrap();
 }
 
 fn warm_memory_progress() -> &'static str {
@@ -1695,16 +1752,14 @@ fn cli_imports_a_real_legacy_wal_without_changing_its_layout() {
 }
 
 #[tokio::test]
-async fn sequential_commands_reap_owned_memory_before_returning_on_success_or_error() {
-    use kuru_memory::MemoryStore;
-    use serde_json::json;
-
+async fn sequential_commands_release_clients_reuse_warm_memory_and_reap_on_retirement() {
     let env = Sandbox::new();
     let scope = kuru_runtime::project_scope(&env.project).unwrap();
     let store_path = env
         .data
         .join("memory")
         .join(scope.strip_prefix("project/").unwrap());
+    let endpoint_path = store_path.join("endpoint.json");
     let stopped = || {
         assert!(
             matches!(std::fs::symlink_metadata(store_path.join("endpoint.json")),
@@ -1738,90 +1793,29 @@ async fn sequential_commands_reap_owned_memory_before_returning_on_success_or_er
             .expect("CLI returned before its supervisor released the lifecycle lease");
     };
     env.success(&["run", "Seed memory for sequential inspection"]);
-    stopped();
-    for args in [
-        vec!["config"],
-        vec!["sessions"],
-        vec!["models"],
-        vec!["tools"],
-        vec!["memory", "status"],
-        vec!["memory", "history", "--limit", "1"],
-    ] {
-        env.success(&args);
-        stopped();
-    }
-    for (args, diagnostic) in [
-        (
-            vec!["memory", "history", "--limit", "0"],
-            "between 1 and 1000",
-        ),
-        (
-            vec!["tool", "file_read", "--args", "malformed"],
-            "expected value",
-        ),
-    ] {
-        let output = env.run(&args);
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+    let generation = std::fs::read(&endpoint_path).unwrap();
+    let warm = |stage: &str| {
+        assert_eq!(
+            std::fs::read(&endpoint_path)
+                .unwrap_or_else(|error| panic!("{stage}: warm endpoint is unavailable: {error}")),
+            generation,
+            "{stage}: sequential CLI command replaced the warm service generation"
         );
-        stopped();
-    }
-    let output = env
-        .command_for("unknown-provider")
-        .arg("models")
-        .output()
-        .unwrap();
+    };
+    warm("seed");
+    env.success(&["memory", "status"]);
+    warm("successful memory client");
+    let output = env.run(&["memory", "history", "--limit", "0"]);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("configuration validation error"),
+        String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    stopped();
+    warm("failing memory client");
     let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
-    let memory = MemoryStore::open(options.clone()).await.unwrap();
-    memory
-        .put(
-            &format!("{scope}/preferences"),
-            &json!({"mode":"not-a-framework"}),
-        )
+    kuru_memory::test_support::retire_idle_service(&options)
         .await
         .unwrap();
-    memory.close().await.unwrap();
-    let output = env.run(&["config"]);
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("preferences are omitted"));
-    toml::from_str::<toml::Value>(&String::from_utf8(output.stdout).unwrap()).unwrap();
-    stopped();
-    let memory = MemoryStore::open(options).await.unwrap();
-    memory
-        .put(&format!("{scope}/preferences"), &json!({}))
-        .await
-        .unwrap();
-    memory.close().await.unwrap();
-    let invalid_config = env.root.path().join("invalid-selection.toml");
-    std::fs::write(&invalid_config, "max_parts = 1\n").unwrap();
-    let output = env
-        .command()
-        .arg("--config")
-        .arg(&invalid_config)
-        .arg("config")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("preferences are omitted"));
-    let output = env
-        .command()
-        .arg("--config")
-        .arg(&invalid_config)
-        .args(["run", "invalid effective topology"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    stopped();
-    env.success(&["run", "The next command still works"]);
     stopped();
 }

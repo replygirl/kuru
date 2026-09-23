@@ -41,7 +41,7 @@ use terminal::{READY_TIMEOUT, Terminal, startup_timeout};
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Sandbox {
-    root: tempfile::TempDir,
+    root: memory::ServiceCleanup,
     project: PathBuf,
     data: PathBuf,
     startup_timeout: Duration,
@@ -58,7 +58,7 @@ impl Sandbox {
             configuration.join("kuru/config.toml"),
         )?)?;
         Ok(Self {
-            root,
+            root: memory::ServiceCleanup::new(root, &data),
             project,
             data,
             startup_timeout: startup_timeout(Duration::from_secs(

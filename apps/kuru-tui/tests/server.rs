@@ -50,6 +50,7 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
     let project = root.path().join("workspace");
     let data = root.path().join("data");
     std::fs::create_dir(&project)?;
+    let root = memory::ServiceCleanup::new(root, &data);
     #[cfg(unix)]
     let (mut child, line) = {
         let child = Command::new(env!("CARGO_BIN_EXE_kuru"))

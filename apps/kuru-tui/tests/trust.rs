@@ -23,6 +23,9 @@ use kuru_memory::MemoryStore;
 use kuru_runtime::{DreamProposal, Harness, Topology};
 use serde_json::{Value, json};
 
+#[path = "support/memory.rs"]
+mod memory;
+
 #[cfg(unix)]
 #[allow(dead_code)]
 #[path = "support/terminal.rs"]
@@ -44,7 +47,7 @@ fn ensure_powershell_warm() {
 }
 
 struct Sandbox {
-    root: tempfile::TempDir,
+    root: memory::ServiceCleanup,
     project: PathBuf,
     data: PathBuf,
 }
@@ -61,7 +64,7 @@ impl Sandbox {
         std::fs::create_dir(root.path().join("config")).unwrap();
         std::fs::write(project.join(".kuru/config.toml"), config).unwrap();
         Self {
-            root,
+            root: memory::ServiceCleanup::new(root, &data),
             project,
             data,
         }

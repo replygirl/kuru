@@ -76,7 +76,7 @@ fn composer_coordinates_use_physical_rows_after_conpty_autowrap() {
 }
 
 struct Sandbox {
-    _temporary: tempfile::TempDir,
+    _temporary: memory::ServiceCleanup,
     root: PathBuf,
     project: PathBuf,
     data: PathBuf,
@@ -150,7 +150,7 @@ impl Sandbox {
         let startup =
             Duration::from_secs((configuration.memory.startup_timeout_secs + 5) * 2 + 13) + READY;
         Ok(Self {
-            _temporary: temporary,
+            _temporary: memory::ServiceCleanup::new(temporary, &data),
             root,
             project,
             data,
