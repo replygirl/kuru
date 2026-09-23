@@ -384,6 +384,10 @@ pub(crate) fn require_private(
 
 pub(crate) fn set_private(handle: BorrowedHandle<'_>, access_mask: u32) -> io::Result<()> {
     require_private(handle, false)?;
+    apply_private_dacl(handle, access_mask)
+}
+
+fn apply_private_dacl(handle: BorrowedHandle<'_>, access_mask: u32) -> io::Result<()> {
     let security = PrivateSecurity::new(access_mask, false)?;
     // SAFETY: the handle and security allocation remain live for this call;
     // setting only the DACL does not change the already-validated owner.
@@ -595,11 +599,6 @@ unsafe fn assign_staged_owner(staged: BorrowedHandle<'_>, source_owner: PSID) ->
     require_private(staged, false)?;
     // SAFETY: the caller retains the validated source SID through this call.
     unsafe { require_assignable_file_owner(source_owner)? };
-    // CreateFile may normalize a zero-mask OWNER RIGHTS ACE while TokenUser is
-    // still the owner. Reapply the same protected private file policy through
-    // the retained WRITE_DAC stage before a distinct TokenOwner can acquire
-    // implicit READ_CONTROL or WRITE_DAC rights.
-    set_private(staged, FILE_ALL_ACCESS)?;
     // SAFETY: ReOpenFile derives the new handle from the retained exact file
     // object, not a pathname. The original movable handle already shares read,
     // write and delete; the reopened handle is immediately RAII-owned.
@@ -633,7 +632,12 @@ unsafe fn assign_staged_owner(staged: BorrowedHandle<'_>, source_owner: PSID) ->
         return Err(io::Error::from_raw_os_error(status as i32));
     }
     drop(owner_handle);
-    // A distinct TokenOwner is accepted only when the staged DACL still has
+    // On elevated tokens, assigning the distinct TokenOwner can normalize an
+    // effective zero-mask OWNER RIGHTS ACE into an inherit-only ACE. Restore
+    // the identical protected private policy through the retained WRITE_DAC
+    // handle before this stage can reach a source-DACL copy or publication.
+    apply_private_dacl(staged, FILE_ALL_ACCESS)?;
+    // A distinct TokenOwner is accepted only after the staged DACL again has
     // the effective OWNER RIGHTS suppression required by private_status.
     require_private(staged, false)
 }
