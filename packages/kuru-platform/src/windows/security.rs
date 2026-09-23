@@ -728,7 +728,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs::File;
     use std::io::Write;
-    use std::os::windows::io::AsHandle;
+    use std::os::windows::io::{AsHandle, BorrowedHandle};
     use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
 
     fn descriptor(sddl: &str) -> PrivateSecurity {
@@ -749,6 +749,28 @@ mod tests {
         }
     }
 
+    fn set_dacl_on_handle(handle: BorrowedHandle<'_>, dacl: *const ACL) {
+        // SAFETY: the fixture retains the exact checked DACL handle and keeps
+        // the descriptor alive; null intentionally constructs a null-DACL case.
+        let result = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null(),
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "fixture SetSecurityInfo failed: {}",
+            io::Error::from_raw_os_error(result as i32)
+        );
+    }
+
     fn set_dacl(file: &File, dacl: *const ACL) {
         use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
 
@@ -766,25 +788,14 @@ mod tests {
             )
         };
         assert_ne!(
-            dacl_handle, INVALID_HANDLE_VALUE,
-            "fixture ReOpenFile failed"
+            dacl_handle,
+            INVALID_HANDLE_VALUE,
+            "fixture ReOpenFile failed: {}",
+            io::Error::last_os_error()
         );
         // SAFETY: successful ReOpenFile transfers one unique owned handle.
         let dacl_handle = unsafe { OwnedHandle::from_raw_handle(dacl_handle) };
-        // SAFETY: the fixture retains the exact checked DACL handle and keeps
-        // the descriptor alive; null intentionally constructs a null-DACL case.
-        let result = unsafe {
-            SetSecurityInfo(
-                dacl_handle.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                dacl,
-                null(),
-            )
-        };
-        assert_eq!(result, 0, "fixture SetSecurityInfo failed: {result}");
+        set_dacl_on_handle(dacl_handle.as_handle(), dacl);
     }
 
     fn security_text(file: &File) -> String {
@@ -1254,7 +1265,7 @@ mod tests {
             .unwrap();
         let sid = CurrentUser::read().unwrap().sid_string().unwrap();
         let changed = descriptor(&format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"));
-        set_dacl(&parent_acl, changed.dacl().unwrap());
+        set_dacl_on_handle(parent_acl.as_handle(), changed.dacl().unwrap());
         let after = security_shape(&candidate);
         assert_ne!(
             after, before,
@@ -1294,7 +1305,7 @@ mod tests {
         assert_eq!(file_access_token(replacement.as_handle()).unwrap()[0], 0);
 
         let changed_again = descriptor(&format!("O:{sid}D:P(A;OICI;FA;;;{sid})"));
-        set_dacl(&parent_acl, changed_again.dacl().unwrap());
+        set_dacl_on_handle(parent_acl.as_handle(), changed_again.dacl().unwrap());
         let replacement_after = security_shape(&replacement);
         assert_ne!(
             replacement_after, replacement_before,
