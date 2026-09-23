@@ -1607,7 +1607,8 @@ mod tests {
         )
         .await
         .context("live-owner fixture exceeded its outer deadline")?
-        .expect_err("stale transport must not authorize replacing a live owner");
+        .err()
+        .context("stale transport authorized replacing a live owner")?;
         ensure!(
             format!("{error:#}").contains("existing memory service owner did not publish"),
             "live owner refusal lost its authoritative stage: {error:#}"
