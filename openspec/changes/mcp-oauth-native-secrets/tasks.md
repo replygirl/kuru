@@ -24,7 +24,7 @@
 
 - [x] 4.1 Integrate OAuth into `McpClient` session initialization, discovery, calls and close while keeping static-authorization and STDIO paths separate, permitting validated non-authorization headers only on protected resource requests, and verify every captured request has only its alias's authorized headers and a valid live list remains the sole route publication event.
 - [x] 4.2 Extend cache context and alias status with nonsecret OAuth binding/generation/scope facts, and verify changed authority/login/logout makes old metadata ineligible without treating authorization or stale metadata as execution permission.
-- [ ] 4.3 Exercise mixed disabled, live, stale, degraded, login-required, refresh-required and native-store-unavailable aliases through `ToolCatalog`, and verify one failing/authenticating alias never hides, authorizes or mutates another.
+- [x] 4.3 Exercise mixed disabled, live, stale, degraded, login-required, refresh-required and native-store-unavailable aliases through `ToolCatalog`, and verify one failing/authenticating alias never hides, authorizes or mutates another.
 
 ## 5. Commands and documentation
 
@@ -34,7 +34,7 @@
 
 ## 6. Integrated verification and delivery
 
-- [ ] 6.1 Run the deterministic fake authorization/resource matrix and secret-exclusion scan across config, cache, status, stdout, stderr and errors, and record exact observed results in `verification.md` without live or paid provider calls.
+- [x] 6.1 Run the deterministic fake authorization/resource matrix and secret-exclusion scan across config, cache, status, stdout, stderr and errors, and record exact observed results in `verification.md` without live or paid provider calls.
 - [ ] 6.2 Run granular format, lint, typecheck and affected core/platform/connectors/TUI suites plus real native keychain and PTY cases on macOS, Linux and Windows, and record each executed count/result separately from unavailable hosted evidence.
 - [ ] 6.3 Run combined workspace coverage with its package-owned instrumented fixtures, retain the 90% gate, inspect practical login/status/logout terminal output, and record the current official-protocol comparison.
 - [ ] 6.4 Complete every verification row, strict-validate, confirm the apply gate, archive the change through Cospec, run normal hooks and hand Delivery the clean scoped commit with exact native/CI evidence.

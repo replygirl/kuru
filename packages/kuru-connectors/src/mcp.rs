@@ -640,45 +640,53 @@ impl McpHosts {
 
     pub(crate) async fn oauth_logout(&self, alias: &str) -> Result<McpOAuthLogout> {
         let (client, store) = self.oauth_client_and_store(alias)?;
-        let lease = store.acquire(alias).await?;
-        let (lease, Some(record)) = lease.read_locked().await? else {
-            return Ok(McpOAuthLogout {
-                alias: alias.to_owned(),
-                local_deleted: false,
-                remote: "no_local_credential",
-            });
-        };
-        let generation = record.generation();
-        let remote = match McpOAuthCredential::decode(record.secret()) {
-            Ok(credential) => {
-                let attempted = self
-                    .remote_revocation(alias, client, &store, &credential)
-                    .await;
-                match attempted {
-                    Ok(outcome) => revocation_name(outcome),
-                    Err(_) => "remote_outcome_uncertain",
+        let alias = alias.to_owned();
+        // Once admitted, logout owns one detached settlement task. Dropping a
+        // CLI/TUI caller cannot interrupt an in-flight remote attempt between
+        // dispatch and the authoritative generation-checked local deletion.
+        tokio::spawn(async move {
+            let lease = store.acquire(&alias).await?;
+            let (lease, Some(record)) = lease.read_locked().await? else {
+                return Ok(McpOAuthLogout {
+                    alias,
+                    local_deleted: false,
+                    remote: "no_local_credential",
+                });
+            };
+            let generation = record.generation();
+            let remote = match McpOAuthCredential::decode(record.secret()) {
+                Ok(credential) => {
+                    let attempted =
+                        Self::remote_revocation(&alias, &client, &store, &credential).await;
+                    match attempted {
+                        Ok(outcome) => revocation_name(outcome),
+                        Err(_) => "remote_outcome_uncertain",
+                    }
                 }
-            }
-            Err(_) => "local_credential_invalid",
-        };
-        // Local deletion is unconditional after the bounded remote attempt,
-        // including malformed local records and uncertain network outcomes.
-        lease.delete(generation).await?;
-        Ok(McpOAuthLogout {
-            alias: alias.to_owned(),
-            local_deleted: true,
-            remote,
+                Err(_) => "local_credential_invalid",
+            };
+            // Local deletion is unconditional after the bounded remote attempt,
+            // including malformed local records and uncertain network outcomes.
+            lease.delete(generation).await?;
+            Ok(McpOAuthLogout {
+                alias,
+                local_deleted: true,
+                remote,
+            })
         })
+        .await
+        .context("MCP OAuth logout settlement task stopped")?
     }
 
     fn oauth_client_and_store(
         &self,
         alias: &str,
-    ) -> Result<(&Arc<McpClient>, Arc<McpCredentialStore>)> {
+    ) -> Result<(Arc<McpClient>, Arc<McpCredentialStore>)> {
         ensure_open(&self.admission)?;
         let client = self
             .clients
             .get(alias)
+            .cloned()
             .with_context(|| format!("configured MCP alias {alias} is unavailable"))?;
         ensure!(
             client
@@ -697,7 +705,6 @@ impl McpHosts {
     }
 
     async fn remote_revocation(
-        &self,
         alias: &str,
         client: &McpClient,
         store: &McpCredentialStore,
@@ -2167,8 +2174,9 @@ mod tests {
     use crate::test_support::{HttpFixture, Reply, StdioFixture, Step};
     use axum::{
         Router,
+        body::{Body, Bytes},
         http::StatusCode,
-        response::IntoResponse,
+        response::{IntoResponse, Response},
         routing::{get, post},
     };
     use kuru_core::{ConfigSnapshot, InvocationOverrides};
@@ -2593,6 +2601,16 @@ mod tests {
                 logout.local_deleted && logout.remote == "revoked",
                 "unexpected logout outcome: {logout:?}"
             );
+            let projected = serde_json::to_string(&logout)?;
+            for secret in [
+                "synthetic-code",
+                "synthetic-access-one",
+                "synthetic-access-two",
+                "synthetic-refresh-one",
+                "synthetic-refresh-two",
+            ] {
+                ensure!(!projected.contains(secret), "logout disclosed {secret}");
+            }
             ensure!(store.acquire("test").await?.get().await?.is_none());
             Ok(())
         }
@@ -2620,7 +2638,8 @@ mod tests {
         let revoked_body = revoked_body.lock().await.clone();
         if let Err(error) = result {
             panic!(
-                "OAuth flow failed after {token_count} token requests and {revocation_count} revocations ({revoked_body:?}): {error:#}"
+                "OAuth flow failed after {token_count} token requests and {revocation_count} revocations (body captured: {}): {error:#}",
+                revoked_body.is_some()
             );
         }
         assert_eq!(token_count, 2);
@@ -2631,6 +2650,246 @@ mod tests {
                 .is_some_and(|body| body.contains("token=synthetic-refresh-two"))
         );
     }
+
+    #[tokio::test]
+    async fn logout_settles_local_deletion_across_cancellation_and_generation_races() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let revocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let revocation_mode = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", socket.local_addr().unwrap());
+        let issuer = format!("{base}/");
+        let resource = format!("{base}/mcp");
+        let task = tokio::spawn({
+            let base = base.clone();
+            let issuer = issuer.clone();
+            let resource = resource.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            let revocations = revocations.clone();
+            let revocation_mode = revocation_mode.clone();
+            async move {
+                let resource_metadata = json!({
+                    "resource": resource,
+                    "authorization_servers": [issuer.clone()]
+                });
+                let app = Router::new()
+                    .route(
+                        "/.well-known/oauth-protected-resource/mcp",
+                        get({
+                            let metadata = resource_metadata.clone();
+                            move || {
+                                let metadata = metadata.clone();
+                                async move { axum::Json(metadata) }
+                            }
+                        }),
+                    )
+                    .route(
+                        "/.well-known/oauth-protected-resource",
+                        get(move || {
+                            let metadata = resource_metadata.clone();
+                            async move { axum::Json(metadata) }
+                        }),
+                    )
+                    .route(
+                        "/.well-known/oauth-authorization-server",
+                        get({
+                            let base = base.clone();
+                            let issuer = issuer.clone();
+                            let revocation_mode = revocation_mode.clone();
+                            move || {
+                                let mut metadata = json!({
+                                    "issuer": issuer,
+                                    "authorization_endpoint": format!("{base}/authorize"),
+                                    "token_endpoint": format!("{base}/token"),
+                                    "code_challenge_methods_supported": ["S256"]
+                                });
+                                if revocation_mode.load(Ordering::Acquire) != 1 {
+                                    metadata["revocation_endpoint"] =
+                                        json!(format!("{base}/revoke"));
+                                }
+                                async move { axum::Json(metadata) }
+                            }
+                        }),
+                    )
+                    .route(
+                        "/revoke",
+                        post(move || {
+                            let entered = entered.clone();
+                            let release = release.clone();
+                            let revocations = revocations.clone();
+                            let revocation_mode = revocation_mode.clone();
+                            async move {
+                                revocations.fetch_add(1, Ordering::Relaxed);
+                                match revocation_mode.load(Ordering::Acquire) {
+                                    0 => {
+                                        entered.notify_one();
+                                        release.notified().await;
+                                        StatusCode::OK.into_response()
+                                    }
+                                    2 => StatusCode::BAD_REQUEST.into_response(),
+                                    3 => {
+                                        let failed = futures::stream::once(async {
+                                            Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                                std::io::ErrorKind::ConnectionReset,
+                                                "fixture dropped the accepted revocation response",
+                                            ))
+                                        });
+                                        Response::new(Body::from_stream(failed))
+                                    }
+                                    4 => vec![b'x'; 256 * 1024 + 1].into_response(),
+                                    mode => panic!("unexpected revocation fixture mode {mode}"),
+                                }
+                            }
+                        }),
+                    );
+                axum::serve(socket, app).await.unwrap();
+            }
+        });
+
+        let project = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let store = credential_store(project.path(), private.path());
+        let mut credential =
+            fixture_credential(&store, "auth", &resource, unix_time().unwrap() + 300);
+        credential.issuer = oauth_binding(b"issuer", &issuer);
+        let generation = store
+            .acquire("auth")
+            .await
+            .unwrap()
+            .create(credential.encode().unwrap())
+            .await
+            .unwrap();
+        let config = [(
+            "auth".into(),
+            McpConfig {
+                url: Some(resource.clone()),
+                oauth: Some(McpOAuthConfig {
+                    enabled: true,
+                    client_id: Some("native-client".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )]
+        .into();
+        let hosts = Arc::new(McpHosts::new(project.path(), &config).unwrap());
+        hosts.install_credentials(store.clone()).unwrap();
+
+        // Hold the alias before logout's first poll. That poll admits the
+        // detached settlement task but cannot dispatch revocation yet. A
+        // concurrent refresh that already owns the lease settles first; the
+        // cancelled logout then observes, revokes and deletes that exact new
+        // generation rather than restoring either credential.
+        let (lease, record) = store
+            .acquire("auth")
+            .await
+            .unwrap()
+            .read_locked()
+            .await
+            .unwrap();
+        assert_eq!(record.unwrap().generation(), generation);
+        let mut before_dispatch = Box::pin(hosts.oauth_logout("auth"));
+        assert!(futures::poll!(before_dispatch.as_mut()).is_pending());
+        drop(before_dispatch);
+        assert_eq!(revocations.load(Ordering::Relaxed), 0);
+        let mut refreshed =
+            fixture_credential(&store, "auth", &resource, unix_time().unwrap() + 600);
+        refreshed.issuer = oauth_binding(b"issuer", &issuer);
+        lease
+            .replace(generation, refreshed.encode().unwrap())
+            .await
+            .unwrap();
+        entered.notified().await;
+        release.notify_one();
+        let current = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.acquire("auth").await.unwrap().get(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(current.is_none());
+
+        let mut credential =
+            fixture_credential(&store, "auth", &resource, unix_time().unwrap() + 300);
+        credential.issuer = oauth_binding(b"issuer", &issuer);
+        let generation = store
+            .acquire("auth")
+            .await
+            .unwrap()
+            .create(credential.encode().unwrap())
+            .await
+            .unwrap();
+        let caller = tokio::spawn({
+            let hosts = hosts.clone();
+            async move { hosts.oauth_logout("auth").await }
+        });
+        entered.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.notify_one();
+
+        let current = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.acquire("auth").await.unwrap().get(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(current.is_none());
+        let stale = fixture_credential(&store, "auth", &base, unix_time().unwrap() + 300)
+            .encode()
+            .unwrap();
+        assert!(
+            store
+                .acquire("auth")
+                .await
+                .unwrap()
+                .replace(generation, stale)
+                .await
+                .is_err()
+        );
+        assert_eq!(revocations.load(Ordering::Relaxed), 2);
+
+        for (mode, expected) in [
+            (1, "no_advertised_endpoint"),
+            (2, "remote_refused"),
+            (3, "remote_outcome_uncertain"),
+            (4, "remote_outcome_uncertain"),
+        ] {
+            revocation_mode.store(mode, Ordering::Release);
+            let mut credential =
+                fixture_credential(&store, "auth", &resource, unix_time().unwrap() + 300);
+            credential.issuer = oauth_binding(b"issuer", &issuer);
+            store
+                .acquire("auth")
+                .await
+                .unwrap()
+                .create(credential.encode().unwrap())
+                .await
+                .unwrap();
+            let outcome = hosts.oauth_logout("auth").await.unwrap();
+            assert!(outcome.local_deleted, "mode {mode}: {outcome:?}");
+            assert_eq!(outcome.remote, expected, "mode {mode}: {outcome:?}");
+            assert!(
+                store
+                    .acquire("auth")
+                    .await
+                    .unwrap()
+                    .get()
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(revocations.load(Ordering::Relaxed), 5);
+
+        hosts.shutdown().await.unwrap();
+        task.abort();
+    }
+
     fn tool(name: &str) -> Value {
         json!({"name":name,"description":"A fixture tool","inputSchema":{"type":"object"}})
     }
@@ -2653,6 +2912,158 @@ mod tests {
             McpCatalogStore::new(private, root.clone(), snapshot.manifest().full_digest()).unwrap(),
         );
         (root, store)
+    }
+
+    fn credential_store(project: &Path, private: &Path) -> Arc<McpCredentialStore> {
+        let root =
+            Arc::new(Directory::open(project, Privacy::Inherited, NameRetention::Pinned).unwrap());
+        let parent = Directory::open(private, Privacy::Inherited, NameRetention::Movable).unwrap();
+        let data = parent
+            .create_private_directory(std::ffi::OsStr::new("oauth-data"))
+            .unwrap();
+        let snapshot = ConfigSnapshot::parse_with_sources(
+            None,
+            None,
+            project,
+            None,
+            None,
+            None,
+            &["/mcp", "/tools"],
+            InvocationOverrides::default(),
+        )
+        .unwrap();
+        Arc::new(
+            McpCredentialStore::new(data.path(), root, snapshot.manifest().full_digest()).unwrap(),
+        )
+    }
+
+    fn fixture_credential(
+        store: &McpCredentialStore,
+        alias: &str,
+        resource: &str,
+        expires_at: u64,
+    ) -> McpOAuthCredential {
+        let resource = checked_resource_url(resource).unwrap();
+        McpOAuthCredential {
+            authority: store.binding_authority(),
+            project: store.project_identity(),
+            alias: oauth_binding(b"alias", alias),
+            resource: oauth_binding(b"resource", resource.as_str()),
+            issuer: oauth_binding(b"issuer", "https://issuer.invalid/"),
+            registration: McpRegistrationKind::Configured,
+            expires_at,
+            client_id: "native-client".into(),
+            scopes: vec!["mcp.read".into()],
+            client_secret: Some("recognizable-client-secret".into()),
+            access_token: "recognizable-access-secret".into(),
+            refresh_token: Some("recognizable-refresh-secret".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_status_tracks_mixed_alias_state_without_projecting_secrets() {
+        let live =
+            HttpFixture::new((0..5).map(|_| Reply::json(json!({}))).collect::<Vec<_>>()).await;
+        let disabled = HttpFixture::new(Vec::new()).await;
+        let project = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let store = credential_store(project.path(), private.path());
+        let config = BTreeMap::from([
+            (
+                "auth".into(),
+                McpConfig {
+                    url: Some(live.url.clone()),
+                    oauth: Some(McpOAuthConfig {
+                        enabled: true,
+                        client_id: Some("native-client".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "disabled".into(),
+                McpConfig {
+                    enabled: false,
+                    url: Some(disabled.url.clone()),
+                    oauth: Some(McpOAuthConfig {
+                        enabled: true,
+                        client_id: Some("native-client".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let future = fixture_credential(&store, "auth", &live.url, unix_time().unwrap() + 300);
+        let generation = store
+            .acquire("auth")
+            .await
+            .unwrap()
+            .create(future.encode().unwrap())
+            .await
+            .unwrap();
+        let hosts = McpHosts::new(project.path(), &config).unwrap();
+        hosts.install_credentials(store.clone()).unwrap();
+
+        let authorized = hosts.oauth_status("auth").await.unwrap();
+        assert_eq!(authorized.state, "authorized");
+        assert_eq!(
+            authorized.availability,
+            McpAvailability::Degraded,
+            "{authorized:?}"
+        );
+        assert_eq!(authorized.scopes, ["mcp.read"]);
+        let disabled_status = hosts.oauth_status("disabled").await.unwrap();
+        assert_eq!(disabled_status.state, "disabled");
+        assert!(disabled.requests.lock().await.is_empty());
+        let projected = serde_json::to_string(&(authorized, disabled_status)).unwrap();
+        const SECRETS: [&str; 3] = [
+            "recognizable-client-secret",
+            "recognizable-access-secret",
+            "recognizable-refresh-secret",
+        ];
+        for secret in SECRETS {
+            assert!(!projected.contains(secret), "status disclosed {secret}");
+        }
+
+        let expired = fixture_credential(&store, "auth", &live.url, 1);
+        let expired_generation = store
+            .acquire("auth")
+            .await
+            .unwrap()
+            .replace(generation, expired.encode().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            hosts.oauth_status("auth").await.unwrap().state,
+            "refresh_required"
+        );
+        store
+            .acquire("auth")
+            .await
+            .unwrap()
+            .delete(expired_generation)
+            .await
+            .unwrap();
+        assert_eq!(
+            hosts.oauth_status("auth").await.unwrap().state,
+            "login_required"
+        );
+        let catalog = hosts.catalog().await.unwrap();
+        let projected = serde_json::to_string(&(catalog.tools, catalog.statuses)).unwrap();
+        for secret in SECRETS {
+            assert!(!projected.contains(secret), "catalog disclosed {secret}");
+        }
+
+        let moved = project.path().with_extension("temporarily-moved");
+        std::fs::rename(project.path(), &moved).unwrap();
+        let unavailable = hosts.oauth_status("auth").await.unwrap();
+        assert_eq!(unavailable.state, "native_store_unavailable");
+        assert!(unavailable.diagnostic.is_some());
+        std::fs::rename(&moved, project.path()).unwrap();
+
+        hosts.shutdown().await.unwrap();
     }
 
     #[tokio::test]

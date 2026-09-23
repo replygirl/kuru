@@ -1599,7 +1599,7 @@ mod tests {
 
     use axum::{
         Json, Router,
-        body::Bytes,
+        body::{Body, Bytes},
         extract::State,
         http::{HeaderMap, Method, StatusCode, Uri},
         response::{IntoResponse, Response},
@@ -2278,6 +2278,70 @@ mod tests {
             !headers.contains_key("authorization") && !headers.contains_key("proxy-authorization")
         }));
         drop(requests);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rotating_refresh_lost_response_is_returned_without_replay() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", socket.local_addr().unwrap());
+        let task = tokio::spawn({
+            let requests = requests.clone();
+            async move {
+                let app = Router::new().route(
+                    "/token",
+                    post(move |body: String| {
+                        let requests = requests.clone();
+                        async move {
+                            requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            assert!(body.contains("refresh_token=rotating-secret"));
+                            let failed = futures::stream::once(async {
+                                Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionReset,
+                                    "fixture dropped the accepted refresh response",
+                                ))
+                            });
+                            Response::new(Body::from_stream(failed))
+                        }
+                    }),
+                );
+                axum::serve(socket, app).await.unwrap();
+            }
+        });
+        let issuer = loopback(&format!("{base}/issuer"));
+        let metadata = AuthorizationServerMetadata::parse(
+            &serde_json::to_vec(&json!({
+                "issuer": issuer.as_str(),
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "code_challenge_methods_supported": ["S256"]
+            }))
+            .unwrap(),
+            &issuer,
+            UrlPolicy::LoopbackFixture,
+        )
+        .unwrap();
+        let resource = loopback(&format!("{base}/mcp"));
+        let token = SecretText::new("refresh token", "rotating-secret".into()).unwrap();
+        let error = refresh_access_token(
+            &reqwest::Client::new(),
+            &metadata,
+            "native-client",
+            None,
+            &resource,
+            &token,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("dispatch MCP OAuth token request")
+                || diagnostic.contains("read OAuth response body"),
+            "{diagnostic}"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1);
         task.abort();
     }
 
