@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::MAX_BYTES;
 
 use super::{
-    ProviderEvent, ProviderFailureKind, ProviderSink, TextDeltaSource,
+    ProviderEvent, ProviderFailureKind, ProviderReasoningSummary, ProviderSink, TextDeltaSource,
     diagnostics::{self, Operation},
 };
 
@@ -29,7 +29,7 @@ pub(super) async fn response(
     operation: Operation,
     allow_missing_content_type: bool,
     sink: &mut dyn ProviderSink,
-) -> Result<Value> {
+) -> Result<SettledResponse> {
     let mut response = diagnostics::successful(response, operation).await?;
     ensure!(
         response.content_length().unwrap_or(0) <= MAX_SSE_WIRE_BYTES as u64,
@@ -78,9 +78,18 @@ pub(super) async fn response(
             sink.emit(event).await?;
         }
         if let Some(value) = value {
-            return Ok(value);
+            return Ok(SettledResponse {
+                reasoning_summaries: decoder.settled_reasoning_summaries(&value)?,
+                value,
+            });
         }
     }
+}
+
+#[derive(Debug)]
+pub(super) struct SettledResponse {
+    pub(super) value: Value,
+    pub(super) reasoning_summaries: Vec<ProviderReasoningSummary>,
 }
 
 #[derive(Default)]
@@ -109,6 +118,66 @@ struct Decoder {
 impl Decoder {
     fn take_observations(&mut self) -> Vec<ProviderEvent> {
         std::mem::take(&mut self.observations)
+    }
+
+    /// Extract summaries only after the terminal response has reconciled every
+    /// streamed fragment. The terminal array is allowed to reorder items, so
+    /// its position never becomes a fabricated native `output_index`.
+    fn settled_reasoning_summaries(
+        &self,
+        response: &Value,
+    ) -> Result<Vec<ProviderReasoningSummary>> {
+        let output = response["output"]
+            .as_array()
+            .context("completed response lacks output")?;
+        let mut summaries = Vec::new();
+        for item in output {
+            if item["type"] != "reasoning" {
+                continue;
+            }
+            let item_id = item["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            let Some(final_summaries) = item["summary"].as_array() else {
+                continue;
+            };
+            for (summary_index, summary) in final_summaries.iter().enumerate() {
+                ensure!(
+                    summary["type"] == "summary_text",
+                    "completed reasoning summary has incompatible type"
+                );
+                let text = summary["text"]
+                    .as_str()
+                    .or_else(|| summary["summary_text"].as_str())
+                    .context("completed reasoning summary lacks text")?;
+                ensure!(
+                    text.len() <= MAX_BYTES,
+                    "completed reasoning summary exceeds retained output limit"
+                );
+                let summary_index = u64::try_from(summary_index)
+                    .context("completed reasoning summary index exceeds u64")?;
+                let mut output_indexes = self.summary_fragments.keys().filter_map(
+                    |(output_index, observed_item_id, observed_summary_index)| {
+                        (item_id.as_deref() == Some(observed_item_id)
+                            && *observed_summary_index == summary_index)
+                            .then_some(*output_index)
+                    },
+                );
+                let output_index = output_indexes.next();
+                ensure!(
+                    output_indexes.next().is_none(),
+                    "stream reasoning summary has conflicting output indexes"
+                );
+                summaries.push(ProviderReasoningSummary {
+                    item_id: item_id.clone(),
+                    output_index,
+                    summary_index,
+                    text: text.to_owned(),
+                });
+            }
+        }
+        Ok(summaries)
     }
     fn push(&mut self, bytes: &[u8]) -> Result<Option<Value>> {
         self.wire_bytes = self
@@ -1153,6 +1222,49 @@ mod tests {
             hidden_refusal,
         );
         assert!(Decoder::default().push(conflict.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn settled_summaries_keep_native_coordinates_without_terminal_order_inference() {
+        let output = json!([
+            {"type":"message","id":"message-1","content":[{"type":"output_text","text":"ready"}]},
+            {"type":"reasoning","id":"reasoning-native","summary":[{"type":"summary_text","text":"traced"}]},
+            {"type":"reasoning","id":"reasoning-terminal","summary":[{"type":"summary_text","text":"terminal only"}]},
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"unaddressed"}]}
+        ]);
+        let events = [
+            json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-native","output_index":7,"summary_index":0,"delta":"traced"}),
+            json!({"type":"response.completed","response":{"id":"r1","output":output}}),
+        ];
+        let bytes: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        let mut decoder = Decoder::default();
+        let response = decoder.push(bytes.as_bytes()).unwrap().unwrap();
+        assert_eq!(
+            decoder.settled_reasoning_summaries(&response).unwrap(),
+            vec![
+                ProviderReasoningSummary {
+                    item_id: Some("reasoning-native".into()),
+                    output_index: Some(7),
+                    summary_index: 0,
+                    text: "traced".into(),
+                },
+                ProviderReasoningSummary {
+                    item_id: Some("reasoning-terminal".into()),
+                    output_index: None,
+                    summary_index: 0,
+                    text: "terminal only".into(),
+                },
+                ProviderReasoningSummary {
+                    item_id: None,
+                    output_index: None,
+                    summary_index: 0,
+                    text: "unaddressed".into(),
+                },
+            ]
+        );
     }
 
     #[test]

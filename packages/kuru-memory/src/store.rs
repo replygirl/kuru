@@ -3272,6 +3272,111 @@ mod tests {
     use serde_json::json;
     use sha2::Digest;
 
+    fn reasoning_summary(text: impl Into<String>) -> ReasoningSummaryRecord {
+        ReasoningSummaryRecord {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            actor_id: "actor".into(),
+            invocation_id: "invocation".into(),
+            item_id: Some("item".into()),
+            output_index: Some(0),
+            summary_index: 0,
+            text: text.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn private_reasoning_summary_batch_is_atomic_and_idempotent() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let first = reasoning_summary("first");
+        store.put_reasoning_summaries(&[first.clone()]).await?;
+        store.put_reasoning_summaries(&[first.clone()]).await?;
+
+        let mut fresh = reasoning_summary("fresh");
+        fresh.summary_index = 1;
+        let mut conflicting = first.clone();
+        conflicting.text = "conflicting".into();
+        let error = store
+            .put_reasoning_summaries(&[fresh.clone(), conflicting])
+            .await
+            .unwrap_err();
+        ensure!(
+            error.downcast_ref::<ReasoningSummaryConflict>().is_some(),
+            "different payload for a settled summary identity was not a typed conflict: {error:#}"
+        );
+        let first_key = reasoning_summary_key(&first)?;
+        let fresh_key = reasoning_summary_key(&fresh)?;
+        ensure!(
+            store.get(&first_key).await? == Some(serde_json::to_value(&first)?),
+            "idempotent reasoning summary changed its original durable payload"
+        );
+        ensure!(
+            store.get(&fresh_key).await?.is_none(),
+            "summary batch committed a prefix before its later identity conflict"
+        );
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn private_reasoning_summary_identity_keeps_equal_text_in_its_admitted_tuple()
+    -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let first = reasoning_summary("same provider text");
+        let mut other_session = first.clone();
+        other_session.session_id = "other-session".into();
+        let mut other_actor = first.clone();
+        other_actor.actor_id = "other-actor".into();
+        let mut other_turn = first.clone();
+        other_turn.turn_id = "other-turn".into();
+        let mut other_invocation = first.clone();
+        other_invocation.invocation_id = "other-invocation".into();
+        let records = [
+            first.clone(),
+            other_session.clone(),
+            other_actor.clone(),
+            other_turn.clone(),
+            other_invocation.clone(),
+        ];
+        store.put_reasoning_summaries(&records).await?;
+
+        let keys = records
+            .iter()
+            .map(reasoning_summary_key)
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        ensure!(
+            keys.len() == records.len(),
+            "distinct admitted reasoning-summary identities shared one durable key"
+        );
+        for record in records {
+            let key = reasoning_summary_key(&record)?;
+            ensure!(
+                store.get(&key).await? == Some(serde_json::to_value(record)?),
+                "reasoning summary identity did not retain its exact admitted record"
+            );
+        }
+        store.close().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn private_reasoning_summary_batch_bounds_total_identity_and_text_bytes() -> Result<()> {
+        let mut at_limit = reasoning_summary("");
+        let identity_bytes = at_limit.session_id.len()
+            + at_limit.turn_id.len()
+            + at_limit.actor_id.len()
+            + at_limit.invocation_id.len()
+            + at_limit.item_id.as_ref().map_or(0, String::len);
+        at_limit.text = "x".repeat(MAX_REASONING_SUMMARY_BATCH_STRING_BYTES - identity_bytes);
+        encode_reasoning_summaries(&[at_limit.clone()])?;
+        at_limit.text.push('x');
+        ensure!(
+            encode_reasoning_summaries(&[at_limit]).is_err(),
+            "reasoning summary aggregate accepted one byte over its 16 MiB bound"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn service_disconnect_and_owner_restart_preserve_unresolved_candidate() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(90), async {

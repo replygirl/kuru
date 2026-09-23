@@ -1916,6 +1916,7 @@ impl Harness {
     async fn ask_controlled_with_progress(
         &self,
         id: &str,
+        turn_id: &str,
         inputs: Vec<Message>,
         phase: (&str, ActorPhase),
         tools: Vec<ToolSpec>,
@@ -1925,6 +1926,7 @@ impl Harness {
         self.ask_in_controlled_with_progress(
             &self.memory,
             id,
+            Some(turn_id),
             inputs,
             phase.0,
             tools,
@@ -1950,6 +1952,7 @@ impl Harness {
             .ask_in_controlled_with_progress(
                 memory,
                 id,
+                None,
                 inputs,
                 phase.0,
                 tools,
@@ -1967,6 +1970,7 @@ impl Harness {
         &self,
         memory: &MemoryStore,
         id: &str,
+        turn_id: Option<&str>,
         inputs: Vec<Message>,
         phase: &str,
         tools: Vec<ToolSpec>,
@@ -2045,6 +2049,7 @@ impl Harness {
             memory: memory.clone(),
             ledger: self.memory.usage_ledger()?,
             invocation,
+            turn_id: turn_id.map(str::to_owned),
             context_sources,
             inputs,
             instructions,
@@ -2557,6 +2562,7 @@ impl Harness {
             let (completion, invocation_id) = self
                 .ask_controlled_with_progress(
                     &speaker,
+                    turn_id,
                     inputs,
                     (
                         "speak and act: you are the identity the user is talking to",

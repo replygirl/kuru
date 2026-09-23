@@ -72,6 +72,16 @@ rows, operations, and schema tables. Export never starts a provider, imports leg
 or creates a fresh memory store. It is a current committed snapshot, not a
 historical-revision browser or a secure-erasure/archive facility.
 
+This is a full-project export for its invoking owner, so it can include
+producer-private state such as settled provider reasoning summaries. Treat the
+output as private project data. Conversation transcripts, peer context, fork
+presentation, and session export do not project those records. During an active
+selected-speaker turn, the existing TUI may show a bounded transient text-only
+reasoning preview; it carries no provider coordinates, clears with the turn,
+and is never a durable record. The producing actor can use private state only
+through a policy-selected replay or compaction path; Kuru never injects it into
+every request.
+
 The operational usage ledger is separate from the exported live-memory snapshot
 and is not included in `memory export`. It belongs to the same managed project
 store, so closing or purging that store also covers its ledger. Dream promotion,

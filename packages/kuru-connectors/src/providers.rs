@@ -147,6 +147,12 @@ pub enum ProviderEvent {
         summary_index: u64,
         text: String,
     },
+    /// Provider-authored reasoning summaries reconciled against a successful
+    /// terminal response. This private sidecar deliberately remains separate
+    /// from [`Completion`] and public output blocks. Consumers that persist it
+    /// must buffer it until the following [`ProviderEvent::Completed`] has
+    /// been accepted, because an observer can still reject that terminal event.
+    SettledReasoningSummaries(Vec<ProviderReasoningSummary>),
     ToolCallDelta {
         item_id: String,
         output_index: u64,
@@ -157,6 +163,19 @@ pub enum ProviderEvent {
     Failed {
         kind: ProviderFailureKind,
     },
+}
+
+/// One provider-authored reasoning summary from a settled response.
+///
+/// Item and output coordinates are present only when the provider supplied
+/// them. The terminal output array may be reordered, so callers must not
+/// manufacture a coordinate when it was absent from the stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderReasoningSummary {
+    pub item_id: Option<String>,
+    pub output_index: Option<u64>,
+    pub summary_index: u64,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -885,13 +904,20 @@ impl Provider for ResponsesProvider {
 
     async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
         let budget = OperationBudget::new(self.completion_timeout);
-        let completion = tokio::time::timeout(
+        let settled = tokio::time::timeout(
             self.completion_timeout,
             self.complete_request(request, &budget, sink),
         )
         .await
         .context("Responses request exceeded 600-second total limit")??;
-        sink.emit(ProviderEvent::Completed(completion)).await
+        if !settled.reasoning_summaries.is_empty() {
+            sink.emit(ProviderEvent::SettledReasoningSummaries(
+                settled.reasoning_summaries,
+            ))
+            .await?;
+        }
+        sink.emit(ProviderEvent::Completed(settled.completion))
+            .await
     }
 }
 
@@ -961,7 +987,7 @@ impl ResponsesProvider {
         request: CompletionRequest,
         budget: &OperationBudget,
         sink: &mut dyn ProviderSink,
-    ) -> Result<Completion> {
+    ) -> Result<SettledCompletion> {
         ensure!(
             request.model != "auto",
             "select an explicit model for the Responses provider"
@@ -1079,7 +1105,7 @@ impl ResponsesProvider {
         builder = builder.header(reqwest::header::ACCEPT, "text/event-stream");
         let operation = self.operation(false);
         let response = self.send(builder, operation, budget).await?;
-        let value = sse::response(
+        let response = sse::response(
             response,
             crate::IO_TIMEOUT,
             operation,
@@ -1087,7 +1113,7 @@ impl ResponsesProvider {
             sink,
         )
         .await?;
-        let result = completion(&value, operation)?;
+        let result = completion(&response.value, operation)?;
         if let Some(input_tokens) = result.usage.input_tokens {
             tracing::debug!(
                 target: "kuru.provider",
@@ -1104,15 +1130,23 @@ impl ResponsesProvider {
             Some(Pending {
                 input,
                 native_output_ranges: native_output_ranges.unwrap_or_default(),
-                output: value["output"]
+                output: response.value["output"]
                     .as_array()
                     .context("missing output")?
                     .clone(),
                 calls: result.calls().into_iter().map(|call| call.id).collect(),
             })
         };
-        Ok(result)
+        Ok(SettledCompletion {
+            completion: result,
+            reasoning_summaries: response.reasoning_summaries,
+        })
     }
+}
+
+struct SettledCompletion {
+    completion: Completion,
+    reasoning_summaries: Vec<ProviderReasoningSummary>,
 }
 
 #[cfg(test)]
