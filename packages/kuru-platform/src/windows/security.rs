@@ -727,7 +727,7 @@ mod tests {
     use crate::fs::{Directory, NameRetention, Privacy};
     use std::ffi::OsStr;
     use std::fs::File;
-    use std::io::Write;
+    use std::io::{Read, Seek, Write};
     use std::os::windows::io::{AsHandle, BorrowedHandle};
     use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
 
@@ -1125,7 +1125,7 @@ mod tests {
             .unwrap();
         let mut candidate = private.create_new(OsStr::new("payload")).unwrap();
         candidate.write_all(b"published bytes").unwrap();
-        copy_file_access(&source, &candidate).unwrap();
+        let access = copy_file_access(&source, &candidate).unwrap();
         assert!(owners_equal(&source, &candidate));
         private.revalidate().unwrap();
         assert!(private.read(OsStr::new("payload")).is_err());
@@ -1134,10 +1134,11 @@ mod tests {
             Directory::open(private.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
         assert_eq!(stage.identity(), private.identity());
         parent
-            .publish_file(
+            .publish_file_with_access(
                 &stage,
                 OsStr::new("payload"),
                 &candidate,
+                &access,
                 OsStr::new("published"),
                 Publication::New,
             )
@@ -1146,6 +1147,85 @@ mod tests {
         assert_eq!(
             std::fs::read(project.join("published")).unwrap(),
             b"published bytes"
+        );
+        assert_eq!(security_text(&candidate), original_acl);
+    }
+
+    #[test]
+    fn replacement_retains_private_delete_authority_across_restrictive_target_dacl() {
+        use crate::fs::{Publication, copy_file_access, finalize_file_access, regular_file_info};
+        use windows_sys::Win32::Storage::FileSystem::DELETE;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap();
+        let mut original = parent.create_new(OsStr::new("replace-me")).unwrap();
+        original.write_all(b"old bytes").unwrap();
+        let original_identity = regular_file_info(&original).unwrap().identity;
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        // The file itself deliberately grants no DELETE. The ordinary parent
+        // still grants the current user replacement through DELETE_CHILD.
+        let restrictive = descriptor(&format!("O:{sid}D:P(A;;FRFW;;;{sid})"));
+        set_dacl(&original, restrictive.dacl().unwrap());
+        let original_acl = security_text(&original);
+
+        let stage = parent
+            .create_private_directory(OsStr::new(".kuru-edit-restrictive"))
+            .unwrap();
+        let mut candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        candidate.write_all(b"new bytes").unwrap();
+        let candidate_identity = regular_file_info(&candidate).unwrap().identity;
+        let access = copy_file_access(&original, &candidate).unwrap();
+        assert_eq!(security_text(&candidate), original_acl);
+        // A late handle-only DELETE reopen cannot rely on the parent's
+        // DELETE_CHILD grant and must fail after the restrictive DACL copy.
+        // SAFETY: candidate is a live retained file handle and no successful
+        // handle is expected or adopted by this negative assertion.
+        let late_delete = unsafe {
+            ReOpenFile(
+                candidate.as_raw_handle(),
+                DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if late_delete != INVALID_HANDLE_VALUE {
+            // SAFETY: an unexpected successful ReOpenFile still transfers one
+            // unique handle which this failing fixture must close.
+            drop(unsafe { OwnedHandle::from_raw_handle(late_delete) });
+            panic!("restrictive target DACL unexpectedly grants file DELETE");
+        }
+        let source =
+            Directory::open(stage.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        parent
+            .publish_file_with_access(
+                &source,
+                OsStr::new("payload"),
+                &candidate,
+                &access,
+                OsStr::new("replace-me"),
+                Publication::ReplaceRegular,
+            )
+            .unwrap();
+        finalize_file_access(&original, &candidate).unwrap();
+
+        assert_eq!(
+            regular_file_info(&original).unwrap().identity,
+            original_identity
+        );
+        original.rewind().unwrap();
+        let mut old = Vec::new();
+        original.read_to_end(&mut old).unwrap();
+        assert_eq!(old, b"old bytes");
+        let published = parent.read(OsStr::new("replace-me")).unwrap();
+        assert_eq!(
+            regular_file_info(&published).unwrap().identity,
+            candidate_identity
+        );
+        assert_eq!(
+            std::fs::read(project.join("replace-me")).unwrap(),
+            b"new bytes"
         );
         assert_eq!(security_text(&candidate), original_acl);
     }
@@ -1239,15 +1319,16 @@ mod tests {
             (unsafe { EqualSid(user.sid().unwrap(), default_owner.sid().unwrap()) }) != 0
         };
         assert_eq!(owners_equal(&template, &candidate), default_matches_user);
-        copy_file_access(&template, &candidate).unwrap();
+        let access = copy_file_access(&template, &candidate).unwrap();
         assert!(owners_equal(&template, &candidate));
         let stage =
             Directory::open(private.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
         parent
-            .publish_file(
+            .publish_file_with_access(
                 &stage,
                 OsStr::new("payload"),
                 &candidate,
+                &access,
                 OsStr::new("created"),
                 Publication::New,
             )
@@ -1278,12 +1359,13 @@ mod tests {
         );
 
         let original = parent.create_new(OsStr::new("replace-me")).unwrap();
+        let original_identity = crate::fs::regular_file_info(&original).unwrap().identity;
         let replacement_stage = parent
             .create_private_directory(OsStr::new(".kuru-edit-replacement"))
             .unwrap();
         let mut replacement = replacement_stage.create_new(OsStr::new("payload")).unwrap();
         replacement.write_all(b"replacement").unwrap();
-        copy_file_access(&original, &replacement).unwrap();
+        let access = copy_file_access(&original, &replacement).unwrap();
         let replacement_source = Directory::open(
             replacement_stage.path(),
             Privacy::Inherited,
@@ -1291,14 +1373,27 @@ mod tests {
         )
         .unwrap();
         parent
-            .publish_file(
+            .publish_file_with_access(
                 &replacement_source,
                 OsStr::new("payload"),
                 &replacement,
+                &access,
                 OsStr::new("replace-me"),
                 Publication::ReplaceRegular,
             )
             .unwrap();
+        assert_eq!(
+            crate::fs::regular_file_info(&original).unwrap().identity,
+            original_identity,
+            "retained replaced handle changed identity"
+        );
+        assert_eq!(
+            crate::fs::regular_file_info(&parent.read(OsStr::new("replace-me")).unwrap())
+                .unwrap()
+                .identity,
+            crate::fs::regular_file_info(&replacement).unwrap().identity,
+            "published name does not identify the retained replacement"
+        );
         finalize_file_access(&original, &replacement).unwrap();
         let replacement_before = security_shape(&replacement);
         assert_eq!(replacement_before, security_shape(&template));

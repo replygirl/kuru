@@ -13,13 +13,17 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileDispositionInfo, FileIdInfo,
-    FileStandardInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
-    READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
+    FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
+    FileDispositionInfo, FileIdInfo, FileRenameInfoEx, FileStandardInfo,
+    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, SetFileInformationByHandle,
+    WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
+use windows_sys::Win32::System::WindowsProgramming::{
+    FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+};
 
 pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
     match path.components().next() {
@@ -285,6 +289,27 @@ pub(super) fn copy_file_access(source: &File, staged: &File) -> io::Result<()> {
     // created stages retain WRITE_DAC. Keep the source ACL's protected bit.
     staged.set_permissions(source.metadata()?.permissions())?;
     security::copy_file_dacl(source.as_handle(), staged.as_handle())
+}
+
+pub(super) fn prepare_file_replacement(staged: &File) -> io::Result<Option<File>> {
+    // Capture DELETE while this exact staged object still carries its private
+    // creation DACL. A later copied ordinary DACL may omit file DELETE while
+    // the destination parent still authorizes replacement through DELETE_CHILD.
+    // SAFETY: ReOpenFile derives a new handle from the retained exact object.
+    let replacement = unsafe {
+        ReOpenFile(
+            staged.as_raw_handle(),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if replacement == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful ReOpenFile transfers one unique handle owner.
+    let replacement = unsafe { OwnedHandle::from_raw_handle(replacement) };
+    Ok(Some(File::from(replacement)))
 }
 
 pub(super) fn file_access_token(source: &File) -> io::Result<Vec<u8>> {
@@ -638,24 +663,117 @@ fn remove_regular(
 pub(super) fn publish(
     _: &File,
     source: &Path,
-    _: &File,
+    source_file: &File,
+    prepared_replacement: Option<&File>,
+    destination_parent: &File,
     destination: &Path,
     policy: Publication,
 ) -> Result<(), (PublicationPhase, io::Error)> {
+    if policy == Publication::ReplaceRegular {
+        return replace_open_destination(
+            destination_parent,
+            source_file,
+            prepared_replacement,
+            destination,
+        );
+    }
     let source = wide(source).map_err(|error| (PublicationPhase::Rejected, error))?;
     let destination = wide(destination).map_err(|error| (PublicationPhase::Rejected, error))?;
-    let flags = MOVEFILE_WRITE_THROUGH
-        | if policy == Publication::ReplaceRegular {
-            MOVEFILE_REPLACE_EXISTING
-        } else {
-            0
-        };
+    let flags = MOVEFILE_WRITE_THROUGH;
     // SAFETY: both paths are live, validated local names. Same-volume checks
     // happened before this call; COPY_ALLOWED is deliberately absent. Native
     // write-through publication replaces Unix parent-directory fsync here.
     if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
         // Conservatively retain uncertainty once Windows attempted publication;
         // callers inspect held identity/receipts and never infer a rollback.
+        Err((PublicationPhase::Uncertain, io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+fn replace_open_destination(
+    destination_parent: &File,
+    source: &File,
+    prepared_replacement: Option<&File>,
+    destination: &Path,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    let name = destination.file_name().ok_or_else(|| {
+        (
+            PublicationPhase::Rejected,
+            invalid("missing publication filename"),
+        )
+    })?;
+    let name: Vec<_> = name.encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return Err((
+            PublicationPhase::Rejected,
+            invalid("invalid native publication filename"),
+        ));
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| {
+            (
+                PublicationPhase::Rejected,
+                invalid("native publication filename exceeds bound"),
+            )
+        })?;
+    let record_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| {
+            (
+                PublicationPhase::Rejected,
+                invalid("native publication record exceeds bound"),
+            )
+        })?;
+    let record_len = u32::try_from(record_bytes).map_err(|_| {
+        (
+            PublicationPhase::Rejected,
+            invalid("native publication record exceeds bound"),
+        )
+    })?;
+    let mut record = vec![0usize; record_bytes.div_ceil(size_of::<usize>())];
+    let record_ptr = record.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: the usize-backed buffer is aligned for FILE_RENAME_INFO and is
+    // sized through the complete variable-length UTF-16 FileName field.
+    unsafe {
+        (*record_ptr).Anonymous.Flags =
+            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        (*record_ptr).RootDirectory = destination_parent.as_raw_handle();
+        (*record_ptr).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            record
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(std::mem::offset_of!(FILE_RENAME_INFO, FileName)) as *mut u16,
+            name.len(),
+        );
+    }
+    let reopened = prepared_replacement
+        .is_none()
+        .then(|| prepare_file_replacement(source))
+        .transpose()
+        .map_err(|error| (PublicationPhase::Rejected, error))?
+        .flatten();
+    let renamed = prepared_replacement
+        .or(reopened.as_ref())
+        .expect("Windows replacement handle exists");
+    // SAFETY: renamed is the retained exact source with DELETE access; record
+    // is aligned, initialized and bounded, and its relative target is resolved
+    // through the retained exact destination-parent handle.
+    let status = unsafe {
+        SetFileInformationByHandle(
+            renamed.as_raw_handle(),
+            FileRenameInfoEx,
+            record.as_mut_ptr().cast(),
+            record_len,
+        )
+    };
+    if status == 0 {
         Err((PublicationPhase::Uncertain, io::Error::last_os_error()))
     } else {
         Ok(())
