@@ -11,4 +11,4 @@
 ## 3. Verification
 
 - [x] 3.1 Run formatting, diff checks, strict validation, and relevant all-target compilation
-- [ ] 3.2 Run focused native fixtures locally where supported and record hosted Windows application/install evidence separately
+- [x] 3.2 Run focused native fixtures locally where supported and record hosted Windows application/install evidence separately

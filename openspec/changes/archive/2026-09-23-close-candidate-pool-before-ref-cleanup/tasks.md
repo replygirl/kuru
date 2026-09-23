@@ -11,4 +11,4 @@
 ## 3. Verification
 
 - [x] 3.1 Run focused real-Dolt candidate/runtime checks, formatting, lint, typecheck and strict Cospec gates
-- [ ] 3.2 Record hosted Windows memory/runtime acceptance before archive
+- [x] 3.2 Record hosted Windows memory/runtime acceptance before archive
