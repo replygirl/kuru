@@ -106,8 +106,9 @@ async fn checkpoint_fixture(
 ) -> (TempDir, TempDir, Harness) {
     let project = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();
+    let project_path = project.path().canonicalize().unwrap();
     let root = Arc::new(
-        Directory::open(project.path(), Privacy::Inherited, NameRetention::Pinned).unwrap(),
+        Directory::open(&project_path, Privacy::Inherited, NameRetention::Pinned).unwrap(),
     );
     let tools = ToolHost::with_retained_root(root.clone(), &config)
         .unwrap()
@@ -117,7 +118,7 @@ async fn checkpoint_fixture(
         .unwrap();
     let harness = Harness::with_tool_host(
         config,
-        project.path(),
+        &project_path,
         MemoryStore::temporary().await.unwrap(),
         provider,
         None,

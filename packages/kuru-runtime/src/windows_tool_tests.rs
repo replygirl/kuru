@@ -9,9 +9,10 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use kuru_connectors::Provider;
+use kuru_connectors::{CheckpointStore, Provider, ToolHost};
 use kuru_core::{Completion, CompletionRequest, Config, Mode, ModelInfo, ToolCall};
 use kuru_memory::MemoryStore;
+use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde_json::{Value, json};
 
 use crate::Harness;
@@ -99,6 +100,8 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
     let temporary = tempfile::tempdir()?;
     let project = temporary.path().join("project 日本語");
     std::fs::create_dir(&project)?;
+    let project = project.canonicalize()?;
+    let checkpoint_data = tempfile::tempdir()?;
     let outside = temporary.path().join("outside.txt");
     std::fs::write(&outside, b"outside bytes must survive")?;
     std::fs::hard_link(&outside, project.join("alias"))?;
@@ -185,12 +188,22 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         dream_on_exit: false,
         ..Config::default()
     };
-    let mut harness = Harness::new(
+    let root = Arc::new(Directory::open(
+        &project,
+        Privacy::Inherited,
+        NameRetention::Pinned,
+    )?);
+    let tools =
+        ToolHost::with_retained_root(root.clone(), &config)?.with_checkpoint_store(Arc::new(
+            CheckpointStore::new(&checkpoint_data.path().join("checkpoints"), root)?,
+        ))?;
+    let mut harness = Harness::with_tool_host(
         config,
         &project,
         MemoryStore::temporary().await?,
         replay.clone(),
         None,
+        tools,
     )
     .await?;
     let result = tokio::time::timeout(
