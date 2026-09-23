@@ -20,6 +20,10 @@ pub(super) fn copy_file_access(source: &File, staged: &File) -> io::Result<()> {
     staged.set_permissions(source_info.permissions())
 }
 
+pub(super) fn prepare_file_replacement(_: &File) -> io::Result<Option<File>> {
+    Ok(None)
+}
+
 pub(super) fn finalize_file_access(_: &File, _: &File) -> io::Result<()> {
     Ok(())
 }
@@ -348,6 +352,8 @@ fn remove_children(
 pub(super) fn publish(
     source_parent: &File,
     source: &Path,
+    _: &File,
+    _: Option<&File>,
     destination_parent: &File,
     destination: &Path,
     policy: Publication,

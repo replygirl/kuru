@@ -78,17 +78,28 @@ pub struct FileInfo {
 }
 
 /// Opaque access-policy capture from one retained regular-file handle.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FileAccessToken(Vec<u8>);
+pub struct FileAccessToken {
+    bytes: Vec<u8>,
+    staged_identity: FileIdentity,
+    replacement: Option<File>,
+}
 
 /// Copy the access policy of a checked regular file onto a newly staged file.
 /// Callers must keep the staged file behind a private directory until publish:
 /// this operation can intentionally grant ordinary project access.
 pub fn copy_file_access(source: &File, staged: &File) -> io::Result<FileAccessToken> {
     checked_file(source)?;
-    checked_file(staged)?;
-    let token = FileAccessToken(native::file_access_token(source)?);
+    let staged_identity = checked_file(staged)?.identity;
+    let bytes = native::file_access_token(source)?;
+    // Retain the exact private stage's replacement authority before copying an
+    // ordinary target DACL that may deliberately omit DELETE on the file.
+    let replacement = native::prepare_file_replacement(staged)?;
     native::copy_file_access(source, staged)?;
+    let token = FileAccessToken {
+        bytes,
+        staged_identity,
+        replacement,
+    };
     verify_file_access(source, &token)?;
     Ok(token)
 }
@@ -100,7 +111,7 @@ pub fn verify_file_access(source: &File, expected: &FileAccessToken) -> io::Resu
     if regular_file_info(source)?.links > 1 {
         return Err(denied("access source gained another hardlink"));
     }
-    if native::file_access_token(source)? != expected.0 {
+    if native::file_access_token(source)? != expected.bytes {
         return Err(denied("file access policy changed during publication"));
     }
     Ok(())
@@ -662,7 +673,36 @@ impl Directory {
         destination: &OsStr,
         policy: Publication,
     ) -> Result<(), PublicationError> {
-        self.transfer_file_then((source, name, file), destination, policy, true, || Ok(()))
+        self.transfer_file_then(
+            (source, name, file),
+            destination,
+            policy,
+            true,
+            None,
+            || Ok(()),
+        )
+    }
+
+    /// Publish a staged file whose ordinary access policy was copied through
+    /// [`copy_file_access`]. The opaque token retains the exact private stage's
+    /// narrow Windows replacement authority across that DACL transition.
+    pub fn publish_file_with_access(
+        &self,
+        source: &Directory,
+        name: &OsStr,
+        file: &File,
+        access: &FileAccessToken,
+        destination: &OsStr,
+        policy: Publication,
+    ) -> Result<(), PublicationError> {
+        self.transfer_file_then(
+            (source, name, file),
+            destination,
+            policy,
+            true,
+            Some(access),
+            || Ok(()),
+        )
     }
 
     /// Rename an unchanged existing file without flushing a read-only source.
@@ -677,7 +717,14 @@ impl Directory {
         destination: &OsStr,
         policy: Publication,
     ) -> Result<(), PublicationError> {
-        self.transfer_file_then((source, name, file), destination, policy, false, || Ok(()))
+        self.transfer_file_then(
+            (source, name, file),
+            destination,
+            policy,
+            false,
+            None,
+            || Ok(()),
+        )
     }
 
     fn transfer_file_then(
@@ -686,6 +733,7 @@ impl Directory {
         destination: &OsStr,
         policy: Publication,
         flush_payload: bool,
+        access: Option<&FileAccessToken>,
         after_move: impl FnOnce() -> io::Result<()>,
     ) -> Result<(), PublicationError> {
         let identity = checked_file(file).ok().map(|info| info.identity);
@@ -700,6 +748,11 @@ impl Directory {
         let preflight = || -> io::Result<()> {
             component(destination)?;
             source.verify(name, file)?;
+            if let Some(access) = access
+                && access.staged_identity != checked_file(file)?.identity
+            {
+                return Err(denied("copied access token belongs to another staged file"));
+            }
             if self.privacy == Privacy::OwnerOnly {
                 require_private(file)?;
             }
@@ -733,6 +786,8 @@ impl Directory {
         native::publish(
             &source.anchor().file,
             &source.path().join(name),
+            file,
+            access.and_then(|access| access.replacement.as_ref()),
             &self.anchor().file,
             &target,
             policy,
@@ -792,6 +847,8 @@ impl Directory {
         native::publish(
             parent,
             source.path(),
+            &source.anchor().file,
+            None,
             &self.anchor().file,
             &target,
             Publication::New,
@@ -1061,6 +1118,7 @@ mod tests {
                 OsStr::new("published"),
                 Publication::New,
                 true,
+                None,
                 || {
                     Err(io::Error::other(
                         "controlled completion failure after actual native move",
