@@ -728,6 +728,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs::File;
     use std::io::{Read, Seek, Write};
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsHandle, BorrowedHandle};
     use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
 
@@ -1178,6 +1179,17 @@ mod tests {
         let candidate_identity = regular_file_info(&candidate).unwrap().identity;
         let access = copy_file_access(&original, &candidate).unwrap();
         assert_eq!(security_text(&candidate), original_acl);
+        // The private stage parent initially grants DELETE_CHILD, which can
+        // independently authorize a later DELETE open despite the file DACL.
+        // Remove only that alternative authority in this negative fixture;
+        // the retained pre-copy DELETE handle must still publish the candidate.
+        let stage_dacl = descriptor(&format!("O:{sid}D:P(A;;FRFW;;;{sid})"));
+        let stage_dacl_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(stage.path())
+            .unwrap();
+        set_dacl(&stage_dacl_file, stage_dacl.dacl().unwrap());
         // A late handle-only DELETE reopen cannot rely on the parent's
         // DELETE_CHILD grant and must fail after the restrictive DACL copy.
         // SAFETY: candidate is a live retained file handle and no successful

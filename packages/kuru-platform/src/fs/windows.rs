@@ -10,15 +10,15 @@ use std::path::Prefix;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
+    CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
     FileDispositionInfo, FileIdInfo, FileRenameInfoEx, FileStandardInfo,
     GetFileInformationByHandleEx, GetVolumeInformationByHandleW, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, SetFileInformationByHandle,
-    WRITE_DAC,
+    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, SYNCHRONIZE,
+    SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
 use windows_sys::Win32::System::WindowsProgramming::{
@@ -698,6 +698,40 @@ fn replace_open_destination(
     prepared_replacement: Option<&File>,
     destination: &Path,
 ) -> Result<(), (PublicationPhase, io::Error)> {
+    let expected_parent =
+        info(destination_parent).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if !expected_parent.directory {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("publication parent is not a directory"),
+        ));
+    }
+    // The checked directory's ordinary inspection handle has read rights only.
+    // Rename requires creation authority on the exact retained parent. Reopen
+    // that object by handle before attempting publication, and keep the new
+    // handle live through the synchronous call.
+    let publication_parent = unsafe {
+        ReOpenFile(
+            destination_parent.as_raw_handle(),
+            FILE_ADD_FILE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if publication_parent == INVALID_HANDLE_VALUE {
+        return Err((PublicationPhase::Rejected, io::Error::last_os_error()));
+    }
+    // SAFETY: successful ReOpenFile transfers a unique handle to this scope.
+    let publication_parent =
+        File::from(unsafe { OwnedHandle::from_raw_handle(publication_parent) });
+    let actual_parent =
+        info(&publication_parent).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if !actual_parent.directory || actual_parent.file.identity != expected_parent.file.identity {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("publication parent no longer has the retained identity"),
+        ));
+    }
     let name = destination.file_name().ok_or_else(|| {
         (
             PublicationPhase::Rejected,
@@ -744,7 +778,7 @@ fn replace_open_destination(
     unsafe {
         (*record_ptr).Anonymous.Flags =
             FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
-        (*record_ptr).RootDirectory = destination_parent.as_raw_handle();
+        (*record_ptr).RootDirectory = publication_parent.as_raw_handle();
         (*record_ptr).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
