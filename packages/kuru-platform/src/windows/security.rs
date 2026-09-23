@@ -1155,7 +1155,7 @@ mod tests {
     #[test]
     fn replacement_retains_private_delete_authority_across_restrictive_target_dacl() {
         use crate::fs::{Publication, copy_file_access, finalize_file_access, regular_file_info};
-        use windows_sys::Win32::Storage::FileSystem::DELETE;
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, READ_CONTROL, WRITE_DAC};
 
         let temporary = tempfile::tempdir().unwrap();
         let project = temporary.path().join("project");
@@ -1186,10 +1186,35 @@ mod tests {
         let stage_dacl = descriptor(&format!("O:{sid}D:P(A;;FRFW;;;{sid})"));
         let stage_dacl_file = std::fs::OpenOptions::new()
             .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(stage.path())
             .unwrap();
-        set_dacl(&stage_dacl_file, stage_dacl.dacl().unwrap());
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let mut stage_id = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+        // SAFETY: FileIdInfo writes the entire correctly sized output record
+        // while the directory handle remains live.
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    stage_dacl_file.as_raw_handle(),
+                    FileIdInfo,
+                    stage_id.as_mut_ptr().cast(),
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                )
+            },
+            0,
+            "fixture could not identify its retained stage directory"
+        );
+        // SAFETY: the successful native call initialized the complete record.
+        let stage_id = unsafe { stage_id.assume_init() };
+        let mut stage_identity = [0u8; 24];
+        stage_identity[..8].copy_from_slice(&stage_id.VolumeSerialNumber.to_le_bytes());
+        stage_identity[8..].copy_from_slice(&stage_id.FileId.Identifier);
+        assert_eq!(stage_identity, stage.identity().to_bytes());
+        set_dacl_on_handle(stage_dacl_file.as_handle(), stage_dacl.dacl().unwrap());
         // A late handle-only DELETE reopen cannot rely on the parent's
         // DELETE_CHILD grant and must fail after the restrictive DACL copy.
         // SAFETY: candidate is a live retained file handle and no successful

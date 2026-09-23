@@ -706,24 +706,25 @@ fn replace_open_destination(
             denied("publication parent is not a directory"),
         ));
     }
-    // The checked directory's ordinary inspection handle has read rights only.
-    // Rename requires creation authority on the exact retained parent. Reopen
-    // that object by handle before attempting publication, and keep the new
-    // handle live through the synchronous call.
-    let publication_parent = unsafe {
-        ReOpenFile(
-            destination_parent.as_raw_handle(),
-            FILE_ADD_FILE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    // The checked inspection handle has read rights only. Acquire creation
+    // authority through a fresh directory open, then bind that short-lived
+    // handle to the still-retained exact parent before it can authorize any
+    // rename. A path rebound or reparse point is rejected before mutation.
+    let parent_path = destination.parent().ok_or_else(|| {
+        (
+            PublicationPhase::Rejected,
+            invalid("missing publication parent path"),
         )
-    };
-    if publication_parent == INVALID_HANDLE_VALUE {
-        return Err((PublicationPhase::Rejected, io::Error::last_os_error()));
-    }
-    // SAFETY: successful ReOpenFile transfers a unique handle to this scope.
-    let publication_parent =
-        File::from(unsafe { OwnedHandle::from_raw_handle(publication_parent) });
+    })?;
+    let publication_parent = open(
+        parent_path,
+        FILE_ADD_FILE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NameRetention::Movable,
+        None,
+    )
+    .map_err(|error| (PublicationPhase::Rejected, error))?;
     let actual_parent =
         info(&publication_parent).map_err(|error| (PublicationPhase::Rejected, error))?;
     if !actual_parent.directory || actual_parent.file.identity != expected_parent.file.identity {
