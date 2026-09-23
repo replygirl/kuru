@@ -45,6 +45,8 @@ impl Sandbox {
     }
     fn command_for(&self, provider: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+        #[cfg(windows)]
+        command.fixture_allow_independent_service();
         command
             .arg("-C")
             .arg(&self.project)

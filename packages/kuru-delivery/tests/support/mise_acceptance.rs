@@ -261,13 +261,129 @@ impl Server {
 }
 
 struct Installation {
-    _root: tempfile::TempDir,
     root: PathBuf,
     project: PathBuf,
     mise: PathBuf,
     env: Vec<(OsString, OsString)>,
     kuru_data: PathBuf,
     engine_cache: PathBuf,
+    memory_cleanup: MiseMemoryCleanup,
+}
+
+struct MiseMemoryCleanup {
+    root: Option<tempfile::TempDir>,
+    options: Option<kuru_memory::OpenOptions>,
+}
+
+impl MiseMemoryCleanup {
+    fn new(root: tempfile::TempDir) -> Self {
+        Self {
+            root: Some(root),
+            options: None,
+        }
+    }
+
+    fn arm(&mut self, options: kuru_memory::OpenOptions) {
+        assert!(self.options.is_none(), "mise memory cleanup already armed");
+        self.options = Some(options);
+    }
+
+    async fn finish(&mut self) -> Result<()> {
+        let Some(options) = self.options.take() else {
+            return Ok(());
+        };
+        if let Err(error) = kuru_memory::test_support::retire_idle_service(&options).await {
+            let retained = self.retain();
+            return Err(error).context(format!(
+                "retire native mise fixture memory owner; fixture root retained in place at {retained:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn retain_after_error(&mut self) -> (PathBuf, Option<anyhow::Error>) {
+        let retirement = if let Some(options) = self.options.take() {
+            kuru_memory::test_support::retire_idle_service(&options)
+                .await
+                .err()
+        } else {
+            None
+        };
+        (self.retain(), retirement)
+    }
+
+    fn retire_blocking(&mut self) -> Result<()> {
+        let Some(options) = self.options.take() else {
+            return Ok(());
+        };
+        std::thread::Builder::new()
+            .name("kuru-mise-memory-cleanup".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("create native mise cleanup runtime")?;
+                runtime.block_on(async move {
+                    kuru_memory::test_support::retire_idle_service(&options)
+                        .await
+                        .context("retire native mise fixture memory owner")
+                })
+            })?
+            .join()
+            .map_err(|_| anyhow::anyhow!("native mise memory cleanup thread panicked"))?
+    }
+
+    fn retain(&mut self) -> PathBuf {
+        self.root
+            .take()
+            .expect("native mise fixture root retained before cleanup")
+            .keep()
+    }
+
+    fn retain_if_owned(&mut self) -> Option<PathBuf> {
+        self.root.take().map(tempfile::TempDir::keep)
+    }
+}
+
+impl Drop for MiseMemoryCleanup {
+    fn drop(&mut self) {
+        let abandoned = self.options.is_some();
+        let panicking = std::thread::panicking();
+        let retirement = self.retire_blocking();
+        let retained = if abandoned || panicking || retirement.is_err() {
+            self.retain_if_owned()
+        } else {
+            None
+        };
+        if panicking {
+            let retained = retained
+                .as_ref()
+                .map_or_else(|| "already retained".to_owned(), |path| format!("{path:?}"));
+            if let Err(error) = retirement {
+                eprintln!(
+                    "native mise memory cleanup failed while preserving the original panic; fixture root retained in place at {retained}: {error:#}"
+                );
+            } else {
+                eprintln!(
+                    "native mise fixture failed; fixture root retained in place at {retained}"
+                );
+            }
+        } else if let Err(error) = retirement {
+            let retained = retained
+                .as_ref()
+                .map_or_else(|| "already retained".to_owned(), |path| format!("{path:?}"));
+            panic!(
+                "native mise memory cleanup failed; fixture root retained in place at {retained}: {error:#}"
+            );
+        } else if abandoned {
+            let retained = retained
+                .as_ref()
+                .map_or_else(|| "already retained".to_owned(), |path| format!("{path:?}"));
+            eprintln!(
+                "native mise conversation was cancelled; authenticated memory retirement completed and fixture root was retained in place at {retained}"
+            );
+        }
+    }
 }
 
 impl Installation {
@@ -301,17 +417,18 @@ impl Installation {
         )?;
         let kuru_data = root.join("cold-kuru-data");
         Ok(Self {
-            _root: temporary,
             root,
             project,
             mise: mise.to_owned(),
             env,
             kuru_data,
             engine_cache,
+            memory_cleanup: MiseMemoryCleanup::new(temporary),
         })
     }
     fn command(&self) -> Command {
         let mut command = Command::new(&self.mise);
+        command.fixture_allow_independent_service();
         command.env_clear().current_dir(&self.project);
         for (name, value) in &self.env {
             command.env(name, value);
@@ -385,11 +502,42 @@ impl Installation {
         );
         Ok(serde_json::from_slice(&output.stdout)?)
     }
-    async fn conversation(&self, binary: &Path) -> Result<()> {
+    fn memory_options(&self, binary: &Path, scope: String) -> kuru_memory::OpenOptions {
+        let mut options = kuru_memory::OpenOptions::new(self.kuru_data.clone(), scope);
+        options.config = kuru_core::MemoryConfig {
+            offline: true,
+            cache_dir: Some(self.engine_cache.clone()),
+            ..Default::default()
+        };
+        options.supervisor = Some(binary.to_owned());
+        options
+    }
+
+    async fn conversation(&mut self, binary: &Path) -> Result<()> {
         ensure!(
             !self.engine_cache.exists() && !self.kuru_data.exists(),
             "mise runtime fixture is not cold"
         );
+        let scope = kuru_runtime::project_scope(&self.project)?;
+        self.memory_cleanup
+            .arm(self.memory_options(binary, scope.clone()));
+        let result = self.conversation_inner(binary, &scope).await;
+        match result {
+            Ok(()) => self.memory_cleanup.finish().await,
+            Err(error) => {
+                let (retained, retirement) = self.memory_cleanup.retain_after_error().await;
+                let cleanup = retirement.map_or_else(
+                    || "authenticated memory retirement completed".to_owned(),
+                    |cleanup| format!("authenticated memory retirement also failed: {cleanup:#}"),
+                );
+                Err(error.context(format!(
+                    "native mise conversation failed; {cleanup}; fixture root retained in place at {retained:?}"
+                )))
+            }
+        }
+    }
+
+    async fn conversation_inner(&self, binary: &Path, scope: &str) -> Result<()> {
         let marker = "mise native cold marker violet-837";
         let first = self.kuru(&["run", marker, "--json"]).await?;
         let session = first["session"].as_str().context("first session ID")?;
@@ -432,15 +580,8 @@ impl Installation {
                 "conversation revision absent from history"
             );
         }
-        let scope = kuru_runtime::project_scope(&self.project)?;
-        let mut options = kuru_memory::OpenOptions::new(self.kuru_data.clone(), scope.clone());
-        options.config = kuru_core::MemoryConfig {
-            offline: true,
-            cache_dir: Some(self.engine_cache.clone()),
-            ..Default::default()
-        };
+        let mut options = self.memory_options(binary, scope.to_owned());
         options.read_only = true;
-        options.supervisor = Some(binary.to_owned());
         let store = kuru_memory::MemoryStore::open(options).await?;
         let transcript = store
             .history(&format!("{scope}/transcript/{session}"), 100)
@@ -542,7 +683,7 @@ async fn run_archive(bytes: Vec<u8>, expected: String) -> Result<()> {
     .enumerate()
     {
         let server = Server::new(&bytes, scenario).await?;
-        let installed = Installation::new(&mise, &server.base)?;
+        let mut installed = Installation::new(&mise, &server.base)?;
         ensure!(
             installed
                 .success(&["--version"])

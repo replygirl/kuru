@@ -8,7 +8,7 @@ use anyhow::Context as _;
 /// maintenance step rather than leave independent Dolt processes accumulating
 /// across the parallel application suite.
 pub struct ServiceCleanup {
-    data: PathBuf,
+    data: Vec<PathBuf>,
     root: Option<tempfile::TempDir>,
     pending: bool,
 }
@@ -16,7 +16,7 @@ pub struct ServiceCleanup {
 impl ServiceCleanup {
     pub fn new(root: tempfile::TempDir, data: &Path) -> Self {
         Self {
-            data: data.to_owned(),
+            data: vec![data.to_owned()],
             root: Some(root),
             pending: true,
         }
@@ -28,6 +28,15 @@ impl ServiceCleanup {
     )]
     pub fn path(&self) -> &Path {
         self.root.as_ref().expect("fixture root retained").path()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "only fixtures with more than one managed data root use this extension"
+    )]
+    pub fn add_data(&mut self, data: &Path) {
+        assert!(self.pending, "cannot extend completed fixture cleanup");
+        self.data.push(data.to_owned());
     }
 
     pub fn finish(&mut self) -> anyhow::Result<()> {
@@ -48,36 +57,37 @@ impl ServiceCleanup {
     }
 
     fn retire(&self) -> anyhow::Result<()> {
-        let memory = self.data.join("memory");
-        let entries = match std::fs::read_dir(&memory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect fixture memory root {memory:?}"));
-            }
-        };
-        let mut scopes = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
+        let mut projects = Vec::new();
+        for data in &self.data {
+            let memory = data.join("memory");
+            let entries = match std::fs::read_dir(&memory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspect fixture memory root {memory:?}"));
+                }
             };
-            if entry.file_type()?.is_dir()
-                && name.len() == 64
-                && name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                scopes.push(format!("project/{name}"));
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if entry.file_type()?.is_dir()
+                    && name.len() == 64
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    projects.push((data.clone(), format!("project/{name}")));
+                }
             }
         }
-        if scopes.is_empty() {
+        if projects.is_empty() {
             return Ok(());
         }
-        scopes.sort();
-        let data = self.data.clone();
+        projects.sort();
         std::thread::Builder::new()
             .name("kuru-fixture-memory-cleanup".into())
             .spawn(move || {
@@ -86,8 +96,8 @@ impl ServiceCleanup {
                     .build()
                     .context("create managed-memory cleanup runtime")?;
                 runtime.block_on(async move {
-                    for scope in scopes {
-                        let options = kuru_memory::OpenOptions::new(data.clone(), scope);
+                    for (data, scope) in projects {
+                        let options = kuru_memory::OpenOptions::new(data, scope);
                         kuru_memory::test_support::retire_idle_service(&options)
                             .await
                             .with_context(|| {
