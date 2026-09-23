@@ -11,6 +11,7 @@ use kuru_core::{ContentBlock, MemoryConfig, Message};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{Connection, MySqlConnection, MySqlPool, Row};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use uuid::Uuid;
@@ -105,6 +106,10 @@ struct Pending {
 #[derive(Clone, Debug)]
 enum Receipt {
     Operation(String),
+    CandidateCreation {
+        branch: String,
+        base: String,
+    },
     Promotion {
         base: String,
         target: String,
@@ -131,9 +136,30 @@ pub struct MemoryStore {
     shared: Arc<Shared>,
     pool: Arc<MySqlPool>,
     branch: String,
+    logical_receipt: Option<LogicalReceipt>,
 }
-pub type MemoryView = MemoryStore;
 
+/// Compact request identity for one server-dispatched mutation. The branch is
+/// pinned by the store view; this does not grant cross-branch UUID authority.
+#[derive(Clone, Debug)]
+pub(crate) struct LogicalReceipt {
+    physical_id: String,
+    method: String,
+    digest: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct LogicalReceiptConflict;
+
+impl std::fmt::Display for LogicalReceiptConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "logical mutation ID conflicts with a different operation on this memory view",
+        )
+    }
+}
+
+impl std::error::Error for LogicalReceiptConflict {}
 /// One durable message row with its stable store sequence.
 ///
 /// Callers that present selected active notes use the sequence only with an
@@ -161,6 +187,35 @@ pub struct Candidate {
     base: String,
     promoted: Arc<StdMutex<Option<String>>>,
 }
+
+pub(crate) enum CandidateLookup {
+    Open(Box<Candidate>),
+    Resolved,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateTransitionObservation {
+    Promoted,
+    Abandoned,
+    OpenUnchanged,
+    OpenConflict,
+    Indeterminate,
+}
+
+/// A validated candidate cannot fast-forward after another writer moves main.
+/// The service maps this one domain error without exposing private SQL detail.
+#[derive(Debug)]
+pub(crate) struct CandidateConflict;
+
+impl std::fmt::Display for CandidateConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("dream candidate is stale: live memory changed since its base")
+    }
+}
+
+impl std::error::Error for CandidateConflict {}
+
 impl Candidate {
     pub fn view(&self) -> MemoryStore {
         self.view.clone()
@@ -169,19 +224,36 @@ impl Candidate {
         &self.base
     }
     pub async fn promote(&self) -> Result<String> {
+        self.promote_checked(None).await
+    }
+
+    pub(crate) async fn promote_exact(&self, expected_target: &str) -> Result<String> {
+        self.promote_checked(Some(expected_target)).await
+    }
+
+    async fn promote_checked(&self, expected_target: Option<&str>) -> Result<String> {
         if let Some(target) = self.promoted.lock().expect("candidate result lock").clone() {
+            ensure!(
+                expected_target.is_none_or(|expected| expected == target),
+                CandidateConflict
+            );
             return Ok(target);
         }
         self.live.writable()?;
         let guard = self.live.shared.write.clone().lock_owned().await;
         self.live.resolve_uncertain().await?;
         if let Some(target) = self.promoted.lock().expect("candidate result lock").clone() {
+            ensure!(
+                expected_target.is_none_or(|expected| expected == target),
+                CandidateConflict
+            );
             return Ok(target);
         }
         let live = self.live.clone();
         let base = self.base.clone();
         let promoted = self.promoted.clone();
         let names = CandidateNames::from_open(&self.view.branch)?;
+        let expected_target = expected_target.map(str::to_owned);
         // Keep accepted promotion alive if the UI cancels while awaiting its reply.
         tokio::spawn(async move {
             let _guard = guard;
@@ -190,6 +262,12 @@ impl Candidate {
                 !before.contains_key(&names.abandoned),
                 "dream candidate was already abandoned"
             );
+            if let Some(expected) = &expected_target {
+                ensure!(
+                    !before.is_empty() && before.values().all(|head| head == expected),
+                    CandidateConflict
+                );
+            }
             let current = live.revision().await?;
             let target = match before.get(&names.promoting) {
                 Some(target) => {
@@ -201,10 +279,9 @@ impl Candidate {
                         .get(&names.open)
                         .context("dream candidate ref is missing")?
                         .clone();
-                    ensure!(
-                        current == base,
-                        "dream candidate is stale: live memory changed since its base"
-                    );
+                    if current != base {
+                        return Err(CandidateConflict.into());
+                    }
                     ensure_branch_clean(&live, &names.open).await?;
                     transition_candidate(&live, &names.open, &names.promoting, &target).await?;
                     target
@@ -215,10 +292,9 @@ impl Candidate {
                 let _ = cleanup_promoted_candidate(&live, &names, &target).await;
                 return Ok(target);
             }
-            ensure!(
-                current == base,
-                "dream candidate is stale: live memory changed since its base"
-            );
+            if current != base {
+                return Err(CandidateConflict.into());
+            }
             let (mut connection, id) = owned_connection(&live.pool).await?;
             *live.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: live.pool.clone(),
@@ -250,6 +326,14 @@ impl Candidate {
     }
 
     pub async fn abandon(&self) -> Result<()> {
+        self.abandon_checked(None).await
+    }
+
+    pub(crate) async fn abandon_exact(&self, expected_target: &str) -> Result<()> {
+        self.abandon_checked(Some(expected_target)).await
+    }
+
+    async fn abandon_checked(&self, expected_target: Option<&str>) -> Result<()> {
         if self
             .promoted
             .lock()
@@ -262,12 +346,24 @@ impl Candidate {
         let live = self.live.clone();
         let promoted = self.promoted.clone();
         let names = CandidateNames::from_open(&self.view.branch)?;
+        let expected_target = expected_target.map(str::to_owned);
         tokio::spawn(async move {
             let guard = live.shared.write.clone().lock_owned().await;
             let _guard = guard;
             live.resolve_uncertain().await?;
             if promoted.lock().expect("candidate result lock").is_some() {
                 return Ok(());
+            }
+            if let Some(expected) = &expected_target {
+                let heads = candidate_heads(&live.pool, &names).await?;
+                ensure!(
+                    heads.values().all(|head| head == expected),
+                    CandidateConflict
+                );
+                ensure!(
+                    !heads.is_empty(),
+                    "candidate ref is missing before abandonment"
+                );
             }
             abandon_candidate(&live, &names).await
         })
@@ -616,7 +712,7 @@ async fn abandon_candidate(store: &MemoryStore, names: &CandidateNames) -> Resul
     cleanup_abandoned_candidate(store, names, &target, &heads).await
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Revision {
     pub hash: String,
     pub message: String,
@@ -652,11 +748,135 @@ mod migrations;
 pub(crate) mod purge;
 mod usage_ledger;
 pub use export::{ActiveExportSnapshot, ExportCursor, ExportPage, ExportProvenance, StorageRecord};
-pub use usage_ledger::UsageLedger;
+pub use usage_ledger::{UsageLedger, UsageProof};
 
 impl MemoryStore {
     pub(crate) fn service_instance(&self) -> &str {
         self.shared.server.instance()
+    }
+
+    pub(crate) fn pinned_view(&self) -> &str {
+        &self.branch
+    }
+
+    /// Attach a caller-retained identity to this one view clone. The compact
+    /// digest binds the method, pinned branch, store and encoded arguments;
+    /// no request body is copied into the receipt row.
+    pub(crate) fn with_logical_receipt(
+        &self,
+        id: Uuid,
+        method: &'static str,
+        encoded_arguments: &[u8],
+    ) -> Self {
+        let argument_digest = Sha256::digest(encoded_arguments);
+        let argument_digest = argument_digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let logical = self.logical_receipt_for_view(&self.branch, id, method, &argument_digest);
+        let mut view = self.clone();
+        view.logical_receipt = Some(logical);
+        view
+    }
+
+    fn logical_receipt_for_view(
+        &self,
+        branch: &str,
+        id: Uuid,
+        method: &str,
+        argument_digest: &str,
+    ) -> LogicalReceipt {
+        let mut hash = Sha256::new();
+        for field in [
+            b"kuru-memory-operation-v1".as_slice(),
+            self.shared.server.instance().as_bytes(),
+            branch.as_bytes(),
+            method.as_bytes(),
+            argument_digest.as_bytes(),
+        ] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field);
+        }
+        let digest = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        // Dolt branches inherit the operation rows present at their base.
+        // Mapping the caller UUID through the pinned view gives each branch a
+        // distinct physical PK, even when an inherited main receipt has the
+        // same logical UUID. The original UUID remains the query/retry key.
+        let mut physical = Sha256::new();
+        for field in [
+            b"kuru-memory-receipt-view-v1".as_slice(),
+            self.shared.server.instance().as_bytes(),
+            branch.as_bytes(),
+            id.as_bytes(),
+        ] {
+            physical.update((field.len() as u64).to_be_bytes());
+            physical.update(field);
+        }
+        let physical_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, &physical.finalize()).to_string();
+        LogicalReceipt {
+            physical_id,
+            method: method.to_owned(),
+            digest,
+        }
+    }
+
+    /// Inspect only the indexed row for an exact original view. A candidate
+    /// receipt may still be on its open/status ref or may have reached main by
+    /// checked promotion; another view's inherited rows never prove it.
+    pub(crate) async fn indexed_logical_outcome(
+        &self,
+        branch: &str,
+        id: Uuid,
+        method: &str,
+        argument_digest: &str,
+    ) -> Result<Option<bool>> {
+        self.readable()?;
+        ensure!(
+            !method.is_empty() && method.len() <= 64 && method.is_ascii(),
+            "invalid logical mutation method"
+        );
+        ensure!(
+            argument_digest.len() == 64
+                && argument_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid logical mutation argument digest"
+        );
+        let names = if branch == "main" {
+            None
+        } else {
+            Some(CandidateNames::from_open(branch)?)
+        };
+        let _guard = self.shared.write.lock().await;
+        self.resolve_uncertain().await?;
+        let expected = self.logical_receipt_for_view(branch, id, method, argument_digest);
+        if operation_receipt_matches(&self.pool, &expected).await? {
+            return Ok(Some(true));
+        }
+        if let Some(names) = names {
+            let heads = candidate_heads(&self.pool, &names).await?;
+            if heads.is_empty() {
+                // A formerly writable candidate may have been explicitly
+                // abandoned and reclaimed. A missing ref cannot prove its
+                // earlier accepted write never committed on that view.
+                return Ok(None);
+            }
+            for branch in [&names.open, &names.promoting, &names.abandoned] {
+                if heads.contains_key(branch) {
+                    let pool = self.shared.server.pool(branch).await?;
+                    let found = operation_receipt_matches(&pool, &expected).await;
+                    pool.close().await;
+                    if found? {
+                        return Ok(Some(true));
+                    }
+                }
+            }
+        }
+        Ok(Some(false))
     }
 
     pub fn exists(data_dir: &Path, project_scope: &str) -> Result<bool> {
@@ -997,6 +1217,7 @@ impl MemoryStore {
             shared,
             pool,
             branch: "main".into(),
+            logical_receipt: None,
         };
         if !options.read_only {
             run_candidate_recovery_worker(&store).await?;
@@ -1067,6 +1288,7 @@ impl MemoryStore {
             shared: self.shared.clone(),
             pool,
             branch: usage_ledger::BRANCH.into(),
+            logical_receipt: self.logical_receipt.clone(),
         }))
     }
 
@@ -1343,11 +1565,24 @@ impl MemoryStore {
         self.writable()?;
         let guard = self.shared.write.clone().lock_owned().await;
         self.resolve_uncertain().await?;
+        if let Some(receipt) = &self.logical_receipt {
+            ensure!(
+                self.schema_version().await? == migrations::CURRENT_VERSION,
+                "logical mutation receipts require upgraded writable memory"
+            );
+            if operation_receipt_matches(&self.pool, receipt).await? {
+                return Ok(());
+            }
+        }
         let store = self.clone();
         let label = label.to_owned();
         tokio::spawn(async move {
             let _guard = guard;
-            let operation = Uuid::new_v4().to_string();
+            let logical = store.logical_receipt.clone();
+            let operation = logical.as_ref().map_or_else(
+                || Uuid::new_v4().to_string(),
+                |receipt| receipt.physical_id.clone(),
+            );
             let (mut connection, id) = owned_connection(&store.pool).await?;
             *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
                 pool: store.pool.clone(),
@@ -1356,7 +1591,13 @@ impl MemoryStore {
             });
             let result = tokio::time::timeout(
                 QUERY_TIMEOUT,
-                apply(&mut connection, &operation, &label, mutation),
+                apply(
+                    &mut connection,
+                    &operation,
+                    &label,
+                    mutation,
+                    logical.as_ref(),
+                ),
             )
             .await;
             drop(connection);
@@ -1387,6 +1628,21 @@ impl MemoryStore {
             let committed = match pending.receipt {
                 Receipt::Operation(operation) => {
                     operation_exists(&pending.pool, &operation).await?
+                }
+                Receipt::CandidateCreation { branch, base } => {
+                    let names = CandidateNames::from_open(&branch)?;
+                    let heads = candidate_heads(&pending.pool, &names).await?;
+                    ensure!(
+                        !heads.contains_key(&names.promoting)
+                            && !heads.contains_key(&names.abandoned),
+                        "candidate creation gained a status ref before settling"
+                    );
+                    if let Some(head) = heads.get(&branch) {
+                        ensure!(head == &base, "candidate creation changed its base head");
+                        true
+                    } else {
+                        false
+                    }
                 }
                 Receipt::Promotion { base, target } => {
                     let observed = revision(&pending.pool).await?;
@@ -1455,26 +1711,157 @@ impl MemoryStore {
         self.resolve_uncertain().await
     }
     pub async fn begin_candidate(&self, label: &str) -> Result<Candidate> {
+        self.begin_candidate_with_id(label, Uuid::new_v4()).await
+    }
+
+    pub(crate) async fn begin_candidate_with_id(&self, label: &str, id: Uuid) -> Result<Candidate> {
         self.writable()?;
         identifier("candidate label", label, 128)?;
+        let guard = self.shared.write.clone().lock_owned().await;
+        self.resolve_uncertain().await?;
+        let branch = self.candidate_branch_for_id(id);
+        let names = CandidateNames::from_open(&branch)?;
+        let heads = candidate_heads(&self.pool, &names).await?;
+        ensure!(
+            heads.is_empty(),
+            "candidate creation identity already has a durable ref; inspect its exact outcome"
+        );
+        let base = self.revision().await?;
+        let worker = self.clone();
+        let created_branch = branch.clone();
+        let created_base = base.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let (mut connection, connection_id) = owned_connection(&worker.pool).await?;
+            *worker.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
+                pool: worker.pool.clone(),
+                connection: connection_id,
+                receipt: Receipt::CandidateCreation {
+                    branch: created_branch.clone(),
+                    base: created_base.clone(),
+                },
+            });
+            let result = tokio::time::timeout(
+                QUERY_TIMEOUT,
+                sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                    .bind(&created_branch)
+                    .bind(&created_base)
+                    .fetch_all(&mut connection),
+            )
+            .await;
+            drop(connection);
+            if worker.resolve_uncertain().await? == Some(true) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            result.context("candidate creation deadline exceeded")??;
+            bail!("candidate creation did not retain its exact ref")
+        })
+        .await
+        .context("candidate creation worker failed")??;
+        self.candidate_from_branch(branch, base).await
+    }
+
+    /// Read only the caller-derived branch identity. This never invokes branch
+    /// creation, even when the original creation reply was lost.
+    pub(crate) async fn candidate_for_id(&self, id: Uuid) -> Result<CandidateLookup> {
+        self.readable()?;
         let _guard = self.shared.write.lock().await;
         self.resolve_uncertain().await?;
-        let base = self.revision().await?;
-        let branch = format!("candidate_{}", Uuid::new_v4().simple());
-        tokio::time::timeout(
+        let branch = self.candidate_branch_for_id(id);
+        let names = CandidateNames::from_open(&branch)?;
+        let heads = candidate_heads(&self.pool, &names).await?;
+        if heads.contains_key(&names.promoting) || heads.contains_key(&names.abandoned) {
+            return Ok(CandidateLookup::Resolved);
+        }
+        if !heads.contains_key(&branch) {
+            return Ok(CandidateLookup::Missing);
+        }
+        // For an unresolved open ref, main remains an append-only history.
+        // Its exact common ancestor is the original candidate creation base,
+        // including after both heads advance. A resolved ref is rejected above.
+        let base = tokio::time::timeout(
             QUERY_TIMEOUT,
-            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+            sqlx::query_scalar::<_, String>("SELECT DOLT_MERGE_BASE(?, ?)")
                 .bind(&branch)
-                .bind(&base)
-                .fetch_all(self.pool.as_ref()),
+                .bind("main")
+                .fetch_one(self.pool.as_ref()),
         )
         .await
-        .context("candidate creation deadline exceeded")??;
+        .context("candidate creation-base lookup deadline exceeded")??;
+        Ok(CandidateLookup::Open(Box::new(
+            self.candidate_from_branch(branch, base).await?,
+        )))
+    }
+
+    /// Read-only transition proof for a branch and revisions captured before
+    /// dispatch. Reclaimed refs without a unique result stay indeterminate;
+    /// merely losing a connection never authorizes candidate deletion.
+    pub(crate) async fn candidate_transition_observation(
+        &self,
+        branch: &str,
+        base: &str,
+        target: &str,
+    ) -> Result<CandidateTransitionObservation> {
+        self.readable()?;
+        let _guard = self.shared.write.lock().await;
+        self.resolve_uncertain().await?;
+        let names = CandidateNames::from_open(branch)?;
+        let heads = candidate_heads(&self.pool, &names).await?;
+        let matching = |name: &str| heads.get(name).is_some_and(|head| head == target);
+        if heads.values().any(|head| head != target) {
+            return Ok(CandidateTransitionObservation::Indeterminate);
+        }
+        if matching(&names.abandoned) {
+            return Ok(CandidateTransitionObservation::Abandoned);
+        }
+        let current = self.revision().await?;
+        let target_is_ancestor = if current == target {
+            Some(true)
+        } else {
+            match tokio::time::timeout(
+                QUERY_TIMEOUT,
+                sqlx::query_scalar::<_, String>("SELECT DOLT_MERGE_BASE(?, ?)")
+                    .bind(target)
+                    .bind(&current)
+                    .fetch_one(self.pool.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(ancestor)) => Some(ancestor == target),
+                Ok(Err(_)) | Err(_) => None,
+            }
+        };
+        if target != base && target_is_ancestor == Some(true) {
+            return Ok(CandidateTransitionObservation::Promoted);
+        }
+        if matching(&names.promoting) {
+            return Ok(CandidateTransitionObservation::Indeterminate);
+        }
+        if matching(&names.open) {
+            return Ok(if current == base {
+                CandidateTransitionObservation::OpenUnchanged
+            } else {
+                CandidateTransitionObservation::OpenConflict
+            });
+        }
+        // Once the service has proven the original worker completed or the
+        // previous owner was reaped, a missing exact ref with a candidate-only
+        // commit outside main's ancestry is an abandoned result. An unchanged
+        // candidate (target == base) has no distinguishable history here.
+        Ok(if target != base && target_is_ancestor == Some(false) {
+            CandidateTransitionObservation::Abandoned
+        } else {
+            CandidateTransitionObservation::Indeterminate
+        })
+    }
+
+    async fn candidate_from_branch(&self, branch: String, base: String) -> Result<Candidate> {
         let pool = self.shared.server.pool(&branch).await?;
         let view = Self {
             shared: self.shared.clone(),
             pool,
             branch,
+            logical_receipt: None,
         };
         Ok(Candidate {
             live: self.clone(),
@@ -1482,6 +1869,22 @@ impl MemoryStore {
             base,
             promoted: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    pub(crate) fn candidate_branch_for_id(&self, id: Uuid) -> String {
+        let mut hash = Sha256::new();
+        for field in [
+            b"kuru-memory-candidate-creation-v1".as_slice(),
+            self.shared.server.instance().as_bytes(),
+            id.as_bytes(),
+        ] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field);
+        }
+        format!(
+            "{CANDIDATE_PREFIX}{}",
+            Uuid::new_v5(&Uuid::NAMESPACE_OID, &hash.finalize()).simple()
+        )
     }
 
     async fn recover_candidates(&self) -> Result<()> {
@@ -1758,6 +2161,7 @@ async fn apply(
     operation: &str,
     label: &str,
     mutation: Mutation,
+    logical: Option<&LogicalReceipt>,
 ) -> Result<()> {
     let mut transaction = connection.begin().await?;
     match mutation {
@@ -1829,17 +2233,37 @@ async fn apply(
             );
         }
     }
-    // The serialized caller has reconciled the previous receipt before this
-    // transaction. Replace only active operational receipts; historical Dolt
-    // revisions and all user messages, notes and journal state remain intact.
-    sqlx::query("DELETE FROM operations")
-        .execute(&mut *transaction)
+    // Historical candidate views keep their committed schema and sole-receipt
+    // behavior. Current writable views retain every indexed receipt so a later
+    // sibling mutation cannot erase evidence of an accepted operation.
+    let version: i32 = sqlx::query_scalar("SELECT version FROM kuru_schema WHERE id = 1")
+        .fetch_one(&mut *transaction)
         .await?;
-    sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
-        .bind(operation)
-        .bind(label)
-        .execute(&mut *transaction)
-        .await?;
+    if version <= 3 {
+        sqlx::query("DELETE FROM operations")
+            .execute(&mut *transaction)
+            .await?;
+    } else {
+        ensure!(
+            version == migrations::CURRENT_VERSION,
+            "unsupported writable memory schema version {version}"
+        );
+    }
+    if let Some(receipt) = logical {
+        sqlx::query("INSERT INTO operations (id, label, receipt_format, method, request_digest) VALUES (?, ?, 1, ?, ?)")
+            .bind(operation)
+            .bind(label)
+            .bind(&receipt.method)
+            .bind(&receipt.digest)
+            .execute(&mut *transaction)
+            .await?;
+    } else {
+        sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
+            .bind(operation)
+            .bind(label)
+            .execute(&mut *transaction)
+            .await?;
+    }
     sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
         .bind(format!("{label} [{operation}]"))
         .bind(AUTHOR)
@@ -1942,6 +2366,28 @@ async fn operation_exists(pool: &MySqlPool, operation: &str) -> Result<bool> {
     .await
     .context("memory reconciliation deadline exceeded")??;
     Ok(result.is_some())
+}
+
+async fn operation_receipt_matches(pool: &MySqlPool, expected: &LogicalReceipt) -> Result<bool> {
+    let row: Option<(i8, Option<String>, Option<String>)> = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_as(
+            "SELECT receipt_format, method, request_digest FROM operations WHERE id = ? LIMIT 2",
+        )
+        .bind(&expected.physical_id)
+        .fetch_optional(pool),
+    )
+    .await
+    .context("logical mutation receipt lookup deadline exceeded")??;
+    match row {
+        None => Ok(false),
+        Some((1, Some(method), Some(digest)))
+            if method == expected.method && digest == expected.digest =>
+        {
+            Ok(true)
+        }
+        Some(_) => Err(LogicalReceiptConflict.into()),
+    }
 }
 async fn revision(pool: &MySqlPool) -> Result<String> {
     Ok(tokio::time::timeout(
@@ -2319,7 +2765,107 @@ pub(crate) fn test_supervisor() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::rpc::ViewOperation;
+    use crate::service::{self, ServiceCall, ServiceValue};
     use serde_json::json;
+    use sha2::Digest;
+
+    #[tokio::test]
+    async fn service_disconnect_and_owner_restart_preserve_unresolved_candidate() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = sha2::Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let served = tokio::spawn(owner.serve());
+            let mut client = service::attach_existing(&options, &project)
+                .await?
+                .context("service endpoint did not admit a candidate client")?;
+            let ServiceValue::CandidateStarted { handle, .. } = client
+                .call(ServiceCall::BeginCandidate {
+                    label: "disconnect-dream".into(),
+                })
+                .await?
+            else {
+                bail!("service did not return the candidate identity");
+            };
+            ensure!(
+                matches!(
+                    client
+                        .call(ServiceCall::View {
+                            candidate: Some(handle),
+                            operation: ViewOperation::PutMany {
+                                values: vec![("dream-private".into(), json!("retained"))],
+                            },
+                        })
+                        .await?,
+                    ServiceValue::Unit
+                ),
+                "service did not accept the candidate write"
+            );
+            drop(client);
+            let permit = service::acquire_maintenance_permit(&options).await?;
+            tokio::time::timeout(Duration::from_secs(10), served)
+                .await
+                .context("first owner did not reap after candidate client disconnected")???;
+            drop(permit);
+
+            let first = MemoryStore::open(options.clone()).await?;
+            let candidate_refs = candidate_refs_with_value(&first).await?;
+            ensure!(
+                candidate_refs.len() == 1,
+                "candidate ref was deleted on disconnect"
+            );
+            first.close().await?;
+
+            let successor = service::ServiceOwner::open(options.clone(), &project).await?;
+            successor.close().await?;
+            let reopened = MemoryStore::open(options).await?;
+            ensure!(
+                candidate_refs_with_value(&reopened).await? == candidate_refs,
+                "owner restart changed the unresolved candidate ref, head or private rows"
+            );
+            reopened.close().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("candidate disconnect/restart fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    async fn candidate_refs_with_value(
+        store: &MemoryStore,
+    ) -> Result<Vec<(String, String, String)>> {
+        let refs: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, hash FROM dolt_branches WHERE LEFT(BINARY name, ?) = BINARY ? ORDER BY BINARY name LIMIT 3",
+        )
+        .bind(CANDIDATE_PREFIX.len() as i64)
+        .bind(CANDIDATE_PREFIX)
+        .fetch_all(store.pool.as_ref())
+        .await?;
+        let mut observed = Vec::new();
+        for (name, head) in refs {
+            let pool = store.shared.server.pool(&name).await?;
+            let value: String = sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
+                .bind(b"dream-private".as_slice())
+                .fetch_one(pool.as_ref())
+                .await?;
+            observed.push((name, head, value));
+            pool.close().await;
+        }
+        Ok(observed)
+    }
 
     #[tokio::test]
     async fn observed_open_reports_ready_only_after_a_usable_store() -> Result<()> {
@@ -2675,9 +3221,15 @@ mod tests {
         .bind(&parent)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let great_grandparent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&grandparent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            grandparent, base,
-            "v1 to v3 must contain two ordered upgrades"
+            great_grandparent, base,
+            "v1 to v4 must contain three ordered upgrades"
         );
         let commits: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
@@ -2691,6 +3243,12 @@ mod tests {
         .fetch_one(store.pool.as_ref())
         .await?;
         assert_eq!(typed_commits, 1);
+        let receipt_commits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 4%'",
+        )
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(receipt_commits, 1);
         store.close().await?;
 
         let reopened = MemoryStore::open(options).await?;
@@ -2738,7 +3296,7 @@ mod tests {
                     Some(name)
                 }
                 None if future_schema => {
-                    sqlx::query("UPDATE kuru_schema SET version = 4 WHERE id = 1")
+                    sqlx::query("UPDATE kuru_schema SET version = 5 WHERE id = 1")
                         .execute(pool.as_ref())
                         .await?;
                     None
@@ -2761,8 +3319,8 @@ mod tests {
                 (None, false) => "uncommitted changes",
                 (Some(2), false) => "attempt newer than its schema",
                 (Some(3), false) => "attempt newer than its schema",
-                (Some(4), false) => "unsupported Dolt memory schema transition",
-                (None, true) => "unsupported Dolt memory schema version 4",
+                (Some(4), false) => "attempt newer than its schema",
+                (None, true) => "unsupported Dolt memory schema version 5",
                 _ => unreachable!(),
             };
             assert!(rendered.contains(expected), "{case}: {rendered}");
@@ -2848,6 +3406,7 @@ mod tests {
             shared: store.shared.clone(),
             pool: old_pool.clone(),
             branch: branch.clone(),
+            logical_receipt: None,
         };
         sqlx::query("CREATE TABLE historical_dirty_probe (id INT PRIMARY KEY)")
             .execute(old_pool.as_ref())
@@ -2916,6 +3475,7 @@ mod tests {
             shared: reopened.shared.clone(),
             pool: preserved.clone(),
             branch,
+            logical_receipt: None,
         };
         assert_eq!(revision(&preserved).await?, candidate_head);
         assert_eq!(migrations::version(&preserved).await?, 1);
@@ -2981,7 +3541,7 @@ mod tests {
         let error = MemoryStore::open(readonly).await.unwrap_err();
         let error = format!("{error:#}");
         assert!(
-            error.contains("version 1 requires writable upgrade to 3"),
+            error.contains("version 1 requires writable upgrade to 4"),
             "unexpected read-only v1 open error: {error}"
         );
         assert_eq!(fs::read(directory.join("ready.json"))?, marker);
@@ -3023,9 +3583,15 @@ mod tests {
         .bind(&parent)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let great_grandparent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&grandparent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            grandparent, base,
-            "upgrade must retain both ordered commits"
+            great_grandparent, base,
+            "upgrade must retain all three ordered commits"
         );
         assert_eq!(
             sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
@@ -3051,13 +3617,16 @@ mod tests {
         let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(store.pool.as_ref())
             .await?;
-        assert_eq!(receipts, 2);
+        assert_eq!(receipts, 3);
         let receipt: Vec<(i32, String, String, String)> = sqlx::query_as(
             "SELECT version, id, digest, operation FROM kuru_migrations ORDER BY version",
         )
         .fetch_all(store.pool.as_ref())
         .await?;
-        assert_eq!(receipt.iter().map(|row| row.0).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(
+            receipt.iter().map(|row| row.0).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
         assert!(receipt.iter().all(|row| Uuid::parse_str(&row.3).is_ok()));
         store.close().await?;
 
@@ -3249,6 +3818,7 @@ mod tests {
             }),
             pool: pool.clone(),
             branch,
+            logical_receipt: None,
         };
         let error = history
             .history("missing", 1)
@@ -3336,7 +3906,7 @@ mod tests {
 
         let store = MemoryStore::temporary().await?;
         sqlx::query(
-            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (4, 'forged', ?, ?)",
+            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (5, 'forged', ?, ?)",
         )
         .bind("0".repeat(64))
         .bind(Uuid::new_v4().hyphenated().to_string())
@@ -3432,6 +4002,7 @@ mod tests {
                 )],
                 values: vec![("two".into(), "2".into())],
             },
+            None,
         )
         .await
         .unwrap();
@@ -3450,7 +4021,8 @@ mod tests {
                         encode_typed_message(&Message::text("assistant", "duplicate")).unwrap(),
                     )],
                     values: vec![("one".into(), "10".into())],
-                }
+                },
+                None,
             )
             .await
             .is_err()
@@ -3490,6 +4062,216 @@ mod tests {
         });
         assert_eq!(store.reconcile().await.unwrap(), Some(false));
         store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn indexed_logical_receipt_survives_sibling_write_and_scopes_exact_retry_to_view()
+    -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let id = Uuid::new_v4();
+        let original = store.with_logical_receipt(id, "view.append", b"same encoded call");
+        original.append("private/actor", "user", "once").await?;
+        let first_revision = store.revision().await?;
+        store
+            .append("private/actor", "assistant", "later sibling")
+            .await?;
+        let later_revision = store.revision().await?;
+        ensure!(later_revision != first_revision);
+        original.append("private/actor", "user", "once").await?;
+        ensure!(store.revision().await? == later_revision);
+        ensure!(store.history("private/actor", 10).await?.len() == 2);
+        let conflicting = store.with_logical_receipt(id, "view.append", b"different encoded call");
+        ensure!(
+            conflicting
+                .append("private/actor", "user", "different")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts"),
+            "same-view logical ID reuse with different work was accepted"
+        );
+        let candidate = store.begin_candidate("same UUID on another view").await?;
+        let candidate_write =
+            candidate
+                .view()
+                .with_logical_receipt(id, "view.append", b"different encoded call");
+        let candidate_receipt = candidate_write
+            .logical_receipt
+            .as_ref()
+            .context("candidate request has no logical receipt")?;
+        ensure!(
+            candidate_receipt.physical_id
+                != original
+                    .logical_receipt
+                    .as_ref()
+                    .context("main request has no logical receipt")?
+                    .physical_id,
+            "candidate inherited the main view's physical receipt identity"
+        );
+        candidate_write
+            .append("private/actor", "user", "private candidate")
+            .await?;
+        ensure!(store.history("private/actor", 10).await?.len() == 2);
+        ensure!(candidate.view().history("private/actor", 10).await?.len() == 3);
+        candidate.promote().await?;
+        ensure!(store.history("private/actor", 10).await?.len() == 3);
+        ensure!(
+            operation_receipt_matches(&store.pool, candidate_receipt).await?,
+            "promotion lost the candidate view's exact indexed receipt"
+        );
+        ensure!(
+            operation_receipt_matches(
+                &store.pool,
+                original
+                    .logical_receipt
+                    .as_ref()
+                    .context("main request has no logical receipt")?
+            )
+            .await?,
+            "promotion erased the inherited main receipt"
+        );
+        let abandoned = store.begin_candidate("reclaimed outcome view").await?;
+        let abandoned_branch = abandoned.view().pinned_view().to_owned();
+        let abandoned_id = Uuid::new_v4();
+        let encoded = b"abandoned private write";
+        abandoned
+            .view()
+            .with_logical_receipt(abandoned_id, "view.append", encoded)
+            .append("private/actor", "user", "discarded")
+            .await?;
+        abandoned.abandon().await?;
+        let argument_digest = Sha256::digest(encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        ensure!(
+            store
+                .indexed_logical_outcome(
+                    &abandoned_branch,
+                    abandoned_id,
+                    "view.append",
+                    &argument_digest,
+                )
+                .await?
+                .is_none(),
+            "reclaimed private candidate falsely proved its accepted write absent"
+        );
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_transition_observation_uses_exact_refs_and_revisions() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let store = MemoryStore::temporary().await?;
+            let stale = store.begin_candidate("stale transition").await?;
+            let stale_branch = stale.view().pinned_view().to_owned();
+            let stale_base = stale.base().to_owned();
+            stale.view().put("private-stale", &json!(1)).await?;
+            let stale_target = stale.view().revision().await?;
+            ensure!(stale.promote_exact(&stale_base).await.is_err());
+            ensure!(
+                store
+                    .candidate_transition_observation(&stale_branch, &stale_base, &stale_target)
+                    .await?
+                    == CandidateTransitionObservation::OpenUnchanged
+            );
+            store.put("sibling", &json!(true)).await?;
+            ensure!(
+                store
+                    .candidate_transition_observation(&stale_branch, &stale_base, &stale_target)
+                    .await?
+                    == CandidateTransitionObservation::OpenConflict
+            );
+            ensure!(stale.promote_exact(&stale_target).await.is_err());
+            stale.abandon_exact(&stale_target).await?;
+
+            let promoted = store.begin_candidate("promoted transition").await?;
+            let branch = promoted.view().pinned_view().to_owned();
+            let base = promoted.base().to_owned();
+            promoted.view().put("private-promoted", &json!(2)).await?;
+            let target = promoted.view().revision().await?;
+            ensure!(promoted.promote_exact(&target).await? == target);
+            store.put("later", &json!(true)).await?;
+            ensure!(
+                store
+                    .candidate_transition_observation(&branch, &base, &target)
+                    .await?
+                    == CandidateTransitionObservation::Promoted,
+                "later main revision hid the exact promoted candidate head"
+            );
+            store.close().await
+        })
+        .await
+        .context("candidate transition observation fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_creation_outcome_only_reads_its_exact_ref_across_restart() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let options = crate::test_support::open_options(
+                root.path().to_owned(),
+                format!("project/{}", "7".repeat(64)),
+            )?;
+            let store = MemoryStore::open(options.clone()).await?;
+            let id = Uuid::new_v4();
+            ensure!(matches!(
+                store.candidate_for_id(id).await?,
+                CandidateLookup::Missing
+            ));
+            let candidate = store.begin_candidate_with_id("exact candidate", id).await?;
+            let branch = candidate.view().pinned_view().to_owned();
+            let base = candidate.base().to_owned();
+            candidate.view().put("private", &json!("retained")).await?;
+            store.put("sibling", &json!("later")).await?;
+            let before = candidate_heads(&store.pool, &CandidateNames::from_open(&branch)?).await?;
+            let CandidateLookup::Open(recovered) = store.candidate_for_id(id).await? else {
+                bail!("exact candidate was not readable after both histories advanced")
+            };
+            ensure!(recovered.base() == base, "candidate creation base changed");
+            ensure!(recovered.view().pinned_view() == branch);
+            ensure!(recovered.view().get("private").await? == Some(json!("retained")));
+            ensure!(
+                candidate_heads(&store.pool, &CandidateNames::from_open(&branch)?).await? == before,
+                "read-only candidate outcome changed the exact refs"
+            );
+            ensure!(
+                store
+                    .begin_candidate_with_id("exact candidate", id)
+                    .await
+                    .is_err(),
+                "a second Begin reused an active candidate identity"
+            );
+            drop(recovered);
+            drop(candidate);
+            store.close().await?;
+
+            let reopened = MemoryStore::open(options).await?;
+            let CandidateLookup::Open(recovered) = reopened.candidate_for_id(id).await? else {
+                bail!("owner restart lost the caller-derived candidate ref")
+            };
+            ensure!(recovered.base() == base);
+            ensure!(recovered.view().get("private").await? == Some(json!("retained")));
+            recovered.abandon().await?;
+            drop(recovered);
+            ensure!(matches!(
+                reopened.candidate_for_id(id).await?,
+                CandidateLookup::Resolved | CandidateLookup::Missing
+            ));
+            ensure!(
+                candidate_heads(&reopened.pool, &CandidateNames::from_open(&branch)?)
+                    .await?
+                    .is_empty(),
+                "explicit abandonment did not reclaim the exact ref"
+            );
+            reopened.close().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("exact candidate outcome fixture exceeded 90 seconds")??;
+        Ok(())
     }
 
     #[tokio::test]

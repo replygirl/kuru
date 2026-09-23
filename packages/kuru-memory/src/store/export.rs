@@ -39,20 +39,20 @@ pub enum StorageRecord {
 }
 
 /// Opaque continuation for an [`ActiveExportSnapshot`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExportCursor {
     snapshot: Uuid,
     phase: Phase,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 enum Phase {
     Messages(Option<i64>),
     State(Option<Vec<u8>>),
 }
 
 /// One bounded export page and its continuation, if another page exists.
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ExportPage {
     pub records: Vec<StorageRecord>,
     pub next: Option<ExportCursor>,
@@ -534,7 +534,10 @@ mod tests {
         };
         store.append_message("export/mixed", &typed).await?;
         let snapshot = store.begin_active_export().await?;
-        assert_eq!(snapshot.provenance().schema_version, 3);
+        assert_eq!(
+            snapshot.provenance().schema_version,
+            migrations::CURRENT_VERSION
+        );
         let records = snapshot.page(None).await?.records;
         assert_eq!(records.len(), 2);
         assert!(matches!(&records[0], StorageRecord::Message {

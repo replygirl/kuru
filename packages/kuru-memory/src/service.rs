@@ -4,6 +4,8 @@
 //! Transport privacy excludes other OS users; a same-user process able to read
 //! the private endpoint record is within the account's local authority.
 
+#[cfg(test)]
+use std::sync::Arc;
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
@@ -18,11 +20,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-mod rpc;
+pub(crate) mod rpc;
 pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, ServiceValue};
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SERVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -159,27 +161,125 @@ pub type LocalStream = kuru_platform::windows::pipe::Pipe;
 pub struct ServiceAttachment {
     stream: Option<LocalStream>,
     authority: EndpointAuthority,
+    locator: Option<AttachmentLocator>,
+    last_fault: Option<rpc::ServiceFault>,
+    #[cfg(test)]
+    reply_pause: Option<Arc<rpc::ReplyPause>>,
+}
+
+#[derive(Clone)]
+struct AttachmentLocator {
+    data: PathBuf,
+    address: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct AttachmentFactory {
+    authority: EndpointAuthority,
+    locator: AttachmentLocator,
+}
+
+impl AttachmentFactory {
+    pub(crate) fn store_instance(&self) -> &str {
+        &self.authority.store_instance
+    }
+
+    pub(crate) async fn connect(&self) -> Result<ServiceAttachment> {
+        let mut stream = connect_local(
+            &self.locator.data,
+            &self.authority.project_scope,
+            &self.locator.address,
+            HANDSHAKE_TIMEOUT,
+        )
+        .await?;
+        connect_handshake(&mut stream, &self.authority).await?;
+        Ok(ServiceAttachment {
+            stream: Some(stream),
+            authority: self.authority.clone(),
+            locator: Some(self.locator.clone()),
+            last_fault: None,
+            #[cfg(test)]
+            reply_pause: None,
+        })
+    }
 }
 
 impl ServiceAttachment {
+    pub(crate) fn store_instance(&self) -> &str {
+        &self.authority.store_instance
+    }
+
     pub fn generation(&self) -> &str {
         &self.authority.service_generation
     }
 
+    pub(crate) fn has_complete_exchange(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// A generic storage failure can conceal a committed but unresolved
+    /// operation; a complete wire reply alone is not mutation proof.
+    pub(crate) fn has_definite_mutation_reply(&self) -> bool {
+        self.has_complete_exchange()
+            && !matches!(self.last_fault, Some(rpc::ServiceFault::StorageFailed))
+    }
+
     pub async fn call(&mut self, call: ServiceCall) -> Result<ServiceValue> {
+        self.call_with_id(uuid::Uuid::new_v4(), call).await
+    }
+
+    pub(crate) async fn call_with_id(
+        &mut self,
+        id: uuid::Uuid,
+        call: ServiceCall,
+    ) -> Result<ServiceValue> {
         let mut stream = self
             .stream
             .take()
             .context("memory service attachment is closed")?;
-        let result = rpc::request_attached(&mut stream, &self.authority, call).await;
-        if result.is_ok() {
-            self.stream = Some(stream);
-        }
-        result
+        self.last_fault = None;
+        #[cfg(test)]
+        let response = if let Some(pause) = self.reply_pause.take() {
+            rpc::exchange_attached_with_id_paused(&mut stream, &self.authority, id, call, &pause)
+                .await?
+        } else {
+            rpc::exchange_attached_with_id(&mut stream, &self.authority, id, call).await?
+        };
+        #[cfg(not(test))]
+        let response =
+            rpc::exchange_attached_with_id(&mut stream, &self.authority, id, call).await?;
+        self.last_fault = match &response {
+            rpc::ServiceResponse::Rejected(fault) => Some(*fault),
+            rpc::ServiceResponse::Success(_) => None,
+        };
+        self.stream = Some(stream);
+        rpc::resolve_response(response)
+    }
+
+    /// Open another authenticated attachment to the same service generation.
+    /// Candidate and export handles use their own connection-owned state.
+    pub async fn fork(&self) -> Result<Self> {
+        self.factory()?.connect().await
+    }
+
+    pub(crate) fn factory(&self) -> Result<AttachmentFactory> {
+        let locator = self
+            .locator
+            .as_ref()
+            .context("fixture attachment cannot open another connection")?;
+        Ok(AttachmentFactory {
+            authority: self.authority.clone(),
+            locator: locator.clone(),
+        })
     }
 
     pub fn close(&mut self) {
         self.stream = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_send(&mut self, pause: Arc<rpc::ReplyPause>) {
+        self.reply_pause = Some(pause);
     }
 }
 
@@ -199,7 +299,10 @@ pub async fn attach_or_start(
     );
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
-    if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project).await? {
+    if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
+        .await
+        .context("attach before memory service start election")?
+    {
         return Ok(attached);
     }
     let _start = loop {
@@ -214,14 +317,18 @@ pub async fn attach_or_start(
             tokio::time::Instant::now() < deadline,
             "memory service election deadline exceeded"
         );
-        if let Some(attached) =
-            try_attach(&options.data_dir, &options.project_scope, project).await?
+        if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
+            .await
+            .context("attach while waiting for memory service start election")?
         {
             return Ok(attached);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project).await? {
+    if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
+        .await
+        .context("attach after acquiring memory service start election")?
+    {
         return Ok(attached);
     }
     loop {
@@ -240,19 +347,35 @@ pub async fn attach_or_start(
             tokio::time::Instant::now() < deadline,
             "existing memory service owner did not publish a valid endpoint"
         );
-        if let Some(attached) =
-            try_attach(&options.data_dir, &options.project_scope, project).await?
+        if let Some(attached) = try_attach(&options.data_dir, &options.project_scope, project)
+            .await
+            .context("attach while the elected memory service owner is still active")?
         {
             return Ok(attached);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let mut child = ServiceProcess::new(spawn_service(options, project, executable).await?);
+    let mut child = ServiceProcess::new(
+        spawn_service(options, project, executable)
+            .await
+            .context("spawn elected memory service owner")?,
+    );
     loop {
-        if let Some(attached) =
-            try_attach(&options.data_dir, &options.project_scope, project).await?
-        {
-            return Ok(attached);
+        match try_attach(&options.data_dir, &options.project_scope, project).await {
+            Ok(Some(attached)) => return Ok(attached),
+            Ok(None) => {}
+            Err(error) => {
+                let child_state = match child.try_wait() {
+                    Ok(Some(status)) => format!("exited with {status}"),
+                    Ok(None) => "remained running".into(),
+                    Err(status_error) => {
+                        format!("status observation failed with {status_error}")
+                    }
+                };
+                return Err(error).with_context(|| {
+                    format!("attach after starting the elected memory service; child {child_state}")
+                });
+            }
         }
         if let Some(status) = child.try_wait()? {
             bail!("memory service exited before readiness: {status}");
@@ -260,6 +383,38 @@ pub async fn attach_or_start(
         ensure!(
             tokio::time::Instant::now() < deadline,
             "memory service readiness deadline exceeded"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A read-only inspection may attach to a published owner without electing or
+/// starting one. The fallback remains an explicitly local read-only open.
+pub(crate) async fn attach_existing(
+    options: &crate::store::OpenOptions,
+    project: &Path,
+) -> Result<Option<ServiceAttachment>> {
+    ensure_project_scope(project, &options.project_scope)?;
+    options.config.validate()?;
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
+    loop {
+        if let Some(attachment) =
+            try_attach(&options.data_dir, &options.project_scope, project).await?
+        {
+            return Ok(Some(attachment));
+        }
+        if let Some(owner_probe) = ServiceLock::try_acquire(
+            &options.data_dir,
+            &options.project_scope,
+            ServiceLockKind::Owner,
+        )? {
+            owner_probe.verify()?;
+            return Ok(None);
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "active memory service did not publish a readable endpoint"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -294,6 +449,13 @@ async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<S
     Ok(Some(ServiceAttachment {
         stream: Some(stream),
         authority: record.authority,
+        locator: Some(AttachmentLocator {
+            data: data.to_owned(),
+            address: record.address,
+        }),
+        last_fault: None,
+        #[cfg(test)]
+        reply_pause: None,
     }))
 }
 
@@ -439,6 +601,7 @@ pub struct ServiceOwner {
     listener: ServiceListener,
     record: EndpointRecord,
     data_dir: PathBuf,
+    receipt_progress: std::sync::Arc<rpc::ReceiptProgress>,
 }
 
 impl ServiceOwner {
@@ -485,6 +648,7 @@ impl ServiceOwner {
             listener,
             record,
             data_dir: options.data_dir,
+            receipt_progress: std::sync::Arc::new(rpc::ReceiptProgress::default()),
         })
     }
 
@@ -521,24 +685,34 @@ impl ServiceOwner {
     ) -> Result<()> {
         let mut attachments = tokio::task::JoinSet::new();
         let frame_budget = std::sync::Arc::new(tokio::sync::Semaphore::new(rpc::FRAME_BUDGET_MIB));
+        let retirement = std::sync::Arc::new(rpc::Retirement::default());
         loop {
             if let Err(error) = self.lock.verify() {
                 abort_and_drain(&mut attachments).await;
                 return Err(error);
             }
+            if retirement.requested() {
+                while let Some(completed) = attachments.join_next().await {
+                    if let Err(error) = completed {
+                        tracing::warn!(error = %error, "memory service retirement attachment failed");
+                    }
+                }
+                break;
+            }
             if attachments.is_empty() {
                 tokio::select! {
                     biased;
                     accepted = self.listener.accept(accept_timeout) => {
-                        self.attach(accepted?, &mut attachments, &frame_budget);
+                        self.attach(accepted?, &mut attachments, &frame_budget, &retirement);
                     }
                     _ = tokio::time::sleep(idle_timeout) => break,
+                    _ = retirement.notified() => continue,
                 }
             } else {
                 tokio::select! {
                     accepted = self.listener.accept(accept_timeout) => {
                         match accepted {
-                            Ok(stream) => self.attach(stream, &mut attachments, &frame_budget),
+                            Ok(stream) => self.attach(stream, &mut attachments, &frame_budget, &retirement),
                             Err(error) if is_accept_timeout(&error) => continue,
                             Err(error) => {
                                 abort_and_drain(&mut attachments).await;
@@ -551,6 +725,7 @@ impl ServiceOwner {
                             tracing::warn!(error = %error, "memory service attachment task failed");
                         }
                     }
+                    _ = retirement.notified() => continue,
                 }
             }
         }
@@ -562,17 +737,31 @@ impl ServiceOwner {
         stream: LocalStream,
         attachments: &mut tokio::task::JoinSet<()>,
         frame_budget: &std::sync::Arc<tokio::sync::Semaphore>,
+        retirement: &std::sync::Arc<rpc::Retirement>,
     ) {
         if attachments.len() >= MAX_ATTACHMENTS {
             return;
         }
+        let Some(retained) = retirement.attached() else {
+            return;
+        };
         let authority = self.record.authority.clone();
         let store = self.store.clone();
         let frame_budget = frame_budget.clone();
+        let retirement = retirement.clone();
+        let receipt_progress = self.receipt_progress.clone();
         attachments.spawn(async move {
+            let _retained = retained;
             let mut stream = stream;
-            if let Err(error) =
-                rpc::serve_attached(&mut stream, &authority, &store, frame_budget).await
+            if let Err(error) = rpc::serve_attached(
+                &mut stream,
+                &authority,
+                &store,
+                frame_budget,
+                retirement,
+                receipt_progress,
+            )
+            .await
                 && !is_peer_closed(&error)
             {
                 tracing::warn!(error = %error, "memory service attachment ended with an error");
@@ -590,6 +779,7 @@ impl ServiceOwner {
             listener,
             record,
             data_dir,
+            receipt_progress: _,
         } = self;
         drop(listener);
         store.close().await?;
@@ -718,6 +908,131 @@ pub struct ServiceLock {
     name: OsString,
     file: File,
     kind: ServiceLockKind,
+}
+
+/// Retains both election and owner authority while an explicit maintenance
+/// operation inspects or moves this project's storage. An active service must
+/// retire before this permit can be acquired; a new starter cannot elect until
+/// the permit is dropped.
+pub(crate) struct MaintenancePermit {
+    _start: ServiceLock,
+    _owner: ServiceLock,
+}
+
+pub(crate) async fn acquire_maintenance_permit(
+    options: &crate::store::OpenOptions,
+) -> Result<MaintenancePermit> {
+    options.config.validate()?;
+    ensure!(
+        !options.read_only,
+        "memory maintenance requires writable options"
+    );
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
+    let start = loop {
+        if let Some(lock) = ServiceLock::try_acquire(
+            &options.data_dir,
+            &options.project_scope,
+            ServiceLockKind::Start,
+        )? {
+            break lock;
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "memory maintenance election deadline exceeded"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let mut retirement_requested = false;
+    let mut busy_observations = 0;
+    let owner = loop {
+        if let Some(lock) = ServiceLock::try_acquire(
+            &options.data_dir,
+            &options.project_scope,
+            ServiceLockKind::Owner,
+        )? {
+            break lock;
+        }
+        if !retirement_requested {
+            match tokio::time::timeout_at(deadline, request_idle_retirement(options))
+                .await
+                .context("memory maintenance owner-response deadline exceeded")??
+            {
+                Some(true) => retirement_requested = true,
+                Some(false) => {
+                    busy_observations += 1;
+                    ensure!(
+                        busy_observations < 10,
+                        "memory service has active clients; close them before maintenance"
+                    );
+                }
+                None => {}
+            }
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "memory service owner is still active; maintenance cannot proceed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    start.verify()?;
+    owner.verify()?;
+    Ok(MaintenancePermit {
+        _start: start,
+        _owner: owner,
+    })
+}
+
+/// The caller holds the start gate, so a successful idle retirement cannot
+/// race a replacement election while the owner reaps Dolt. A missing/stale
+/// endpoint is a wait condition; a valid owner with live clients refuses.
+async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<Option<bool>> {
+    let Some(record) = EndpointRecord::read(&options.data_dir, &options.project_scope)? else {
+        return Ok(None);
+    };
+    let stream = match connect_local(
+        &options.data_dir,
+        &options.project_scope,
+        &record.address,
+        HANDSHAKE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(error)
+            if error
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<io::Error>())
+                .any(|cause| {
+                    matches!(
+                        cause.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    )
+                }) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("connect to memory service for maintenance"),
+    };
+    let mut attachment = ServiceAttachment {
+        stream: Some(stream),
+        authority: record.authority,
+        locator: None,
+        last_fault: None,
+        #[cfg(test)]
+        reply_pause: None,
+    };
+    connect_handshake(
+        attachment.stream.as_mut().expect("new maintenance stream"),
+        &attachment.authority,
+    )
+    .await?;
+    let result = attachment.call(ServiceCall::RetireIfIdle).await;
+    attachment.close();
+    match result? {
+        ServiceValue::Retirement { accepted } => Ok(Some(accepted)),
+        _ => bail!("memory service returned the wrong maintenance response"),
+    }
 }
 
 impl ServiceLock {
@@ -1028,6 +1343,10 @@ pub async fn connect_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     authority: &EndpointAuthority,
 ) -> Result<()> {
+    ensure!(
+        authority.version.major == PROTOCOL_MAJOR && authority.version.minor >= PROTOCOL_MINOR,
+        "memory service protocol is incompatible; close the active Kuru session or use its matching version"
+    );
     write_frame(
         stream,
         &authority.hello(),
@@ -1154,6 +1473,274 @@ pub fn is_peer_closed(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    /// A crash fixture retains the exact spawned child. Early test failure
+    /// terminates that handle; ServiceProcess then installs its native reaper.
+    struct KillServiceOnDrop(ServiceProcess);
+
+    impl KillServiceOnDrop {
+        fn terminate(&mut self) -> Result<()> {
+            let child = self
+                .0
+                .0
+                .as_mut()
+                .context("service child was already reaped")?;
+            #[cfg(unix)]
+            child.kill().context("terminate fixture service process")?;
+            #[cfg(windows)]
+            child
+                .terminate()
+                .context("terminate fixture service process")?;
+            Ok(())
+        }
+    }
+
+    impl Drop for KillServiceOnDrop {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.terminate();
+            }
+        }
+    }
+
+    /// A published endpoint does not prove that this particular attempt has
+    /// obtained a Windows pipe instance. Keep that fixture-only readiness
+    /// observation inside the caller's named outer deadline; product
+    /// attachment still treats a connect timeout as an error and never
+    /// silently retries an ambiguous request.
+    async fn try_attach_fixture_stage(
+        data: &Path,
+        scope: &str,
+        project: &Path,
+        stage: &'static str,
+    ) -> Result<Option<ServiceAttachment>> {
+        match try_attach(data, scope, project).await {
+            Ok(attached) => Ok(attached),
+            #[cfg(windows)]
+            Err(error) if is_private_pipe_connect_timeout(&error) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("{stage} attachment failed")),
+        }
+    }
+
+    #[cfg(windows)]
+    fn is_private_pipe_connect_timeout(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<io::Error>())
+            .any(|cause| {
+                cause.kind() == io::ErrorKind::TimedOut
+                    && cause.to_string() == "private pipe connect timed out"
+            })
+    }
+
+    #[tokio::test]
+    async fn inspection_waits_for_a_booting_owner_without_starting_dolt() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        options.read_only = true;
+        options.config.startup_timeout_secs = 1;
+        let owner = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire service owner lock")?;
+        let error =
+            tokio::time::timeout(Duration::from_secs(3), attach_existing(&options, &project))
+                .await
+                .context("inspection did not respect the owner startup deadline")?
+                .err()
+                .context("inspection bypassed an unpublished live owner")?;
+        ensure!(
+            format!("{error:#}").contains("did not publish a readable endpoint"),
+            "inspection did not identify the booting owner: {error:#}"
+        );
+        drop(owner);
+        ensure!(
+            attach_existing(&options, &project).await?.is_none(),
+            "inspection treated a retired owner as live"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stale_pipe_does_not_replace_a_live_service_owner() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        options.config.startup_timeout_secs = 1;
+        let owner = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire service owner lock")?;
+        let mut endpoint_authority = authority();
+        endpoint_authority.project_path = project_path_bytes(&project);
+        endpoint_authority.project_scope = scope.clone();
+        let endpoint = EndpointRecord {
+            authority: endpoint_authority,
+            address: format!(r"\\.\pipe\kuru-{}", uuid::Uuid::new_v4()),
+        };
+        endpoint.publish(&data, &owner)?;
+
+        let executable = project.join("must-not-spawn.exe");
+        let error = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT.saturating_mul(3),
+            attach_or_start(&options, &project, &executable),
+        )
+        .await
+        .context("live-owner fixture exceeded its outer deadline")?
+        .err()
+        .context("stale transport authorized replacing a live owner")?;
+        ensure!(
+            format!("{error:#}").contains("existing memory service owner did not publish"),
+            "live owner refusal lost its authoritative stage: {error:#}"
+        );
+        ensure!(
+            EndpointRecord::read(&data, &scope)?.is_some(),
+            "refused replacement retired the live owner's endpoint"
+        );
+        ensure!(
+            ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_none(),
+            "refused replacement displaced the live owner's lock"
+        );
+        drop(owner);
+        endpoint.retire(
+            &data,
+            &ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+                .context("fixture did not reacquire owner lock for cleanup")?,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_refuses_a_live_service_owner_before_writing_intent() -> Result<()> {
+        let data = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "a".repeat(64));
+        let mut options = crate::OpenOptions::new(data.path().to_owned(), scope.clone());
+        options.config.startup_timeout_secs = 1;
+        let owner = ServiceLock::try_acquire(data.path(), &scope, ServiceLockKind::Owner)?
+            .context("fixture did not acquire service owner lock")?;
+        let error =
+            tokio::time::timeout(Duration::from_secs(3), crate::MemoryStore::purge(options))
+                .await
+                .context("purge did not respect its owner deadline")?
+                .expect_err("purge must not run while the service owns the store");
+        ensure!(
+            format!("{error:#}").contains("memory service owner is still active"),
+            "purge did not explain the live owner: {error:#}"
+        );
+        ensure!(
+            !data
+                .path()
+                .join("memory/controls")
+                .join(format!("{}.json", "a".repeat(64)))
+                .exists(),
+            "refused purge wrote durable intent"
+        );
+        drop(owner);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintenance_retires_only_an_idle_owner_and_holds_election() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let data = root.path().join("private");
+            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+            options.config.cache_dir = Some(crate::store::test_cache());
+            options.config.offline = true;
+            options.supervisor = Some(crate::store::test_supervisor()?);
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let served = tokio::spawn(owner.serve());
+            let mut client = try_attach(&data, &scope, &project)
+                .await?
+                .context("fixture owner did not accept a client")?;
+
+            let refused = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::MemoryStore::purge(options.clone()),
+            )
+            .await
+            .context("busy owner maintenance refusal exceeded five seconds")?
+            .expect_err("maintenance admitted another live client");
+            ensure!(
+                format!("{refused:#}").contains("active clients"),
+                "busy owner refusal lacked client context: {refused:#}"
+            );
+            ensure!(
+                !data
+                    .join("memory/controls")
+                    .join(format!("{}.json", &scope["project/".len()..]))
+                    .exists(),
+                "refused purge wrote durable intent"
+            );
+            ensure!(
+                matches!(
+                    client.call(ServiceCall::Revision).await?,
+                    ServiceValue::Revision(_)
+                ),
+                "refused maintenance disturbed the live client"
+            );
+            client.close();
+
+            let permit = tokio::time::timeout(
+                Duration::from_secs(20),
+                acquire_maintenance_permit(&options),
+            )
+            .await
+            .context("idle owner was not retired before its 30-second grace period")??;
+            ensure!(
+                ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_none(),
+                "maintenance did not retain the starter election gate"
+            );
+            ensure!(
+                EndpointRecord::read(&data, &scope)?.is_none(),
+                "retired owner still published an endpoint"
+            );
+            tokio::time::timeout(Duration::from_secs(5), served)
+                .await
+                .context("retired owner did not finish reaping")???;
+            drop(permit);
+            ensure!(
+                ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Start)?.is_some(),
+                "maintenance did not release the election gate"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("idle-owner maintenance fixture exceeded 90 seconds")??;
+        Ok(())
+    }
 
     #[cfg(windows)]
     fn windows_starter_fixture(
@@ -1436,6 +2023,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_rejects_an_older_owner_before_sending_new_operations() -> Result<()> {
+        let (mut client, _old_owner) = duplex(1024);
+        let mut old = authority();
+        old.version.minor -= 1;
+        let error = connect_handshake(&mut client, &old).await.unwrap_err();
+        ensure!(
+            format!("{error:#}").contains("protocol is incompatible"),
+            "older owner had no actionable compatibility result: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bounded_frames_round_trip_and_reject_oversize_before_payload() {
         let (mut client, mut server) = duplex(1024);
         write_frame(
@@ -1629,6 +2229,10 @@ mod tests {
             let mut attachment = ServiceAttachment {
                 stream: Some(stream),
                 authority: expected,
+                locator: None,
+                last_fault: None,
+                #[cfg(test)]
+                reply_pause: None,
             };
             let mut call = Box::pin(attachment.call(ServiceCall::Revision));
             tokio::select! {
@@ -1755,6 +2359,1087 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lost_reply_receipt_survives_sibling_write_and_owner_restart() -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        use uuid::Uuid;
+
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = tempfile::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let data = root.path().join("private");
+            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+            options.config.cache_dir = Some(crate::store::test_cache());
+            options.config.offline = true;
+            options.supervisor = Some(crate::store::test_supervisor()?);
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
+            let original = owner.authority().clone();
+            let record = EndpointRecord::read(&data, &scope)?.context("missing owner endpoint")?;
+            let id = Uuid::new_v4();
+            let first = ServiceCall::AppendMessage {
+                namespace: "lost-reply-fixture".into(),
+                message: kuru_core::Message::text("user", "first committed"),
+            };
+            let (method, argument_digest) = first
+                .unit_receipt_fingerprint("main")?
+                .context("append has no logical receipt")?;
+            let request = rpc::ServiceRequest::with_id(&original.service_generation, id, first);
+            let body = serde_json::to_vec(&request)?;
+            let mut client =
+                connect_local(&data, &scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+            let mut accepted = owner.accept(HANDSHAKE_TIMEOUT).await?;
+            let sent = async {
+                connect_handshake(&mut client, &original).await?;
+                client.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                client.write_all(&body).await?;
+                client.flush().await?;
+                drop(client); // never inspect the accepted write's reply
+                Ok::<(), anyhow::Error>(())
+            };
+            let (sent, _) =
+                tokio::join!(sent, rpc::serve_one(&mut accepted, &original, &owner.store),);
+            sent?;
+            drop(accepted);
+
+            let mut sibling =
+                connect_local(&data, &scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+            let mut sibling_server = owner.accept(HANDSHAKE_TIMEOUT).await?;
+            let (sibling_reply, sibling_served) = tokio::join!(
+                rpc::request_one(
+                    &mut sibling,
+                    &original,
+                    ServiceCall::AppendMessage {
+                        namespace: "lost-reply-fixture".into(),
+                        message: kuru_core::Message::text("assistant", "sibling committed"),
+                    },
+                ),
+                rpc::serve_one(&mut sibling_server, &original, &owner.store),
+            );
+            ensure!(matches!(sibling_reply?, ServiceValue::Unit));
+            sibling_served?;
+            drop(sibling_server);
+            drop(sibling);
+
+            let query = |original_id| ServiceCall::Outcome {
+                original_id,
+                original_generation: original.service_generation.clone(),
+                view: "main".into(),
+                method: method.into(),
+                argument_digest: argument_digest.clone(),
+            };
+            let absent_id = Uuid::new_v4();
+            for (query_id, expected) in [
+                (id, rpc::OutcomeStatus::Committed),
+                (absent_id, rpc::OutcomeStatus::StillUncertain),
+            ] {
+                let mut outcome =
+                    connect_local(&data, &scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+                let mut outcome_server = owner.accept(HANDSHAKE_TIMEOUT).await?;
+                let (reported, served) = tokio::join!(
+                    rpc::request_one(&mut outcome, &original, query(query_id)),
+                    rpc::serve_one(&mut outcome_server, &original, &owner.store),
+                );
+                ensure!(matches!(reported?, ServiceValue::Outcome(status) if status == expected));
+                served?;
+                drop(outcome_server);
+                drop(outcome);
+            }
+            owner.close().await?;
+
+            let mut successor = ServiceOwner::open(options, &project).await?;
+            ensure!(
+                successor.authority().service_generation != original.service_generation,
+                "owner restart retained its prior generation"
+            );
+            let current = successor.authority().clone();
+            let current_record =
+                EndpointRecord::read(&data, &scope)?.context("missing successor endpoint")?;
+            for (query_id, expected) in [
+                (id, rpc::OutcomeStatus::Committed),
+                (absent_id, rpc::OutcomeStatus::Absent),
+            ] {
+                let mut client =
+                    connect_local(&data, &scope, &current_record.address, HANDSHAKE_TIMEOUT)
+                        .await?;
+                let mut accepted = successor.accept(HANDSHAKE_TIMEOUT).await?;
+                let (reported, served) = tokio::join!(
+                    rpc::request_one(&mut client, &current, query(query_id)),
+                    rpc::serve_one(&mut accepted, &current, &successor.store),
+                );
+                ensure!(matches!(reported?, ServiceValue::Outcome(status) if status == expected));
+                served?;
+                drop(accepted);
+                drop(client);
+            }
+            successor.close().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("lost-reply receipt and owner restart fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registered_in_flight_write_cannot_be_reported_absent() -> Result<()> {
+        use uuid::Uuid;
+
+        async fn query(
+            owner: &mut ServiceOwner,
+            data: &Path,
+            scope: &str,
+            authority: &EndpointAuthority,
+            progress: &std::sync::Arc<rpc::ReceiptProgress>,
+            call: ServiceCall,
+        ) -> Result<ServiceValue> {
+            let mut client =
+                connect_local(data, scope, &owner.record.address, HANDSHAKE_TIMEOUT).await?;
+            let mut accepted = owner.accept(HANDSHAKE_TIMEOUT).await?;
+            let request = async {
+                connect_handshake(&mut client, authority).await?;
+                rpc::resolve_response(rpc::exchange_attached(&mut client, authority, call).await?)
+            };
+            let (reply, served) = tokio::join!(
+                request,
+                rpc::serve_one_with_progress(&mut accepted, authority, &owner.store, progress),
+            );
+            served?;
+            reply
+        }
+
+        let root = tempfile::tempdir()?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let data = root.path().join("private");
+        let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+        options.config.cache_dir = Some(crate::store::test_cache());
+        options.config.offline = true;
+        options.supervisor = Some(crate::store::test_supervisor()?);
+        let _gate = crate::spawn_gate::spawning().await;
+        let mut owner = ServiceOwner::open(options, &project).await?;
+        let authority = owner.authority().clone();
+        let progress = owner.receipt_progress.clone();
+        let pause = std::sync::Arc::new(rpc::RegisteredPause::default());
+        progress.pause_next(pause.clone());
+
+        let id = Uuid::new_v4();
+        let write = ServiceCall::AppendMessage {
+            namespace: "in-flight-outcome".into(),
+            message: kuru_core::Message::text("user", "accepted once"),
+        };
+        let (method, argument_digest) = write
+            .unit_receipt_fingerprint("main")?
+            .context("append has no logical receipt")?;
+        let outcome = || ServiceCall::Outcome {
+            original_id: id,
+            original_generation: authority.service_generation.clone(),
+            view: "main".into(),
+            method: method.into(),
+            argument_digest: argument_digest.clone(),
+        };
+        let mut writer_client =
+            connect_local(&data, &scope, &owner.record.address, HANDSHAKE_TIMEOUT).await?;
+        let mut writer_server = owner.accept(HANDSHAKE_TIMEOUT).await?;
+        let client_authority = authority.clone();
+        let mut writer = tokio::spawn(async move {
+            connect_handshake(&mut writer_client, &client_authority).await?;
+            rpc::resolve_response(
+                rpc::exchange_attached_with_id(&mut writer_client, &client_authority, id, write)
+                    .await?,
+            )
+        });
+        let server_authority = authority.clone();
+        let server_store = owner.store.clone();
+        let server_progress = progress.clone();
+        let mut served = tokio::spawn(async move {
+            rpc::serve_one_with_progress(
+                &mut writer_server,
+                &server_authority,
+                &server_store,
+                &server_progress,
+            )
+            .await
+        });
+
+        let tested = tokio::time::timeout(Duration::from_secs(40), async {
+            tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+                .await
+                .context("write did not register its receipt before dispatch")?;
+            ensure!(
+                matches!(
+                    query(&mut owner, &data, &scope, &authority, &progress, outcome()).await?,
+                    ServiceValue::Outcome(rpc::OutcomeStatus::InFlight)
+                ),
+                "registered in-flight write was not reported as in flight"
+            );
+            pause.release.notify_one();
+            let (write_result, server_result) =
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::join!(&mut writer, &mut served)
+                })
+                .await
+                .context("registered write did not settle after release")?;
+            ensure!(matches!(write_result??, ServiceValue::Unit));
+            server_result??;
+            ensure!(
+                matches!(
+                    query(&mut owner, &data, &scope, &authority, &progress, outcome()).await?,
+                    ServiceValue::Outcome(rpc::OutcomeStatus::Committed)
+                ),
+                "settled write lost its committed receipt"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        pause.release.notify_one();
+        if !writer.is_finished() {
+            writer.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut writer).await;
+        }
+        if !served.is_finished() {
+            served.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut served).await;
+        }
+        let closed = tokio::time::timeout(Duration::from_secs(10), owner.close())
+            .await
+            .context("in-flight outcome fixture owner did not reap")?;
+        tested.context("in-flight outcome fixture exceeded 40 seconds")??;
+        closed?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn crashed_owner_retains_accepted_receipt_after_sibling_write() -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        tokio::time::timeout(Duration::from_secs(120), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let data = root.path().join("private");
+            let executable = crate::store::test_supervisor()?;
+            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+            options.config.cache_dir = Some(crate::store::test_cache());
+            options.config.offline = true;
+            options.supervisor = Some(executable.clone());
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut process = KillServiceOnDrop(ServiceProcess::new(
+                spawn_service(&options, &project, &executable).await?,
+            ));
+            let mut original = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if let Some(attached) =
+                        try_attach_fixture_stage(&data, &scope, &project, "initial owner readiness")
+                            .await?
+                    {
+                        break Ok::<_, anyhow::Error>(attached);
+                    }
+                    if let Some(status) = process.0.try_wait()? {
+                        bail!("fixture service exited before readiness: {status}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("crash fixture service did not publish a usable endpoint")??;
+            let generation = original.generation().to_owned();
+            let request_id = uuid::Uuid::new_v4();
+            let first = ServiceCall::AppendMessage {
+                namespace: "crashed-owner-receipt".into(),
+                message: kuru_core::Message::text("user", "accepted before crash"),
+            };
+            let (method, argument_digest) = first
+                .unit_receipt_fingerprint("main")?
+                .context("append has no logical receipt")?;
+            let request = rpc::ServiceRequest::with_id(&generation, request_id, first);
+            let body = serde_json::to_vec(&request)?;
+            let mut stream = original
+                .stream
+                .take()
+                .context("authenticated fixture attachment was closed")?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                stream.write_all(&body).await?;
+                stream.flush().await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .context("accepted fixture frame write exceeded five seconds")??;
+            drop(stream); // the caller never reads the mutation reply
+            drop(original);
+
+            let mut sibling = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(attached) = try_attach_fixture_stage(
+                        &data,
+                        &scope,
+                        &project,
+                        "original-owner sibling readiness",
+                    )
+                    .await?
+                    {
+                        break Ok::<_, anyhow::Error>(attached);
+                    }
+                    if let Some(status) = process.0.try_wait()? {
+                        bail!("fixture service exited before sibling readiness: {status}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("sibling did not attach to the original owner")??;
+            ensure!(sibling.generation() == generation);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let ServiceValue::HistoryWindow(window) = sibling
+                        .call(ServiceCall::HistoryWindow {
+                            namespace: "crashed-owner-receipt".into(),
+                            limit: 4,
+                        })
+                        .await?
+                    else {
+                        bail!("sibling history returned the wrong response")
+                    };
+                    if window.total_rows == 1 {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("sibling could not observe the accepted durable write")??;
+            ensure!(matches!(
+                sibling
+                    .call(ServiceCall::AppendMessage {
+                        namespace: "crashed-owner-receipt".into(),
+                        message: kuru_core::Message::text("assistant", "sibling before crash"),
+                    })
+                    .await?,
+                ServiceValue::Unit
+            ));
+            drop(sibling);
+            ensure!(
+                process.0.try_wait()?.is_none(),
+                "fixture owner exited before the deliberate crash"
+            );
+            process.terminate()?;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if process.0.try_wait()?.is_some() {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("crashed service process was not reaped")??;
+
+            let mut successor = attach_or_start(&options, &project, &executable)
+                .await
+                .context("successor election and readiness after crashed endpoint retirement")?;
+            ensure!(successor.generation() != generation);
+            let query = |original_id| ServiceCall::Outcome {
+                original_id,
+                original_generation: generation.clone(),
+                view: "main".into(),
+                method: method.into(),
+                argument_digest: argument_digest.clone(),
+            };
+            ensure!(matches!(
+                successor
+                    .call(query(request_id))
+                    .await
+                    .context("successor could not recover the accepted receipt")?,
+                ServiceValue::Outcome(rpc::OutcomeStatus::Committed)
+            ));
+            ensure!(matches!(
+                successor
+                    .call(query(uuid::Uuid::new_v4()))
+                    .await
+                    .context("successor could not classify an unrelated request")?,
+                ServiceValue::Outcome(rpc::OutcomeStatus::Absent)
+            ));
+            ensure!(matches!(
+                successor
+                    .call_with_id(
+                        request_id,
+                        ServiceCall::AppendMessage {
+                            namespace: "crashed-owner-receipt".into(),
+                            message: kuru_core::Message::text("user", "accepted before crash"),
+                        },
+                    )
+                    .await
+                    .context("successor could not retry the exact accepted request")?,
+                ServiceValue::Unit
+            ));
+            ensure!(
+                successor
+                    .call_with_id(
+                        request_id,
+                        ServiceCall::AppendMessage {
+                            namespace: "crashed-owner-receipt".into(),
+                            message: kuru_core::Message::text("user", "changed retry"),
+                        },
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("conflicts"),
+                "changed retry after owner crash reused the original receipt"
+            );
+            let ServiceValue::HistoryWindow(window) = successor
+                .call(ServiceCall::HistoryWindow {
+                    namespace: "crashed-owner-receipt".into(),
+                    limit: 4,
+                })
+                .await
+                .context("successor could not read history after receipt recovery")?
+            else {
+                bail!("successor history returned the wrong response")
+            };
+            ensure!(window.total_rows == 2 && window.messages.len() == 2);
+            drop(successor);
+            let permit = acquire_maintenance_permit(&options)
+                .await
+                .context("successor did not retire for fixture maintenance")?;
+            drop(permit);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("crashed-owner receipt fixture exceeded 120 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_usage_reply_uses_natural_key_after_sibling_write_and_restart() -> Result<()> {
+        use kuru_core::{InvocationStart, UsagePhase};
+        use tokio::io::AsyncWriteExt;
+        use uuid::Uuid;
+
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let data = root.path().join("private");
+            let options = crate::test_support::open_options(data.clone(), scope.clone())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
+            let original = owner.authority().clone();
+            let record = EndpointRecord::read(&data, &scope)?.context("missing owner endpoint")?;
+            let start = InvocationStart {
+                session_id: "proof-session".into(),
+                invocation_id: "proof-invocation".into(),
+                operation_id: "proof-turn".into(),
+                phase: UsagePhase::Speak,
+                actor_id: "speaker".into(),
+                route: "responses".into(),
+                model: "model".into(),
+                price_at_invocation: None,
+            };
+            let ledger = owner.store.usage_ledger()?;
+            ledger.mark_new_session(&start.session_id).await?;
+            drop(ledger);
+            let proof = rpc::LedgerOperation::Admit {
+                start: Box::new(start.clone()),
+            }
+            .proof()?
+            .context("admit has no natural-key proof")?;
+            let id = Uuid::new_v4();
+            let request = rpc::ServiceRequest::with_id(
+                &original.service_generation,
+                id,
+                ServiceCall::Ledger {
+                    operation: Box::new(rpc::LedgerOperation::Admit {
+                        start: Box::new(start.clone()),
+                    }),
+                },
+            );
+            let body = serde_json::to_vec(&request)?;
+            let mut client =
+                connect_local(&data, &scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+            let mut server = owner.accept(HANDSHAKE_TIMEOUT).await?;
+            let sent = async {
+                connect_handshake(&mut client, &original).await?;
+                client.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                client.write_all(&body).await?;
+                client.flush().await?;
+                drop(client);
+                Ok::<(), anyhow::Error>(())
+            };
+            let (sent, _) =
+                tokio::join!(sent, rpc::serve_one(&mut server, &original, &owner.store));
+            sent?;
+            drop(server);
+
+            let sibling = owner.store.usage_ledger()?;
+            sibling
+                .admit(InvocationStart {
+                    invocation_id: "sibling-invocation".into(),
+                    ..start.clone()
+                })
+                .await?;
+            drop(sibling);
+            let query = |original_id, proof| ServiceCall::LedgerOutcome {
+                original_id,
+                original_generation: original.service_generation.clone(),
+                proof,
+            };
+            let missing = crate::store::UsageProof::admit(&InvocationStart {
+                invocation_id: "missing-invocation".into(),
+                ..start.clone()
+            })?;
+            for (query_id, candidate_proof, expected) in [
+                (id, proof.clone(), rpc::OutcomeStatus::Committed),
+                (
+                    Uuid::new_v4(),
+                    missing.clone(),
+                    rpc::OutcomeStatus::StillUncertain,
+                ),
+            ] {
+                let mut client =
+                    connect_local(&data, &scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+                let mut server = owner.accept(HANDSHAKE_TIMEOUT).await?;
+                let (response, served) = tokio::join!(
+                    rpc::request_one(&mut client, &original, query(query_id, candidate_proof)),
+                    rpc::serve_one(&mut server, &original, &owner.store),
+                );
+                ensure!(matches!(response?, ServiceValue::Outcome(status) if status == expected));
+                served?;
+                drop(server);
+                drop(client);
+            }
+            owner.close().await?;
+
+            let mut successor = ServiceOwner::open(options, &project).await?;
+            let current = successor.authority().clone();
+            let current_record =
+                EndpointRecord::read(&data, &scope)?.context("missing successor endpoint")?;
+            for (query_id, candidate_proof, expected) in [
+                (id, proof, rpc::OutcomeStatus::Committed),
+                (Uuid::new_v4(), missing, rpc::OutcomeStatus::Absent),
+            ] {
+                let mut client =
+                    connect_local(&data, &scope, &current_record.address, HANDSHAKE_TIMEOUT)
+                        .await?;
+                let mut server = successor.accept(HANDSHAKE_TIMEOUT).await?;
+                let (response, served) = tokio::join!(
+                    rpc::request_one(&mut client, &current, query(query_id, candidate_proof)),
+                    rpc::serve_one(&mut server, &current, &successor.store),
+                );
+                ensure!(matches!(response?, ServiceValue::Outcome(status) if status == expected));
+                served?;
+                drop(server);
+                drop(client);
+            }
+            let ledger = successor.store.usage_ledger()?;
+            ledger.admit(start.clone()).await?;
+            ensure!(
+                ledger.session(&start.session_id).await?.invocation_count == 2,
+                "exact usage retry charged the original invocation twice"
+            );
+            drop(ledger);
+            successor.close().await
+        })
+        .await
+        .context("lost usage reply fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_transition_query_preserves_open_conflict_and_promoted_revision() -> Result<()>
+    {
+        use crate::service::rpc::{CandidateTransitionKind, CandidateTransitionResult};
+
+        async fn inspect(
+            owner: &mut ServiceOwner,
+            authority: &EndpointAuthority,
+            data: &Path,
+            scope: &str,
+            generation: &str,
+            transition: CandidateTransitionKind,
+            subject: (&str, &str, &str),
+        ) -> Result<CandidateTransitionResult> {
+            let (branch, base, target) = subject;
+            let record = EndpointRecord::read(data, scope)?.context("missing endpoint")?;
+            let mut client = connect_local(data, scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+            let mut server = owner.accept(HANDSHAKE_TIMEOUT).await?;
+            let (response, served) = tokio::join!(
+                rpc::request_one(
+                    &mut client,
+                    authority,
+                    ServiceCall::CandidateTransitionOutcome {
+                        original_id: uuid::Uuid::new_v4(),
+                        original_generation: generation.to_owned(),
+                        transition,
+                        branch: branch.to_owned(),
+                        base: base.to_owned(),
+                        target: target.to_owned(),
+                    },
+                ),
+                rpc::serve_one(&mut server, authority, &owner.store),
+            );
+            served?;
+            let ServiceValue::CandidateTransitionOutcome(result) = response? else {
+                bail!("candidate transition query returned the wrong typed response")
+            };
+            Ok(result)
+        }
+
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!("project/{}", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+            let data = root.path().join("private");
+            let options = crate::test_support::open_options(data.clone(), scope.clone())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
+            let original = owner.authority().clone();
+            let candidate = owner.store.begin_candidate("transition outcome").await?;
+            let branch = candidate.view().pinned_view().to_owned();
+            let base = candidate.base().to_owned();
+            candidate.view().put("private", &serde_json::json!(1)).await?;
+            let target = candidate.view().revision().await?;
+            ensure!(matches!(
+                inspect(&mut owner, &original, &data, &scope, &original.service_generation, CandidateTransitionKind::Promote, (&branch, &base, &target)).await?,
+                CandidateTransitionResult::StillUncertain
+            ));
+            owner.store.put("sibling", &serde_json::json!(true)).await?;
+            ensure!(matches!(
+                inspect(&mut owner, &original, &data, &scope, &original.service_generation, CandidateTransitionKind::Promote, (&branch, &base, &target)).await?,
+                CandidateTransitionResult::StillUncertain
+            ));
+            drop(candidate);
+            owner.close().await?;
+
+            let mut successor = ServiceOwner::open(options, &project).await?;
+            let current = successor.authority().clone();
+            ensure!(matches!(
+                inspect(&mut successor, &current, &data, &scope, &original.service_generation, CandidateTransitionKind::Promote, (&branch, &base, &target)).await?,
+                CandidateTransitionResult::OpenConflict
+            ));
+            let new_candidate = successor.store.begin_candidate("later promoted").await?;
+            let new_branch = new_candidate.view().pinned_view().to_owned();
+            let new_base = new_candidate.base().to_owned();
+            new_candidate.view().put("promoted", &serde_json::json!(2)).await?;
+            let new_target = new_candidate.view().revision().await?;
+            ensure!(new_candidate.promote_exact(&new_target).await? == new_target);
+            successor.store.put("after-promotion", &serde_json::json!(3)).await?;
+            ensure!(matches!(
+                inspect(&mut successor, &current, &data, &scope, &original.service_generation, CandidateTransitionKind::Promote, (&new_branch, &new_base, &new_target)).await?,
+                CandidateTransitionResult::Promoted { revision } if revision == new_target
+            ));
+            ensure!(matches!(
+                inspect(&mut successor, &current, &data, &scope, &original.service_generation, CandidateTransitionKind::Abandon, (&new_branch, &new_base, &new_target)).await?,
+                CandidateTransitionResult::PreservedConflict
+            ));
+            drop(new_candidate);
+            successor.close().await
+        })
+        .await
+        .context("candidate transition outcome fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_candidate_transition_replies_survive_sibling_write_and_owner_restart()
+    -> Result<()> {
+        use crate::service::rpc::{
+            CandidateTransitionKind, CandidateTransitionResult, ViewOperation,
+        };
+
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!("project/{}", digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = ServiceOwner::open(options.clone(), &project).await?;
+            let served = tokio::spawn(owner.serve());
+            let mut client = attach_existing(&options, &project).await?.context("missing service attachment")?;
+            let generation = client.generation().to_owned();
+            let ServiceValue::CandidateStarted { handle, base, branch } = client
+                .call(ServiceCall::BeginCandidate { label: "lost promotion".into() })
+                .await? else { bail!("service did not start the candidate") };
+            ensure!(matches!(client.call(ServiceCall::View {
+                candidate: Some(handle),
+                operation: ViewOperation::PutMany { values: vec![("private".into(), serde_json::json!(1))] },
+            }).await?, ServiceValue::Unit));
+            let ServiceValue::Revision(target) = client.call(ServiceCall::View {
+                candidate: Some(handle), operation: ViewOperation::Revision,
+            }).await? else { bail!("service did not report candidate target") };
+            let id = uuid::Uuid::new_v4();
+            let request = rpc::ServiceRequest::with_id(&generation, id,
+                ServiceCall::PromoteCandidate {
+                    handle, branch: branch.clone(), base: base.clone(), target: target.clone(),
+                });
+            let body = serde_json::to_vec(&request)?;
+            let mut stream = client.stream.take().context("missing live candidate stream")?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                stream.write_all(&body).await?;
+                stream.flush().await
+            }).await.context("candidate promotion frame send deadline")??;
+            drop(stream); // the accepted request may complete; its reply is lost
+            drop(client);
+
+            let query = || ServiceCall::CandidateTransitionOutcome {
+                original_id: id, original_generation: generation.clone(),
+                transition: CandidateTransitionKind::Promote,
+                branch: branch.clone(), base: base.clone(), target: target.clone(),
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let mut observer = attach_existing(&options, &project).await?
+                        .context("owner disappeared before promotion proof")?;
+                    match observer.call(query()).await? {
+                        ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Promoted { revision })
+                            if revision == target => break Ok::<(), anyhow::Error>(()),
+                        ServiceValue::CandidateTransitionOutcome(
+                            CandidateTransitionResult::InFlight | CandidateTransitionResult::StillUncertain,
+                        ) => tokio::time::sleep(Duration::from_millis(20)).await,
+                        other => bail!("candidate promotion returned unexpected outcome: {other:?}"),
+                    }
+                }
+            }).await.context("accepted promotion proof deadline")??;
+            let mut sibling = attach_existing(&options, &project).await?
+                .context("missing service for sibling write")?;
+            ensure!(matches!(sibling.call(ServiceCall::PutMany {
+                values: vec![("later-main".into(), serde_json::json!(true))],
+            }).await?, ServiceValue::Unit));
+            drop(sibling);
+            let mut observer = attach_existing(&options, &project).await?
+                .context("missing service after sibling write")?;
+            ensure!(matches!(observer.call(query()).await?,
+                ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Promoted { revision })
+                    if revision == target));
+            drop(observer);
+            let mut abandoner = attach_existing(&options, &project).await?
+                .context("missing service for accepted abandonment")?;
+            let abandon_generation = abandoner.generation().to_owned();
+            let ServiceValue::CandidateStarted {
+                handle: abandon_handle,
+                base: abandon_base,
+                branch: abandon_branch,
+            } = abandoner.call(ServiceCall::BeginCandidate {
+                label: "lost abandonment".into(),
+            }).await? else { bail!("service did not start the abandonment candidate") };
+            ensure!(matches!(abandoner.call(ServiceCall::View {
+                candidate: Some(abandon_handle),
+                operation: ViewOperation::PutMany {
+                    values: vec![("abandoned-private".into(), serde_json::json!(1))],
+                },
+            }).await?, ServiceValue::Unit));
+            let ServiceValue::Revision(abandon_target) = abandoner.call(ServiceCall::View {
+                candidate: Some(abandon_handle), operation: ViewOperation::Revision,
+            }).await? else { bail!("service did not report the abandonment target") };
+            let abandon_id = uuid::Uuid::new_v4();
+            let request = rpc::ServiceRequest::with_id(&abandon_generation, abandon_id,
+                ServiceCall::AbandonCandidate {
+                    handle: abandon_handle,
+                    branch: abandon_branch.clone(),
+                    base: abandon_base.clone(),
+                    target: abandon_target.clone(),
+                });
+            let body = serde_json::to_vec(&request)?;
+            let mut stream = abandoner.stream.take().context("missing abandonment stream")?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                stream.write_all(&body).await?;
+                stream.flush().await
+            }).await.context("candidate abandonment frame send deadline")??;
+            drop(stream);
+            drop(abandoner);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let mut observer = attach_existing(&options, &project).await?
+                        .context("owner disappeared before abandonment proof")?;
+                    match observer.call(ServiceCall::CandidateTransitionOutcome {
+                        original_id: abandon_id,
+                        original_generation: abandon_generation.clone(),
+                        transition: CandidateTransitionKind::Abandon,
+                        branch: abandon_branch.clone(),
+                        base: abandon_base.clone(),
+                        target: abandon_target.clone(),
+                    }).await? {
+                        ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Abandoned) =>
+                            break Ok::<(), anyhow::Error>(()),
+                        ServiceValue::CandidateTransitionOutcome(
+                            CandidateTransitionResult::InFlight | CandidateTransitionResult::StillUncertain,
+                        ) => tokio::time::sleep(Duration::from_millis(20)).await,
+                        other => bail!("candidate abandonment returned unexpected outcome: {other:?}"),
+                    }
+                }
+            }).await.context("accepted abandonment proof deadline")??;
+            let permit = acquire_maintenance_permit(&options).await?;
+            tokio::time::timeout(Duration::from_secs(10), served)
+                .await.context("promotion fixture owner did not reap")???;
+            drop(permit);
+            let successor = ServiceOwner::open(options.clone(), &project).await?;
+            let successor_served = tokio::spawn(successor.serve());
+            let mut observer = attach_existing(&options, &project).await?
+                .context("successor did not publish its endpoint")?;
+            ensure!(observer.generation() != generation);
+            ensure!(matches!(observer.call(query()).await?,
+                ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Promoted { revision })
+                    if revision == target));
+            ensure!(matches!(observer.call(ServiceCall::CandidateTransitionOutcome {
+                original_id: abandon_id,
+                original_generation: abandon_generation,
+                transition: CandidateTransitionKind::Abandon,
+                branch: abandon_branch,
+                base: abandon_base,
+                target: abandon_target,
+            }).await?, ServiceValue::CandidateTransitionOutcome(CandidateTransitionResult::Abandoned)));
+            drop(observer);
+            let permit = acquire_maintenance_permit(&options).await?;
+            tokio::time::timeout(Duration::from_secs(10), successor_served)
+                .await.context("transition fixture successor did not reap")???;
+            drop(permit);
+            Ok::<(), anyhow::Error>(())
+        }).await.context("lost candidate promotion fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_candidate_begin_reply_uses_only_read_only_exact_ref_outcomes() -> Result<()> {
+        use crate::store::CandidateLookup;
+        use rpc::CandidateCreationOutcome;
+        use tokio::io::AsyncWriteExt;
+        use uuid::Uuid;
+
+        async fn inspect(
+            owner: &mut ServiceOwner,
+            authority: &EndpointAuthority,
+            data: &Path,
+            scope: &str,
+            id: Uuid,
+            generation: &str,
+        ) -> Result<CandidateCreationOutcome> {
+            let record = EndpointRecord::read(data, scope)?.context("missing endpoint")?;
+            let mut client = connect_local(data, scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+            let mut server = owner.accept(HANDSHAKE_TIMEOUT).await?;
+            let (response, served) = tokio::join!(
+                rpc::request_one(
+                    &mut client,
+                    authority,
+                    ServiceCall::CandidateOutcome {
+                        original_id: id,
+                        original_generation: generation.to_owned(),
+                    },
+                ),
+                rpc::serve_one(&mut server, authority, &owner.store),
+            );
+            served?;
+            let ServiceValue::CandidateOutcome(outcome) = response? else {
+                bail!("candidate query returned the wrong typed response")
+            };
+            Ok(outcome)
+        }
+
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let data = root.path().join("private");
+            let options = crate::test_support::open_options(data.clone(), scope.clone())?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
+            let authority = owner.authority().clone();
+            let original_generation = authority.service_generation.clone();
+            let id = Uuid::new_v4();
+            let record = EndpointRecord::read(&data, &scope)?.context("missing endpoint")?;
+            let request = rpc::ServiceRequest::with_id(
+                &original_generation,
+                id,
+                ServiceCall::BeginCandidate {
+                    label: "lost-begin".into(),
+                },
+            );
+            let body = serde_json::to_vec(&request)?;
+            let mut client =
+                connect_local(&data, &scope, &record.address, HANDSHAKE_TIMEOUT).await?;
+            let mut server = owner.accept(HANDSHAKE_TIMEOUT).await?;
+            let sent = async {
+                connect_handshake(&mut client, &authority).await?;
+                client.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                client.write_all(&body).await?;
+                client.flush().await?;
+                drop(client); // the caller has no candidate handle or base
+                Ok::<(), anyhow::Error>(())
+            };
+            let (sent, _) =
+                tokio::join!(sent, rpc::serve_one(&mut server, &authority, &owner.store));
+            sent?;
+            drop(server);
+
+            let (branch, base) = match inspect(
+                &mut owner,
+                &authority,
+                &data,
+                &scope,
+                id,
+                &original_generation,
+            )
+            .await?
+            {
+                CandidateCreationOutcome::Open { branch, base, .. } => (branch, base),
+                _ => bail!("lost Begin did not retain its exact candidate ref"),
+            };
+            for _ in 0..2 {
+                let CandidateCreationOutcome::Open {
+                    branch: observed,
+                    base: observed_base,
+                    ..
+                } = inspect(
+                    &mut owner,
+                    &authority,
+                    &data,
+                    &scope,
+                    id,
+                    &original_generation,
+                )
+                .await?
+                else {
+                    bail!("repeat candidate outcome lost the open ref")
+                };
+                ensure!(observed == branch && observed_base == base);
+            }
+            let CandidateLookup::Open(retained) = owner.store.candidate_for_id(id).await? else {
+                bail!("accepted Begin lost its exact candidate before restart")
+            };
+            retained
+                .view()
+                .put("private/lost-begin", &serde_json::json!("retained"))
+                .await?;
+            let private_head = retained.view().revision().await?;
+            drop(retained);
+            owner
+                .store
+                .put("later/main", &serde_json::json!("sibling"))
+                .await?;
+            owner.close().await?;
+
+            let mut successor = ServiceOwner::open(options.clone(), &project).await?;
+            let next = successor.authority().clone();
+            ensure!(next.service_generation != original_generation);
+            let CandidateCreationOutcome::Open {
+                branch: observed,
+                base: observed_base,
+                ..
+            } = inspect(
+                &mut successor,
+                &next,
+                &data,
+                &scope,
+                id,
+                &original_generation,
+            )
+            .await?
+            else {
+                bail!("successor did not reattach the exact candidate ref")
+            };
+            ensure!(observed == branch && observed_base == base);
+            let CandidateLookup::Open(retained) = successor.store.candidate_for_id(id).await?
+            else {
+                bail!("successor did not retain the exact candidate contents")
+            };
+            ensure!(
+                retained.view().revision().await? == private_head,
+                "candidate head changed while recovering the lost Begin reply"
+            );
+            ensure!(
+                retained.view().get("private/lost-begin").await?
+                    == Some(serde_json::json!("retained")),
+                "candidate private rows disappeared across owner restart"
+            );
+            drop(retained);
+            successor.close().await?;
+
+            let local = crate::store::MemoryStore::open(options.clone()).await?;
+            let CandidateLookup::Open(candidate) = local.candidate_for_id(id).await? else {
+                bail!("exact candidate was missing before explicit abandonment")
+            };
+            candidate.abandon().await?;
+            drop(candidate);
+            local.close().await?;
+            let mut final_owner = ServiceOwner::open(options, &project).await?;
+            let final_authority = final_owner.authority().clone();
+            ensure!(matches!(
+                inspect(
+                    &mut final_owner,
+                    &final_authority,
+                    &data,
+                    &scope,
+                    id,
+                    &original_generation,
+                )
+                .await?,
+                CandidateCreationOutcome::StillUncertain
+            ));
+            ensure!(matches!(
+                final_owner.store.candidate_for_id(id).await?,
+                CandidateLookup::Missing
+            ));
+            final_owner.close().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("candidate lost-reply outcome fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn independent_clients_elect_one_real_process_and_keep_it_warm() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(120), async {
             let root = tempfile::tempdir()?;
@@ -1830,10 +3515,16 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            ensure!(
-                ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_some(),
-                "idle service retained owner authority after endpoint retirement"
-            );
+            // Endpoint retirement happens before the service owner drops its
+            // retained lock. Observe both steps, without mistaking that
+            // brief ordering interval for a leaked owner.
+            while ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_none() {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "idle service did not release owner authority after endpoint retirement"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             Ok::<(), anyhow::Error>(())
         })
         .await
@@ -2062,10 +3753,13 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            ensure!(
-                ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_some(),
-                "cold-start fixture service retained owner authority after idle cleanup"
-            );
+            while ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?.is_none() {
+                ensure!(
+                    tokio::time::Instant::now() < idle_deadline,
+                    "cold-start fixture service did not release owner authority after endpoint retirement"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             Ok::<(), anyhow::Error>(())
         })
         .await

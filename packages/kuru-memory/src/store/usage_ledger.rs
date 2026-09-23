@@ -25,6 +25,103 @@ pub struct UsageLedger {
     store: MemoryStore,
 }
 
+/// Compact, typed natural-key proof for one accepted ledger call. The query
+/// carries no duplicated invocation record or provider payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UsageProof {
+    NewSession {
+        session_id: String,
+    },
+    Admit {
+        invocation_id: String,
+        digest: String,
+    },
+    Observe {
+        invocation_id: String,
+        sequence: u64,
+        digest: String,
+    },
+    Settle {
+        invocation_id: String,
+        digest: String,
+    },
+}
+
+impl UsageProof {
+    pub(crate) fn new_session(session_id: &str) -> Self {
+        Self::NewSession {
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    pub(crate) fn admit(start: &InvocationStart) -> Result<Self> {
+        Ok(Self::Admit {
+            invocation_id: start.invocation_id.clone(),
+            digest: proof_digest(start)?,
+        })
+    }
+
+    pub(crate) fn observe(invocation_id: &str, observation: &UsageObservation) -> Result<Self> {
+        Ok(Self::Observe {
+            invocation_id: invocation_id.to_owned(),
+            sequence: observation.sequence,
+            digest: proof_digest(observation)?,
+        })
+    }
+
+    pub(crate) fn settle(invocation_id: &str, outcome: InvocationOutcome) -> Result<Self> {
+        Ok(Self::Settle {
+            invocation_id: invocation_id.to_owned(),
+            digest: proof_digest(&outcome)?,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::NewSession { session_id } => session_id_valid(session_id),
+            Self::Admit {
+                invocation_id,
+                digest,
+            }
+            | Self::Settle {
+                invocation_id,
+                digest,
+            } => {
+                invocation_id_valid(invocation_id)?;
+                proof_digest_valid(digest)
+            }
+            Self::Observe {
+                invocation_id,
+                sequence,
+                digest,
+            } => {
+                invocation_id_valid(invocation_id)?;
+                ensure!(*sequence > 0, "usage proof sequence must start at one");
+                proof_digest_valid(digest)
+            }
+        }
+    }
+}
+
+fn proof_digest(value: &impl Serialize) -> Result<String> {
+    Ok(Sha256::digest(serde_json::to_vec(value)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn proof_digest_valid(digest: &str) -> Result<()> {
+    ensure!(
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid usage proof digest"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct SessionMarker {
@@ -134,6 +231,81 @@ impl UsageLedger {
         fold.finish()
     }
 
+    /// Inspect one existing natural key after any accepted SQL session has
+    /// settled. A missing key is only noncommit proof once the service's
+    /// handler-completion or prior-owner-reap boundary is also established.
+    pub(crate) async fn inspect_proof(&self, proof: &UsageProof) -> Result<bool> {
+        proof.validate()?;
+        self.store.readable()?;
+        let _guard = self.store.shared.write.lock().await;
+        self.store.resolve_uncertain().await?;
+        let pool = self.store.pool.as_ref();
+        let matching = match proof {
+            UsageProof::NewSession { session_id } => read_marker(pool, session_id)
+                .await?
+                .is_some_and(|marker| marker.historical_complete),
+            UsageProof::Admit {
+                invocation_id,
+                digest,
+            } => match read_state(pool, &record_key(invocation_id)).await? {
+                Some(value) => {
+                    let record = decode_record(&value)?;
+                    ensure!(
+                        record.start.invocation_id == *invocation_id,
+                        "usage proof record identity changed"
+                    );
+                    ensure!(
+                        proof_digest(&record.start)? == *digest,
+                        LogicalReceiptConflict
+                    );
+                    true
+                }
+                None => false,
+            },
+            UsageProof::Observe {
+                invocation_id,
+                sequence,
+                digest,
+            } => match read_state(pool, &observation_key(invocation_id, *sequence)).await? {
+                Some(value) => {
+                    let observation = decode_observation(&value)?;
+                    ensure!(
+                        observation.invocation_id == *invocation_id
+                            && observation.observation.sequence == *sequence,
+                        "usage proof observation identity changed"
+                    );
+                    ensure!(
+                        proof_digest(&observation.observation)? == *digest,
+                        LogicalReceiptConflict
+                    );
+                    true
+                }
+                None => false,
+            },
+            UsageProof::Settle {
+                invocation_id,
+                digest,
+            } => match read_state(pool, &record_key(invocation_id)).await? {
+                Some(value) => {
+                    let record = decode_record(&value)?;
+                    ensure!(
+                        record.start.invocation_id == *invocation_id,
+                        "usage proof record identity changed"
+                    );
+                    match record.outcome {
+                        Some(outcome) => {
+                            ensure!(proof_digest(&outcome)? == *digest, LogicalReceiptConflict);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                None => false,
+            },
+        };
+        Ok(matching)
+    }
+
     async fn change(&self, change: Change) -> Result<()> {
         self.store.writable()?;
         let guard = self.store.shared.write.clone().lock_owned().await;
@@ -208,6 +380,9 @@ pub(super) async fn establish(store: &MemoryStore) -> Result<()> {
     }
     let pool = store.shared.server.pool(BRANCH).await?;
     validate_branch(pool.as_ref()).await?;
+    migrations::upgrade_usage(&store.shared.server, pool.as_ref()).await?;
+    migrations::validate_usage(&store.shared.server, pool.as_ref()).await?;
+    validate_branch(pool.as_ref()).await?;
     *store.shared.usage_pool.lock().expect("usage pool lock") = Some(pool);
     Ok(())
 }
@@ -220,16 +395,21 @@ async fn validate_branch(pool: &MySqlPool) -> Result<()> {
     .await
     .context("usage ledger working-set validation deadline exceeded")??;
     ensure!(dirty == 0, "usage ledger branch has uncommitted changes");
-    let receipts: Vec<(String, String)> = tokio::time::timeout(
-        QUERY_TIMEOUT,
-        sqlx::query_as("SELECT id, label FROM operations LIMIT 2").fetch_all(pool),
-    )
-    .await
-    .context("usage ledger receipt validation deadline exceeded")??;
-    ensure!(
-        receipts.len() <= 1,
-        "usage ledger receipt state is ambiguous"
-    );
+    let version = migrations::validate_historical(pool).await?;
+    if version <= 3 {
+        let old_receipts: Vec<(String, String)> = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_as("SELECT id, label FROM operations LIMIT 2").fetch_all(pool),
+        )
+        .await
+        .context("historical usage receipt validation deadline exceeded")??;
+        ensure!(
+            old_receipts.len() <= 1,
+            "historical usage receipt state is ambiguous"
+        );
+    }
+    // Current usage receipts intentionally survive later ledger writes;
+    // there is no one-row limit on an upgraded writable branch.
     let mut after = None;
     loop {
         let rows = owned_state_page(pool, after.as_deref()).await?;
@@ -425,9 +605,13 @@ async fn apply_change(
         transaction.rollback().await?;
         return Ok(false);
     }
-    sqlx::query("DELETE FROM operations")
-        .execute(&mut *transaction)
+    let version: i32 = sqlx::query_scalar("SELECT version FROM kuru_schema WHERE id = 1")
+        .fetch_one(&mut *transaction)
         .await?;
+    ensure!(
+        version == migrations::CURRENT_VERSION,
+        "usage ledger branch requires retained receipt schema before writing"
+    );
     sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")
         .bind(operation)
         .bind("usage ledger v1")
@@ -981,6 +1165,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn natural_key_proofs_survive_sibling_writes_and_reopen() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let store = reopen(&root).await?;
+        let ledger = store.usage_ledger()?;
+        let admitted = start("proof-session", "proof-invocation");
+        let observation = UsageObservation {
+            sequence: 1,
+            terminal: true,
+            usage: Usage {
+                input_tokens: Some(11),
+                ..Usage::default()
+            },
+        };
+        let session_proof = UsageProof::new_session("proof-session");
+        let admit_proof = UsageProof::admit(&admitted)?;
+        let observe_proof = UsageProof::observe("proof-invocation", &observation)?;
+        let settle_proof = UsageProof::settle("proof-invocation", InvocationOutcome::Succeeded)?;
+        for proof in [&session_proof, &admit_proof, &observe_proof, &settle_proof] {
+            ensure!(!ledger.inspect_proof(proof).await?);
+        }
+        ledger.mark_new_session("proof-session").await?;
+        ledger.admit(admitted.clone()).await?;
+        ledger
+            .observe("proof-invocation", observation.clone())
+            .await?;
+        ledger
+            .settle("proof-invocation", InvocationOutcome::Succeeded)
+            .await?;
+        ledger
+            .admit(start("proof-session", "sibling-invocation"))
+            .await?;
+        for proof in [&session_proof, &admit_proof, &observe_proof, &settle_proof] {
+            ensure!(ledger.inspect_proof(proof).await?);
+        }
+        let changed = UsageProof::observe(
+            "proof-invocation",
+            &UsageObservation {
+                usage: Usage {
+                    input_tokens: Some(12),
+                    ..Usage::default()
+                },
+                ..observation
+            },
+        )?;
+        ensure!(
+            ledger
+                .inspect_proof(&changed)
+                .await
+                .unwrap_err()
+                .downcast_ref::<LogicalReceiptConflict>()
+                .is_some(),
+            "changed observation did not conflict with its durable natural key"
+        );
+        drop(ledger);
+        store.close().await?;
+
+        let reopened = reopen(&root).await?;
+        let ledger = reopened.usage_ledger()?;
+        for proof in [&session_proof, &admit_proof, &observe_proof, &settle_proof] {
+            ensure!(ledger.inspect_proof(proof).await?);
+        }
+        drop(ledger);
+        reopened.close().await
+    }
+
+    #[tokio::test]
     async fn permanent_branch_keeps_usage_out_of_main_and_candidate_promotion() -> Result<()> {
         let store = MemoryStore::temporary().await?;
         let main_before = store.revision().await?;
@@ -1138,6 +1388,18 @@ mod tests {
         ledger
             .settle("invocation-1", InvocationOutcome::Succeeded)
             .await?;
+        let usage_pool = store
+            .shared
+            .usage_pool
+            .lock()
+            .expect("usage pool lock")
+            .clone()
+            .context("usage branch pool missing")?;
+        let retained: Vec<String> = sqlx::query_scalar("SELECT id FROM operations ORDER BY id")
+            .fetch_all(usage_pool.as_ref())
+            .await?;
+        assert_eq!(retained.len(), 3, "later ledger writes erased a receipt");
+        drop(usage_pool);
         drop(ledger);
         store.close().await?;
 
@@ -1147,6 +1409,17 @@ mod tests {
         assert!(!session.historical_complete);
         assert_eq!(session.known_usage.input_tokens, Some(7));
         assert!(!session.component_complete.input_tokens);
+        let usage_pool = reopened
+            .shared
+            .usage_pool
+            .lock()
+            .expect("usage pool lock")
+            .clone()
+            .context("reopened usage branch pool missing")?;
+        let after: Vec<String> = sqlx::query_scalar("SELECT id FROM operations ORDER BY id")
+            .fetch_all(usage_pool.as_ref())
+            .await?;
+        assert_eq!(after, retained, "reopen changed retained usage receipts");
         ledger.admit(start("resumed", "invocation-1")).await?;
         assert!(ledger.mark_new_session("resumed").await.is_err());
         assert!(

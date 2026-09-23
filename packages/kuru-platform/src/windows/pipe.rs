@@ -672,7 +672,8 @@ fn open_client(
 
 pub async fn connect(address: &OsStr, timeout: Duration) -> io::Result<Pipe> {
     check_address(address)?;
-    tokio::time::timeout(timeout, async {
+    let mut last_retry_error = None;
+    match tokio::time::timeout(timeout, async {
         loop {
             match open_client(address, true, true, true) {
                 Ok(handle) => return Ok(Pipe::new(handle, true, true)),
@@ -680,6 +681,7 @@ pub async fn connect(address: &OsStr, timeout: Duration) -> io::Result<Pipe> {
                     if error.kind() == io::ErrorKind::NotFound
                         || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) =>
                 {
+                    last_retry_error = Some(error);
                     tokio::time::sleep(POLL_INTERVAL).await
                 }
                 Err(error) => return Err(error),
@@ -687,7 +689,19 @@ pub async fn connect(address: &OsStr, timeout: Duration) -> io::Result<Pipe> {
         }
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "private pipe connect timed out"))?
+    {
+        Ok(result) => result,
+        Err(_) => match last_retry_error {
+            // Absence is a transport observation rather than ownership
+            // authority. Callers may inspect their retained election and owner
+            // locks before deciding whether a replacement can be started.
+            Some(error) if error.kind() == io::ErrorKind::NotFound => Err(error),
+            _ => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "private pipe connect timed out",
+            )),
+        },
+    }
 }
 
 /// The parent opens this synchronous endpoint for inheritance; its client PID

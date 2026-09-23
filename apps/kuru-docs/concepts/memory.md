@@ -79,9 +79,10 @@ The authenticated SQL sidecar runs only while its owning Kuru process needs it. 
 
 Messages can contain ordered text and structured tool-call/result blocks. Schema
 3 labels old rows as literal text and new typed rows with an explicit content
-format; JSON-looking old messages remain text. Upgrading preserves their bytes,
-revision history and old candidate branches. Older Kuru binaries that do not
-support schema 3 refuse the upgraded store instead of downgrading it.
+format; JSON-looking old messages remain text. Schema 4 retains compact indexed
+operation receipts across later writes, while preserving old candidate branches
+on their historical schema. Older Kuru binaries that do not support schema 4
+refuse the upgraded store instead of downgrading it.
 
 JSON and Markdown memory exports use export format version 2 and include each
 message's content-format discriminator. Export consumers should check those
@@ -126,8 +127,10 @@ reconciles an interrupted write against its durable receipt before it continues,
 so it can distinguish no pending operation, a completed operation, and one that
 did not commit.
 
-Kuru replaces internal operation receipts and reclaims a dream candidate only
-after its promotion or explicit abandonment is durably resolved. Unresolved
+Current writable branches retain compact internal operation receipts for exact
+lost-reply reconciliation. Historical schema-1-through-3 branches keep their
+older receipt shape. Kuru reclaims a dream candidate only after its promotion
+or explicit abandonment is durably resolved. Unresolved
 candidates, conversations, notes and reachable revisions do not expire
 automatically. The bundled engine performs bounded, growth-triggered storage
 maintenance while Kuru owns it, but retained history can continue to grow. This

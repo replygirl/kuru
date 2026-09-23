@@ -73,6 +73,14 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
         .map_err(|error| fixture_startup_error(&fixture_options, error))
 }
 
+#[cfg(test)]
+pub(crate) async fn open_local_fixture(options: OpenOptions) -> Result<crate::store::MemoryStore> {
+    let fixture_options = options.clone();
+    crate::store::MemoryStore::open(options)
+        .await
+        .map_err(|error| fixture_startup_error(&fixture_options, error))
+}
+
 /// [`MemoryStore::open`], serialised against this lib's own advisory-lock
 /// tests; see `crate::spawn_gate`. Every real-engine open in the workspace
 /// behavioral fixtures (`store::recovery_tests`, `store::migration_lifecycle_tests`,
@@ -83,9 +91,9 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
 /// `open_fixture`), so it stays a drop-in replacement for assertions on the
 /// raw `MemoryStore::open` result.
 #[cfg(test)]
-pub(crate) async fn spawn_gated_open(options: OpenOptions) -> Result<MemoryStore> {
+pub(crate) async fn spawn_gated_open(options: OpenOptions) -> Result<crate::store::MemoryStore> {
     let _gate = crate::spawn_gate::spawning().await;
-    MemoryStore::open(options).await
+    crate::store::MemoryStore::open(options).await
 }
 
 pub(crate) fn fixture_startup_error(options: &OpenOptions, error: Error) -> Error {
