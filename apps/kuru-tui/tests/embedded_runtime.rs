@@ -14,8 +14,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     ffi::OsStr,
-    fs::{self, File},
-    io::Read,
+    fs::{self, File, OpenOptions as FsOpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Output,
     time::Duration,
@@ -31,6 +31,8 @@ const BOOTSTRAP_INVENTORY_BYTES: usize = 4096;
 // Cold creation starts staging and active servers, each with the configured
 // 30-second bound, then includes their handshakes and bounded shutdowns.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(100);
+const PREPARE_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_INSTRUMENTED_INPUT_BYTES: u64 = archive::MAX_ARCHIVE_BYTES as u64 + 32 * 1024 * 1024;
 const MANIFEST: &str = include_str!("../../../packages/kuru-memory/support/dolt-assets.json");
 #[cfg(windows)]
 const BOOTSTRAP_PHASES: &[&str] = &[
@@ -56,20 +58,207 @@ const BOOTSTRAP_DIRECT_CHECKPOINTS: &[&str] = &[
 
 fn digest(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
+    digest_file(&mut file)
+}
+
+fn digest_file(file: &mut File) -> Result<String> {
+    file.seek(SeekFrom::Start(0))?;
     let mut hash = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     loop {
-        let bytes = Read::read(&mut file, &mut buffer)?;
+        let bytes = file.read(&mut buffer)?;
         if bytes == 0 {
             break;
         }
         hash.update(&buffer[..bytes]);
     }
+    file.seek(SeekFrom::Start(0))?;
     Ok(hash
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Result<PathBuf> {
+    let mut held = File::open(source).context("open instrumented Cargo artifact")?;
+    let before = regular_file_info(&held)?;
+    ensure!(
+        before.len > 0 && before.len <= MAX_INSTRUMENTED_INPUT_BYTES,
+        "instrumented Cargo artifact exceeds the bounded fixture input"
+    );
+    let source_digest = digest_file(&mut held)?;
+    let staged = root.join(if cfg!(windows) {
+        "instrumented-package-input.exe"
+    } else {
+        "instrumented-package-input"
+    });
+    let mut candidate = FsOpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .context("create private instrumented packaging input")?;
+    let copied_bytes = std::io::copy(
+        &mut Read::by_ref(&mut held).take(MAX_INSTRUMENTED_INPUT_BYTES + 1),
+        &mut candidate,
+    )?;
+    ensure!(
+        copied_bytes == before.len,
+        "instrumented Cargo artifact changed length while snapshotting"
+    );
+    candidate.set_permissions(held.metadata()?.permissions())?;
+    candidate.flush()?;
+    candidate.sync_all()?;
+    drop(candidate);
+    let mut copied = File::open(&staged)?;
+    let copied_info = regular_file_info(&copied)?;
+    ensure!(
+        copied_info.identity != before.identity
+            && copied_info.links == 1
+            && copied_info.len == before.len
+            && digest_file(&mut copied)? == source_digest,
+        "instrumented packaging input is not an independent exact copy"
+    );
+
+    #[cfg(target_os = "macos")]
+    let mut strip = Command::new("/usr/bin/strip");
+    #[cfg(target_os = "macos")]
+    strip.args(["-S"]).arg(&staged);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut strip = Command::new("strip");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    strip.arg("--strip-debug").arg(&staged);
+    #[cfg(unix)]
+    {
+        let output = kuru_delivery::command::output(&mut strip, PREPARE_INPUT_TIMEOUT)
+            .await
+            .context("remove debug symbols from the private coverage copy")?;
+        ensure!(
+            output.status.success(),
+            "debug-symbol removal failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let current = File::open(source).context("reopen instrumented Cargo artifact")?;
+    let after = regular_file_info(&held)?;
+    let named = regular_file_info(&current)?;
+    ensure!(
+        before.identity == after.identity
+            && before.identity == named.identity
+            && before.len == after.len
+            && before.len == named.len
+            && digest_file(&mut held)? == source_digest,
+        "instrumented Cargo artifact changed while preparing its private copy"
+    );
+    let staged_info = regular_file_info(&File::open(&staged)?)?;
+    ensure!(
+        staged_info.identity != before.identity
+            && staged_info.links == 1
+            && staged_info.len > 0
+            && staged_info.len <= archive::MAX_ARCHIVE_BYTES as u64,
+        "prepared instrumented packaging input is not a bounded independent file"
+    );
+    #[cfg(unix)]
+    ensure!(
+        staged_info.len < before.len,
+        "debug-symbol removal did not reduce the instrumented packaging input"
+    );
+
+    let destination = std::env::var_os("LLVM_PROFILE_FILE")
+        .map(PathBuf::from)
+        .context("instrumented packaging preparation requires a coverage destination")?;
+    ensure!(
+        destination.is_absolute(),
+        "coverage destination must be absolute"
+    );
+    let profile_dir = destination.parent().context("coverage directory")?;
+    let reservation = tempfile::Builder::new()
+        .prefix("kuru-package-input-")
+        .tempfile_in(profile_dir)?;
+    let prefix = format!(
+        "{}-",
+        reservation
+            .path()
+            .file_name()
+            .and_then(OsStr::to_str)
+            .context("coverage reservation filename")?
+    );
+    let probe_root = root.join("instrumented-packaging-probe");
+    let probe_home = probe_root.join("home");
+    let probe_config = probe_root.join("config");
+    let probe_cache = probe_root.join("cache");
+    let probe_data = probe_root.join("data");
+    let probe_temporary = probe_root.join("temporary");
+    let probe_workspace = probe_root.join("workspace");
+    let probe_empty_path = probe_root.join("empty-path");
+    for directory in [
+        &probe_home,
+        &probe_config,
+        &probe_cache,
+        &probe_data,
+        &probe_temporary,
+        &probe_workspace,
+        &probe_empty_path,
+    ] {
+        fs::create_dir_all(directory)?;
+    }
+    let mut probe = Command::new(&staged);
+    probe
+        .env_clear()
+        .env("HOME", &probe_home)
+        .env("USERPROFILE", &probe_home)
+        .env("APPDATA", &probe_config)
+        .env("LOCALAPPDATA", &probe_cache)
+        .env("XDG_CONFIG_HOME", &probe_config)
+        .env("XDG_CACHE_HOME", &probe_cache)
+        .env("XDG_DATA_HOME", &probe_data)
+        .env("TMPDIR", &probe_temporary)
+        .env("TMP", &probe_temporary)
+        .env("TEMP", &probe_temporary)
+        .env("PATH", &probe_empty_path)
+        .env(
+            "LLVM_PROFILE_FILE",
+            profile_dir.join(format!("{prefix}%p-%m.profraw")),
+        )
+        .current_dir(&probe_workspace)
+        .arg("-C")
+        .arg(&probe_workspace)
+        .arg("--data-dir")
+        .arg(&probe_data)
+        .arg("config");
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("SystemRoot") {
+        probe.env("SystemRoot", path);
+    }
+    let output = kuru_delivery::command::output(&mut probe, PREPARE_INPUT_TIMEOUT)
+        .await
+        .context("run prepared instrumented packaging input")?;
+    ensure!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains("memory was not opened"),
+        "prepared instrumented packaging input did not complete isolated configuration inspection: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let mut profiles = Vec::new();
+    for entry in fs::read_dir(profile_dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".profraw"))
+        {
+            profiles.push(entry);
+        }
+    }
+    let profile_metadata = profiles.first().map(|entry| entry.metadata()).transpose()?;
+    ensure!(
+        profiles.len() == 1
+            && profile_metadata.is_some_and(|metadata| metadata.is_file() && metadata.len() > 0),
+        "prepared packaging input did not emit one nonempty coverage profile"
+    );
+    drop(reservation);
+    Ok(staged)
 }
 
 fn bounded_bootstrap_inventory(install_dir: &Path) -> String {
@@ -858,7 +1047,8 @@ async fn install_packaged(
 }
 
 async fn packaged_roundtrip(root: &Path) -> Result<()> {
-    let binary = match std::env::var_os("KURU_EMBEDDED_TEST_BINARY") {
+    let explicit = std::env::var_os("KURU_EMBEDDED_TEST_BINARY");
+    let selected = match explicit.as_ref() {
         Some(path) => {
             ensure!(
                 Path::new(&path).is_absolute(),
@@ -867,6 +1057,11 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
             PathBuf::from(path)
         }
         None => PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+    };
+    let binary = if explicit.is_none() && std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        prepare_instrumented_packaging_input(root, &selected).await?
+    } else {
+        selected
     };
     let target = archive::host_target()?;
     let manifest: Value = serde_json::from_str(MANIFEST)?;
