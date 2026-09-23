@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, MySqlConnection, MySqlPool, Row};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use uuid::Uuid;
 #[cfg(any(test, feature = "test-support"))]
@@ -58,6 +60,8 @@ pub struct OpenOptions {
     migration_hooks: Option<Arc<migrations::MigrationRunnerHooks>>,
     #[cfg(test)]
     candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
+    #[cfg(test)]
+    candidate_cleanup_failure: Option<Arc<AtomicBool>>,
 }
 impl OpenOptions {
     pub fn new(data_dir: PathBuf, project_scope: String) -> Self {
@@ -71,6 +75,8 @@ impl OpenOptions {
             migration_hooks: None,
             #[cfg(test)]
             candidate_recovery_pause: None,
+            #[cfg(test)]
+            candidate_cleanup_failure: None,
         }
     }
 }
@@ -86,6 +92,8 @@ struct Shared {
     usage_pool: StdMutex<Option<Arc<MySqlPool>>>,
     #[cfg(test)]
     candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
+    #[cfg(test)]
+    candidate_cleanup_failure: Option<Arc<AtomicBool>>,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -94,6 +102,19 @@ struct Shared {
 struct CandidateRecoveryPause {
     reached: Arc<Semaphore>,
     resume: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+fn fail_candidate_cleanup_once(store: &MemoryStore) -> Result<()> {
+    if store
+        .shared
+        .candidate_cleanup_failure
+        .as_ref()
+        .is_some_and(|failure| failure.swap(false, Ordering::SeqCst))
+    {
+        bail!("injected candidate cleanup failure");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -344,8 +365,11 @@ impl Candidate {
                 }
             };
             if current == target {
+                #[cfg(test)]
+                fail_candidate_cleanup_once(&live)?;
+                live.shared.server.retire_pool(&names.open).await?;
+                cleanup_promoted_candidate(&live, &names, &target).await?;
                 *promoted.lock().expect("candidate result lock") = Some(target.clone());
-                let _ = cleanup_promoted_candidate(&live, &names, &target).await;
                 return Ok(target);
             }
             if current != base {
@@ -373,8 +397,11 @@ impl Candidate {
                 result.context("Dolt promotion deadline exceeded")??;
                 bail!("Dolt did not fast-forward to the candidate revision");
             }
+            #[cfg(test)]
+            fail_candidate_cleanup_once(&live)?;
+            live.shared.server.retire_pool(&names.open).await?;
+            cleanup_promoted_candidate(&live, &names, &target).await?;
             *promoted.lock().expect("candidate result lock") = Some(target.clone());
-            let _ = cleanup_promoted_candidate(&live, &names, &target).await;
             Ok(target)
         })
         .await
@@ -418,6 +445,7 @@ impl Candidate {
                 );
                 ensure!(!heads.is_empty(), CandidateConflict);
             }
+            live.shared.server.retire_pool(&names.open).await?;
             abandon_candidate(&live, &names).await
         })
         .await
@@ -1264,6 +1292,8 @@ impl MemoryStore {
             usage_pool: StdMutex::new(None),
             #[cfg(test)]
             candidate_recovery_pause: options.candidate_recovery_pause,
+            #[cfg(test)]
+            candidate_cleanup_failure: options.candidate_cleanup_failure,
             _permit: permit,
         });
         let store = Self {
@@ -4057,6 +4087,7 @@ mod tests {
                 uncertain: StdMutex::new(None),
                 usage_pool: StdMutex::new(None),
                 candidate_recovery_pause: None,
+                candidate_cleanup_failure: None,
                 _permit: None,
             }),
             pool: pool.clone(),
@@ -4404,15 +4435,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_promotion_retries_cleanup_before_caching_success() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let mut options = crate::test_support::open_options(
+                root.path().to_owned(),
+                format!("project/{}", "7".repeat(64)),
+            )?;
+            options.candidate_cleanup_failure = Some(Arc::new(AtomicBool::new(true)));
+            let store = MemoryStore::open(options).await?;
+            let candidate = store.begin_candidate("retry resolved cleanup").await?;
+            let retained = candidate.view();
+            let branch = candidate.branch().to_owned();
+            let base = candidate.base().to_owned();
+            retained.put("retry-promoted", &json!(true)).await?;
+            let target = retained.revision().await?;
+
+            let error = candidate
+                .promote_exact(&target)
+                .await
+                .expect_err("injected cleanup failure was ignored");
+            ensure!(
+                error
+                    .to_string()
+                    .contains("injected candidate cleanup failure"),
+                "unexpected injected cleanup error: {error:#}"
+            );
+            ensure!(store.revision().await? == target);
+            ensure!(
+                retained.get("retry-promoted").await.is_err(),
+                "committed promotion retained a usable candidate view after cleanup failure"
+            );
+            ensure!(
+                store
+                    .candidate_transition_observation(&branch, &base, &target)
+                    .await?
+                    == CandidateTransitionObservation::Promoted
+            );
+
+            ensure!(candidate.promote_exact(&target).await? == target);
+            ensure!(
+                retained.get("retry-promoted").await.is_err(),
+                "cleanup retry left the resolved candidate view usable"
+            );
+            ensure!(store.get("retry-promoted").await? == Some(json!(true)));
+            ensure!(
+                candidate_heads(&store.pool, &CandidateNames::from_open(&branch)?)
+                    .await?
+                    .is_empty()
+            );
+            store.close().await
+        })
+        .await
+        .context("candidate cleanup retry fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn candidate_transition_observation_uses_exact_refs_and_revisions() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(90), async {
             let store = MemoryStore::temporary().await?;
             let stale = store.begin_candidate("stale transition").await?;
+            let stale_view = stale.view();
             let stale_branch = stale.view().pinned_view().to_owned();
             let stale_base = stale.base().to_owned();
             stale.view().put("private-stale", &json!(1)).await?;
             let stale_target = stale.view().revision().await?;
             ensure!(stale.promote_exact(&stale_base).await.is_err());
+            ensure!(stale_view.get("private-stale").await? == Some(json!(1)));
             ensure!(
                 store
                     .candidate_transition_observation(&stale_branch, &stale_base, &stale_target)
@@ -4427,14 +4517,25 @@ mod tests {
                     == CandidateTransitionObservation::OpenConflict
             );
             ensure!(stale.promote_exact(&stale_target).await.is_err());
+            ensure!(stale_view.get("private-stale").await? == Some(json!(1)));
             stale.abandon_exact(&stale_target).await?;
+            ensure!(
+                stale_view.get("private-stale").await.is_err(),
+                "resolved abandoned candidate view remained usable"
+            );
 
             let promoted = store.begin_candidate("promoted transition").await?;
+            let promoted_view = promoted.view();
             let branch = promoted.view().pinned_view().to_owned();
             let base = promoted.base().to_owned();
             promoted.view().put("private-promoted", &json!(2)).await?;
             let target = promoted.view().revision().await?;
             ensure!(promoted.promote_exact(&target).await? == target);
+            ensure!(
+                promoted_view.get("private-promoted").await.is_err(),
+                "resolved promoted candidate view remained usable"
+            );
+            ensure!(store.get("private-promoted").await? == Some(json!(2)));
             store.put("later", &json!(true)).await?;
             ensure!(
                 store

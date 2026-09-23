@@ -1435,15 +1435,19 @@ async fn dispatch(
             base,
             target,
         } => {
-            let candidate = state
-                .candidates
-                .get(&handle)
-                .context("candidate does not belong to this attachment")?;
-            ensure!(
-                candidate.view().pinned_view() == branch && candidate.base() == base,
-                "candidate transition identity changed"
-            );
-            ServiceValue::Revision(candidate.promote_exact(&target).await?)
+            let revision = {
+                let candidate = state
+                    .candidates
+                    .get(&handle)
+                    .context("candidate does not belong to this attachment")?;
+                ensure!(
+                    candidate.view().pinned_view() == branch && candidate.base() == base,
+                    "candidate transition identity changed"
+                );
+                candidate.promote_exact(&target).await?
+            };
+            state.candidates.remove(&handle);
+            ServiceValue::Revision(revision)
         }
         ServiceCall::AbandonCandidate {
             handle,

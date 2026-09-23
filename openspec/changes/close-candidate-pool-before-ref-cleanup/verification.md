@@ -1,0 +1,14 @@
+## 1. Resolved candidate pool lifetime [critical]
+
+- [x] 1.1 @regression (agent) retain a candidate view clone while promoting through real Dolt -> promotion succeeds, the clone is closed, candidate refs are cleaned, main contains the promoted value, and close/reopen plus undo remain valid. The focused store transition test and the exact runtime dream promotion/undo/reopen regression passed locally on 2026-09-23.
+- [x] 1.2 @regression (agent) retain a candidate view clone while abandoning through real Dolt -> abandonment succeeds, the clone is closed, candidate refs are cleaned, and main remains unchanged. The focused store transition test passed locally on 2026-09-23.
+
+## 2. Rejected and uncertain outcomes
+
+- [x] 2.1 @integration (agent) conflict a candidate by advancing main before promotion -> typed conflict leaves the candidate view usable with its exact private value and ref. The focused store transition test passed locally on 2026-09-23.
+- [x] 2.2 @integration (agent) inject a failure after the main merge commits but before resolved-ref cleanup, then retry the exact target -> the first call reports failure, retains the durable promoting ref and does not cache success; the retry observes the committed target, completes cleanup without replaying the merge, closes the retained view and removes the exact refs. The focused real-Dolt cleanup-retry test passed locally on 2026-09-23.
+
+## 3. Native acceptance
+
+- [ ] 3.1 @regression (agent) run the hosted Windows memory/runtime shard that failed with a branch-in-use error -> alternate-memory dream promotion, undo and reopen pass without force deletion
+- [x] 3.2 @equivalence (agent) run focused memory/runtime checks plus formatting, lint, typecheck and strict Cospec validation -> no unrelated regression or contract drift. On 2026-09-23, the retained-clone store regression, injected cleanup-retry regression and exact runtime dream promotion/undo/reopen test passed; `cargo clippy -p kuru-memory -p kuru-runtime --all-targets --all-features --locked -- -D warnings`, formatting, diff validation, strict Cospec validation and the apply gate all passed.
