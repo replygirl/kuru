@@ -23,7 +23,7 @@ use axum::{
     routing::{get, post},
 };
 use futures::stream;
-use kuru_core::{Config, Mode, SelectionOverrides};
+use kuru_core::{Config, Mode, ModeProfile, SelectionOverrides};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{
@@ -2402,18 +2402,29 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     resumed.wait_exit(EXIT_TIMEOUT)?;
     resumed.assert_restored()?;
 
-    let harness = kuru_runtime::Harness::new(
-        Config {
-            provider: "demo".into(),
-            ..Config::default()
-        },
-        &sandbox.project,
-        MemoryStore::open(memory_options(&sandbox)?).await?,
-        Arc::new(kuru_connectors::DemoProvider),
-        Some(&sessions[0].id),
-    )
-    .await?;
-    let history = harness.history().await?;
+    let mut observed_options = memory_options(&sandbox)?;
+    observed_options.read_only = true;
+    let project = sandbox.project.canonicalize()?;
+    let (_, opening) = MemoryStore::open_managed_observed(
+        observed_options,
+        project.clone(),
+        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+    );
+    let memory = opening
+        .await
+        .context("attach managed read-only PTY history inspector")?;
+    let scope = kuru_runtime::project_scope(&project)?;
+    let transcript = ModeProfile::builtin(Mode::Freudian)
+        .memory
+        .transcript_namespace(&scope, &sessions[0].id);
+    let history = memory
+        .history(&transcript, 500)
+        .await
+        .context("read committed PTY history")?;
+    memory
+        .close()
+        .await
+        .context("close managed read-only PTY history inspector")?;
     assert!(
         history
             .iter()

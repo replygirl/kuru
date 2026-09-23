@@ -1651,7 +1651,15 @@ async fn cli_undo_dream_shows_one_notice_without_constructing_a_provider() {
         "undo-dream attempted provider setup: {first_stderr}"
     );
 
-    let reopened = MemoryStore::open(options.clone()).await.unwrap();
+    let mut observed_options = options.clone();
+    observed_options.read_only = true;
+    let project = env.project.canonicalize().unwrap();
+    let (_, opening) = MemoryStore::open_managed_observed(
+        observed_options,
+        project,
+        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+    );
+    let reopened = opening.await.unwrap();
     assert_eq!(
         reopened
             .get(&format!("{scope}/notice/memory-storage"))
