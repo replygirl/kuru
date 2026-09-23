@@ -30,9 +30,9 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE,
-        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, FILETIME, GENERIC_READ,
+        GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal},
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
@@ -42,10 +42,11 @@ use windows_sys::Win32::{
             STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
         },
         JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+            CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+            TerminateJobObject,
         },
         Memory::{GetProcessHeap, HeapAlloc, HeapFree},
         ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
@@ -71,9 +72,10 @@ pub enum Lifetime {
     /// Caller supplies an explicit lifetime protocol and must await cleanup.
     /// Drop closes the process handle without terminating this child.
     TrustedSupervisor,
-    /// A service that must outlive its starter requests native Job breakaway.
-    /// A containing Job that forbids breakaway rejects the launch; no fallback
-    /// may silently tie the service to that Job's kill-on-close lifetime.
+    /// A service independent of its starter requests native Job breakaway. If
+    /// an existing nonpermitting Job denies that exact create, the service may
+    /// remain inside that outer lifetime boundary while retaining its own
+    /// process handle and cleanup protocol.
     IndependentService,
     /// Native fixture only: a kill-on-close Job permitting explicit breakaway.
     #[cfg(feature = "test-support")]
@@ -204,7 +206,7 @@ impl NativeSpawnSpec {
                 "batch execution requires an explicit consumer shell policy",
             ));
         }
-        let (executable, mut command_line) = match &self.syntax {
+        let (executable, command_line) = match &self.syntax {
             CommandSyntax::Argv => (
                 wide(self.executable.as_os_str())?,
                 command_line(self.executable.as_os_str(), &self.args)?,
@@ -296,27 +298,56 @@ impl NativeSpawnSpec {
                 startup.StartupInfo.wShowWindow = SW_HIDE as u16;
             }
         }
-        // SAFETY: output-only plain C structure; all buffers/attributes/handles
-        // above remain live for this synchronous call. Job assignment happens
-        // inside creation, before any child code; no suspended orphan interval.
-        let mut process: PROCESS_INFORMATION = unsafe { mem::zeroed() };
-        let created = unsafe {
-            CreateProcessW(
-                executable.as_ptr(),
-                command_line.as_mut_ptr(),
-                ptr::null(),
-                ptr::null(),
-                1,
-                flags,
-                environment.as_ptr().cast(),
-                cwd.as_ptr(),
-                &startup.StartupInfo,
-                &mut process,
-            )
+        let create = |flags| {
+            // CreateProcessW may modify its command-line buffer even when it
+            // fails. Each attempt therefore receives a fresh copy and a fresh
+            // output structure while all immutable attributes and handles stay
+            // retained across the synchronous call.
+            let mut command_line = command_line.clone();
+            // SAFETY: output-only plain C structure; all buffers, attributes
+            // and handles remain live. Job assignment happens inside creation,
+            // before any child code; no suspended orphan interval.
+            let mut process: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+            let created = unsafe {
+                CreateProcessW(
+                    executable.as_ptr(),
+                    command_line.as_mut_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    1,
+                    flags,
+                    environment.as_ptr().cast(),
+                    cwd.as_ptr(),
+                    &startup.StartupInfo,
+                    &mut process,
+                )
+            };
+            if created == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(process)
+            }
         };
-        if created == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let process = match create(flags) {
+            Ok(process) => process,
+            Err(error)
+                if self.lifetime == Lifetime::IndependentService
+                    && error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) =>
+            {
+                let mut in_job = 0;
+                // SAFETY: the current-process pseudo handle is borrowed, null
+                // requests membership in any Job, and in_job is writable.
+                if unsafe { IsProcessInJob(GetCurrentProcess(), ptr::null_mut(), &mut in_job) } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if in_job == 0 {
+                    return Err(error);
+                }
+                create(flags & !CREATE_BREAKAWAY_FROM_JOB)?
+            }
+            Err(error) => return Err(error),
+        };
         // SAFETY: successful creation transfers both independent owned handles.
         let process_handle = unsafe { OwnedHandle::from_raw_handle(process.hProcess) };
         // SAFETY: same transfer; the primary thread handle is not needed.
@@ -369,6 +400,13 @@ impl NativeChild {
             self.process.as_raw_handle(),
             PROCESS_QUERY_LIMITED_INFORMATION,
         )
+    }
+    /// Native fixture observation for a root inside an owned Job whose
+    /// descendants intentionally remain active. The retained process handle,
+    /// rather than its numeric ID, supplies the identity.
+    #[cfg(feature = "test-support")]
+    pub fn fixture_root_has_exited(&self) -> io::Result<bool> {
+        Ok(!process_is_running(&self.process)?)
     }
     pub fn take_stdin(&mut self) -> Option<Pipe> {
         self.stdin.take()

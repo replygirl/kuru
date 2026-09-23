@@ -549,9 +549,10 @@ async fn spawn_service(
             .environment
             .push(("LLVM_PROFILE_FILE".into(), profile));
     }
-    command.spawn().await.context(
-        "start independent project memory service; a containing Windows Job must allow breakaway",
-    )
+    command
+        .spawn()
+        .await
+        .context("start independent or outer-contained project memory service")
 }
 
 #[cfg(unix)]
@@ -1849,6 +1850,21 @@ mod tests {
     }
 
     #[cfg(windows)]
+    async fn windows_root_exited(
+        child: &kuru_platform::windows::process::NativeChild,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !child.fixture_root_has_exited()? {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "contained starter root did not exit"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn starter_job_exit_preserves_independent_owner_and_surviving_client() -> Result<()> {
         use kuru_platform::windows::process::Lifetime;
@@ -1946,74 +1962,81 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn denying_job_rejects_independent_owner_before_publication() -> Result<()> {
-        use kuru_platform::windows::process::{Lifetime, Stdio};
-        use tokio::io::AsyncReadExt;
-        tokio::time::timeout(Duration::from_secs(40), async {
+    async fn denying_outer_job_contains_owner_until_close_then_recovery_succeeds() -> Result<()> {
+        use kuru_platform::windows::process::Lifetime;
+        tokio::time::timeout(Duration::from_secs(110), async {
             let (root, project, options, executable) = windows_service_fixture()?;
-            let ready = root.path().join("denied-ready");
-            let release = root.path().join("denied-release");
+            let ready = root.path().join("contained-ready");
+            let release = root.path().join("contained-release");
             let _gate = crate::spawn_gate::spawning().await;
-            let mut command = windows_starter_fixture(
+            let mut starter = windows_starter_fixture(
                 &project,
                 &options,
                 &executable,
                 &ready,
                 &release,
                 Lifetime::OwnedJob,
-            );
-            command.stderr = Stdio::Pipe;
-            let mut starter = command.spawn().await?;
-            let mut stderr = starter.take_stderr().context("missing starter stderr")?;
-            let drain = async move {
-                let mut diagnostic = Vec::new();
-                let mut truncated = false;
-                let mut block = [0u8; 4096];
-                loop {
-                    let count = stderr.read(&mut block).await?;
-                    if count == 0 {
-                        break;
-                    }
-                    let retained = (16 * 1024usize).saturating_sub(diagnostic.len()).min(count);
-                    diagnostic.extend_from_slice(&block[..retained]);
-                    truncated |= retained < count;
+            )
+            .spawn()
+            .await?;
+            let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+            while !ready.exists() {
+                if let Some(status) = starter.try_wait()? {
+                    bail!("contained memory starter exited before readiness: {status}");
                 }
-                Ok::<_, anyhow::Error>((
-                    String::from_utf8_lossy(&diagnostic).into_owned(),
-                    truncated,
-                ))
+                ensure!(
+                    tokio::time::Instant::now() < ready_deadline,
+                    "contained memory starter did not publish readiness"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let generation = std::fs::read_to_string(&ready)?;
+            let mut survivor = try_attach(&options.data_dir, &options.project_scope, &project)
+                .await?
+                .context("contained survivor could not attach to starter's owner")?;
+            ensure!(survivor.generation() == generation);
+            std::fs::write(&release, b"release")?;
+            windows_root_exited(&starter).await?;
+            ensure!(matches!(
+                survivor
+                    .call(ServiceCall::AppendMessage {
+                        namespace: "starter-exit-fixture".into(),
+                        message: kuru_core::Message::text("assistant", "survivor committed"),
+                    })
+                    .await?,
+                ServiceValue::Unit
+            ));
+            survivor.close();
+
+            drop(starter); // closes the outer kill-on-close Job and its complete tree
+            let mut recovered = attach_or_start(&options, &project, &executable)
+                .await
+                .context("recover after outer Job terminated contained owner")?;
+            ensure!(
+                recovered.generation() != generation,
+                "outer Job closure did not replace the contained generation"
+            );
+            let ServiceValue::HistoryWindow(window) = recovered
+                .call(ServiceCall::HistoryWindow {
+                    namespace: "starter-exit-fixture".into(),
+                    limit: 4,
+                })
+                .await?
+            else {
+                bail!("recovered owner returned the wrong history result");
             };
-            let (status, diagnostic) = tokio::join!(starter.wait(Duration::from_secs(30)), drain);
-            let status = status?;
             ensure!(
-                !status.success(),
-                "denied breakaway unexpectedly started owner"
+                window.total_rows == 2
+                    && window.messages.len() == 2
+                    && window.messages[1].plain_text() == Some("survivor committed"),
+                "recovered owner lost the contained commit"
             );
-            let (diagnostic, truncated) = diagnostic?;
-            ensure!(!truncated, "denied breakaway diagnostic exceeded 16 KiB");
-            ensure!(
-                diagnostic.contains("containing Windows Job must allow breakaway"),
-                "denied breakaway lacked containment diagnosis: {diagnostic}"
-            );
-            drop(starter);
-            ensure!(!ready.exists(), "denied starter published readiness");
-            ensure!(
-                EndpointRecord::read(&options.data_dir, &options.project_scope)?.is_none(),
-                "denied owner published an endpoint"
-            );
-            ensure!(
-                ServiceLock::try_acquire(
-                    &options.data_dir,
-                    &options.project_scope,
-                    ServiceLockKind::Owner,
-                )?
-                .is_some(),
-                "denied owner retained the lifecycle lock"
-            );
+            recovered.close();
+            drop(acquire_maintenance_permit(&options).await?);
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("Windows denied-breakaway fixture exceeded 40 seconds")??;
+        .context("Windows contained-owner recovery fixture exceeded 110 seconds")??;
         Ok(())
     }
 
