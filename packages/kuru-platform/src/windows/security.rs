@@ -21,8 +21,8 @@ use windows_sys::Win32::Security::{
     WinCreatorOwnerRightsSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, ReOpenFile, WRITE_OWNER,
+    FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile, WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -595,6 +595,11 @@ unsafe fn assign_staged_owner(staged: BorrowedHandle<'_>, source_owner: PSID) ->
     require_private(staged, false)?;
     // SAFETY: the caller retains the validated source SID through this call.
     unsafe { require_assignable_file_owner(source_owner)? };
+    // CreateFile may normalize a zero-mask OWNER RIGHTS ACE while TokenUser is
+    // still the owner. Reapply the same protected private file policy through
+    // the retained WRITE_DAC stage before a distinct TokenOwner can acquire
+    // implicit READ_CONTROL or WRITE_DAC rights.
+    set_private(staged, FILE_ALL_ACCESS)?;
     // SAFETY: ReOpenFile derives the new handle from the retained exact file
     // object, not a pathname. The original movable handle already shares read,
     // write and delete; the reopened handle is immediately RAII-owned.
@@ -741,16 +746,17 @@ mod tests {
     }
 
     fn set_dacl(file: &File, dacl: *const ACL) {
-        use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+        use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
 
         // The production source handle intentionally needs only READ_CONTROL.
-        // Reopen this retained exact fixture object with the one additional
-        // test right instead of changing production source-open authority.
+        // Reopen this retained exact fixture object with the checked read and
+        // test-only mutation rights instead of changing production source-open
+        // authority.
         // SAFETY: ReOpenFile derives the new handle from this retained object.
         let dacl_handle = unsafe {
             ReOpenFile(
                 file.as_raw_handle(),
-                WRITE_DAC,
+                READ_CONTROL | WRITE_DAC,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             )
@@ -761,8 +767,8 @@ mod tests {
         );
         // SAFETY: successful ReOpenFile transfers one unique owned handle.
         let dacl_handle = unsafe { OwnedHandle::from_raw_handle(dacl_handle) };
-        // SAFETY: the fixture retains the exact WRITE_DAC handle and keeps the
-        // descriptor alive; null intentionally constructs a null-DACL case.
+        // SAFETY: the fixture retains the exact checked DACL handle and keeps
+        // the descriptor alive; null intentionally constructs a null-DACL case.
         let result = unsafe {
             SetSecurityInfo(
                 dacl_handle.as_raw_handle(),
@@ -1085,6 +1091,21 @@ mod tests {
         assert!(unsafe { assign_staged_owner(candidate.as_handle(), owner) }.is_err());
         assert_eq!(security_text(&candidate), before);
         require_private(candidate.as_handle(), true).unwrap();
+    }
+
+    #[test]
+    fn staged_owner_assignment_retains_effective_owner_rights_privacy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let (source, _) = default_owned_file(&private);
+        let candidate = private.create_new(OsStr::new("payload")).unwrap();
+        let (source_descriptor, source_owner) = file_owner(source.as_handle()).unwrap();
+        // SAFETY: source_descriptor retains the validated source owner SID.
+        unsafe { assign_staged_owner(candidate.as_handle(), source_owner) }.unwrap();
+        require_same_file_owner(source.as_handle(), candidate.as_handle()).unwrap();
+        require_private(candidate.as_handle(), true).unwrap();
+        assert!(security_text(&candidate).contains(";;;OW)"));
+        drop(source_descriptor);
     }
 
     #[test]
