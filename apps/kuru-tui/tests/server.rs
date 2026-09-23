@@ -1,5 +1,7 @@
 #[cfg(windows)]
-use kuru_platform::windows::process::{Console, NativeChild as Child, NativeSpawnSpec, Stdio};
+use kuru_platform::windows::process::{
+    Console, Lifetime, NativeChild as Child, NativeSpawnSpec, Stdio,
+};
 use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::{
@@ -105,6 +107,7 @@ async fn authenticated_a2a_cli_routes_a_part_and_shuts_down_cleanly() -> Result<
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut spec =
             NativeSpawnSpec::new(env!("CARGO_BIN_EXE_kuru").into(), root.path().to_path_buf());
+        spec.lifetime = Lifetime::FixtureBreakawayJob;
         spec.args = vec![
             "-C".into(),
             project.as_os_str().into(),
