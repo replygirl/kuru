@@ -671,6 +671,11 @@ impl ServiceOwner {
         &self.record.authority
     }
 
+    #[cfg(test)]
+    pub(crate) fn inspection_store_for_test(&self) -> crate::store::MemoryStore {
+        self.store.clone()
+    }
+
     pub async fn accept(&mut self, deadline: Duration) -> Result<LocalStream> {
         self.lock.verify()?;
         self.listener.accept(deadline).await

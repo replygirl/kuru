@@ -2180,6 +2180,7 @@ mod tests {
                 drop(candidate);
                 local.close().await?;
                 let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                let owner_inspection = owner.inspection_store_for_test();
                 let mut served = tokio::spawn(owner.serve());
                 let _owner_cleanup = AbortOnDrop(served.abort_handle());
                 let executable = std::env::current_exe()?;
@@ -2212,10 +2213,31 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
                     .await
                     .context("selected abandon frame was not flushed")?;
-                // Selected abandonment excludes sibling attachments while its
-                // exact-ref checks and transition run. Retry the exact owner
-                // handshake until that reservation is released, then retain
-                // the authenticated sibling before cancelling the reply wait.
+                // The frame-send barrier precedes owner dispatch. Inspect the
+                // already-owned store without adding a sibling attachment;
+                // otherwise that sibling can win the reservation race and
+                // correctly cause selected abandonment to be refused.
+                let mut last_status = None;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if served.is_finished() {
+                            let ended = (&mut served).await;
+                            bail!("selected abandon owner exited before ref cleanup: {ended:?}");
+                        }
+                        let status = owner_inspection.candidate_ref_status(&branch).await?;
+                        let reclaimed = status.state == store::CandidateRefState::Missing;
+                        last_status = Some(status);
+                        if reclaimed {
+                            break Ok::<(), anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .with_context(|| format!("selected ref was not reclaimed: {last_status:?}"))??;
+                drop(owner_inspection);
+                // Now retain an authenticated sibling in the original
+                // generation before cancelling the held client reply.
                 let mut original_generation =
                     tokio::time::timeout(Duration::from_secs(10), async {
                         loop {
@@ -2235,27 +2257,18 @@ mod tests {
                     .await
                     .context("cancelled selected abandon did not end")?;
                 ensure!(stopped.is_err_and(|error| error.is_cancelled()));
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        match original_generation
+                ensure!(
+                    matches!(
+                        original_generation
                             .call(ServiceCall::CandidateRefStatus {
                                 branch: branch.clone(),
                             })
-                            .await?
-                        {
-                            ServiceValue::CandidateRefStatus(status)
-                                if status.state == store::CandidateRefState::Missing =>
-                            {
-                                break Ok::<(), anyhow::Error>(());
-                            }
-                            ServiceValue::CandidateRefStatus(_) => {}
-                            _ => bail!("memory service returned the wrong candidate status"),
-                        }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                })
-                .await
-                .context("selected ref was not reclaimed")??;
+                            .await?,
+                        ServiceValue::CandidateRefStatus(status)
+                            if status.state == store::CandidateRefState::Missing
+                    ),
+                    "sibling did not observe the reclaimed selected ref"
+                );
                 if staged {
                     // A newly invented same-generation request ID cannot
                     // turn a reclaimed ref into proof that it ran.
