@@ -824,6 +824,92 @@ mod tests {
         .unwrap()
     }
 
+    fn security_shape(file: &File) -> String {
+        let user = CurrentUser::read().unwrap();
+        let default_owner = CurrentUser::owner().unwrap();
+        let mut owner = null_mut();
+        let mut dacl = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: the fixture retains the file and the returned descriptor.
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut owner,
+                    null_mut(),
+                    &mut dacl,
+                    null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        let descriptor = LocalMemory(descriptor);
+        let bytes = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
+        // SAFETY: the native descriptor owns the returned owner SID.
+        unsafe { bounded_sid(owner, descriptor.0.cast(), bytes) }.unwrap();
+        assert!(!dacl.is_null());
+        assert_ne!(unsafe { IsValidAcl(dacl) }, 0);
+        let owner = if unsafe { EqualSid(owner, user.sid().unwrap()) } != 0 {
+            "token-user"
+        } else if unsafe { EqualSid(owner, default_owner.sid().unwrap()) } != 0 {
+            "token-owner"
+        } else {
+            "other"
+        };
+        let mut information: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+        // SAFETY: GetSecurityInfo returned a live, validated DACL.
+        checked_bool(unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        })
+        .unwrap();
+        let mut aces = Vec::new();
+        for index in 0..information.AceCount {
+            let mut ace = null_mut();
+            // SAFETY: the index is bounded by the native ACL count.
+            checked_bool(unsafe { GetAce(dacl, index, &mut ace) }).unwrap();
+            let header = unsafe { ace.cast::<ACE_HEADER>().read_unaligned() };
+            if !matches!(
+                u32::from(header.AceType),
+                ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+            ) {
+                aces.push(format!(
+                    "type={:#04x},flags={:#04x},principal=unmodeled",
+                    header.AceType, header.AceFlags
+                ));
+                continue;
+            }
+            let entry = unsafe { ace.cast::<ACCESS_ALLOWED_ACE>().read_unaligned() };
+            let sid = (ace as *mut u8)
+                .wrapping_add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                .cast();
+            // SAFETY: the complete ACE extent is bounded by the retained
+            // descriptor before its principal is categorized.
+            unsafe { bounded_sid(sid, ace.cast(), usize::from(header.AceSize)) }.unwrap();
+            let principal = if unsafe { IsWellKnownSid(sid, WinCreatorOwnerRightsSid) } != 0 {
+                "owner-rights"
+            } else if unsafe { EqualSid(sid, user.sid().unwrap()) } != 0 {
+                "token-user"
+            } else if unsafe { EqualSid(sid, default_owner.sid().unwrap()) } != 0 {
+                "token-owner"
+            } else {
+                "other"
+            };
+            aces.push(format!(
+                "type={:#04x},flags={:#04x},mask={:#010x},principal={principal}",
+                header.AceType, header.AceFlags, entry.Mask
+            ));
+        }
+        format!("owner={owner};aces=[{}]", aces.join(";"))
+    }
+
     fn owners_equal(left: &File, right: &File) -> bool {
         let (left_descriptor, left_owner) = file_owner(left.as_handle()).unwrap();
         let (right_descriptor, right_owner) = file_owner(right.as_handle()).unwrap();
@@ -1100,8 +1186,13 @@ mod tests {
         let (source, _) = default_owned_file(&private);
         let candidate = private.create_new(OsStr::new("payload")).unwrap();
         let (source_descriptor, source_owner) = file_owner(source.as_handle()).unwrap();
+        let before = security_shape(&candidate);
         // SAFETY: source_descriptor retains the validated source owner SID.
-        unsafe { assign_staged_owner(candidate.as_handle(), source_owner) }.unwrap();
+        let assigned = unsafe { assign_staged_owner(candidate.as_handle(), source_owner) };
+        let after = security_shape(&candidate);
+        assigned.unwrap_or_else(|error| {
+            panic!("staged owner assignment failed: {error}; before={before}; after={after}")
+        });
         require_same_file_owner(source.as_handle(), candidate.as_handle()).unwrap();
         require_private(candidate.as_handle(), true).unwrap();
         assert!(security_text(&candidate).contains(";;;OW)"));
