@@ -916,9 +916,14 @@ impl CheckpointLease<'_> {
                     .or(template.as_ref())
                     .expect("replace has an original; create has an empty template");
                 verify_file_access(access_source, &access_token)?;
-                if let Err(error) =
-                    parent.publish_file(&source, OsStr::new("payload"), &candidate, name, policy)
-                {
+                if let Err(error) = parent.publish_file_with_access(
+                    &source,
+                    OsStr::new("payload"),
+                    &candidate,
+                    &access_token,
+                    name,
+                    policy,
+                ) {
                     let _ = self.settle(id, CheckpointState::Uncertain, None);
                     return Err(error).context(
                         "file publication is unresolved; checkpoint retained for inspection",

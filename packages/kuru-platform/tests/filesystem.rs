@@ -345,10 +345,11 @@ fn checked_publication_preserves_occupied_targets_then_replaces_atomically() {
     );
     #[cfg(windows)]
     {
-        // Movable grants delete sharing; native write-through replacement still
-        // requires the destination to have no outstanding data handles.
+        // Handle-relative POSIX replacement keeps the exact replaced object
+        // available through its retained movable handle while atomically
+        // publishing the candidate at the checked destination name.
         let old_identity = regular_file_info(&old).unwrap().identity;
-        let error = directory
+        directory
             .publish_file(
                 &directory,
                 OsStr::new("candidate"),
@@ -356,20 +357,12 @@ fn checked_publication_preserves_occupied_targets_then_replaces_atomically() {
                 OsStr::new("published"),
                 Publication::ReplaceRegular,
             )
-            .unwrap_err();
-        assert_eq!(error.phase, PublicationPhase::Uncertain);
-        assert_eq!(error.source_identity, Some(identity));
-        directory.verify(OsStr::new("published"), &old).unwrap();
-        directory.verify(OsStr::new("candidate"), &new).unwrap();
+            .unwrap();
         assert_eq!(regular_file_info(&old).unwrap().identity, old_identity);
-        assert_eq!(fs::read(&error.destination).unwrap(), b"old bytes");
-        assert_eq!(
-            fs::read(directory.path().join("candidate")).unwrap(),
-            b"new bytes"
-        );
         old.rewind().unwrap();
         assert_eq!(contents(old), b"old bytes");
     }
+    #[cfg(not(windows))]
     directory
         .publish_file(
             &directory,
