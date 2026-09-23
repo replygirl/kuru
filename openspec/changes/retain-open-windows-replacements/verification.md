@@ -1,5 +1,7 @@
 ## 1. Retained Windows replacement [critical]
 
+Native CI run 35886468805 at be2c831 failed four replacement cases with Win32 error 87; new-only publication passed. The published rename record used `offset_of!(FILE_RENAME_INFO, FileName) + FileNameLength`, four bytes below the documented `sizeof(FILE_RENAME_INFO) + FileNameLength` minimum on x64. The corrected record length is cross-typechecked and linted; native replacement acceptance and archive remain pending a new exact-head run.
+
 - [ ] 1.1 @regression (agent) replace a checked regular destination while its validated data handle remains open on native Windows -> the call succeeds, the retained handle keeps the old identity and bytes, and a fresh destination open has the staged identity and bytes
 - [ ] 1.2 @integration (agent) copy an unprotected ordinary file's access policy through retained-handle replacement and mutate the parent DACL afterward on native Windows -> the published file inherits identically to an ordinary sibling while the replaced handle remains bound to the old object
 - [ ] 1.3 @regression (agent) replace a target whose copied DACL denies file DELETE while its parent authorizes child replacement -> a late DELETE reopen is denied, the retained private-stage authority publishes once, and the published file keeps the copied DACL

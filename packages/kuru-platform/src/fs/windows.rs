@@ -721,7 +721,9 @@ fn replace_open_destination(
                 invalid("native publication filename exceeds bound"),
             )
         })?;
-    let record_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+    // FileRenameInfoEx requires the full structure, including its trailing
+    // FileName placeholder, plus the UTF-16 bytes named by FileNameLength.
+    let record_bytes = size_of::<FILE_RENAME_INFO>()
         .checked_add(name_bytes as usize)
         .ok_or_else(|| {
             (
