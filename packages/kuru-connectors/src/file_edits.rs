@@ -1123,7 +1123,7 @@ mod tests {
         let root = Arc::new(Directory::open(
             &project,
             Privacy::Inherited,
-            NameRetention::Pinned,
+            NameRetention::Movable,
         )?);
         let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable)?;
         let private_parent =
@@ -1303,7 +1303,7 @@ mod tests {
         let root = Arc::new(Directory::open(
             &project,
             Privacy::Inherited,
-            NameRetention::Pinned,
+            NameRetention::Movable,
         )?);
         let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable)?;
         let private_parent =
@@ -1390,7 +1390,7 @@ mod tests {
         let root = Arc::new(Directory::open(
             &project,
             Privacy::Inherited,
-            NameRetention::Pinned,
+            NameRetention::Movable,
         )?);
         let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable)?;
         let private_parent =
@@ -1433,7 +1433,7 @@ mod tests {
         let root = Arc::new(Directory::open(
             &project,
             Privacy::Inherited,
-            NameRetention::Pinned,
+            NameRetention::Movable,
         )?);
         let private_parent =
             Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable)?;
@@ -1491,7 +1491,7 @@ mod tests {
         let root = Arc::new(Directory::open(
             &project,
             Privacy::Inherited,
-            NameRetention::Pinned,
+            NameRetention::Movable,
         )?);
         let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable)?;
         let private_parent =
@@ -1619,7 +1619,7 @@ mod tests {
         let root = Arc::new(Directory::open(
             &project,
             Privacy::Inherited,
-            NameRetention::Pinned,
+            NameRetention::Movable,
         )?);
         let private_parent =
             Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable)?;

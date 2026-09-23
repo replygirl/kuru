@@ -29,6 +29,8 @@ use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, sinks::UTF8};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use kuru_core::{Config, NativeTool, PermissionSelector, ProjectRelativeTarget, ToolSpec};
+#[cfg(windows)]
+use kuru_platform::fs::FileIdentity;
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 #[cfg(windows)]
 use kuru_platform::fs::{regular_file_info, validate_component};
@@ -307,7 +309,7 @@ impl ToolHost {
         let root_guard = Arc::new(Directory::open(
             &root,
             Privacy::Inherited,
-            NameRetention::Pinned,
+            NameRetention::Movable,
         )?);
         Self::with_retained_root(root_guard, config)
     }
@@ -452,10 +454,21 @@ impl ToolHost {
             self.validated_permission_target(&now.path, true)? == target,
             "file undo target changed during permission review"
         );
-        let (_, final_name, _path_guard) = self.path(&now.path, true)?;
+        #[cfg(windows)]
+        let (_, final_name, path_guard) = self.path(&now.path, true)?;
+        #[cfg(unix)]
+        let (_, final_name, _) = self.path(&now.path, true)?;
+        #[cfg(windows)]
+        let parent_identity = path_guard.identity();
+        #[cfg(windows)]
+        drop(path_guard);
         let parent_path = self
             .root
             .join(Path::new(&now.path).parent().unwrap_or(Path::new(".")));
+        #[cfg(windows)]
+        let parent =
+            reopen_movable_parent(&self.root_guard, &parent_path, parent_identity, "file undo")?;
+        #[cfg(unix)]
         let parent = Directory::open(&parent_path, Privacy::Inherited, NameRetention::Movable)?;
         ensure!(
             parent.is_within(&self.root_guard)?,
@@ -1008,7 +1021,7 @@ impl ToolHost {
         writing: bool,
     ) -> Result<ProjectRelativeTarget> {
         self.root_guard.revalidate()?;
-        let _ = self.path(value, writing)?;
+        let _path_guard = self.path(value, writing)?;
         #[cfg(any(windows, target_os = "macos"))]
         return self.physical_permission_target(value);
         #[cfg(not(any(windows, target_os = "macos")))]
@@ -1446,7 +1459,8 @@ impl ToolHost {
         omitted: &mut SearchOmissions,
     ) -> Result<Vec<ProjectRelativeTarget>> {
         let root = optional_path(args)?;
-        let _ = self.path(root, false)?;
+        self.root_guard.revalidate()?;
+        let _path_guard = self.path(root, false)?;
         let include_hidden = optional_bool(args, "include_hidden")?;
         let include_ignored = optional_bool(args, "include_ignored")?;
         let mut walker = WalkBuilder::new(self.root.join(root));
@@ -1573,15 +1587,26 @@ impl ToolHost {
         authorized_target: Option<&ProjectRelativeTarget>,
     ) -> Result<String> {
         let value = string(args, "path")?;
-        let (_, final_name, _path_guard) = self.path(value, true)?;
+        #[cfg(windows)]
+        let (_, final_name, path_guard) = self.path(value, true)?;
+        #[cfg(unix)]
+        let (_, final_name, _) = self.path(value, true)?;
         let target = self.validated_permission_target(value, true)?;
         ensure!(
             authorized_target == Some(&target),
             "file permission target changed before mutation"
         );
+        #[cfg(windows)]
+        let parent_identity = path_guard.identity();
+        #[cfg(windows)]
+        drop(path_guard);
         let parent_path = self
             .root
             .join(Path::new(value).parent().unwrap_or(Path::new(".")));
+        #[cfg(windows)]
+        let parent =
+            reopen_movable_parent(&self.root_guard, &parent_path, parent_identity, "file")?;
+        #[cfg(unix)]
         let parent = Directory::open(&parent_path, Privacy::Inherited, NameRetention::Movable)?;
         ensure!(
             parent.is_within(&self.root_guard)?,
@@ -1843,6 +1868,25 @@ async fn read_file_output(mut file: tokio::fs::File, extent: u64) -> Result<Stri
     }
     ensure!(pending.is_empty(), "file is not UTF-8");
     output.finish().map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn reopen_movable_parent(
+    root_guard: &Directory,
+    parent_path: &Path,
+    expected_identity: FileIdentity,
+    operation: &str,
+) -> Result<Directory> {
+    let parent = Directory::open(parent_path, Privacy::Inherited, NameRetention::Movable)?;
+    ensure!(
+        parent.identity() == expected_identity,
+        "{operation} parent changed during handle handoff"
+    );
+    ensure!(
+        parent.is_within(root_guard)?,
+        "{operation} parent changed outside project root"
+    );
+    Ok(parent)
 }
 
 fn optional_path(args: &Value) -> Result<&str> {
@@ -2123,6 +2167,7 @@ async fn shell_inner(
     );
     // Use the same identity-checked launch spelling as other configured native
     // commands. PowerShell's .NET file APIs cannot use an introduced verbatim cwd.
+    let root_pin = Directory::open(root, Privacy::Inherited, NameRetention::Pinned)?;
     let system_directory = system_directory()?;
     let program = system_directory.join("WindowsPowerShell/v1.0/powershell.exe");
     // This owned stock-shell launch must reconstruct its own module paths: a
@@ -2137,6 +2182,7 @@ async fn shell_inner(
         .spawn()
         .await
         .context("cannot start Windows PowerShell")?;
+    drop(root_pin);
     let mut stdout = child.take_stdout().context("missing shell stdout")?;
     let mut stderr = child.take_stderr().context("missing shell stderr")?;
     let mut out = ShellCapture::new();
@@ -2227,6 +2273,30 @@ mod tests {
             CheckpointStore::new(&private.path().join("state"), root).unwrap(),
         ))
         .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn movable_parent_handoff_rejects_a_replacement_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let root_guard =
+            Directory::open(root.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        let pinned = Directory::open(&parent, Privacy::Inherited, NameRetention::Pinned).unwrap();
+        let expected_identity = pinned.identity();
+        drop(pinned);
+
+        std::fs::rename(&parent, root.path().join("displaced")).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let error = match reopen_movable_parent(&root_guard, &parent, expected_identity, "file") {
+            Ok(_) => panic!("replacement parent was adopted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "file parent changed during handle handoff"
+        );
     }
 
     struct RecordInstructionDirectories(std::sync::Mutex<Vec<Vec<String>>>);
@@ -4620,7 +4690,6 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
         });
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn retained_root_replacement_refuses_all_tool_dispatch() {
         let parent = tempfile::tempdir().unwrap();
@@ -4628,7 +4697,7 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("held.txt"), "held object").unwrap();
         let retained =
-            Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Pinned).unwrap());
+            Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Movable).unwrap());
         let host = ToolHost::with_retained_root(
             retained,
             &Config {
@@ -4648,10 +4717,17 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
             .await
             .unwrap_err();
         let shell_error = host
-            .execute("shell", json!({"command":"printf started > launched"}))
+            .execute(
+                "shell",
+                json!({"command": if cfg!(windows) { "[IO.File]::WriteAllText('launched', 'started')" } else { "printf started > launched" }}),
+            )
             .await
             .unwrap_err();
-        for error in [&file_error, &shell_error] {
+        let search_error = host
+            .execute("glob", json!({"pattern":"**/*"}))
+            .await
+            .unwrap_err();
+        for error in [&file_error, &shell_error, &search_error] {
             assert_eq!(
                 error.to_string(),
                 "tool execution failed: directory name or ancestor identity changed"

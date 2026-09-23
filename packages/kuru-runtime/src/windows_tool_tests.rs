@@ -191,7 +191,7 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
     let root = Arc::new(Directory::open(
         &project,
         Privacy::Inherited,
-        NameRetention::Pinned,
+        NameRetention::Movable,
     )?);
     let tools =
         ToolHost::with_retained_root(root.clone(), &config)?.with_checkpoint_store(Arc::new(

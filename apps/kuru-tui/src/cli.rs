@@ -742,7 +742,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     }
     let (cwd, data, user) = paths(&cli)?;
     let root = Arc::new(
-        Directory::open(&cwd, Privacy::Inherited, NameRetention::Pinned)
+        Directory::open(&cwd, Privacy::Inherited, NameRetention::Movable)
             .context("workspace directory could not be retained safely")?,
     );
     let cwd = root.path().to_path_buf();
@@ -1730,8 +1730,9 @@ mod permission_tests {
             ),
         )
         .unwrap();
-        let root =
-            Arc::new(Directory::open(&project, Privacy::Inherited, NameRetention::Pinned).unwrap());
+        let root = Arc::new(
+            Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap(),
+        );
         let snapshot =
             ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
         let cli = Cli::try_parse_from(["kuru", "tool", "file_write", "--args", "{}"]).unwrap();

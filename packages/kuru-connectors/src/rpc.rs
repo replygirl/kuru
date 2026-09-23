@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use kuru_platform::fs::Directory;
+use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -355,13 +355,30 @@ impl Session {
         stderr: Arc<StdMutex<StderrTail>>,
         completion: Arc<Completion>,
     ) -> Startup {
+        let cwd = if cwd.is_absolute() {
+            cwd.to_path_buf()
+        } else {
+            let Ok(current) = std::env::current_dir() else {
+                return Startup::Rejected;
+            };
+            current.join(cwd)
+        };
+        let cwd_pin = match Directory::open(&cwd, Privacy::Inherited, NameRetention::Pinned) {
+            Ok(cwd_pin) => cwd_pin,
+            Err(_) => return Startup::Rejected,
+        };
+        match cwd_pin.is_within(&root_guard) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return Startup::Rejected,
+        }
+        let cwd = cwd_pin.path().to_path_buf();
         #[cfg(unix)]
         let (owner, input, output, error) = {
             let mut command = std::process::Command::new(program);
             command
                 .args(args)
                 .envs(env)
-                .current_dir(cwd)
+                .current_dir(&cwd)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -375,6 +392,7 @@ impl Session {
                 Ok(owner) => owner,
                 Err(_) => return Startup::Rejected,
             };
+            drop(cwd_pin);
             #[cfg(test)]
             admission.after_launch().await;
             #[cfg(test)]
@@ -405,7 +423,7 @@ impl Session {
         };
         #[cfg(windows)]
         let (owner, input, output, error) = {
-            let mut spec = match crate::process::configured(program, args, env, cwd) {
+            let mut spec = match crate::process::configured(program, args, env, &cwd) {
                 Ok(spec) => spec,
                 Err(_) => return Startup::Rejected,
             };
@@ -422,6 +440,7 @@ impl Session {
                 Ok(owner) => owner,
                 Err(_) => return Startup::Rejected,
             };
+            drop(cwd_pin);
             #[cfg(test)]
             admission.after_launch().await;
             #[cfg(test)]

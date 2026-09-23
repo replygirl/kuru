@@ -108,7 +108,7 @@ async fn checkpoint_fixture(
     let data = TempDir::new().unwrap();
     let project_path = project.path().canonicalize().unwrap();
     let root = Arc::new(
-        Directory::open(&project_path, Privacy::Inherited, NameRetention::Pinned).unwrap(),
+        Directory::open(&project_path, Privacy::Inherited, NameRetention::Movable).unwrap(),
     );
     let tools = ToolHost::with_retained_root(root.clone(), &config)
         .unwrap()
