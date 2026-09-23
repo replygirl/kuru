@@ -17,6 +17,9 @@ pub(crate) enum CommandId {
     Focus,
     Help,
     Memory,
+    MemoryCandidateAbandon,
+    MemoryCandidateStatus,
+    MemoryCandidates,
     MemoryHistory,
     MemoryStatus,
     Mode,
@@ -82,6 +85,24 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
         name: "/memory",
         usage: "/memory ID",
         summary: "Inspect one part's memory",
+    },
+    CommandSpec {
+        id: CommandId::MemoryCandidateAbandon,
+        name: "/memory-candidate-abandon",
+        usage: "/memory-candidate-abandon BRANCH BASE HEAD",
+        summary: "Explicitly abandon one inspected candidate",
+    },
+    CommandSpec {
+        id: CommandId::MemoryCandidateStatus,
+        name: "/memory-candidate-status",
+        usage: "/memory-candidate-status BRANCH",
+        summary: "Recheck one exact candidate ref",
+    },
+    CommandSpec {
+        id: CommandId::MemoryCandidates,
+        name: "/memory-candidates",
+        usage: "/memory-candidates [CURSOR]",
+        summary: "List retained candidate refs",
     },
     CommandSpec {
         id: CommandId::MemoryHistory,
@@ -314,7 +335,14 @@ mod tests {
     fn completion_is_bounded_and_prefix_order_is_stable() {
         assert_eq!(
             names_matching("/mem"),
-            vec!["/memory", "/memory-history", "/memory-status"]
+            vec![
+                "/memory",
+                "/memory-candidate-abandon",
+                "/memory-candidate-status",
+                "/memory-candidates",
+                "/memory-history",
+                "/memory-status"
+            ]
         );
         assert_eq!(names_matching("/cle"), vec!["/clear"]);
         assert!(names_matching("ordinary").is_empty());
