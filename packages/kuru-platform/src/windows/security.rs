@@ -1242,8 +1242,9 @@ mod tests {
             )
             .unwrap();
         finalize_file_access(&template, &candidate).unwrap();
-        let before = security_text(&candidate);
-        assert_eq!(before, security_text(&template));
+        let before = security_shape(&candidate);
+        assert_eq!(before, security_shape(&template));
+        assert_eq!(file_access_token(candidate.as_handle()).unwrap()[0], 0);
 
         let parent_acl = std::fs::OpenOptions::new()
             .read(true)
@@ -1254,14 +1255,14 @@ mod tests {
         let sid = CurrentUser::read().unwrap().sid_string().unwrap();
         let changed = descriptor(&format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"));
         set_dacl(&parent_acl, changed.dacl().unwrap());
-        let after = security_text(&candidate);
+        let after = security_shape(&candidate);
         assert_ne!(
             after, before,
             "published file stopped inheriting parent changes"
         );
         assert_eq!(
             after,
-            security_text(&template),
+            security_shape(&template),
             "published file inherited differently from ordinary template"
         );
 
@@ -1288,19 +1289,20 @@ mod tests {
             )
             .unwrap();
         finalize_file_access(&original, &replacement).unwrap();
-        let replacement_before = security_text(&replacement);
-        assert_eq!(replacement_before, security_text(&template));
+        let replacement_before = security_shape(&replacement);
+        assert_eq!(replacement_before, security_shape(&template));
+        assert_eq!(file_access_token(replacement.as_handle()).unwrap()[0], 0);
 
         let changed_again = descriptor(&format!("O:{sid}D:P(A;OICI;FA;;;{sid})"));
         set_dacl(&parent_acl, changed_again.dacl().unwrap());
-        let replacement_after = security_text(&replacement);
+        let replacement_after = security_shape(&replacement);
         assert_ne!(
             replacement_after, replacement_before,
             "unprotected replacement stopped inheriting parent changes"
         );
         assert_eq!(
             replacement_after,
-            security_text(&template),
+            security_shape(&template),
             "unprotected replacement inherited differently from ordinary file"
         );
     }
