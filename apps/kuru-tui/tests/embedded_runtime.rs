@@ -184,20 +184,61 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
             .and_then(OsStr::to_str)
             .context("coverage reservation filename")?
     );
+    let probe_root = root.join("instrumented-packaging-probe");
+    let probe_home = probe_root.join("home");
+    let probe_config = probe_root.join("config");
+    let probe_cache = probe_root.join("cache");
+    let probe_data = probe_root.join("data");
+    let probe_temporary = probe_root.join("temporary");
+    let probe_workspace = probe_root.join("workspace");
+    let probe_empty_path = probe_root.join("empty-path");
+    for directory in [
+        &probe_home,
+        &probe_config,
+        &probe_cache,
+        &probe_data,
+        &probe_temporary,
+        &probe_workspace,
+        &probe_empty_path,
+    ] {
+        fs::create_dir_all(directory)?;
+    }
     let mut probe = Command::new(&staged);
-    probe.arg("--version").env(
-        "LLVM_PROFILE_FILE",
-        profile_dir.join(format!("{prefix}%p-%m.profraw")),
-    );
+    probe
+        .env_clear()
+        .env("HOME", &probe_home)
+        .env("USERPROFILE", &probe_home)
+        .env("APPDATA", &probe_config)
+        .env("LOCALAPPDATA", &probe_cache)
+        .env("XDG_CONFIG_HOME", &probe_config)
+        .env("XDG_CACHE_HOME", &probe_cache)
+        .env("XDG_DATA_HOME", &probe_data)
+        .env("TMPDIR", &probe_temporary)
+        .env("TMP", &probe_temporary)
+        .env("TEMP", &probe_temporary)
+        .env("PATH", &probe_empty_path)
+        .env(
+            "LLVM_PROFILE_FILE",
+            profile_dir.join(format!("{prefix}%p-%m.profraw")),
+        )
+        .current_dir(&probe_workspace)
+        .arg("-C")
+        .arg(&probe_workspace)
+        .arg("--data-dir")
+        .arg(&probe_data)
+        .arg("config");
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("SystemRoot") {
+        probe.env("SystemRoot", path);
+    }
     let output = kuru_delivery::command::output(&mut probe, PREPARE_INPUT_TIMEOUT)
         .await
         .context("run prepared instrumented packaging input")?;
     ensure!(
         output.status.success()
-            && String::from_utf8_lossy(&output.stdout).trim()
-                == format!("kuru {}", env!("CARGO_PKG_VERSION")),
-        "prepared instrumented packaging input did not run successfully: {}",
-        String::from_utf8_lossy(&output.stderr)
+            && String::from_utf8_lossy(&output.stderr).contains("memory was not opened"),
+        "prepared instrumented packaging input did not complete isolated configuration inspection: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
     let mut profiles = Vec::new();
     for entry in fs::read_dir(profile_dir)? {
