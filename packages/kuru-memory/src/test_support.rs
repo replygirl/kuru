@@ -151,6 +151,8 @@ pub(crate) fn fixture_startup_error(options: &OpenOptions, error: Error) -> Erro
             || message.starts_with(
                 "memory server startup failed: Dolt startup/lifetime failed; private diagnostics:",
             )
+            || message.starts_with("Dolt database bootstrap deadline exceeded while ")
+            || message == "authenticated Dolt startup deadline exceeded"
             || message == "memory supervisor readiness deadline exceeded"
     }) {
         return error;
@@ -255,6 +257,12 @@ mod fixture_diagnostic_tests {
             .context("open staged memory server")
     }
 
+    fn bootstrap_error() -> Error {
+        anyhow::anyhow!(
+            "Dolt database bootstrap deadline exceeded while verifying the project identity"
+        )
+    }
+
     #[test]
     fn startup_log_capture_is_opt_in_exact_and_bounded() -> Result<()> {
         let root = tempdir()?;
@@ -293,6 +301,10 @@ mod fixture_diagnostic_tests {
         assert!(readiness_rendered.contains("fixture-private-log"));
         assert!(readiness_rendered.contains(&log.display().to_string()));
         assert!(readiness_rendered.contains("memory supervisor readiness deadline exceeded"));
+        let bootstrap_captured = fixture_startup_error(&options, bootstrap_error());
+        let bootstrap_rendered = format!("{bootstrap_captured:#}");
+        assert!(bootstrap_rendered.contains("fixture-private-log"));
+        assert!(bootstrap_rendered.contains("verifying the project identity"));
 
         files::write(&log, &vec![b'x'; 8 * 1024])?;
         let bounded = fixture_startup_error(&options, startup_error()).to_string();

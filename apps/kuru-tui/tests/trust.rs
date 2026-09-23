@@ -1294,7 +1294,9 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
     assert_eq!(http.requests(), 0, "approved undo contacted the provider");
     assert!(!sandbox.data.join("trust").exists());
 
-    let memory = MemoryStore::open(options).await.unwrap();
+    let memory = kuru_memory::test_support::open_fixture(options)
+        .await
+        .unwrap();
     assert_ne!(memory.revision().await.unwrap(), before_revision);
     assert_eq!(
         memory.get(&format!("{scope}/sessions")).await.unwrap(),
