@@ -4,6 +4,9 @@
 use std::collections::BTreeMap;
 
 use kuru_core::PromptCatalog;
+use kuru_memory::{CandidateRefState, CandidateRefStatus};
+
+pub(crate) const CANDIDATE_PAGE_LIMIT: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandId {
@@ -14,6 +17,9 @@ pub(crate) enum CommandId {
     Focus,
     Help,
     Memory,
+    MemoryCandidateAbandon,
+    MemoryCandidateStatus,
+    MemoryCandidates,
     MemoryHistory,
     MemoryStatus,
     Mode,
@@ -79,6 +85,24 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
         name: "/memory",
         usage: "/memory ID",
         summary: "Inspect one part's memory",
+    },
+    CommandSpec {
+        id: CommandId::MemoryCandidateAbandon,
+        name: "/memory-candidate-abandon",
+        usage: "/memory-candidate-abandon BRANCH BASE HEAD",
+        summary: "Explicitly abandon one inspected candidate",
+    },
+    CommandSpec {
+        id: CommandId::MemoryCandidateStatus,
+        name: "/memory-candidate-status",
+        usage: "/memory-candidate-status BRANCH",
+        summary: "Recheck one exact candidate ref",
+    },
+    CommandSpec {
+        id: CommandId::MemoryCandidates,
+        name: "/memory-candidates",
+        usage: "/memory-candidates [CURSOR]",
+        summary: "List retained candidate refs",
     },
     CommandSpec {
         id: CommandId::MemoryHistory,
@@ -265,6 +289,17 @@ pub(crate) fn expand_custom(entry: &kuru_core::CustomCommand, args: &str) -> Str
     format!("{}\n\nArguments (literal text):\n{}", entry.body, args)
 }
 
+pub(crate) fn candidate_status_json(status: &CandidateRefStatus) -> serde_json::Value {
+    serde_json::json!({
+        "candidate": status,
+        "operation_outcome": if status.state == CandidateRefState::Missing {
+            "unproved"
+        } else {
+            "not_queried"
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,7 +335,14 @@ mod tests {
     fn completion_is_bounded_and_prefix_order_is_stable() {
         assert_eq!(
             names_matching("/mem"),
-            vec!["/memory", "/memory-history", "/memory-status"]
+            vec![
+                "/memory",
+                "/memory-candidate-abandon",
+                "/memory-candidate-status",
+                "/memory-candidates",
+                "/memory-history",
+                "/memory-status"
+            ]
         );
         assert_eq!(names_matching("/cle"), vec!["/clear"]);
         assert!(names_matching("ordinary").is_empty());
@@ -352,5 +394,18 @@ mod tests {
             expand_custom(entry, args),
             "Explain the risks.\n\n\nArguments (literal text):\n`literal` $HOME"
         );
+    }
+
+    #[test]
+    fn missing_candidate_keeps_operation_outcome_unproved() {
+        let status = CandidateRefStatus {
+            branch: "candidate_00000000000000000000000000000000".into(),
+            head: None,
+            base: None,
+            state: CandidateRefState::Missing,
+        };
+        let projected = candidate_status_json(&status);
+        assert_eq!(projected["candidate"]["state"], "missing");
+        assert_eq!(projected["operation_outcome"], "unproved");
     }
 }

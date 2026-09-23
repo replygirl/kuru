@@ -4,7 +4,7 @@
 //! Transport privacy excludes other OS users; a same-user process able to read
 //! the private endpoint record is within the account's local authority.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use std::{
     ffi::{OsStr, OsString},
@@ -24,7 +24,9 @@ pub(crate) mod rpc;
 pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, ServiceValue};
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 1;
+// Exact-ref inventory and selected-abandon outcome calls require this owner
+// version. Older owners reject the new client before a mutating frame.
+pub const PROTOCOL_MINOR: u16 = 2;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SERVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -163,7 +165,7 @@ pub struct ServiceAttachment {
     authority: EndpointAuthority,
     locator: Option<AttachmentLocator>,
     last_fault: Option<rpc::ServiceFault>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     reply_pause: Option<Arc<rpc::ReplyPause>>,
 }
 
@@ -198,7 +200,7 @@ impl AttachmentFactory {
             authority: self.authority.clone(),
             locator: Some(self.locator.clone()),
             last_fault: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             reply_pause: None,
         })
     }
@@ -238,14 +240,14 @@ impl ServiceAttachment {
             .take()
             .context("memory service attachment is closed")?;
         self.last_fault = None;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let response = if let Some(pause) = self.reply_pause.take() {
             rpc::exchange_attached_with_id_paused(&mut stream, &self.authority, id, call, &pause)
                 .await?
         } else {
             rpc::exchange_attached_with_id(&mut stream, &self.authority, id, call).await?
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let response =
             rpc::exchange_attached_with_id(&mut stream, &self.authority, id, call).await?;
         self.last_fault = match &response {
@@ -277,7 +279,7 @@ impl ServiceAttachment {
         self.stream = None;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn pause_after_next_send(&mut self, pause: Arc<rpc::ReplyPause>) {
         self.reply_pause = Some(pause);
     }
@@ -445,7 +447,16 @@ async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<S
         }
         Err(error) => return Err(error),
     };
-    connect_handshake(&mut stream, &record.authority).await?;
+    match connect_handshake(&mut stream, &record.authority).await {
+        Ok(()) => {}
+        // Endpoint retirement and final transport close are distinct steps.
+        // A client can connect to the retiring endpoint just before the owner
+        // closes it; let the existing election loop re-read discovery and
+        // owner authority instead of treating that closed peer as a protocol
+        // failure. Decoded rejection replies remain fatal below.
+        Err(error) if is_peer_closed(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    }
     Ok(Some(ServiceAttachment {
         stream: Some(stream),
         authority: record.authority,
@@ -454,7 +465,7 @@ async fn try_attach(data: &Path, scope: &str, project: &Path) -> Result<Option<S
             address: record.address,
         }),
         last_fault: None,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         reply_pause: None,
     }))
 }
@@ -541,9 +552,10 @@ async fn spawn_service(
             .environment
             .push(("LLVM_PROFILE_FILE".into(), profile));
     }
-    command.spawn().await.context(
-        "start independent project memory service; a containing Windows Job must allow breakaway",
-    )
+    command
+        .spawn()
+        .await
+        .context("start independent or outer-contained project memory service")
 }
 
 #[cfg(unix)]
@@ -657,6 +669,11 @@ impl ServiceOwner {
 
     pub fn authority(&self) -> &EndpointAuthority {
         &self.record.authority
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inspection_store_for_test(&self) -> crate::store::MemoryStore {
+        self.store.clone()
     }
 
     pub async fn accept(&mut self, deadline: Duration) -> Result<LocalStream> {
@@ -1022,7 +1039,7 @@ async fn request_idle_retirement(options: &crate::store::OpenOptions) -> Result<
         authority: record.authority,
         locator: None,
         last_fault: None,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         reply_pause: None,
     };
     connect_handshake(
@@ -1843,6 +1860,47 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn retiring_endpoint_close_during_handshake_is_transient() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let data = root.path().join("private");
+            let mut options = crate::store::OpenOptions::new(data.clone(), scope.clone());
+            options.config.cache_dir = Some(crate::store::test_cache());
+            options.config.offline = true;
+            options.supervisor = Some(crate::store::test_supervisor()?);
+            let _gate = crate::spawn_gate::spawning().await;
+            let mut owner = ServiceOwner::open(options, &project).await?;
+            let closed_peer = async {
+                let stream = owner.accept(HANDSHAKE_TIMEOUT).await?;
+                drop(stream);
+                Ok::<(), anyhow::Error>(())
+            };
+            let (attached, closed) = tokio::join!(try_attach(&data, &scope, &project), closed_peer);
+            closed?;
+            ensure!(
+                attached?.is_none(),
+                "closed retiring handshake produced a live attachment"
+            );
+            owner.close().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("retiring-handshake fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
     #[cfg(windows)]
     fn windows_starter_fixture(
         project: &Path,
@@ -1895,6 +1953,21 @@ mod tests {
         let executable = crate::store::test_supervisor()?;
         options.supervisor = Some(executable.clone());
         Ok((root, project, options, executable))
+    }
+
+    #[cfg(windows)]
+    async fn windows_root_exited(
+        child: &kuru_platform::windows::process::NativeChild,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !child.fixture_root_has_exited()? {
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "contained starter root did not exit"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -1995,74 +2068,81 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn denying_job_rejects_independent_owner_before_publication() -> Result<()> {
-        use kuru_platform::windows::process::{Lifetime, Stdio};
-        use tokio::io::AsyncReadExt;
-        tokio::time::timeout(Duration::from_secs(40), async {
+    async fn denying_outer_job_contains_owner_until_close_then_recovery_succeeds() -> Result<()> {
+        use kuru_platform::windows::process::Lifetime;
+        tokio::time::timeout(Duration::from_secs(110), async {
             let (root, project, options, executable) = windows_service_fixture()?;
-            let ready = root.path().join("denied-ready");
-            let release = root.path().join("denied-release");
+            let ready = root.path().join("contained-ready");
+            let release = root.path().join("contained-release");
             let _gate = crate::spawn_gate::spawning().await;
-            let mut command = windows_starter_fixture(
+            let mut starter = windows_starter_fixture(
                 &project,
                 &options,
                 &executable,
                 &ready,
                 &release,
                 Lifetime::OwnedJob,
-            );
-            command.stderr = Stdio::Pipe;
-            let mut starter = command.spawn().await?;
-            let mut stderr = starter.take_stderr().context("missing starter stderr")?;
-            let drain = async move {
-                let mut diagnostic = Vec::new();
-                let mut truncated = false;
-                let mut block = [0u8; 4096];
-                loop {
-                    let count = stderr.read(&mut block).await?;
-                    if count == 0 {
-                        break;
-                    }
-                    let retained = (16 * 1024usize).saturating_sub(diagnostic.len()).min(count);
-                    diagnostic.extend_from_slice(&block[..retained]);
-                    truncated |= retained < count;
+            )
+            .spawn()
+            .await?;
+            let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+            while !ready.exists() {
+                if let Some(status) = starter.try_wait()? {
+                    bail!("contained memory starter exited before readiness: {status}");
                 }
-                Ok::<_, anyhow::Error>((
-                    String::from_utf8_lossy(&diagnostic).into_owned(),
-                    truncated,
-                ))
+                ensure!(
+                    tokio::time::Instant::now() < ready_deadline,
+                    "contained memory starter did not publish readiness"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let generation = std::fs::read_to_string(&ready)?;
+            let mut survivor = try_attach(&options.data_dir, &options.project_scope, &project)
+                .await?
+                .context("contained survivor could not attach to starter's owner")?;
+            ensure!(survivor.generation() == generation);
+            std::fs::write(&release, b"release")?;
+            windows_root_exited(&starter).await?;
+            ensure!(matches!(
+                survivor
+                    .call(ServiceCall::AppendMessage {
+                        namespace: "starter-exit-fixture".into(),
+                        message: kuru_core::Message::text("assistant", "survivor committed"),
+                    })
+                    .await?,
+                ServiceValue::Unit
+            ));
+            survivor.close();
+
+            drop(starter); // closes the outer kill-on-close Job and its complete tree
+            let mut recovered = attach_or_start(&options, &project, &executable)
+                .await
+                .context("recover after outer Job terminated contained owner")?;
+            ensure!(
+                recovered.generation() != generation,
+                "outer Job closure did not replace the contained generation"
+            );
+            let ServiceValue::HistoryWindow(window) = recovered
+                .call(ServiceCall::HistoryWindow {
+                    namespace: "starter-exit-fixture".into(),
+                    limit: 4,
+                })
+                .await?
+            else {
+                bail!("recovered owner returned the wrong history result");
             };
-            let (status, diagnostic) = tokio::join!(starter.wait(Duration::from_secs(30)), drain);
-            let status = status?;
             ensure!(
-                !status.success(),
-                "denied breakaway unexpectedly started owner"
+                window.total_rows == 2
+                    && window.messages.len() == 2
+                    && window.messages[1].plain_text() == Some("survivor committed"),
+                "recovered owner lost the contained commit"
             );
-            let (diagnostic, truncated) = diagnostic?;
-            ensure!(!truncated, "denied breakaway diagnostic exceeded 16 KiB");
-            ensure!(
-                diagnostic.contains("containing Windows Job must allow breakaway"),
-                "denied breakaway lacked containment diagnosis: {diagnostic}"
-            );
-            drop(starter);
-            ensure!(!ready.exists(), "denied starter published readiness");
-            ensure!(
-                EndpointRecord::read(&options.data_dir, &options.project_scope)?.is_none(),
-                "denied owner published an endpoint"
-            );
-            ensure!(
-                ServiceLock::try_acquire(
-                    &options.data_dir,
-                    &options.project_scope,
-                    ServiceLockKind::Owner,
-                )?
-                .is_some(),
-                "denied owner retained the lifecycle lock"
-            );
+            recovered.close();
+            drop(acquire_maintenance_permit(&options).await?);
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .context("Windows denied-breakaway fixture exceeded 40 seconds")??;
+        .context("Windows contained-owner recovery fixture exceeded 110 seconds")??;
         Ok(())
     }
 
@@ -2133,6 +2213,10 @@ mod tests {
             format!("{error:#}").contains("protocol is incompatible"),
             "older owner had no actionable compatibility result: {error:#}"
         );
+        ensure!(
+            !is_peer_closed(&error),
+            "protocol incompatibility was mistaken for a retired transport"
+        );
         Ok(())
     }
 
@@ -2192,6 +2276,7 @@ mod tests {
         .expect("rejected handshake deadline")
         .unwrap_err();
         assert!(format!("{error:#}").contains("another project"));
+        assert!(!is_peer_closed(&error));
         assert_eq!(server_task.await.unwrap(), Err(HandshakeRejection::Project));
     }
 

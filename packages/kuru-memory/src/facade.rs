@@ -54,11 +54,13 @@ struct RemoteView {
 
 struct RemoteSession {
     closed: AtomicBool,
+    checked_successor_rebind: AtomicBool,
     uncertain_write: AtomicBool,
     pending_unit: Mutex<Option<PendingUnit>>,
     pending_candidate: Mutex<Option<PendingCandidate>>,
     pending_ledger: Mutex<Option<PendingLedger>>,
     pending_transition: Mutex<Option<PendingTransition>>,
+    pending_selected_abandon: Mutex<Option<PendingSelectedAbandon>>,
     factory: AttachmentFactory,
     options: OpenOptions,
     project: PathBuf,
@@ -101,6 +103,37 @@ struct PendingTransition {
     target: String,
     creation_id: Uuid,
 }
+
+#[derive(Clone)]
+struct PendingSelectedAbandon {
+    id: Uuid,
+    generation: String,
+    branch: String,
+    base: String,
+    target: String,
+}
+
+/// Typed result of an explicit exact-ref abandonment whose reply was lost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectedAbandonResolution {
+    Abandoned,
+    OpenUnchanged,
+    OpenConflict,
+    PreservedConflict,
+}
+
+/// The exact selected abandonment remains in flight or cannot yet be proved.
+/// Callers may poll the retained request identity, but must never resend it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectedAbandonUncertain;
+
+impl std::fmt::Display for SelectedAbandonUncertain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("selected candidate abandonment remains uncertain")
+    }
+}
+
+impl std::error::Error for SelectedAbandonUncertain {}
 
 /// Exact read-only result for a candidate transition whose service reply was
 /// lost. `None` means this facade has no pending transition to inspect.
@@ -177,11 +210,13 @@ impl RemoteSession {
         let read_only = options.read_only;
         let session = Arc::new(Self {
             closed: AtomicBool::new(false),
+            checked_successor_rebind: AtomicBool::new(false),
             uncertain_write: AtomicBool::new(false),
             pending_unit: Mutex::new(None),
             pending_candidate: Mutex::new(None),
             pending_ledger: Mutex::new(None),
             pending_transition: Mutex::new(None),
+            pending_selected_abandon: Mutex::new(None),
             factory,
             options,
             project,
@@ -224,6 +259,15 @@ impl RemoteSession {
         Ok(())
     }
 
+    fn retire_after_checked_recovery(&self) {
+        // Mark closed while the mutation guard is held so a queued call
+        // cannot slip through before the old attachments are drained. The
+        // terminal typed result is already known; retaining this capability
+        // lets cancellation retry cleanup and main-view reattachment.
+        self.checked_successor_rebind.store(true, Ordering::Release);
+        self.closed.store(true, Ordering::Release);
+    }
+
     fn ensure_mutation_allowed(&self) -> Result<()> {
         self.ensure_open()?;
         ensure!(
@@ -236,12 +280,13 @@ impl RemoteSession {
     async fn close(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
         self.extra_connections.close();
-        let attachments = std::mem::take(
-            &mut *self
-                .attachments
-                .lock()
-                .map_err(|_| anyhow::anyhow!("memory attachment registry is poisoned"))?,
-        );
+        // A cancelled close must leave every attachment discoverable for a
+        // later drain. Weak entries are pruned by register or session drop.
+        let attachments = self
+            .attachments
+            .lock()
+            .map_err(|_| anyhow::anyhow!("memory attachment registry is poisoned"))?
+            .clone();
         for attachment in attachments {
             if let Some(attachment) = attachment.upgrade() {
                 attachment.lock().await.close();
@@ -298,10 +343,9 @@ impl RemoteSession {
                     self.uncertain_write.store(false, Ordering::Release);
                 } else {
                     // Any candidate, export or ledger handle still names the
-                    // retired owner generation; require a fresh public open.
-                    self.closed.store(true, Ordering::Release);
-                    drop(_mutation);
-                    self.close().await?;
+                    // retired owner generation; close the old session and
+                    // require a checked fresh main view before continuation.
+                    self.retire_after_checked_recovery();
                 }
                 Ok(Some(status == service::rpc::OutcomeStatus::Committed))
             }
@@ -401,9 +445,7 @@ impl RemoteSession {
         if current_generation {
             self.uncertain_write.store(false, Ordering::Release);
         } else {
-            self.closed.store(true, Ordering::Release);
-            drop(_mutation);
-            self.close().await?;
+            self.retire_after_checked_recovery();
         }
         Ok(Some(CandidateUnitRecovery {
             committed,
@@ -450,9 +492,7 @@ impl RemoteSession {
                 if current_generation {
                     self.uncertain_write.store(false, Ordering::Release);
                 } else {
-                    self.closed.store(true, Ordering::Release);
-                    drop(_mutation);
-                    self.close().await?;
+                    self.retire_after_checked_recovery();
                 }
                 Ok(Some(status == service::rpc::OutcomeStatus::Committed))
             }
@@ -591,14 +631,78 @@ impl RemoteSession {
         if current_generation {
             self.uncertain_write.store(false, Ordering::Release);
         } else {
-            self.closed.store(true, Ordering::Release);
-            drop(_mutation);
-            self.close().await?;
+            self.retire_after_checked_recovery();
         }
         Ok(Some(CandidateTransitionRecovery {
             resolution: resolved,
             candidate,
         }))
+    }
+
+    async fn recover_selected_candidate_abandon(
+        &self,
+    ) -> Result<Option<SelectedAbandonResolution>> {
+        let _mutation = self.mutations.lock().await;
+        self.ensure_open()?;
+        let pending = self
+            .pending_selected_abandon
+            .lock()
+            .map_err(|_| anyhow::anyhow!("memory pending selected abandonment is poisoned"))?
+            .clone();
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        let mut attachment =
+            service::attach_or_start(&self.options, &self.project, &self.executable)
+                .await
+                .context("connect for selected candidate abandonment outcome")?;
+        ensure!(
+            attachment.store_instance() == self.factory.store_instance(),
+            "memory store identity changed before selected abandonment outcome"
+        );
+        let current_generation = attachment.generation() == pending.generation;
+        let response = attachment
+            .call(ServiceCall::SelectedAbandonOutcome {
+                original_id: pending.id,
+                original_generation: pending.generation,
+                branch: pending.branch,
+                base: pending.base,
+                target: pending.target,
+            })
+            .await?;
+        let ServiceValue::CandidateTransitionOutcome(result) = response else {
+            bail!("memory service returned the wrong selected abandonment outcome")
+        };
+        let resolution = match result {
+            service::rpc::CandidateTransitionResult::Abandoned => {
+                SelectedAbandonResolution::Abandoned
+            }
+            service::rpc::CandidateTransitionResult::OpenUnchanged => {
+                SelectedAbandonResolution::OpenUnchanged
+            }
+            service::rpc::CandidateTransitionResult::OpenConflict => {
+                SelectedAbandonResolution::OpenConflict
+            }
+            service::rpc::CandidateTransitionResult::PreservedConflict
+            | service::rpc::CandidateTransitionResult::Promoted { .. } => {
+                SelectedAbandonResolution::PreservedConflict
+            }
+            service::rpc::CandidateTransitionResult::InFlight
+            | service::rpc::CandidateTransitionResult::StillUncertain => {
+                return Err(SelectedAbandonUncertain.into());
+            }
+        };
+        *self
+            .pending_selected_abandon
+            .lock()
+            .map_err(|_| anyhow::anyhow!("memory pending selected abandonment is poisoned"))? =
+            None;
+        if current_generation {
+            self.uncertain_write.store(false, Ordering::Release);
+        } else {
+            self.retire_after_checked_recovery();
+        }
+        Ok(Some(resolution))
     }
 
     async fn recover_candidate_begin(self: &Arc<Self>) -> Result<Option<Candidate>> {
@@ -670,9 +774,7 @@ impl RemoteSession {
         if current_generation {
             self.uncertain_write.store(false, Ordering::Release);
         } else {
-            self.closed.store(true, Ordering::Release);
-            drop(_mutation);
-            self.close().await?;
+            self.retire_after_checked_recovery();
         }
         Ok(Some(Candidate {
             backend: CandidateBackend::Remote(RemoteCandidate { view, handle, base }),
@@ -737,6 +839,14 @@ impl RemoteView {
                 target,
                 ..
             } => Some((CandidateTransitionKind::Abandon, branch, base, target)),
+            _ => None,
+        };
+        let selected_abandon = match &call {
+            ServiceCall::AbandonCandidateRef {
+                branch,
+                base,
+                target,
+            } => Some((branch, base, target)),
             _ => None,
         };
         if mutating {
@@ -809,6 +919,21 @@ impl RemoteView {
                     .context("candidate transition is missing its original creation identity")?,
             });
         }
+        if let Some((branch, base, target)) = selected_abandon {
+            ensure!(
+                self.candidate.is_none(),
+                "selected abandonment requires the main view"
+            );
+            *self.session.pending_selected_abandon.lock().map_err(|_| {
+                anyhow::anyhow!("memory pending selected abandonment is poisoned")
+            })? = Some(PendingSelectedAbandon {
+                id: request_id,
+                generation: attachment.generation().to_owned(),
+                branch: branch.clone(),
+                base: base.clone(),
+                target: target.clone(),
+            });
+        }
         let mut pending = mutating.then(|| PendingMutation {
             uncertain: &self.session.uncertain_write,
             complete: false,
@@ -839,6 +964,9 @@ impl RemoteView {
                     .map_err(|_| anyhow::anyhow!("memory pending usage proof is poisoned"))? = None;
                 *self.session.pending_transition.lock().map_err(|_| {
                     anyhow::anyhow!("memory pending candidate transition is poisoned")
+                })? = None;
+                *self.session.pending_selected_abandon.lock().map_err(|_| {
+                    anyhow::anyhow!("memory pending selected abandonment is poisoned")
                 })? = None;
             }
         }
@@ -910,6 +1038,22 @@ fn unit(value: ServiceValue) -> Result<()> {
 }
 
 impl MemoryStore {
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn fixture_pause_next_service_reply(
+        &self,
+        barrier: &crate::test_support::ReplyBarrier,
+    ) -> Result<()> {
+        let Backend::Remote(remote) = &self.backend else {
+            bail!("reply pause requires a managed memory view")
+        };
+        remote
+            .attachment
+            .lock()
+            .await
+            .pause_after_next_send(barrier.inner.clone());
+        Ok(())
+    }
+
     pub fn exists(data_dir: &Path, project_scope: &str) -> Result<bool> {
         store::MemoryStore::exists(data_dir, project_scope)
     }
@@ -970,6 +1114,62 @@ impl MemoryStore {
             })
         };
         (progress, opening)
+    }
+
+    /// Build a fresh main view only after this exact session settled an
+    /// operation against a verified successor owner. Repeated calls are safe:
+    /// old clones remain closed and cannot consume another caller's recovery.
+    /// Transport loss or ordinary close cannot grant this rebind.
+    pub async fn reopen_after_checked_recovery(&self) -> Result<Option<Self>> {
+        let Backend::Remote(remote) = &self.backend else {
+            return Ok(None);
+        };
+        ensure!(
+            remote.candidate.is_none() && remote.pinned_view == "main",
+            "only a main memory view can reattach after successor recovery"
+        );
+        let session = &remote.session;
+        if !session.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        ensure!(
+            session.checked_successor_rebind.load(Ordering::Acquire),
+            "closed memory session has no settled successor recovery"
+        );
+        ensure!(
+            !session.options.read_only,
+            "read-only memory view cannot resume writable recovery"
+        );
+        // The close registry survives cancellation, so a later caller can
+        // retry the drain before it attaches to the verified successor.
+        session.close().await?;
+        let attachment =
+            service::attach_or_start(&session.options, &session.project, &session.executable)
+                .await?;
+        ensure!(
+            attachment.store_instance() == session.factory.store_instance(),
+            "memory store identity changed before successor reattachment"
+        );
+        let view = RemoteSession::new_view(
+            attachment,
+            session.options.clone(),
+            session.project.clone(),
+            session.executable.clone(),
+        )?;
+        Ok(Some(Self {
+            backend: Backend::Remote(view),
+        }))
+    }
+
+    /// Release one fixture transport while retaining its logical receipt and
+    /// candidate identity for a successor-owner outcome query.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn close_transport_for_test(&self) -> Result<()> {
+        let Backend::Remote(remote) = &self.backend else {
+            bail!("transport fixture requires managed memory")
+        };
+        remote.attachment.lock().await.close();
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1169,6 +1369,17 @@ impl MemoryStore {
             Backend::Local(store) => store.reconcile().await,
             Backend::Remote(remote) => {
                 if remote.session.uncertain_write.load(Ordering::Acquire) {
+                    if remote
+                        .session
+                        .pending_selected_abandon
+                        .lock()
+                        .map_err(|_| {
+                            anyhow::anyhow!("memory pending selected abandonment is poisoned")
+                        })?
+                        .is_some()
+                    {
+                        bail!("selected candidate abandonment requires its typed outcome recovery");
+                    }
                     let has_ledger_proof = remote
                         .session
                         .pending_ledger
@@ -1261,6 +1472,74 @@ impl MemoryStore {
         }
     }
 
+    /// Inspect exact retained candidate refs without opening or changing them.
+    pub async fn candidate_inventory(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<store::CandidateInventoryPage> {
+        match &self.backend {
+            Backend::Local(store) => store.candidate_inventory(after, limit).await,
+            Backend::Remote(remote) => match remote
+                .call_raw(ServiceCall::CandidateInventory {
+                    after: after.map(str::to_owned),
+                    limit,
+                })
+                .await?
+            {
+                ServiceValue::CandidateInventory(page) => Ok(page),
+                _ => bail!("memory service returned the wrong candidate inventory response"),
+            },
+        }
+    }
+
+    /// Recheck one validated candidate branch without dispatching a mutation.
+    pub async fn candidate_ref_status(&self, branch: &str) -> Result<store::CandidateRefStatus> {
+        match &self.backend {
+            Backend::Local(store) => store.candidate_ref_status(branch).await,
+            Backend::Remote(remote) => match remote
+                .call_raw(ServiceCall::CandidateRefStatus {
+                    branch: branch.to_owned(),
+                })
+                .await?
+            {
+                ServiceValue::CandidateRefStatus(status) => Ok(status),
+                _ => bail!("memory service returned the wrong candidate status response"),
+            },
+        }
+    }
+
+    /// Explicitly abandon only the inspected branch/base/head. If the reply
+    /// is lost, query `recover_selected_candidate_abandon`; never resend it.
+    pub async fn abandon_candidate_ref(&self, branch: &str, base: &str, head: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Local(store) => store.abandon_candidate_ref(branch, base, head).await,
+            Backend::Remote(remote) => {
+                remote.ensure_writable()?;
+                unit(
+                    remote
+                        .call_raw(ServiceCall::AbandonCandidateRef {
+                            branch: branch.to_owned(),
+                            base: base.to_owned(),
+                            target: head.to_owned(),
+                        })
+                        .await?,
+                )
+            }
+        }
+    }
+
+    /// Resolve a lost selected-abandon reply from the exact typed ref result.
+    /// An open or conflicted result requires a fresh inspection before action.
+    pub async fn recover_selected_candidate_abandon(
+        &self,
+    ) -> Result<Option<SelectedAbandonResolution>> {
+        match &self.backend {
+            Backend::Local(_) => Ok(None),
+            Backend::Remote(remote) => remote.session.recover_selected_candidate_abandon().await,
+        }
+    }
+
     pub async fn revision(&self) -> Result<String> {
         match &self.backend {
             Backend::Local(store) => store.revision().await,
@@ -1343,17 +1622,18 @@ impl MemoryStore {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Candidate {
     backend: CandidateBackend,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum CandidateBackend {
     Local(store::Candidate),
     Remote(RemoteCandidate),
 }
 
+#[derive(Clone)]
 struct RemoteCandidate {
     view: RemoteView,
     handle: Uuid,
@@ -1374,6 +1654,7 @@ impl Candidate {
     async fn remote_transition(
         candidate: &RemoteCandidate,
         kind: CandidateTransitionKind,
+        expected_target: Option<&str>,
     ) -> Result<ServiceValue> {
         let session = &candidate.view.session;
         // Ordinary candidate calls take this attachment before the shared
@@ -1382,19 +1663,23 @@ impl Candidate {
         let mut attachment = candidate.view.attachment.lock().await;
         let _mutation = session.mutations.lock().await;
         candidate.view.ensure_writable()?;
-        let target = match candidate
-            .view
-            .checked_call_locked(
-                &mut attachment,
-                ServiceCall::View {
-                    candidate: Some(candidate.handle),
-                    operation: ViewOperation::Revision,
-                },
-            )
-            .await?
-        {
-            ServiceValue::Revision(revision) => revision,
-            _ => bail!("memory service returned the wrong candidate revision response"),
+        let target = if let Some(expected) = expected_target {
+            expected.to_owned()
+        } else {
+            match candidate
+                .view
+                .checked_call_locked(
+                    &mut attachment,
+                    ServiceCall::View {
+                        candidate: Some(candidate.handle),
+                        operation: ViewOperation::Revision,
+                    },
+                )
+                .await?
+            {
+                ServiceValue::Revision(revision) => revision,
+                _ => bail!("memory service returned the wrong candidate revision response"),
+            }
         };
         let branch = candidate.view.pinned_view.clone();
         let base = candidate.base.clone();
@@ -1436,11 +1721,41 @@ impl Candidate {
         }
     }
 
+    /// The exact durable branch pinned by this candidate handle.
+    pub fn branch(&self) -> &str {
+        match &self.backend {
+            CandidateBackend::Local(candidate) => candidate.branch(),
+            CandidateBackend::Remote(candidate) => &candidate.view.pinned_view,
+        }
+    }
+
     pub async fn promote(&self) -> Result<String> {
         match &self.backend {
             CandidateBackend::Local(candidate) => candidate.promote().await,
             CandidateBackend::Remote(candidate) => {
-                match Self::remote_transition(candidate, CandidateTransitionKind::Promote).await? {
+                match Self::remote_transition(candidate, CandidateTransitionKind::Promote, None)
+                    .await?
+                {
+                    ServiceValue::Revision(revision) => Ok(revision),
+                    _ => bail!("memory service returned the wrong promotion response"),
+                }
+            }
+        }
+    }
+
+    /// Promote only the exact staged head already captured by the caller.
+    /// The owner rechecks the branch, base and target before transition.
+    pub async fn promote_exact(&self, expected_target: &str) -> Result<String> {
+        match &self.backend {
+            CandidateBackend::Local(candidate) => candidate.promote_exact(expected_target).await,
+            CandidateBackend::Remote(candidate) => {
+                match Self::remote_transition(
+                    candidate,
+                    CandidateTransitionKind::Promote,
+                    Some(expected_target),
+                )
+                .await?
+                {
                     ServiceValue::Revision(revision) => Ok(revision),
                     _ => bail!("memory service returned the wrong promotion response"),
                 }
@@ -1451,9 +1766,25 @@ impl Candidate {
     pub async fn abandon(&self) -> Result<()> {
         match &self.backend {
             CandidateBackend::Local(candidate) => candidate.abandon().await,
-            CandidateBackend::Remote(candidate) => {
-                unit(Self::remote_transition(candidate, CandidateTransitionKind::Abandon).await?)
-            }
+            CandidateBackend::Remote(candidate) => unit(
+                Self::remote_transition(candidate, CandidateTransitionKind::Abandon, None).await?,
+            ),
+        }
+    }
+
+    /// Abandon an attached candidate only if it still has the exact head the
+    /// user inspected. The owner rechecks this target under its write lock.
+    pub async fn abandon_exact(&self, expected_target: &str) -> Result<()> {
+        match &self.backend {
+            CandidateBackend::Local(candidate) => candidate.abandon_exact(expected_target).await,
+            CandidateBackend::Remote(candidate) => unit(
+                Self::remote_transition(
+                    candidate,
+                    CandidateTransitionKind::Abandon,
+                    Some(expected_target),
+                )
+                .await?,
+            ),
         }
     }
 }
@@ -1819,6 +2150,207 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_abandon_lost_reply_proves_staged_but_not_empty_ref() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(150), async {
+            for staged in [false, true] {
+                let root = crate::test_support::tempdir()?;
+                let project = root.path().join("project");
+                std::fs::create_dir(&project)?;
+                let project = project.canonicalize()?;
+                let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+                let scope = format!(
+                    "project/{}",
+                    digest
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                );
+                let options =
+                    crate::test_support::open_options(root.path().join("private"), scope)?;
+                let _gate = crate::spawn_gate::spawning().await;
+                let local = store::MemoryStore::open(options.clone()).await?;
+                let candidate = local.begin_candidate("selected ref").await?;
+                let branch = candidate.view().pinned_view().to_owned();
+                let base = candidate.base().to_owned();
+                if staged {
+                    candidate.view().put("private-staged", &json!(true)).await?;
+                }
+                let target = candidate.view().revision().await?;
+                ensure!((target != base) == staged);
+                drop(candidate);
+                local.close().await?;
+                let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+                let owner_inspection = owner.inspection_store_for_test();
+                let mut served = tokio::spawn(owner.serve());
+                let _owner_cleanup = AbortOnDrop(served.abort_handle());
+                let executable = std::env::current_exe()?;
+                let open = || {
+                    MemoryStore::open_managed_observed(
+                        options.clone(),
+                        project.clone(),
+                        executable.clone(),
+                    )
+                    .1
+                };
+                let memory = open().await?;
+                let Backend::Remote(remote) = &memory.backend else {
+                    bail!("selected ref fixture did not attach to the service")
+                };
+                let pause = Arc::new(service::rpc::ReplyPause::default());
+                remote
+                    .attachment
+                    .lock()
+                    .await
+                    .pause_after_next_send(pause.clone());
+                let writer = tokio::spawn({
+                    let memory = memory.clone();
+                    let branch = branch.clone();
+                    let base = base.clone();
+                    let target = target.clone();
+                    async move { memory.abandon_candidate_ref(&branch, &base, &target).await }
+                });
+                let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+                tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                    .await
+                    .context("selected abandon frame was not flushed")?;
+                // The frame-send barrier precedes owner dispatch. Inspect the
+                // already-owned store without adding a sibling attachment;
+                // otherwise that sibling can win the reservation race and
+                // correctly cause selected abandonment to be refused.
+                let mut last_status = None;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if served.is_finished() {
+                            let ended = (&mut served).await;
+                            bail!("selected abandon owner exited before ref cleanup: {ended:?}");
+                        }
+                        let status = owner_inspection.candidate_ref_status(&branch).await?;
+                        let reclaimed = status.state == store::CandidateRefState::Missing;
+                        last_status = Some(status);
+                        if reclaimed {
+                            break Ok::<(), anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .with_context(|| format!("selected ref was not reclaimed: {last_status:?}"))??;
+                drop(owner_inspection);
+                // Now retain an authenticated sibling in the original
+                // generation before cancelling the held client reply.
+                let mut original_generation =
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            match remote.session.factory.connect().await {
+                                Ok(attachment) => break Ok::<_, anyhow::Error>(attachment),
+                                Err(error) if service::is_peer_closed(&error) => {
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    })
+                    .await
+                    .context("selected abandon reservation did not release")??;
+                writer.abort();
+                let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
+                    .await
+                    .context("cancelled selected abandon did not end")?;
+                ensure!(stopped.is_err_and(|error| error.is_cancelled()));
+                ensure!(
+                    matches!(
+                        original_generation
+                            .call(ServiceCall::CandidateRefStatus {
+                                branch: branch.clone(),
+                            })
+                            .await?,
+                        ServiceValue::CandidateRefStatus(status)
+                            if status.state == store::CandidateRefState::Missing
+                    ),
+                    "sibling did not observe the reclaimed selected ref"
+                );
+                if staged {
+                    // A newly invented same-generation request ID cannot
+                    // turn a reclaimed ref into proof that it ran.
+                    let generation = original_generation.generation().to_owned();
+                    let unregistered = original_generation
+                        .call(ServiceCall::SelectedAbandonOutcome {
+                            original_id: Uuid::new_v4(),
+                            original_generation: generation,
+                            branch: branch.clone(),
+                            base: base.clone(),
+                            target: target.clone(),
+                        })
+                        .await?;
+                    ensure!(matches!(
+                        unregistered,
+                        ServiceValue::CandidateTransitionOutcome(
+                            service::rpc::CandidateTransitionResult::StillUncertain
+                        )
+                    ));
+                }
+                original_generation.close();
+                // Force exact old-owner/Dolt retirement, then expose the
+                // retained request only to a verified successor generation.
+                let permit = service::acquire_maintenance_permit(&options).await?;
+                tokio::time::timeout(Duration::from_secs(10), &mut served)
+                    .await
+                    .context("selected ref old owner did not reap")???;
+                drop(permit);
+                let successor = service::ServiceOwner::open(options.clone(), &project).await?;
+                let successor_served = tokio::spawn(successor.serve());
+                let _successor_cleanup = AbortOnDrop(successor_served.abort_handle());
+                if staged {
+                    ensure!(
+                        memory.recover_selected_candidate_abandon().await?
+                            == Some(SelectedAbandonResolution::Abandoned),
+                        "staged selected abandonment lost its typed result"
+                    );
+                    let rebound = memory
+                        .reopen_after_checked_recovery()
+                        .await?
+                        .context("settled selected abandonment did not rebind main")?;
+                    ensure!(
+                        memory
+                            .put("old-main-remains-closed", &json!(true))
+                            .await
+                            .is_err(),
+                        "checked rebind revived the retired main view"
+                    );
+                    rebound.put("after-proof", &json!(true)).await?;
+                    rebound.close().await?;
+                } else {
+                    let error = memory
+                        .recover_selected_candidate_abandon()
+                        .await
+                        .unwrap_err();
+                    ensure!(
+                        error.is::<SelectedAbandonUncertain>(),
+                        "missing no-op ref falsely proved the selected request: {error:#}"
+                    );
+                    ensure!(memory.put("blocked", &json!(true)).await.is_err());
+                }
+                memory.close().await?;
+                let inspector = open().await?;
+                ensure!(
+                    inspector.candidate_ref_status(&branch).await?.state
+                        == store::CandidateRefState::Missing
+                );
+                inspector.close().await?;
+                let permit = service::acquire_maintenance_permit(&options).await?;
+                tokio::time::timeout(Duration::from_secs(10), successor_served)
+                    .await
+                    .context("selected ref successor owner did not reap")???;
+                drop(permit);
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("selected abandonment fixture exceeded 150 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lost_candidate_unit_reply_reattaches_before_read_write_and_promotion() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(90), async {
             for restart_owner in [false, true] {
@@ -1846,6 +2378,7 @@ mod tests {
                 )
                 .1
                 .await?;
+                let old_main_clone = memory.clone();
                 let candidate = memory.begin_candidate("accepted private write").await?;
                 let private = candidate.view();
                 let Backend::Remote(remote) = &private.backend else {
@@ -1960,18 +2493,45 @@ mod tests {
                 ensure!(recovered.committed);
                 ensure!(private.get("accepted-private").await.is_err());
                 let candidate = recovered.candidate;
+                let (rebound_main, rebound_clone) = if restart_owner {
+                    // The first close completes the main attachment, then
+                    // waits on this held old candidate attachment. Cancelling
+                    // there must retain both weak registry entries so either
+                    // old main clone can retry checked successor rebind.
+                    let held = remote.attachment.lock().await;
+                    ensure!(
+                        tokio::time::timeout(
+                            Duration::from_millis(50),
+                            memory.reopen_after_checked_recovery(),
+                        )
+                        .await
+                        .is_err(),
+                        "retired attachment drain escaped its held candidate"
+                    );
+                    ensure!(
+                        remote.session.extra_connections.is_closed(),
+                        "cancelled rebind did not enter retired-session drain"
+                    );
+                    drop(held);
+                    let rebound_clone = old_main_clone
+                        .reopen_after_checked_recovery()
+                        .await?
+                        .context("old clone could not independently rebind")?;
+                    let rebound_main = memory
+                        .reopen_after_checked_recovery()
+                        .await?
+                        .context("cancelled main rebind could not retry")?;
+                    ensure!(memory.get("accepted-private").await.is_err());
+                    ensure!(old_main_clone.get("accepted-private").await.is_err());
+                    (Some(rebound_main), Some(rebound_clone))
+                } else {
+                    (None, None)
+                };
                 ensure!(candidate.view().get("accepted-private").await? == Some(json!(1)));
                 candidate.view().put("after-proof", &json!(2)).await?;
                 candidate.promote().await?;
                 let observer = if restart_owner {
-                    ensure!(memory.get("accepted-private").await.is_err());
-                    MemoryStore::open_managed_observed(
-                        options.clone(),
-                        project.clone(),
-                        executable.clone(),
-                    )
-                    .1
-                    .await?
+                    rebound_main.context("missing checked successor main view")?
                 } else {
                     memory.clone()
                 };
@@ -1979,6 +2539,10 @@ mod tests {
                 ensure!(observer.get("after-proof").await? == Some(json!(2)));
                 observer.close().await?;
                 if restart_owner {
+                    rebound_clone
+                        .context("missing independently rebound clone")?
+                        .close()
+                        .await?;
                     // The recovered candidate owns a new logical session; the
                     // old main close below cannot release its attachment.
                     candidate.view().close().await?;
@@ -2560,7 +3124,29 @@ mod tests {
                 "closing one client's clone left its original handle usable"
             );
             ensure!(second.history("private/actor", 10).await?.len() == 3);
+            let CandidateBackend::Remote(candidate_remote) = &candidate.backend else {
+                bail!("managed fixture candidate lost its remote attachment")
+            };
+            let held_candidate = candidate_remote.view.attachment.lock().await;
+            ensure!(
+                tokio::time::timeout(Duration::from_millis(50), second.clone().close())
+                    .await
+                    .is_err(),
+                "session close did not wait for its held candidate attachment"
+            );
+            drop(held_candidate);
+            // A cancelled close cannot take and lose the remaining weak
+            // attachment registry; this retry must close the candidate too.
             second.close().await?;
+            ensure!(
+                !candidate_remote
+                    .view
+                    .attachment
+                    .lock()
+                    .await
+                    .has_complete_exchange(),
+                "retry left the previously held candidate transport alive"
+            );
             ensure!(
                 candidate
                     .view()

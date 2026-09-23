@@ -2326,7 +2326,17 @@ async fn dispatch_controlled(
     if command.starts_with('/') && registered.is_none() && custom_prompt.is_none() {
         anyhow::bail!("unknown command; use /help");
     }
-    harness.reconcile().await?;
+    let candidate_recovery = registered.is_some_and(|request| {
+        matches!(
+            request.id,
+            CommandId::MemoryCandidateAbandon
+                | CommandId::MemoryCandidateStatus
+                | CommandId::MemoryCandidates
+        )
+    });
+    if !candidate_recovery {
+        harness.reconcile().await?;
+    }
     let args = registered.map_or("", |request| request.args);
     let feedback = match registered.map(|request| request.id) {
         Some(CommandId::Parts) => serde_json::to_string_pretty(&harness.topology)?,
@@ -2373,6 +2383,44 @@ async fn dispatch_controlled(
             format!("Activated {} · {}", relation.kind, relation.id)
         }
         Some(CommandId::Memory) => serde_json::to_string_pretty(&harness.memory_for(args).await?)?,
+        Some(CommandId::MemoryCandidates) => serde_json::to_string_pretty(
+            &harness
+                .candidate_inventory(
+                    (!args.is_empty()).then_some(args),
+                    commands::CANDIDATE_PAGE_LIMIT,
+                )
+                .await?,
+        )?,
+        Some(CommandId::MemoryCandidateStatus) => {
+            ensure!(!args.is_empty(), "usage: /memory-candidate-status BRANCH");
+            ensure!(
+                !args.chars().any(char::is_whitespace),
+                "candidate branch cannot contain whitespace"
+            );
+            serde_json::to_string_pretty(&commands::candidate_status_json(
+                &harness.candidate_ref_status(args).await?,
+            ))?
+        }
+        Some(CommandId::MemoryCandidateAbandon) => {
+            let mut fields = args.split_whitespace();
+            let branch = fields
+                .next()
+                .context("usage: /memory-candidate-abandon BRANCH BASE HEAD")?;
+            let base = fields
+                .next()
+                .context("usage: /memory-candidate-abandon BRANCH BASE HEAD")?;
+            let head = fields
+                .next()
+                .context("usage: /memory-candidate-abandon BRANCH BASE HEAD")?;
+            ensure!(
+                fields.next().is_none(),
+                "usage: /memory-candidate-abandon BRANCH BASE HEAD"
+            );
+            harness
+                .abandon_candidate_ref_exact(branch, base, head)
+                .await?;
+            serde_json::json!({"branch": branch, "state": "abandoned"}).to_string()
+        }
         Some(CommandId::Notes) => {
             serde_json::to_string_pretty(&harness.notes_for(args, 100).await?)?
         }
@@ -2845,7 +2893,7 @@ mod tests {
         assert_eq!(view.key(key(KeyCode::Tab)), None);
         assert_eq!(view.input, "/memory");
         assert_eq!(view.key(key(KeyCode::Tab)), None);
-        assert_eq!(view.input, "/memory-history");
+        assert_eq!(view.input, "/memory-candidate-abandon");
         assert_eq!(view.key(key(KeyCode::BackTab)), None);
         assert_eq!(view.input, "/memory");
         view.key(key(KeyCode::Char('x')));

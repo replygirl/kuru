@@ -17,8 +17,32 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
+    time::Duration,
 };
+
+/// A one-shot test barrier after a complete typed service request frame and
+/// before the client reads its reply. The owner continues independently.
+#[derive(Clone, Default)]
+pub struct ReplyBarrier {
+    pub(crate) inner: Arc<crate::service::rpc::ReplyPause>,
+}
+
+impl ReplyBarrier {
+    pub async fn wait_sent(&self) {
+        self.inner.sent.notified().await;
+    }
+
+    pub fn promotion_sent(&self) -> bool {
+        self.inner
+            .promotion_sent
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn release(&self) {
+        self.inner.release.notify_one();
+    }
+}
 
 const LIMIT: u64 = 512 * 1024 * 1024;
 const DIRECTORY: &str = "kuru-test-supervisors";
@@ -73,6 +97,30 @@ pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {
         .map_err(|error| fixture_startup_error(&fixture_options, error))
 }
 
+/// Retire the exact idle managed owner after fixture clients release their
+/// transports. The maintenance permit is dropped before a successor starts.
+pub async fn retire_idle_service(options: &OpenOptions) -> Result<()> {
+    let permit = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match crate::service::acquire_maintenance_permit(options).await {
+                Ok(permit) => break Ok(permit),
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("memory service has active clients") =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => break Err(error),
+            }
+        }
+    })
+    .await
+    .context("idle managed owner did not retire within 10 seconds")??;
+    drop(permit);
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) async fn open_local_fixture(options: OpenOptions) -> Result<crate::store::MemoryStore> {
     let fixture_options = options.clone();
@@ -103,6 +151,8 @@ pub(crate) fn fixture_startup_error(options: &OpenOptions, error: Error) -> Erro
             || message.starts_with(
                 "memory server startup failed: Dolt startup/lifetime failed; private diagnostics:",
             )
+            || message.starts_with("Dolt database bootstrap deadline exceeded while ")
+            || message == "authenticated Dolt startup deadline exceeded"
             || message.starts_with("fixture service exited before")
             || message == "memory supervisor readiness deadline exceeded"
     }) {
@@ -208,6 +258,12 @@ mod fixture_diagnostic_tests {
             .context("open staged memory server")
     }
 
+    fn bootstrap_error() -> Error {
+        anyhow::anyhow!(
+            "Dolt database bootstrap deadline exceeded while verifying the project identity"
+        )
+    }
+
     #[test]
     fn startup_log_capture_is_opt_in_exact_and_bounded() -> Result<()> {
         let root = tempdir()?;
@@ -251,6 +307,10 @@ mod fixture_diagnostic_tests {
         assert!(format!("{exited:#}").contains("fixture-private-log"));
         assert!(readiness_rendered.contains(&log.display().to_string()));
         assert!(readiness_rendered.contains("memory supervisor readiness deadline exceeded"));
+        let bootstrap_captured = fixture_startup_error(&options, bootstrap_error());
+        let bootstrap_rendered = format!("{bootstrap_captured:#}");
+        assert!(bootstrap_rendered.contains("fixture-private-log"));
+        assert!(bootstrap_rendered.contains("verifying the project identity"));
 
         files::write(&log, &vec![b'x'; 8 * 1024])?;
         let bounded = fixture_startup_error(&options, startup_error()).to_string();

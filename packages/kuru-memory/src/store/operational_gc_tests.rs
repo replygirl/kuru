@@ -171,9 +171,23 @@ async fn dirty_promoting_retry_publishes_the_committed_head_but_preserves_the_re
         .execute(status_pool.as_ref())
         .await?;
 
-    assert_eq!(candidate.promote().await?, target);
-    assert_eq!(candidate.promote().await?, target);
-    assert_eq!(store.revision().await?, target);
+    for _ in 0..2 {
+        let error = candidate
+            .promote()
+            .await
+            .expect_err("dirty promoting ref must not be reported as cleaned up");
+        assert!(
+            format!("{error:#}").contains("candidate working set is not clean"),
+            "unexpected cleanup refusal: {error:#}"
+        );
+        assert_eq!(store.revision().await?, target);
+        assert_eq!(
+            candidate_heads(&store.pool, &names)
+                .await?
+                .get(&names.promoting),
+            Some(&target)
+        );
+    }
     let heads = candidate_heads(&store.pool, &names).await?;
     assert_eq!(heads.get(&names.promoting), Some(&target));
     let reopened = store.shared.server.pool(&names.promoting).await?;
@@ -234,6 +248,10 @@ async fn dirty_promoting_retry_publishes_the_committed_head_but_preserves_the_re
         0
     );
     drop(preserved);
+    let main_before_cleanup = reopened.revision().await?;
+    reopened.recover_candidates().await?;
+    assert_eq!(reopened.revision().await?, main_before_cleanup);
+    assert!(candidate_heads(&reopened.pool, &names).await?.is_empty());
     reopened.close().await?;
 
     let recovered = crate::test_support::spawn_gated_open(options).await?;
