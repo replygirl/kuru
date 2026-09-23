@@ -8,6 +8,8 @@
 - [x] 2.1 @integration (agent) conflict a candidate by advancing main before promotion -> typed conflict leaves the candidate view usable with its exact private value and ref. The focused store transition test passed locally on 2026-09-23.
 - [x] 2.2 @integration (agent) inject a failure after the main merge commits but before resolved-ref cleanup, then retry the exact target -> the first call reports failure, retains the durable promoting ref and does not cache success; the retry observes the committed target, completes cleanup without replaying the merge, closes the retained view and removes the exact refs. The focused real-Dolt cleanup-retry test passed locally on 2026-09-23.
 
+The ordinary hooked push of `243d243` ended exit 1 after combined coverage found one stale GC fixture: it expected success while the promoting branch was deliberately dirty. The corrected real-Dolt fixture now requires two exact cleanup refusals, preserves the committed main target and dirty ref across reopen, and verifies a clean recovery retires the ref without changing main. Its focused run passed 1/1; the new full coverage, hosted native acceptance and archive remain pending.
+
 ## 3. Native acceptance
 
 - [ ] 3.1 @regression (agent) run the hosted Windows memory/runtime shard that failed with a branch-in-use error -> alternate-memory dream promotion, undo and reopen pass without force deletion
