@@ -46,6 +46,8 @@ Model, effort, and framework selections made here are [saved for the project](./
 
 Tab completes only the leading command name and leaves its arguments unchanged. `/clear` affects only the current terminal view: stored conversation, usage, and session identity remain available, including after resume. `/status` uses the local session snapshot and makes no provider request.
 
+Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/NAME.md` under Kuru's user configuration directory. A file needs YAML `name` and `description` frontmatter followed by a nonempty Markdown prompt. `/NAME` sends the captured prompt as a normal turn; optional arguments are separately labeled literal text. It never runs a shell command. Built-in names win collisions, followed by project and user entries. After workspace trust, `/help` and Tab show only effective commands. Project entries join the complete base authority manifest; see [skills and custom prompts](./configuration#skills-and-custom-prompts).
+
 ## CLI commands
 
 | Command                                 | Purpose                                                                                     |

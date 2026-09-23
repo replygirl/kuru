@@ -10,6 +10,7 @@ mod framework;
 mod model_catalog;
 mod permissions;
 mod policy;
+mod prompt_sources;
 mod types;
 
 pub use accounting::{
@@ -44,6 +45,7 @@ pub use policy::{
     validate_context_sources, validate_contributions, validate_facing, validate_identity_namespace,
     validate_peer_edge, validate_recipients, validate_relationship_members,
 };
+pub use prompt_sources::{CustomCommand, PromptCatalog, SkillMetadata};
 pub use types::{
     CacheWriteTerms, Completion, CompletionRequest, ContentBlock, FactProvenance, LongContextTier,
     Message, ModelInfo, ModelMetadata, PriceBasis, PriceSchedule, SourceCitation, Sourced,

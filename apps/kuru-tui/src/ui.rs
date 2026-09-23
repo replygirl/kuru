@@ -84,7 +84,7 @@ pub struct InstructionPrompt {
 #[derive(Debug, Clone)]
 struct CommandCompletion {
     original_prefix: String,
-    matches: Vec<&'static str>,
+    matches: Vec<String>,
     selected: usize,
     rendered: String,
 }
@@ -130,6 +130,7 @@ pub struct View {
     pub input: String,
     pub cursor: usize,
     command_completion: Option<CommandCompletion>,
+    command_registry: Arc<commands::Registry>,
     pub mode: String,
     pub model: String,
     pub effort: String,
@@ -199,6 +200,7 @@ impl View {
             input: String::new(),
             cursor: 0,
             command_completion: None,
+            command_registry: Arc::new(commands::Registry::default()),
             mode: runtime.mode,
             model: runtime.model,
             effort: runtime.effort,
@@ -244,6 +246,11 @@ impl View {
             notice_until: 0,
             completion_locked: false,
         }
+    }
+
+    fn with_command_registry(mut self, registry: commands::Registry) -> Self {
+        self.command_registry = Arc::new(registry);
+        self
     }
 
     /// Ambient frames are slower than busy indicators; all motion uses this
@@ -361,14 +368,14 @@ impl View {
             (previous.original_prefix, previous.matches, selected)
         } else {
             let prefix = self.input[..self.cursor].to_owned();
-            let matches = commands::names_matching(&prefix);
+            let matches = self.command_registry.names_matching(&prefix);
             if matches.is_empty() {
                 return;
             }
             let selected = if backwards { matches.len() - 1 } else { 0 };
             (prefix, matches, selected)
         };
-        self.input.replace_range(0..token_end, matches[selected]);
+        self.input.replace_range(0..token_end, &matches[selected]);
         self.cursor = matches[selected].len();
         self.command_completion = Some(CommandCompletion {
             original_prefix,
@@ -1325,13 +1332,30 @@ pub(crate) async fn run_with_notice(
     models: Vec<ModelInfo>,
     notice: Option<MemoryNotice>,
 ) -> Result<()> {
+    run_with_notice_and_commands(harness, models, notice, commands::Registry::default()).await
+}
+
+pub(crate) async fn run_with_notice_and_commands(
+    harness: Harness,
+    models: Vec<ModelInfo>,
+    notice: Option<MemoryNotice>,
+    registry: commands::Registry,
+) -> Result<()> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "interactive mode requires a terminal; use kuru run PROMPT"
     );
     let mut guard = TerminalSession::enter(&mut io::stdout())?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run_loop_with_notice(&mut terminal, harness, models, notice).await;
+    let result = run_loop_with_stream_and_notice(
+        &mut terminal,
+        harness,
+        models,
+        EventStream::new(),
+        notice,
+        registry,
+    )
+    .await;
     // Ratatui's Drop may show its cursor. Finish that while terminal output
     // processing is still active, before restoring the caller's console modes.
     drop(terminal);
@@ -1340,18 +1364,6 @@ pub(crate) async fn run_with_notice(
         Ok(()) => restored,
         Err(error) => Err(error),
     }
-}
-
-async fn run_loop_with_notice<B: Backend>(
-    terminal: &mut Terminal<B>,
-    harness: Harness,
-    models: Vec<ModelInfo>,
-    notice: Option<MemoryNotice>,
-) -> Result<()>
-where
-    B::Error: Send + Sync + 'static,
-{
-    run_loop_with_stream_and_notice(terminal, harness, models, EventStream::new(), notice).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1802,7 +1814,15 @@ where
     B::Error: Send + Sync + 'static,
     S: Stream<Item = io::Result<TerminalEvent>> + Unpin,
 {
-    run_loop_with_stream_and_notice(terminal, harness, models, input, None).await
+    run_loop_with_stream_and_notice(
+        terminal,
+        harness,
+        models,
+        input,
+        None,
+        commands::Registry::default(),
+    )
+    .await
 }
 
 async fn run_loop_with_stream_and_notice<B, S>(
@@ -1811,6 +1831,7 @@ async fn run_loop_with_stream_and_notice<B, S>(
     models: Vec<ModelInfo>,
     mut input: S,
     mut notice: Option<MemoryNotice>,
+    registry: commands::Registry,
 ) -> Result<()>
 where
     B: Backend,
@@ -1818,7 +1839,7 @@ where
     S: Stream<Item = io::Result<TerminalEvent>> + Unpin,
 {
     let initial = project_initial_view(&harness).await?;
-    let mut view = View::from_initial(initial, models);
+    let mut view = View::from_initial(initial, models).with_command_registry(registry);
     let permission_service = harness.permission_service();
     refresh_permission_state(&permission_service, &mut view)?;
     if let Some(notice) = &notice {
@@ -1941,6 +1962,10 @@ where
                     dirty |= redraw;
                     if let Some(command) = command {
                         let registered = commands::parse(&command);
+                        let custom_prompt = view
+                            .command_registry
+                            .custom(&command)
+                            .map(|(entry, args)| commands::expand_custom(entry, args));
                         let command_id = registered.map(|request| request.id);
                         let no_args = registered.is_some_and(|request| request.args.is_empty());
                         if let Some(answer) = match command.as_str() {
@@ -2036,7 +2061,7 @@ where
                                 let _ = tx.send((generation, result)).await;
                             }));
                         } else if command_id == Some(CommandId::Help) && no_args {
-                            view.transcript.push(("help".into(), commands::help_text()));
+                            view.transcript.push(("help".into(), view.command_registry.help_text()));
                             view.show_scene = false;
                         } else if command_id == Some(CommandId::Clear) && no_args && !view.busy {
                             view.clear_visible_conversation();
@@ -2066,7 +2091,7 @@ where
                             ));
                             view.show_scene = false;
                             view.scroll = 0;
-                        } else if command.starts_with('/') && command_id.is_none() && !view.busy {
+                        } else if command.starts_with('/') && command_id.is_none() && custom_prompt.is_none() && !view.busy {
                             view.transcript.push(("kuru".into(), "Unknown command; use /help".into()));
                             view.show_scene = false;
                             view.scroll = 0;
@@ -2083,13 +2108,13 @@ where
                                 view.open_picker(Picker::Modes);
                                 continue;
                             }
-                            if !command.starts_with('/') {
+                            if !command.starts_with('/') || custom_prompt.is_some() {
                                 view.transcript.push(("user".into(), command.clone()));
                                 view.show_scene = false;
                                 view.scroll = 0;
                             }
                             view.begin_operation();
-                            view.status = if command.starts_with('/') {
+                            view.status = if command.starts_with('/') && custom_prompt.is_none() {
                                 "Updating session"
                             } else {
                                 "Listening to the parts"
@@ -2098,7 +2123,7 @@ where
                             view.part_activity.clear();
                             view.routes.clear();
                             generation = generation.wrapping_add(1);
-                            let turn_id = (!command.starts_with('/'))
+                            let turn_id = (!command.starts_with('/') || custom_prompt.is_some())
                                 .then(|| uuid::Uuid::new_v4().to_string());
                             view.active_operation_id = turn_id.clone();
                             if turn_id.is_some() {
@@ -2110,6 +2135,7 @@ where
                             let harness = harness.clone();
                             let tx = tx.clone();
                             let models = view.models.clone();
+                            let command_registry = view.command_registry.clone();
                             let operation_cancellation = CancellationToken::new();
                             cancellation = Some(operation_cancellation.clone());
                             let (approval_tx, receiver) = mpsc::channel(1);
@@ -2121,10 +2147,13 @@ where
                                     &mut *harness.lock().await,
                                     &models,
                                     &command,
+                                    &command_registry,
                                     &operation_cancellation,
                                     turn_id.as_deref(),
-                                    Some(ApprovalSender::new(approval_tx)),
-                                    Some(InstructionReviewSender::new(instruction_tx)),
+                                    DispatchReviews {
+                                        permission: Some(ApprovalSender::new(approval_tx)),
+                                        instructions: Some(InstructionReviewSender::new(instruction_tx)),
+                                    },
                                 )
                                 .await;
                                 let _ = tx.send((generation, result)).await;
@@ -2259,20 +2288,42 @@ pub(crate) async fn dispatch(
     command: &str,
 ) -> Result<DispatchOutcome> {
     let cancellation = CancellationToken::new();
-    dispatch_controlled(harness, models, command, &cancellation, None, None, None).await
+    dispatch_controlled(
+        harness,
+        models,
+        command,
+        &commands::Registry::default(),
+        &cancellation,
+        None,
+        DispatchReviews::default(),
+    )
+    .await
+}
+
+#[derive(Default)]
+struct DispatchReviews {
+    permission: Option<ApprovalSender>,
+    instructions: Option<InstructionReviewSender>,
 }
 
 async fn dispatch_controlled(
     harness: &mut Harness,
     models: &[ModelInfo],
     command: &str,
+    registry: &commands::Registry,
     cancellation: &CancellationToken,
     turn_id: Option<&str>,
-    approval: Option<ApprovalSender>,
-    instruction_approval: Option<InstructionReviewSender>,
+    reviews: DispatchReviews,
 ) -> Result<DispatchOutcome> {
+    let DispatchReviews {
+        permission: approval,
+        instructions: instruction_approval,
+    } = reviews;
     let registered = commands::parse(command);
-    if command.starts_with('/') && registered.is_none() {
+    let custom_prompt = registry
+        .custom(command)
+        .map(|(entry, args)| commands::expand_custom(entry, args));
+    if command.starts_with('/') && registered.is_none() && custom_prompt.is_none() {
         anyhow::bail!("unknown command; use /help");
     }
     harness.reconcile().await?;
@@ -2366,6 +2417,7 @@ async fn dispatch_controlled(
             anyhow::bail!("this command requires the interactive view")
         }
         None => {
+            let prompt = custom_prompt.as_deref().unwrap_or(command);
             let generated;
             let turn_id = if let Some(turn_id) = turn_id {
                 turn_id
@@ -2379,7 +2431,7 @@ async fn dispatch_controlled(
                 {
                     harness
                         .run_local_controlled_with_reviews(
-                            command,
+                            prompt,
                             None,
                             turn_id,
                             cancellation,
@@ -2390,7 +2442,7 @@ async fn dispatch_controlled(
                 } else if let Some(approval) = approval {
                     harness
                         .run_local_controlled_with_approval(
-                            command,
+                            prompt,
                             None,
                             turn_id,
                             cancellation,
@@ -2399,7 +2451,7 @@ async fn dispatch_controlled(
                         .await?
                 } else {
                     harness
-                        .run_local_controlled(command, None, turn_id, cancellation)
+                        .run_local_controlled(prompt, None, turn_id, cancellation)
                         .await?
                 },
             ));

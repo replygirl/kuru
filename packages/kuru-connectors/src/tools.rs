@@ -201,7 +201,9 @@ fn windows_shell_environment(
 
 use crate::{
     MAX_BYTES,
-    instruction_review::{InstructionGate, InstructionGateOutcome, InstructionReviewSender},
+    instruction_review::{
+        InstructionGate, InstructionGateOutcome, InstructionReviewSender, SkillGate,
+    },
     mcp::{McpExecution, McpHosts, McpStatus},
     permissions::{ApprovalSender, PermissionInvocation, PermissionOutcome, PermissionService},
     redaction,
@@ -217,6 +219,8 @@ pub struct ToolHost {
     root_guard: Arc<Directory>,
     permissions: Arc<PermissionService>,
     instruction_gate: Option<Arc<dyn InstructionGate>>,
+    skill_gate: Option<Arc<dyn SkillGate>>,
+    has_skills: bool,
     mcp: McpHosts,
     #[cfg(unix)]
     shells: ShellRegistry,
@@ -289,6 +293,8 @@ impl ToolHost {
             root_guard,
             permissions,
             instruction_gate: None,
+            skill_gate: None,
+            has_skills: false,
             #[cfg(unix)]
             shells: ShellRegistry::new(),
         })
@@ -296,6 +302,12 @@ impl ToolHost {
 
     pub fn with_instruction_gate(mut self, gate: Arc<dyn InstructionGate>) -> Self {
         self.instruction_gate = Some(gate);
+        self
+    }
+
+    pub fn with_skill_gate(mut self, gate: Arc<dyn SkillGate>, has_skills: bool) -> Self {
+        self.skill_gate = Some(gate);
+        self.has_skills = has_skills;
         self
     }
 
@@ -360,6 +372,16 @@ impl ToolHost {
 
     pub async fn catalog(&self) -> Result<ToolCatalog> {
         let mut specs = Vec::new();
+        if self.has_skills {
+            let mut skill = spec(
+                "skill_load",
+                "Select one catalog skill and optionally one direct Markdown reference. Selection reviews project prompt authority; it grants no tool permissions or script execution.",
+                &["name"],
+                &["name"],
+            );
+            skill.parameters["properties"]["reference"] = json!({"type":"string"});
+            specs.push(skill);
+        }
         if self
             .permissions
             .advertises(&PermissionSelector::native(NativeTool::FileRead))
@@ -519,6 +541,65 @@ impl ToolHost {
     ) -> ActorToolOutcome {
         let mut instructions = None;
         let mut replan_required = false;
+        if name == "skill_load" {
+            let result: std::result::Result<ToolExecution, ToolFailure> = async {
+                if !actor {
+                    return Err(ToolFailure::built_in(anyhow::anyhow!(
+                        "skill_load is actor-only"
+                    )));
+                }
+                if !args.is_object() {
+                    return Err(ToolFailure::built_in(anyhow::anyhow!(
+                        "skill arguments must be an object"
+                    )));
+                }
+                let selected = string(&args, "name").map_err(ToolFailure::built_in)?;
+                let reference = args
+                    .get("reference")
+                    .map(|value| value.as_str().context("reference must be a string"))
+                    .transpose()
+                    .map_err(ToolFailure::built_in)?;
+                let gate = self
+                    .skill_gate
+                    .as_ref()
+                    .context("skill catalog is unavailable")
+                    .map_err(ToolFailure::built_in)?;
+                match gate
+                    .review_skill(selected, reference, instruction_approval)
+                    .await
+                    .map_err(ToolFailure::built_in)?
+                {
+                    InstructionGateOutcome::Unchanged => {}
+                    InstructionGateOutcome::Proposed(proposal) => {
+                        self.root_guard
+                            .revalidate()
+                            .map_err(|error| ToolFailure::built_in(error.into()))?;
+                        instructions =
+                            Some(proposal.publish().await.map_err(ToolFailure::built_in)?);
+                    }
+                    InstructionGateOutcome::Denied => {
+                        return Err(ToolFailure::permission_denied(anyhow::anyhow!(
+                            "skill prompt authority was denied"
+                        )));
+                    }
+                    InstructionGateOutcome::Required(detail) => {
+                        return Err(ToolFailure::permission_required(anyhow::anyhow!(detail)));
+                    }
+                }
+                Ok(ToolExecution::ProjectedText(format!(
+                    "Skill {selected} is active; continue with its reviewed instructions."
+                )))
+            }
+            .await;
+            return ActorToolOutcome {
+                result: match result {
+                    Ok(execution) => project_execution(execution),
+                    Err(failure) => project_failure(failure),
+                },
+                instructions,
+                replan_required,
+            };
+        }
         // Search discovers many independent file targets. It has no request
         // root grant: every returned candidate is authorized with the same
         // foreground sender and exact target before its path or contents can

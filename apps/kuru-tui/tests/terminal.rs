@@ -635,6 +635,225 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
     resumed.assert_restored()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_custom_command_uses_reviewed_catalog_and_literal_arguments() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let custom = sandbox.project.join(".kuru/commands/review.md");
+    std::fs::create_dir_all(custom.parent().context("command parent")?)?;
+    std::fs::write(
+        &custom,
+        "---\nname: review\ndescription: Review this change\n---\nCUSTOM-PROMPT-SENTINEL\n",
+    )?;
+    let unapproved = sandbox
+        .command("demo")
+        .args(["run", "before review"])
+        .output()?;
+    ensure!(
+        !unapproved.status.success()
+            && String::from_utf8_lossy(&unapproved.stderr)
+                .contains("workspace authority is not approved"),
+        "unapproved project prompt command did not stop at trust preflight"
+    );
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route(
+            "/v1/responses",
+            post(move |Json(request): Json<Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().unwrap().push(request);
+                    priced_complete(Json(json!({}))).await
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("custom-command-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--trust-workspace-once", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 48, 120)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command("/help", None)?;
+    terminal.wait_composer_frame(
+        &["/review [arguments]", "Review this change"],
+        READY_TIMEOUT,
+    )?;
+    let before = requests.lock().unwrap().len();
+    std::fs::write(
+        &custom,
+        "---\nname: review\ndescription: Changed after startup\n---\nNEW-PROMPT-SENTINEL\n",
+    )?;
+    terminal.command("/not-registered", None)?;
+    terminal.wait_composer_frame(&["Unknown command", "enter send"], READY_TIMEOUT)?;
+    ensure!(
+        requests.lock().unwrap().len() == before,
+        "unknown command reached provider"
+    );
+    terminal.send(b"/rev\t")?;
+    terminal.wait_composer_frame(&["/review", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b" literal $HOME $(echo no-execution)\r")?;
+    terminal.wait_composer_frame(&["PRICED_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
+    let seen = requests.lock().unwrap();
+    ensure!(
+        seen[before..].iter().any(|request| {
+            let wire = request.to_string();
+            wire.contains("CUSTOM-PROMPT-SENTINEL")
+                && wire.contains("literal $HOME $(echo no-execution)")
+                && !wire.contains("NEW-PROMPT-SENTINEL")
+        }),
+        "custom prompt and literal arguments were absent from the provider request"
+    );
+    drop(seen);
+    let sessions = sandbox.sessions()?;
+    ensure!(
+        sessions.len() == 1 && sessions[0].turns == 1,
+        "{sessions:?}"
+    );
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
+#[derive(Clone)]
+struct SkillSelectionProvider {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+async fn skill_selection_complete(
+    State(state): State<SkillSelectionProvider>,
+    Json(request): Json<Value>,
+) -> Response {
+    let instructions = request["instructions"].as_str().unwrap_or_default();
+    let speaking = instructions.contains("Phase: speak and act");
+    let continued = request["input"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    });
+    if speaking {
+        state.seen.lock().unwrap().push(instructions.to_owned());
+    }
+    let output = if speaking && !continued {
+        json!([{"type":"function_call","call_id":"select-review", "name":"skill_load",
+            "arguments":json!({"name":"review"}).to_string()}])
+    } else {
+        let answer = if speaking && instructions.contains("SELECTED-SKILL-BODY") {
+            "SKILL_SELECTION_FINAL"
+        } else {
+            "SKILL_SELECTION_WAITING"
+        };
+        json!([{"type":"message","content":[{"type":"output_text","text":answer}]}])
+    };
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "data: {}\n\n",
+            json!({
+                "type":"response.completed",
+                "response":{"id":"skill-selection","status":"completed","output":output,
+                    "usage":{"input_tokens":8,"output_tokens":5}}
+            })
+        ),
+    )
+        .into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_skill_selection_reviews_body_before_provider_continuation() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let skill = sandbox.project.join(".agents/skills/review/SKILL.md");
+    std::fs::create_dir_all(skill.parent().context("skill parent")?)?;
+    std::fs::write(
+        &skill,
+        "---\nname: review\ndescription: Review code carefully\nallowed-tools: shell\n---\nSELECTED-SKILL-BODY\n",
+    )?;
+    let approval = sandbox
+        .command("demo")
+        .args(["trust", "approve", "--yes"])
+        .output()?;
+    ensure!(
+        approval.status.success(),
+        "base workspace approval failed: {}",
+        String::from_utf8_lossy(&approval.stderr)
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(skill_selection_complete))
+        .with_state(SkillSelectionProvider { seen: seen.clone() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("skill-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=3\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--mode", "freudian", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 35, 120)?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.send(b"Select the review skill\r")?;
+    terminal.wait_composer_frame(
+        &[
+            "Workspace instruction review",
+            "selected project skill material",
+        ],
+        READY_TIMEOUT,
+    )?;
+    ensure!(
+        seen.lock().unwrap().len() == 1,
+        "provider continued before skill review"
+    );
+    terminal.send(b"1")?;
+    terminal.wait_text(
+        &["SKILL_SELECTION_FINAL"],
+        &["Workspace instruction review"],
+    )?;
+    let requests = seen.lock().unwrap();
+    ensure!(
+        requests.len() >= 2,
+        "skill selection did not reach a new provider request"
+    );
+    ensure!(requests[0].contains("Review code carefully"));
+    ensure!(!requests[0].contains("SELECTED-SKILL-BODY"));
+    ensure!(requests[1].contains("SELECTED-SKILL-BODY"));
+    ensure!(!requests[1].contains("allowed-tools"));
+    drop(requests);
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
 /// T3's coherent surface: one completed frame carries model, effort, mode,
 /// cost, context use and permission state at once, and the cost and permission
 /// figures are the same ones `/cost` and `/permissions` print.
