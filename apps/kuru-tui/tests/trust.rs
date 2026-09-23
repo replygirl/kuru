@@ -1294,9 +1294,18 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
     assert_eq!(http.requests(), 0, "approved undo contacted the provider");
     assert!(!sandbox.data.join("trust").exists());
 
-    let memory = kuru_memory::test_support::open_fixture(options)
-        .await
-        .unwrap();
+    // The approved CLI command owns the intentionally warm managed service.
+    // This final phase only inspects its committed result; a direct writable
+    // reopen would compete with that owner instead of testing the CLI state.
+    let mut observed_options = options;
+    observed_options.read_only = true;
+    let project = sandbox.project.canonicalize().unwrap();
+    let (_, opening) = MemoryStore::open_managed_observed(
+        observed_options,
+        project,
+        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+    );
+    let memory = opening.await.unwrap();
     assert_ne!(memory.revision().await.unwrap(), before_revision);
     assert_eq!(
         memory.get(&format!("{scope}/sessions")).await.unwrap(),
