@@ -358,7 +358,7 @@ pub async fn attach_or_start(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let mut child = ServiceProcess::new(
-        spawn_service(options, project, executable)
+        spawn_service(options, project, executable, None)
             .await
             .context("spawn elected memory service owner")?,
     );
@@ -512,6 +512,7 @@ async fn spawn_service(
     options: &crate::store::OpenOptions,
     project: &Path,
     executable: &Path,
+    stderr: Option<File>,
 ) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let mut command = std::process::Command::new(executable);
@@ -519,7 +520,7 @@ async fn spawn_service(
     command.current_dir(project);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
-    command.stderr(std::process::Stdio::null());
+    command.stderr(stderr.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
     command.process_group(0);
     command.spawn().context("start project memory service")
 }
@@ -529,12 +530,14 @@ async fn spawn_service(
     options: &crate::store::OpenOptions,
     project: &Path,
     executable: &Path,
+    stderr: Option<File>,
 ) -> Result<kuru_platform::windows::process::NativeChild> {
-    use kuru_platform::windows::process::{Console, Lifetime, NativeSpawnSpec};
+    use kuru_platform::windows::process::{Console, Lifetime, NativeSpawnSpec, Stdio};
     let mut command = NativeSpawnSpec::new(executable.to_owned(), project.to_owned());
     command.args = service_arguments(options, project);
     command.lifetime = Lifetime::IndependentService;
     command.console = Console::PrivateHidden;
+    command.stderr = stderr.map_or(Stdio::Null, |file| Stdio::Handle(file.into()));
     let system = kuru_platform::windows::process::system_directory()?;
     let windows = system
         .parent()
@@ -1484,7 +1487,60 @@ pub fn is_peer_closed(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom, Write};
     use tokio::io::duplex;
+
+    const FIXTURE_DIAGNOSTIC_TAIL_BYTES: u64 = 4 * 1024;
+
+    #[derive(Default)]
+    struct FixtureAttachObservations {
+        missing_endpoint: usize,
+        published_transport_unavailable: usize,
+        pipe_connect_timeout: usize,
+    }
+
+    impl std::fmt::Display for FixtureAttachObservations {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "missing endpoint: {}; published transport unavailable: {}; private pipe connect timeout: {}",
+                self.missing_endpoint,
+                self.published_transport_unavailable,
+                self.pipe_connect_timeout
+            )
+        }
+    }
+
+    fn fixture_diagnostic_tail(file: &mut File) -> Result<String> {
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(
+            length.saturating_sub(FIXTURE_DIAGNOSTIC_TAIL_BYTES),
+        ))?;
+        let mut bytes = Vec::new();
+        file.take(FIXTURE_DIAGNOSTIC_TAIL_BYTES)
+            .read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            Ok("fixture service stderr remained empty".into())
+        } else {
+            Ok(format!(
+                "fixture service stderr tail: {}",
+                String::from_utf8_lossy(&bytes)
+            ))
+        }
+    }
+
+    fn fixture_readiness_error(
+        options: &crate::store::OpenOptions,
+        diagnostic: &mut File,
+        stage: &'static str,
+        outcome: String,
+        observations: &FixtureAttachObservations,
+    ) -> Result<anyhow::Error> {
+        let stderr = fixture_diagnostic_tail(diagnostic)?;
+        let error = anyhow::anyhow!(outcome)
+            .context(format!("readiness observations: {observations}; {stderr}"));
+        Ok(crate::test_support::fixture_startup_error(options, error).context(stage))
+    }
 
     /// A crash fixture retains the exact spawned child. Early test failure
     /// terminates that handle; ServiceProcess then installs its native reaper.
@@ -1525,11 +1581,24 @@ mod tests {
         scope: &str,
         project: &Path,
         stage: &'static str,
+        observations: &mut FixtureAttachObservations,
     ) -> Result<Option<ServiceAttachment>> {
+        let endpoint_published = EndpointRecord::read(data, scope)?.is_some();
         match try_attach(data, scope, project).await {
-            Ok(attached) => Ok(attached),
+            Ok(Some(attached)) => Ok(Some(attached)),
+            Ok(None) => {
+                if endpoint_published {
+                    observations.published_transport_unavailable += 1;
+                } else {
+                    observations.missing_endpoint += 1;
+                }
+                Ok(None)
+            }
             #[cfg(windows)]
-            Err(error) if is_private_pipe_connect_timeout(&error) => Ok(None),
+            Err(error) if is_private_pipe_connect_timeout(&error) => {
+                observations.pipe_connect_timeout += 1;
+                Ok(None)
+            }
             Err(error) => Err(error).with_context(|| format!("{stage} attachment failed")),
         }
     }
@@ -1543,6 +1612,38 @@ mod tests {
                 cause.kind() == io::ErrorKind::TimedOut
                     && cause.to_string() == "private pipe connect timed out"
             })
+    }
+
+    #[test]
+    fn crash_fixture_diagnostics_are_distinct_and_bounded() -> Result<()> {
+        let observations = FixtureAttachObservations {
+            missing_endpoint: 7,
+            published_transport_unavailable: 3,
+            pipe_connect_timeout: 2,
+        };
+        assert_eq!(
+            observations.to_string(),
+            "missing endpoint: 7; published transport unavailable: 3; private pipe connect timeout: 2"
+        );
+
+        let root = crate::test_support::tempdir()?;
+        let path = root.path().join("fixture.stderr");
+        let mut file = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.write_all(&vec![b'x'; FIXTURE_DIAGNOSTIC_TAIL_BYTES as usize + 1])?;
+        file.write_all(b"terminal fixture cause")?;
+        file.flush()?;
+        let tail = fixture_diagnostic_tail(&mut file)?;
+        assert!(tail.starts_with("fixture service stderr tail: "));
+        assert!(tail.ends_with("terminal fixture cause"));
+        assert_eq!(
+            tail.len(),
+            "fixture service stderr tail: ".len() + FIXTURE_DIAGNOSTIC_TAIL_BYTES as usize
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2730,25 +2831,58 @@ mod tests {
             options.config.offline = true;
             options.supervisor = Some(executable.clone());
             let _gate = crate::spawn_gate::spawning().await;
+            let diagnostic_path = root.path().join("crash-service.stderr");
+            let mut diagnostic = File::options()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&diagnostic_path)?;
             let mut process = KillServiceOnDrop(ServiceProcess::new(
-                spawn_service(&options, &project, &executable).await?,
+                spawn_service(
+                    &options,
+                    &project,
+                    &executable,
+                    Some(diagnostic.try_clone()?),
+                )
+                .await?,
             ));
-            let mut original = tokio::time::timeout(Duration::from_secs(20), async {
-                loop {
-                    if let Some(attached) =
-                        try_attach_fixture_stage(&data, &scope, &project, "initial owner readiness")
-                            .await?
-                    {
-                        break Ok::<_, anyhow::Error>(attached);
-                    }
-                    if let Some(status) = process.0.try_wait()? {
-                        bail!("fixture service exited before readiness: {status}");
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut observations = FixtureAttachObservations::default();
+            let mut original = loop {
+                if let Some(attached) = try_attach_fixture_stage(
+                    &data,
+                    &scope,
+                    &project,
+                    "initial owner readiness",
+                    &mut observations,
+                )
+                .await?
+                {
+                    break attached;
                 }
-            })
-            .await
-            .context("crash fixture service did not publish a usable endpoint")??;
+                if let Some(status) = process.0.try_wait()? {
+                    return Err(fixture_readiness_error(
+                        &options,
+                        &mut diagnostic,
+                        "crash fixture service did not publish a usable endpoint",
+                        format!("fixture service exited before readiness: {status}"),
+                        &observations,
+                    )?);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(fixture_readiness_error(
+                        &options,
+                        &mut diagnostic,
+                        "crash fixture service did not publish a usable endpoint",
+                        "memory supervisor readiness deadline exceeded".into(),
+                        &observations,
+                    )?);
+                }
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(20)),
+                )
+                .await;
+            };
             let generation = original.generation().to_owned();
             let request_id = uuid::Uuid::new_v4();
             let first = ServiceCall::AppendMessage {
@@ -2775,26 +2909,43 @@ mod tests {
             drop(stream); // the caller never reads the mutation reply
             drop(original);
 
-            let mut sibling = tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if let Some(attached) = try_attach_fixture_stage(
-                        &data,
-                        &scope,
-                        &project,
-                        "original-owner sibling readiness",
-                    )
-                    .await?
-                    {
-                        break Ok::<_, anyhow::Error>(attached);
-                    }
-                    if let Some(status) = process.0.try_wait()? {
-                        bail!("fixture service exited before sibling readiness: {status}");
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+            let sibling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut sibling_observations = FixtureAttachObservations::default();
+            let mut sibling = loop {
+                if let Some(attached) = try_attach_fixture_stage(
+                    &data,
+                    &scope,
+                    &project,
+                    "original-owner sibling readiness",
+                    &mut sibling_observations,
+                )
+                .await?
+                {
+                    break attached;
                 }
-            })
-            .await
-            .context("sibling did not attach to the original owner")??;
+                if let Some(status) = process.0.try_wait()? {
+                    return Err(fixture_readiness_error(
+                        &options,
+                        &mut diagnostic,
+                        "sibling did not attach to the original owner",
+                        format!("fixture service exited before sibling readiness: {status}"),
+                        &sibling_observations,
+                    )?);
+                }
+                if tokio::time::Instant::now() >= sibling_deadline {
+                    return Err(fixture_readiness_error(
+                        &options,
+                        &mut diagnostic,
+                        "sibling did not attach to the original owner",
+                        "memory supervisor readiness deadline exceeded".into(),
+                        &sibling_observations,
+                    )?);
+                }
+                tokio::time::sleep_until(
+                    sibling_deadline.min(tokio::time::Instant::now() + Duration::from_millis(20)),
+                )
+                .await;
+            };
             ensure!(sibling.generation() == generation);
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {

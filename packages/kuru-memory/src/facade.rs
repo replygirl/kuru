@@ -2905,10 +2905,35 @@ mod tests {
                 }
                 let candidate = memory
                     .recover_candidate_begin()
-                    .await?
-                    .context("exact candidate ref was not recovered")?;
-                candidate.view().put("private", &json!("retained")).await?;
-                ensure!(candidate.view().get("private").await? == Some(json!("retained")));
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "recover exact candidate ref (restart_owner={restart_owner})"
+                        )
+                    })?
+                    .with_context(|| {
+                        format!(
+                            "exact candidate ref was not recovered (restart_owner={restart_owner})"
+                        )
+                    })?;
+                candidate
+                    .view()
+                    .put("private", &json!("retained"))
+                    .await
+                    .with_context(|| {
+                        format!("write recovered candidate (restart_owner={restart_owner})")
+                    })?;
+                ensure!(
+                    candidate
+                        .view()
+                        .get("private")
+                        .await
+                        .with_context(|| {
+                            format!("read recovered candidate (restart_owner={restart_owner})")
+                        })?
+                        == Some(json!("retained")),
+                    "recovered candidate returned the wrong value (restart_owner={restart_owner})"
+                );
                 if restart_owner {
                     ensure!(
                         memory
@@ -2921,11 +2946,32 @@ mod tests {
                         "a retired-generation clone remained writable"
                     );
                 } else {
-                    memory.put("unblocked", &json!(true)).await?;
+                    memory
+                        .put("unblocked", &json!(true))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "write main after candidate recovery (restart_owner={restart_owner})"
+                            )
+                        })?;
                 }
-                candidate.abandon().await?;
-                candidate.view().close().await?;
-                memory.close().await?;
+                candidate
+                    .abandon()
+                    .await
+                    .with_context(|| {
+                        format!("abandon recovered candidate (restart_owner={restart_owner})")
+                    })?;
+                candidate
+                    .view()
+                    .close()
+                    .await
+                    .with_context(|| {
+                        format!("close recovered candidate view (restart_owner={restart_owner})")
+                    })?;
+                memory
+                    .close()
+                    .await
+                    .with_context(|| format!("close main view (restart_owner={restart_owner})"))?;
                 let permit = service::acquire_maintenance_permit(&options).await?;
                 tokio::time::timeout(Duration::from_secs(10), served)
                     .await

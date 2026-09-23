@@ -153,6 +153,7 @@ pub(crate) fn fixture_startup_error(options: &OpenOptions, error: Error) -> Erro
             )
             || message.starts_with("Dolt database bootstrap deadline exceeded while ")
             || message == "authenticated Dolt startup deadline exceeded"
+            || message.starts_with("fixture service exited before")
             || message == "memory supervisor readiness deadline exceeded"
     }) {
         return error;
@@ -299,6 +300,11 @@ mod fixture_diagnostic_tests {
         let readiness_captured = fixture_startup_error(&options, readiness_error());
         let readiness_rendered = format!("{readiness_captured:#}");
         assert!(readiness_rendered.contains("fixture-private-log"));
+        let exited = fixture_startup_error(
+            &options,
+            anyhow::anyhow!("fixture service exited before readiness: exit code: 1"),
+        );
+        assert!(format!("{exited:#}").contains("fixture-private-log"));
         assert!(readiness_rendered.contains(&log.display().to_string()));
         assert!(readiness_rendered.contains("memory supervisor readiness deadline exceeded"));
         let bootstrap_captured = fixture_startup_error(&options, bootstrap_error());
