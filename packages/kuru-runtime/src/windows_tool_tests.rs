@@ -249,16 +249,20 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         );
     }
     let receipts = &observed.receipts;
-    let create_checkpoint = receipts["create"]
-        .strip_prefix("file_write completed; checkpoint file-")
-        .context("native file-write receipt omitted its durable checkpoint")?;
-    ensure!(
-        create_checkpoint.len() == 64
-            && create_checkpoint
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit()),
-        "native file-write receipt contained an invalid checkpoint ID"
-    );
+    for (id, tool) in [
+        ("create", "file_write"),
+        ("delete", "file_delete"),
+        ("shell-delete", "file_delete"),
+    ] {
+        let prefix = format!("{tool} completed; checkpoint file-");
+        let checkpoint = receipts[id]
+            .strip_prefix(&prefix)
+            .with_context(|| format!("{id} receipt omitted its durable checkpoint"))?;
+        ensure!(
+            checkpoint.len() == 64 && checkpoint.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{id} receipt contained an invalid checkpoint ID"
+        );
+    }
     ensure!(
         receipts["read"] == literal,
         "file argument data was interpreted"
@@ -280,7 +284,7 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
                 "shell receipt was not JSON: {}; shell-read-has-written-bytes={}; shell-delete-succeeded={}",
                 receipts["shell"],
                 receipts["shell-read"] == "shell bytes",
-                receipts["shell-delete"] == "Deleted file"
+                receipts["shell-delete"].starts_with("file_delete completed; checkpoint file-")
             )
         })?;
     ensure!(
@@ -300,9 +304,6 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         receipts["shell-read"] == "shell bytes",
         "shell did not perform its authorized write"
     );
-    for id in ["delete", "shell-delete"] {
-        ensure!(receipts[id] == "Deleted file", "{id}: {}", receipts[id]);
-    }
     for id in [
         "traversal",
         "trailing",

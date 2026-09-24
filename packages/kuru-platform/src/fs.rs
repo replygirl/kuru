@@ -80,6 +80,7 @@ pub struct FileInfo {
 /// Opaque access-policy capture from one retained regular-file handle.
 pub struct FileAccessToken {
     bytes: Vec<u8>,
+    source_identity: FileIdentity,
     staged_identity: FileIdentity,
     replacement: Option<File>,
 }
@@ -88,7 +89,7 @@ pub struct FileAccessToken {
 /// Callers must keep the staged file behind a private directory until publish:
 /// this operation can intentionally grant ordinary project access.
 pub fn copy_file_access(source: &File, staged: &File) -> io::Result<FileAccessToken> {
-    checked_file(source)?;
+    let source_identity = checked_file(source)?.identity;
     let staged_identity = checked_file(staged)?.identity;
     let bytes = native::file_access_token(source)?;
     // Retain the exact private stage's replacement authority before copying an
@@ -97,6 +98,7 @@ pub fn copy_file_access(source: &File, staged: &File) -> io::Result<FileAccessTo
     native::copy_file_access(source, staged)?;
     let token = FileAccessToken {
         bytes,
+        source_identity,
         staged_identity,
         replacement,
     };
@@ -108,7 +110,11 @@ pub fn copy_file_access(source: &File, staged: &File) -> io::Result<FileAccessTo
 /// replaced source may have zero links after publication; any new alias is
 /// still refused. This does not lock out an external ACL writer.
 pub fn verify_file_access(source: &File, expected: &FileAccessToken) -> io::Result<()> {
-    if regular_file_info(source)?.links > 1 {
+    let info = regular_file_info(source)?;
+    if info.identity != expected.source_identity {
+        return Err(denied("access source identity changed during publication"));
+    }
+    if info.links > 1 {
         return Err(denied("access source gained another hardlink"));
     }
     if native::file_access_token(source)? != expected.bytes {
@@ -121,10 +127,23 @@ pub fn verify_file_access(source: &File, expected: &FileAccessToken) -> io::Resu
 /// handle. Windows POSIX replacement can retire that object with zero links;
 /// ordinary name-based admission and the pre-publication check remain strict.
 pub fn verify_retained_file_access(source: &File, expected: &FileAccessToken) -> io::Result<()> {
-    if retained_file_info(source)?.links > 1 {
+    let info = retained_file_info(source)?;
+    if info.identity != expected.source_identity {
+        return Err(denied("access source identity changed during publication"));
+    }
+    if info.links > 1 {
         return Err(denied("access source gained another hardlink"));
     }
-    if native::file_access_token(source)? != expected.bytes {
+    let current = native::file_access_token(source)?;
+    if current != expected.bytes {
+        // A Windows POSIX replacement can remove the last name of the exact
+        // retained source and clear inherited-ACE provenance. Only that one
+        // bit may differ, and only after the kernel reports delete-pending with
+        // zero links. Every live and pre-publication check remains byte-exact.
+        #[cfg(windows)]
+        if info.links == 0 && native::retired_access_matches(source, &expected.bytes, &current)? {
+            return Ok(());
+        }
         return Err(denied("file access policy changed during publication"));
     }
     Ok(())
