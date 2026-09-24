@@ -29,15 +29,12 @@ async fn initial_authentication_uses_remaining_startup_budget_and_reaps_on_expir
     // deadline permits this bounded authenticated probe and identity check.
     let success_dir = root.path().join("within-budget");
     let entered = Arc::new(AtomicBool::new(false));
-    let success = {
-        let _gate = crate::spawn_gate::spawning().await;
-        Server::open_with_initial_probe_delay(
-            options(success_dir, Duration::from_secs(30)),
-            Duration::from_millis(2300),
-            entered.clone(),
-        )
-        .await?
-    };
+    let success = Server::open_with_initial_probe_delay(
+        options(success_dir, Duration::from_secs(30)),
+        Duration::from_millis(2300),
+        entered.clone(),
+    )
+    .await?;
     success.close().await?;
     assert!(
         entered.load(Ordering::SeqCst),
@@ -46,16 +43,13 @@ async fn initial_authentication_uses_remaining_startup_budget_and_reaps_on_expir
 
     let expired_dir = root.path().join("past-deadline");
     let entered = Arc::new(AtomicBool::new(false));
-    let error = {
-        let _gate = crate::spawn_gate::spawning().await;
-        Server::open_with_initial_probe_delay(
-            options(expired_dir.clone(), Duration::from_secs(30)),
-            Duration::from_secs(40),
-            entered.clone(),
-        )
-        .await
-        .expect_err("an expired initial authentication cannot return a server")
-    };
+    let error = Server::open_with_initial_probe_delay(
+        options(expired_dir.clone(), Duration::from_secs(30)),
+        Duration::from_secs(40),
+        entered.clone(),
+    )
+    .await
+    .expect_err("an expired initial authentication cannot return a server");
     assert!(
         entered.load(Ordering::SeqCst),
         "initial callback was not entered"

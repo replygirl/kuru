@@ -323,7 +323,7 @@ impl Server {
         options: ServerOptions,
         reap_guard: Arc<StdMutex<Option<File>>>,
     ) -> Result<Self> {
-        Self::open_inner_with_probe_delay(options, reap_guard, None).await
+        Self::open_inner_with_probe_delay(options, reap_guard, None, None).await
     }
 
     #[cfg(test)]
@@ -332,10 +332,12 @@ impl Server {
         delay: Duration,
         entered: Arc<AtomicBool>,
     ) -> Result<Self> {
+        let spawn_guard = crate::spawn_gate::spawning().await;
         Self::open_inner_with_probe_delay(
             options,
             Arc::new(StdMutex::new(None)),
             Some((delay, entered)),
+            Some(spawn_guard),
         )
         .await
     }
@@ -344,6 +346,7 @@ impl Server {
         options: ServerOptions,
         reap_guard: Arc<StdMutex<Option<File>>>,
         _initial_probe_delay: Option<(Duration, Arc<AtomicBool>)>,
+        _test_spawn_guard: Option<tokio::sync::RwLockReadGuard<'static, ()>>,
     ) -> Result<Self> {
         ensure!(
             options.timeout >= Duration::from_millis(1)
@@ -354,14 +357,21 @@ impl Server {
             !options.project_scope.is_empty() && options.project_scope.len() <= 4096,
             "invalid memory project scope"
         );
-        prepare_directory(&options.directory, options.read_only)?;
-        let directory = fs::canonicalize(&options.directory)?;
-        LifecycleLease::validate_root(&directory, options.lifecycle_root.as_deref())?;
-        if let Some(identity) = load_identity(&directory, &options.project_scope)? {
+        prepare_directory(&options.directory, options.read_only)
+            .context("prepare private memory directory before startup")?;
+        let directory = fs::canonicalize(&options.directory)
+            .context("resolve private memory directory before startup")?;
+        LifecycleLease::validate_root(&directory, options.lifecycle_root.as_deref())
+            .context("validate memory lifecycle directory before startup")?;
+        if let Some(identity) = load_identity(&directory, &options.project_scope)
+            .context("read memory identity before supervisor startup")?
+        {
             // Validate a published endpoint even for a writer, but only readers
             // may borrow another parent's lifetime. A writer must wait for the
             // stable lease and retain its own supervisor before exposing pools.
-            if let Some(endpoint) = live_endpoint(&directory, &identity, options.read_only).await?
+            if let Some(endpoint) = live_endpoint(&directory, &identity, options.read_only)
+                .await
+                .context("inspect existing memory endpoint before startup")?
                 && options.read_only
             {
                 return Ok(Self::new(
@@ -410,6 +420,9 @@ impl Server {
             let child = command
                 .spawn()
                 .context("start memory lifetime supervisor")?;
+            // The test gate guards this process's child creation, not the
+            // supervisor's later startup or the delayed authentication probe.
+            drop(_test_spawn_guard);
             let mut owner = Owner {
                 child: Some(child),
                 lifetime: None,
@@ -433,8 +446,12 @@ impl Server {
             owner.lifetime = Some(pipe::Sender::from_owned_fd(OwnedFd::from(lifetime))?);
             let mut output = pipe::Receiver::from_owned_fd(OwnedFd::from(output))?;
             let response = timeout_at(startup_deadline, async {
-                write_frame(owner.lifetime.as_mut().expect("owned lifetime"), &request).await?;
-                read_frame::<_, Response>(&mut output).await
+                write_frame(owner.lifetime.as_mut().expect("owned lifetime"), &request)
+                    .await
+                    .context("send memory supervisor startup request")?;
+                read_frame::<_, Response>(&mut output)
+                    .await
+                    .context("read memory supervisor readiness response")
             })
             .await
             .context("memory supervisor readiness deadline exceeded")
@@ -469,6 +486,7 @@ impl Server {
                 .spawn()
                 .await
                 .context("start memory lifetime supervisor")?;
+            drop(_test_spawn_guard);
             let accept = listener.accept(&child, Duration::from_secs(5));
             let mut owner = Owner {
                 child: Some(child),
@@ -479,10 +497,18 @@ impl Server {
                 reaped_observer: None,
             };
             let response = timeout_at(startup_deadline, async {
-                owner.lifetime = Some(accept.await?);
+                owner.lifetime = Some(
+                    accept
+                        .await
+                        .context("accept memory supervisor private channel")?,
+                );
                 let channel = owner.lifetime.as_mut().expect("owned lifetime");
-                write_frame(channel, &request).await?;
-                read_frame::<_, Response>(channel).await
+                write_frame(channel, &request)
+                    .await
+                    .context("send memory supervisor startup request")?;
+                read_frame::<_, Response>(channel)
+                    .await
+                    .context("read memory supervisor readiness response")
             })
             .await
             .context("memory supervisor readiness deadline exceeded")
@@ -515,7 +541,8 @@ impl Server {
             }
         };
         let verified = async {
-            let identity = load_identity(&directory, &options.project_scope)?
+            let identity = load_identity(&directory, &options.project_scope)
+                .context("read memory identity after supervisor readiness")?
                 .context("memory identity missing after startup")?;
             let remaining = startup_deadline.saturating_duration_since(Instant::now());
             ensure!(
