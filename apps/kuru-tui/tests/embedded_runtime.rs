@@ -127,12 +127,12 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut strip = Command::new("strip");
     #[cfg(all(unix, not(target_os = "macos")))]
-    strip.arg("--strip-debug").arg(&staged);
+    strip.arg("--strip-all").arg(&staged);
     #[cfg(unix)]
     {
         let output = kuru_delivery::command::output(&mut strip, PREPARE_INPUT_TIMEOUT)
             .await
-            .context("remove debug symbols from the private coverage copy")?;
+            .context("remove symbols from the private coverage copy")?;
         ensure!(
             output.status.success(),
             "debug-symbol removal failed: {}",
@@ -157,12 +157,16 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
             && staged_info.links == 1
             && staged_info.len > 0
             && staged_info.len <= archive::MAX_ARCHIVE_BYTES as u64,
-        "prepared instrumented packaging input is not a bounded independent file"
+        "prepared instrumented packaging input is not a bounded independent file: distinct_identity={}, links={}, bytes={}, maximum_bytes={}",
+        staged_info.identity != before.identity,
+        staged_info.links,
+        staged_info.len,
+        archive::MAX_ARCHIVE_BYTES,
     );
     #[cfg(unix)]
     ensure!(
         staged_info.len < before.len,
-        "debug-symbol removal did not reduce the instrumented packaging input"
+        "symbol removal did not reduce the instrumented packaging input"
     );
 
     let destination = std::env::var_os("LLVM_PROFILE_FILE")
