@@ -72,6 +72,10 @@ pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
     })
 }
 
+pub(super) fn retained_info(file: &File) -> io::Result<ObjectInfo> {
+    info(file)
+}
+
 pub(super) fn require_private(file: &File) -> io::Result<()> {
     let metadata = file.metadata()?;
     if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {

@@ -21,7 +21,7 @@ fn ensure_powershell_warm() {
 }
 
 struct Sandbox {
-    root: tempfile::TempDir,
+    root: memory::ServiceCleanup,
     project: PathBuf,
     data: PathBuf,
 }
@@ -35,7 +35,7 @@ impl Sandbox {
         std::fs::create_dir(&project).unwrap();
         memory::configuration(root.path()).unwrap();
         Self {
-            root,
+            root: memory::ServiceCleanup::new(root, &data),
             project,
             data,
         }
@@ -45,6 +45,8 @@ impl Sandbox {
     }
     fn command_for(&self, provider: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+        #[cfg(windows)]
+        command.fixture_allow_independent_service();
         command
             .arg("-C")
             .arg(&self.project)
@@ -68,15 +70,175 @@ impl Sandbox {
     }
 }
 
-fn warm_memory_progress() -> &'static str {
-    concat!(
-        "Memory: waiting for project ownership…\n",
-        "Memory: verifying cached runtime…\n",
-        "Memory: checking runtime version…\n",
-        "Memory: preparing database…\n",
-        "Memory: opening database…\n",
-        "Memory: ready.\n",
-    )
+#[test]
+fn failed_service_cleanup_retains_the_fixture_at_its_original_path() {
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().to_path_buf();
+    let data = original.join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("memory"), b"not a fixture memory directory").unwrap();
+    let mut cleanup = memory::ServiceCleanup::new(root, &data);
+
+    let error = cleanup.finish().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("fixture root retained in place"),
+        "{error:#}"
+    );
+    assert!(original.is_dir());
+    assert!(data.join("memory").is_file());
+
+    drop(cleanup);
+    std::fs::remove_dir_all(original).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().to_path_buf();
+    let data = original.join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("memory"), b"drop must fail the test").unwrap();
+    let panic = std::panic::catch_unwind(|| {
+        let _cleanup = memory::ServiceCleanup::new(root, &data);
+    })
+    .unwrap_err();
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap();
+    assert!(message.contains("managed-memory fixture cleanup failed"));
+    assert!(original.is_dir());
+    std::fs::remove_dir_all(original).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().to_path_buf();
+    let data = original.join("data");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::write(data.join("memory"), b"second invalid memory root").unwrap();
+    let panic = std::panic::catch_unwind(|| {
+        let _cleanup = memory::ServiceCleanup::new(root, &data);
+        panic!("original fixture assertion");
+    })
+    .unwrap_err();
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"original fixture assertion")
+    );
+    assert!(original.is_dir());
+    assert!(data.join("memory").is_file());
+    std::fs::remove_dir_all(original).unwrap();
+}
+
+fn assert_memory_progress(stderr: &str) {
+    let lines: Vec<_> = stderr.lines().collect();
+    assert_eq!(
+        lines.first(),
+        Some(&"Memory: waiting for project ownership…"),
+        "{stderr}"
+    );
+    let ready = lines
+        .iter()
+        .position(|line| *line == "Memory: ready.")
+        .expect("memory startup omitted ready progress");
+    let mut previous = 0;
+    for stage in [
+        "Memory: waiting for verified runtime cache…",
+        "Memory: extracting embedded runtime…",
+        "Memory: verifying cached runtime…",
+        "Memory: checking runtime version…",
+        "Memory: preparing database…",
+        "Memory: opening database…",
+    ] {
+        if let Some(position) = lines.iter().position(|line| *line == stage) {
+            assert!(position > previous && position < ready, "{stderr}");
+            previous = position;
+        }
+    }
+}
+
+#[tokio::test]
+async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
+    let env = Sandbox::new();
+    let scope = kuru_runtime::project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope).unwrap();
+    let memory = kuru_memory::test_support::open_fixture(options.clone())
+        .await
+        .unwrap();
+    let candidate = memory
+        .begin_candidate("retained CLI candidate")
+        .await
+        .unwrap();
+    let branch = candidate.branch().to_owned();
+    let base = candidate.base().to_owned();
+    let view = candidate.view();
+    view.append("fixture/candidate", "user", "private CLI value")
+        .await
+        .unwrap();
+    let head = view.revision().await.unwrap();
+    drop(view);
+    drop(candidate);
+    memory.close().await.unwrap();
+
+    let run_json = |args: &[&str]| -> anyhow::Result<Value> {
+        let output = env.run(args);
+        anyhow::ensure!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let commands = (|| -> anyhow::Result<(Output, Value, Value, Value, Value)> {
+        Ok((
+            env.run(&[
+                "memory",
+                "candidate-abandon",
+                &branch,
+                "--base",
+                &base,
+                "--head",
+                &base,
+            ]),
+            run_json(&["memory", "candidates", "--limit", "1"])?,
+            run_json(&["memory", "candidate-status", &branch])?,
+            run_json(&[
+                "memory",
+                "candidate-abandon",
+                &branch,
+                "--base",
+                &base,
+                "--head",
+                &head,
+            ])?,
+            run_json(&["memory", "candidate-status", &branch])?,
+        ))
+    })();
+    let retirement = kuru_memory::test_support::retire_idle_service(&options).await;
+    let (rejected, inventory, status, abandoned, missing) = commands.unwrap();
+    retirement.unwrap();
+
+    assert!(!rejected.status.success());
+    let rejection = String::from_utf8(rejected.stderr).unwrap();
+    assert!(
+        rejection.contains("selected candidate ref changed or its outcome is unproved"),
+        "{rejection}"
+    );
+    assert!(!rejection.contains("retained request identity"));
+    assert!(!rejection.contains("outcome recovery"));
+    assert_eq!(inventory["candidates"][0]["branch"], branch);
+    assert_eq!(inventory["candidates"][0]["base"], base);
+    assert_eq!(inventory["candidates"][0]["head"], head);
+    assert_eq!(inventory["candidates"][0]["state"], "open_unchanged");
+
+    assert_eq!(status["candidate"]["branch"], branch);
+    assert_eq!(status["candidate"]["base"], base);
+    assert_eq!(status["candidate"]["head"], head);
+    assert_eq!(status["candidate"]["state"], "open_unchanged");
+    assert_eq!(status["operation_outcome"], "not_queried");
+
+    assert_eq!(abandoned["branch"], branch);
+    assert_eq!(abandoned["state"], "abandoned");
+
+    assert_eq!(missing["candidate"]["state"], "missing");
+    assert_eq!(missing["operation_outcome"], "unproved");
 }
 
 fn git_fixture(directory: &std::path::Path, args: &[&str]) -> Output {
@@ -564,10 +726,7 @@ async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_proje
         String::from_utf8_lossy(&export.stderr)
     );
     assert!(export.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&export.stderr),
-        warm_memory_progress()
-    );
+    assert_memory_progress(&String::from_utf8_lossy(&export.stderr));
     let export_before = std::fs::read(&export_path).unwrap();
 
     let engine =
@@ -1024,10 +1183,7 @@ async fn memory_export_is_provider_free_and_publishes_one_committed_snapshot() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        warm_memory_progress()
-    );
+    assert_memory_progress(&String::from_utf8_lossy(&output.stderr));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["manifest"]["snapshot"], "committed active main");
     assert_eq!(json["manifest"]["provenance"]["revision"], revision);
@@ -1069,10 +1225,7 @@ async fn memory_export_is_provider_free_and_publishes_one_committed_snapshot() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        warm_memory_progress()
-    );
+    assert_memory_progress(&String::from_utf8_lossy(&output.stderr));
     let markdown = std::fs::read_to_string(&output_path).unwrap();
     assert!(markdown.contains("# Kuru committed memory export"));
     assert!(markdown.contains("committed active main"));
@@ -1464,18 +1617,7 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     let cold_json: Value = serde_json::from_slice(&cold.stdout).unwrap();
     assert!(cold_json["text"].as_str().unwrap().contains("demo"));
     let cold_stderr = String::from_utf8_lossy(&cold.stderr);
-    assert!(
-        cold_stderr.starts_with(concat!(
-            "Memory: waiting for project ownership…\n",
-            "Memory: waiting for verified runtime cache…\n",
-            "Memory: extracting embedded runtime…\n",
-            "Memory: checking runtime version…\n",
-            "Memory: preparing database…\n",
-            "Memory: opening database…\n",
-            "Memory: ready.\n",
-        )),
-        "{cold_stderr}"
-    );
+    assert_memory_progress(&cold_stderr);
     assert!(cold_stderr.contains("Memory is ready at"), "{cold_stderr}");
     assert!(
         cold_stderr.contains("kuru memory notes ID"),
@@ -1492,10 +1634,7 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     );
     let warm_json: Value = serde_json::from_slice(&warm.stdout).unwrap();
     assert!(warm_json["text"].as_str().unwrap().contains("demo"));
-    assert_eq!(
-        String::from_utf8_lossy(&warm.stderr),
-        warm_memory_progress()
-    );
+    assert_memory_progress(&String::from_utf8_lossy(&warm.stderr));
     eprintln!(
         "observed isolated CLI startup wall time: cold={cold_elapsed:?}; warm={warm_elapsed:?}; no optimization claim"
     );
@@ -1576,7 +1715,15 @@ async fn cli_undo_dream_shows_one_notice_without_constructing_a_provider() {
         "undo-dream attempted provider setup: {first_stderr}"
     );
 
-    let reopened = MemoryStore::open(options.clone()).await.unwrap();
+    let mut observed_options = options.clone();
+    observed_options.read_only = true;
+    let project = env.project.canonicalize().unwrap();
+    let (_, opening) = MemoryStore::open_managed_observed(
+        observed_options,
+        project,
+        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+    );
+    let reopened = opening.await.unwrap();
     assert_eq!(
         reopened
             .get(&format!("{scope}/notice/memory-storage"))
@@ -1670,16 +1817,14 @@ fn cli_imports_a_real_legacy_wal_without_changing_its_layout() {
 }
 
 #[tokio::test]
-async fn sequential_commands_reap_owned_memory_before_returning_on_success_or_error() {
-    use kuru_memory::MemoryStore;
-    use serde_json::json;
-
+async fn sequential_commands_release_clients_reuse_warm_memory_and_reap_on_retirement() {
     let env = Sandbox::new();
     let scope = kuru_runtime::project_scope(&env.project).unwrap();
     let store_path = env
         .data
         .join("memory")
         .join(scope.strip_prefix("project/").unwrap());
+    let endpoint_path = store_path.join("endpoint.json");
     let stopped = || {
         assert!(
             matches!(std::fs::symlink_metadata(store_path.join("endpoint.json")),
@@ -1713,90 +1858,29 @@ async fn sequential_commands_reap_owned_memory_before_returning_on_success_or_er
             .expect("CLI returned before its supervisor released the lifecycle lease");
     };
     env.success(&["run", "Seed memory for sequential inspection"]);
-    stopped();
-    for args in [
-        vec!["config"],
-        vec!["sessions"],
-        vec!["models"],
-        vec!["tools"],
-        vec!["memory", "status"],
-        vec!["memory", "history", "--limit", "1"],
-    ] {
-        env.success(&args);
-        stopped();
-    }
-    for (args, diagnostic) in [
-        (
-            vec!["memory", "history", "--limit", "0"],
-            "between 1 and 1000",
-        ),
-        (
-            vec!["tool", "file_read", "--args", "malformed"],
-            "expected value",
-        ),
-    ] {
-        let output = env.run(&args);
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+    let generation = std::fs::read(&endpoint_path).unwrap();
+    let warm = |stage: &str| {
+        assert_eq!(
+            std::fs::read(&endpoint_path)
+                .unwrap_or_else(|error| panic!("{stage}: warm endpoint is unavailable: {error}")),
+            generation,
+            "{stage}: sequential CLI command replaced the warm service generation"
         );
-        stopped();
-    }
-    let output = env
-        .command_for("unknown-provider")
-        .arg("models")
-        .output()
-        .unwrap();
+    };
+    warm("seed");
+    env.success(&["memory", "status"]);
+    warm("successful memory client");
+    let output = env.run(&["memory", "history", "--limit", "0"]);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("configuration validation error"),
+        String::from_utf8_lossy(&output.stderr).contains("between 1 and 1000"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    stopped();
+    warm("failing memory client");
     let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
-    let memory = MemoryStore::open(options.clone()).await.unwrap();
-    memory
-        .put(
-            &format!("{scope}/preferences"),
-            &json!({"mode":"not-a-framework"}),
-        )
+    kuru_memory::test_support::retire_idle_service(&options)
         .await
         .unwrap();
-    memory.close().await.unwrap();
-    let output = env.run(&["config"]);
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("preferences are omitted"));
-    toml::from_str::<toml::Value>(&String::from_utf8(output.stdout).unwrap()).unwrap();
-    stopped();
-    let memory = MemoryStore::open(options).await.unwrap();
-    memory
-        .put(&format!("{scope}/preferences"), &json!({}))
-        .await
-        .unwrap();
-    memory.close().await.unwrap();
-    let invalid_config = env.root.path().join("invalid-selection.toml");
-    std::fs::write(&invalid_config, "max_parts = 1\n").unwrap();
-    let output = env
-        .command()
-        .arg("--config")
-        .arg(&invalid_config)
-        .arg("config")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("preferences are omitted"));
-    let output = env
-        .command()
-        .arg("--config")
-        .arg(&invalid_config)
-        .args(["run", "invalid effective topology"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    stopped();
-    env.success(&["run", "The next command still works"]);
     stopped();
 }

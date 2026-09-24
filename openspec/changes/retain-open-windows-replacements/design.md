@@ -22,15 +22,25 @@ domain receipt policy.
 ## Decisions
 
 While the staged file still has its private creation DACL, derive a narrow
-`DELETE`-only handle from that exact object with the same read/write/delete
+`DELETE | SYNCHRONIZE` handle from that exact object with the same read/write/delete
 shares. Retain it inside the existing opaque copied-access token, bind that token
 to the staged file's native identity, and keep it across the ordinary target-DACL
 copy. This avoids requiring DELETE from either the ordinary source handle or its
 possibly restrictive DACL; the destination parent may be the authority that
-permits replacement. For `ReplaceRegular`, call
-`SetFileInformationByHandle(FileRenameInfoEx)` with
+permits replacement. Reopen the checked destination directory with the narrow
+`FILE_ADD_FILE | SYNCHRONIZE | FILE_READ_ATTRIBUTES` rights, then compare its
+full native identity with the retained parent before any rename. For
+`ReplaceRegular`, call `NtSetInformationFile(FileRenameInformationEx)` with
 `FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS`, naming
 the checked destination relative to the retained destination-parent handle.
+Use the documented full variable-length rename record and retain the source,
+parent, record and `IO_STATUS_BLOCK` through the synchronous call. The source
+is reopened without `FILE_FLAG_OVERLAPPED`; if the native call unexpectedly
+returns pending, wait on its `SYNCHRONIZE`-capable handle until the final status
+is known before allowing a caller to reconcile or mutate again. An isolated
+native Windows differential showed the equivalent Win32 extended calls returned
+error 87 while this native relative-parent call published with the expected
+bytes and identities. No pathname replacement fallback is used.
 Windows specifies that POSIX replacement leaves existing handles to the replaced
 file usable while subsequent opens of its old name resolve to the renamed file.
 This preserves both the caller's original-object evidence and one atomic
@@ -44,7 +54,7 @@ remains absent. Microsoft documents `MOVEFILE_WRITE_THROUGH`'s additional flush
 guarantee for copy/delete moves, which Kuru forbids, so replacing the same-volume
 replacement call does not claim a broader crash-durability guarantee.
 
-Failure to encode the record, derive the early DELETE-only staged handle or
+Failure to encode the record, derive the early DELETE-capable staged handle or
 match its bound staged identity is a definite pre-dispatch rejection. Every error returned by the dispatched native
 replacement remains `PublicationPhase::Uncertain`: the API may have changed the
 namespace before returning failure, and only retained identity plus the caller's
@@ -70,7 +80,7 @@ evidence.
 
 ## Integration contract
 
-The only external boundary is the supported Win32 file-information API. The
+The only external boundary is the Windows native file-information API. The
 source handle is reopened from an exact retained object, the target name is
 resolved relative to an exact retained parent, and the old target handle is not
 used as mutable authority. No schema, SDK, wire format or user-facing interface

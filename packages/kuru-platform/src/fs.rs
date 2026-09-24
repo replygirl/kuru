@@ -117,6 +117,19 @@ pub fn verify_file_access(source: &File, expected: &FileAccessToken) -> io::Resu
     Ok(())
 }
 
+/// Verify the same source policy after publication using only its already-held
+/// handle. Windows POSIX replacement can retire that object with zero links;
+/// ordinary name-based admission and the pre-publication check remain strict.
+pub fn verify_retained_file_access(source: &File, expected: &FileAccessToken) -> io::Result<()> {
+    if retained_file_info(source)?.links > 1 {
+        return Err(denied("access source gained another hardlink"));
+    }
+    if native::file_access_token(source)? != expected.bytes {
+        return Err(denied("file access policy changed during publication"));
+    }
+    Ok(())
+}
+
 /// After a checked move into the destination parent, restore the source's
 /// inheritance behavior through the still-retained published file handle.
 /// A caller must not settle its effect as applied until this succeeds.
@@ -124,7 +137,7 @@ pub fn finalize_file_access(source: &File, published: &File) -> io::Result<()> {
     // A replaced source can have zero links after the checked publication,
     // while its retained handle still carries the access policy we copied.
     // It was checked before publication; reject any newly linked alias.
-    if regular_file_info(source)?.links > 1 {
+    if retained_file_info(source)?.links > 1 {
         return Err(denied("access source gained another hardlink"));
     }
     checked_file(published)?;
@@ -267,6 +280,10 @@ fn denied(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
+fn not_found(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, message)
+}
+
 /// Child operations take one literal native component, preserving Unix names.
 pub fn validate_component(name: &OsStr) -> io::Result<()> {
     let mut parts = Path::new(name).components();
@@ -319,6 +336,19 @@ pub fn regular_file_info(file: &File) -> io::Result<FileInfo> {
     Ok(info.file)
 }
 
+/// Inspect an already-retained file handle after a checked publication.
+///
+/// Windows may mark the displaced object delete-pending while its handle still
+/// supplies its exact identity and access policy. This metadata-only query is
+/// not an admission check for a new source, destination, or writable file.
+pub fn retained_file_info(file: &File) -> io::Result<FileInfo> {
+    let info = native::retained_info(file)?;
+    if info.directory {
+        return Err(denied("expected a regular disk file"));
+    }
+    Ok(info.file)
+}
+
 pub fn require_private(file: &File) -> io::Result<()> {
     native::require_private(file)
 }
@@ -338,7 +368,10 @@ pub fn make_executable(file: &File) -> io::Result<()> {
 
 fn checked_file(file: &File) -> io::Result<FileInfo> {
     let info = regular_file_info(file)?;
-    if info.links != 1 {
+    if info.links == 0 {
+        return Err(not_found("regular file was unlinked"));
+    }
+    if info.links > 1 {
         return Err(denied("regular file must have exactly one hardlink"));
     }
     Ok(info)

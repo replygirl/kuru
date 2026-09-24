@@ -23,6 +23,9 @@ use kuru_memory::MemoryStore;
 use kuru_runtime::{DreamProposal, Harness, Topology};
 use serde_json::{Value, json};
 
+#[path = "support/memory.rs"]
+mod memory;
+
 #[cfg(unix)]
 #[allow(dead_code)]
 #[path = "support/terminal.rs"]
@@ -44,7 +47,7 @@ fn ensure_powershell_warm() {
 }
 
 struct Sandbox {
-    root: tempfile::TempDir,
+    root: memory::ServiceCleanup,
     project: PathBuf,
     data: PathBuf,
 }
@@ -61,7 +64,7 @@ impl Sandbox {
         std::fs::create_dir(root.path().join("config")).unwrap();
         std::fs::write(project.join(".kuru/config.toml"), config).unwrap();
         Self {
-            root,
+            root: memory::ServiceCleanup::new(root, &data),
             project,
             data,
         }
@@ -73,6 +76,8 @@ impl Sandbox {
 
     fn command_at(&self, project: &std::path::Path) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+        #[cfg(windows)]
+        command.fixture_allow_independent_service();
         command
             .arg("-C")
             .arg(project)
@@ -1291,7 +1296,18 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
     assert_eq!(http.requests(), 0, "approved undo contacted the provider");
     assert!(!sandbox.data.join("trust").exists());
 
-    let memory = MemoryStore::open(options).await.unwrap();
+    // The approved CLI command owns the intentionally warm managed service.
+    // This final phase only inspects its committed result; a direct writable
+    // reopen would compete with that owner instead of testing the CLI state.
+    let mut observed_options = options;
+    observed_options.read_only = true;
+    let project = sandbox.project.canonicalize().unwrap();
+    let (_, opening) = MemoryStore::open_managed_observed(
+        observed_options,
+        project,
+        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+    );
+    let memory = opening.await.unwrap();
     assert_ne!(memory.revision().await.unwrap(), before_revision);
     assert_eq!(
         memory.get(&format!("{scope}/sessions")).await.unwrap(),

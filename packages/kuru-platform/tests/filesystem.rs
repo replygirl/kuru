@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use kuru_platform::fs::retained_file_info;
 use kuru_platform::fs::{
     Directory, NameRetention, Privacy, Publication, PublicationPhase, make_executable,
     regular_file_info, require_private, seal_private,
@@ -6,6 +8,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::Path;
+#[cfg(any(windows, all(unix, feature = "test-support")))]
 use std::time::Duration;
 
 fn fixture() -> (tempfile::TempDir, Directory) {
@@ -272,14 +275,43 @@ fn aliases_are_detected_by_handle_identity_and_rejected_by_checked_reads() {
         regular_file_info(&alias).unwrap().identity
     );
     assert_eq!(regular_file_info(&original).unwrap().links, 2);
-    assert!(directory.read(OsStr::new("alias")).is_err());
-    assert!(directory.read_write(OsStr::new("alias")).is_err());
-    assert!(directory.lock_file(OsStr::new("alias")).is_err());
-    assert!(seal_private(&original, false).is_err());
+    assert_eq!(
+        directory.read(OsStr::new("alias")).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        directory
+            .read_write(OsStr::new("alias"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        directory.lock_file(OsStr::new("alias")).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        seal_private(&original, false).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
     assert_eq!(
         fs::read(directory.path().join("original")).unwrap(),
         b"do not truncate"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unlinked_retained_file_is_rejected_as_vanished() {
+    let (_temporary, directory) = fixture();
+    let name = OsStr::new("vanished");
+    let retained = directory.create_new(name).unwrap();
+    fs::remove_file(directory.path().join(name)).unwrap();
+    assert_eq!(regular_file_info(&retained).unwrap().links, 0);
+
+    let error = directory.verify(name, &retained).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(error.to_string(), "regular file was unlinked");
 }
 
 #[test]
@@ -358,7 +390,7 @@ fn checked_publication_preserves_occupied_targets_then_replaces_atomically() {
                 Publication::ReplaceRegular,
             )
             .unwrap();
-        assert_eq!(regular_file_info(&old).unwrap().identity, old_identity);
+        assert_eq!(retained_file_info(&old).unwrap().identity, old_identity);
         old.rewind().unwrap();
         assert_eq!(contents(old), b"old bytes");
     }

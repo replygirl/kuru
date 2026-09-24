@@ -728,6 +728,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs::File;
     use std::io::{Read, Seek, Write};
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsHandle, BorrowedHandle};
     use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
 
@@ -1153,8 +1154,11 @@ mod tests {
 
     #[test]
     fn replacement_retains_private_delete_authority_across_restrictive_target_dacl() {
-        use crate::fs::{Publication, copy_file_access, finalize_file_access, regular_file_info};
-        use windows_sys::Win32::Storage::FileSystem::DELETE;
+        use crate::fs::{
+            Publication, copy_file_access, finalize_file_access, regular_file_info,
+            retained_file_info,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, READ_CONTROL, WRITE_DAC};
 
         let temporary = tempfile::tempdir().unwrap();
         let project = temporary.path().join("project");
@@ -1178,6 +1182,42 @@ mod tests {
         let candidate_identity = regular_file_info(&candidate).unwrap().identity;
         let access = copy_file_access(&original, &candidate).unwrap();
         assert_eq!(security_text(&candidate), original_acl);
+        // The private stage parent initially grants DELETE_CHILD, which can
+        // independently authorize a later DELETE open despite the file DACL.
+        // Remove only that alternative authority in this negative fixture;
+        // the retained pre-copy DELETE handle must still publish the candidate.
+        let stage_dacl = descriptor(&format!("O:{sid}D:P(A;;FRFW;;;{sid})"));
+        let stage_dacl_file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(stage.path())
+            .unwrap();
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let mut stage_id = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+        // SAFETY: FileIdInfo writes the entire correctly sized output record
+        // while the directory handle remains live.
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    stage_dacl_file.as_raw_handle(),
+                    FileIdInfo,
+                    stage_id.as_mut_ptr().cast(),
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                )
+            },
+            0,
+            "fixture could not identify its retained stage directory"
+        );
+        // SAFETY: the successful native call initialized the complete record.
+        let stage_id = unsafe { stage_id.assume_init() };
+        let mut stage_identity = [0u8; 24];
+        stage_identity[..8].copy_from_slice(&stage_id.VolumeSerialNumber.to_le_bytes());
+        stage_identity[8..].copy_from_slice(&stage_id.FileId.Identifier);
+        assert_eq!(stage_identity, stage.identity().to_bytes());
+        set_dacl_on_handle(stage_dacl_file.as_handle(), stage_dacl.dacl().unwrap());
         // A late handle-only DELETE reopen cannot rely on the parent's
         // DELETE_CHILD grant and must fail after the restrictive DACL copy.
         // SAFETY: candidate is a live retained file handle and no successful
@@ -1211,7 +1251,7 @@ mod tests {
         finalize_file_access(&original, &candidate).unwrap();
 
         assert_eq!(
-            regular_file_info(&original).unwrap().identity,
+            retained_file_info(&original).unwrap().identity,
             original_identity
         );
         original.rewind().unwrap();
@@ -1296,7 +1336,7 @@ mod tests {
 
     #[test]
     fn ordinary_create_and_unprotected_replacement_regain_parent_acl_inheritance() {
-        use crate::fs::{Publication, copy_file_access, finalize_file_access};
+        use crate::fs::{Publication, copy_file_access, finalize_file_access, retained_file_info};
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC,
@@ -1383,7 +1423,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            crate::fs::regular_file_info(&original).unwrap().identity,
+            retained_file_info(&original).unwrap().identity,
             original_identity,
             "retained replaced handle changed identity"
         );

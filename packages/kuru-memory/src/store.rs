@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, MySqlConnection, MySqlPool, Row};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use uuid::Uuid;
 #[cfg(any(test, feature = "test-support"))]
@@ -58,6 +60,8 @@ pub struct OpenOptions {
     migration_hooks: Option<Arc<migrations::MigrationRunnerHooks>>,
     #[cfg(test)]
     candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
+    #[cfg(test)]
+    candidate_cleanup_failure: Option<Arc<AtomicBool>>,
 }
 impl OpenOptions {
     pub fn new(data_dir: PathBuf, project_scope: String) -> Self {
@@ -71,6 +75,8 @@ impl OpenOptions {
             migration_hooks: None,
             #[cfg(test)]
             candidate_recovery_pause: None,
+            #[cfg(test)]
+            candidate_cleanup_failure: None,
         }
     }
 }
@@ -86,6 +92,8 @@ struct Shared {
     usage_pool: StdMutex<Option<Arc<MySqlPool>>>,
     #[cfg(test)]
     candidate_recovery_pause: Option<Arc<CandidateRecoveryPause>>,
+    #[cfg(test)]
+    candidate_cleanup_failure: Option<Arc<AtomicBool>>,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -94,6 +102,19 @@ struct Shared {
 struct CandidateRecoveryPause {
     reached: Arc<Semaphore>,
     resume: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+fn fail_candidate_cleanup_once(store: &MemoryStore) -> Result<()> {
+    if store
+        .shared
+        .candidate_cleanup_failure
+        .as_ref()
+        .is_some_and(|failure| failure.swap(false, Ordering::SeqCst))
+    {
+        bail!("injected candidate cleanup failure");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -180,7 +201,7 @@ pub struct HistoryWindow {
     pub total_rows: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Candidate {
     live: MemoryStore,
     view: MemoryStore,
@@ -194,10 +215,63 @@ pub(crate) enum CandidateLookup {
     Missing,
 }
 
+/// A conservative projection of one exact Kuru candidate ref. A missing ref
+/// says nothing about the outcome of an earlier accepted private write.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CandidateRefStatus {
+    pub branch: String,
+    pub head: Option<String>,
+    pub base: Option<String>,
+    pub state: CandidateRefState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateRefState {
+    OpenUnchanged,
+    OpenConflict,
+    TransitionUncertain,
+    Resolved,
+    Missing,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CandidateInventoryPage {
+    pub candidates: Vec<CandidateRefStatus>,
+    pub next: Option<String>,
+}
+
+/// A selected-ref request rejected before any branch transition begins.
+/// Errors after dispatching a transition never use this definite-no-effect type.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateRefRefusal {
+    Invalid,
+    Changed,
+    Active,
+    SchemaUnverified,
+}
+
+#[derive(Debug)]
+pub struct CandidateRefRejected(pub CandidateRefRefusal);
+
+impl std::fmt::Display for CandidateRefRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "candidate ref was rejected before transition: {:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for CandidateRefRejected {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CandidateTransitionObservation {
     Promoted,
     Abandoned,
+    AbandonedReclaimed,
     OpenUnchanged,
     OpenConflict,
     Indeterminate,
@@ -206,7 +280,7 @@ pub(crate) enum CandidateTransitionObservation {
 /// A validated candidate cannot fast-forward after another writer moves main.
 /// The service maps this one domain error without exposing private SQL detail.
 #[derive(Debug)]
-pub(crate) struct CandidateConflict;
+pub struct CandidateConflict;
 
 impl std::fmt::Display for CandidateConflict {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -219,6 +293,9 @@ impl std::error::Error for CandidateConflict {}
 impl Candidate {
     pub fn view(&self) -> MemoryStore {
         self.view.clone()
+    }
+    pub(crate) fn branch(&self) -> &str {
+        self.view.pinned_view()
     }
     pub fn base(&self) -> &str {
         &self.base
@@ -288,8 +365,11 @@ impl Candidate {
                 }
             };
             if current == target {
+                #[cfg(test)]
+                fail_candidate_cleanup_once(&live)?;
+                live.shared.server.retire_pool(&names.open).await?;
+                cleanup_promoted_candidate(&live, &names, &target).await?;
                 *promoted.lock().expect("candidate result lock") = Some(target.clone());
-                let _ = cleanup_promoted_candidate(&live, &names, &target).await;
                 return Ok(target);
             }
             if current != base {
@@ -317,8 +397,11 @@ impl Candidate {
                 result.context("Dolt promotion deadline exceeded")??;
                 bail!("Dolt did not fast-forward to the candidate revision");
             }
+            #[cfg(test)]
+            fail_candidate_cleanup_once(&live)?;
+            live.shared.server.retire_pool(&names.open).await?;
+            cleanup_promoted_candidate(&live, &names, &target).await?;
             *promoted.lock().expect("candidate result lock") = Some(target.clone());
-            let _ = cleanup_promoted_candidate(&live, &names, &target).await;
             Ok(target)
         })
         .await
@@ -360,11 +443,9 @@ impl Candidate {
                     heads.values().all(|head| head == expected),
                     CandidateConflict
                 );
-                ensure!(
-                    !heads.is_empty(),
-                    "candidate ref is missing before abandonment"
-                );
+                ensure!(!heads.is_empty(), CandidateConflict);
             }
+            live.shared.server.retire_pool(&names.open).await?;
             abandon_candidate(&live, &names).await
         })
         .await
@@ -1211,6 +1292,8 @@ impl MemoryStore {
             usage_pool: StdMutex::new(None),
             #[cfg(test)]
             candidate_recovery_pause: options.candidate_recovery_pause,
+            #[cfg(test)]
+            candidate_cleanup_failure: options.candidate_cleanup_failure,
             _permit: permit,
         });
         let store = Self {
@@ -1793,6 +1876,196 @@ impl MemoryStore {
         )))
     }
 
+    /// Page canonical candidate identities from the owner's actual ref table.
+    /// A creation UUID cannot be reconstructed from its store-bound branch
+    /// hash, so recovery after process exit uses the exact retained branch.
+    pub(crate) async fn candidate_inventory(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<CandidateInventoryPage> {
+        self.readable()?;
+        ensure!(
+            self.branch == "main",
+            "candidate inventory requires the live view"
+        );
+        ensure!(
+            (1..=16).contains(&limit),
+            "candidate inventory limit must be 1 through 16"
+        );
+        // The cursor is an opaque raw suffix, not an asserted candidate ID.
+        // A foreign malformed prefix match can occupy a SQL page boundary;
+        // filtering only the returned rows must not strand later valid refs.
+        let after = after.unwrap_or("");
+        ensure!(
+            after.len() <= 1024 && !after.contains('\0'),
+            "invalid candidate inventory cursor"
+        );
+        let _guard = self.shared.write.lock().await;
+        self.resolve_uncertain().await?;
+        let suffixes: Vec<String> = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar(
+                "SELECT suffix FROM (\
+                    SELECT SUBSTRING(name, ?) AS suffix FROM dolt_branches WHERE LEFT(BINARY name, ?) = BINARY ? \
+                    UNION SELECT SUBSTRING(name, ?) AS suffix FROM dolt_branches WHERE LEFT(BINARY name, ?) = BINARY ? \
+                    UNION SELECT SUBSTRING(name, ?) AS suffix FROM dolt_branches WHERE LEFT(BINARY name, ?) = BINARY ?\
+                ) AS candidate_refs WHERE BINARY suffix > BINARY ? ORDER BY BINARY suffix LIMIT ?",
+            )
+            .bind((CANDIDATE_PREFIX.len() + 1) as i64)
+            .bind(CANDIDATE_PREFIX.len() as i64)
+            .bind(CANDIDATE_PREFIX)
+            .bind((PROMOTING_PREFIX.len() + 1) as i64)
+            .bind(PROMOTING_PREFIX.len() as i64)
+            .bind(PROMOTING_PREFIX)
+            .bind((ABANDONED_PREFIX.len() + 1) as i64)
+            .bind(ABANDONED_PREFIX.len() as i64)
+            .bind(ABANDONED_PREFIX)
+            .bind(after)
+            .bind((limit + 1) as i64)
+            .fetch_all(self.pool.as_ref()),
+        )
+        .await
+        .context("candidate inventory deadline exceeded")??;
+        ensure!(
+            suffixes
+                .iter()
+                .all(|suffix| suffix.len() <= 1024 && !suffix.contains('\0')),
+            "candidate inventory contains an unsupported branch name"
+        );
+        let more = suffixes.len() > limit;
+        let next = more.then(|| suffixes[limit - 1].clone());
+        let mut candidates = Vec::with_capacity(limit);
+        for suffix in suffixes.into_iter().take(limit) {
+            if Uuid::parse_str(&suffix).is_ok_and(|id| id.simple().to_string() == suffix) {
+                candidates.push(
+                    self.candidate_ref_status_locked(&format!("{CANDIDATE_PREFIX}{suffix}"))
+                        .await?,
+                );
+            }
+        }
+        Ok(CandidateInventoryPage { candidates, next })
+    }
+
+    pub(crate) async fn candidate_ref_status(&self, branch: &str) -> Result<CandidateRefStatus> {
+        self.readable()?;
+        ensure!(
+            self.branch == "main",
+            "candidate status requires the live view"
+        );
+        let _guard = self.shared.write.lock().await;
+        self.resolve_uncertain().await?;
+        self.candidate_ref_status_locked(branch).await
+    }
+
+    async fn candidate_ref_status_locked(&self, branch: &str) -> Result<CandidateRefStatus> {
+        let names = CandidateNames::from_open(branch)?;
+        let heads = candidate_heads(&self.pool, &names).await?;
+        let head = heads
+            .get(&names.open)
+            .or_else(|| heads.get(&names.promoting))
+            .or_else(|| heads.get(&names.abandoned))
+            .cloned();
+        let state = if heads.is_empty() {
+            CandidateRefState::Missing
+        } else if heads.values().any(|value| Some(value) != head.as_ref()) {
+            CandidateRefState::TransitionUncertain
+        } else if heads.contains_key(&names.abandoned) {
+            CandidateRefState::Resolved
+        } else if heads.contains_key(&names.promoting) {
+            // A promoting marker can precede the merge. In particular, a
+            // target equal to its base has no unique outcome after cleanup.
+            CandidateRefState::TransitionUncertain
+        } else {
+            let base: String = tokio::time::timeout(
+                QUERY_TIMEOUT,
+                sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
+                    .bind(&names.open)
+                    .bind("main")
+                    .fetch_one(self.pool.as_ref()),
+            )
+            .await
+            .context("candidate inventory base lookup deadline exceeded")??;
+            let state = if self.revision().await? == base {
+                CandidateRefState::OpenUnchanged
+            } else {
+                CandidateRefState::OpenConflict
+            };
+            return Ok(CandidateRefStatus {
+                branch: names.open,
+                head,
+                base: Some(base),
+                state,
+            });
+        };
+        Ok(CandidateRefStatus {
+            branch: names.open,
+            head,
+            base: None,
+            state,
+        })
+    }
+
+    /// Explicit selected-ref disposal, never called from attachment Drop or
+    /// uncertain transition recovery. The service must additionally exclude
+    /// other live attachments before calling this local operation.
+    pub(crate) async fn abandon_candidate_ref(
+        &self,
+        branch: &str,
+        expected_base: &str,
+        expected_head: &str,
+    ) -> Result<()> {
+        self.writable()?;
+        if self.branch != "main" {
+            return Err(CandidateRefRejected(CandidateRefRefusal::Invalid).into());
+        }
+        let names = CandidateNames::from_open(branch)
+            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::Invalid))?;
+        let _guard = self.shared.write.lock().await;
+        self.resolve_uncertain().await?;
+        let heads = candidate_heads(&self.pool, &names).await?;
+        if heads.len() != 1
+            || !heads
+                .get(&names.open)
+                .is_some_and(|head| head == expected_head)
+        {
+            return Err(CandidateRefRejected(CandidateRefRefusal::Changed).into());
+        }
+        let base: String = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
+                .bind(&names.open)
+                .bind("main")
+                .fetch_one(self.pool.as_ref()),
+        )
+        .await
+        .context("candidate abandonment base lookup deadline exceeded")??;
+        if base != expected_base {
+            return Err(CandidateRefRejected(CandidateRefRefusal::Changed).into());
+        }
+        let pool = self.shared.server.pool(&names.open).await?;
+        if Arc::strong_count(&pool) != 1 {
+            return Err(CandidateRefRejected(CandidateRefRefusal::Active).into());
+        }
+        tokio::time::timeout(QUERY_TIMEOUT, migrations::validate_current(&pool))
+            .await
+            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))?
+            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))?;
+        tokio::time::timeout(QUERY_TIMEOUT, pool.close())
+            .await
+            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))?;
+        drop(pool);
+        let heads = candidate_heads(&self.pool, &names).await?;
+        if heads.len() != 1
+            || !heads
+                .get(&names.open)
+                .is_some_and(|head| head == expected_head)
+        {
+            return Err(CandidateRefRejected(CandidateRefRefusal::Changed).into());
+        }
+        abandon_candidate(self, &names).await
+    }
+
     /// Read-only transition proof for a branch and revisions captured before
     /// dispatch. Reclaimed refs without a unique result stay indeterminate;
     /// merely losing a connection never authorizes candidate deletion.
@@ -1849,7 +2122,7 @@ impl MemoryStore {
         // commit outside main's ancestry is an abandoned result. An unchanged
         // candidate (target == base) has no distinguishable history here.
         Ok(if target != base && target_is_ancestor == Some(false) {
-            CandidateTransitionObservation::Abandoned
+            CandidateTransitionObservation::AbandonedReclaimed
         } else {
             CandidateTransitionObservation::Indeterminate
         })
@@ -3814,6 +4087,7 @@ mod tests {
                 uncertain: StdMutex::new(None),
                 usage_pool: StdMutex::new(None),
                 candidate_recovery_pause: None,
+                candidate_cleanup_failure: None,
                 _permit: None,
             }),
             pool: pool.clone(),
@@ -4161,15 +4435,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_promotion_retries_cleanup_before_caching_success() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let mut options = crate::test_support::open_options(
+                root.path().to_owned(),
+                format!("project/{}", "7".repeat(64)),
+            )?;
+            options.candidate_cleanup_failure = Some(Arc::new(AtomicBool::new(true)));
+            let store = MemoryStore::open(options).await?;
+            let candidate = store.begin_candidate("retry resolved cleanup").await?;
+            let retained = candidate.view();
+            let branch = candidate.branch().to_owned();
+            let base = candidate.base().to_owned();
+            retained.put("retry-promoted", &json!(true)).await?;
+            let target = retained.revision().await?;
+
+            let error = candidate
+                .promote_exact(&target)
+                .await
+                .expect_err("injected cleanup failure was ignored");
+            ensure!(
+                error
+                    .to_string()
+                    .contains("injected candidate cleanup failure"),
+                "unexpected injected cleanup error: {error:#}"
+            );
+            ensure!(store.revision().await? == target);
+            ensure!(
+                retained.get("retry-promoted").await.is_err(),
+                "committed promotion retained a usable candidate view after cleanup failure"
+            );
+            ensure!(
+                store
+                    .candidate_transition_observation(&branch, &base, &target)
+                    .await?
+                    == CandidateTransitionObservation::Promoted
+            );
+
+            ensure!(candidate.promote_exact(&target).await? == target);
+            ensure!(
+                retained.get("retry-promoted").await.is_err(),
+                "cleanup retry left the resolved candidate view usable"
+            );
+            ensure!(store.get("retry-promoted").await? == Some(json!(true)));
+            ensure!(
+                candidate_heads(&store.pool, &CandidateNames::from_open(&branch)?)
+                    .await?
+                    .is_empty()
+            );
+            store.close().await
+        })
+        .await
+        .context("candidate cleanup retry fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn candidate_transition_observation_uses_exact_refs_and_revisions() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(90), async {
             let store = MemoryStore::temporary().await?;
             let stale = store.begin_candidate("stale transition").await?;
+            let stale_view = stale.view();
             let stale_branch = stale.view().pinned_view().to_owned();
             let stale_base = stale.base().to_owned();
             stale.view().put("private-stale", &json!(1)).await?;
             let stale_target = stale.view().revision().await?;
             ensure!(stale.promote_exact(&stale_base).await.is_err());
+            ensure!(stale_view.get("private-stale").await? == Some(json!(1)));
             ensure!(
                 store
                     .candidate_transition_observation(&stale_branch, &stale_base, &stale_target)
@@ -4184,14 +4517,25 @@ mod tests {
                     == CandidateTransitionObservation::OpenConflict
             );
             ensure!(stale.promote_exact(&stale_target).await.is_err());
+            ensure!(stale_view.get("private-stale").await? == Some(json!(1)));
             stale.abandon_exact(&stale_target).await?;
+            ensure!(
+                stale_view.get("private-stale").await.is_err(),
+                "resolved abandoned candidate view remained usable"
+            );
 
             let promoted = store.begin_candidate("promoted transition").await?;
+            let promoted_view = promoted.view();
             let branch = promoted.view().pinned_view().to_owned();
             let base = promoted.base().to_owned();
             promoted.view().put("private-promoted", &json!(2)).await?;
             let target = promoted.view().revision().await?;
             ensure!(promoted.promote_exact(&target).await? == target);
+            ensure!(
+                promoted_view.get("private-promoted").await.is_err(),
+                "resolved promoted candidate view remained usable"
+            );
+            ensure!(store.get("private-promoted").await? == Some(json!(2)));
             store.put("later", &json!(true)).await?;
             ensure!(
                 store
@@ -4204,6 +4548,72 @@ mod tests {
         })
         .await
         .context("candidate transition observation fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selected_candidate_inventory_pages_past_foreign_prefix_and_abandons_exact_ref()
+    -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let store = MemoryStore::temporary().await?;
+            let candidate = store.begin_candidate("retained exact ref").await?;
+            let branch = candidate.view().pinned_view().to_owned();
+            let base = candidate.base().to_owned();
+            candidate
+                .view()
+                .put("private-selected", &json!(true))
+                .await?;
+            let head = candidate.view().revision().await?;
+            sqlx::query("CALL DOLT_BRANCH(?, ?)")
+                .bind("candidate_000")
+                .bind(&base)
+                .fetch_all(store.pool.as_ref())
+                .await?;
+            let first = store.candidate_inventory(None, 1).await?;
+            ensure!(first.candidates.is_empty());
+            ensure!(first.next.as_deref() == Some("000"));
+            let second = store.candidate_inventory(first.next.as_deref(), 1).await?;
+            ensure!(second.candidates.len() == 1 && second.candidates[0].branch == branch);
+            ensure!(second.candidates[0].head.as_deref() == Some(head.as_str()));
+            ensure!(second.candidates[0].base.as_deref() == Some(base.as_str()));
+            ensure!(second.candidates[0].state == CandidateRefState::OpenUnchanged);
+            ensure!(
+                store
+                    .abandon_candidate_ref(&branch, &base, &head)
+                    .await
+                    .is_err(),
+                "active candidate view was abandoned"
+            );
+            drop(candidate);
+            ensure!(
+                store
+                    .abandon_candidate_ref(&branch, &base, &base)
+                    .await
+                    .is_err()
+            );
+            ensure!(
+                store
+                    .abandon_candidate_ref(&branch, &head, &head)
+                    .await
+                    .is_err()
+            );
+            store.put("later-main", &json!(true)).await?;
+            ensure!(
+                store.candidate_ref_status(&branch).await?.state == CandidateRefState::OpenConflict
+            );
+            store.abandon_candidate_ref(&branch, &base, &head).await?;
+            ensure!(store.candidate_ref_status(&branch).await?.state == CandidateRefState::Missing);
+            ensure!(
+                store
+                    .candidate_transition_observation(&branch, &base, &head)
+                    .await?
+                    == CandidateTransitionObservation::AbandonedReclaimed
+            );
+            ensure!(store.get("private-selected").await?.is_none());
+            store.close().await
+        })
+        .await
+        .context("selected candidate inventory fixture exceeded 90 seconds")??;
         Ok(())
     }
 

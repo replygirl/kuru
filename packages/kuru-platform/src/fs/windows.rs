@@ -8,19 +8,24 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Prefix;
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileDispositionInfo, FileIdInfo, FileRenameInfoEx, FileStandardInfo,
-    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, SetFileInformationByHandle,
-    WRITE_DAC,
+use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformationEx, NtSetInformationFile};
+use windows_sys::Win32::Foundation::{
+    GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, STATUS_PENDING,
+    WAIT_OBJECT_0,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
+    FileDispositionInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
+    READ_CONTROL, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
+};
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 use windows_sys::Win32::System::WindowsProgramming::{
     FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
 };
@@ -99,7 +104,7 @@ unsafe fn query<T: Default>(file: &File, kind: i32) -> io::Result<T> {
     }
 }
 
-pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
+fn inspect_info(file: &File, allow_retained_delete_pending: bool) -> io::Result<ObjectInfo> {
     // SAFETY: each class below is paired with its exact plain native record.
     let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe { query(file, FileAttributeTagInfo)? };
     if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -107,7 +112,9 @@ pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
     }
     // SAFETY: FILE_STANDARD_INFO is the documented output for FileStandardInfo.
     let standard: FILE_STANDARD_INFO = unsafe { query(file, FileStandardInfo)? };
-    if standard.DeletePending || standard.EndOfFile < 0 {
+    if (standard.DeletePending && (!allow_retained_delete_pending || standard.NumberOfLinks != 0))
+        || standard.EndOfFile < 0
+    {
         return Err(denied(
             "filesystem object is pending deletion or has an invalid size",
         ));
@@ -125,6 +132,17 @@ pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
         },
         directory: standard.Directory,
     })
+}
+
+pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
+    inspect_info(file, false)
+}
+
+pub(super) fn retained_info(file: &File) -> io::Result<ObjectInfo> {
+    // POSIX replacement marks the old object for deletion while its already
+    // held, now-unlinked handle remains readable. Ordinary admission still
+    // uses strict info, and a delete-pending object with a live link is refused.
+    inspect_info(file, true)
 }
 
 fn persistent_acls(file: &File) -> io::Result<()> {
@@ -299,7 +317,7 @@ pub(super) fn prepare_file_replacement(staged: &File) -> io::Result<Option<File>
     let replacement = unsafe {
         ReOpenFile(
             staged.as_raw_handle(),
-            DELETE,
+            DELETE | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_FLAG_OPEN_REPARSE_POINT,
         )
@@ -698,6 +716,41 @@ fn replace_open_destination(
     prepared_replacement: Option<&File>,
     destination: &Path,
 ) -> Result<(), (PublicationPhase, io::Error)> {
+    let expected_parent =
+        info(destination_parent).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if !expected_parent.directory {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("publication parent is not a directory"),
+        ));
+    }
+    // The checked inspection handle has read rights only. Acquire creation
+    // authority through a fresh directory open, then bind that short-lived
+    // handle to the still-retained exact parent before it can authorize any
+    // rename. A path rebound or reparse point is rejected before mutation.
+    let parent_path = destination.parent().ok_or_else(|| {
+        (
+            PublicationPhase::Rejected,
+            invalid("missing publication parent path"),
+        )
+    })?;
+    let publication_parent = open(
+        parent_path,
+        FILE_ADD_FILE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NameRetention::Movable,
+        None,
+    )
+    .map_err(|error| (PublicationPhase::Rejected, error))?;
+    let actual_parent =
+        info(&publication_parent).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if !actual_parent.directory || actual_parent.file.identity != expected_parent.file.identity {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("publication parent no longer has the retained identity"),
+        ));
+    }
     let name = destination.file_name().ok_or_else(|| {
         (
             PublicationPhase::Rejected,
@@ -721,7 +774,9 @@ fn replace_open_destination(
                 invalid("native publication filename exceeds bound"),
             )
         })?;
-    let record_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+    // FileRenameInformationEx requires the full structure, including its trailing
+    // FileName placeholder, plus the UTF-16 bytes named by FileNameLength.
+    let record_bytes = size_of::<FILE_RENAME_INFO>()
         .checked_add(name_bytes as usize)
         .ok_or_else(|| {
             (
@@ -742,7 +797,7 @@ fn replace_open_destination(
     unsafe {
         (*record_ptr).Anonymous.Flags =
             FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
-        (*record_ptr).RootDirectory = destination_parent.as_raw_handle();
+        (*record_ptr).RootDirectory = publication_parent.as_raw_handle();
         (*record_ptr).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
@@ -762,21 +817,53 @@ fn replace_open_destination(
     let renamed = prepared_replacement
         .or(reopened.as_ref())
         .expect("Windows replacement handle exists");
-    // SAFETY: renamed is the retained exact source with DELETE access; record
-    // is aligned, initialized and bounded, and its relative target is resolved
-    // through the retained exact destination-parent handle.
-    let status = unsafe {
-        SetFileInformationByHandle(
+    let mut io_status = IO_STATUS_BLOCK::default();
+    io_status.Anonymous.Status = STATUS_PENDING;
+    // SAFETY: the source, aligned record, status block and retained exact
+    // destination-parent handle remain live until authoritative completion.
+    // The same record and rights passed the isolated native Windows fixture;
+    // SetFileInformationByHandle(FileRenameInfoEx) rejected that fixture.
+    let mut status = unsafe {
+        NtSetInformationFile(
             renamed.as_raw_handle(),
-            FileRenameInfoEx,
+            &mut io_status,
             record.as_mut_ptr().cast(),
             record_len,
+            FileRenameInformationEx,
         )
     };
+    if status == STATUS_PENDING {
+        // ReOpenFile omitted FILE_FLAG_OVERLAPPED and retained SYNCHRONIZE.
+        // Pending is unexpected for that synchronous file object, but the
+        // caller cannot reconcile from a snapshot while its rename may still
+        // complete. Keep every kernel-referenced input alive and wait for the
+        // final IO_STATUS_BLOCK, just as the synchronous open normally does.
+        loop {
+            let waited = unsafe { WaitForSingleObject(renamed.as_raw_handle(), INFINITE) };
+            if waited == WAIT_OBJECT_0 {
+                // SAFETY: a completed file-object wait publishes IO_STATUS_BLOCK.
+                status = unsafe { io_status.Anonymous.Status };
+                if status != STATUS_PENDING {
+                    break;
+                }
+            }
+            // A spurious signal or failed wait still cannot release borrowed
+            // storage or permit a concurrent retry; avoid a busy loop.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     if status == 0 {
-        Err((PublicationPhase::Uncertain, io::Error::last_os_error()))
-    } else {
         Ok(())
+    } else {
+        // Keep the NTSTATUS as well as its Win32 mapping for exact diagnosis.
+        let mapped = unsafe { RtlNtStatusToDosError(status) };
+        Err((
+            PublicationPhase::Uncertain,
+            io::Error::new(
+                io::Error::from_raw_os_error(mapped as i32).kind(),
+                format!("native replacement NTSTATUS {status:#010x} (Win32 {mapped})"),
+            ),
+        ))
     }
 }
 
@@ -784,7 +871,7 @@ fn replace_open_destination(
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
 
@@ -1182,10 +1269,125 @@ mod tests {
                 OsStr::new("published"),
                 Publication::ReplaceRegular,
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("native replacement failed: {error:?}"));
         assert_eq!(
             std::fs::read(directory.path().join("published")).unwrap(),
             b"new"
         );
+    }
+
+    #[test]
+    fn retained_old_access_is_verified_after_checked_posix_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory =
+            Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        directory
+            .create_new(OsStr::new("published"))
+            .unwrap()
+            .write_all(b"old")
+            .unwrap();
+        let mut old = directory.read(OsStr::new("published")).unwrap();
+        let old_identity = info(&old).unwrap().file.identity;
+        let stage = directory
+            .create_private_directory(OsStr::new("stage"))
+            .unwrap();
+        let mut candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        candidate.write_all(b"new").unwrap();
+        let access = crate::fs::copy_file_access(&old, &candidate).unwrap();
+        crate::fs::verify_file_access(&old, &access).unwrap();
+        directory
+            .publish_file_with_access(
+                &stage,
+                OsStr::new("payload"),
+                &candidate,
+                &access,
+                OsStr::new("published"),
+                Publication::ReplaceRegular,
+            )
+            .unwrap();
+        crate::fs::finalize_file_access(&old, &candidate).unwrap();
+        crate::fs::verify_retained_file_access(&old, &access).unwrap();
+        assert_eq!(crate::fs::retained_file_info(&old).unwrap().links, 0);
+        assert_eq!(
+            info(&old)
+                .err()
+                .expect("retired object was accepted")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let mut old_bytes = Vec::new();
+        old.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, b"old");
+        assert_eq!(
+            crate::fs::retained_file_info(&old).unwrap().identity,
+            old_identity
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("published")).unwrap(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn retained_access_refuses_a_new_hardlink_before_publication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        directory
+            .create_new(OsStr::new("source"))
+            .unwrap()
+            .write_all(b"source bytes")
+            .unwrap();
+        let source = directory.read(OsStr::new("source")).unwrap();
+        let stage = directory
+            .create_private_directory(OsStr::new("stage"))
+            .unwrap();
+        let candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        let access = crate::fs::copy_file_access(&source, &candidate).unwrap();
+        crate::fs::verify_retained_file_access(&source, &access).unwrap();
+
+        let alias = directory.path().join("unexpected-alias");
+        std::fs::hard_link(directory.path().join("source"), &alias).unwrap();
+        assert_eq!(crate::fs::retained_file_info(&source).unwrap().links, 2);
+        let error = crate::fs::verify_retained_file_access(&source, &access).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(directory.path().join("source")).unwrap(),
+            b"source bytes"
+        );
+        assert_eq!(std::fs::read(&alias).unwrap(), b"source bytes");
+        assert!(!directory.path().join("published").exists());
+    }
+
+    #[test]
+    fn replacement_rejects_wrong_parent_authority_before_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_dir = Directory::ensure_private(&temporary.path().join("source")).unwrap();
+        let destination_dir =
+            Directory::ensure_private(&temporary.path().join("destination")).unwrap();
+        let mut candidate = source_dir.create_new(OsStr::new("candidate")).unwrap();
+        candidate.write_all(b"new").unwrap();
+        let destination = destination_dir.path().join("published");
+
+        let (phase, _) =
+            replace_open_destination(&candidate, &candidate, None, &destination).unwrap_err();
+        assert_eq!(phase, PublicationPhase::Rejected);
+
+        let wrong_parent = open(
+            source_dir.path(),
+            FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let (phase, _) =
+            replace_open_destination(&wrong_parent, &candidate, None, &destination).unwrap_err();
+        assert_eq!(phase, PublicationPhase::Rejected);
+        assert_eq!(
+            std::fs::read(source_dir.path().join("candidate")).unwrap(),
+            b"new"
+        );
+        assert!(!destination.exists());
     }
 }

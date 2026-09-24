@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         }
         ensure!(plan.mode == "app", "unknown terminal fixture mode");
         let mut spec = NativeSpawnSpec::new(plan.binary, plan.cwd);
+        spec.lifetime = kuru_platform::windows::process::Lifetime::FixtureBreakawayJob;
         spec.args = plan.args.into_iter().map(Into::into).collect();
         spec.environment = plan
             .environment
