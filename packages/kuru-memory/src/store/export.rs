@@ -672,9 +672,19 @@ mod tests {
         let empty = store.begin_active_export().await?;
         let messages = empty.page(None).await?;
         assert!(messages.records.is_empty());
-        let state = empty.page(messages.next).await?;
-        assert!(state.records.is_empty());
-        assert!(state.next.is_none());
+        let mut cursor = messages.next;
+        let mut empty_pages = 0;
+        while let Some(next) = cursor {
+            assert!(
+                empty_pages < 3,
+                "empty export must terminate after all phases"
+            );
+            let page = empty.page(Some(next)).await?;
+            assert!(page.records.is_empty());
+            cursor = page.next;
+            empty_pages += 1;
+        }
+        assert_eq!(empty_pages, 3, "empty v5 export must visit every phase");
         empty.verify_counts(0, 0, 0, 0)?;
         store.append("export", "note", "one").await?;
         let first = store.begin_active_export().await?;

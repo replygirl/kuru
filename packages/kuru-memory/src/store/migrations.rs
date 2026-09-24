@@ -1185,6 +1185,15 @@ pub(super) async fn upgrade(server: &Server, main: &MySqlPool) -> Result<()> {
     upgrade_with(REGISTRY, server, main, &MigrationRunnerHooks::none()).await
 }
 
+#[cfg(test)]
+pub(super) async fn upgrade_main_to_v3_fixture(server: &Server, main: &MySqlPool) -> Result<()> {
+    const RELEASED_V3: Registry = Registry {
+        current: 3,
+        definitions: &[V2, V3],
+    };
+    upgrade_with(RELEASED_V3, server, main, &MigrationRunnerHooks::none()).await
+}
+
 /// The permanent usage branch is writable independently of main. Give its
 /// staged attempts a separate owned namespace so a main migration attempt can never
 /// be mistaken for an exact-base usage attempt (or vice versa).
@@ -1743,19 +1752,40 @@ mod tests {
         definitions: RELEASED_V3_DEFINITIONS,
     };
 
+    const RELEASED_V4_REGISTRY: Registry = Registry {
+        current: 4,
+        definitions: &[V2, super::V3, super::V4],
+    };
+
     #[tokio::test]
     async fn older_registry_rejects_v4_store_without_mutating_it() -> Result<()> {
-        let store = super::super::MemoryStore::temporary().await?;
-        let before = durable_snapshot(&store.pool).await?;
-        let error = validate_active_with(RELEASED_V3_REGISTRY, &store.shared.server, &store.pool)
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().join("private"),
+            format!("project/{}", "4".repeat(64)),
+        )?;
+        super::super::tests::released_v1(&options).await?;
+        let server = super::super::tests::released_server(&options).await?;
+        let main = server.pool("main").await?;
+        upgrade_with(
+            RELEASED_V4_REGISTRY,
+            &server,
+            &main,
+            &MigrationRunnerHooks::none(),
+        )
+        .await?;
+        let before = durable_snapshot(&main).await?;
+        let error = validate_active_with(RELEASED_V3_REGISTRY, &server, &main)
             .await
             .expect_err("a v3 binary must reject v4 memory before opening it for writes");
         assert!(
             format!("{error:#}").contains("unsupported Dolt memory schema version 4"),
             "unexpected older-registry refusal: {error:#}"
         );
-        assert_eq!(durable_snapshot(&store.pool).await?, before);
-        store.close().await?;
+        assert_eq!(durable_snapshot(&main).await?, before);
+        main.close().await;
+        drop(main);
+        server.close().await?;
         Ok(())
     }
 
@@ -2245,8 +2275,8 @@ mod tests {
                 }
                 Corruption::ExtraReceipt => {
                     bounded_query(
-                        sqlx::query("INSERT INTO kuru_migrations VALUES (5, ?, ?, ?)")
-                            .bind("fixture.extra.v5")
+                        sqlx::query("INSERT INTO kuru_migrations VALUES (6, ?, ?, ?)")
+                            .bind("fixture.extra.v6")
                             .bind("0".repeat(64))
                             .bind(Uuid::new_v4().hyphenated().to_string())
                             .execute(store.pool.as_ref()),
@@ -2509,7 +2539,7 @@ mod tests {
             let names = match invalid {
                 InvalidInventory::Malformed => vec!["kuru_migration_bad".to_owned()],
                 InvalidInventory::UnknownTarget => {
-                    vec![attempt_name(6, Uuid::new_v4())]
+                    vec![attempt_name(7, Uuid::new_v4())]
                 }
                 InvalidInventory::Excess => {
                     let existing = reserved_names(&store.pool).await?.len();
@@ -2518,7 +2548,7 @@ mod tests {
                         "fixture inventory is already excessive"
                     );
                     (0..=(INVENTORY_LIMIT - existing))
-                        .map(|_| attempt_name(6, Uuid::new_v4()))
+                        .map(|_| attempt_name(7, Uuid::new_v4()))
                         .collect()
                 }
             };
@@ -2764,8 +2794,8 @@ mod tests {
         let completed_name = reserved_names(&store.pool)
             .await?
             .into_iter()
-            .find(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 4))
-            .context("temporary store did not retain its v4 migration branch")?;
+            .find(|name| parse_attempt(name).is_ok_and(|(target, _)| target == CURRENT_VERSION))
+            .context("temporary store did not retain its current migration branch")?;
         let completed = store.shared.server.pool(&completed_name).await?;
         bounded_query(
             sqlx::query("INSERT INTO messages (namespace, role, content) VALUES (?, ?, ?)")
@@ -2794,7 +2824,7 @@ mod tests {
             &store.shared.server,
             &store.pool,
             &before,
-            "schema version 4, expected 3",
+            "schema version 5, expected 4",
         )
         .await?;
         let completed = store.shared.server.pool(&completed_name).await?;
@@ -3119,7 +3149,7 @@ mod tests {
                 .fetch_one(old_candidate.as_ref()),
         )
         .await?;
-        assert_eq!(old_content, "kept on schema v4");
+        assert_eq!(old_content, "kept on schema v5");
         old_candidate.close().await;
         drop(old_candidate);
         main.close().await;

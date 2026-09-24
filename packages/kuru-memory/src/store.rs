@@ -5210,9 +5210,15 @@ mod tests {
         .bind(&grandparent)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let v1_base: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&great_grandparent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            great_grandparent, base,
-            "upgrade must retain all three ordered commits"
+            v1_base, base,
+            "upgrade must retain all four ordered commits"
         );
         assert_eq!(
             sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
@@ -5238,7 +5244,7 @@ mod tests {
         let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(store.pool.as_ref())
             .await?;
-        assert_eq!(receipts, 3);
+        assert_eq!(receipts, i64::from(migrations::CURRENT_VERSION - 1));
         let receipt: Vec<(i32, String, String, String)> = sqlx::query_as(
             "SELECT version, id, digest, operation FROM kuru_migrations ORDER BY version",
         )
@@ -5246,7 +5252,7 @@ mod tests {
         .await?;
         assert_eq!(
             receipt.iter().map(|row| row.0).collect::<Vec<_>>(),
-            [2, 3, 4]
+            [2, 3, 4, 5]
         );
         assert!(receipt.iter().all(|row| Uuid::parse_str(&row.3).is_ok()));
         store.close().await?;

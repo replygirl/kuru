@@ -8,7 +8,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use kuru_connectors::{DemoProvider, Provider};
 use kuru_core::{
-    Completion, CompletionRequest, Config, Mode, ModelInfo, ToolCall, canonical_peer_instruction,
+    Completion, CompletionRequest, Config, Message, Mode, ModelInfo, ToolCall,
+    canonical_peer_instruction,
 };
 use kuru_memory::{CandidateConflict, CandidateRefState, MemoryStore};
 use serde_json::json;
@@ -174,7 +175,11 @@ async fn explicit_cancellation_keeps_live_dream_state_and_private_histories_isol
         .collect::<Vec<_>>();
     for (index, namespace) in namespaces.iter().enumerate() {
         memory
-            .append(namespace, "user", &format!("PRIVATE-MARKER-{index}"))
+            .append_session_message(
+                namespace,
+                &harness.session.id,
+                &Message::text("user", format!("PRIVATE-MARKER-{index}")),
+            )
             .await
             .unwrap();
     }
