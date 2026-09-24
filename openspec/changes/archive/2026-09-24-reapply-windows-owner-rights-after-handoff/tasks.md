@@ -6,4 +6,4 @@
 ## 2. Native regression and delivery
 
 - [x] 2.1 Preserve the descriptor-shape regression that fails before the correction and proves effective OWNER RIGHTS after it
-- [ ] 2.2 Run focused Windows platform and application fixtures, record observed evidence, validate and archive the change
+- [x] 2.2 Run focused Windows platform and application fixtures, record observed evidence, validate and archive the change
