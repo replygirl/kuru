@@ -1,7 +1,9 @@
+#[cfg(all(windows, test))]
+use std::io::Write;
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    io::{Read, Write},
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -27,6 +29,8 @@ use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, sinks::UTF8};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use kuru_core::{Config, NativeTool, PermissionSelector, ProjectRelativeTarget, ToolSpec};
+#[cfg(windows)]
+use kuru_platform::fs::FileIdentity;
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 #[cfg(windows)]
 use kuru_platform::fs::{regular_file_info, validate_component};
@@ -201,6 +205,7 @@ fn windows_shell_environment(
 
 use crate::{
     MAX_BYTES,
+    file_edits::{CheckpointStore, CheckpointSummary, EditHunk, FileEffect, apply_hunks},
     instruction_review::{
         InstructionGate, InstructionGateOutcome, InstructionReviewSender, SkillGate,
     },
@@ -218,6 +223,7 @@ pub struct ToolHost {
     directory: Dir,
     root_guard: Arc<Directory>,
     permissions: Arc<PermissionService>,
+    checkpoints: Option<Arc<CheckpointStore>>,
     instruction_gate: Option<Arc<dyn InstructionGate>>,
     skill_gate: Option<Arc<dyn SkillGate>>,
     has_skills: bool,
@@ -237,6 +243,50 @@ pub struct ActorToolOutcome {
     pub result: Result<String>,
     pub instructions: Option<String>,
     pub replan_required: bool,
+}
+
+/// The concrete provider call that proposed a tool effect. Direct user file
+/// commands use a separate one-shot origin and never fabricate these fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolInvocationContext {
+    pub session_id: String,
+    pub turn_id: String,
+    pub actor_id: String,
+    pub invocation_id: String,
+    pub call_id: String,
+}
+
+impl ToolInvocationContext {
+    fn receipt_id(&self) -> Result<String> {
+        for field in [
+            &self.session_id,
+            &self.turn_id,
+            &self.actor_id,
+            &self.invocation_id,
+            &self.call_id,
+        ] {
+            ensure!(
+                !field.is_empty() && field.len() <= 256,
+                "tool invocation provenance is incomplete or oversized"
+            );
+        }
+        let encoded = serde_json::to_vec(&(
+            "kuru-file-effect-v1",
+            &self.session_id,
+            &self.turn_id,
+            &self.actor_id,
+            &self.invocation_id,
+            &self.call_id,
+        ))?;
+        Ok(format!("file-{}", crate::file_edits::hash(&encoded)))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ToolInvocationOrigin<'a> {
+    DirectUser,
+    Actor(&'a ToolInvocationContext),
+    ActorUnattributed,
 }
 
 impl ToolCatalog {
@@ -259,7 +309,7 @@ impl ToolHost {
         let root_guard = Arc::new(Directory::open(
             &root,
             Privacy::Inherited,
-            NameRetention::Pinned,
+            NameRetention::Movable,
         )?);
         Self::with_retained_root(root_guard, config)
     }
@@ -292,6 +342,7 @@ impl ToolHost {
             directory,
             root_guard,
             permissions,
+            checkpoints: None,
             instruction_gate: None,
             skill_gate: None,
             has_skills: false,
@@ -303,6 +354,14 @@ impl ToolHost {
     pub fn with_instruction_gate(mut self, gate: Arc<dyn InstructionGate>) -> Self {
         self.instruction_gate = Some(gate);
         self
+    }
+
+    /// Attach the app's checked private file checkpoint store. A mutating file
+    /// tool refuses to run when this store is unavailable.
+    pub fn with_checkpoint_store(mut self, store: Arc<CheckpointStore>) -> Result<Self> {
+        store.validate_root(&self.root_guard)?;
+        self.checkpoints = Some(store);
+        Ok(self)
     }
 
     pub fn with_skill_gate(mut self, gate: Arc<dyn SkillGate>, has_skills: bool) -> Self {
@@ -327,6 +386,95 @@ impl ToolHost {
     /// retains no UI channel; callers lend one only for a foreground operation.
     pub fn permission_service(&self) -> Arc<PermissionService> {
         Arc::clone(&self.permissions)
+    }
+
+    pub fn inspect_file_checkpoint(&self, id: &str) -> Result<Option<CheckpointSummary>> {
+        self.checkpoints
+            .as_ref()
+            .context("private file checkpoint store is unavailable")?
+            .inspect(id)
+    }
+
+    pub fn list_file_checkpoints(&self, limit: usize) -> Result<Vec<CheckpointSummary>> {
+        self.checkpoints
+            .as_ref()
+            .context("private file checkpoint store is unavailable")?
+            .list(limit)
+    }
+
+    pub fn prune_file_checkpoint(&self, id: &str, discard_uncertain: bool) -> Result<bool> {
+        self.checkpoints
+            .as_ref()
+            .context("private file checkpoint store is unavailable")?
+            .prune(id, discard_uncertain)
+    }
+
+    /// Explicit user action; this is deliberately absent from the model tool
+    /// catalog. Undo is newly authorized for the exact target before effects.
+    pub async fn undo_file_checkpoint(
+        &self,
+        id: &str,
+        approval: Option<&ApprovalSender>,
+    ) -> Result<CheckpointSummary> {
+        let store = self
+            .checkpoints
+            .as_ref()
+            .context("private file checkpoint store is unavailable")?;
+        let selected = store
+            .inspect(id)?
+            .context("selected file checkpoint does not exist")?;
+        let target = self.validated_permission_target(&selected.path, true)?;
+        let selector = PermissionSelector::native(if selected.created {
+            NativeTool::FileDelete
+        } else {
+            NativeTool::FileWrite
+        });
+        let undo_args = json!({"path": selected.path.as_str()});
+        let invocation = PermissionInvocation::new(selector, Some(target.clone()), &undo_args)?;
+        ensure!(
+            self.permissions
+                .authorize(&invocation, approval)
+                .await?
+                .is_authorized(),
+            "file undo requires exact target permission"
+        );
+        self.root_guard.revalidate()?;
+        let now = store
+            .inspect(id)?
+            .context("selected file checkpoint disappeared")?;
+        ensure!(
+            now.id == selected.id
+                && now.path == selected.path
+                && now.effect == selected.effect
+                && now.state == selected.state
+                && now.created == selected.created,
+            "selected file checkpoint changed during permission review"
+        );
+        ensure!(
+            self.validated_permission_target(&now.path, true)? == target,
+            "file undo target changed during permission review"
+        );
+        #[cfg(windows)]
+        let (_, final_name, path_guard) = self.path(&now.path, true)?;
+        #[cfg(unix)]
+        let (_, final_name, _) = self.path(&now.path, true)?;
+        #[cfg(windows)]
+        let parent_identity = path_guard.identity();
+        #[cfg(windows)]
+        drop(path_guard);
+        let parent_path = self
+            .root
+            .join(Path::new(&now.path).parent().unwrap_or(Path::new(".")));
+        #[cfg(windows)]
+        let parent =
+            reopen_movable_parent(&self.root_guard, &parent_path, parent_identity, "file undo")?;
+        #[cfg(unix)]
+        let parent = Directory::open(&parent_path, Privacy::Inherited, NameRetention::Movable)?;
+        ensure!(
+            parent.is_within(&self.root_guard)?,
+            "file undo parent changed outside project root"
+        );
+        store.lease()?.undo(id, &parent, final_name.as_os_str())
     }
 
     /// Admit one configured outbound A2A call using the same immutable service
@@ -448,6 +596,14 @@ impl ToolHost {
             .advertises(&PermissionSelector::native(NativeTool::FileWrite))
         {
             specs.push(spec("file_write", "Create or replace a project file. Parent directories must exist. Instruction/config/memory paths are protected.", &["path", "content"], &["path", "content"]));
+            let mut edit = spec(
+                "file_edit",
+                "Apply unique, ordered exact-context hunks to one checked UTF-8 project file. An ambiguous or stale hunk changes nothing.",
+                &["path", "hunks"],
+                &["path", "hunks"],
+            );
+            edit.parameters["properties"]["hunks"] = json!({"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"before":{"type":"string"},"old":{"type":"string"},"after":{"type":"string"},"replacement":{"type":"string"}},"required":["before","old","after","replacement"],"additionalProperties":false}});
+            specs.push(edit);
         }
         if self
             .permissions
@@ -514,9 +670,16 @@ impl ToolHost {
         args: Value,
         approval: Option<&ApprovalSender>,
     ) -> Result<String> {
-        self.execute_dispatch(name, args, approval, None, false)
-            .await
-            .result
+        self.execute_dispatch(
+            name,
+            args,
+            approval,
+            None,
+            false,
+            ToolInvocationOrigin::DirectUser,
+        )
+        .await
+        .result
     }
 
     /// Actor calls additionally review any newly applicable instruction graph.
@@ -527,8 +690,36 @@ impl ToolHost {
         permission_approval: Option<&ApprovalSender>,
         instruction_approval: Option<&InstructionReviewSender>,
     ) -> ActorToolOutcome {
-        self.execute_dispatch(name, args, permission_approval, instruction_approval, true)
-            .await
+        self.execute_dispatch(
+            name,
+            args,
+            permission_approval,
+            instruction_approval,
+            true,
+            ToolInvocationOrigin::ActorUnattributed,
+        )
+        .await
+    }
+
+    /// Runtime-authorized call with the actual admitted turn and provider
+    /// invocation identities. Actor file effects fail closed without them.
+    pub async fn execute_for_actor_with_context(
+        &self,
+        name: &str,
+        args: Value,
+        permission_approval: Option<&ApprovalSender>,
+        instruction_approval: Option<&InstructionReviewSender>,
+        context: &ToolInvocationContext,
+    ) -> ActorToolOutcome {
+        self.execute_dispatch(
+            name,
+            args,
+            permission_approval,
+            instruction_approval,
+            true,
+            ToolInvocationOrigin::Actor(context),
+        )
+        .await
     }
 
     async fn execute_dispatch(
@@ -538,6 +729,7 @@ impl ToolHost {
         approval: Option<&ApprovalSender>,
         instruction_approval: Option<&InstructionReviewSender>,
         actor: bool,
+        origin: ToolInvocationOrigin<'_>,
     ) -> ActorToolOutcome {
         let mut instructions = None;
         let mut replan_required = false;
@@ -626,6 +818,8 @@ impl ToolHost {
                     approval,
                     instruction_approval,
                     actor,
+                    origin,
+                    None,
                     &mut instructions,
                 )
                 .await
@@ -738,7 +932,8 @@ impl ToolHost {
                 }
                 _ => unreachable!("permission service returned an invalid outcome"),
             }
-            self.execute_inner(name, args, approval, instruction_approval, actor, &mut instructions).await
+            let authorized_target = invocation.target().cloned();
+            self.execute_inner(name, args, approval, instruction_approval, actor, origin, authorized_target.as_ref(), &mut instructions).await
         }
         .await;
         let result = match result {
@@ -784,7 +979,7 @@ impl ToolHost {
                     ),
                 )
             }
-            "file_write" => (
+            "file_write" | "file_edit" => (
                 native(NativeTool::FileWrite),
                 Some(
                     self.validated_permission_target(
@@ -826,7 +1021,7 @@ impl ToolHost {
         writing: bool,
     ) -> Result<ProjectRelativeTarget> {
         self.root_guard.revalidate()?;
-        let _ = self.path(value, writing)?;
+        let _path_guard = self.path(value, writing)?;
         #[cfg(any(windows, target_os = "macos"))]
         return self.physical_permission_target(value);
         #[cfg(not(any(windows, target_os = "macos")))]
@@ -889,6 +1084,10 @@ impl ToolHost {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "native and MCP dispatch keeps approval, authority and result projection explicit"
+    )]
     async fn execute_inner(
         &self,
         name: &str,
@@ -896,6 +1095,8 @@ impl ToolHost {
         approval: Option<&ApprovalSender>,
         instruction_approval: Option<&InstructionReviewSender>,
         actor: bool,
+        origin: ToolInvocationOrigin<'_>,
+        authorized_target: Option<&ProjectRelativeTarget>,
         instructions: &mut Option<String>,
     ) -> std::result::Result<ToolExecution, ToolFailure> {
         if !args.is_object() {
@@ -964,53 +1165,10 @@ impl ToolHost {
                 .grep(&args, approval, instruction_approval, actor, instructions)
                 .await
                 .map(ToolExecution::Json),
-            "file_write" => {
-                let execution = (|| -> Result<ToolExecution> {
-                    let content = string(&args, "content")?;
-                    ensure!(
-                        content.len() <= MAX_BYTES,
-                        "file content exceeds 2 MiB limit"
-                    );
-                    let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
-                    let temporary = format!(".kuru-write-{}", uuid::Uuid::new_v4());
-                    let mut options = OpenOptions::new();
-                    options
-                        .write(true)
-                        .create_new(true)
-                        .follow(FollowSymlinks::No);
-                    let mut file = directory.open_with(&temporary, &options)?;
-                    let written = (|| -> Result<()> {
-                        file.write_all(content.as_bytes())?;
-                        file.sync_all()?;
-                        if let Ok(metadata) = directory.symlink_metadata(&path) {
-                            file.set_permissions(metadata.permissions())?;
-                        }
-                        directory.rename(&temporary, &directory, &path)?;
-                        Ok(())
-                    })();
-                    if written.is_err() {
-                        let _ = directory.remove_file(&temporary);
-                    }
-                    written?;
-                    Ok(ToolExecution::Text(format!(
-                        "Wrote {} bytes",
-                        content.len()
-                    )))
-                })();
-                execution.map_err(ToolFailure::built_in)
-            }
-            "file_delete" => {
-                let execution = (|| -> Result<ToolExecution> {
-                    let (directory, path, _guard) = self.path(string(&args, "path")?, true)?;
-                    ensure!(
-                        directory.symlink_metadata(&path)?.is_file(),
-                        "file_delete requires a regular file"
-                    );
-                    directory.remove_file(path)?;
-                    Ok(ToolExecution::Text("Deleted file".into()))
-                })();
-                execution.map_err(ToolFailure::built_in)
-            }
+            "file_write" | "file_edit" | "file_delete" => self
+                .file_mutation(name, &args, origin, authorized_target)
+                .map(ToolExecution::Text)
+                .map_err(ToolFailure::built_in),
             "file_list" => {
                 let execution = (|| -> Result<ToolExecution> {
                     let input_path = args
@@ -1301,7 +1459,8 @@ impl ToolHost {
         omitted: &mut SearchOmissions,
     ) -> Result<Vec<ProjectRelativeTarget>> {
         let root = optional_path(args)?;
-        let _ = self.path(root, false)?;
+        self.root_guard.revalidate()?;
+        let _path_guard = self.path(root, false)?;
         let include_hidden = optional_bool(args, "include_hidden")?;
         let include_ignored = optional_bool(args, "include_ignored")?;
         let mut walker = WalkBuilder::new(self.root.join(root));
@@ -1418,6 +1577,109 @@ impl ToolHost {
     #[cfg(all(unix, test))]
     fn test_shells(&self) -> &ShellRegistry {
         &self.shells
+    }
+
+    fn file_mutation(
+        &self,
+        name: &str,
+        args: &Value,
+        origin: ToolInvocationOrigin<'_>,
+        authorized_target: Option<&ProjectRelativeTarget>,
+    ) -> Result<String> {
+        let value = string(args, "path")?;
+        #[cfg(windows)]
+        let (_, final_name, path_guard) = self.path(value, true)?;
+        #[cfg(unix)]
+        let (_, final_name, _) = self.path(value, true)?;
+        let target = self.validated_permission_target(value, true)?;
+        ensure!(
+            authorized_target == Some(&target),
+            "file permission target changed before mutation"
+        );
+        #[cfg(windows)]
+        let parent_identity = path_guard.identity();
+        #[cfg(windows)]
+        drop(path_guard);
+        let parent_path = self
+            .root
+            .join(Path::new(value).parent().unwrap_or(Path::new(".")));
+        #[cfg(windows)]
+        let parent =
+            reopen_movable_parent(&self.root_guard, &parent_path, parent_identity, "file")?;
+        #[cfg(unix)]
+        let parent = Directory::open(&parent_path, Privacy::Inherited, NameRetention::Movable)?;
+        ensure!(
+            parent.is_within(&self.root_guard)?,
+            "file parent changed outside project root"
+        );
+        let store = self
+            .checkpoints
+            .as_ref()
+            .context("private file checkpoint store is unavailable")?;
+        store.validate_root(&self.root_guard)?;
+        let lease = store.lease()?;
+        let id = match origin {
+            ToolInvocationOrigin::DirectUser => uuid::Uuid::new_v4().to_string(),
+            ToolInvocationOrigin::Actor(context) => context.receipt_id()?,
+            ToolInvocationOrigin::ActorUnattributed => {
+                bail!("actor file mutation lacks admitted provider invocation provenance")
+            }
+        };
+        let fingerprint = crate::file_edits::hash(&serde_json::to_vec(&(name, args))?);
+        let path = target.as_str();
+        let summary = match name {
+            "file_write" => {
+                let content = string(args, "content")?;
+                ensure!(
+                    content.len() <= MAX_BYTES,
+                    "file content exceeds 2 MiB limit"
+                );
+                lease.mutate(
+                    &id,
+                    &fingerprint,
+                    path,
+                    FileEffect::Write,
+                    &parent,
+                    final_name.as_os_str(),
+                    |_| Ok(Some(content.as_bytes().to_vec())),
+                )?
+            }
+            "file_edit" => {
+                let hunks = args.get("hunks").context("file_edit requires hunks")?;
+                let hunks: Vec<EditHunk> =
+                    serde_json::from_value(hunks.clone()).context("invalid file_edit hunks")?;
+                lease.mutate(
+                    &id,
+                    &fingerprint,
+                    path,
+                    FileEffect::Edit,
+                    &parent,
+                    final_name.as_os_str(),
+                    |before| {
+                        let before =
+                            before.context("file_edit requires an existing regular file")?;
+                        Ok(Some(apply_hunks(before, &hunks)?))
+                    },
+                )?
+            }
+            "file_delete" => lease.mutate(
+                &id,
+                &fingerprint,
+                path,
+                FileEffect::Delete,
+                &parent,
+                final_name.as_os_str(),
+                |before| {
+                    ensure!(
+                        before.is_some(),
+                        "file_delete requires an existing regular file"
+                    );
+                    Ok(None)
+                },
+            )?,
+            _ => bail!("unknown file mutation"),
+        };
+        Ok(format!("{} completed; checkpoint {}", name, summary.id))
     }
 
     fn path(&self, value: &str, writing: bool) -> Result<(Dir, PathBuf, PathGuard)> {
@@ -1608,6 +1870,25 @@ async fn read_file_output(mut file: tokio::fs::File, extent: u64) -> Result<Stri
     output.finish().map_err(Into::into)
 }
 
+#[cfg(windows)]
+fn reopen_movable_parent(
+    root_guard: &Directory,
+    parent_path: &Path,
+    expected_identity: FileIdentity,
+    operation: &str,
+) -> Result<Directory> {
+    let parent = Directory::open(parent_path, Privacy::Inherited, NameRetention::Movable)?;
+    ensure!(
+        parent.identity() == expected_identity,
+        "{operation} parent changed during handle handoff"
+    );
+    ensure!(
+        parent.is_within(root_guard)?,
+        "{operation} parent changed outside project root"
+    );
+    Ok(parent)
+}
+
 fn optional_path(args: &Value) -> Result<&str> {
     args.get("path")
         .map(|value| value.as_str().context("path must be a string"))
@@ -1729,6 +2010,10 @@ fn protected_component(value: &str, writing: bool) -> bool {
             | "memory.db"
     ) || name == ".env"
         || name.starts_with(".env.")
+        // A failed checked publication can leave its staged replacement in
+        // the project directory. Keep its private bytes outside every native
+        // file and search projection, including include_hidden searches.
+        || name.starts_with(".kuru-edit-")
         || (writing
             && matches!(
                 name.as_str(),
@@ -1882,6 +2167,7 @@ async fn shell_inner(
     );
     // Use the same identity-checked launch spelling as other configured native
     // commands. PowerShell's .NET file APIs cannot use an introduced verbatim cwd.
+    let root_pin = Directory::open(root, Privacy::Inherited, NameRetention::Pinned)?;
     let system_directory = system_directory()?;
     let program = system_directory.join("WindowsPowerShell/v1.0/powershell.exe");
     // This owned stock-shell launch must reconstruct its own module paths: a
@@ -1896,6 +2182,7 @@ async fn shell_inner(
         .spawn()
         .await
         .context("cannot start Windows PowerShell")?;
+    drop(root_pin);
     let mut stdout = child.take_stdout().context("missing shell stdout")?;
     let mut stderr = child.take_stderr().context("missing shell stderr")?;
     let mut out = ShellCapture::new();
@@ -1979,6 +2266,38 @@ mod tests {
     #[cfg(unix)]
     use crate::test_support::{StdioFixture, Step};
     use kuru_core::{McpConfig, PermissionAction, PermissionRule};
+
+    fn with_test_checkpoints(host: ToolHost, private: &tempfile::TempDir) -> ToolHost {
+        let root = host.root_guard.clone();
+        host.with_checkpoint_store(Arc::new(
+            CheckpointStore::new(&private.path().join("state"), root).unwrap(),
+        ))
+        .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn movable_parent_handoff_rejects_a_replacement_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let root_guard =
+            Directory::open(root.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        let pinned = Directory::open(&parent, Privacy::Inherited, NameRetention::Pinned).unwrap();
+        let expected_identity = pinned.identity();
+        drop(pinned);
+
+        std::fs::rename(&parent, root.path().join("displaced")).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let error = match reopen_movable_parent(&root_guard, &parent, expected_identity, "file") {
+            Ok(_) => panic!("replacement parent was adopted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "file parent changed during handle handoff"
+        );
+    }
 
     struct RecordInstructionDirectories(std::sync::Mutex<Vec<Vec<String>>>);
 
@@ -2102,9 +2421,15 @@ mod tests {
     #[tokio::test]
     async fn file_crud_is_contained_and_replaces_atomically() {
         let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("src")).unwrap();
         std::fs::write(root.path().join("AGENTS.md"), "instructions").unwrap();
         std::fs::write(root.path().join(".env"), "protected").unwrap();
+        std::fs::write(
+            root.path().join(".kuru-edit-private-stage"),
+            "private-stage-token",
+        )
+        .unwrap();
         let host = ToolHost::new(
             root.path(),
             &Config {
@@ -2113,6 +2438,7 @@ mod tests {
             },
         )
         .unwrap();
+        let host = with_test_checkpoints(host, &private);
         assert!(
             host.specs()
                 .await
@@ -2136,6 +2462,25 @@ mod tests {
             serde_json::from_str(&host.execute("file_list", json!({})).await.unwrap()).unwrap();
         assert_eq!(entries["src"], "directory");
         assert!(entries.get(".env").is_none());
+        assert!(entries.get(".kuru-edit-private-stage").is_none());
+        for (name, args) in [
+            (
+                "grep",
+                json!({"pattern":"private-stage-token","include_hidden":true}),
+            ),
+            (
+                "glob",
+                json!({"pattern":"**/.kuru-edit-*","include_hidden":true}),
+            ),
+        ] {
+            let result: Value =
+                serde_json::from_str(&host.execute(name, args).await.unwrap()).unwrap();
+            assert_eq!(
+                result["matches"],
+                json!([]),
+                "{name} exposed a private stage"
+            );
+        }
         assert_eq!(
             host.execute("file_read", json!({"path":"AGENTS.md"}))
                 .await
@@ -2147,6 +2492,7 @@ mod tests {
             "/etc/passwd",
             ".kuru/memory.sqlite",
             ".env",
+            ".kuru-edit-private-stage",
             "src/../a",
             "",
         ] {
@@ -2202,6 +2548,166 @@ mod tests {
         assert!(host.execute("file_read", json!({"path":1})).await.is_err());
         assert!(host.execute("file_read", json!([])).await.is_err());
         assert!(host.execute("unknown", json!({})).await.is_err());
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_file_edit_reuses_exact_receipt_and_selected_undo_restores_source() {
+        let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "alpha\none\nbeta\ntwo\n").unwrap();
+        let host = with_test_checkpoints(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    allow_write: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            &private,
+        );
+        let context = ToolInvocationContext {
+            session_id: "session-1".into(),
+            turn_id: "turn-1".into(),
+            actor_id: "actor-1".into(),
+            invocation_id: "invocation-1".into(),
+            call_id: "call-1".into(),
+        };
+        let arguments = json!({"path":"note.txt","hunks":[
+            {"before":"alpha\n","old":"one","after":"\n","replacement":"un"},
+            {"before":"beta\n","old":"two","after":"\n","replacement":"deux"}
+        ]});
+        let first = host
+            .execute_for_actor_with_context("file_edit", arguments.clone(), None, None, &context)
+            .await
+            .result
+            .unwrap();
+        let id = first
+            .strip_prefix("file_edit completed; checkpoint ")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
+            "alpha\nun\nbeta\ndeux\n"
+        );
+        let retry = host
+            .execute_for_actor_with_context("file_edit", arguments.clone(), None, None, &context)
+            .await
+            .result
+            .unwrap();
+        assert_eq!(retry, first);
+        assert!(
+            host.execute_for_actor_with_context(
+                "file_edit",
+                json!({"path":"note.txt","hunks":[
+                    {"before":"alpha\n","old":"one","after":"\n","replacement":"changed"}
+                ]}),
+                None,
+                None,
+                &context
+            )
+            .await
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts")
+        );
+        let undone = host.undo_file_checkpoint(id, None).await.unwrap();
+        assert_eq!(undone.effect, FileEffect::Undo);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("note.txt")).unwrap(),
+            "alpha\none\nbeta\ntwo\n"
+        );
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_actor_edit_proposals_apply_only_the_unique_authorized_hunk() {
+        let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("valid.txt"), "alpha old omega\n").unwrap();
+        std::fs::write(root.path().join("ambiguous.txt"), "old old\n").unwrap();
+        std::fs::write(root.path().join("stale.txt"), "new source\n").unwrap();
+        std::fs::write(root.path().join(".env"), "protected secret\n").unwrap();
+        let host = with_test_checkpoints(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    allow_write: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            &private,
+        );
+        // Fixed, provider-free tool proposals use separate admitted call IDs.
+        // A refusal cannot be hidden by exact-retry receipt matching.
+        let proposals = [
+            (
+                "valid.txt",
+                json!([{"before":"alpha ","old":"old","after":" omega\n","replacement":"new"}]),
+                None,
+            ),
+            (
+                "ambiguous.txt",
+                json!([{"before":"","old":"old","after":"","replacement":"new"}]),
+                Some("ambiguous"),
+            ),
+            (
+                "stale.txt",
+                json!([{"before":"","old":"old","after":"","replacement":"new"}]),
+                Some("stale"),
+            ),
+            (
+                ".env",
+                json!([{"before":"","old":"protected","after":"","replacement":"new"}]),
+                Some("protected"),
+            ),
+        ];
+        for (index, (path, hunks, refused_for)) in proposals.into_iter().enumerate() {
+            let context = ToolInvocationContext {
+                session_id: "session-1".into(),
+                turn_id: "turn-1".into(),
+                actor_id: "actor-1".into(),
+                invocation_id: "invocation-1".into(),
+                call_id: format!("call-{index}"),
+            };
+            let result = host
+                .execute_for_actor_with_context(
+                    "file_edit",
+                    json!({"path":path,"hunks":hunks}),
+                    None,
+                    None,
+                    &context,
+                )
+                .await
+                .result;
+            if let Some(reason) = refused_for {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(reason), "{path}: {error}");
+            } else {
+                assert!(
+                    result
+                        .unwrap()
+                        .starts_with("file_edit completed; checkpoint "),
+                    "valid edit did not settle"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("valid.txt")).unwrap(),
+            "alpha new omega\n"
+        );
+        for (path, expected) in [
+            ("ambiguous.txt", "old old\n"),
+            ("stale.txt", "new source\n"),
+            (".env", "protected secret\n"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(root.path().join(path)).unwrap(),
+                expected
+            );
+        }
         host.shutdown().await.unwrap();
     }
 
@@ -2458,6 +2964,7 @@ mod tests {
     #[tokio::test]
     async fn central_permission_gate_denies_effects_and_explicit_allow_overrides_legacy_false() {
         let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
         let denied_path = root.path().join("denied.txt");
         let denied = ToolHost::new(
             root.path(),
@@ -2501,6 +3008,7 @@ mod tests {
             },
         )
         .unwrap();
+        let allowed = with_test_checkpoints(allowed, &private);
         allowed
             .execute(
                 "file_write",
@@ -2518,6 +3026,7 @@ mod tests {
     #[tokio::test]
     async fn retained_windows_root_spellings_reach_file_permission_decisions() {
         let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
         let ordinary = root.path().to_path_buf();
         let verbatim = root.path().canonicalize().unwrap();
 
@@ -2538,6 +3047,7 @@ mod tests {
                 },
             )
             .unwrap();
+            let allowed = with_test_checkpoints(allowed, &private);
             allowed
                 .execute(
                     "file_write",
@@ -2675,7 +3185,11 @@ mod tests {
     #[tokio::test]
     async fn foreground_once_approval_dispatches_the_bound_native_write() {
         let root = tempfile::tempdir().unwrap();
-        let host = ToolHost::new(root.path(), &Config::default()).unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let host = with_test_checkpoints(
+            ToolHost::new(root.path(), &Config::default()).unwrap(),
+            &private,
+        );
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::ApprovalRequest>(1);
         let reply = tokio::spawn(async move {
             let request = receiver.recv().await.unwrap();
@@ -2915,6 +3429,7 @@ mod tests {
         const SECRET: &str = "sk-abcdefghijklmnop";
         const MARKER: &str = "[REDACTED:recognized-secret]";
         let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
         let filename = "read.txt";
         let source = format!("ordinary {SECRET} retained on disk");
         std::fs::write(root.path().join(filename), &source).unwrap();
@@ -2926,6 +3441,7 @@ mod tests {
             },
         )
         .unwrap();
+        let host = with_test_checkpoints(host, &private);
 
         let read = host
             .execute("file_read", json!({"path":&filename}))
@@ -3408,6 +3924,7 @@ mod tests {
                 "grep",
                 "glob",
                 "file_write",
+                "file_edit",
                 "file_delete",
                 "web_fetch",
                 "shell"
@@ -3469,6 +3986,7 @@ mod tests {
     async fn links_cannot_escape_or_alias_protected_files() {
         use std::os::unix::fs::symlink;
         let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret"), "outside").unwrap();
         std::fs::create_dir(root.path().join(".kuru")).unwrap();
@@ -3484,6 +4002,7 @@ mod tests {
             },
         )
         .unwrap();
+        let host = with_test_checkpoints(host, &private);
         for path in ["escape/secret", "alias", "hardlink"] {
             assert!(
                 host.execute("file_read", json!({"path":path}))
@@ -3498,10 +4017,17 @@ mod tests {
                     .is_err()
             );
         }
-        // Atomic replacement disconnects a hard link; it cannot alter its target.
-        host.execute("file_write", json!({"path":"hardlink","content":"local"}))
-            .await
-            .unwrap();
+        // A multiply linked source cannot be selected for a checkpointed
+        // replacement; neither the project link nor its other name changes.
+        assert!(
+            host.execute("file_write", json!({"path":"hardlink","content":"local"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("hardlink")).unwrap(),
+            "outside"
+        );
         assert_eq!(
             std::fs::read_to_string(outside.path().join("secret")).unwrap(),
             "outside"
@@ -4172,7 +4698,7 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("held.txt"), "held object").unwrap();
         let retained =
-            Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Pinned).unwrap());
+            Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Movable).unwrap());
         let host = ToolHost::with_retained_root(
             retained,
             &Config {
@@ -4192,10 +4718,17 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
             .await
             .unwrap_err();
         let shell_error = host
-            .execute("shell", json!({"command":"printf started > launched"}))
+            .execute(
+                "shell",
+                json!({"command": if cfg!(windows) { "[IO.File]::WriteAllText('launched', 'started')" } else { "printf started > launched" }}),
+            )
             .await
             .unwrap_err();
-        for error in [&file_error, &shell_error] {
+        let search_error = host
+            .execute("glob", json!({"pattern":"**/*"}))
+            .await
+            .unwrap_err();
+        for error in [&file_error, &shell_error, &search_error] {
             assert_eq!(
                 error.to_string(),
                 "tool execution failed: directory name or ancestor identity changed"
@@ -4204,6 +4737,39 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
         }
         assert_eq!(
             std::fs::read_to_string(parent.path().join("replaced/held.txt")).unwrap(),
+            "held object"
+        );
+        assert!(!root.join("launched").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_root_handle_prevents_substitution_before_tool_dispatch() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("held.txt"), "held object").unwrap();
+        let retained =
+            Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Movable).unwrap());
+        let original_identity = retained.identity();
+        let host = ToolHost::with_retained_root(retained, &Config::default()).unwrap();
+
+        // cap-std retains a second Windows directory handle without
+        // FILE_SHARE_DELETE. The attempted substitution is rejected by the OS
+        // before a replacement root can grant any tool effect.
+        let error = std::fs::rename(&root, parent.path().join("replaced")).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert!(!parent.path().join("replaced").exists());
+        assert_eq!(
+            Directory::open(&root, Privacy::Inherited, NameRetention::Movable)
+                .unwrap()
+                .identity(),
+            original_identity
+        );
+        assert_eq!(
+            host.execute("file_read", json!({"path":"held.txt"}))
+                .await
+                .unwrap(),
             "held object"
         );
         assert!(!root.join("launched").exists());

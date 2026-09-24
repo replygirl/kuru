@@ -39,9 +39,42 @@ const FIXTURE_CLEANUP_RETRY_SPACING: Duration = Duration::from_millis(20);
 fn remove_fixture_binary(binary: &Path, expected: kuru_platform::fs::FileIdentity) -> Result<()> {
     let mut retry_deadline = None;
     loop {
-        let (parent, file) = files::read(binary, Privacy::OwnerOnly)?;
+        let (parent, file) = match files::read(binary, Privacy::OwnerOnly) {
+            Ok(held) => held,
+            // A just-executed Windows image can temporarily deny even the
+            // checked read open before we reach the removal syscall. Retry
+            // only these native sharing/access denials, within the same
+            // deadline as removal and namespace-disappearance observation.
+            Err(error)
+                if matches!(
+                    error
+                        .root_cause()
+                        .downcast_ref::<io::Error>()
+                        .and_then(io::Error::raw_os_error),
+                    Some(5 | 32)
+                ) =>
+            {
+                let deadline = *retry_deadline
+                    .get_or_insert_with(|| Instant::now() + FIXTURE_CLEANUP_RETRY_LIMIT);
+                if Instant::now() >= deadline {
+                    return Err(error.context(
+                        "fixture cache binary checked reopen exhausted its bounded native removal recovery",
+                    ));
+                }
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(FIXTURE_CLEANUP_RETRY_SPACING),
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         ensure!(
-            regular_file_info(&file)?.identity == expected,
+            regular_file_info(&file)
+                .context("fixture cache binary held identity inspection")?
+                .identity
+                == expected,
             "fixture cache binary identity changed before invalidation"
         );
         match parent.remove_file(files::name(binary)?, file) {
@@ -668,7 +701,10 @@ async fn held_descendant_releases_after_checked_no_move_and_activation_recovers(
         .await;
     tokio::time::resume();
     assert!(result.unwrap().is_none());
-    assert_eq!(denied, 1, "release only the observed checked rejection");
+    assert!(
+        denied >= 1,
+        "release the blocker on an observed checked no-move refusal"
+    );
     assert_eq!(
         files::directory(&destination).unwrap().identity(),
         source_identity

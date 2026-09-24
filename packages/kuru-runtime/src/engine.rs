@@ -12,8 +12,8 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use futures::future::join_all;
 use kuru_connectors::{
-    ApprovalSender, InstructionReviewSender, PermissionService, Provider, ToolHost, a2a_send,
-    is_permission_denied, project_text,
+    ApprovalSender, CheckpointSummary, InstructionReviewSender, PermissionService, Provider,
+    ToolHost, a2a_send, is_permission_denied, project_text,
 };
 use kuru_core::{
     ActorPhase, Completion, Config, ContextBudget, FacingInput, InvocationStart, Message, Mode,
@@ -678,6 +678,26 @@ impl Harness {
     /// service retains no process-wide approval sender.
     pub fn permission_service(&self) -> Arc<PermissionService> {
         self.tools.permission_service()
+    }
+
+    pub fn file_checkpoints(&self, limit: usize) -> Result<Vec<CheckpointSummary>> {
+        self.tools.list_file_checkpoints(limit)
+    }
+
+    pub fn file_checkpoint(&self, id: &str) -> Result<Option<CheckpointSummary>> {
+        self.tools.inspect_file_checkpoint(id)
+    }
+
+    pub fn prune_file_checkpoint(&self, id: &str, discard_uncertain: bool) -> Result<bool> {
+        self.tools.prune_file_checkpoint(id, discard_uncertain)
+    }
+
+    pub async fn undo_file_checkpoint(
+        &self,
+        id: &str,
+        approval: Option<&ApprovalSender>,
+    ) -> Result<CheckpointSummary> {
+        self.tools.undo_file_checkpoint(id, approval).await
     }
 
     /// Subscribe to replaceable, ephemeral progress for the selected speaker.
@@ -1901,7 +1921,7 @@ impl Harness {
         tools: Vec<ToolSpec>,
         cancellation: &CancellationToken,
         progress: ProgressDescriptor,
-    ) -> Result<Completion> {
+    ) -> Result<(Completion, String)> {
         self.ask_in_controlled_with_progress(
             &self.memory,
             id,
@@ -1926,19 +1946,21 @@ impl Harness {
         tools: Vec<ToolSpec>,
         cancellation: &CancellationToken,
     ) -> Result<Completion> {
-        self.ask_in_controlled_with_progress(
-            memory,
-            id,
-            inputs,
-            phase.0,
-            tools,
-            AskControl {
-                cancellation,
-                progress: None,
-                phase: phase.1,
-            },
-        )
-        .await
+        Ok(self
+            .ask_in_controlled_with_progress(
+                memory,
+                id,
+                inputs,
+                phase.0,
+                tools,
+                AskControl {
+                    cancellation,
+                    progress: None,
+                    phase: phase.1,
+                },
+            )
+            .await?
+            .0)
     }
 
     async fn ask_in_controlled_with_progress(
@@ -1949,7 +1971,7 @@ impl Harness {
         phase: &str,
         tools: Vec<ToolSpec>,
         control: AskControl<'_>,
-    ) -> Result<Completion> {
+    ) -> Result<(Completion, String)> {
         control.cancellation.check()?;
         let actor = self.actors.get(id).context("actor is inactive")?;
         let context_sources = self.profile.visibility.context_sources(id, control.phase);
@@ -2004,7 +2026,7 @@ impl Harness {
         );
         let invocation = InvocationStart {
             session_id: self.session.id.clone(),
-            invocation_id,
+            invocation_id: invocation_id.clone(),
             operation_id: self.operation_id.clone(),
             phase: phase_kind,
             actor_id: id.into(),
@@ -2047,7 +2069,10 @@ impl Harness {
                 Ok(())
             })
             .await?;
-        rx.await.context("actor response channel closed")?
+        Ok((
+            rx.await.context("actor response channel closed")??,
+            invocation_id,
+        ))
     }
 
     pub async fn run(&mut self, prompt: &str) -> Result<TurnOutput> {
@@ -2266,6 +2291,7 @@ impl Harness {
         let result = Box::pin(
             self.run_admitted(
                 prompt,
+                turn_id,
                 resolved_target,
                 &key,
                 &mut journal,
@@ -2298,9 +2324,14 @@ impl Harness {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the admitted turn ID stays distinct from journal and review authority"
+    )]
     async fn run_admitted(
         &mut self,
         prompt: &str,
+        turn_id: &str,
         target: Option<String>,
         journal_key: &str,
         journal: &mut TurnJournal,
@@ -2523,7 +2554,7 @@ impl Harness {
             };
             let request_round = u32::try_from(request_index + 1)
                 .context("speaking request round exceeds progress identity range")?;
-            let completion = self
+            let (completion, invocation_id) = self
                 .ask_controlled_with_progress(
                     &speaker,
                     inputs,
@@ -2648,11 +2679,18 @@ impl Harness {
                             .wait(async {
                                 Ok(self
                                     .tools
-                                    .execute_for_actor(
+                                    .execute_for_actor_with_context(
                                         &call.name,
                                         call.arguments.clone(),
                                         reviews.permission,
                                         reviews.instructions,
+                                        &kuru_connectors::ToolInvocationContext {
+                                            session_id: self.session.id.clone(),
+                                            turn_id: turn_id.to_owned(),
+                                            actor_id: speaker.clone(),
+                                            invocation_id: invocation_id.clone(),
+                                            call_id: call.id.clone(),
+                                        },
                                     )
                                     .await)
                             })

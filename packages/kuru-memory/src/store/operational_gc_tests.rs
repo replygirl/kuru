@@ -3,6 +3,50 @@ use serde_json::json;
 
 const TEST_DEADLINE: Duration = Duration::from_secs(10);
 
+#[test]
+fn candidate_failure_record_exposes_only_fixed_stage_and_sql_class() {
+    let error = anyhow::Error::new(CandidateRefRejected(CandidateRefRefusal::Changed))
+        .context(CandidateFailureStage::RefInspection)
+        .context("private branch and SQL text must not appear");
+    assert_eq!(
+        candidate_failure_record(&error).as_deref(),
+        Some(
+            "candidate_owner stage=ref_inspection class=non_sql sqlstate=none vendor=0 reason=other"
+        )
+    );
+}
+
+#[test]
+fn branch_rename_reason_requires_the_exact_pinned_dolt_error() {
+    const MESSAGE: &str = "unsafe to delete or rename branches in use in other sessions; use --force to force the change";
+    assert_eq!(
+        candidate_branch_rename_reason(CandidateFailureStage::BranchRename, "HY000", 1105, MESSAGE),
+        "branch_in_use"
+    );
+    for (stage, state, vendor, message) in [
+        (
+            CandidateFailureStage::BranchRename,
+            "HY000",
+            1105,
+            "another Dolt error",
+        ),
+        (CandidateFailureStage::RefInspection, "HY000", 1105, MESSAGE),
+        (CandidateFailureStage::BranchRename, "HY001", 1105, MESSAGE),
+        (CandidateFailureStage::BranchRename, "HY000", 1106, MESSAGE),
+        (
+            CandidateFailureStage::BranchRename,
+            "HY000",
+            1105,
+            "unsafe to delete or rename branches in use in other sessions; use --force to force the change: private branch",
+        ),
+    ] {
+        assert_eq!(
+            candidate_branch_rename_reason(stage, state, vendor, message),
+            "other"
+        );
+    }
+}
+
 #[tokio::test]
 async fn lost_receipt_reply_settles_and_remains_indexed_after_later_write() -> Result<()> {
     let store = MemoryStore::temporary().await?;
@@ -277,23 +321,321 @@ async fn held_candidate_view_delays_explicit_abandonment_without_losing_history(
         .await?;
     let names = CandidateNames::from_open(&candidate.view.branch)?;
     let target = candidate.view().revision().await?;
-    let (held, held_id) = owned_connection(&candidate.view.pool).await?;
-    let error = candidate
-        .abandon()
+    ensure_branch_clean(&store, &names.open).await?;
+    let source_pool = store.shared.server.pool(&names.open).await?;
+    let (mut held, held_id) = owned_connection(&source_pool).await?;
+    let database: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&mut held)
+        .await?;
+    let exact_session: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ? AND BINARY DB = BINARY ?",
+    )
+    .bind(held_id)
+    .bind(&database)
+    .fetch_one(store.pool.as_ref())
+    .await?;
+    assert_eq!(
+        exact_session, 1,
+        "held source session was not server-visible"
+    );
+    let wait_started = store.shared.server.observe_next_candidate_wait().await;
+    let waiting_store = store.clone();
+    let source = names.open.clone();
+    let status = names.abandoned.clone();
+    let expected = target.clone();
+    let waiting = tokio::spawn(async move {
+        transition_candidate_with_retirement_deadline(
+            &waiting_store,
+            &source,
+            &status,
+            &expected,
+            Duration::from_secs(2),
+        )
         .await
-        .expect_err("live candidate session permitted force cleanup");
-    assert!(format!("{error:#}").contains("in use"));
+    });
+    tokio::time::timeout(TEST_DEADLINE, wait_started)
+        .await
+        .context("held source session was not observed by the retirement wait")??;
+    let error = tokio::time::timeout(TEST_DEADLINE, waiting)
+        .await??
+        .expect_err("live candidate session permitted status rename");
+    assert!(
+        format!("{error:#}").contains("candidate source session retirement deadline exceeded"),
+        "held source session did not cause bounded pre-rename refusal"
+    );
+    let record = candidate_failure_record(&error)
+        .context("held-session refusal lost its fixed owner-stage diagnostic")?;
+    assert_eq!(
+        record,
+        "candidate_owner stage=pool_retirement class=non_sql sqlstate=none vendor=0 reason=other",
+        "held-session refusal was not classified before branch rename"
+    );
+    eprintln!("{record}");
     let heads = candidate_heads(&store.pool, &names).await?;
     assert_eq!(heads.get(&names.open), Some(&target));
     assert!(!heads.contains_key(&names.abandoned));
     assert!(store.history("candidate history", 10).await?.is_empty());
+    assert!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none()
+    );
 
+    let exact_session: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ? AND BINARY DB = BINARY ?",
+    )
+    .bind(held_id)
+    .bind(&database)
+    .fetch_one(store.pool.as_ref())
+    .await?;
+    assert_eq!(exact_session, 1, "held source session ended before refusal");
     drop(held);
     await_session_end(&store.pool, held_id, TEST_DEADLINE).await?;
+    drop(source_pool);
     tokio::time::timeout(TEST_DEADLINE, candidate.abandon()).await??;
     assert!(candidate_heads(&store.pool, &names).await?.is_empty());
     store.put("after held view", &json!(true)).await?;
     store.close().await
+}
+
+#[tokio::test]
+async fn candidate_source_admission_waits_for_server_session_before_status_rename() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let candidate = store.begin_candidate("source admission fence").await?;
+    candidate
+        .view()
+        .put("candidate effect", &json!(true))
+        .await?;
+    let names = CandidateNames::from_open(&candidate.view.branch)?;
+    let target = candidate.view().revision().await?;
+    let pool = candidate.view.pool.clone();
+    let (mut held, id) = owned_connection(&pool).await?;
+    let source_database: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&mut held)
+        .await?;
+    assert!(
+        source_database == format!("kuru/{}", names.open),
+        "candidate session selected the wrong database"
+    );
+    let observed_database: Option<String> =
+        sqlx::query_scalar("SELECT DB FROM information_schema.processlist WHERE ID = ?")
+            .bind(id)
+            .fetch_one(store.pool.as_ref())
+            .await?;
+    assert!(
+        observed_database.as_deref() == Some(source_database.as_str()),
+        "held candidate session has the wrong processlist database"
+    );
+
+    let transition_store = store.clone();
+    let source = names.open.clone();
+    let status = names.promoting.clone();
+    let expected = target.clone();
+    let wait_started = store.shared.server.observe_next_candidate_wait().await;
+    let mut transition = tokio::spawn(async move {
+        transition_candidate(&transition_store, &source, &status, &expected).await
+    });
+    tokio::time::timeout(TEST_DEADLINE, wait_started)
+        .await
+        .context("candidate pool was not retired before the server-session wait")??;
+    assert!(
+        pool.is_closed(),
+        "candidate pool stayed open at the wait boundary"
+    );
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.processlist WHERE BINARY DB = BINARY ?",
+    )
+    .bind(&source_database)
+    .fetch_one(store.pool.as_ref())
+    .await?;
+    assert!(active > 0, "held candidate session was not server-visible");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), &mut transition)
+            .await
+            .is_err(),
+        "status rename completed while its source session remained active"
+    );
+    assert_eq!(
+        candidate_heads(&store.pool, &names).await?.get(&names.open),
+        Some(&target)
+    );
+    assert!(
+        !candidate_heads(&store.pool, &names)
+            .await?
+            .contains_key(&names.promoting)
+    );
+    assert!(
+        store
+            .shared
+            .uncertain
+            .lock()
+            .expect("uncertain lock")
+            .is_none()
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            store.shared.server.fence_pool(&names.open),
+        )
+        .await
+        .is_err(),
+        "source admission guard was not held during the server-session wait"
+    );
+
+    let server = store.shared.server.clone();
+    let blocked_source = names.open.clone();
+    let (attempted, attempt_started) = tokio::sync::oneshot::channel();
+    let mut source_acquisition = tokio::spawn(async move {
+        let _ = attempted.send(());
+        server.pool(&blocked_source).await
+    });
+    tokio::time::timeout(TEST_DEADLINE, attempt_started).await??;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), &mut source_acquisition)
+            .await
+            .is_err(),
+        "a new source pool crossed the status-transition fence"
+    );
+    let unrelated =
+        tokio::time::timeout(TEST_DEADLINE, store.shared.server.pool(&store.branch)).await??;
+    drop(unrelated);
+
+    drop(held);
+    await_session_end(&store.pool, id, TEST_DEADLINE).await?;
+    tokio::time::timeout(TEST_DEADLINE, transition).await???;
+    assert!(
+        tokio::time::timeout(TEST_DEADLINE, source_acquisition)
+            .await??
+            .is_err(),
+        "the retired source branch became available again after status rename"
+    );
+    let heads = candidate_heads(&store.pool, &names).await?;
+    assert!(heads.get(&names.promoting) == Some(&target));
+    assert!(!heads.contains_key(&names.open));
+    drop(candidate);
+    store.close().await
+}
+
+#[tokio::test]
+async fn candidate_pool_retirement_observes_exact_server_sessions_before_rename() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let observation = async {
+        let candidate = store.begin_candidate("retirement observation").await?;
+        candidate
+            .view()
+            .put("candidate write", &json!(true))
+            .await?;
+        let names = CandidateNames::from_open(&candidate.view.branch)?;
+        let target = candidate.view().revision().await?;
+        let pool = candidate.view.pool.clone();
+
+        // Keep all four pool permits checked out together. Repeated queries on one
+        // idle connection would not identify a different session in the same pool.
+        let mut connections = Vec::new();
+        let mut ids = BTreeSet::new();
+        for _ in 0..4 {
+            let mut connection = pool.acquire().await?;
+            let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(&mut *connection)
+                .await?;
+            let database: String = sqlx::query_scalar("SELECT DATABASE()")
+                .fetch_one(&mut *connection)
+                .await?;
+            assert!(
+                database == format!("kuru/{}", names.open),
+                "candidate session database mismatch"
+            );
+            assert!(
+                ids.insert(id),
+                "candidate pool reused a checked-out session"
+            );
+            let observed: Option<String> =
+                sqlx::query_scalar("SELECT DB FROM information_schema.processlist WHERE ID = ?")
+                    .bind(id)
+                    .fetch_one(store.pool.as_ref())
+                    .await?;
+            assert!(
+                observed.as_deref() == Some(database.as_str()),
+                "candidate processlist database mismatch"
+            );
+            connections.push(connection);
+        }
+        assert_eq!(ids.len(), 4);
+        drop(connections);
+
+        store.shared.server.retire_pool(&names.open).await?;
+        let mut active_after_close = 0;
+        for id in ids {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ?",
+            )
+            .bind(id)
+            .fetch_one(store.pool.as_ref())
+            .await?;
+            assert!(active <= 1);
+            active_after_close += active;
+        }
+        eprintln!(
+            "candidate_retirement stage=after_pool_close active_sessions={active_after_close}"
+        );
+
+        if let Err(error) =
+            transition_candidate(&store, &names.open, &names.promoting, &target).await
+        {
+            let mut sqlstate = "none";
+            let mut vendor = 0;
+            for cause in error.chain() {
+                if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>() {
+                    if let Some(mysql) =
+                        database.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                    {
+                        sqlstate = mysql
+                            .code()
+                            .filter(|code| {
+                                code.len() == 5
+                                    && code.bytes().all(|byte| {
+                                        byte.is_ascii_uppercase() || byte.is_ascii_digit()
+                                    })
+                            })
+                            .unwrap_or("other");
+                        vendor = mysql.number();
+                    }
+                    break;
+                }
+            }
+            eprintln!(
+                "candidate_retirement stage=rename_failed sqlstate={sqlstate} vendor={vendor}"
+            );
+            let heads = candidate_heads(&store.pool, &names).await?;
+            assert!(
+                heads.get(&names.open) == Some(&target),
+                "failed candidate rename changed the source head"
+            );
+            assert!(!heads.contains_key(&names.promoting));
+            bail!("candidate retirement stage=rename_failed sqlstate={sqlstate} vendor={vendor}");
+        }
+        eprintln!("candidate_retirement stage=rename_succeeded");
+        let heads = candidate_heads(&store.pool, &names).await?;
+        assert!(
+            heads.get(&names.promoting) == Some(&target),
+            "successful candidate rename lost the status head"
+        );
+        assert!(!heads.contains_key(&names.open));
+        ensure!(
+            active_after_close == 0,
+            "candidate retirement left an owned server session active before rename"
+        );
+        drop(pool);
+        drop(candidate);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let closed = store.close().await;
+    observation?;
+    closed
 }
 
 #[tokio::test]

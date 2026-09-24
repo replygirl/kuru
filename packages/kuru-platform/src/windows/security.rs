@@ -6,7 +6,7 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LocalFree};
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
@@ -15,9 +15,14 @@ use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
     DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
     GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetTokenInformation, INHERIT_ONLY_ACE,
-    IsValidAcl, IsValidSecurityDescriptor, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_OWNER,
-    TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser, WinCreatorOwnerRightsSid,
+    INHERITED_ACE, IsValidAcl, IsValidSecurityDescriptor, IsValidSid, IsWellKnownSid,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+    SECURITY_ATTRIBUTES, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+    UNPROTECTED_DACL_SECURITY_INFORMATION, WinCreatorOwnerRightsSid,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile, WRITE_OWNER,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -379,6 +384,10 @@ pub(crate) fn require_private(
 
 pub(crate) fn set_private(handle: BorrowedHandle<'_>, access_mask: u32) -> io::Result<()> {
     require_private(handle, false)?;
+    apply_private_dacl(handle, access_mask)
+}
+
+fn apply_private_dacl(handle: BorrowedHandle<'_>, access_mask: u32) -> io::Result<()> {
     let security = PrivateSecurity::new(access_mask, false)?;
     // SAFETY: the handle and security allocation remain live for this call;
     // setting only the DACL does not change the already-validated owner.
@@ -400,14 +409,407 @@ pub(crate) fn set_private(handle: BorrowedHandle<'_>, access_mask: u32) -> io::R
     }
 }
 
+/// Copy a held regular file's current effective DACL.
+/// The caller keeps the destination behind a checked private directory until
+/// publication, so broad access does not expose staged payload bytes.
+fn canonical_access_token(
+    protected: bool,
+    owner: &[u8],
+    dacl: &[u8],
+    used_bytes: usize,
+    ace_count: u32,
+) -> io::Result<Vec<u8>> {
+    if dacl.len() < size_of::<ACL>() || !(size_of::<ACL>()..=dacl.len()).contains(&used_bytes) {
+        return Err(denied("file DACL used extent is invalid"));
+    }
+    // A NULL DACL is refused by file_access_token before this point. Preserve
+    // the revision, count, and every ordered ACE byte, but not AclSize's free
+    // allocation space or reserved ACL-header padding.
+    let ace_bytes = &dacl[size_of::<ACL>()..used_bytes];
+    let mut token = Vec::with_capacity(1 + 4 + owner.len() + 1 + 4 + 4 + ace_bytes.len());
+    token.push(u8::from(protected));
+    token.extend_from_slice(&(owner.len() as u32).to_le_bytes());
+    token.extend_from_slice(owner);
+    token.push(dacl[0]);
+    token.extend_from_slice(&ace_count.to_le_bytes());
+    token.extend_from_slice(&(ace_bytes.len() as u32).to_le_bytes());
+    token.extend_from_slice(ace_bytes);
+    Ok(token)
+}
+
+/// Compare a retired regular file's policy after Windows removes its last
+/// name. Only the inherited-ACE provenance bit is irrelevant to access on an
+/// already-unlinked file; the caller must separately prove the retained file
+/// is delete-pending with zero links. Every other ordered ACE byte, including
+/// inherit-only/effective status and unknown payloads, remains significant.
+pub(crate) fn same_retired_file_access(before: &[u8], after: &[u8]) -> bool {
+    fn without_inherited_provenance(token: &[u8]) -> Option<Vec<u8>> {
+        let mut token = token.to_vec();
+        let owner_len = u32::from_le_bytes(token.get(1..5)?.try_into().ok()?) as usize;
+        let owner_end = 5usize.checked_add(owner_len)?;
+        let count =
+            u32::from_le_bytes(token.get(owner_end + 1..owner_end + 5)?.try_into().ok()?) as usize;
+        let ace_len =
+            u32::from_le_bytes(token.get(owner_end + 5..owner_end + 9)?.try_into().ok()?) as usize;
+        let mut cursor = owner_end.checked_add(9)?;
+        if cursor.checked_add(ace_len)? != token.len() || count > ace_len / 4 {
+            return None;
+        }
+        for _ in 0..count {
+            let size =
+                u16::from_le_bytes(token.get(cursor + 2..cursor + 4)?.try_into().ok()?) as usize;
+            let end = cursor.checked_add(size)?;
+            if size < 4 || end > token.len() {
+                return None;
+            }
+            token[cursor + 1] &= !(INHERITED_ACE as u8);
+            cursor = end;
+        }
+        (cursor == token.len()).then_some(token)
+    }
+
+    match (
+        without_inherited_provenance(before),
+        without_inherited_provenance(after),
+    ) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
+    }
+}
+
+pub(crate) fn file_access_token(source: BorrowedHandle<'_>) -> io::Result<Vec<u8>> {
+    let mut owner = null_mut();
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the retained source handle stays live; the returned component
+    // pointers borrow the one descriptor allocation retained below.
+    let status = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalMemory(descriptor);
+    if descriptor.0.is_null() || owner.is_null() || dacl.is_null() {
+        return Err(denied("file access descriptor is incomplete"));
+    }
+    // SAFETY: GetSecurityInfo returned a complete retained descriptor.
+    if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 || unsafe { IsValidAcl(dacl) } == 0 {
+        return Err(denied("file access descriptor is invalid"));
+    }
+    // SAFETY: the descriptor was validated and remains allocated.
+    let bytes = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
+    if !(size_of::<ACL>()..=131_072).contains(&bytes) {
+        return Err(denied("file access descriptor exceeds bound"));
+    }
+    // SAFETY: bounded_sid validates the complete SID extent in this allocation.
+    unsafe { bounded_sid(owner, descriptor.0.cast(), bytes)? };
+    let sid_len = 8 + (unsafe { *owner.cast::<u8>().add(1) } as usize) * 4;
+    let start = descriptor.0 as usize;
+    let end = start
+        .checked_add(bytes)
+        .ok_or_else(|| denied("file access descriptor extent overflow"))?;
+    let acl_start = dacl as usize;
+    if acl_start < start
+        || acl_start
+            .checked_add(size_of::<ACL>())
+            .is_none_or(|v| v > end)
+    {
+        return Err(denied("file DACL lies outside its descriptor"));
+    }
+    // SAFETY: the fixed ACL header is inside the retained descriptor.
+    let acl_len = unsafe { (*dacl).AclSize } as usize;
+    if acl_len < size_of::<ACL>() || acl_start.checked_add(acl_len).is_none_or(|v| v > end) {
+        return Err(denied("file DACL exceeds its descriptor"));
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: the output slots are writable and the descriptor is retained.
+    checked_bool(unsafe {
+        GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision)
+    })?;
+    // SAFETY: IsValidAcl checked the DACL, and the integer-only result has
+    // exactly the native structure's writable extent.
+    let mut information: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+    checked_bool(unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    })?;
+    let used_bytes = information.AclBytesInUse as usize;
+    if information.AceCount != u32::from(unsafe { (*dacl).AceCount }) {
+        return Err(denied("file DACL entry count is inconsistent"));
+    }
+    // SAFETY: owner and DACL extents were checked against the retained
+    // descriptor above; the canonical encoder copies only within those bounds.
+    canonical_access_token(
+        control & SE_DACL_PROTECTED != 0,
+        unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), sid_len) },
+        unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), acl_len) },
+        used_bytes,
+        information.AceCount,
+    )
+}
+
+pub(crate) fn copy_file_dacl(
+    source: BorrowedHandle<'_>,
+    staged: BorrowedHandle<'_>,
+) -> io::Result<()> {
+    let (source_owner_descriptor, source_owner) = file_owner(source)?;
+    // SAFETY: file_owner validated source_owner inside the retained descriptor.
+    unsafe { assign_staged_owner(staged, source_owner)? };
+    require_same_file_owner(source, staged)?;
+    drop(source_owner_descriptor);
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the source handle remains live; the component pointer borrows
+    // the single descriptor allocation retained below.
+    let status = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalMemory(descriptor);
+    if descriptor.0.is_null() || dacl.is_null() {
+        return Err(denied("source file has no bounded DACL"));
+    }
+    // SAFETY: GetSecurityInfo returned a complete retained descriptor.
+    if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 || unsafe { IsValidAcl(dacl) } == 0 {
+        return Err(denied("source file has an invalid DACL"));
+    }
+    // SAFETY: both file handles and the descriptor stay live throughout the
+    // call; only the DACL is copied, never ownership. Protect the staged copy
+    // so inheritance from its private parent cannot replace the captured ACEs.
+    let status = unsafe {
+        SetSecurityInfo(
+            staged.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
+fn file_owner(handle: BorrowedHandle<'_>) -> io::Result<(LocalMemory, PSID)> {
+    let mut sid = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the handle stays live and both output pointers borrow the one
+    // descriptor allocation retained immediately below.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut sid,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalMemory(descriptor);
+    if descriptor.0.is_null() || sid.is_null() {
+        return Err(denied("file has no checked owner"));
+    }
+    // SAFETY: GetSecurityInfo returned the complete retained descriptor.
+    if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 {
+        return Err(denied("invalid file-owner descriptor"));
+    }
+    // SAFETY: the SID pointer borrows this validated descriptor allocation.
+    let bytes = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
+    unsafe { bounded_sid(sid, descriptor.0.cast(), bytes)? };
+    Ok((descriptor, sid))
+}
+
+/// `owner` must be a validated SID retained for the duration of this call.
+unsafe fn require_assignable_file_owner(owner: PSID) -> io::Result<()> {
+    let user = CurrentUser::read()?;
+    let default_owner = CurrentUser::owner()?;
+    // SAFETY: callers retain and validate the owner SID; both token queries
+    // validate and retain their complete SID allocations.
+    if unsafe { EqualSid(owner, user.sid()?) } != 0
+        || unsafe { EqualSid(owner, default_owner.sid()?) } != 0
+    {
+        Ok(())
+    } else {
+        Err(denied(
+            "source file owner is not assignable by the current process token",
+        ))
+    }
+}
+
+/// `source_owner` must be a validated SID retained through this handoff.
+unsafe fn assign_staged_owner(staged: BorrowedHandle<'_>, source_owner: PSID) -> io::Result<()> {
+    // The original staged handle deliberately lacks WRITE_OWNER. It still
+    // proves that this exact object is private before a short-lived reopen adds
+    // only the authority needed for the owner handoff.
+    require_private(staged, false)?;
+    // SAFETY: the caller retains the validated source SID through this call.
+    unsafe { require_assignable_file_owner(source_owner)? };
+    // SAFETY: ReOpenFile derives the new handle from the retained exact file
+    // object, not a pathname. The original movable handle already shares read,
+    // write and delete; the reopened handle is immediately RAII-owned.
+    let owner_handle = unsafe {
+        ReOpenFile(
+            staged.as_raw_handle(),
+            WRITE_OWNER,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if owner_handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful ReOpenFile transfers one unique owned handle.
+    let owner_handle = unsafe { OwnedHandle::from_raw_handle(owner_handle) };
+    // SAFETY: the retained source descriptor owns source_owner through this
+    // call; only this exact staged object's owner is changed.
+    let status = unsafe {
+        SetSecurityInfo(
+            owner_handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            source_owner,
+            null_mut(),
+            null_mut(),
+            null(),
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    drop(owner_handle);
+    // On elevated tokens, assigning the distinct TokenOwner can normalize an
+    // effective zero-mask OWNER RIGHTS ACE into an inherit-only ACE. Restore
+    // the identical protected private policy through the retained WRITE_DAC
+    // handle before this stage can reach a source-DACL copy or publication.
+    apply_private_dacl(staged, FILE_ALL_ACCESS)?;
+    // A distinct TokenOwner is accepted only after the staged DACL again has
+    // the effective OWNER RIGHTS suppression required by private_status.
+    require_private(staged, false)
+}
+
+fn require_same_file_owner(
+    source: BorrowedHandle<'_>,
+    staged: BorrowedHandle<'_>,
+) -> io::Result<()> {
+    let (source_descriptor, source_sid) = file_owner(source)?;
+    let (staged_descriptor, staged_sid) = file_owner(staged)?;
+    // SAFETY: both validated SIDs remain inside their retained allocations.
+    let same = unsafe { EqualSid(source_sid, staged_sid) } != 0;
+    drop((source_descriptor, staged_descriptor));
+    if same {
+        Ok(())
+    } else {
+        Err(denied("staged file cannot preserve source owner access"))
+    }
+}
+
+/// Complete the access-policy handoff after the staged file has moved under
+/// its actual destination parent. Protected source ACLs are already final;
+/// unprotected sources must regain inheritance from that destination parent.
+pub(crate) fn restore_file_dacl_inheritance(
+    source: BorrowedHandle<'_>,
+    published: BorrowedHandle<'_>,
+) -> io::Result<()> {
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: the source handle stays live and the DACL borrows the one retained
+    // descriptor allocation below.
+    let status = unsafe {
+        GetSecurityInfo(
+            source.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalMemory(descriptor);
+    if descriptor.0.is_null() || dacl.is_null() {
+        return Err(denied("source file has no bounded DACL"));
+    }
+    // SAFETY: the complete descriptor and DACL remain owned and live here.
+    if unsafe { IsValidSecurityDescriptor(descriptor.0) } == 0 || unsafe { IsValidAcl(dacl) } == 0 {
+        return Err(denied("source file has an invalid DACL"));
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: control and revision are writable output slots.
+    checked_bool(unsafe {
+        GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision)
+    })?;
+    if control & SE_DACL_PROTECTED != 0 {
+        return Ok(());
+    }
+    // SAFETY: published is the retained WRITE_DAC file handle after the checked
+    // move; setting its unprotected DACL now inherits from the real parent.
+    let status = unsafe {
+        SetSecurityInfo(
+            published.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs::{Directory, NameRetention, Privacy};
     use std::ffi::OsStr;
     use std::fs::File;
-    use std::io::Write;
-    use std::os::windows::io::AsHandle;
+    use std::io::{Read, Seek, Write};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsHandle, BorrowedHandle};
     use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
 
     fn descriptor(sddl: &str) -> PrivateSecurity {
@@ -428,12 +830,73 @@ mod tests {
         }
     }
 
-    fn set_dacl(file: &File, dacl: *const ACL) {
-        // SAFETY: the fixture owns a WRITE_DAC handle and keeps the descriptor
-        // alive; a null pointer intentionally constructs a real null-DACL case.
+    #[test]
+    fn retired_access_comparison_ignores_only_inherited_ace_provenance() {
+        fn token(flags: u8, mask: u32, payload: [u8; 4]) -> Vec<u8> {
+            let mut dacl = vec![2, 0, 0, 0, 0, 0, 1, 0];
+            dacl.extend_from_slice(&[ACCESS_ALLOWED_ACE_TYPE as u8, flags, 12, 0]);
+            dacl.extend_from_slice(&mask.to_le_bytes());
+            dacl.extend_from_slice(&payload);
+            let size = u16::try_from(dacl.len()).unwrap().to_le_bytes();
+            dacl[2..4].copy_from_slice(&size);
+            canonical_access_token(false, &[1, 2], &dacl, dacl.len(), 1).unwrap()
+        }
+
+        let inherited = token(INHERITED_ACE as u8, 0x12, [3, 4, 5, 6]);
+        let explicit = token(0, 0x12, [3, 4, 5, 6]);
+        assert!(same_retired_file_access(&inherited, &inherited));
+        assert!(same_retired_file_access(&inherited, &explicit));
+        assert!(same_retired_file_access(&explicit, &inherited));
+        assert!(!same_retired_file_access(
+            &inherited,
+            &token(INHERIT_ONLY_ACE as u8, 0x12, [3, 4, 5, 6])
+        ));
+        for flag in [0x01, 0x02, 0x04, 0x20, 0x80] {
+            assert!(!same_retired_file_access(
+                &inherited,
+                &token(flag, 0x12, [3, 4, 5, 6])
+            ));
+        }
+        assert!(!same_retired_file_access(
+            &inherited,
+            &token(0, 0x13, [3, 4, 5, 6])
+        ));
+        assert!(!same_retired_file_access(
+            &inherited,
+            &token(0, 0x12, [3, 4, 5, 7])
+        ));
+        for offset in [0, 5, 7, 8] {
+            let mut changed = explicit.clone();
+            changed[offset] ^= 1;
+            assert!(!same_retired_file_access(&inherited, &changed));
+        }
+        for offset in [16, 18] {
+            let mut changed = explicit.clone();
+            changed[offset] ^= 1; // ACE type or size, respectively.
+            assert!(!same_retired_file_access(&inherited, &changed));
+        }
+        let mut two_aces = explicit.clone();
+        two_aces[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        two_aces[12..16].copy_from_slice(&24_u32.to_le_bytes());
+        two_aces.extend_from_slice(&[ACCESS_ALLOWED_ACE_TYPE as u8, 0, 12, 0]);
+        two_aces.extend_from_slice(&0x34_u32.to_le_bytes());
+        two_aces.extend_from_slice(&[7, 8, 9, 10]);
+        let mut reordered = two_aces.clone();
+        reordered[16..28].copy_from_slice(&two_aces[28..40]);
+        reordered[28..40].copy_from_slice(&two_aces[16..28]);
+        assert!(!same_retired_file_access(&two_aces, &reordered));
+        assert!(!same_retired_file_access(
+            &inherited,
+            &explicit[..explicit.len() - 1]
+        ));
+    }
+
+    fn set_dacl_on_handle(handle: BorrowedHandle<'_>, dacl: *const ACL) {
+        // SAFETY: the fixture retains the exact checked DACL handle and keeps
+        // the descriptor alive; null intentionally constructs a null-DACL case.
         let result = unsafe {
             SetSecurityInfo(
-                file.as_raw_handle(),
+                handle.as_raw_handle(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 null_mut(),
@@ -442,7 +905,39 @@ mod tests {
                 null(),
             )
         };
-        assert_eq!(result, 0, "fixture SetSecurityInfo failed: {result}");
+        assert_eq!(
+            result,
+            0,
+            "fixture SetSecurityInfo failed: {}",
+            io::Error::from_raw_os_error(result as i32)
+        );
+    }
+
+    fn set_dacl(file: &File, dacl: *const ACL) {
+        use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+
+        // The production source handle intentionally needs only READ_CONTROL.
+        // Reopen this retained exact fixture object with the checked read and
+        // test-only mutation rights instead of changing production source-open
+        // authority.
+        // SAFETY: ReOpenFile derives the new handle from this retained object.
+        let dacl_handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                READ_CONTROL | WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        assert_ne!(
+            dacl_handle,
+            INVALID_HANDLE_VALUE,
+            "fixture ReOpenFile failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: successful ReOpenFile transfers one unique owned handle.
+        let dacl_handle = unsafe { OwnedHandle::from_raw_handle(dacl_handle) };
+        set_dacl_on_handle(dacl_handle.as_handle(), dacl);
     }
 
     fn security_text(file: &File) -> String {
@@ -484,6 +979,101 @@ mod tests {
             std::slice::from_raw_parts(text, length.saturating_sub(1) as usize)
         })
         .unwrap()
+    }
+
+    fn security_shape(file: &File) -> String {
+        let user = CurrentUser::read().unwrap();
+        let default_owner = CurrentUser::owner().unwrap();
+        let mut owner = null_mut();
+        let mut dacl = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: the fixture retains the file and the returned descriptor.
+        assert_eq!(
+            unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut owner,
+                    null_mut(),
+                    &mut dacl,
+                    null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        let descriptor = LocalMemory(descriptor);
+        let bytes = unsafe { GetSecurityDescriptorLength(descriptor.0) } as usize;
+        // SAFETY: the native descriptor owns the returned owner SID.
+        unsafe { bounded_sid(owner, descriptor.0.cast(), bytes) }.unwrap();
+        assert!(!dacl.is_null());
+        assert_ne!(unsafe { IsValidAcl(dacl) }, 0);
+        let owner = if unsafe { EqualSid(owner, user.sid().unwrap()) } != 0 {
+            "token-user"
+        } else if unsafe { EqualSid(owner, default_owner.sid().unwrap()) } != 0 {
+            "token-owner"
+        } else {
+            "other"
+        };
+        let mut information: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+        // SAFETY: GetSecurityInfo returned a live, validated DACL.
+        checked_bool(unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        })
+        .unwrap();
+        let mut aces = Vec::new();
+        for index in 0..information.AceCount {
+            let mut ace = null_mut();
+            // SAFETY: the index is bounded by the native ACL count.
+            checked_bool(unsafe { GetAce(dacl, index, &mut ace) }).unwrap();
+            let header = unsafe { ace.cast::<ACE_HEADER>().read_unaligned() };
+            if !matches!(
+                u32::from(header.AceType),
+                ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+            ) {
+                aces.push(format!(
+                    "type={:#04x},flags={:#04x},principal=unmodeled",
+                    header.AceType, header.AceFlags
+                ));
+                continue;
+            }
+            let entry = unsafe { ace.cast::<ACCESS_ALLOWED_ACE>().read_unaligned() };
+            let sid = (ace as *mut u8)
+                .wrapping_add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+                .cast();
+            // SAFETY: the complete ACE extent is bounded by the retained
+            // descriptor before its principal is categorized.
+            unsafe { bounded_sid(sid, ace.cast(), usize::from(header.AceSize)) }.unwrap();
+            let principal = if unsafe { IsWellKnownSid(sid, WinCreatorOwnerRightsSid) } != 0 {
+                "owner-rights"
+            } else if unsafe { EqualSid(sid, user.sid().unwrap()) } != 0 {
+                "token-user"
+            } else if unsafe { EqualSid(sid, default_owner.sid().unwrap()) } != 0 {
+                "token-owner"
+            } else {
+                "other"
+            };
+            aces.push(format!(
+                "type={:#04x},flags={:#04x},mask={:#010x},principal={principal}",
+                header.AceType, header.AceFlags, entry.Mask
+            ));
+        }
+        format!("owner={owner};aces=[{}]", aces.join(";"))
+    }
+
+    fn owners_equal(left: &File, right: &File) -> bool {
+        let (left_descriptor, left_owner) = file_owner(left.as_handle()).unwrap();
+        let (right_descriptor, right_owner) = file_owner(right.as_handle()).unwrap();
+        // SAFETY: both validated SIDs remain inside the retained descriptors.
+        let equal = unsafe { EqualSid(left_owner, right_owner) } != 0;
+        drop((left_descriptor, right_descriptor));
+        equal
     }
 
     fn default_owned_file(directory: &Directory) -> (File, bool) {
@@ -535,6 +1125,46 @@ mod tests {
         let user_owned = unsafe { EqualSid(owner, user.sid().unwrap()) } != 0;
         eprintln!("ordinary native child: TokenOwner equals TokenUser = {user_owned}");
         (file, user_owned)
+    }
+
+    #[test]
+    fn access_token_ignores_only_unused_acl_storage() {
+        let owner = [1, 1, 0, 0, 0, 0, 0, 5];
+        let dacl = [
+            2, 0, 24, 0, 1, 0, 0, 0, // ACL revision, allocated size, ACE count
+            0, 0, 16, 0, 1, 0, 0, 0, // ordered allow ACE and access mask
+            1, 1, 0, 0, 0, 0, 0, 5, // SID within that ACE
+        ];
+        let original = canonical_access_token(false, &owner, &dacl, 24, 1).unwrap();
+        let mut extra_capacity = dacl.to_vec();
+        extra_capacity[2..4].copy_from_slice(&32u16.to_le_bytes());
+        extra_capacity.extend_from_slice(&[0xa5; 8]);
+        assert_eq!(
+            original,
+            canonical_access_token(false, &owner, &extra_capacity, 24, 1).unwrap(),
+            "unused ACL allocation bytes changed the access policy token"
+        );
+
+        let mut changed_access = dacl;
+        changed_access[12] = 2;
+        assert_ne!(
+            original,
+            canonical_access_token(false, &owner, &changed_access, 24, 1).unwrap(),
+            "a changed ACE access mask was ignored"
+        );
+        assert_ne!(
+            original,
+            canonical_access_token(true, &owner, &dacl, 24, 1).unwrap()
+        );
+        assert_ne!(
+            original,
+            canonical_access_token(false, &[1, 1, 0, 0, 0, 0, 0, 6], &dacl, 24, 1).unwrap()
+        );
+        let empty_dacl = [2, 0, 8, 0, 0, 0, 0, 0];
+        assert_ne!(
+            original,
+            canonical_access_token(false, &owner, &empty_dacl, 8, 0).unwrap()
+        );
     }
 
     #[test]
@@ -655,6 +1285,353 @@ mod tests {
             b"ordinary candidate"
         );
         assert_eq!(security_text(&candidate), before);
+    }
+
+    #[test]
+    fn shielded_stage_copies_effective_acl_before_checked_publication() {
+        use crate::fs::{Publication, copy_file_access, finalize_file_access};
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap();
+        let source = parent.create_new(OsStr::new("original")).unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let broad = descriptor(&format!(
+            "O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)(A;;FR;;;OW)"
+        ));
+        set_dacl(&source, broad.dacl().unwrap());
+        let original_acl = security_text(&source);
+
+        let private = parent
+            .create_private_directory(OsStr::new(".kuru-edit-stage"))
+            .unwrap();
+        let mut candidate = private.create_new(OsStr::new("payload")).unwrap();
+        candidate.write_all(b"published bytes").unwrap();
+        let access = copy_file_access(&source, &candidate).unwrap();
+        assert!(owners_equal(&source, &candidate));
+        private.revalidate().unwrap();
+        assert!(private.read(OsStr::new("payload")).is_err());
+        assert_eq!(security_text(&candidate), original_acl);
+        let stage =
+            Directory::open(private.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        assert_eq!(stage.identity(), private.identity());
+        parent
+            .publish_file_with_access(
+                &stage,
+                OsStr::new("payload"),
+                &candidate,
+                &access,
+                OsStr::new("published"),
+                Publication::New,
+            )
+            .unwrap();
+        finalize_file_access(&source, &candidate).unwrap();
+        assert_eq!(
+            std::fs::read(project.join("published")).unwrap(),
+            b"published bytes"
+        );
+        assert_eq!(security_text(&candidate), original_acl);
+    }
+
+    #[test]
+    fn replacement_retains_private_delete_authority_across_restrictive_target_dacl() {
+        use crate::fs::{
+            Publication, copy_file_access, finalize_file_access, regular_file_info,
+            retained_file_info,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, READ_CONTROL, WRITE_DAC};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap();
+        let mut original = parent.create_new(OsStr::new("replace-me")).unwrap();
+        original.write_all(b"old bytes").unwrap();
+        let original_identity = regular_file_info(&original).unwrap().identity;
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        // The file itself deliberately grants no DELETE. The ordinary parent
+        // still grants the current user replacement through DELETE_CHILD.
+        let restrictive = descriptor(&format!("O:{sid}D:P(A;;FRFW;;;{sid})"));
+        set_dacl(&original, restrictive.dacl().unwrap());
+        let original_acl = security_text(&original);
+
+        let stage = parent
+            .create_private_directory(OsStr::new(".kuru-edit-restrictive"))
+            .unwrap();
+        let mut candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        candidate.write_all(b"new bytes").unwrap();
+        let candidate_identity = regular_file_info(&candidate).unwrap().identity;
+        let access = copy_file_access(&original, &candidate).unwrap();
+        assert_eq!(security_text(&candidate), original_acl);
+        // The private stage parent initially grants DELETE_CHILD, which can
+        // independently authorize a later DELETE open despite the file DACL.
+        // Remove only that alternative authority in this negative fixture;
+        // the retained pre-copy DELETE handle must still publish the candidate.
+        let stage_dacl = descriptor(&format!("O:{sid}D:P(A;;FRFW;;;{sid})"));
+        let stage_dacl_file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(stage.path())
+            .unwrap();
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let mut stage_id = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+        // SAFETY: FileIdInfo writes the entire correctly sized output record
+        // while the directory handle remains live.
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    stage_dacl_file.as_raw_handle(),
+                    FileIdInfo,
+                    stage_id.as_mut_ptr().cast(),
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                )
+            },
+            0,
+            "fixture could not identify its retained stage directory"
+        );
+        // SAFETY: the successful native call initialized the complete record.
+        let stage_id = unsafe { stage_id.assume_init() };
+        let mut stage_identity = [0u8; 24];
+        stage_identity[..8].copy_from_slice(&stage_id.VolumeSerialNumber.to_le_bytes());
+        stage_identity[8..].copy_from_slice(&stage_id.FileId.Identifier);
+        assert_eq!(stage_identity, stage.identity().to_bytes());
+        set_dacl_on_handle(stage_dacl_file.as_handle(), stage_dacl.dacl().unwrap());
+        // A late handle-only DELETE reopen cannot rely on the parent's
+        // DELETE_CHILD grant and must fail after the restrictive DACL copy.
+        // SAFETY: candidate is a live retained file handle and no successful
+        // handle is expected or adopted by this negative assertion.
+        let late_delete = unsafe {
+            ReOpenFile(
+                candidate.as_raw_handle(),
+                DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if late_delete != INVALID_HANDLE_VALUE {
+            // SAFETY: an unexpected successful ReOpenFile still transfers one
+            // unique handle which this failing fixture must close.
+            drop(unsafe { OwnedHandle::from_raw_handle(late_delete) });
+            panic!("restrictive target DACL unexpectedly grants file DELETE");
+        }
+        let source =
+            Directory::open(stage.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        parent
+            .publish_file_with_access(
+                &source,
+                OsStr::new("payload"),
+                &candidate,
+                &access,
+                OsStr::new("replace-me"),
+                Publication::ReplaceRegular,
+            )
+            .unwrap();
+        finalize_file_access(&original, &candidate).unwrap();
+
+        assert_eq!(
+            retained_file_info(&original).unwrap().identity,
+            original_identity
+        );
+        original.rewind().unwrap();
+        let mut old = Vec::new();
+        original.read_to_end(&mut old).unwrap();
+        assert_eq!(old, b"old bytes");
+        let published = parent.read(OsStr::new("replace-me")).unwrap();
+        assert_eq!(
+            regular_file_info(&published).unwrap().identity,
+            candidate_identity
+        );
+        assert_eq!(
+            std::fs::read(project.join("replace-me")).unwrap(),
+            b"new bytes"
+        );
+        assert_eq!(security_text(&candidate), original_acl);
+    }
+
+    #[test]
+    fn staged_access_token_rejects_a_held_source_dacl_change() {
+        use crate::fs::{copy_file_access, verify_file_access};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent =
+            Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        let source = parent.create_new(OsStr::new("source")).unwrap();
+        let stage = parent
+            .create_private_directory(OsStr::new("stage"))
+            .unwrap();
+        let candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        let token = copy_file_access(&source, &candidate).unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let changed = descriptor(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"));
+        set_dacl(&source, changed.dacl().unwrap());
+        assert!(verify_file_access(&source, &token).is_err());
+    }
+
+    #[test]
+    fn staged_owner_assignment_rejects_a_non_token_owner_without_changing_the_stage() {
+        use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let candidate = private.create_new(OsStr::new("payload")).unwrap();
+        let before = security_text(&candidate);
+        let foreign = descriptor("O:WDD:P(A;;FA;;;WD)");
+        let mut owner = null_mut();
+        let mut defaulted = 0;
+        // SAFETY: the fixture descriptor remains live and output slots are writable.
+        checked_bool(unsafe {
+            GetSecurityDescriptorOwner(foreign.descriptor.0, &mut owner, &mut defaulted)
+        })
+        .unwrap();
+        let bytes = unsafe { GetSecurityDescriptorLength(foreign.descriptor.0) } as usize;
+        // SAFETY: the fixture descriptor remains live and owns the returned SID.
+        unsafe { bounded_sid(owner, foreign.descriptor.0.cast(), bytes) }.unwrap();
+        // SAFETY: the owner SID was just bounded inside the retained descriptor.
+        assert!(unsafe { assign_staged_owner(candidate.as_handle(), owner) }.is_err());
+        assert_eq!(security_text(&candidate), before);
+        require_private(candidate.as_handle(), true).unwrap();
+    }
+
+    #[test]
+    fn staged_owner_assignment_retains_effective_owner_rights_privacy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let private = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        let (source, _) = default_owned_file(&private);
+        let candidate = private.create_new(OsStr::new("payload")).unwrap();
+        let (source_descriptor, source_owner) = file_owner(source.as_handle()).unwrap();
+        let before = security_shape(&candidate);
+        // SAFETY: source_descriptor retains the validated source owner SID.
+        let assigned = unsafe { assign_staged_owner(candidate.as_handle(), source_owner) };
+        let after = security_shape(&candidate);
+        assigned.unwrap_or_else(|error| {
+            panic!("staged owner assignment failed: {error}; before={before}; after={after}")
+        });
+        require_same_file_owner(source.as_handle(), candidate.as_handle()).unwrap();
+        require_private(candidate.as_handle(), true).unwrap();
+        assert!(security_text(&candidate).contains(";;;OW)"));
+        drop(source_descriptor);
+    }
+
+    #[test]
+    fn ordinary_create_and_unprotected_replacement_regain_parent_acl_inheritance() {
+        use crate::fs::{Publication, copy_file_access, finalize_file_access, retained_file_info};
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC,
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let parent = Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap();
+        let template = parent.create_new(OsStr::new("empty-template")).unwrap();
+        let private = parent
+            .create_private_directory(OsStr::new(".kuru-edit-stage"))
+            .unwrap();
+        let mut candidate = private.create_new(OsStr::new("payload")).unwrap();
+        candidate.write_all(b"payload").unwrap();
+        let default_matches_user = {
+            let user = CurrentUser::read().unwrap();
+            let default_owner = CurrentUser::owner().unwrap();
+            // SAFETY: both token query buffers retain validated SIDs.
+            (unsafe { EqualSid(user.sid().unwrap(), default_owner.sid().unwrap()) }) != 0
+        };
+        assert_eq!(owners_equal(&template, &candidate), default_matches_user);
+        let access = copy_file_access(&template, &candidate).unwrap();
+        assert!(owners_equal(&template, &candidate));
+        let stage =
+            Directory::open(private.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        parent
+            .publish_file_with_access(
+                &stage,
+                OsStr::new("payload"),
+                &candidate,
+                &access,
+                OsStr::new("created"),
+                Publication::New,
+            )
+            .unwrap();
+        finalize_file_access(&template, &candidate).unwrap();
+        let before = security_shape(&candidate);
+        assert_eq!(before, security_shape(&template));
+        assert_eq!(file_access_token(candidate.as_handle()).unwrap()[0], 0);
+
+        let parent_acl = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&project)
+            .unwrap();
+        let sid = CurrentUser::read().unwrap().sid_string().unwrap();
+        let changed = descriptor(&format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;WD)"));
+        set_dacl_on_handle(parent_acl.as_handle(), changed.dacl().unwrap());
+        let after = security_shape(&candidate);
+        assert_ne!(
+            after, before,
+            "published file stopped inheriting parent changes"
+        );
+        assert_eq!(
+            after,
+            security_shape(&template),
+            "published file inherited differently from ordinary template"
+        );
+
+        let original = parent.create_new(OsStr::new("replace-me")).unwrap();
+        let original_identity = crate::fs::regular_file_info(&original).unwrap().identity;
+        let replacement_stage = parent
+            .create_private_directory(OsStr::new(".kuru-edit-replacement"))
+            .unwrap();
+        let mut replacement = replacement_stage.create_new(OsStr::new("payload")).unwrap();
+        replacement.write_all(b"replacement").unwrap();
+        let access = copy_file_access(&original, &replacement).unwrap();
+        let replacement_source = Directory::open(
+            replacement_stage.path(),
+            Privacy::Inherited,
+            NameRetention::Movable,
+        )
+        .unwrap();
+        parent
+            .publish_file_with_access(
+                &replacement_source,
+                OsStr::new("payload"),
+                &replacement,
+                &access,
+                OsStr::new("replace-me"),
+                Publication::ReplaceRegular,
+            )
+            .unwrap();
+        assert_eq!(
+            retained_file_info(&original).unwrap().identity,
+            original_identity,
+            "retained replaced handle changed identity"
+        );
+        assert_eq!(
+            crate::fs::regular_file_info(&parent.read(OsStr::new("replace-me")).unwrap())
+                .unwrap()
+                .identity,
+            crate::fs::regular_file_info(&replacement).unwrap().identity,
+            "published name does not identify the retained replacement"
+        );
+        finalize_file_access(&original, &replacement).unwrap();
+        let replacement_before = security_shape(&replacement);
+        assert_eq!(replacement_before, security_shape(&template));
+        assert_eq!(file_access_token(replacement.as_handle()).unwrap()[0], 0);
+
+        let changed_again = descriptor(&format!("O:{sid}D:P(A;OICI;FA;;;{sid})"));
+        set_dacl_on_handle(parent_acl.as_handle(), changed_again.dacl().unwrap());
+        let replacement_after = security_shape(&replacement);
+        assert_ne!(
+            replacement_after, replacement_before,
+            "unprotected replacement stopped inheriting parent changes"
+        );
+        assert_eq!(
+            replacement_after,
+            security_shape(&template),
+            "unprotected replacement inherited differently from ordinary file"
+        );
     }
 
     #[test]

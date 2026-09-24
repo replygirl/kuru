@@ -40,6 +40,51 @@ use terminal::{READY_TIMEOUT, Terminal, startup_timeout};
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[test]
+fn real_pty_file_checkpoint_inspect_and_selected_undo() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let target = sandbox.project.join("checkpoint-note.txt");
+    std::fs::write(&target, "before")?;
+    let output = sandbox
+        .command("demo")
+        .args([
+            "--allow-write",
+            "tool",
+            "file_write",
+            "--args",
+            r#"{"path":"checkpoint-note.txt","content":"after"}"#,
+        ])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "fixture file write failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout)?;
+    let id = output
+        .trim()
+        .strip_prefix("file_write completed; checkpoint ")
+        .context("fixture write omitted checkpoint ID")?;
+    let mut command = sandbox.command("demo");
+    command.arg("--allow-write");
+    let mut terminal = Terminal::spawn(command, 35, 120)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command(&format!("/file-inspect {id}"), None)?;
+    terminal.wait_composer_frame(
+        &["checkpoint-note.txt", "applied", "enter send"],
+        READY_TIMEOUT,
+    )?;
+    terminal.command(&format!("/file-undo {id}"), None)?;
+    terminal.wait_composer_frame(&["undo", "applied", "enter send"], READY_TIMEOUT)?;
+    ensure!(
+        std::fs::read(&target)? == b"before",
+        "PTY undo did not restore the file"
+    );
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
 struct Sandbox {
     root: memory::ServiceCleanup,
     project: PathBuf,

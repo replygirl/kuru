@@ -9,9 +9,10 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use kuru_connectors::Provider;
+use kuru_connectors::{CheckpointStore, Provider, ToolHost};
 use kuru_core::{Completion, CompletionRequest, Config, Mode, ModelInfo, ToolCall};
 use kuru_memory::MemoryStore;
+use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde_json::{Value, json};
 
 use crate::Harness;
@@ -99,6 +100,8 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
     let temporary = tempfile::tempdir()?;
     let project = temporary.path().join("project 日本語");
     std::fs::create_dir(&project)?;
+    let project = project.canonicalize()?;
+    let checkpoint_data = tempfile::tempdir()?;
     let outside = temporary.path().join("outside.txt");
     std::fs::write(&outside, b"outside bytes must survive")?;
     std::fs::hard_link(&outside, project.join("alias"))?;
@@ -185,12 +188,22 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         dream_on_exit: false,
         ..Config::default()
     };
-    let mut harness = Harness::new(
+    let root = Arc::new(Directory::open(
+        &project,
+        Privacy::Inherited,
+        NameRetention::Movable,
+    )?);
+    let tools =
+        ToolHost::with_retained_root(root.clone(), &config)?.with_checkpoint_store(Arc::new(
+            CheckpointStore::new(&checkpoint_data.path().join("checkpoints"), root)?,
+        ))?;
+    let mut harness = Harness::with_tool_host(
         config,
         &project,
         MemoryStore::temporary().await?,
         replay.clone(),
         None,
+        tools,
     )
     .await?;
     let result = tokio::time::timeout(
@@ -236,11 +249,20 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         );
     }
     let receipts = &observed.receipts;
-    ensure!(
-        receipts["create"].starts_with("Wrote "),
-        "{}",
-        receipts["create"]
-    );
+    for (id, tool) in [
+        ("create", "file_write"),
+        ("delete", "file_delete"),
+        ("shell-delete", "file_delete"),
+    ] {
+        let prefix = format!("{tool} completed; checkpoint file-");
+        let checkpoint = receipts[id]
+            .strip_prefix(&prefix)
+            .with_context(|| format!("{id} receipt omitted its durable checkpoint"))?;
+        ensure!(
+            checkpoint.len() == 64 && checkpoint.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{id} receipt contained an invalid checkpoint ID"
+        );
+    }
     ensure!(
         receipts["read"] == literal,
         "file argument data was interpreted"
@@ -262,7 +284,7 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
                 "shell receipt was not JSON: {}; shell-read-has-written-bytes={}; shell-delete-succeeded={}",
                 receipts["shell"],
                 receipts["shell-read"] == "shell bytes",
-                receipts["shell-delete"] == "Deleted file"
+                receipts["shell-delete"].starts_with("file_delete completed; checkpoint file-")
             )
         })?;
     ensure!(
@@ -282,9 +304,6 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         receipts["shell-read"] == "shell bytes",
         "shell did not perform its authorized write"
     );
-    for id in ["delete", "shell-delete"] {
-        ensure!(receipts[id] == "Deleted file", "{id}: {}", receipts[id]);
-    }
     for id in [
         "traversal",
         "trailing",

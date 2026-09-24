@@ -248,6 +248,8 @@ name, or an outbound A2A configuration alias. MCP's provider-facing hashed tool
 name is not a permission selector. File patterns are anchored to the validated
 project-relative path; they cannot authorize an outside or protected target.
 Shell commands and MCP arguments do not have pattern matching.
+`file_edit` is an exact-context mutation and uses the same `file_write` native
+permission selector for its target; no separate path grant is inferred.
 
 Up to 128 rules are supported. File patterns contain at most 512 Unicode
 characters: `*` and `?` match within one path segment, while a whole-segment

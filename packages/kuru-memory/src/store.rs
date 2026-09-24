@@ -282,6 +282,95 @@ pub(crate) enum CandidateTransitionObservation {
 #[derive(Debug)]
 pub struct CandidateConflict;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CandidateFailureStage {
+    RefInspection,
+    SchemaValidation,
+    PoolRetirement,
+    WorkingSetInspection,
+    BranchRename,
+    OutcomeReconciliation,
+    Cleanup,
+    MainMerge,
+}
+
+impl CandidateFailureStage {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::RefInspection => "ref_inspection",
+            Self::SchemaValidation => "schema_validation",
+            Self::PoolRetirement => "pool_retirement",
+            Self::WorkingSetInspection => "working_set_inspection",
+            Self::BranchRename => "branch_rename",
+            Self::OutcomeReconciliation => "outcome_reconciliation",
+            Self::Cleanup => "cleanup",
+            Self::MainMerge => "main_merge",
+        }
+    }
+}
+
+impl std::fmt::Display for CandidateFailureStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+impl std::error::Error for CandidateFailureStage {}
+
+#[cfg(any(test, feature = "test-support"))]
+fn candidate_branch_rename_reason(
+    stage: CandidateFailureStage,
+    sqlstate: &str,
+    vendor: u16,
+    message: &str,
+) -> &'static str {
+    // Dolt 2.3.3's branch procedure returns this fixed message only when an
+    // active session prevents the checked rename. Keep its text private.
+    const BRANCH_IN_USE: &str = "unsafe to delete or rename branches in use in other sessions; use --force to force the change";
+    if matches!(stage, CandidateFailureStage::BranchRename)
+        && sqlstate == "HY000"
+        && vendor == 1105
+        && message == BRANCH_IN_USE
+    {
+        "branch_in_use"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn candidate_failure_record(error: &anyhow::Error) -> Option<String> {
+    let stage = error.downcast_ref::<CandidateFailureStage>()?;
+    let mut class = "non_sql";
+    let mut sqlstate = "none";
+    let mut vendor = 0;
+    let mut reason = "other";
+    if let Some(sqlx_error) = error.downcast_ref::<sqlx::Error>() {
+        class = "sqlx";
+        if let sqlx::Error::Database(database) = sqlx_error {
+            class = "database";
+            if let Some(mysql) = database.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
+                sqlstate = mysql
+                    .code()
+                    .filter(|code| {
+                        code.len() == 5
+                            && code
+                                .bytes()
+                                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                    })
+                    .unwrap_or("other");
+                vendor = mysql.number();
+                reason =
+                    candidate_branch_rename_reason(*stage, sqlstate, vendor, database.message());
+            }
+        }
+    }
+    Some(format!(
+        "candidate_owner stage={} class={class} sqlstate={sqlstate} vendor={vendor} reason={reason}",
+        stage.label()
+    ))
+}
+
 impl std::fmt::Display for CandidateConflict {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("dream candidate is stale: live memory changed since its base")
@@ -334,7 +423,9 @@ impl Candidate {
         // Keep accepted promotion alive if the UI cancels while awaiting its reply.
         tokio::spawn(async move {
             let _guard = guard;
-            let before = candidate_heads(&live.pool, &names).await?;
+            let before = candidate_heads(&live.pool, &names)
+                .await
+                .context(CandidateFailureStage::RefInspection)?;
             ensure!(
                 !before.contains_key(&names.abandoned),
                 "dream candidate was already abandoned"
@@ -359,7 +450,9 @@ impl Candidate {
                     if current != base {
                         return Err(CandidateConflict.into());
                     }
-                    ensure_branch_clean(&live, &names.open).await?;
+                    ensure_branch_clean(&live, &names.open)
+                        .await
+                        .context(CandidateFailureStage::WorkingSetInspection)?;
                     transition_candidate(&live, &names.open, &names.promoting, &target).await?;
                     target
                 }
@@ -367,8 +460,14 @@ impl Candidate {
             if current == target {
                 #[cfg(test)]
                 fail_candidate_cleanup_once(&live)?;
-                live.shared.server.retire_pool(&names.open).await?;
-                cleanup_promoted_candidate(&live, &names, &target).await?;
+                live.shared
+                    .server
+                    .retire_pool(&names.open)
+                    .await
+                    .context(CandidateFailureStage::PoolRetirement)?;
+                cleanup_promoted_candidate(&live, &names, &target)
+                    .await
+                    .context(CandidateFailureStage::Cleanup)?;
                 *promoted.lock().expect("candidate result lock") = Some(target.clone());
                 return Ok(target);
             }
@@ -392,15 +491,28 @@ impl Candidate {
             )
             .await;
             drop(connection);
-            let committed = live.resolve_uncertain().await? == Some(true);
+            let committed = live
+                .resolve_uncertain()
+                .await
+                .context(CandidateFailureStage::OutcomeReconciliation)?
+                == Some(true);
             if !committed {
-                result.context("Dolt promotion deadline exceeded")??;
+                result
+                    .context("Dolt promotion deadline exceeded")
+                    .context(CandidateFailureStage::MainMerge)?
+                    .context(CandidateFailureStage::MainMerge)?;
                 bail!("Dolt did not fast-forward to the candidate revision");
             }
             #[cfg(test)]
             fail_candidate_cleanup_once(&live)?;
-            live.shared.server.retire_pool(&names.open).await?;
-            cleanup_promoted_candidate(&live, &names, &target).await?;
+            live.shared
+                .server
+                .retire_pool(&names.open)
+                .await
+                .context(CandidateFailureStage::PoolRetirement)?;
+            cleanup_promoted_candidate(&live, &names, &target)
+                .await
+                .context(CandidateFailureStage::Cleanup)?;
             *promoted.lock().expect("candidate result lock") = Some(target.clone());
             Ok(target)
         })
@@ -433,19 +545,27 @@ impl Candidate {
         tokio::spawn(async move {
             let guard = live.shared.write.clone().lock_owned().await;
             let _guard = guard;
-            live.resolve_uncertain().await?;
+            live.resolve_uncertain()
+                .await
+                .context(CandidateFailureStage::OutcomeReconciliation)?;
             if promoted.lock().expect("candidate result lock").is_some() {
                 return Ok(());
             }
             if let Some(expected) = &expected_target {
-                let heads = candidate_heads(&live.pool, &names).await?;
+                let heads = candidate_heads(&live.pool, &names)
+                    .await
+                    .context(CandidateFailureStage::RefInspection)?;
                 ensure!(
                     heads.values().all(|head| head == expected),
                     CandidateConflict
                 );
                 ensure!(!heads.is_empty(), CandidateConflict);
             }
-            live.shared.server.retire_pool(&names.open).await?;
+            live.shared
+                .server
+                .retire_pool(&names.open)
+                .await
+                .context(CandidateFailureStage::PoolRetirement)?;
             abandon_candidate(&live, &names).await
         })
         .await
@@ -534,20 +654,35 @@ fn validate_candidate_pair(
 }
 
 async fn candidate_branch_is_clean(store: &MemoryStore, branch: &str) -> Result<bool> {
-    let pool = store.shared.server.pool(branch).await?;
+    let pool = store
+        .shared
+        .server
+        .pool(branch)
+        .await
+        .context(CandidateFailureStage::WorkingSetInspection)?;
     let result = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_status").fetch_one(pool.as_ref()),
     )
     .await
-    .context("candidate working-set inspection deadline exceeded")?;
-    let cleanup = store.shared.server.retire_pool(branch).await;
+    .context("candidate working-set inspection deadline exceeded")
+    .context(CandidateFailureStage::WorkingSetInspection)?;
+    let result = result
+        .map_err(anyhow::Error::from)
+        .context(CandidateFailureStage::WorkingSetInspection);
+    let cleanup = store
+        .shared
+        .server
+        .retire_pool(branch)
+        .await
+        .context(CandidateFailureStage::PoolRetirement);
     match (result, cleanup) {
         (Ok(dirty), Ok(())) => Ok(dirty == 0),
-        (Err(error), Ok(())) => Err(error.into()),
+        (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(cleanup)) => Err(anyhow::Error::from(error)
-            .context(format!("candidate pool cleanup also failed: {cleanup:#}"))),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("candidate pool cleanup also failed: {cleanup:#}")))
+        }
     }
 }
 
@@ -595,7 +730,32 @@ async fn transition_candidate(
     status: &str,
     expected: &str,
 ) -> Result<()> {
-    store.shared.server.retire_pool(source).await?;
+    transition_candidate_with_retirement_deadline(store, source, status, expected, QUERY_TIMEOUT)
+        .await
+}
+
+async fn transition_candidate_with_retirement_deadline(
+    store: &MemoryStore,
+    source: &str,
+    status: &str,
+    expected: &str,
+    retirement_deadline: Duration,
+) -> Result<()> {
+    let source_admission = store
+        .shared
+        .server
+        .fence_pool(source)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)?;
+    store
+        .shared
+        .server
+        .retire_pool(source)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)?;
+    await_branch_sessions_end(store, source, retirement_deadline)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)?;
     let (mut connection, id) = owned_connection(&store.pool).await?;
     *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
         pool: store.pool.clone(),
@@ -615,9 +775,19 @@ async fn transition_candidate(
     )
     .await;
     drop(connection);
-    let settled = store.resolve_uncertain().await? == Some(true);
+    let settled = store
+        .resolve_uncertain()
+        .await
+        .context(CandidateFailureStage::OutcomeReconciliation)?
+        == Some(true);
     let names = CandidateNames::from_status(status)?;
-    let heads = candidate_heads(&store.pool, &names).await?;
+    let heads = candidate_heads(&store.pool, &names)
+        .await
+        .context(CandidateFailureStage::RefInspection)?;
+    // A successful transition may inspect the source again to verify its clean
+    // working set. Release admission only after the rename is reconciled and
+    // the exact refs are read, before that later inspection can reopen a pool.
+    drop(source_admission);
     if settled {
         for branch in [source, status] {
             if heads.contains_key(branch) {
@@ -632,7 +802,10 @@ async fn transition_candidate(
             "candidate transition changed the source ref unexpectedly"
         );
     }
-    result.context("candidate status transition deadline exceeded")??;
+    result
+        .context("candidate status transition deadline exceeded")
+        .context(CandidateFailureStage::BranchRename)?
+        .context(CandidateFailureStage::BranchRename)?;
     bail!("candidate status transition did not retain its durable ref")
 }
 
@@ -772,7 +945,9 @@ async fn cleanup_abandoned_candidate(
 }
 
 async fn abandon_candidate(store: &MemoryStore, names: &CandidateNames) -> Result<()> {
-    let mut heads = candidate_heads(&store.pool, names).await?;
+    let mut heads = candidate_heads(&store.pool, names)
+        .await
+        .context(CandidateFailureStage::RefInspection)?;
     let target = if let Some(target) = heads.get(&names.abandoned) {
         target.clone()
     } else if let Some(target) = heads.get(&names.promoting) {
@@ -785,12 +960,18 @@ async fn abandon_candidate(store: &MemoryStore, names: &CandidateNames) -> Resul
             .get(&names.open)
             .context("dream candidate ref is missing")?
             .clone();
-        ensure_branch_clean(store, &names.open).await?;
+        ensure_branch_clean(store, &names.open)
+            .await
+            .context(CandidateFailureStage::WorkingSetInspection)?;
         transition_candidate(store, &names.open, &names.abandoned, &target).await?;
         target
     };
-    heads = candidate_heads(&store.pool, names).await?;
-    cleanup_abandoned_candidate(store, names, &target, &heads).await
+    heads = candidate_heads(&store.pool, names)
+        .await
+        .context(CandidateFailureStage::RefInspection)?;
+    cleanup_abandoned_candidate(store, names, &target, &heads)
+        .await
+        .context(CandidateFailureStage::Cleanup)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2022,14 +2203,21 @@ impl MemoryStore {
         let names = CandidateNames::from_open(branch)
             .map_err(|_| CandidateRefRejected(CandidateRefRefusal::Invalid))?;
         let _guard = self.shared.write.lock().await;
-        self.resolve_uncertain().await?;
-        let heads = candidate_heads(&self.pool, &names).await?;
+        self.resolve_uncertain()
+            .await
+            .context(CandidateFailureStage::OutcomeReconciliation)?;
+        let heads = candidate_heads(&self.pool, &names)
+            .await
+            .context(CandidateFailureStage::RefInspection)?;
         if heads.len() != 1
             || !heads
                 .get(&names.open)
                 .is_some_and(|head| head == expected_head)
         {
-            return Err(CandidateRefRejected(CandidateRefRefusal::Changed).into());
+            return Err(
+                anyhow::Error::new(CandidateRefRejected(CandidateRefRefusal::Changed))
+                    .context(CandidateFailureStage::RefInspection),
+            );
         }
         let base: String = tokio::time::timeout(
             QUERY_TIMEOUT,
@@ -2039,29 +2227,44 @@ impl MemoryStore {
                 .fetch_one(self.pool.as_ref()),
         )
         .await
-        .context("candidate abandonment base lookup deadline exceeded")??;
+        .context("candidate abandonment base lookup deadline exceeded")
+        .context(CandidateFailureStage::RefInspection)?
+        .context(CandidateFailureStage::RefInspection)?;
         if base != expected_base {
             return Err(CandidateRefRejected(CandidateRefRefusal::Changed).into());
         }
-        let pool = self.shared.server.pool(&names.open).await?;
+        let pool = self
+            .shared
+            .server
+            .pool(&names.open)
+            .await
+            .context(CandidateFailureStage::WorkingSetInspection)?;
         if Arc::strong_count(&pool) != 1 {
             return Err(CandidateRefRejected(CandidateRefRefusal::Active).into());
         }
         tokio::time::timeout(QUERY_TIMEOUT, migrations::validate_current(&pool))
             .await
-            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))?
-            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))?;
+            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))
+            .context(CandidateFailureStage::SchemaValidation)?
+            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))
+            .context(CandidateFailureStage::SchemaValidation)?;
         tokio::time::timeout(QUERY_TIMEOUT, pool.close())
             .await
-            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))?;
+            .map_err(|_| CandidateRefRejected(CandidateRefRefusal::SchemaUnverified))
+            .context(CandidateFailureStage::PoolRetirement)?;
         drop(pool);
-        let heads = candidate_heads(&self.pool, &names).await?;
+        let heads = candidate_heads(&self.pool, &names)
+            .await
+            .context(CandidateFailureStage::RefInspection)?;
         if heads.len() != 1
             || !heads
                 .get(&names.open)
                 .is_some_and(|head| head == expected_head)
         {
-            return Err(CandidateRefRejected(CandidateRefRefusal::Changed).into());
+            return Err(
+                anyhow::Error::new(CandidateRefRejected(CandidateRefRefusal::Changed))
+                    .context(CandidateFailureStage::RefInspection),
+            );
         }
         abandon_candidate(self, &names).await
     }
@@ -2627,6 +2830,32 @@ async fn await_session_end(pool: &MySqlPool, id: u64, duration: Duration) -> Res
     })
     .await
     .context("memory SQL session teardown deadline exceeded")?
+}
+
+async fn await_branch_sessions_end(
+    store: &MemoryStore,
+    branch: &str,
+    duration: Duration,
+) -> Result<()> {
+    let database = format!("kuru/{branch}");
+    tokio::time::timeout(duration, async {
+        loop {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.processlist WHERE BINARY DB = BINARY ?",
+            )
+            .bind(&database)
+            .fetch_one(store.pool.as_ref())
+            .await?;
+            if active == 0 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            #[cfg(test)]
+            store.shared.server.notify_candidate_wait().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("candidate source session retirement deadline exceeded")?
 }
 
 async fn operation_exists(pool: &MySqlPool, operation: &str) -> Result<bool> {

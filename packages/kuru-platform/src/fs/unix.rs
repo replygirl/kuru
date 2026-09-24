@@ -1,4 +1,32 @@
 use super::*;
+
+pub(super) fn file_access_token(source: &File) -> io::Result<Vec<u8>> {
+    let metadata = source.metadata()?;
+    let mut token = Vec::with_capacity(12);
+    token.extend_from_slice(&metadata.uid().to_le_bytes());
+    token.extend_from_slice(&metadata.gid().to_le_bytes());
+    token.extend_from_slice(&metadata.mode().to_le_bytes());
+    Ok(token)
+}
+
+pub(super) fn copy_file_access(source: &File, staged: &File) -> io::Result<()> {
+    let source_info = source.metadata()?;
+    let staged_info = staged.metadata()?;
+    if source_info.uid() != staged_info.uid() || source_info.gid() != staged_info.gid() {
+        return Err(denied(
+            "staged file cannot preserve source owner and group access",
+        ));
+    }
+    staged.set_permissions(source_info.permissions())
+}
+
+pub(super) fn prepare_file_replacement(_: &File) -> io::Result<Option<File>> {
+    Ok(None)
+}
+
+pub(super) fn finalize_file_access(_: &File, _: &File) -> io::Result<()> {
+    Ok(())
+}
 use rustix::fs::{
     AtFlags, Dir, Mode, OFlags, RenameFlags, mkdirat, openat, renameat, renameat_with, unlinkat,
 };
@@ -42,6 +70,10 @@ pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
         },
         directory: metadata.is_dir(),
     })
+}
+
+pub(super) fn retained_info(file: &File) -> io::Result<ObjectInfo> {
+    info(file)
 }
 
 pub(super) fn require_private(file: &File) -> io::Result<()> {
@@ -324,6 +356,8 @@ fn remove_children(
 pub(super) fn publish(
     source_parent: &File,
     source: &Path,
+    _: &File,
+    _: Option<&File>,
     destination_parent: &File,
     destination: &Path,
     policy: Publication,

@@ -19,7 +19,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use kuru_platform::{
-    fs::Directory,
+    fs::{Directory, NameRetention, Privacy},
     unix::{GroupPresence, OwnedProcessGroup, Reap, RootState, Termination},
 };
 use serde_json::json;
@@ -705,6 +705,13 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
         finish.complete(Err(error));
         return;
     }
+    let root_pin = match Directory::open(&root, Privacy::Inherited, NameRetention::Pinned) {
+        Ok(root_pin) => root_pin,
+        Err(error) => {
+            finish.complete(Err(error.into()));
+            return;
+        }
+    };
     if let Err(error) = root_guard.revalidate() {
         finish.complete(Err(error.into()));
         return;
@@ -737,6 +744,7 @@ fn worker(registry: Weak<RegistryInner>, id: u64, control: Arc<Control>, request
             return;
         }
     };
+    drop(root_pin);
     finish.spawned.store(true, Ordering::Release);
 
     // Keep `group` outside the panic boundary. A post-spawn panic can then use

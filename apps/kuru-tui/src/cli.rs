@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use kuru_connectors::permissions::{PermissionBinding, PermissionService};
-use kuru_connectors::{McpStatus, Provider, ToolHost, provider};
+use kuru_connectors::{CheckpointStore, McpStatus, Provider, ToolHost, provider};
 use kuru_core::{
     AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
     ProjectPreferences, SafeManifest,
@@ -125,6 +125,11 @@ pub enum Command {
         #[arg(long, default_value = "{}")]
         args: String,
     },
+    /// Inspect, undo, or explicitly prune this project's private file checkpoints.
+    File {
+        #[command(subcommand)]
+        command: FileCommand,
+    },
     /// List available workspace and MCP tools.
     Tools,
     /// Serve authenticated A2A 1.0 on loopback.
@@ -162,6 +167,25 @@ pub enum TrustCommand {
     },
     /// Remove this exact workspace's saved approval.
     Revoke,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FileCommand {
+    /// List bounded checkpoint metadata without file snapshot bodies.
+    List {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Inspect one selected checkpoint without its private snapshots.
+    Inspect { id: String },
+    /// Undo one durably applied file effect if its checked post-state still matches.
+    Undo { id: String },
+    /// Remove one inactive receipt; unresolved effects require explicit discard.
+    Prune {
+        id: String,
+        #[arg(long)]
+        discard_uncertain: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -771,7 +795,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     }
     let (cwd, data, user) = paths(&cli)?;
     let root = Arc::new(
-        Directory::open(&cwd, Privacy::Inherited, NameRetention::Pinned)
+        Directory::open(&cwd, Privacy::Inherited, NameRetention::Movable)
             .context("workspace directory could not be retained safely")?,
     );
     let cwd = root.path().to_path_buf();
@@ -808,6 +832,63 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             }
         );
         return Ok(());
+    }
+
+    // Checkpoint inspection and selected pruning use only Kuru's checked
+    // private store. Malformed or unapproved project configuration must not
+    // activate or obstruct these explicit recovery commands.
+    if let Some(Command::File { command }) = &cli.command {
+        match command {
+            FileCommand::List { limit } => {
+                ensure!(
+                    (1..=1000).contains(limit),
+                    "checkpoint list limit must be 1–1000"
+                );
+                let rows = CheckpointStore::existing(&data, root.clone())?
+                    .map(|store| store.list(*limit))
+                    .transpose()?
+                    .unwrap_or_default();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            FileCommand::Inspect { id } => {
+                let store = CheckpointStore::existing(&data, root.clone())?
+                    .context("file checkpoint does not exist")?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &store
+                            .inspect(id)?
+                            .context("file checkpoint does not exist")?
+                    )?
+                );
+                return Ok(());
+            }
+            FileCommand::Prune {
+                id,
+                discard_uncertain,
+            } => {
+                let store = CheckpointStore::existing(&data, root.clone())?
+                    .context("file checkpoint does not exist")?;
+                let prior = store
+                    .inspect(id)?
+                    .context("file checkpoint does not exist")?;
+                ensure!(
+                    store.prune(id, *discard_uncertain)?,
+                    "file checkpoint disappeared before pruning"
+                );
+                println!(
+                    "{}",
+                    if prior.state == kuru_connectors::CheckpointState::Applied {
+                        "Selected settled file checkpoint pruned; its undo and exact-retry evidence is no longer available."
+                    } else {
+                        "Selected unresolved file checkpoint discarded; its recovery and undo evidence is no longer available."
+                    }
+                );
+                return Ok(());
+            }
+            FileCommand::Undo { .. } => {}
+        }
     }
 
     let local = discovered_local(&root).await?;
@@ -1135,7 +1216,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 return Ok(());
             }
             Some(Command::Tool { name, args }) => {
-                let host = permission_host(&data, root.clone(), &config, &snapshot)?;
+                let host = permission_host(&data, root.clone(), &config, &snapshot, matches!(name.as_str(), "file_write" | "file_edit" | "file_delete"))?;
                 let result = async {
                     let arguments = serde_json::from_str(args)?;
                     let catalog = host.catalog().await?;
@@ -1149,13 +1230,28 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 return Ok(());
             }
             Some(Command::Tools) => {
-                let host = permission_host(&data, root.clone(), &config, &snapshot)?;
+                let host = permission_host(&data, root.clone(), &config, &snapshot, false)?;
                 let catalog = host.catalog().await;
                 let cleanup = host.shutdown().await;
                 let catalog = catalog?;
                 report_mcp_statuses(catalog.mcp());
                 println!("{}", serde_json::to_string_pretty(catalog.tools())?);
                 cleanup?;
+                return Ok(());
+            }
+            Some(Command::File { command }) => {
+                match command {
+                    FileCommand::Undo { id } => {
+                        let host = permission_host(&data, root.clone(), &config, &snapshot, true)?;
+                        let outcome = host.undo_file_checkpoint(id, None).await;
+                        let cleanup = host.shutdown().await;
+                        println!("{}", serde_json::to_string_pretty(&outcome?)?);
+                        cleanup?;
+                    }
+                    FileCommand::List { .. }
+                    | FileCommand::Inspect { .. }
+                    | FileCommand::Prune { .. } => unreachable!("inspection returned before configuration"),
+                }
                 return Ok(());
             }
             _ => {}
@@ -1210,7 +1306,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             cli.trust_workspace_once,
         ));
         let has_skills = snapshot.prompt_catalog().skills().next().is_some();
-        let tools = permission_host(&data, root.clone(), &config, &snapshot)?
+        let tools = permission_host(&data, root.clone(), &config, &snapshot, true)?
             .with_instruction_gate(prompt_gate.clone())
             .with_skill_gate(prompt_gate, has_skills);
         let mut harness = Harness::with_tool_host_and_instructions(
@@ -1269,7 +1365,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result?)?);
                 cleanup?;
             }
-            Some(Command::UndoDream) => unreachable!("undo returned before provider construction"),
+            Some(Command::UndoDream | Command::File { .. }) => unreachable!("local control returned before provider construction"),
             Some(Command::Serve { bind, token_env }) => {
                 ensure!(
                     bind.ip().is_loopback(),
@@ -1339,11 +1435,17 @@ fn permission_host(
     root: Arc<Directory>,
     config: &Config,
     snapshot: &ConfigSnapshot,
+    checkpoints: bool,
 ) -> Result<ToolHost> {
     let binding = PermissionBinding::checked(&root, snapshot.manifest().full_digest(), config)?;
     let store = Arc::new(GrantStore::new(data, root.clone(), binding.clone())?);
     let permissions = Arc::new(PermissionService::new(config.clone(), binding, store)?);
-    ToolHost::with_permission_service(root, config, permissions)
+    let host = ToolHost::with_permission_service(root.clone(), config, permissions)?;
+    if checkpoints {
+        host.with_checkpoint_store(Arc::new(CheckpointStore::new(data, root)?))
+    } else {
+        Ok(host)
+    }
 }
 
 pub(crate) fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClaimCategory> {
@@ -1376,6 +1478,10 @@ fn command_claim_categories(
         Some(Command::Sessions | Command::Memory { .. } | Command::UndoDream) => {
             &[Category::MemoryDoltBinary, Category::MemoryCacheDir]
         }
+        Some(Command::File {
+            command: FileCommand::Undo { .. },
+        }) => &[Category::WorkspaceWrite, Category::ToolPermissions],
+        Some(Command::File { .. }) => &[],
         Some(Command::Models) => &[
             Category::MemoryDoltBinary,
             Category::MemoryCacheDir,
@@ -1730,8 +1836,9 @@ mod permission_tests {
             ),
         )
         .unwrap();
-        let root =
-            Arc::new(Directory::open(&project, Privacy::Inherited, NameRetention::Pinned).unwrap());
+        let root = Arc::new(
+            Directory::open(&project, Privacy::Inherited, NameRetention::Movable).unwrap(),
+        );
         let snapshot =
             ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
         let cli = Cli::try_parse_from(["kuru", "tool", "file_write", "--args", "{}"]).unwrap();
@@ -1747,7 +1854,7 @@ mod permission_tests {
             .unwrap();
         preflight(&cli, &root, &data, &snapshot).unwrap();
         let config = snapshot.finalize(&ProjectPreferences::default()).unwrap();
-        let host = permission_host(&data, root, &config, &snapshot).unwrap();
+        let host = permission_host(&data, root, &config, &snapshot, true).unwrap();
         let refused = host
             .execute(
                 "file_write",

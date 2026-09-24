@@ -8,18 +8,27 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Prefix;
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileDispositionInfo, FileIdInfo,
-    FileStandardInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
-    READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
+use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformationEx, NtSetInformationFile};
+use windows_sys::Win32::Foundation::{
+    GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, STATUS_PENDING,
+    WAIT_OBJECT_0,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
+    FileDispositionInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
+    READ_CONTROL, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
+};
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+use windows_sys::Win32::System::WindowsProgramming::{
+    FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+};
 
 pub(super) fn normalize(path: &Path) -> io::Result<PathBuf> {
     match path.components().next() {
@@ -95,7 +104,7 @@ unsafe fn query<T: Default>(file: &File, kind: i32) -> io::Result<T> {
     }
 }
 
-pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
+fn inspect_info(file: &File, allow_retained_delete_pending: bool) -> io::Result<ObjectInfo> {
     // SAFETY: each class below is paired with its exact plain native record.
     let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe { query(file, FileAttributeTagInfo)? };
     if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -103,7 +112,9 @@ pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
     }
     // SAFETY: FILE_STANDARD_INFO is the documented output for FileStandardInfo.
     let standard: FILE_STANDARD_INFO = unsafe { query(file, FileStandardInfo)? };
-    if standard.DeletePending || standard.EndOfFile < 0 {
+    if (standard.DeletePending && (!allow_retained_delete_pending || standard.NumberOfLinks != 0))
+        || standard.EndOfFile < 0
+    {
         return Err(denied(
             "filesystem object is pending deletion or has an invalid size",
         ));
@@ -121,6 +132,17 @@ pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
         },
         directory: standard.Directory,
     })
+}
+
+pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
+    inspect_info(file, false)
+}
+
+pub(super) fn retained_info(file: &File) -> io::Result<ObjectInfo> {
+    // POSIX replacement marks the old object for deletion while its already
+    // held, now-unlinked handle remains readable. Ordinary admission still
+    // uses strict info, and a delete-pending object with a live link is refused.
+    inspect_info(file, true)
 }
 
 fn persistent_acls(file: &File) -> io::Result<()> {
@@ -278,6 +300,57 @@ pub(super) fn make_executable(_: &File) -> io::Result<()> {
     // Windows has no Unix executable mode; preserve the installed file's ACL.
     // Type/hash/version checks are separate from its extension and access policy.
     Ok(())
+}
+
+pub(super) fn copy_file_access(source: &File, staged: &File) -> io::Result<()> {
+    // The original read handle includes READ_CONTROL; owner-private newly
+    // created stages retain WRITE_DAC. Keep the source ACL's protected bit.
+    staged.set_permissions(source.metadata()?.permissions())?;
+    security::copy_file_dacl(source.as_handle(), staged.as_handle())
+}
+
+pub(super) fn prepare_file_replacement(staged: &File) -> io::Result<Option<File>> {
+    // Capture DELETE while this exact staged object still carries its private
+    // creation DACL. A later copied ordinary DACL may omit file DELETE while
+    // the destination parent still authorizes replacement through DELETE_CHILD.
+    // SAFETY: ReOpenFile derives a new handle from the retained exact object.
+    let replacement = unsafe {
+        ReOpenFile(
+            staged.as_raw_handle(),
+            DELETE | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if replacement == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful ReOpenFile transfers one unique handle owner.
+    let replacement = unsafe { OwnedHandle::from_raw_handle(replacement) };
+    Ok(Some(File::from(replacement)))
+}
+
+pub(super) fn file_access_token(source: &File) -> io::Result<Vec<u8>> {
+    security::file_access_token(source.as_handle())
+}
+
+pub(super) fn retired_access_matches(
+    source: &File,
+    before: &[u8],
+    after: &[u8],
+) -> io::Result<bool> {
+    // This exception cannot be used for a named or still-linked source. The
+    // caller has already checked this held file's full identity and metadata;
+    // the kernel's delete-pending bit proves it is the displaced old object.
+    // SAFETY: FileStandardInfo returns the plain FILE_STANDARD_INFO record.
+    let standard: FILE_STANDARD_INFO = unsafe { query(source, FileStandardInfo)? };
+    Ok(standard.DeletePending
+        && standard.NumberOfLinks == 0
+        && security::same_retired_file_access(before, after))
+}
+
+pub(super) fn finalize_file_access(source: &File, published: &File) -> io::Result<()> {
+    security::restore_file_dacl_inheritance(source.as_handle(), published.as_handle())
 }
 
 pub(super) fn remove(
@@ -623,18 +696,23 @@ fn remove_regular(
 pub(super) fn publish(
     _: &File,
     source: &Path,
-    _: &File,
+    source_file: &File,
+    prepared_replacement: Option<&File>,
+    destination_parent: &File,
     destination: &Path,
     policy: Publication,
 ) -> Result<(), (PublicationPhase, io::Error)> {
+    if policy == Publication::ReplaceRegular {
+        return replace_open_destination(
+            destination_parent,
+            source_file,
+            prepared_replacement,
+            destination,
+        );
+    }
     let source = wide(source).map_err(|error| (PublicationPhase::Rejected, error))?;
     let destination = wide(destination).map_err(|error| (PublicationPhase::Rejected, error))?;
-    let flags = MOVEFILE_WRITE_THROUGH
-        | if policy == Publication::ReplaceRegular {
-            MOVEFILE_REPLACE_EXISTING
-        } else {
-            0
-        };
+    let flags = MOVEFILE_WRITE_THROUGH;
     // SAFETY: both paths are live, validated local names. Same-volume checks
     // happened before this call; COPY_ALLOWED is deliberately absent. Native
     // write-through publication replaces Unix parent-directory fsync here.
@@ -647,11 +725,168 @@ pub(super) fn publish(
     }
 }
 
+fn replace_open_destination(
+    destination_parent: &File,
+    source: &File,
+    prepared_replacement: Option<&File>,
+    destination: &Path,
+) -> Result<(), (PublicationPhase, io::Error)> {
+    let expected_parent =
+        info(destination_parent).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if !expected_parent.directory {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("publication parent is not a directory"),
+        ));
+    }
+    // The checked inspection handle has read rights only. Acquire creation
+    // authority through a fresh directory open, then bind that short-lived
+    // handle to the still-retained exact parent before it can authorize any
+    // rename. A path rebound or reparse point is rejected before mutation.
+    let parent_path = destination.parent().ok_or_else(|| {
+        (
+            PublicationPhase::Rejected,
+            invalid("missing publication parent path"),
+        )
+    })?;
+    let publication_parent = open(
+        parent_path,
+        FILE_ADD_FILE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        NameRetention::Movable,
+        None,
+    )
+    .map_err(|error| (PublicationPhase::Rejected, error))?;
+    let actual_parent =
+        info(&publication_parent).map_err(|error| (PublicationPhase::Rejected, error))?;
+    if !actual_parent.directory || actual_parent.file.identity != expected_parent.file.identity {
+        return Err((
+            PublicationPhase::Rejected,
+            denied("publication parent no longer has the retained identity"),
+        ));
+    }
+    let name = destination.file_name().ok_or_else(|| {
+        (
+            PublicationPhase::Rejected,
+            invalid("missing publication filename"),
+        )
+    })?;
+    let name: Vec<_> = name.encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return Err((
+            PublicationPhase::Rejected,
+            invalid("invalid native publication filename"),
+        ));
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| {
+            (
+                PublicationPhase::Rejected,
+                invalid("native publication filename exceeds bound"),
+            )
+        })?;
+    // FileRenameInformationEx requires the full structure, including its trailing
+    // FileName placeholder, plus the UTF-16 bytes named by FileNameLength.
+    let record_bytes = size_of::<FILE_RENAME_INFO>()
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| {
+            (
+                PublicationPhase::Rejected,
+                invalid("native publication record exceeds bound"),
+            )
+        })?;
+    let record_len = u32::try_from(record_bytes).map_err(|_| {
+        (
+            PublicationPhase::Rejected,
+            invalid("native publication record exceeds bound"),
+        )
+    })?;
+    let mut record = vec![0usize; record_bytes.div_ceil(size_of::<usize>())];
+    let record_ptr = record.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: the usize-backed buffer is aligned for FILE_RENAME_INFO and is
+    // sized through the complete variable-length UTF-16 FileName field.
+    unsafe {
+        (*record_ptr).Anonymous.Flags =
+            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        (*record_ptr).RootDirectory = publication_parent.as_raw_handle();
+        (*record_ptr).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            record
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(std::mem::offset_of!(FILE_RENAME_INFO, FileName)) as *mut u16,
+            name.len(),
+        );
+    }
+    let reopened = prepared_replacement
+        .is_none()
+        .then(|| prepare_file_replacement(source))
+        .transpose()
+        .map_err(|error| (PublicationPhase::Rejected, error))?
+        .flatten();
+    let renamed = prepared_replacement
+        .or(reopened.as_ref())
+        .expect("Windows replacement handle exists");
+    let mut io_status = IO_STATUS_BLOCK::default();
+    io_status.Anonymous.Status = STATUS_PENDING;
+    // SAFETY: the source, aligned record, status block and retained exact
+    // destination-parent handle remain live until authoritative completion.
+    // The same record and rights passed the isolated native Windows fixture;
+    // SetFileInformationByHandle(FileRenameInfoEx) rejected that fixture.
+    let mut status = unsafe {
+        NtSetInformationFile(
+            renamed.as_raw_handle(),
+            &mut io_status,
+            record.as_mut_ptr().cast(),
+            record_len,
+            FileRenameInformationEx,
+        )
+    };
+    if status == STATUS_PENDING {
+        // ReOpenFile omitted FILE_FLAG_OVERLAPPED and retained SYNCHRONIZE.
+        // Pending is unexpected for that synchronous file object, but the
+        // caller cannot reconcile from a snapshot while its rename may still
+        // complete. Keep every kernel-referenced input alive and wait for the
+        // final IO_STATUS_BLOCK, just as the synchronous open normally does.
+        loop {
+            let waited = unsafe { WaitForSingleObject(renamed.as_raw_handle(), INFINITE) };
+            if waited == WAIT_OBJECT_0 {
+                // SAFETY: a completed file-object wait publishes IO_STATUS_BLOCK.
+                status = unsafe { io_status.Anonymous.Status };
+                if status != STATUS_PENDING {
+                    break;
+                }
+            }
+            // A spurious signal or failed wait still cannot release borrowed
+            // storage or permit a concurrent retry; avoid a busy loop.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    if status == 0 {
+        Ok(())
+    } else {
+        // Keep the NTSTATUS as well as its Win32 mapping for exact diagnosis.
+        let mapped = unsafe { RtlNtStatusToDosError(status) };
+        Err((
+            PublicationPhase::Uncertain,
+            io::Error::new(
+                io::Error::from_raw_os_error(mapped as i32).kind(),
+                format!("native replacement NTSTATUS {status:#010x} (Win32 {mapped})"),
+            ),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
 
@@ -1001,6 +1236,10 @@ mod tests {
         );
 
         let mut permissions = fs::metadata(&file_path).unwrap().permissions();
+        #[allow(
+            clippy::permissions_set_readonly_false,
+            reason = "Windows-only test clears the Windows READONLY attribute before cleanup"
+        )]
         permissions.set_readonly(false);
         fs::set_permissions(&file_path, permissions).unwrap();
         directory.remove_tree().unwrap();
@@ -1045,10 +1284,289 @@ mod tests {
                 OsStr::new("published"),
                 Publication::ReplaceRegular,
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("native replacement failed: {error:?}"));
         assert_eq!(
             std::fs::read(directory.path().join("published")).unwrap(),
             b"new"
         );
+    }
+
+    struct AccessDiagnostic<'a> {
+        protected: u8,
+        owner: &'a [u8],
+        revision: u8,
+        aces: Vec<AceDiagnostic<'a>>,
+    }
+
+    struct AceDiagnostic<'a> {
+        kind: u8,
+        flags: u8,
+        size: usize,
+        mask_slot: Option<&'a [u8]>,
+        payload: &'a [u8],
+    }
+
+    // Test-only parser for security::canonical_access_token's current framing.
+    // Report component equality, never owner or ACE bytes.
+    fn parse_access_token(token: &[u8]) -> AccessDiagnostic<'_> {
+        let owner_len = u32::from_le_bytes(token[1..5].try_into().unwrap()) as usize;
+        let owner_end = 5 + owner_len;
+        let owner = &token[5..owner_end];
+        let revision = token[owner_end];
+        let ace_count = u32::from_le_bytes(token[owner_end + 1..owner_end + 5].try_into().unwrap());
+        let ace_len =
+            u32::from_le_bytes(token[owner_end + 5..owner_end + 9].try_into().unwrap()) as usize;
+        let ace_bytes = &token[owner_end + 9..];
+        assert_eq!(ace_bytes.len(), ace_len);
+        let mut remaining = ace_bytes;
+        let mut aces = Vec::new();
+        for _ in 0..ace_count {
+            let size = u16::from_le_bytes(remaining[2..4].try_into().unwrap()) as usize;
+            assert!(size >= 4 && size <= remaining.len());
+            let (ace, rest) = remaining.split_at(size);
+            aces.push(AceDiagnostic {
+                kind: ace[0],
+                flags: ace[1],
+                size,
+                mask_slot: (size >= 8).then(|| &ace[4..8]),
+                payload: if size >= 8 { &ace[8..] } else { &ace[4..] },
+            });
+            remaining = rest;
+        }
+        assert!(remaining.is_empty());
+        AccessDiagnostic {
+            protected: token[0],
+            owner,
+            revision,
+            aces,
+        }
+    }
+
+    fn access_token_difference(before: &[u8], after: &[u8]) -> String {
+        let before = parse_access_token(before);
+        let after = parse_access_token(after);
+        let inherited = windows_sys::Win32::Security::INHERITED_ACE as u8;
+        let mut inherited_cleared = 0;
+        let mut inherited_added = 0;
+        let mut other_flag_changes = 0;
+        for (left, right) in before.aces.iter().zip(&after.aces) {
+            if left.flags & inherited != 0 && right.flags & inherited == 0 {
+                inherited_cleared += 1;
+            } else if left.flags & inherited == 0 && right.flags & inherited != 0 {
+                inherited_added += 1;
+            }
+            if (left.flags ^ right.flags) & !inherited != 0 {
+                other_flag_changes += 1;
+            }
+        }
+        let changed: Vec<_> = before
+            .aces
+            .iter()
+            .zip(&after.aces)
+            .enumerate()
+            .filter_map(|(index, (left, right))| {
+                let same = left.kind == right.kind
+                    && left.flags == right.flags
+                    && left.size == right.size
+                    && left.mask_slot == right.mask_slot
+                    && left.payload == right.payload;
+                (!same).then(|| {
+                    format!(
+                        "{index}: type={}, flags={}/0x{:02x}->0x{:02x}/xor=0x{:02x}/inherited_provenance_only={}, size={}, mask_slot={}, payload={}",
+                        left.kind == right.kind,
+                        left.flags == right.flags,
+                        left.flags,
+                        right.flags,
+                        left.flags ^ right.flags,
+                        left.flags ^ right.flags == windows_sys::Win32::Security::INHERITED_ACE as u8,
+                        left.size == right.size,
+                        left.mask_slot == right.mask_slot,
+                        left.payload == right.payload,
+                    )
+                })
+            })
+            .take(16)
+            .collect();
+        format!(
+            "protected={}, owner={}, revision={}, ace_count={}/{}, inherited_cleared={}, inherited_added={}, other_flag_changes={}, changed_aces=[{}]",
+            before.protected == after.protected,
+            before.owner == after.owner,
+            before.revision == after.revision,
+            before.aces.len(),
+            after.aces.len(),
+            inherited_cleared,
+            inherited_added,
+            other_flag_changes,
+            changed.join("; "),
+        )
+    }
+
+    #[test]
+    fn access_token_diagnostic_parser_uses_canonical_field_boundaries() {
+        let token = [
+            1, 2, 0, 0, 0, 0xaa, 0xbb, 2, 2, 0, 0, 0, 12, 0, 0, 0, 0, 0, 8, 0, 1, 2, 3, 4, 0x7f, 0,
+            4, 0,
+        ];
+        let parts = parse_access_token(&token);
+        assert_eq!(parts.protected, 1);
+        assert_eq!(parts.owner, [0xaa, 0xbb]);
+        assert_eq!(parts.revision, 2);
+        assert_eq!(parts.aces.len(), 2);
+        assert_eq!(parts.aces[0].size, 8);
+        assert_eq!(parts.aces[0].mask_slot, Some(&[1, 2, 3, 4][..]));
+        assert_eq!(parts.aces[1].mask_slot, None);
+        assert!(parts.aces[1].payload.is_empty());
+    }
+
+    #[test]
+    fn retained_old_access_is_verified_after_checked_posix_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory =
+            Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        directory
+            .create_new(OsStr::new("published"))
+            .unwrap()
+            .write_all(b"old")
+            .unwrap();
+        let mut old = directory.read(OsStr::new("published")).unwrap();
+        let old_identity = info(&old).unwrap().file.identity;
+        let stage = directory
+            .create_private_directory(OsStr::new("stage"))
+            .unwrap();
+        let mut candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        candidate.write_all(b"new").unwrap();
+        let access = crate::fs::copy_file_access(&old, &candidate).unwrap();
+        crate::fs::verify_file_access(&old, &access).unwrap();
+        let before_publish = file_access_token(&old).unwrap();
+        assert!(
+            before_publish == file_access_token(&old).unwrap(),
+            "source access token changed before publication"
+        );
+        assert!(
+            !retired_access_matches(&old, &before_publish, &before_publish).unwrap(),
+            "a still-linked source was treated as a retired file"
+        );
+        let source =
+            Directory::open(stage.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        assert_eq!(source.identity(), stage.identity());
+        directory
+            .publish_file_with_access(
+                &source,
+                OsStr::new("payload"),
+                &candidate,
+                &access,
+                OsStr::new("published"),
+                Publication::ReplaceRegular,
+            )
+            .unwrap();
+        let after_publish = file_access_token(&old).unwrap();
+        assert!(
+            security::same_retired_file_access(&before_publish, &after_publish),
+            "retired source changed more than inherited-ACE provenance: {}",
+            access_token_difference(&before_publish, &after_publish)
+        );
+        assert!(
+            retired_access_matches(&old, &before_publish, &after_publish).unwrap(),
+            "retained old file did not satisfy the checked zero-link retirement boundary"
+        );
+        crate::fs::finalize_file_access(&old, &candidate).unwrap();
+        let after_finalize = file_access_token(&old).unwrap();
+        writeln!(
+            std::io::stderr().lock(),
+            "retained-old access after publish: {}; after finalize: {}",
+            access_token_difference(&before_publish, &after_publish),
+            access_token_difference(&before_publish, &after_finalize),
+        )
+        .unwrap();
+        crate::fs::verify_retained_file_access(&old, &access).unwrap();
+        assert_eq!(crate::fs::retained_file_info(&old).unwrap().links, 0);
+        assert_eq!(
+            info(&old)
+                .err()
+                .expect("retired object was accepted")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let mut old_bytes = Vec::new();
+        old.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, b"old");
+        assert_eq!(
+            crate::fs::retained_file_info(&old).unwrap().identity,
+            old_identity
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("published")).unwrap(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn retained_access_refuses_a_new_hardlink_before_publication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = Directory::ensure_private(&temporary.path().join("private")).unwrap();
+        directory
+            .create_new(OsStr::new("source"))
+            .unwrap()
+            .write_all(b"source bytes")
+            .unwrap();
+        let source = directory.read(OsStr::new("source")).unwrap();
+        let stage = directory
+            .create_private_directory(OsStr::new("stage"))
+            .unwrap();
+        let candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        let access = crate::fs::copy_file_access(&source, &candidate).unwrap();
+        crate::fs::verify_retained_file_access(&source, &access).unwrap();
+        let unrelated = directory.create_new(OsStr::new("unrelated")).unwrap();
+        assert_eq!(
+            crate::fs::verify_retained_file_access(&unrelated, &access)
+                .unwrap_err()
+                .to_string(),
+            "access source identity changed during publication"
+        );
+
+        let alias = directory.path().join("unexpected-alias");
+        std::fs::hard_link(directory.path().join("source"), &alias).unwrap();
+        assert_eq!(crate::fs::retained_file_info(&source).unwrap().links, 2);
+        let error = crate::fs::verify_retained_file_access(&source, &access).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(directory.path().join("source")).unwrap(),
+            b"source bytes"
+        );
+        assert_eq!(std::fs::read(&alias).unwrap(), b"source bytes");
+        assert!(!directory.path().join("published").exists());
+    }
+
+    #[test]
+    fn replacement_rejects_wrong_parent_authority_before_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_dir = Directory::ensure_private(&temporary.path().join("source")).unwrap();
+        let destination_dir =
+            Directory::ensure_private(&temporary.path().join("destination")).unwrap();
+        let mut candidate = source_dir.create_new(OsStr::new("candidate")).unwrap();
+        candidate.write_all(b"new").unwrap();
+        let destination = destination_dir.path().join("published");
+
+        let (phase, _) =
+            replace_open_destination(&candidate, &candidate, None, &destination).unwrap_err();
+        assert_eq!(phase, PublicationPhase::Rejected);
+
+        let wrong_parent = open(
+            source_dir.path(),
+            FILE_READ_ATTRIBUTES,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        let (phase, _) =
+            replace_open_destination(&wrong_parent, &candidate, None, &destination).unwrap_err();
+        assert_eq!(phase, PublicationPhase::Rejected);
+        assert_eq!(
+            std::fs::read(source_dir.path().join("candidate")).unwrap(),
+            b"new"
+        );
+        assert!(!destination.exists());
     }
 }

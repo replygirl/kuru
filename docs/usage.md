@@ -254,6 +254,8 @@ kuru -C /path/to/project tools
 kuru -C /path/to/project tool file_read --args '{"path":"README.md"}'
 kuru -C /path/to/project --allow-write tool file_write \
   --args '{"path":"notes.txt","content":"A working note."}'
+kuru -C /path/to/project --allow-write tool file_edit \
+  --args '{"path":"notes.txt","hunks":[{"before":"A ","old":"working","after":" note.","replacement":"revised"}]}'
 ```
 
 `tools` discovers built-ins and configured MCP tools. Use the returned stable
@@ -264,6 +266,45 @@ but an unresolved ask refuses immediately instead of opening a prompt. Shell
 uses your process permissions; it is not a sandbox. See
 [tool permissions](configuration.md#tool-permissions) for legacy flags, explicit
 rules, grant lifetimes and deny precedence.
+
+Native `file_write`, `file_edit`, and `file_delete` keep private, project-bound
+before/after checkpoints outside the tool root. `file_edit` applies 1–64 ordered
+exact-context hunks to one UTF-8 source capture; stale, ambiguous, overlapping,
+or oversized edits change nothing. Each snapshot is capped at 2 MiB and the
+project checkpoint inventory at 128 MiB (including conservative retained-stage
+reservations) and 10,000 private inventory entries. A full inventory refuses another file
+mutation before touching its target; checkpoints do not expire automatically.
+Checkpointed writes to multiply linked files are refused before any effect.
+Earlier `file_write` could replace just the selected pathname, but capturing
+the required before snapshot could read an out-of-root alias that `file_read`
+already refuses.
+Pruning a settled receipt also forfeits its selected undo and exact-retry
+evidence.
+Shell and MCP effects are outside file checkpoint and undo coverage.
+
+```sh
+kuru -C /path/to/project file list
+kuru -C /path/to/project file inspect CHECKPOINT_ID
+kuru -C /path/to/project --allow-write file undo CHECKPOINT_ID
+kuru -C /path/to/project file prune CHECKPOINT_ID
+kuru -C /path/to/project file prune CHECKPOINT_ID --discard-uncertain
+```
+
+The TUI has `/file-checkpoints`, `/file-inspect ID`, `/file-undo ID`, and
+`/file-prune ID [--discard-uncertain]`. Inspection shows IDs, paths, effect and
+status without snapshot bodies. A durably applied checkpoint can be undone
+after restart if the checked current file still matches its recorded post-state;
+undo performs a new exact-file permission check and records its own effect.
+File undo is separate from `undo-dream` and never rewinds conversation history.
+If a process stops before the applied marker is durable, matching file bytes
+or an absent deleted path cannot prove who made the effect. The checkpoint stays
+unresolved and cannot be retried or undone automatically. Explicitly discarding
+one inactive unresolved receipt forfeits its recovery and undo evidence without
+changing the project file. Discard removes only a stage and empty access template
+whose captured identities still match; if the target parent or those artifacts
+were replaced, it refuses and retains the receipt for manual directory recovery.
+A later target with a different checked identity or
+bytes causes undo to conflict instead of overwriting it.
 
 ## Authentication and service commands
 

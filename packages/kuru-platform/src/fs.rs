@@ -77,6 +77,92 @@ pub struct FileInfo {
     pub len: u64,
 }
 
+/// Opaque access-policy capture from one retained regular-file handle.
+pub struct FileAccessToken {
+    bytes: Vec<u8>,
+    source_identity: FileIdentity,
+    staged_identity: FileIdentity,
+    replacement: Option<File>,
+}
+
+/// Copy the access policy of a checked regular file onto a newly staged file.
+/// Callers must keep the staged file behind a private directory until publish:
+/// this operation can intentionally grant ordinary project access.
+pub fn copy_file_access(source: &File, staged: &File) -> io::Result<FileAccessToken> {
+    let source_identity = checked_file(source)?.identity;
+    let staged_identity = checked_file(staged)?.identity;
+    let bytes = native::file_access_token(source)?;
+    // Retain the exact private stage's replacement authority before copying an
+    // ordinary target DACL that may deliberately omit DELETE on the file.
+    let replacement = native::prepare_file_replacement(staged)?;
+    native::copy_file_access(source, staged)?;
+    let token = FileAccessToken {
+        bytes,
+        source_identity,
+        staged_identity,
+        replacement,
+    };
+    verify_file_access(source, &token)?;
+    Ok(token)
+}
+
+/// Detect a source access-policy change on the same retained handle. A
+/// replaced source may have zero links after publication; any new alias is
+/// still refused. This does not lock out an external ACL writer.
+pub fn verify_file_access(source: &File, expected: &FileAccessToken) -> io::Result<()> {
+    let info = regular_file_info(source)?;
+    if info.identity != expected.source_identity {
+        return Err(denied("access source identity changed during publication"));
+    }
+    if info.links > 1 {
+        return Err(denied("access source gained another hardlink"));
+    }
+    if native::file_access_token(source)? != expected.bytes {
+        return Err(denied("file access policy changed during publication"));
+    }
+    Ok(())
+}
+
+/// Verify the same source policy after publication using only its already-held
+/// handle. Windows POSIX replacement can retire that object with zero links;
+/// ordinary name-based admission and the pre-publication check remain strict.
+pub fn verify_retained_file_access(source: &File, expected: &FileAccessToken) -> io::Result<()> {
+    let info = retained_file_info(source)?;
+    if info.identity != expected.source_identity {
+        return Err(denied("access source identity changed during publication"));
+    }
+    if info.links > 1 {
+        return Err(denied("access source gained another hardlink"));
+    }
+    let current = native::file_access_token(source)?;
+    if current != expected.bytes {
+        // A Windows POSIX replacement can remove the last name of the exact
+        // retained source and clear inherited-ACE provenance. Only that one
+        // bit may differ, and only after the kernel reports delete-pending with
+        // zero links. Every live and pre-publication check remains byte-exact.
+        #[cfg(windows)]
+        if info.links == 0 && native::retired_access_matches(source, &expected.bytes, &current)? {
+            return Ok(());
+        }
+        return Err(denied("file access policy changed during publication"));
+    }
+    Ok(())
+}
+
+/// After a checked move into the destination parent, restore the source's
+/// inheritance behavior through the still-retained published file handle.
+/// A caller must not settle its effect as applied until this succeeds.
+pub fn finalize_file_access(source: &File, published: &File) -> io::Result<()> {
+    // A replaced source can have zero links after the checked publication,
+    // while its retained handle still carries the access policy we copied.
+    // It was checked before publication; reject any newly linked alias.
+    if retained_file_info(source)?.links > 1 {
+        return Err(denied("access source gained another hardlink"));
+    }
+    checked_file(published)?;
+    native::finalize_file_access(source, published)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Privacy {
     /// Ordinary files inherit their containing directory's access policy.
@@ -263,6 +349,19 @@ fn component(name: &OsStr) -> io::Result<()> {
 /// Metadata inspection reports hardlink identity; checked opens reject links.
 pub fn regular_file_info(file: &File) -> io::Result<FileInfo> {
     let info = native::info(file)?;
+    if info.directory {
+        return Err(denied("expected a regular disk file"));
+    }
+    Ok(info.file)
+}
+
+/// Inspect an already-retained file handle after a checked publication.
+///
+/// Windows may mark the displaced object delete-pending while its handle still
+/// supplies its exact identity and access policy. This metadata-only query is
+/// not an admission check for a new source, destination, or writable file.
+pub fn retained_file_info(file: &File) -> io::Result<FileInfo> {
+    let info = native::retained_info(file)?;
     if info.directory {
         return Err(denied("expected a regular disk file"));
     }
@@ -626,7 +725,36 @@ impl Directory {
         destination: &OsStr,
         policy: Publication,
     ) -> Result<(), PublicationError> {
-        self.transfer_file_then((source, name, file), destination, policy, true, || Ok(()))
+        self.transfer_file_then(
+            (source, name, file),
+            destination,
+            policy,
+            true,
+            None,
+            || Ok(()),
+        )
+    }
+
+    /// Publish a staged file whose ordinary access policy was copied through
+    /// [`copy_file_access`]. The opaque token retains the exact private stage's
+    /// narrow Windows replacement authority across that DACL transition.
+    pub fn publish_file_with_access(
+        &self,
+        source: &Directory,
+        name: &OsStr,
+        file: &File,
+        access: &FileAccessToken,
+        destination: &OsStr,
+        policy: Publication,
+    ) -> Result<(), PublicationError> {
+        self.transfer_file_then(
+            (source, name, file),
+            destination,
+            policy,
+            true,
+            Some(access),
+            || Ok(()),
+        )
     }
 
     /// Rename an unchanged existing file without flushing a read-only source.
@@ -641,7 +769,14 @@ impl Directory {
         destination: &OsStr,
         policy: Publication,
     ) -> Result<(), PublicationError> {
-        self.transfer_file_then((source, name, file), destination, policy, false, || Ok(()))
+        self.transfer_file_then(
+            (source, name, file),
+            destination,
+            policy,
+            false,
+            None,
+            || Ok(()),
+        )
     }
 
     fn transfer_file_then(
@@ -650,6 +785,7 @@ impl Directory {
         destination: &OsStr,
         policy: Publication,
         flush_payload: bool,
+        access: Option<&FileAccessToken>,
         after_move: impl FnOnce() -> io::Result<()>,
     ) -> Result<(), PublicationError> {
         let identity = checked_file(file).ok().map(|info| info.identity);
@@ -664,6 +800,11 @@ impl Directory {
         let preflight = || -> io::Result<()> {
             component(destination)?;
             source.verify(name, file)?;
+            if let Some(access) = access
+                && access.staged_identity != checked_file(file)?.identity
+            {
+                return Err(denied("copied access token belongs to another staged file"));
+            }
             if self.privacy == Privacy::OwnerOnly {
                 require_private(file)?;
             }
@@ -697,6 +838,8 @@ impl Directory {
         native::publish(
             &source.anchor().file,
             &source.path().join(name),
+            file,
+            access.and_then(|access| access.replacement.as_ref()),
             &self.anchor().file,
             &target,
             policy,
@@ -756,6 +899,8 @@ impl Directory {
         native::publish(
             parent,
             source.path(),
+            &source.anchor().file,
+            None,
             &self.anchor().file,
             &target,
             Publication::New,
@@ -778,6 +923,38 @@ impl Directory {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_access_token_rejects_a_held_source_mode_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let parent =
+            Directory::open(temporary.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        let source = parent.create_new(OsStr::new("source")).unwrap();
+        source
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let stage = parent
+            .create_private_directory(OsStr::new("stage"))
+            .unwrap();
+        let candidate = stage.create_new(OsStr::new("payload")).unwrap();
+        let token = copy_file_access(&source, &candidate).unwrap();
+        source
+            .set_permissions(std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        assert!(verify_file_access(&source, &token).is_err());
+        assert_eq!(
+            std::fs::metadata(stage.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "staged payload directory lost owner-only traversal"
+        );
+    }
 
     #[test]
     fn checked_tree_removal_consumes_only_regular_private_descendants() {
@@ -993,6 +1170,7 @@ mod tests {
                 OsStr::new("published"),
                 Publication::New,
                 true,
+                None,
                 || {
                     Err(io::Error::other(
                         "controlled completion failure after actual native move",

@@ -600,6 +600,74 @@ impl Drop for ServiceProcess {
     }
 }
 
+/// Test-only retained actual owner. Its stderr is a caller-owned private file;
+/// ordinary service launches continue to discard stderr.
+#[cfg(feature = "test-support")]
+pub struct FixtureLoggedOwner(ServiceProcess);
+
+#[cfg(feature = "test-support")]
+impl FixtureLoggedOwner {
+    pub async fn wait_for_exit(mut self) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                self.0.0.take();
+                ensure!(
+                    status.success(),
+                    "fixture memory owner exited unsuccessfully"
+                );
+                return Ok(());
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "fixture memory owner did not exit after retirement"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) async fn spawn_logged_owner_fixture(
+    options: &crate::store::OpenOptions,
+    project: &Path,
+    executable: &Path,
+    diagnostic: File,
+) -> Result<FixtureLoggedOwner> {
+    ensure_project_scope(project, &options.project_scope)?;
+    ensure!(
+        executable.is_absolute(),
+        "fixture executable must be absolute"
+    );
+    ensure!(
+        try_attach(&options.data_dir, &options.project_scope, project)
+            .await?
+            .is_none(),
+        "fixture already has a managed memory owner"
+    );
+    let mut child =
+        ServiceProcess::new(spawn_service(options, project, executable, Some(diagnostic)).await?);
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(options.config.startup_timeout_secs);
+    loop {
+        if let Some(mut attached) =
+            try_attach(&options.data_dir, &options.project_scope, project).await?
+        {
+            attached.close();
+            return Ok(FixtureLoggedOwner(child));
+        }
+        ensure!(
+            child.try_wait()?.is_none(),
+            "fixture memory owner exited before readiness"
+        );
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "fixture memory owner did not become ready"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 pub struct ServiceListener {
     #[cfg(unix)]
     inner: kuru_platform::local_ipc::PrivateServiceListener,

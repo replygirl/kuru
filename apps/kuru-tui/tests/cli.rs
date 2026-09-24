@@ -1,6 +1,10 @@
 use kuru_delivery::command::BlockingCommand as Command;
 use serde_json::Value;
-use std::{path::PathBuf, process::Output};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+    process::Output,
+};
 
 #[path = "support/memory.rs"]
 mod memory;
@@ -177,6 +181,25 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
     drop(candidate);
     memory.close().await.unwrap();
 
+    let diagnostic_path = env.data.join("candidate-owner-diagnostic.log");
+    let private = kuru_platform::fs::Directory::open(
+        &env.data,
+        kuru_platform::fs::Privacy::OwnerOnly,
+        kuru_platform::fs::NameRetention::Pinned,
+    )
+    .unwrap();
+    let diagnostic = private
+        .create_new(std::ffi::OsStr::new("candidate-owner-diagnostic.log"))
+        .unwrap();
+    let owner = kuru_memory::test_support::spawn_logged_owner(
+        &options,
+        &env.project.canonicalize().unwrap(),
+        Path::new(env!("CARGO_BIN_EXE_kuru")),
+        diagnostic,
+    )
+    .await
+    .unwrap();
+
     let run_json = |args: &[&str]| -> anyhow::Result<Value> {
         let output = env.run(args);
         anyhow::ensure!(
@@ -211,9 +234,56 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
             run_json(&["memory", "candidate-status", &branch])?,
         ))
     })();
+    let controlled = if commands.is_ok() {
+        // Prove the actual owner's private stderr capture only after the
+        // original CLI sequence; no extra client can race its selected action.
+        async {
+            let (_, opening) = kuru_memory::MemoryStore::open_managed_observed(
+                options.clone(),
+                env.project.canonicalize()?,
+                PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+            );
+            let diagnostic_client = opening.await?;
+            let result = diagnostic_client
+                .abandon_candidate_ref(&branch, &base, &head)
+                .await;
+            let closed = diagnostic_client.close().await;
+            closed?;
+            anyhow::ensure!(
+                matches!(
+                    result
+                        .err()
+                        .as_ref()
+                        .and_then(|error| error.downcast_ref::<kuru_memory::CandidateRefRejected>())
+                        .map(|rejected| rejected.0),
+                    Some(kuru_memory::CandidateRefRefusal::Changed)
+                ),
+                "controlled missing-ref request did not return a definite changed refusal"
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await
+    } else {
+        Ok(())
+    };
     let retirement = kuru_memory::test_support::retire_idle_service(&options).await;
-    let (rejected, inventory, status, abandoned, missing) = commands.unwrap();
+    let owner_exit = owner.wait_for_exit().await;
+    let (rejected, inventory, status, abandoned, missing) = commands.unwrap_or_else(|error| {
+        panic!(
+            "{error:#}; {}",
+            candidate_owner_diagnostic_records(&diagnostic_path)
+        )
+    });
     retirement.unwrap();
+    owner_exit.unwrap();
+    controlled.unwrap();
+    let diagnostics = candidate_owner_diagnostic_records(&diagnostic_path);
+    assert!(
+        diagnostics.contains(
+            "candidate_owner stage=ref_inspection class=non_sql sqlstate=none vendor=0 reason=other fault=ref_rejected"
+        ),
+        "the actual owner did not report the controlled changed-head refusal: {diagnostics}"
+    );
 
     assert!(!rejected.status.success());
     let rejection = String::from_utf8(rejected.stderr).unwrap();
@@ -239,6 +309,89 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
 
     assert_eq!(missing["candidate"]["state"], "missing");
     assert_eq!(missing["operation_outcome"], "unproved");
+}
+
+fn candidate_owner_diagnostic_records(path: &Path) -> String {
+    let mut bytes = Vec::new();
+    let Ok(file) = std::fs::File::open(path) else {
+        return "candidate owner diagnostic unavailable".into();
+    };
+    if file.take(4097).read_to_end(&mut bytes).is_err() || bytes.len() > 4096 {
+        return "candidate owner diagnostic unreadable".into();
+    }
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        return "candidate owner diagnostic invalid".into();
+    };
+    let records = contents
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let Some("candidate_owner") = fields.next() else {
+                return false;
+            };
+            let Some(stage) = fields.next().and_then(|field| field.strip_prefix("stage=")) else {
+                return false;
+            };
+            let Some(class) = fields.next().and_then(|field| field.strip_prefix("class=")) else {
+                return false;
+            };
+            let Some(state) = fields
+                .next()
+                .and_then(|field| field.strip_prefix("sqlstate="))
+            else {
+                return false;
+            };
+            let Some(vendor) = fields
+                .next()
+                .and_then(|field| field.strip_prefix("vendor="))
+            else {
+                return false;
+            };
+            let Some(reason) = fields
+                .next()
+                .and_then(|field| field.strip_prefix("reason="))
+            else {
+                return false;
+            };
+            let Some(fault) = fields.next().and_then(|field| field.strip_prefix("fault=")) else {
+                return false;
+            };
+            fields.next().is_none()
+                && matches!(
+                    stage,
+                    "ref_inspection"
+                        | "schema_validation"
+                        | "pool_retirement"
+                        | "working_set_inspection"
+                        | "branch_rename"
+                        | "outcome_reconciliation"
+                        | "cleanup"
+                        | "main_merge"
+                )
+                && matches!(class, "non_sql" | "sqlx" | "database")
+                && (matches!(state, "none" | "other")
+                    || (state.len() == 5
+                        && state
+                            .bytes()
+                            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())))
+                && vendor.parse::<u16>().is_ok()
+                && matches!(reason, "branch_in_use" | "other")
+                && matches!(
+                    fault,
+                    "ref_rejected"
+                        | "candidate_conflict"
+                        | "receipt_conflict"
+                        | "storage_failed"
+                        | "generation_changed"
+                )
+        })
+        .take(8)
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        "candidate owner diagnostic absent".into()
+    } else {
+        format!("candidate owner diagnostics: {}", records.join(" | "))
+    }
 }
 
 fn git_fixture(directory: &std::path::Path, args: &[&str]) -> Output {
@@ -779,6 +932,68 @@ async fn cli_project_purge_preserves_shared_legacy_export_engine_and_other_proje
     let fresh = MemoryStore::open(selected_options).await.unwrap();
     assert_eq!(fresh.get(&selected_key).await.unwrap(), None);
     fresh.close().await.unwrap();
+}
+
+#[test]
+fn cli_file_checkpoint_edit_undo_and_prune_survive_process_restart() {
+    let env = Sandbox::new();
+    assert!(!env.data.exists());
+    assert_eq!(env.success(&["file", "list"]), "[]\n");
+    assert!(!env.data.exists(), "inspection created private state");
+    std::fs::write(env.project.join("note.txt"), "alpha\none\n").unwrap();
+    let edited = env.success(&[
+        "--allow-write",
+        "tool",
+        "file_edit",
+        "--args",
+        r#"{"path":"note.txt","hunks":[{"before":"alpha\n","old":"one","after":"\n","replacement":"un"}]}"#,
+    ]);
+    let id = edited
+        .trim()
+        .strip_prefix("file_edit completed; checkpoint ")
+        .expect("file edit reports selected checkpoint");
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("note.txt")).unwrap(),
+        "alpha\nun\n"
+    );
+    let inspected: Value = serde_json::from_str(&env.success(&["file", "inspect", id])).unwrap();
+    assert_eq!(inspected["id"], id);
+    assert_eq!(inspected["path"], "note.txt");
+    assert_eq!(inspected["state"], "applied");
+    assert!(
+        inspected.get("before").is_none(),
+        "private snapshots leaked into inspection"
+    );
+    let malformed_config = env.root.path().join("malformed-file-config.toml");
+    std::fs::write(&malformed_config, "[").unwrap();
+    let independent = env
+        .command()
+        .arg("--config")
+        .arg(&malformed_config)
+        .args(["file", "inspect", id])
+        .output()
+        .unwrap();
+    assert!(
+        independent.status.success(),
+        "checkpoint inspection activated unrelated config: {}",
+        String::from_utf8_lossy(&independent.stderr)
+    );
+    let undone: Value =
+        serde_json::from_str(&env.success(&["--allow-write", "file", "undo", id])).unwrap();
+    assert_eq!(undone["effect"], "undo");
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("note.txt")).unwrap(),
+        "alpha\none\n"
+    );
+    let list: Value = serde_json::from_str(&env.success(&["file", "list"])).unwrap();
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|record| record["id"] == id)
+    );
+    assert!(env.success(&["file", "prune", id]).contains("pruned"));
+    assert!(!env.run(&["file", "inspect", id]).status.success());
 }
 
 #[test]

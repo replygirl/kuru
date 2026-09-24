@@ -153,10 +153,12 @@ bounded() {
   shift 3
   local kuru_pipe="$kuru_stage/stream" kuru_head_status kuru_source_status kuru_bytes
   mkfifo "$kuru_pipe"
-  "$@" > "$kuru_pipe" &
-  kuru_producer=$!
+  # Arm the reader first. On macOS, an immediately failing writer can otherwise
+  # close during the FIFO open handoff and leave a later reader waiting forever.
   head -c "$((kuru_limit + 1))" < "$kuru_pipe" > "$kuru_output" &
   kuru_consumer=$!
+  "$@" > "$kuru_pipe" &
+  kuru_producer=$!
   if wait "$kuru_consumer"; then kuru_head_status=0; else kuru_head_status=$?; fi
   kuru_consumer=''
   (( kuru_head_status == 0 )) || fail "$kuru_description reader failed ($kuru_head_status)"

@@ -154,6 +154,7 @@ conversation is not evidence of live OpenAI authentication or inference.
 | `grep` | `pattern`, optional `path`, `include_hidden`, `include_ignored` | Checked project search |
 | `glob` | `pattern`, optional `path`, `include_hidden`, `include_ignored` | Checked project path discovery |
 | `file_write` | `path`, `content` | Requires an effective allow decision or approval |
+| `file_edit` | `path`, `hunks` (`before`, `old`, `after`, `replacement`) | Uses the exact-file `file_write` permission; every hunk must match uniquely |
 | `file_delete` | `path` | Requires an effective allow decision or approval |
 | `shell` | `command` | Requires an effective allow decision or approval |
 
