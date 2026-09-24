@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod authentication;
 pub mod cli;
 mod commands;
