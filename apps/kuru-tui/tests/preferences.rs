@@ -14,7 +14,7 @@ use kuru_runtime::Harness;
 mod memory;
 
 struct Sandbox {
-    root: tempfile::TempDir,
+    root: memory::ServiceCleanup,
     project: PathBuf,
     data: PathBuf,
 }
@@ -27,7 +27,7 @@ impl Sandbox {
         std::fs::create_dir(&project).unwrap();
         memory::configuration(root.path()).unwrap();
         Self {
-            root,
+            root: memory::ServiceCleanup::new(root, &data),
             project,
             data,
         }
@@ -39,6 +39,8 @@ impl Sandbox {
 
     fn command_for(&self, project: &Path, data: &Path, provider: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+        #[cfg(windows)]
+        command.fixture_allow_independent_service();
         command
             .arg("-C")
             .arg(project)

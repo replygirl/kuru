@@ -167,7 +167,9 @@ async fn assert_runtime_projection(view: &View, harness: &Arc<tokio::sync::Mutex
 
 #[tokio::test]
 async fn slash_commands_change_real_runtime_state_and_validate_errors() {
-    let (_dir, mut h, models) = fixture().await;
+    let memory = temporary_memory().await;
+    let candidate_source = memory.clone();
+    let (_dir, mut h, models) = fixture_with_memory(memory).await;
     assert!(command_text(dispatch(&mut h, &models, "/parts").await.unwrap()).contains("manager"));
     let tools: serde_json::Value = serde_json::from_str(&command_text(
         dispatch(&mut h, &models, "/tools").await.unwrap(),
@@ -277,6 +279,64 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
             .as_array()
             .is_some_and(|revisions| !revisions.is_empty())
     );
+    let candidate = candidate_source
+        .begin_candidate("TUI exact-ref recovery")
+        .await
+        .unwrap();
+    let branch = candidate.branch().to_owned();
+    let base = candidate.base().to_owned();
+    let candidate_view = candidate.view();
+    candidate_view
+        .append("fixture/tui-candidate", "user", "private TUI value")
+        .await
+        .unwrap();
+    let head = candidate_view.revision().await.unwrap();
+    drop(candidate_view);
+    drop(candidate);
+    let candidates: serde_json::Value = serde_json::from_str(&command_text(
+        dispatch(&mut h, &models, "/memory-candidates")
+            .await
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(candidates["candidates"][0]["branch"], branch);
+    assert_eq!(candidates["candidates"][0]["base"], base);
+    assert_eq!(candidates["candidates"][0]["head"], head);
+    let inspected: serde_json::Value = serde_json::from_str(&command_text(
+        dispatch(
+            &mut h,
+            &models,
+            &format!("/memory-candidate-status {branch}"),
+        )
+        .await
+        .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(inspected["candidate"]["state"], "open_unchanged");
+    let abandoned: serde_json::Value = serde_json::from_str(&command_text(
+        dispatch(
+            &mut h,
+            &models,
+            &format!("/memory-candidate-abandon {branch} {base} {head}"),
+        )
+        .await
+        .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(abandoned["branch"], branch);
+    assert_eq!(abandoned["state"], "abandoned");
+    let missing: serde_json::Value = serde_json::from_str(&command_text(
+        dispatch(
+            &mut h,
+            &models,
+            &format!("/memory-candidate-status {branch}"),
+        )
+        .await
+        .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(missing["candidate"]["state"], "missing");
+    assert_eq!(missing["operation_outcome"], "unproved");
     for bad in [
         "/unknown",
         "/relate",
@@ -284,6 +344,7 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
         "/model",
         "/effort",
         "/memory missing",
+        "/memory-candidate-abandon incomplete",
     ] {
         assert!(dispatch(&mut h, &models, bad).await.is_err(), "{bad}");
     }

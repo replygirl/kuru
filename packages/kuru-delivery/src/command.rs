@@ -95,6 +95,13 @@ impl BlockingCommand {
         self.0.env_clear();
         self
     }
+    /// Native integration fixtures whose checked command may deliberately
+    /// start Kuru's independent memory service permit that explicit breakaway
+    /// from the immediate command Job. Ordinary descendants remain owned.
+    pub fn fixture_allow_independent_service(&mut self) -> &mut Self {
+        self.0.fixture_allow_independent_service();
+        self
+    }
     pub fn output(&mut self) -> std::io::Result<std::process::Output> {
         std::thread::scope(|scope| {
             scope
@@ -478,7 +485,8 @@ pub fn program(command: &Command) -> &std::ffi::OsStr {
 #[cfg(windows)]
 mod windows {
     use kuru_platform::windows::process::{
-        NativeChild, ProcessSample, Stdio, configured_command, environment_key_eq, sample_process,
+        Lifetime, NativeChild, ProcessSample, Stdio, configured_command, environment_key_eq,
+        sample_process,
     };
     use std::{
         ffi::{OsStr, OsString},
@@ -504,6 +512,7 @@ mod windows {
         arguments: Vec<OsString>,
         directory: Option<PathBuf>,
         environment: Vec<(OsString, OsString)>,
+        lifetime: Lifetime,
     }
 
     impl Command {
@@ -513,6 +522,7 @@ mod windows {
                 arguments: Vec::new(),
                 directory: None,
                 environment: std::env::vars_os().collect(),
+                lifetime: Lifetime::OwnedJob,
             }
         }
         pub fn arg(&mut self, value: impl AsRef<OsStr>) -> &mut Self {
@@ -558,6 +568,12 @@ mod windows {
             self.environment.clear();
             self
         }
+        /// Permit only descendants which explicitly request native Job
+        /// breakaway to leave this immediate fixture-owned process tree.
+        pub fn fixture_allow_independent_service(&mut self) -> &mut Self {
+            self.lifetime = Lifetime::FixtureBreakawayJob;
+            self
+        }
         /// The native boundary always owns and terminates its process tree.
         pub fn kill_on_drop(&mut self, _: bool) -> &mut Self {
             self
@@ -595,6 +611,7 @@ mod windows {
                 &cwd,
                 self.environment.clone(),
             )?;
+            spec.lifetime = self.lifetime;
             spec.stdout = Stdio::Pipe;
             spec.stderr = Stdio::Pipe;
             let mut child = spec.spawn().await?;

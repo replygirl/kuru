@@ -3,11 +3,16 @@
 Kuru uses full Dolt for local, versioned memory. Each canonical project directory
 has a separate database and revision history. Parts and relationships retain their
 private namespaces inside that database. The SQL server binds to loopback with
-generated local credentials and runs only while its owning Kuru process needs it.
+generated local credentials. A private per-project memory service owns Dolt,
+allows checked Kuru clients to attach, and remains available for a bounded idle
+interval after the last attachment closes.
 
 ```sh
 kuru memory status
 kuru memory history
+kuru memory candidates --limit 16
+kuru memory candidate-status BRANCH
+kuru memory candidate-abandon BRANCH --base BASE --head HEAD
 kuru memory notes ID --limit 100
 kuru memory forget ID --note SEQUENCE
 kuru memory purge --yes
@@ -32,6 +37,17 @@ notes written by dreaming. `kuru memory forget ID --note SEQUENCE` removes that
 one row from the selected identity's active notes namespace and records a new
 Dolt revision. It does not remove conversations, other notes, or older revisions;
 it is not secure erasure and does not provide a history-recovery command.
+
+Dream candidate writes remain private until promotion. `kuru memory candidates`
+and `/memory-candidates` list bounded pages of retained exact refs; the returned
+cursor is opaque. Candidate status distinguishes an unchanged open ref, a ref
+whose live base moved, an uncertain transition, and a resolved or missing ref.
+Missing reports its operation outcome as unproved: closing or reopening a client
+does not settle it. Explicit abandonment requires the exact inspected branch,
+base, and head, settles any retained typed outcome, and rechecks all three under
+the owner before transition. Changed, active, historical, ambiguous, or
+uncertain refs remain intact. There is no public candidate promotion, merge, or
+automatic replay/abandonment command.
 
 `kuru memory purge --yes` is the explicit destructive control for one canonical
 project. It removes that project's managed current Dolt store, revision history,
@@ -81,6 +97,14 @@ extracting the verified runtime, preparing and opening the database, then ready.
 These messages do not estimate time or prove a stage succeeded; the command's
 ordinary result remains authoritative. JSON and other command output stay on
 standard output, and library callers do not receive progress messages.
+
+Writable runtime commands attach to the private project memory service while
+retaining the existing one-conversation driver lease. This phase does not admit
+simultaneous conversations. Attachments do not own the service process and an
+inspection handle cannot stop it. When the last attachment closes, the service
+waits through its bounded idle interval, drains accepted work, reaps its exact
+Dolt child, and only then releases lifecycle authority. A later command during
+that interval can reuse the same checked service generation.
 
 After the first conversation/runtime command (`kuru run`, `kuru dream`,
 `kuru undo-dream`, the TUI, or `kuru serve`) opens a writable project store, the
@@ -212,21 +236,23 @@ original backup until you have checked session history and memory status. Projec
 identity depends on the canonical workspace path; restoring the data directory
 does not remap a project to a different path.
 
-Kuru releases its owned sidecar when its lifetime pipe closes, including after a
-writer crash. If startup reports a held lifecycle lock, wait for the owner to
-finish. An unknown PID or occupied port never authorizes automatic termination.
+Kuru's private service releases its owned sidecar after its lifetime pipe closes,
+including after a service crash, and a successor waits for exact reap before
+election. If startup reports a held lifecycle lock, wait for the owner to finish.
+An unknown PID or occupied port never authorizes automatic termination.
 Preserve a failed store and its logs before investigating; do not remove a held
 lockfile or replace the directory while a process is using it.
 
-Inspection commands can read an active writer's store. When an inspection starts
-the server itself, a new writer waits for that command to finish before taking
-ownership. Normal command exit waits for owned database cleanup, including when
-the command reports an error. Migration and recovery also hold the lifecycle lock
-through directory activation, so an active database cannot be moved underneath
-another process.
+Inspection commands attach read-only to an active memory service. Without one,
+they use an explicitly local read-only open and never elect an owner. Normal
+runtime command exit awaits attachment cleanup, including when the command
+reports an error; the service may remain warm through its idle interval.
+Migration, recovery, purge, and other maintenance use explicit quiescence gates
+and hold the lifecycle lock through directory activation, so an active database
+cannot be moved underneath another process.
 
-Within Kuru, dropping a memory view only releases that view. An explicit close
-shuts down its shared database handle and every view using it, then awaits the
-owned cleanup. If a write reply is interrupted, Kuru checks the durable receipt
-before proceeding; it distinguishes no pending write, a committed write, and a
-write that did not commit.
+Within Kuru, dropping or explicitly closing a managed memory view releases that
+client attachment; it never abandons a candidate or kills the shared owner. If a
+write reply is interrupted, Kuru checks the durable typed receipt before
+proceeding; reconnect alone never turns uncertainty into success or replays the
+write.

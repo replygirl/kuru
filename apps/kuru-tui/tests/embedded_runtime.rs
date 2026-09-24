@@ -533,6 +533,8 @@ impl Installation {
     }
     fn command(&self) -> Command {
         let mut command = Command::new(&self.binary);
+        #[cfg(windows)]
+        command.fixture_allow_independent_service();
         command
             .env_clear()
             .env("HOME", &self.home)
@@ -573,6 +575,14 @@ impl Installation {
             String::from_utf8_lossy(&output.stderr)
         );
         serde_json::from_slice(&output.stdout).context("installed command did not return JSON")
+    }
+
+    async fn retire_memory(&self) -> Result<()> {
+        let scope = kuru_runtime::project_scope(&self.project)?;
+        let mut options = OpenOptions::new(self.data.clone(), scope);
+        options.config = self.memory.clone();
+        options.supervisor = Some(self.binary.clone());
+        kuru_memory::test_support::retire_idle_service(&options).await
     }
     async fn native_auth_status(&self) -> Result<()> {
         let output = execute(self.command().arg("auth")).await?;
@@ -1127,6 +1137,10 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         .await
         .context("verify the direct installation's cold offline memory")?;
     first.api_key_access().await?;
+    first
+        .retire_memory()
+        .await
+        .context("retire the direct installation's managed memory owner")?;
 
     let previous_identity = regular_file_info(&File::open(&installed)?)?.identity;
     let mut update = first.command();
@@ -1165,6 +1179,10 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         .await
         .context("verify the updated installation's cold offline memory")?;
     second.api_key_access().await?;
+    second
+        .retire_memory()
+        .await
+        .context("retire the updated installation's managed memory owner")?;
     ensure!(
         fs::read_dir(&install_dir)?.count() == if cfg!(windows) { 2 } else { 1 },
         "self-update left a required companion executable"

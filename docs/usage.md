@@ -36,6 +36,9 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | `/relate alliance ID,ID` | Activate a relationship of 2–4 parts |
 | `/memory NAME_OR_ID` | Inspect an identity's stored memory |
 | `/notes NAME_OR_ID` | Inspect an identity's durable notes, separate from its conversation |
+| `/memory-candidates [CURSOR]` | List one bounded page of retained dream candidate refs |
+| `/memory-candidate-status BRANCH` | Recheck one exact retained candidate ref |
+| `/memory-candidate-abandon BRANCH BASE HEAD` | Explicitly abandon the exact inspected candidate |
 | `/memory-status` | Inspect the project's managed memory status |
 | `/memory-history` | Inspect committed memory revisions |
 | `/cost` | Inspect this session's reported usage and estimated API cost |
@@ -190,6 +193,9 @@ kuru sessions
 kuru --resume SESSION_ID --provider demo run "Continue from our last turn."
 kuru --resume SESSION_ID --provider demo run "Continue from our last turn." --turn-id TURN_ID
 kuru memory notes ID --limit 100
+kuru memory candidates --limit 16
+kuru memory candidate-status BRANCH
+kuru memory candidate-abandon BRANCH --base BASE --head HEAD
 ```
 
 JSON output includes `session`, `speaker`, `text`, `relationship`, token counts,
@@ -225,6 +231,16 @@ notes view as `/notes`: `mode`, canonical `identity`, chronological `notes`,
 `requested_limit`, and `truncated`. Limits are 1 through 1000 and default to
 100. An exact retained part or relationship ID remains readable after it is no
 longer active; names and roles resolve only among active identities.
+
+`kuru memory candidates` and `/memory-candidates` inspect bounded pages of
+retained dream candidate refs without changing them. Pass the returned opaque
+cursor to `--after` or as the TUI command argument. Recheck one selected branch
+with `candidate-status` before abandonment. A missing ref is reported with an
+unproved operation outcome; closing and reopening does not turn absence into
+proof. `candidate-abandon` requires the exact inspected branch, base, and head,
+then rechecks them under the memory owner before changing the ref. Changed,
+active, stale, or uncertain refs remain intact. These commands never promote,
+merge, replay, or automatically abandon a candidate.
 
 `kuru --resume SESSION_ID dream` runs explicit consolidation and
 `kuru --resume SESSION_ID undo-dream` restores the previous accepted topology.
