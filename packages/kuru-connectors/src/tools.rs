@@ -3397,15 +3397,39 @@ mod tests {
         else {
             panic!("the original checked target should be admitted");
         };
-        std::fs::remove_file(root.path().join("replace.txt")).unwrap();
-        std::fs::write(root.path().join("replace.txt"), "replacement bytes").unwrap();
-        let error = read
-            .execute(target_changed.clone(), ParallelReadCancellation::default())
-            .await
-            .result
-            .unwrap_err();
-        assert!(crate::is_permission_denied(&error));
-        assert!(error.to_string().contains("replan this call"));
+        #[cfg(windows)]
+        {
+            let path = root.path().join("replace.txt");
+            let original = regular_file_info(&std::fs::File::open(&path).unwrap()).unwrap();
+            let error = std::fs::remove_file(&path).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32));
+            assert_eq!(
+                regular_file_info(&std::fs::File::open(&path).unwrap())
+                    .unwrap()
+                    .identity,
+                original.identity
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"admitted bytes");
+            assert_eq!(
+                read.execute(target_changed.clone(), ParallelReadCancellation::default())
+                    .await
+                    .result
+                    .unwrap(),
+                "admitted bytes"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::remove_file(root.path().join("replace.txt")).unwrap();
+            std::fs::write(root.path().join("replace.txt"), "replacement bytes").unwrap();
+            let error = read
+                .execute(target_changed.clone(), ParallelReadCancellation::default())
+                .await
+                .result
+                .unwrap_err();
+            assert!(crate::is_permission_denied(&error));
+            assert!(error.to_string().contains("replan this call"));
+        }
 
         std::fs::create_dir(root.path().join("listed")).unwrap();
         std::fs::write(root.path().join("listed/item.txt"), "admitted").unwrap();
@@ -3419,15 +3443,41 @@ mod tests {
         else {
             panic!("the original checked directory should be admitted");
         };
-        std::fs::rename(root.path().join("listed"), root.path().join("old-listed")).unwrap();
-        std::fs::create_dir(root.path().join("listed")).unwrap();
-        let error = list
-            .execute(target_changed.clone(), ParallelReadCancellation::default())
-            .await
-            .result
-            .unwrap_err();
-        assert!(crate::is_permission_denied(&error));
-        assert!(error.to_string().contains("replan this call"));
+        #[cfg(windows)]
+        {
+            let path = root.path().join("listed");
+            let original = Directory::open(&path, Privacy::Inherited, NameRetention::Pinned)
+                .unwrap()
+                .identity();
+            let error = std::fs::rename(&path, root.path().join("old-listed")).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32));
+            assert_eq!(
+                Directory::open(&path, Privacy::Inherited, NameRetention::Pinned)
+                    .unwrap()
+                    .identity(),
+                original
+            );
+            assert_eq!(std::fs::read(path.join("item.txt")).unwrap(), b"admitted");
+            assert!(
+                list.execute(target_changed.clone(), ParallelReadCancellation::default())
+                    .await
+                    .result
+                    .unwrap()
+                    .contains("item.txt")
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(root.path().join("listed"), root.path().join("old-listed")).unwrap();
+            std::fs::create_dir(root.path().join("listed")).unwrap();
+            let error = list
+                .execute(target_changed.clone(), ParallelReadCancellation::default())
+                .await
+                .result
+                .unwrap_err();
+            assert!(crate::is_permission_denied(&error));
+            assert!(error.to_string().contains("replan this call"));
+        }
 
         std::fs::write(root.path().join("search.txt"), "unique-admitted-pattern").unwrap();
         let ParallelReadAdmission::Ready(grep) = target_changed
@@ -3440,15 +3490,39 @@ mod tests {
         else {
             panic!("the original checked search candidates should be admitted");
         };
-        std::fs::remove_file(root.path().join("search.txt")).unwrap();
-        std::fs::write(root.path().join("search.txt"), "replacement search bytes").unwrap();
-        let error = grep
-            .execute(target_changed, ParallelReadCancellation::default())
-            .await
-            .result
-            .unwrap_err();
-        assert!(crate::is_permission_denied(&error));
-        assert!(error.to_string().contains("replan this call"));
+        #[cfg(windows)]
+        {
+            let path = root.path().join("search.txt");
+            let original = regular_file_info(&std::fs::File::open(&path).unwrap()).unwrap();
+            let error = std::fs::remove_file(&path).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32));
+            assert_eq!(
+                regular_file_info(&std::fs::File::open(&path).unwrap())
+                    .unwrap()
+                    .identity,
+                original.identity
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"unique-admitted-pattern");
+            assert!(
+                grep.execute(target_changed, ParallelReadCancellation::default())
+                    .await
+                    .result
+                    .unwrap()
+                    .contains("unique-admitted-pattern")
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::remove_file(root.path().join("search.txt")).unwrap();
+            std::fs::write(root.path().join("search.txt"), "replacement search bytes").unwrap();
+            let error = grep
+                .execute(target_changed, ParallelReadCancellation::default())
+                .await
+                .result
+                .unwrap_err();
+            assert!(crate::is_permission_denied(&error));
+            assert!(error.to_string().contains("replan this call"));
+        }
     }
 
     #[tokio::test]

@@ -334,6 +334,21 @@ pub(super) fn file_access_token(source: &File) -> io::Result<Vec<u8>> {
     security::file_access_token(source.as_handle())
 }
 
+pub(super) fn retired_access_matches(
+    source: &File,
+    before: &[u8],
+    after: &[u8],
+) -> io::Result<bool> {
+    // This exception cannot be used for a named or still-linked source. The
+    // caller has already checked this held file's full identity and metadata;
+    // the kernel's delete-pending bit proves it is the displaced old object.
+    // SAFETY: FileStandardInfo returns the plain FILE_STANDARD_INFO record.
+    let standard: FILE_STANDARD_INFO = unsafe { query(source, FileStandardInfo)? };
+    Ok(standard.DeletePending
+        && standard.NumberOfLinks == 0
+        && security::same_retired_file_access(before, after))
+}
+
 pub(super) fn finalize_file_access(source: &File, published: &File) -> io::Result<()> {
     security::restore_file_dacl_inheritance(source.as_handle(), published.as_handle())
 }
@@ -1276,6 +1291,133 @@ mod tests {
         );
     }
 
+    struct AccessDiagnostic<'a> {
+        protected: u8,
+        owner: &'a [u8],
+        revision: u8,
+        aces: Vec<AceDiagnostic<'a>>,
+    }
+
+    struct AceDiagnostic<'a> {
+        kind: u8,
+        flags: u8,
+        size: usize,
+        mask_slot: Option<&'a [u8]>,
+        payload: &'a [u8],
+    }
+
+    // Test-only parser for security::canonical_access_token's current framing.
+    // Report component equality, never owner or ACE bytes.
+    fn parse_access_token(token: &[u8]) -> AccessDiagnostic<'_> {
+        let owner_len = u32::from_le_bytes(token[1..5].try_into().unwrap()) as usize;
+        let owner_end = 5 + owner_len;
+        let owner = &token[5..owner_end];
+        let revision = token[owner_end];
+        let ace_count = u32::from_le_bytes(token[owner_end + 1..owner_end + 5].try_into().unwrap());
+        let ace_len =
+            u32::from_le_bytes(token[owner_end + 5..owner_end + 9].try_into().unwrap()) as usize;
+        let ace_bytes = &token[owner_end + 9..];
+        assert_eq!(ace_bytes.len(), ace_len);
+        let mut remaining = ace_bytes;
+        let mut aces = Vec::new();
+        for _ in 0..ace_count {
+            let size = u16::from_le_bytes(remaining[2..4].try_into().unwrap()) as usize;
+            assert!(size >= 4 && size <= remaining.len());
+            let (ace, rest) = remaining.split_at(size);
+            aces.push(AceDiagnostic {
+                kind: ace[0],
+                flags: ace[1],
+                size,
+                mask_slot: (size >= 8).then(|| &ace[4..8]),
+                payload: if size >= 8 { &ace[8..] } else { &ace[4..] },
+            });
+            remaining = rest;
+        }
+        assert!(remaining.is_empty());
+        AccessDiagnostic {
+            protected: token[0],
+            owner,
+            revision,
+            aces,
+        }
+    }
+
+    fn access_token_difference(before: &[u8], after: &[u8]) -> String {
+        let before = parse_access_token(before);
+        let after = parse_access_token(after);
+        let inherited = windows_sys::Win32::Security::INHERITED_ACE as u8;
+        let mut inherited_cleared = 0;
+        let mut inherited_added = 0;
+        let mut other_flag_changes = 0;
+        for (left, right) in before.aces.iter().zip(&after.aces) {
+            if left.flags & inherited != 0 && right.flags & inherited == 0 {
+                inherited_cleared += 1;
+            } else if left.flags & inherited == 0 && right.flags & inherited != 0 {
+                inherited_added += 1;
+            }
+            if (left.flags ^ right.flags) & !inherited != 0 {
+                other_flag_changes += 1;
+            }
+        }
+        let changed: Vec<_> = before
+            .aces
+            .iter()
+            .zip(&after.aces)
+            .enumerate()
+            .filter_map(|(index, (left, right))| {
+                let same = left.kind == right.kind
+                    && left.flags == right.flags
+                    && left.size == right.size
+                    && left.mask_slot == right.mask_slot
+                    && left.payload == right.payload;
+                (!same).then(|| {
+                    format!(
+                        "{index}: type={}, flags={}/0x{:02x}->0x{:02x}/xor=0x{:02x}/inherited_provenance_only={}, size={}, mask_slot={}, payload={}",
+                        left.kind == right.kind,
+                        left.flags == right.flags,
+                        left.flags,
+                        right.flags,
+                        left.flags ^ right.flags,
+                        left.flags ^ right.flags == windows_sys::Win32::Security::INHERITED_ACE as u8,
+                        left.size == right.size,
+                        left.mask_slot == right.mask_slot,
+                        left.payload == right.payload,
+                    )
+                })
+            })
+            .take(16)
+            .collect();
+        format!(
+            "protected={}, owner={}, revision={}, ace_count={}/{}, inherited_cleared={}, inherited_added={}, other_flag_changes={}, changed_aces=[{}]",
+            before.protected == after.protected,
+            before.owner == after.owner,
+            before.revision == after.revision,
+            before.aces.len(),
+            after.aces.len(),
+            inherited_cleared,
+            inherited_added,
+            other_flag_changes,
+            changed.join("; "),
+        )
+    }
+
+    #[test]
+    fn access_token_diagnostic_parser_uses_canonical_field_boundaries() {
+        let token = [
+            1, 2, 0, 0, 0, 0xaa, 0xbb, 2, 2, 0, 0, 0, 12, 0, 0, 0, 0, 0, 8, 0, 1, 2, 3, 4, 0x7f, 0,
+            4, 0,
+        ];
+        let parts = parse_access_token(&token);
+        assert_eq!(parts.protected, 1);
+        assert_eq!(parts.owner, [0xaa, 0xbb]);
+        assert_eq!(parts.revision, 2);
+        assert_eq!(parts.aces.len(), 2);
+        assert_eq!(parts.aces[0].size, 8);
+        assert_eq!(parts.aces[0].mask_slot, Some(&[1, 2, 3, 4][..]));
+        assert_eq!(parts.aces[1].mask_slot, None);
+        assert!(parts.aces[1].payload.is_empty());
+    }
+
     #[test]
     fn retained_old_access_is_verified_after_checked_posix_replacement() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1295,31 +1437,14 @@ mod tests {
         candidate.write_all(b"new").unwrap();
         let access = crate::fs::copy_file_access(&old, &candidate).unwrap();
         crate::fs::verify_file_access(&old, &access).unwrap();
-        fn access_components(token: &[u8]) -> (u8, &[u8], &[u8]) {
-            let owner_len = u32::from_le_bytes(token[1..5].try_into().unwrap()) as usize;
-            let owner_end = 5 + owner_len;
-            (token[0], &token[5..owner_end], &token[owner_end + 4..])
-        }
-        fn used_aces(dacl: &[u8]) -> &[u8] {
-            let ace_count = u16::from_le_bytes(dacl[4..6].try_into().unwrap());
-            let mut end = 8;
-            for _ in 0..ace_count {
-                let ace_size =
-                    u16::from_le_bytes(dacl[end + 2..end + 4].try_into().unwrap()) as usize;
-                assert!(ace_size >= 4 && end + ace_size <= dacl.len());
-                end += ace_size;
-            }
-            &dacl[8..end]
-        }
-        fn used_dacl_equal(before: &[u8], after: &[u8]) -> bool {
-            before[0] == after[0]
-                && before[4..6] == after[4..6]
-                && used_aces(before) == used_aces(after)
-        }
         let before_publish = file_access_token(&old).unwrap();
         assert!(
             before_publish == file_access_token(&old).unwrap(),
             "source access token changed before publication"
+        );
+        assert!(
+            !retired_access_matches(&old, &before_publish, &before_publish).unwrap(),
+            "a still-linked source was treated as a retired file"
         );
         let source =
             Directory::open(stage.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
@@ -1335,31 +1460,24 @@ mod tests {
             )
             .unwrap();
         let after_publish = file_access_token(&old).unwrap();
+        assert!(
+            security::same_retired_file_access(&before_publish, &after_publish),
+            "retired source changed more than inherited-ACE provenance: {}",
+            access_token_difference(&before_publish, &after_publish)
+        );
+        assert!(
+            retired_access_matches(&old, &before_publish, &after_publish).unwrap(),
+            "retained old file did not satisfy the checked zero-link retirement boundary"
+        );
         crate::fs::finalize_file_access(&old, &candidate).unwrap();
         let after_finalize = file_access_token(&old).unwrap();
-        let (before_protected, before_owner, before_dacl) = access_components(&before_publish);
-        let (published_protected, published_owner, published_dacl) =
-            access_components(&after_publish);
-        let (final_protected, final_owner, final_dacl) = access_components(&after_finalize);
-        eprintln!(
-            "retained-old access after publish: protected={}, owner={}, dacl={}, used_dacl={}, dacl_lengths={}/{}, used_lengths={}/{}; after finalize: protected={}, owner={}, dacl={}, used_dacl={}, dacl_lengths={}/{}, used_lengths={}/{}",
-            before_protected == published_protected,
-            before_owner == published_owner,
-            before_dacl == published_dacl,
-            used_dacl_equal(before_dacl, published_dacl),
-            before_dacl.len(),
-            published_dacl.len(),
-            used_aces(before_dacl).len() + 8,
-            used_aces(published_dacl).len() + 8,
-            before_protected == final_protected,
-            before_owner == final_owner,
-            before_dacl == final_dacl,
-            used_dacl_equal(before_dacl, final_dacl),
-            before_dacl.len(),
-            final_dacl.len(),
-            used_aces(before_dacl).len() + 8,
-            used_aces(final_dacl).len() + 8,
-        );
+        writeln!(
+            std::io::stderr().lock(),
+            "retained-old access after publish: {}; after finalize: {}",
+            access_token_difference(&before_publish, &after_publish),
+            access_token_difference(&before_publish, &after_finalize),
+        )
+        .unwrap();
         crate::fs::verify_retained_file_access(&old, &access).unwrap();
         assert_eq!(crate::fs::retained_file_info(&old).unwrap().links, 0);
         assert_eq!(
@@ -1398,6 +1516,13 @@ mod tests {
         let candidate = stage.create_new(OsStr::new("payload")).unwrap();
         let access = crate::fs::copy_file_access(&source, &candidate).unwrap();
         crate::fs::verify_retained_file_access(&source, &access).unwrap();
+        let unrelated = directory.create_new(OsStr::new("unrelated")).unwrap();
+        assert_eq!(
+            crate::fs::verify_retained_file_access(&unrelated, &access)
+                .unwrap_err()
+                .to_string(),
+            "access source identity changed during publication"
+        );
 
         let alias = directory.path().join("unexpected-alias");
         std::fs::hard_link(directory.path().join("source"), &alias).unwrap();
