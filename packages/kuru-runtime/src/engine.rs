@@ -991,7 +991,7 @@ impl Harness {
     }
 
     async fn admit_turn(
-        &self,
+        &mut self,
         prompt: &str,
         target: Option<&str>,
         id: &str,
@@ -1021,6 +1021,7 @@ impl Harness {
             // A resumable historical entry becomes v2 before it can write a
             // newly completed output. Completed v1 journals return above.
             journal.format = 2;
+            self.refresh_topology_for_turn().await?;
             let resolved_target = target.map(|value| self.resolve(value)).transpose()?;
             cancellation.check()?;
             journal.push(TurnTransition::Resumed)?;
@@ -1033,6 +1034,7 @@ impl Harness {
                 resolved_target,
             });
         }
+        self.refresh_topology_for_turn().await?;
         let resolved_target = target.map(|value| self.resolve(value)).transpose()?;
         cancellation.check()?;
         let journal = TurnJournal {
@@ -1058,7 +1060,12 @@ impl Harness {
             ));
         }
         self.memory
-            .checkpoint(&self.checked_transcript_key()?, &[user(prompt)], &updates)
+            .checkpoint_session(
+                &self.checked_transcript_key()?,
+                &self.session.id,
+                &[user(prompt)],
+                &updates,
+            )
             .await?;
         Ok(TurnAdmission::Run {
             key,
@@ -1122,8 +1129,9 @@ impl Harness {
         let messages = if already_marked { vec![] } else { vec![marker] };
         journal.interruption_marker = true;
         self.memory
-            .checkpoint(
+            .checkpoint_session(
                 &self.checked_transcript_key()?,
+                &self.session.id,
                 &messages,
                 &[(key.into(), serde_json::to_value(journal)?)],
             )
@@ -1991,9 +1999,14 @@ impl Harness {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the admitted turn ID stays distinct from actor work and progress identity"
+    )]
     async fn ask_controlled_with_progress(
         &self,
         id: &str,
+        turn_id: &str,
         inputs: Vec<Message>,
         phase: (&str, ActorPhase),
         tools: Vec<ToolSpec>,
@@ -2003,6 +2016,7 @@ impl Harness {
         self.ask_in_controlled_with_progress(
             &self.memory,
             id,
+            Some(turn_id),
             inputs,
             phase.0,
             tools,
@@ -2028,6 +2042,7 @@ impl Harness {
             .ask_in_controlled_with_progress(
                 memory,
                 id,
+                None,
                 inputs,
                 phase.0,
                 tools,
@@ -2041,10 +2056,15 @@ impl Harness {
             .0)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the admitted turn ID stays distinct from actor work and memory view"
+    )]
     async fn ask_in_controlled_with_progress(
         &self,
         memory: &MemoryStore,
         id: &str,
+        turn_id: Option<&str>,
         inputs: Vec<Message>,
         phase: &str,
         tools: Vec<ToolSpec>,
@@ -2123,6 +2143,7 @@ impl Harness {
             memory: memory.clone(),
             ledger: self.memory.usage_ledger()?,
             invocation,
+            turn_id: turn_id.map(str::to_owned),
             context_sources,
             inputs,
             instructions,
@@ -2402,6 +2423,15 @@ impl Harness {
         }
     }
 
+    async fn refresh_topology_for_turn(&mut self) -> Result<()> {
+        let topology = read_topology_with_profile(&self.memory, &self.scope, &self.profile).await?;
+        validate_topology_with_profile(&topology, &self.config, &self.profile)?;
+        let namespaces = prepared_actor_namespaces(&self.scope, &self.profile, &topology)?;
+        self.topology = topology;
+        self.sync_actors_with(&namespaces);
+        Ok(())
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "the admitted turn ID stays distinct from journal and review authority"
@@ -2568,7 +2598,11 @@ impl Harness {
                 for message in messages {
                     cancellation.check()?;
                     self.memory
-                        .append_message(&self.checked_namespace(&id)?, &message)
+                        .append_session_message(
+                            &self.checked_namespace(&id)?,
+                            &self.session.id,
+                            &message,
+                        )
                         .await?;
                     cancellation.check()?;
                 }
@@ -2635,6 +2669,7 @@ impl Harness {
             let (completion, invocation_id) = self
                 .ask_controlled_with_progress(
                     &speaker,
+                    turn_id,
                     inputs,
                     (
                         "speak and act: you are the identity the user is talking to",
@@ -2941,8 +2976,9 @@ impl Harness {
             proof: PublicationProof::LiveValues,
         });
         self.memory
-            .checkpoint(
+            .checkpoint_session(
                 &self.checked_transcript_key()?,
+                &self.session.id,
                 &[assistant(&text)],
                 &updates,
             )
@@ -3740,6 +3776,57 @@ mod publication_tests {
     }
 
     #[tokio::test]
+    async fn new_turn_admission_refreshes_one_valid_persisted_topology() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            Arc::new(DemoProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let selected = harness.topology.parts[1].id.clone();
+        let mut refreshed = harness.topology.clone();
+        refreshed.focus = Some(Focus {
+            id: selected.clone(),
+            remaining: 3,
+        });
+        memory
+            .put(
+                &format!("{}/{}/topology", harness.scope, harness.profile.mode),
+                &serde_json::to_value(&refreshed).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let admission = harness
+            .admit_turn(
+                "observe refreshed topology",
+                None,
+                "topology-refresh",
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(admission, TurnAdmission::Run { .. }));
+        assert_eq!(harness.topology.focus.as_ref().unwrap().id, selected);
+
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn completed_turn_retry_is_exact_and_session_scoped() {
         let project = tempfile::tempdir().unwrap();
         let memory = MemoryStore::temporary().await.unwrap();
@@ -3774,6 +3861,12 @@ mod publication_tests {
             .unwrap();
         let serialized = serde_json::to_string(&output).unwrap();
         let sends = provider.calls.load(Ordering::SeqCst);
+        let topology_key = format!("{}/{}/topology", first.scope, first.profile.mode);
+        let valid_topology = memory.get(&topology_key).await.unwrap().unwrap();
+        memory
+            .put(&topology_key, &json!({"malformed-after-completion": true}))
+            .await
+            .unwrap();
         let retry = first
             .run_controlled(
                 "one durable request",
@@ -3786,6 +3879,7 @@ mod publication_tests {
         assert_eq!(serde_json::to_string(&retry).unwrap(), serialized);
         assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
         assert_eq!(first.history().await.unwrap().len(), 2);
+        memory.put(&topology_key, &valid_topology).await.unwrap();
         assert!(
             first
                 .run_controlled(

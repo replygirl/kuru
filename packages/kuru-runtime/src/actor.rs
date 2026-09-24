@@ -7,13 +7,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use kuru_connectors::{Provider, ProviderEvent, ProviderSink, collect_completion};
+use kuru_connectors::{
+    Provider, ProviderEvent, ProviderReasoningSummary, ProviderSink, collect_completion,
+};
 use kuru_core::{
     Completion, CompletionRequest, ContentBlock, ContextBudget, ContextSource, ContextSourceKind,
     ContextSourceSize, ContextTooLarge, InvocationOutcome, InvocationStart, Message, ToolSpec,
     UsageObservation, estimated_tokens_for_bytes, validate_context_sources,
 };
-use kuru_memory::{MemoryStore, UsageLedger};
+use kuru_memory::{MemoryStore, ReasoningSummaryRecord, UsageLedger};
 use serde_json::Value;
 use tokio::{
     sync::{Semaphore, mpsc, oneshot, watch},
@@ -48,6 +50,7 @@ pub(crate) struct Work {
     pub memory: MemoryStore,
     pub ledger: UsageLedger,
     pub invocation: InvocationStart,
+    pub turn_id: Option<String>,
     pub inputs: Vec<Message>,
     pub instructions: String,
     pub transcript_key: String,
@@ -85,6 +88,8 @@ struct AccountingObserver {
     omitted_private_rows: u64,
     omitted_note_rows: u64,
     runtime_sources: Vec<ContextSourceSize>,
+    settled_reasoning_summaries: Vec<ProviderReasoningSummary>,
+    reasoning_summaries_seen: bool,
 }
 
 impl ProviderSink for AccountingObserver {
@@ -97,6 +102,17 @@ impl ProviderSink for AccountingObserver {
                 progress.emit(event.clone()).await?;
             }
             match event {
+                ProviderEvent::SettledReasoningSummaries(summaries) => {
+                    if !self.reasoning_summaries_seen {
+                        self.settled_reasoning_summaries = summaries;
+                        self.reasoning_summaries_seen = true;
+                    } else {
+                        ensure!(
+                            self.settled_reasoning_summaries == summaries,
+                            "provider emitted conflicting settled reasoning summaries"
+                        );
+                    }
+                }
                 ProviderEvent::Usage(usage) => {
                     self.sequence = self
                         .sequence
@@ -190,9 +206,14 @@ impl Actor {
                         .collect::<Result<Vec<_>>>()?;
                     let (mut optional_private, omitted_private_rows) = if own_history {
                         let older_limit = work.history_limit.saturating_sub(work.inputs.len());
-                        let window =
-                            read_window(&work.memory, &namespace, older_limit, &work.cancellation)
-                                .await?;
+                        let window = read_session_window(
+                            &work.memory,
+                            &namespace,
+                            &work.invocation.session_id,
+                            older_limit,
+                            &work.cancellation,
+                        )
+                        .await?;
                         let omitted = window
                             .total_rows
                             .saturating_sub(window.messages.len() as u64);
@@ -234,7 +255,7 @@ impl Actor {
                     for input in &work.inputs {
                         work.cancellation.check()?;
                         work.memory
-                            .append_message(&namespace, input)
+                            .append_session_message(&namespace, &work.invocation.session_id, input)
                             .await
                             .map_err(MemoryFailure)?;
                         work.cancellation.check()?;
@@ -252,6 +273,8 @@ impl Actor {
                         omitted_private_rows,
                         omitted_note_rows,
                         runtime_sources: vec![],
+                        settled_reasoning_summaries: vec![],
+                        reasoning_summaries_seen: false,
                     };
                     work.ledger
                         .admit(work.invocation.clone())
@@ -332,16 +355,55 @@ impl Actor {
                         }
                         break result;
                     };
-                    let outcome = match &completion_result {
-                        Ok(_) => InvocationOutcome::Succeeded,
-                        Err(error) if turn_was_cancelled(error) => InvocationOutcome::Cancelled,
-                        Err(_) => InvocationOutcome::Failed,
+                    // A provider may have emitted its settled private sidecar just before a
+                    // caller cancels. Recheck before settling: cancellation is terminal for
+                    // this invocation and must not make that buffered sidecar durable.
+                    let cancellation_after_completion = completion_result
+                        .as_ref()
+                        .ok()
+                        .and_then(|_| work.cancellation.check().err());
+                    let outcome = match (&completion_result, &cancellation_after_completion) {
+                        (_, Some(_)) => InvocationOutcome::Cancelled,
+                        (Ok(_), None) => InvocationOutcome::Succeeded,
+                        (Err(error), None) if turn_was_cancelled(error) => {
+                            InvocationOutcome::Cancelled
+                        }
+                        (Err(_), None) => InvocationOutcome::Failed,
                     };
                     work.ledger
                         .settle(&work.invocation.invocation_id, outcome)
                         .await
                         .map_err(AccountingFailure)?;
+                    if let Some(error) = cancellation_after_completion {
+                        return Err(error);
+                    }
                     let completion = completion_result?;
+                    if let Some(turn_id) = &work.turn_id {
+                        // Successful ledger settlement is the terminal cutoff for this
+                        // completion. Do not observe cancellation again while publishing
+                        // the atomic batch: an accepted write reconciles through memory
+                        // rather than reporting a cancelled prefix as durable state.
+                        let records = observer
+                            .settled_reasoning_summaries
+                            .iter()
+                            .map(|summary| ReasoningSummaryRecord {
+                                session_id: work.invocation.session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                actor_id: work.invocation.actor_id.clone(),
+                                invocation_id: work.invocation.invocation_id.clone(),
+                                item_id: summary.item_id.clone(),
+                                output_index: summary.output_index,
+                                summary_index: summary.summary_index,
+                                text: summary.text.clone(),
+                            })
+                            .collect::<Vec<_>>();
+                        if !records.is_empty() {
+                            work.memory
+                                .put_reasoning_summaries(&records)
+                                .await
+                                .map_err(MemoryFailure)?;
+                        }
+                    }
                     let calls = completion.calls();
                     ensure!(
                         calls.len() <= 1024,
@@ -358,8 +420,9 @@ impl Actor {
                     if !durable_blocks.is_empty() {
                         work.cancellation.check()?;
                         work.memory
-                            .append_message(
+                            .append_session_message(
                                 &namespace,
+                                &work.invocation.session_id,
                                 &Message {
                                     role: "assistant".into(),
                                     blocks: durable_blocks,
@@ -424,6 +487,24 @@ async fn read_window(
         .wait(async {
             memory
                 .history_window(namespace, limit)
+                .await
+                .map_err(MemoryFailure)
+                .map_err(Into::into)
+        })
+        .await
+}
+
+async fn read_session_window(
+    memory: &MemoryStore,
+    namespace: &str,
+    session_id: &str,
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<kuru_memory::HistoryWindow> {
+    cancellation
+        .wait(async {
+            memory
+                .session_history_window(namespace, session_id, limit)
                 .await
                 .map_err(MemoryFailure)
                 .map_err(Into::into)
