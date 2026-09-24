@@ -363,13 +363,18 @@ impl Session {
             };
             current.join(cwd)
         };
+        // A lexical `.` is not a filesystem authority change. Remove it before
+        // Windows' verbatim-path open, which does not normalize dot components.
+        // Parent components remain for Directory::open to reject.
+        let cwd = cwd.components().collect::<PathBuf>();
         let cwd_pin = match Directory::open(&cwd, Privacy::Inherited, NameRetention::Pinned) {
             Ok(cwd_pin) => cwd_pin,
             Err(_) => return Startup::Rejected,
         };
         match cwd_pin.is_within(&root_guard) {
             Ok(true) => {}
-            Ok(false) | Err(_) => return Startup::Rejected,
+            Ok(false) => return Startup::Rejected,
+            Err(_) => return Startup::Rejected,
         }
         let cwd = cwd_pin.path().to_path_buf();
         #[cfg(unix)]

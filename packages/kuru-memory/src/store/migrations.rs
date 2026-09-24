@@ -723,7 +723,6 @@ async fn validate_operation_receipt_shape(pool: &MySqlPool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 pub(super) async fn validate_current(pool: &MySqlPool) -> Result<()> {
     validate_current_with(REGISTRY, pool).await
 }

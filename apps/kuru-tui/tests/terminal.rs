@@ -25,8 +25,8 @@ use axum::{
 };
 use futures::stream;
 use kuru_core::{
-    Config, McpConfig, McpOAuthConfig, Mode, PermissionAction, PermissionRule, PermissionSelector,
-    SelectionOverrides,
+    Config, McpConfig, McpOAuthConfig, Mode, ModeProfile, PermissionAction, PermissionRule,
+    PermissionSelector, SelectionOverrides,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -90,7 +90,7 @@ fn real_pty_file_checkpoint_inspect_and_selected_undo() -> Result<()> {
 }
 
 struct Sandbox {
-    root: tempfile::TempDir,
+    root: memory::ServiceCleanup,
     project: PathBuf,
     data: PathBuf,
     startup_timeout: Duration,
@@ -107,7 +107,7 @@ impl Sandbox {
             configuration.join("kuru/config.toml"),
         )?)?;
         Ok(Self {
-            root,
+            root: memory::ServiceCleanup::new(root, &data),
             project,
             data,
             startup_timeout: startup_timeout(Duration::from_secs(
@@ -704,8 +704,8 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
     terminal.send(b"/mem\t")?;
     terminal.wait_composer_frame(&["/memory", "enter send"], READY_TIMEOUT)?;
     terminal.send(b"\t")?;
-    terminal.wait_composer_frame(&["/memory-history", "enter send"], READY_TIMEOUT)?;
-    terminal.send(&[127; 15])?;
+    terminal.wait_composer_frame(&["/memory-candidate-abandon", "enter send"], READY_TIMEOUT)?;
+    terminal.send(&[127; 25])?;
     terminal.wait_composer_frame(
         &["What shall we explore or build?", "enter send"],
         READY_TIMEOUT,
@@ -1292,20 +1292,39 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
         .position(|bytes| bytes == b"\x1b[?1049h")
         .context("terminal did not enter its alternate screen")?;
     let startup = &terminal.output[..alternate];
-    let mut previous = 0;
+    let waiting = b"Memory: waiting for project ownership";
+    let ready = b"Memory: ready.";
+    let waiting_at = startup
+        .windows(waiting.len())
+        .position(|bytes| bytes == waiting)
+        .context("memory startup did not report project-ownership wait before the first completed TUI frame")?;
+    let ready_at = startup
+        .windows(ready.len())
+        .position(|bytes| bytes == ready)
+        .context("memory startup did not report ready before the first completed TUI frame")?;
+    assert!(
+        waiting_at < ready_at,
+        "memory startup reported ready before ownership wait"
+    );
+    let mut previous = waiting_at;
     for stage in [
-        b"Memory: waiting for project ownership".as_slice(),
-        b"Memory: verifying cached runtime",
+        b"Memory: waiting for verified runtime cache".as_slice(),
+        b"Memory: extracting embedded runtime",
+        b"Memory: verifying cached runtime".as_slice(),
         b"Memory: checking runtime version",
         b"Memory: preparing database",
         b"Memory: opening database",
-        b"Memory: ready.",
     ] {
-        let offset = startup[previous..]
+        if let Some(position) = startup
             .windows(stage.len())
             .position(|bytes| bytes == stage)
-            .context("memory startup progress did not precede the first completed TUI frame")?;
-        previous += offset + stage.len();
+        {
+            assert!(
+                position > previous && position < ready_at,
+                "memory startup reordered {stage:?} before the first completed TUI frame"
+            );
+            previous = position;
+        }
     }
     assert!(
         terminal
@@ -3054,18 +3073,29 @@ async fn real_pty_cancels_provider_work_preserves_draft_and_accepts_the_next_tur
     resumed.wait_exit(EXIT_TIMEOUT)?;
     resumed.assert_restored()?;
 
-    let harness = kuru_runtime::Harness::new(
-        Config {
-            provider: "demo".into(),
-            ..Config::default()
-        },
-        &sandbox.project,
-        MemoryStore::open(memory_options(&sandbox)?).await?,
-        Arc::new(kuru_connectors::DemoProvider),
-        Some(&sessions[0].id),
-    )
-    .await?;
-    let history = harness.history().await?;
+    let mut observed_options = memory_options(&sandbox)?;
+    observed_options.read_only = true;
+    let project = sandbox.project.canonicalize()?;
+    let (_, opening) = MemoryStore::open_managed_observed(
+        observed_options,
+        project.clone(),
+        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+    );
+    let memory = opening
+        .await
+        .context("attach managed read-only PTY history inspector")?;
+    let scope = kuru_runtime::project_scope(&project)?;
+    let transcript = ModeProfile::builtin(Mode::Freudian)
+        .memory
+        .transcript_namespace(&scope, &sessions[0].id);
+    let history = memory
+        .history(&transcript, 500)
+        .await
+        .context("read committed PTY history")?;
+    memory
+        .close()
+        .await
+        .context("close managed read-only PTY history inspector")?;
     assert!(
         history
             .iter()

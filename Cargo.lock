@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "kuru"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-archive"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-connectors"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2154,7 +2154,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "jsonschema",
@@ -2171,7 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-delivery"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-memory"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "flate2",
@@ -2220,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-platform"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "keyring",
  "nix 0.31.3",
@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "kuru-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",

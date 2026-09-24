@@ -82,6 +82,12 @@ supervisor must reap Dolt before releasing its directory or lifecycle lease.
 Writable opens require ownership; attached inspection handles never control the
 owner's lifetime. Await command cleanup before releasing the project writer lease,
 and hold the stable lifecycle lock through migration/recovery directory moves.
+Ordinary writable runtime opens attach to the checked private per-project memory
+service while retaining the single conversation-driver lease; concurrent session
+admission remains gated until session-scoped storage lands. Candidate inspection
+is bounded and read-only. Explicit candidate abandonment binds the inspected
+exact ref, base and head to its own typed request outcome; never promote, replay
+or abandon a candidate from missing or ambiguous evidence.
 
 Every ordinary Kuru executable embeds its target's verified full-Dolt archive
 and upstream licenses. `kuru-memory` owns the authoritative asset manifest,

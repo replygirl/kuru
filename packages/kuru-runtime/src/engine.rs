@@ -28,7 +28,10 @@ use kuru_core::{
     validate_contributions, validate_facing, validate_identity_namespace, validate_peer_edge,
     validate_recipients, validate_relationship_members,
 };
-use kuru_memory::{HistoryWindow, MemoryStatus, MemoryStore, Revision, StoredNote};
+use kuru_memory::{
+    Candidate, CandidateInventoryPage, CandidateRefStatus, CandidateTransitionResolution,
+    HistoryWindow, MemoryStatus, MemoryStore, Revision, SelectedAbandonResolution, StoredNote,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -396,6 +399,17 @@ pub struct ForgetNoteResult {
     pub history_retained: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct CandidateResolutionRequired(&'static str);
+
+impl std::fmt::Display for CandidateResolutionRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for CandidateResolutionRequired {}
+
 pub struct Harness {
     pub config: Config,
     pub(crate) profile: ModeProfile,
@@ -418,8 +432,16 @@ pub struct Harness {
     pub(crate) operation_id: String,
     trace: Vec<Event>,
     pub(crate) pending_publication: Option<PendingPublication>,
+    pub(crate) pending_candidate: Option<Candidate>,
+    pub(crate) pending_candidate_resolution: PendingCandidateResolution,
     #[cfg(test)]
     publication_pause: Option<PublicationPause>,
+    #[cfg(test)]
+    dream_promotion_pause: Option<PublicationPause>,
+    #[cfg(test)]
+    dream_abandon_pause: Option<PublicationPause>,
+    #[cfg(test)]
+    pub(crate) dream_transition_reply_pause: Option<kuru_memory::test_support::ReplyBarrier>,
 }
 
 pub(crate) struct PendingPublication {
@@ -429,6 +451,33 @@ pub(crate) struct PendingPublication {
     pub topology: Topology,
     pub session: Session,
     pub updates: Vec<(String, Value)>,
+    pub proof: PublicationProof,
+}
+
+#[derive(Clone)]
+pub(crate) enum PublicationProof {
+    LiveValues,
+    CandidatePromotion {
+        base: String,
+        target: String,
+        report: crate::dream::DreamReport,
+        status: CandidatePromotionStatus,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) enum CandidatePromotionStatus {
+    Pending,
+    Confirmed(String),
+    OpenUnchanged,
+    OpenConflict,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PendingCandidateResolution {
+    AutomaticCleanup,
+    Explicit,
+    AbandonSent,
 }
 
 struct ConstructorAuthority {
@@ -618,8 +667,16 @@ impl Harness {
             operation_id: Uuid::new_v4().to_string(),
             trace: vec![],
             pending_publication: None,
+            pending_candidate: None,
+            pending_candidate_resolution: PendingCandidateResolution::AutomaticCleanup,
             #[cfg(test)]
             publication_pause: None,
+            #[cfg(test)]
+            dream_promotion_pause: None,
+            #[cfg(test)]
+            dream_abandon_pause: None,
+            #[cfg(test)]
+            dream_transition_reply_pause: None,
         };
         harness.sync_actors_with(&actor_namespaces);
         harness.save().await?;
@@ -871,6 +928,78 @@ impl Harness {
     }
     pub async fn memory_status(&self) -> Result<MemoryStatus> {
         self.memory.status().await
+    }
+    /// Candidate inspection remains available when a prior dream mutation is
+    /// fenced. A missing ref is reported as missing, never as transition proof.
+    pub async fn candidate_inventory(
+        &mut self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<CandidateInventoryPage> {
+        self.rebind_main_if_retired().await?;
+        self.memory.candidate_inventory(after, limit).await
+    }
+    pub async fn candidate_ref_status(&mut self, branch: &str) -> Result<CandidateRefStatus> {
+        self.rebind_main_if_retired().await?;
+        self.memory.candidate_ref_status(branch).await
+    }
+    /// Inspect the original selected abandonment request, if one lost its
+    /// reply. The caller must reselect a ref before any later mutation.
+    pub async fn selected_candidate_abandon_outcome(
+        &mut self,
+    ) -> Result<Option<SelectedAbandonResolution>> {
+        self.rebind_main_if_retired().await?;
+        let outcome = self.memory.recover_selected_candidate_abandon().await?;
+        Ok(outcome)
+    }
+
+    /// Settle prior typed work, then abandon only the exact open ref and head
+    /// that the user selected. The runtime's own retained candidate uses its
+    /// checked handle; an independent historical ref uses the owner's one-shot
+    /// selected resolution gate.
+    pub async fn abandon_candidate_ref_exact(
+        &mut self,
+        branch: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<()> {
+        if let Some(previous) = self.selected_candidate_abandon_outcome().await? {
+            bail!(
+                "previous selected candidate abandonment resolved as {previous:?}; inspect the exact ref before another action"
+            );
+        }
+        match self.reconcile().await {
+            Err(error) if error.is::<CandidateResolutionRequired>() => {}
+            outcome => outcome?,
+        }
+        // The open-candidate signal can stop ordinary reconciliation early.
+        // Require any independent live/usage write to settle before this
+        // selected mutation; a generic reconciliation cannot replace the
+        // typed candidate proof already checked above.
+        self.memory.reconcile().await?;
+        let inspected = self.candidate_ref_status(branch).await?;
+        ensure!(
+            matches!(
+                inspected.state,
+                kuru_memory::CandidateRefState::OpenUnchanged
+                    | kuru_memory::CandidateRefState::OpenConflict
+            ) && inspected.base.as_deref() == Some(base)
+                && inspected.head.as_deref() == Some(head),
+            "selected candidate ref changed or its outcome is unproved"
+        );
+        if let Some(retained) = &self.pending_candidate {
+            ensure!(
+                retained.branch() == branch,
+                "another dream candidate is still active"
+            );
+            self.abandon_pending_dream_exact(branch, base, head).await
+        } else {
+            ensure!(
+                self.pending_publication.is_none(),
+                "a dream publication remains unresolved"
+            );
+            self.memory.abandon_candidate_ref(branch, base, head).await
+        }
     }
     pub async fn memory_revisions(&self, limit: usize) -> Result<Vec<Revision>> {
         self.memory.revisions(limit).await
@@ -1287,6 +1416,7 @@ impl Harness {
             topology,
             session,
             updates: updates.clone(),
+            proof: PublicationProof::LiveValues,
         });
         self.memory.put_many(&updates).await?;
         #[cfg(test)]
@@ -1328,8 +1458,91 @@ impl Harness {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_before_next_dream_promotion(
+        &mut self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, observed) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        assert!(
+            self.dream_promotion_pause.is_none(),
+            "dream promotion pause is active"
+        );
+        self.dream_promotion_pause = Some(PublicationPause {
+            reached,
+            release: wait,
+        });
+        (observed, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_before_next_dream_abandon(
+        &mut self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, observed) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        assert!(
+            self.dream_abandon_pause.is_none(),
+            "dream abandon pause is active"
+        );
+        self.dream_abandon_pause = Some(PublicationPause {
+            reached,
+            release: wait,
+        });
+        (observed, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_before_dream_abandon(&mut self) -> Result<()> {
+        let Some(pause) = self.dream_abandon_pause.take() else {
+            return Ok(());
+        };
+        pause
+            .reached
+            .send(())
+            .map_err(|_| anyhow::anyhow!("dream abandon observer disappeared"))?;
+        pause
+            .release
+            .await
+            .context("dream abandon release channel closed")?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_dream_transition_frame(
+        &mut self,
+    ) -> kuru_memory::test_support::ReplyBarrier {
+        assert!(
+            self.dream_transition_reply_pause.is_none(),
+            "dream transition reply pause is active"
+        );
+        let barrier = kuru_memory::test_support::ReplyBarrier::default();
+        self.dream_transition_reply_pause = Some(barrier.clone());
+        barrier
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_before_dream_promotion(&mut self) -> Result<()> {
+        let Some(pause) = self.dream_promotion_pause.take() else {
+            return Ok(());
+        };
+        pause
+            .reached
+            .send(())
+            .map_err(|_| anyhow::anyhow!("dream promotion observer disappeared"))?;
+        pause
+            .release
+            .await
+            .context("dream promotion release channel closed")?;
+        Ok(())
+    }
+
     pub(crate) fn publish_pending(&mut self) {
         if let Some(pending) = self.pending_publication.take() {
+            if matches!(pending.proof, PublicationProof::CandidatePromotion { .. }) {
+                self.pending_candidate = None;
+                self.pending_candidate_resolution = PendingCandidateResolution::AutomaticCleanup;
+            }
             self.config = pending.config;
             self.profile = pending.profile;
             self.topology = pending.topology;
@@ -1338,11 +1551,236 @@ impl Harness {
         }
     }
 
-    /// A cancelled caller can leave an accepted database write in flight. Drain
-    /// it and publish only the exact values that actually became durable.
+    /// A cancelled caller can leave an accepted database write in flight. A
+    /// dream requires its exact candidate outcome; live values cannot prove a
+    /// promotion because a sibling may have written the same values later.
     pub async fn reconcile(&mut self) -> Result<()> {
+        self.rebind_main_if_retired().await?;
+        if let Some(candidate) = self.memory.recover_candidate_begin().await? {
+            ensure!(
+                self.pending_candidate.is_none(),
+                "a second dream candidate began while the first was unresolved"
+            );
+            self.pending_candidate = Some(candidate);
+            self.rebind_main_if_retired().await?;
+        }
+        if let Some(unit) = self.memory.recover_candidate_unit().await? {
+            self.pending_candidate = Some(unit.candidate);
+            // Even a definitively absent unit write may follow earlier
+            // accepted candidate work. Keep the exact open ref for explicit
+            // resolution instead of silently abandoning it on continuation.
+            self.pending_candidate_resolution = PendingCandidateResolution::Explicit;
+            self.rebind_main_if_retired().await?;
+        }
+        if let Some(PublicationProof::CandidatePromotion {
+            base,
+            target,
+            report,
+            status,
+        }) = self
+            .pending_publication
+            .as_ref()
+            .map(|pending| pending.proof.clone())
+        {
+            let abandonment =
+                self.pending_candidate_resolution == PendingCandidateResolution::AbandonSent;
+            let candidate = self
+                .pending_candidate
+                .as_ref()
+                .context("pending dream candidate was lost before promotion proof")?
+                .clone();
+            ensure!(candidate.base() == base, "dream candidate base changed");
+            match status {
+                CandidatePromotionStatus::Confirmed(revision) => {
+                    ensure!(revision == target, "dream promoted a different revision");
+                    self.publish_recovered_dream(&report);
+                    return Ok(());
+                }
+                CandidatePromotionStatus::OpenUnchanged if !abandonment => {
+                    return Err(CandidateResolutionRequired(
+                        "dream candidate remains open; explicit resolution is required",
+                    )
+                    .into());
+                }
+                CandidatePromotionStatus::OpenConflict if !abandonment => {
+                    return Err(CandidateResolutionRequired(
+                        "dream candidate conflicts with live memory; explicit resolution is required",
+                    )
+                    .into());
+                }
+                CandidatePromotionStatus::Pending
+                | CandidatePromotionStatus::OpenUnchanged
+                | CandidatePromotionStatus::OpenConflict => {}
+            }
+            let outcome = self.memory.recover_candidate_transition().await?;
+            let Some(outcome) = outcome else {
+                // Cancellation can drop the dream future after staging but
+                // before its facade installs a transition request. Only an
+                // exact still-open ref can resolve that local no-send case;
+                // absence is never promotion or abandonment proof.
+                let inspected = self.memory.candidate_ref_status(candidate.branch()).await?;
+                ensure!(
+                    inspected.head.as_deref() == Some(target.as_str())
+                        && inspected.base.as_deref() == Some(base.as_str()),
+                    "dream promotion has no request proof and its exact candidate changed"
+                );
+                let open_conflict = match inspected.state {
+                    kuru_memory::CandidateRefState::OpenUnchanged => false,
+                    kuru_memory::CandidateRefState::OpenConflict => true,
+                    _ => bail!("dream promotion outcome is unproved; exact candidate is not open"),
+                };
+                self.pending_candidate_resolution = PendingCandidateResolution::Explicit;
+                if let Some(PendingPublication {
+                    proof: PublicationProof::CandidatePromotion { status, .. },
+                    ..
+                }) = &mut self.pending_publication
+                {
+                    *status = if open_conflict {
+                        CandidatePromotionStatus::OpenConflict
+                    } else {
+                        CandidatePromotionStatus::OpenUnchanged
+                    };
+                }
+                return Err(CandidateResolutionRequired(
+                    "dream candidate remains open; explicit resolution is required",
+                )
+                .into());
+            };
+            match outcome.resolution {
+                CandidateTransitionResolution::Promoted(revision) => {
+                    ensure!(
+                        !abandonment,
+                        "dream candidate was promoted outside pending abandonment"
+                    );
+                    ensure!(revision == target, "dream promoted a different revision");
+                    self.publish_recovered_dream(&report);
+                    return Ok(());
+                }
+                CandidateTransitionResolution::Abandoned => {
+                    self.pending_candidate = None;
+                    self.pending_candidate_resolution =
+                        PendingCandidateResolution::AutomaticCleanup;
+                    self.pending_publication = None;
+                    if abandonment {
+                        return Ok(());
+                    }
+                    bail!("dream candidate was resolved without promotion")
+                }
+                CandidateTransitionResolution::PreservedConflict => {
+                    self.pending_candidate = None;
+                    self.pending_candidate_resolution =
+                        PendingCandidateResolution::AutomaticCleanup;
+                    self.pending_publication = None;
+                    bail!("dream candidate was resolved outside pending promotion")
+                }
+                CandidateTransitionResolution::OpenUnchanged
+                | CandidateTransitionResolution::OpenConflict => {
+                    let open_conflict = matches!(
+                        outcome.resolution,
+                        CandidateTransitionResolution::OpenConflict
+                    );
+                    self.pending_candidate = Some(
+                        outcome
+                            .candidate
+                            .context("open dream candidate lost its checked handle")?,
+                    );
+                    self.pending_candidate_resolution = PendingCandidateResolution::Explicit;
+                    if let Some(PendingPublication {
+                        proof: PublicationProof::CandidatePromotion { status, .. },
+                        ..
+                    }) = &mut self.pending_publication
+                    {
+                        *status = if open_conflict {
+                            CandidatePromotionStatus::OpenConflict
+                        } else {
+                            CandidatePromotionStatus::OpenUnchanged
+                        };
+                    }
+                    return Err(CandidateResolutionRequired(
+                        "dream candidate remains open; explicit resolution is required",
+                    )
+                    .into());
+                }
+            }
+        }
+        if let Some(candidate) = self.pending_candidate.clone() {
+            match self.pending_candidate_resolution {
+                PendingCandidateResolution::Explicit => {
+                    return Err(CandidateResolutionRequired(
+                        "dream candidate remains open after a recovered write; explicit resolution is required",
+                    )
+                    .into());
+                }
+                PendingCandidateResolution::AbandonSent => {
+                    let outcome = self.memory.recover_candidate_transition().await?;
+                    let Some(outcome) = outcome else {
+                        // Cancellation may occur after the runtime records its
+                        // intent but before the facade installs a request ID.
+                        // A checked still-open ref permits reinspection; a
+                        // missing ref cannot prove what happened.
+                        let inspected =
+                            self.memory.candidate_ref_status(candidate.branch()).await?;
+                        ensure!(
+                            inspected.base.as_deref() == Some(candidate.base())
+                                && matches!(
+                                    inspected.state,
+                                    kuru_memory::CandidateRefState::OpenUnchanged
+                                        | kuru_memory::CandidateRefState::OpenConflict
+                                ),
+                            "dream abandonment outcome is unproved; exact candidate is not open"
+                        );
+                        self.pending_candidate_resolution = PendingCandidateResolution::Explicit;
+                        return Err(CandidateResolutionRequired(
+                            "dream candidate remains open; explicit resolution is required",
+                        )
+                        .into());
+                    };
+                    match outcome.resolution {
+                        CandidateTransitionResolution::Abandoned => {
+                            self.pending_candidate = None;
+                            self.pending_candidate_resolution =
+                                PendingCandidateResolution::AutomaticCleanup;
+                        }
+                        CandidateTransitionResolution::OpenUnchanged
+                        | CandidateTransitionResolution::OpenConflict => {
+                            self.pending_candidate = Some(outcome.candidate.context(
+                                "open dream candidate lost its checked handle after abandonment",
+                            )?);
+                            self.pending_candidate_resolution =
+                                PendingCandidateResolution::Explicit;
+                            return Err(CandidateResolutionRequired(
+                                "dream candidate remains open; explicit resolution is required",
+                            )
+                            .into());
+                        }
+                        CandidateTransitionResolution::Promoted(_)
+                        | CandidateTransitionResolution::PreservedConflict => {
+                            self.pending_candidate = None;
+                            self.pending_candidate_resolution =
+                                PendingCandidateResolution::AutomaticCleanup;
+                            bail!("dream candidate was resolved outside the pending abandonment")
+                        }
+                    }
+                }
+                PendingCandidateResolution::AutomaticCleanup => {
+                    // Mark the attempt before its first await. A lost reply is
+                    // queried by exact transition outcome on the next call;
+                    // reconciliation never sends an automatic second abandon.
+                    self.pending_candidate_resolution = PendingCandidateResolution::AbandonSent;
+                    candidate.abandon().await?;
+                    self.pending_candidate = None;
+                    self.pending_candidate_resolution =
+                        PendingCandidateResolution::AutomaticCleanup;
+                }
+            }
+        }
         self.memory.reconcile().await?;
+        self.rebind_main_if_retired().await?;
         if let Some(pending) = &self.pending_publication {
+            ensure!(
+                matches!(pending.proof, PublicationProof::LiveValues),
+                "candidate promotion requires exact outcome proof"
+            );
             let mut committed = true;
             for (key, value) in &pending.updates {
                 committed &= self.memory.get(key).await?.as_ref() == Some(value);
@@ -1354,6 +1792,26 @@ impl Harness {
             }
         }
         Ok(())
+    }
+
+    async fn rebind_main_if_retired(&mut self) -> Result<()> {
+        if let Some(fresh) = self.memory.reopen_after_checked_recovery().await? {
+            self.memory = fresh;
+        }
+        Ok(())
+    }
+
+    fn publish_recovered_dream(&mut self, report: &crate::dream::DreamReport) {
+        self.publish_pending();
+        self.emit_event(Event::Dream {
+            actor: "pool".into(),
+            detail: format!(
+                "{} summaries, {} changes, {} rejected proposals",
+                report.summaries,
+                report.accepted.len(),
+                report.rejected.len()
+            ),
+        });
     }
 
     pub async fn set_mode(&mut self, mode: Mode) -> Result<()> {
@@ -2544,6 +3002,7 @@ impl Harness {
             topology,
             session,
             updates: updates.clone(),
+            proof: PublicationProof::LiveValues,
         });
         self.memory
             .checkpoint(
@@ -4388,6 +4847,7 @@ mod publication_tests {
                 topology,
                 session: harness.session.clone(),
                 updates,
+                proof: PublicationProof::LiveValues,
             });
             let before = memory.revision().await.unwrap();
             let error = harness

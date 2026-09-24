@@ -19,28 +19,32 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 
 ## Slash commands
 
-| Command              | Action                                                                        |
-| -------------------- | ----------------------------------------------------------------------------- |
-| `/help`              | Show terminal help                                                            |
-| `/clear`             | Clear the visible conversation; keep stored turns and the session             |
-| `/status`            | Show the current session, project, selections, turns, and known usage locally |
-| `/parts`             | Inspect active parts and relationships                                        |
-| `/mode ifs`          | Select `ifs`, `polyvagal`, `freudian`, or `jungian`                           |
-| `/model MODEL_ID`    | Select a model and its advertised default effort                              |
-| `/effort LEVEL`      | Select effort; `default` clears an explicit value                             |
-| `/focus NAME_OR_ID`  | Select a speaking identity                                                    |
-| `/focus auto`        | Return to contextual speaker selection                                        |
-| `/relate KIND ID,ID` | Activate protection, polarization, or alliance among 2–4 members              |
-| `/memory NAME_OR_ID` | Inspect an identity's stored memory                                           |
-| `/notes NAME_OR_ID`  | Inspect an identity's separate bounded durable notes                          |
-| `/retry`             | Safely retry the last durably retained local submission                       |
-| `/cost`              | Show this session's reported usage and estimated API cost                     |
-| `/permissions`       | Inspect session and saved tool grants                                         |
-| `/memory-status`     | Inspect the project's memory store and current revision                       |
-| `/memory-history`    | List committed memory revisions                                               |
-| `/dream`             | Run bounded consolidation                                                     |
-| `/undo-dream`        | Restore the previous accepted topology change                                 |
-| `/quit`              | End the session                                                               |
+| Command                                      | Action                                                                        |
+| -------------------------------------------- | ----------------------------------------------------------------------------- |
+| `/help`                                      | Show terminal help                                                            |
+| `/clear`                                     | Clear the visible conversation; keep stored turns and the session             |
+| `/status`                                    | Show the current session, project, selections, turns, and known usage locally |
+| `/parts`                                     | Inspect active parts and relationships                                        |
+| `/mode ifs`                                  | Select `ifs`, `polyvagal`, `freudian`, or `jungian`                           |
+| `/model MODEL_ID`                            | Select a model and its advertised default effort                              |
+| `/effort LEVEL`                              | Select effort; `default` clears an explicit value                             |
+| `/focus NAME_OR_ID`                          | Select a speaking identity                                                    |
+| `/focus auto`                                | Return to contextual speaker selection                                        |
+| `/relate KIND ID,ID`                         | Activate protection, polarization, or alliance among 2–4 members              |
+| `/memory NAME_OR_ID`                         | Inspect an identity's stored memory                                           |
+| `/notes NAME_OR_ID`                          | Inspect an identity's separate bounded durable notes                          |
+| `/memory-candidates [CURSOR]`                | List one bounded page of retained dream candidate refs                        |
+| `/memory-candidate-status BRANCH`            | Recheck one exact retained candidate ref                                      |
+| `/memory-candidate-abandon BRANCH BASE HEAD` | Explicitly abandon the exact inspected candidate                              |
+| `/retry`                                     | Safely retry the last durably retained local submission                       |
+| `/cost`                                      | Show this session's reported usage and estimated API cost                     |
+| `/permissions`                               | Inspect session and saved tool grants                                         |
+| `/tools`                                     | Inspect built-in and effective MCP tool aliases and their current status      |
+| `/memory-status`                             | Inspect the project's memory store and current revision                       |
+| `/memory-history`                            | List committed memory revisions                                               |
+| `/dream`                                     | Run bounded consolidation                                                     |
+| `/undo-dream`                                | Restore the previous accepted topology change                                 |
+| `/quit`                                      | End the session                                                               |
 
 Model, effort, and framework selections made here are [saved for the project](./configuration#remembered-choices). Identity names must be unambiguous; `/parts` provides IDs.
 
@@ -50,38 +54,41 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 
 ## CLI commands
 
-| Command                                 | Purpose                                                                                     |
-| --------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `kuru run "PROMPT"`                     | Run a turn without the TUI; add `--json` for structured output                              |
-| `kuru run "PROMPT" --turn-id ID`        | Use a bounded explicit turn ID for exact retry in the resumed session                       |
-| `kuru login`                            | Start browser sign-in for ChatGPT subscription access                                       |
-| `kuru login --no-browser`               | Print the browser sign-in URL for you to open                                               |
-| `kuru login --device`                   | Use device authorization                                                                    |
-| `kuru auth`                             | Print redacted local authentication status as JSON                                          |
-| `kuru logout`                           | Clear Kuru's stored ChatGPT credentials                                                     |
-| `kuru models`                           | Discover provider models and advertised efforts                                             |
-| `kuru config`                           | Print configured values with MCP environment values redacted and saved preferences omitted  |
-| `kuru trust status`                     | Inspect exact-workspace authority and complete-manifest approval without creating state     |
-| `kuru trust approve [--yes]`            | Review and persist approval for the complete current authority manifest                     |
-| `kuru trust revoke`                     | Remove the exact workspace's approval without confirmation                                  |
-| `kuru sessions`                         | List saved sessions                                                                         |
-| `kuru memory status`                    | Inspect the project store, branch and revision                                              |
-| `kuru memory history`                   | List committed memory updates; use `--limit` to select 1–1000 entries                       |
-| `kuru memory notes ID`                  | Read newest durable notes for one selected-mode identity; `--limit` is 1–1000 (default 100) |
-| `kuru memory forget ID --note SEQUENCE` | Remove one selected current note and retain prior revision history                          |
-| `kuru memory purge --yes`               | Remove one project's managed current memory and Dolt history after explicit confirmation    |
-| `kuru memory export`                    | Export every application record from one committed active-memory snapshot                   |
-| `kuru dream`                            | Run explicit consolidation                                                                  |
-| `kuru undo-dream`                       | Restore the previous topology change                                                        |
-| `kuru tools`                            | Inspect filtered tools and disabled/live/stale/degraded MCP aliases                         |
-| `kuru mcp login ALIAS`                  | Sign in to one OAuth-enabled MCP alias with a loopback browser callback                     |
-| `kuru mcp login ALIAS --no-browser`     | Print browser and same-host/forwarded-callback guidance                                     |
-| `kuru mcp login ALIAS --device`         | Use an advertised device authorization flow                                                 |
-| `kuru mcp status ALIAS`                 | Inspect redacted local MCP authorization and availability state                             |
-| `kuru mcp logout ALIAS`                 | Delete the local MCP credential and report remote revocation separately                     |
-| `kuru tool NAME --args '{}'`            | Invoke a tool with JSON arguments                                                           |
-| `kuru serve`                            | Start authenticated loopback [A2A ingress](./a2a)                                           |
-| `kuru update`                           | [Install an explicit release or source checkout](/guide/installation#update-deliberately)   |
+| Command                                                        | Purpose                                                                                     |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `kuru run "PROMPT"`                                            | Run a turn without the TUI; add `--json` for structured output                              |
+| `kuru run "PROMPT" --turn-id ID`                               | Use a bounded explicit turn ID for exact retry in the resumed session                       |
+| `kuru login`                                                   | Start browser sign-in for ChatGPT subscription access                                       |
+| `kuru login --no-browser`                                      | Print the browser sign-in URL for you to open                                               |
+| `kuru login --device`                                          | Use device authorization                                                                    |
+| `kuru auth`                                                    | Print redacted local authentication status as JSON                                          |
+| `kuru logout`                                                  | Clear Kuru's stored ChatGPT credentials                                                     |
+| `kuru models`                                                  | Discover provider models and advertised efforts                                             |
+| `kuru config`                                                  | Print configured values with MCP environment values redacted and saved preferences omitted  |
+| `kuru trust status`                                            | Inspect exact-workspace authority and complete-manifest approval without creating state     |
+| `kuru trust approve [--yes]`                                   | Review and persist approval for the complete current authority manifest                     |
+| `kuru trust revoke`                                            | Remove the exact workspace's approval without confirmation                                  |
+| `kuru sessions`                                                | List saved sessions                                                                         |
+| `kuru memory status`                                           | Inspect the project store, branch and revision                                              |
+| `kuru memory history`                                          | List committed memory updates; use `--limit` to select 1–1000 entries                       |
+| `kuru memory candidates`                                       | List retained dream candidate refs; use `--limit` and the opaque `--after` cursor           |
+| `kuru memory candidate-status BRANCH`                          | Recheck one exact retained candidate ref                                                    |
+| `kuru memory candidate-abandon BRANCH --base BASE --head HEAD` | Explicitly abandon the exact inspected candidate                                            |
+| `kuru memory notes ID`                                         | Read newest durable notes for one selected-mode identity; `--limit` is 1–1000 (default 100) |
+| `kuru memory forget ID --note SEQUENCE`                        | Remove one selected current note and retain prior revision history                          |
+| `kuru memory purge --yes`                                      | Remove one project's managed current memory and Dolt history after explicit confirmation    |
+| `kuru memory export`                                           | Export every application record from one committed active-memory snapshot                   |
+| `kuru dream`                                                   | Run explicit consolidation                                                                  |
+| `kuru undo-dream`                                              | Restore the previous topology change                                                        |
+| `kuru tools`                                                   | Inspect filtered tools and disabled/live/stale/degraded MCP aliases                         |
+| `kuru mcp login ALIAS`                                         | Sign in to one OAuth-enabled MCP alias with a loopback browser callback                     |
+| `kuru mcp login ALIAS --no-browser`                            | Print browser and same-host/forwarded-callback guidance                                     |
+| `kuru mcp login ALIAS --device`                                | Use an advertised device authorization flow                                                 |
+| `kuru mcp status ALIAS`                                        | Inspect redacted local MCP authorization and availability state                             |
+| `kuru mcp logout ALIAS`                                        | Delete the local MCP credential and report remote revocation separately                     |
+| `kuru tool NAME --args '{}'`                                   | Invoke a tool with JSON arguments                                                           |
+| `kuru serve`                                                   | Start authenticated loopback [A2A ingress](./a2a)                                           |
+| `kuru update`                                                  | [Install an explicit release or source checkout](/guide/installation#update-deliberately)   |
 
 Supply `--resume SESSION_ID` with `dream` or `undo-dream` when targeting a saved conversation.
 
@@ -136,6 +143,13 @@ tool host, or conversation. Each note includes its stable `sequence` and stored
 role. `kuru memory forget ID --note SEQUENCE` deletes exactly that current notes
 row in a new Dolt revision; it leaves conversations, other notes, and earlier
 revisions intact, so it is not secure erasure or a history-recovery command.
+
+Candidate inventory and status are read-only and remain available when a prior
+dream transition needs explicit resolution. A missing candidate reports its
+operation outcome as unproved; reopening does not settle it. Explicit abandon
+requires the exact inspected branch, base, and head and rechecks them under the
+memory owner. Changed, active, stale, or uncertain refs remain intact. No
+candidate command promotes, merges, retries, or automatically abandons work.
 
 `kuru memory purge --yes` explicitly removes the selected canonical project's
 managed current Dolt store, all of its managed revisions, and recognised managed

@@ -17,14 +17,17 @@ use kuru_core::{
     AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
     ProjectPreferences, SafeManifest,
 };
-use kuru_memory::{MemoryOpenStage, MemoryStore, OpenOptions as MemoryOptions};
+use kuru_memory::{
+    CandidateRefRejected, CandidateRefState, MemoryOpenStage, MemoryStore,
+    OpenOptions as MemoryOptions, SelectedAbandonResolution, SelectedAbandonUncertain,
+};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_runtime::{CancellationToken, Event, Harness, forget_note, read_notes};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::{
-    memory_export,
+    commands, memory_export,
     permission_store::GrantStore,
     trust::{ApprovalState, ApprovalStore},
 };
@@ -225,6 +228,23 @@ pub enum MemoryCommand {
     History {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// List bounded retained dream candidate refs.
+    Candidates {
+        #[arg(long, default_value_t = commands::CANDIDATE_PAGE_LIMIT)]
+        limit: usize,
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// Recheck one exact retained candidate ref.
+    CandidateStatus { branch: String },
+    /// Explicitly abandon one exact candidate ref after inspection.
+    CandidateAbandon {
+        branch: String,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        head: String,
     },
     /// Export every application record from one committed active-memory snapshot.
     Export {
@@ -660,8 +680,10 @@ mod memory_progress_output_tests {
     }
 }
 
-async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
-    let (mut progress, opening) = MemoryStore::open_observed(options);
+async fn open_memory(options: MemoryOptions, project: &Path) -> Result<MemoryStore> {
+    let executable = std::env::current_exe().context("locate the current Kuru executable")?;
+    let (mut progress, opening) =
+        MemoryStore::open_managed_observed(options, project.to_owned(), executable);
     let mut opening = Box::pin(opening);
     let mut output = MemoryProgressOutput::new();
     let mut observed_ready = false;
@@ -712,6 +734,37 @@ async fn open_memory(options: MemoryOptions) -> Result<MemoryStore> {
             output.abandon();
             Err(error)
         }
+    }
+}
+
+async fn settle_selected_candidate_abandon(
+    memory: &MemoryStore,
+    primary: anyhow::Error,
+) -> Result<()> {
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(35), async {
+        loop {
+            match memory.recover_selected_candidate_abandon().await {
+                Ok(Some(outcome)) => return Ok(outcome),
+                Ok(None) => {
+                    bail!("selected candidate abandonment has no retained request identity")
+                }
+                Err(error) if error.is::<SelectedAbandonUncertain>() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await;
+    match recovered {
+        Ok(Ok(SelectedAbandonResolution::Abandoned)) => Ok(()),
+        Ok(Ok(outcome)) => Err(primary.context(format!(
+            "selected candidate abandonment resolved as {outcome:?}"
+        ))),
+        Ok(Err(recovery)) => Err(primary.context(format!(
+            "selected candidate outcome recovery failed: {recovery:#}"
+        ))),
+        Err(_) => Err(primary.context("selected candidate outcome recovery deadline exceeded")),
     }
 }
 
@@ -990,7 +1043,9 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 | Command::UndoDream
                 | Command::Serve { .. }
                 | Command::Memory {
-                    command: MemoryCommand::Forget { .. } | MemoryCommand::Purge { .. }
+                    command: MemoryCommand::Forget { .. }
+                        | MemoryCommand::CandidateAbandon { .. }
+                        | MemoryCommand::Purge { .. }
                 }
         )
     );
@@ -1025,6 +1080,9 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             command: MemoryCommand::Notes { .. }
                 | MemoryCommand::Forget { .. }
                 | MemoryCommand::Export { .. }
+                | MemoryCommand::Candidates { .. }
+                | MemoryCommand::CandidateStatus { .. }
+                | MemoryCommand::CandidateAbandon { .. }
         })
     );
     if memory_control && !exists {
@@ -1081,7 +1139,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         let mut options = MemoryOptions::new(data.clone(), scope.clone());
         options.config = memory_config.clone();
         options.read_only = !writer && !migrate;
-        Ok(Some(open_memory(options).await?))
+        Ok(Some(open_memory(options, &cwd).await?))
     }
     .await
     {
@@ -1134,6 +1192,54 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&memory.revisions(*limit).await?)?
+                        );
+                    }
+                    MemoryCommand::Candidates { limit, after } => {
+                        ensure!(
+                            (1..=commands::CANDIDATE_PAGE_LIMIT).contains(limit),
+                            "memory candidate limit must be between 1 and {}",
+                            commands::CANDIDATE_PAGE_LIMIT
+                        );
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &memory.candidate_inventory(after.as_deref(), *limit).await?
+                            )?
+                        );
+                    }
+                    MemoryCommand::CandidateStatus { branch } => {
+                        let status = memory.candidate_ref_status(branch).await?;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&commands::candidate_status_json(&status))?
+                        );
+                    }
+                    MemoryCommand::CandidateAbandon { branch, base, head } => {
+                        if let Some(previous) = memory.recover_selected_candidate_abandon().await? {
+                            anyhow::bail!(
+                                "previous selected candidate abandonment resolved as {previous:?}; inspect the exact ref before another action"
+                            );
+                        }
+                        memory.reconcile().await?;
+                        let inspected = memory.candidate_ref_status(branch).await?;
+                        ensure!(
+                            matches!(
+                                inspected.state,
+                                CandidateRefState::OpenUnchanged | CandidateRefState::OpenConflict
+                            ) && inspected.base.as_deref() == Some(base.as_str())
+                                && inspected.head.as_deref() == Some(head.as_str()),
+                            "selected candidate ref changed or its outcome is unproved"
+                        );
+                        match memory.abandon_candidate_ref(branch, base, head).await {
+                            Ok(()) => {}
+                            Err(error) if error.is::<CandidateRefRejected>() => return Err(error),
+                            Err(error) => {
+                                settle_selected_candidate_abandon(memory, error).await?
+                            }
+                        }
+                        println!(
+                            "{}",
+                            serde_json::json!({"branch": branch, "state": "abandoned"})
                         );
                     }
                     MemoryCommand::Export { format, output } => {
@@ -1223,7 +1329,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             None => {
                 let mut options = MemoryOptions::new(data.clone(), scope);
                 options.config = memory_config;
-                open_memory(options).await?
+                open_memory(options, &cwd).await?
             }
         };
         memory_to_close = Some(memory.clone());
@@ -1918,5 +2024,65 @@ mod permission_tests {
         );
         assert!(!project.join("note.txt").exists());
         host.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod candidate_command_tests {
+    use super::*;
+
+    #[test]
+    fn exact_candidate_commands_parse_without_a_promotion_surface() {
+        let candidates = Cli::try_parse_from([
+            "kuru",
+            "memory",
+            "candidates",
+            "--limit",
+            "7",
+            "--after",
+            "opaque",
+        ])
+        .unwrap();
+        assert!(matches!(
+            candidates.command,
+            Some(Command::Memory {
+                command: MemoryCommand::Candidates {
+                    limit: 7,
+                    after: Some(ref cursor)
+                }
+            }) if cursor == "opaque"
+        ));
+        let candidates = Cli::try_parse_from(["kuru", "memory", "candidates"]).unwrap();
+        assert!(matches!(
+            candidates.command,
+            Some(Command::Memory {
+                command: MemoryCommand::Candidates {
+                    limit: commands::CANDIDATE_PAGE_LIMIT,
+                    after: None
+                }
+            })
+        ));
+        let abandon = Cli::try_parse_from([
+            "kuru",
+            "memory",
+            "candidate-abandon",
+            "branch",
+            "--base",
+            "base",
+            "--head",
+            "head",
+        ])
+        .unwrap();
+        assert!(matches!(
+            abandon.command,
+            Some(Command::Memory {
+                command: MemoryCommand::CandidateAbandon {
+                    branch,
+                    base,
+                    head
+                }
+            }) if branch == "branch" && base == "base" && head == "head"
+        ));
+        assert!(Cli::try_parse_from(["kuru", "memory", "candidate-promote", "branch"]).is_err());
     }
 }

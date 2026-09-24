@@ -5187,6 +5187,7 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
         });
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn retained_root_replacement_refuses_all_tool_dispatch() {
         let parent = tempfile::tempdir().unwrap();
@@ -5233,6 +5234,39 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
         }
         assert_eq!(
             std::fs::read_to_string(parent.path().join("replaced/held.txt")).unwrap(),
+            "held object"
+        );
+        assert!(!root.join("launched").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_root_handle_prevents_substitution_before_tool_dispatch() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("held.txt"), "held object").unwrap();
+        let retained =
+            Arc::new(Directory::open(&root, Privacy::Inherited, NameRetention::Movable).unwrap());
+        let original_identity = retained.identity();
+        let host = ToolHost::with_retained_root(retained, &Config::default()).unwrap();
+
+        // cap-std retains a second Windows directory handle without
+        // FILE_SHARE_DELETE. The attempted substitution is rejected by the OS
+        // before a replacement root can grant any tool effect.
+        let error = std::fs::rename(&root, parent.path().join("replaced")).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert!(!parent.path().join("replaced").exists());
+        assert_eq!(
+            Directory::open(&root, Privacy::Inherited, NameRetention::Movable)
+                .unwrap()
+                .identity(),
+            original_identity
+        );
+        assert_eq!(
+            host.execute("file_read", json!({"path":"held.txt"}))
+                .await
+                .unwrap(),
             "held object"
         );
         assert!(!root.join("launched").exists());
