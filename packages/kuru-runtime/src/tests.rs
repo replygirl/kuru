@@ -20,7 +20,7 @@ use kuru_core::{
     PermissionAction, PermissionRule, PermissionSelector, RelationshipKind, ToolCall,
     canonical_peer_instruction,
 };
-use kuru_platform::fs::{Directory, NameRetention, Privacy};
+use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -1650,6 +1650,14 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
 
 #[tokio::test]
 async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() {
+    struct ReleaseGateOnDrop(ParallelReadTestGate);
+
+    impl Drop for ReleaseGateOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
     let (receipt, observed) = tokio::sync::oneshot::channel();
     let provider = Arc::new(MixedRefusalEffectProvider {
         receipt: Mutex::new(Some(receipt)),
@@ -1659,6 +1667,9 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
     let private = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("refused.txt"), "admitted bytes").unwrap();
     let gate = ParallelReadTestGate::new(1);
+    // A failed fixture assertion must not strand the read's spawn_blocking
+    // worker inside the gate while Tokio waits for that worker at shutdown.
+    let _release_gate = ReleaseGateOnDrop(gate.clone());
     let config = Config {
         mode: Mode::Freudian,
         provider: "demo".into(),
@@ -1709,8 +1720,15 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
     tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered())
         .await
         .expect("prepared read did not enter its checked execution gate");
-    std::fs::remove_file(project.path().join("refused.txt")).unwrap();
-    std::fs::write(project.path().join("refused.txt"), "replacement bytes").unwrap();
+    let original = project.path().join("refused.txt");
+    let alias = project.path().join("linked-refused.txt");
+    let original_info = regular_file_info(&std::fs::File::open(&original).unwrap()).unwrap();
+    assert_eq!(original_info.links, 1);
+    std::fs::hard_link(&original, &alias).unwrap();
+    let linked_info = regular_file_info(&std::fs::File::open(&alias).unwrap()).unwrap();
+    assert_eq!(linked_info.identity, original_info.identity);
+    assert_eq!(linked_info.links, 2);
+    assert_eq!(std::fs::read(&original).unwrap(), b"admitted bytes");
     gate.release();
 
     let continuation = tokio::time::timeout(Duration::from_secs(10), observed)
@@ -1758,23 +1776,32 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
     assert_eq!(checkpoint.state, CheckpointState::Applied);
     assert_eq!(checkpoint.path, "accepted.txt");
     assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
-    let retry = harness
-        .run_controlled(
+    let retry = tokio::time::timeout(
+        Duration::from_secs(10),
+        harness.run_controlled(
             "refuse one read and publish one write",
             Some(&target),
             "mixed-refusal-effect",
             &CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
+        ),
+    )
+    .await
+    .expect("retry did not refuse the already-admitted mixed effect")
+    .unwrap_err();
     assert!(retry.to_string().contains("may have reached external work"));
     assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
     assert_eq!(
         std::fs::read_to_string(project.path().join("accepted.txt")).unwrap(),
         "one mixed write"
     );
-    harness.shutdown(false).await.unwrap();
-    memory.close().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), harness.shutdown(false))
+        .await
+        .expect("mixed-effect harness shutdown did not finish")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), memory.close())
+        .await
+        .expect("mixed-effect memory close did not finish")
+        .unwrap();
 }
 
 #[tokio::test]
