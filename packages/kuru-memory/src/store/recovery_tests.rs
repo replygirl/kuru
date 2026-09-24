@@ -783,6 +783,15 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
         1,
         "cold recovery must publish the v4 migration exactly once"
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 5%'"
+        )
+        .fetch_one(recovered.pool.as_ref())
+        .await?,
+        1,
+        "cold recovery must publish the v5 migration exactly once"
+    );
     let recovered_candidate = recovered.shared.server.pool(&candidate).await?;
     assert_eq!(revision(&recovered_candidate).await?, candidate_head);
     assert_eq!(
@@ -1615,6 +1624,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
             project_scope: options.project_scope,
             read_only: false,
             write: Arc::new(Mutex::new(())),
+            dream: Arc::new(Mutex::new(())),
             uncertain: StdMutex::new(None),
             usage_pool: StdMutex::new(None),
             candidate_recovery_pause: None,

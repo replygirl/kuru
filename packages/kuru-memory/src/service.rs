@@ -24,9 +24,9 @@ pub(crate) mod rpc;
 pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, ServiceValue};
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-// Exact-ref inventory and selected-abandon outcome calls require this owner
-// version. Older owners reject the new client before a mutating frame.
-pub const PROTOCOL_MINOR: u16 = 2;
+// Exact-ref recovery and session-provenance calls require this owner version.
+// Older owners reject the new client before a mutating frame.
+pub const PROTOCOL_MINOR: u16 = 4;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SERVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);

@@ -84,10 +84,19 @@ operation receipts across later writes, while preserving old candidate branches
 on their historical schema. Older Kuru binaries that do not support schema 4
 refuse the upgraded store instead of downgrading it.
 
-JSON and Markdown memory exports use export format version 2 and include each
-message's content-format discriminator. Export consumers should check those
-versions before interpreting the stored content. This representation does not
-enable image input or store native encrypted reasoning.
+Schema 5 retains physical session identity on new transcript and actor-history
+rows while leaving ambiguous legacy rows unattributed. It also adds strict
+context-summary and cursor records for bounded same-view compaction. Existing
+single conversation-driver admission remains active while later Phase 2 work
+integrates policy-selected continuity and concurrent drivers. Older binaries
+refuse schema 5 rather than assigning or dropping session provenance.
+
+JSON and Markdown memory exports use export format version 3 and include each
+message's optional session identity and content-format discriminator, plus
+strict context-summary and cursor records. Unattributed legacy rows retain a
+null session identity. Export consumers should check those versions before
+interpreting the stored content. This representation does not enable image
+input or store native encrypted reasoning.
 
 Use `kuru memory status` to inspect the store and current revision, `kuru memory
 history` to list committed changes, or `kuru memory notes ID --limit N` to read
@@ -114,9 +123,10 @@ gone, it removes that project's bounded diagnostics ring. An incomplete purge is
 resumed only by rerunning the same explicit command against its recorded
 identities.
 
-`kuru memory export` reads every application message and state row from one
-captured committed `main` revision. The JSON default and Markdown option preserve
-the same rows and a manifest with revision, schema and row counts. Previous
+`kuru memory export` reads every application message, state, context-summary and
+context-cursor row from one captured committed `main` revision. The JSON default
+and Markdown option preserve the same rows and a manifest with revision, schema
+and row counts. Previous
 revisions, candidate branches, uncommitted rows, operations and schema tables are excluded. Export is
 provider-free and refuses fresh stores, legacy import, and overwriting an output
 path; it is not a history-rewrite, purge, or secure-erasure operation.
@@ -137,7 +147,7 @@ so it can distinguish no pending operation, a completed operation, and one that
 did not commit.
 
 Current writable branches retain compact internal operation receipts for exact
-lost-reply reconciliation. Historical schema-1-through-3 branches keep their
+lost-reply reconciliation. Historical schema-1-through-4 branches keep their
 older receipt shape. Kuru reclaims a dream candidate only after its promotion
 or explicit abandonment is durably resolved. Unresolved
 candidates, conversations, notes and reachable revisions do not expire

@@ -61,8 +61,9 @@ same `kuru memory purge --yes` command: it removes only the recorded remaining
 identities. It is not secure erasure and does not rewrite copies outside Kuru's
 managed project store.
 
-`kuru memory export` writes every application message and state record from one
-captured, committed `main` revision. It uses JSON by default; `--format markdown`
+`kuru memory export` writes every application message, state, context-summary
+and context-cursor record from one captured, committed `main` revision. It uses
+JSON by default; `--format markdown`
 renders the same records as JSON fenced blocks. Without `--output PATH`, JSON is
 written to standard output. With `--output PATH`, Kuru completes a private staged
 file before publishing a new destination and refuses to overwrite an existing
@@ -192,19 +193,29 @@ view's schema and format; malformed or unknown formats fail explicitly rather
 than fall back to text. Supported old revisions and candidate branches remain
 readable without rewriting them. Typed writes require an upgraded view.
 
-Memory exports include the content format and use export format version 2.
-Consumers must inspect that version and the per-message discriminator rather
-than assume every content string is ordinary prose. JSON preserves the stored
-payload, and Markdown identifies structured records. This does not add an
+Memory exports include the content format and use export format version 3.
+Consumers must inspect that version, each message's optional session identity,
+and the per-message discriminator rather than assume every content string is
+ordinary prose. JSON preserves unattributed legacy messages with a null session
+identity and preserves strict context summaries and cursors as separate record
+kinds. Markdown identifies the same structured records. This does not add an
 export-import command or rewrite existing user exports.
 
 Schema 4 retains compact indexed operation receipts across later writes for
 exact internal write-outcome checks. Existing
-schema-1-through-3 candidate branches keep their historical schema and remain
+schema-1-through-4 candidate branches keep their historical schema and remain
 inspectable; they are not rewritten or promoted across an upgraded main. An
 older Kuru binary that does not understand schema 4 refuses the upgraded store.
 Replacing the executable with an older release does not downgrade memory; use
 a compatible Kuru to reopen it. Original legacy SQLite data remains intact.
+
+Schema 5 adds nullable physical session provenance to the global message
+sequence and strict context-summary/cursor tables. New conversation transcript
+and actor-history writes carry their session identity. Existing and imported
+rows remain unattributed rather than being assigned to a guessed session; they
+remain available to explicit inspection, export and recovery. The ordinary
+conversation-driver lease remains in force while later Phase 2 work integrates
+policy-selected cross-session context and concurrent admission.
 
 The SQL schema version is independent from the format-1 `ready.json` activation
 record, the database identity record, and the supervisor protocol. An old dream
@@ -219,7 +230,7 @@ outdated live revision cannot overwrite newer conversations. Undo records a new
 revision restoring prior membership, while preserving later chats and preferences.
 
 Current writable branches retain compact internal operation receipts for exact
-lost-reply reconciliation. Historical schema-1-through-3 branches keep their
+lost-reply reconciliation. Historical schema-1-through-4 branches keep their
 older receipt shape. Kuru reclaims a dream candidate only after its promotion
 or explicit abandonment is durably resolved. Unresolved candidates,
 conversations, notes and reachable Dolt revisions do not expire automatically.
