@@ -1913,6 +1913,10 @@ impl Harness {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the admitted turn ID stays distinct from actor work and progress identity"
+    )]
     async fn ask_controlled_with_progress(
         &self,
         id: &str,
@@ -1966,6 +1970,10 @@ impl Harness {
             .0)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the admitted turn ID stays distinct from actor work and memory view"
+    )]
     async fn ask_in_controlled_with_progress(
         &self,
         memory: &MemoryStore,

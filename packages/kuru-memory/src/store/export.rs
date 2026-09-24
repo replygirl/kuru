@@ -581,7 +581,7 @@ mod tests {
             if key.starts_with("kuru/private/reasoning-summary/v1/")
                 && value["text"] == "producer-only summary")
         );
-        snapshot.verify_counts(0, 1, 0, 0)?;
+        snapshot.verify_counts(0, 1)?;
         store.close().await?;
         Ok(())
     }

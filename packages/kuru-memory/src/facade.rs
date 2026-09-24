@@ -1336,6 +1336,30 @@ impl MemoryStore {
         }
     }
 
+    /// Persist one settled provider completion's private reasoning summaries
+    /// in one idempotent mutation. A conflicting settled identity is a typed,
+    /// definite no-effect response; a transport/storage failure remains fenced
+    /// by the ordinary remote-write reconciliation path.
+    pub async fn put_reasoning_summaries(
+        &self,
+        records: &[store::ReasoningSummaryRecord],
+    ) -> Result<()> {
+        store::validate_reasoning_summaries(records)?;
+        match &self.backend {
+            Backend::Local(store) => store.put_reasoning_summaries(records).await,
+            Backend::Remote(remote) => {
+                remote.ensure_writable()?;
+                unit(
+                    remote
+                        .call_raw(ServiceCall::PutReasoningSummaries {
+                            records: records.to_vec(),
+                        })
+                        .await?,
+                )
+            }
+        }
+    }
+
     pub async fn get(&self, key: &str) -> Result<Option<Value>> {
         match &self.backend {
             Backend::Local(store) => store.get(key).await,
@@ -2146,6 +2170,139 @@ mod tests {
         })
         .await
         .context("accepted cancelled write fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_reasoning_summary_lost_reply_reconciles_one_atomic_receipt() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let served = tokio::spawn(owner.serve());
+            let executable = std::env::current_exe()?;
+            let open = || {
+                MemoryStore::open_managed_observed(
+                    options.clone(),
+                    project.clone(),
+                    executable.clone(),
+                )
+                .1
+            };
+            let memory = open().await?;
+            let sibling = open().await?;
+            let Backend::Remote(remote) = &memory.backend else {
+                bail!("reasoning summary fixture did not attach to the managed service")
+            };
+            let record = crate::ReasoningSummaryRecord {
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                actor_id: "actor".into(),
+                invocation_id: "invocation".into(),
+                item_id: Some("item".into()),
+                output_index: Some(0),
+                summary_index: 0,
+                text: "settled private summary".into(),
+            };
+            let expected = serde_json::to_value(&record)?;
+            let key = store::reasoning_summary_key(&record)?;
+            let pause = Arc::new(service::rpc::ReplyPause::default());
+            remote
+                .attachment
+                .lock()
+                .await
+                .pause_after_next_send(pause.clone());
+            let writer = tokio::spawn({
+                let memory = memory.clone();
+                let record = record.clone();
+                async move { memory.put_reasoning_summaries(&[record]).await }
+            });
+            let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                .await
+                .context("reasoning summary reply frame was not flushed")?;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if sibling.get(&key).await? == Some(expected.clone()) {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("owner did not durably commit the paused reasoning summary batch")??;
+            writer.abort();
+            let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .context("cancelled reasoning summary write did not end")?;
+            ensure!(
+                stopped.is_err_and(|error| error.is_cancelled()),
+                "paused reasoning summary write completed instead of being cancelled"
+            );
+            ensure!(
+                memory
+                    .put_reasoning_summaries(std::slice::from_ref(&record))
+                    .await
+                    .is_err(),
+                "a cancelled summary receipt failed to fence further mutations"
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match memory.reconcile().await {
+                        Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
+                        Err(error) if error.to_string().contains("remains uncertain") => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        other => {
+                            bail!("paused reasoning summary had unexpected outcome: {other:?}")
+                        }
+                    }
+                }
+            })
+            .await
+            .context("reasoning summary indexed-outcome deadline")??;
+            memory
+                .put_reasoning_summaries(std::slice::from_ref(&record))
+                .await?;
+            let mut conflicting = record.clone();
+            conflicting.text = "conflicting payload".into();
+            let error = memory
+                .put_reasoning_summaries(&[conflicting])
+                .await
+                .unwrap_err();
+            ensure!(
+                error
+                    .downcast_ref::<store::ReasoningSummaryConflict>()
+                    .is_some(),
+                "managed settled-identity conflict was not typed definite rejection: {error:#}"
+            );
+            let mut later = record;
+            later.summary_index = 1;
+            later.text = "later settled private summary".into();
+            memory.put_reasoning_summaries(&[later]).await?;
+            memory.close().await?;
+            sibling.close().await?;
+            let permit = service::acquire_maintenance_permit(&options).await?;
+            tokio::time::timeout(Duration::from_secs(10), served)
+                .await
+                .context("reasoning summary fixture owner did not reap")???;
+            drop(permit);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("remote reasoning summary lost-reply fixture exceeded 90 seconds")??;
         Ok(())
     }
 
