@@ -172,6 +172,9 @@ impl ProgressObserver {
         self.publish();
     }
 
+    /// A selected speaker's bounded, transient reasoning-summary preview. The
+    /// provider coordinates are intentionally ignored here; settled summaries
+    /// remain private actor state and are not projected through progress.
     pub(crate) fn summary(&mut self, fragment: &str) {
         push_tail(
             &mut self.summary_tail,
@@ -231,6 +234,7 @@ impl ProviderSink for ProgressObserver {
                 ProviderEvent::ToolCallDelta { .. } => self.tool_call(),
                 ProviderEvent::ContextMeasured(_)
                 | ProviderEvent::Usage(_)
+                | ProviderEvent::SettledReasoningSummaries(_)
                 | ProviderEvent::Completed(_)
                 | ProviderEvent::Failed { .. } => {}
             }
@@ -254,6 +258,7 @@ fn push_tail(tail: &mut String, fragment: &str, limit: usize, truncated: &mut bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuru_connectors::ProviderReasoningSummary;
 
     #[test]
     fn preview_tail_is_utf8_bounded_and_terminally_fenced() {
@@ -269,5 +274,39 @@ mod tests {
         drop(turn);
         observer.text("late");
         assert!(receiver.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn selected_preview_uses_streaming_text_but_ignores_settled_records() {
+        let (sender, mut receiver) = watch::channel(None);
+        let _turn = ProgressTurn::new(sender, "turn".into());
+        let mut observer = _turn.round(1).observer();
+        observer
+            .emit(ProviderEvent::ReasoningSummaryDelta {
+                item_id: "stream-item".into(),
+                output_index: 7,
+                summary_index: 3,
+                text: "selected preview".into(),
+            })
+            .await
+            .unwrap();
+        let preview = receiver.borrow_and_update().clone().unwrap();
+        assert_eq!(preview.summary_tail, "selected preview");
+
+        observer
+            .emit(ProviderEvent::SettledReasoningSummaries(vec![
+                ProviderReasoningSummary {
+                    item_id: Some("settled-item".into()),
+                    output_index: Some(11),
+                    summary_index: 5,
+                    text: "private settled record".into(),
+                },
+            ]))
+            .await
+            .unwrap();
+        assert!(
+            !receiver.has_changed().unwrap(),
+            "settled record must not republish public progress"
+        );
     }
 }

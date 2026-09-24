@@ -609,7 +609,7 @@ async fn apply_change(
         .fetch_one(&mut *transaction)
         .await?;
     ensure!(
-        version == migrations::CURRENT_VERSION,
+        version == migrations::USAGE_CURRENT_VERSION,
         "usage ledger branch requires retained receipt schema before writing"
     );
     sqlx::query("INSERT INTO operations (id, label) VALUES (?, ?)")

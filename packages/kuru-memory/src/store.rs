@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use futures::TryStreamExt;
 use kuru_core::{ContentBlock, MemoryConfig, Message};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Connection, MySqlConnection, MySqlPool, Row};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, OwnedSemaphorePermit};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit};
 use uuid::Uuid;
 #[cfg(any(test, feature = "test-support"))]
 use {std::sync::OnceLock, tokio::sync::Semaphore};
@@ -48,6 +49,34 @@ const CANDIDATE_RECOVERY_BATCH: i64 = 16;
 const TEXT_FORMAT: &str = "text-v1";
 const TYPED_FORMAT: &str = "typed-v1";
 const MAX_TYPED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_REASONING_SUMMARY_BATCH_STRING_BYTES: usize = 16 * 1024 * 1024;
+const PRIVATE_REASONING_SUMMARY_PREFIX: &str = "kuru/private/reasoning-summary/v1/";
+const CONTEXT_SUMMARY_FORMAT: &str = "context_summary.v1";
+pub const MAX_SESSION_SOURCE_ROWS: usize = 1024;
+pub const MAX_SESSION_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReasoningSummaryRecord {
+    pub session_id: String,
+    pub turn_id: String,
+    pub actor_id: String,
+    pub invocation_id: String,
+    pub item_id: Option<String>,
+    pub output_index: Option<u64>,
+    pub summary_index: u64,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReasoningSummaryConflict;
+
+impl std::fmt::Display for ReasoningSummaryConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("private reasoning summary conflicts with its settled identity")
+    }
+}
+
+impl std::error::Error for ReasoningSummaryConflict {}
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -88,6 +117,7 @@ struct Shared {
     project_scope: String,
     read_only: bool,
     write: Arc<Mutex<()>>,
+    dream: Arc<Mutex<()>>,
     uncertain: StdMutex<Option<Pending>>,
     usage_pool: StdMutex<Option<Arc<MySqlPool>>>,
     #[cfg(test)]
@@ -200,6 +230,87 @@ pub struct HistoryWindow {
     pub messages: Vec<Message>,
     pub total_rows: u64,
 }
+
+/// One typed raw-history row in the global durable sequence domain.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SequencedMessage {
+    pub sequence: i64,
+    pub message: Message,
+}
+
+/// One bounded source page captured from an exact pinned view and revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionSourceSnapshot {
+    pub actor_namespace: String,
+    pub session_id: String,
+    pub source_namespace: String,
+    pub view: String,
+    pub revision: String,
+    pub after_exclusive: i64,
+    pub through_inclusive: Option<i64>,
+    pub rows: Vec<SequencedMessage>,
+}
+
+/// Strict producer input for one atomic compaction-summary checkpoint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSummaryRecord {
+    pub actor_namespace: String,
+    pub session_id: String,
+    pub source_namespace: String,
+    pub summary_namespace: String,
+    pub source_view: String,
+    pub source_revision: String,
+    pub after_sequence: i64,
+    pub through_sequence: i64,
+    pub turn_id: String,
+    pub invocation_id: String,
+    pub summary: String,
+}
+
+/// Durable cursor returned without exposing the summary tables or SQL handle.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryCursor {
+    pub actor_namespace: String,
+    pub session_id: String,
+    pub source_namespace: String,
+    pub through_sequence: i64,
+    pub summary_id: String,
+    pub source_view: String,
+    pub source_revision: String,
+}
+
+/// One current cursor-selected summary and its durable identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryItem {
+    pub summary_id: String,
+    pub record: ContextSummaryRecord,
+}
+
+/// Bounded current-summary projection from one exact pinned memory view.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryWindow {
+    pub actor_namespace: String,
+    pub summary_namespace: String,
+    pub session_id: Option<String>,
+    pub source_namespace: Option<String>,
+    pub view: String,
+    pub revision: String,
+    pub records: Vec<ContextSummaryItem>,
+    pub total_rows: u64,
+}
+
+/// A conditional checkpoint was proved stale before any effect began.
+#[derive(Debug)]
+pub struct ContextSummaryStale;
+
+impl std::fmt::Display for ContextSummaryStale {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("context summary source snapshot is stale")
+    }
+}
+
+impl std::error::Error for ContextSummaryStale {}
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -1469,6 +1580,7 @@ impl MemoryStore {
             project_scope: options.project_scope,
             read_only: options.read_only,
             write: Arc::new(Mutex::new(())),
+            dream: Arc::new(Mutex::new(())),
             uncertain: StdMutex::new(None),
             usage_pool: StdMutex::new(None),
             #[cfg(test)]
@@ -1563,6 +1675,7 @@ impl MemoryStore {
             "message",
             Mutation::Append {
                 namespace: namespace.into(),
+                session_id: None,
                 role: role.into(),
                 content: content.into(),
                 format: None,
@@ -1582,6 +1695,32 @@ impl MemoryStore {
             "message",
             Mutation::Append {
                 namespace: namespace.into(),
+                session_id: None,
+                role: message.role.clone(),
+                content: encode_typed_message(message)?,
+                format: Some(TYPED_FORMAT),
+            },
+        )
+        .await
+    }
+
+    /// Append one raw private-history row with durable session provenance.
+    pub async fn append_session_message(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        message: &Message,
+    ) -> Result<()> {
+        validate_session_message(namespace, session_id, message)?;
+        ensure!(
+            self.schema_version().await? >= 5,
+            "session-attributed messages require an upgraded memory view"
+        );
+        self.mutate(
+            "session message",
+            Mutation::Append {
+                namespace: namespace.into(),
+                session_id: Some(session_id.into()),
                 role: message.role.clone(),
                 content: encode_typed_message(message)?,
                 format: Some(TYPED_FORMAT),
@@ -1697,6 +1836,320 @@ impl MemoryStore {
             total_rows: u64::try_from(total_rows).context("memory history count is negative")?,
         })
     }
+
+    /// Read the bounded newest raw-history suffix attributed to one session.
+    /// Namespace-only history remains available for explicit inspection and
+    /// export, but runtime continuity uses this physical provenance boundary.
+    pub async fn session_history_window(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<HistoryWindow> {
+        validate_session_history_request(namespace, session_id, limit)?;
+        ensure!(
+            self.schema_version().await? >= 5,
+            "session history requires an upgraded memory view"
+        );
+        let mut transaction = self.pool.begin().await?;
+        let total_rows: i64 = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM messages WHERE namespace = ? AND session_id = ?",
+            )
+            .bind(namespace.as_bytes())
+            .bind(session_id.as_bytes())
+            .fetch_one(&mut *transaction),
+        )
+        .await
+        .context("session history count deadline exceeded")??;
+        let mut messages = tokio::time::timeout(QUERY_TIMEOUT, async {
+            let mut source = sqlx::query("SELECT sequence, role, content_format, content FROM messages WHERE namespace = ? AND session_id = ? ORDER BY sequence DESC LIMIT ?")
+                .bind(namespace.as_bytes())
+                .bind(session_id.as_bytes())
+                .bind(i64::try_from(limit).context("session history limit exceeds integer range")?)
+                .fetch(&mut *transaction);
+            let mut messages = Vec::new();
+            let mut budget = SessionSourceBudget::new(limit);
+            while let Some(row) = source.try_next().await? {
+                let sequenced = decode_session_source_row(&row, 0)?;
+                let row_bytes = serialized_session_source_row_bytes(&sequenced)?;
+                ensure!(
+                    !messages.is_empty() || row_bytes <= MAX_SESSION_SOURCE_BYTES,
+                    "stored session history row exceeds the response byte bound"
+                );
+                if !budget.try_include(row_bytes)? {
+                    break;
+                }
+                messages.push(sequenced.message);
+            }
+            messages.reverse();
+            Ok::<_, anyhow::Error>(messages)
+        })
+        .await
+        .context("session history window deadline exceeded")??;
+        transaction.commit().await?;
+        messages.shrink_to_fit();
+        Ok(HistoryWindow {
+            messages,
+            total_rows: u64::try_from(total_rows).context("session history count is negative")?,
+        })
+    }
+
+    /// Capture the next bounded session-private source page at this view's
+    /// exact revision. Namespace admission remains the caller's policy duty.
+    pub async fn session_source_snapshot(
+        &self,
+        actor_namespace: &str,
+        session_id: &str,
+        source_namespace: &str,
+        after_exclusive: i64,
+        limit: usize,
+    ) -> Result<SessionSourceSnapshot> {
+        self.readable()?;
+        validate_session_source_request(
+            actor_namespace,
+            session_id,
+            source_namespace,
+            after_exclusive,
+            limit,
+        )?;
+        ensure!(
+            self.schema_version().await? >= 5,
+            "session source snapshots require an upgraded memory view"
+        );
+        let _guard = self.shared.write.lock().await;
+        let captured_revision = revision(&self.pool).await?;
+        let rows = tokio::time::timeout(QUERY_TIMEOUT, async {
+            let mut source = sqlx::query("SELECT sequence, role, content_format, content FROM messages WHERE namespace = ? AND session_id = ? AND sequence > ? ORDER BY sequence LIMIT ?")
+                .bind(source_namespace.as_bytes())
+                .bind(session_id.as_bytes())
+                .bind(after_exclusive)
+                .bind(i64::try_from(limit).context("source snapshot limit exceeds integer range")?)
+                .fetch(self.pool.as_ref());
+            let mut rows = Vec::new();
+            let mut budget = SessionSourceBudget::new(limit);
+            while let Some(row) = source.try_next().await? {
+                let row = decode_session_source_row(&row, after_exclusive)?;
+                let row_bytes = serialized_session_source_row_bytes(&row)?;
+                ensure!(
+                    !rows.is_empty() || row_bytes <= MAX_SESSION_SOURCE_BYTES,
+                    "stored session source row exceeds the snapshot byte bound"
+                );
+                if !budget.try_include(row_bytes)? {
+                    break;
+                }
+                rows.push(row);
+            }
+            Ok::<_, anyhow::Error>(rows)
+        })
+        .await
+        .context("session source snapshot deadline exceeded")??;
+        let through_inclusive = rows.last().map(|row| row.sequence);
+        Ok(SessionSourceSnapshot {
+            actor_namespace: actor_namespace.into(),
+            session_id: session_id.into(),
+            source_namespace: source_namespace.into(),
+            view: self.branch.clone(),
+            revision: captured_revision,
+            after_exclusive,
+            through_inclusive,
+            rows,
+        })
+    }
+
+    /// Atomically publish a strict context summary and advance its exact
+    /// actor/session/source cursor if the captured source is still current.
+    pub async fn checkpoint_context_summary(&self, record: &ContextSummaryRecord) -> Result<()> {
+        validate_context_summary(record)?;
+        ensure!(
+            self.schema_version().await? >= 5,
+            "context summaries require an upgraded memory view"
+        );
+        ensure!(record.source_view == self.branch, ContextSummaryStale);
+        let summary_id = context_summary_id(record);
+        self.mutate(
+            "context summary checkpoint",
+            Mutation::ContextSummary {
+                record: record.clone(),
+                summary_id,
+            },
+        )
+        .await
+    }
+
+    /// Read the current typed compaction cursor for an authorized source.
+    pub async fn context_summary_cursor(
+        &self,
+        actor_namespace: &str,
+        session_id: &str,
+        source_namespace: &str,
+    ) -> Result<Option<ContextSummaryCursor>> {
+        self.readable()?;
+        identifier("actor namespace", actor_namespace, 1024)?;
+        identifier("session identity", session_id, 128)?;
+        identifier("source namespace", source_namespace, 1024)?;
+        ensure!(
+            self.schema_version().await? >= 5,
+            "context summaries require an upgraded memory view"
+        );
+        let row = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query("SELECT through_sequence, summary_id, source_view, source_revision FROM context_summary_cursors WHERE actor_namespace = ? AND session_id = ? AND source_namespace = ?")
+                .bind(actor_namespace.as_bytes())
+                .bind(session_id.as_bytes())
+                .bind(source_namespace.as_bytes())
+                .fetch_optional(self.pool.as_ref()),
+        )
+        .await
+        .context("context summary cursor deadline exceeded")??;
+        row.map(|row| {
+            let cursor = ContextSummaryCursor {
+                actor_namespace: actor_namespace.into(),
+                session_id: session_id.into(),
+                source_namespace: source_namespace.into(),
+                through_sequence: row.try_get("through_sequence")?,
+                summary_id: row.try_get("summary_id")?,
+                source_view: row.try_get("source_view")?,
+                source_revision: row.try_get("source_revision")?,
+            };
+            validate_context_summary_cursor(&cursor)?;
+            Ok(cursor)
+        })
+        .transpose()
+    }
+
+    /// Read summaries selected by one checked actor/summary namespace. Passing
+    /// a session selects its private continuity; omitting it is reserved for a
+    /// caller whose memory policy already admitted the shared namespace.
+    pub async fn context_summary_window(
+        &self,
+        actor_namespace: &str,
+        summary_namespace: &str,
+        session_id: Option<&str>,
+        source_namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<ContextSummaryWindow> {
+        self.readable()?;
+        validate_context_summary_window_request(
+            actor_namespace,
+            summary_namespace,
+            session_id,
+            source_namespace,
+            limit,
+        )?;
+        ensure!(
+            self.schema_version().await? >= 5,
+            "context summaries require an upgraded memory view"
+        );
+        let _guard = self.shared.write.lock().await;
+        let captured_revision = revision(&self.pool).await?;
+        let mut transaction = self.pool.begin().await?;
+        let total_rows: i64 = tokio::time::timeout(QUERY_TIMEOUT, async {
+            match (session_id, source_namespace) {
+                (Some(session_id), Some(source_namespace)) => sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace WHERE s.actor_namespace = ? AND s.summary_namespace = ? AND s.session_id = ? AND s.source_namespace = ?",
+                )
+                .bind(actor_namespace.as_bytes())
+                .bind(summary_namespace.as_bytes())
+                .bind(session_id.as_bytes())
+                .bind(source_namespace.as_bytes())
+                .fetch_one(&mut *transaction)
+                .await,
+                (Some(session_id), None) => sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace WHERE s.actor_namespace = ? AND s.summary_namespace = ? AND s.session_id = ?",
+                )
+                .bind(actor_namespace.as_bytes())
+                .bind(summary_namespace.as_bytes())
+                .bind(session_id.as_bytes())
+                .fetch_one(&mut *transaction)
+                .await,
+                (None, Some(source_namespace)) => sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace WHERE s.actor_namespace = ? AND s.summary_namespace = ? AND s.source_namespace = ?",
+                )
+                .bind(actor_namespace.as_bytes())
+                .bind(summary_namespace.as_bytes())
+                .bind(source_namespace.as_bytes())
+                .fetch_one(&mut *transaction)
+                .await,
+                (None, None) => sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace WHERE s.actor_namespace = ? AND s.summary_namespace = ?",
+                )
+                .bind(actor_namespace.as_bytes())
+                .bind(summary_namespace.as_bytes())
+                .fetch_one(&mut *transaction)
+                .await,
+            }
+        })
+        .await
+        .context("context summary count deadline exceeded")??;
+        let mut records = tokio::time::timeout(QUERY_TIMEOUT, async {
+            let query = match (session_id, source_namespace) {
+                (Some(session_id), Some(source_namespace)) => sqlx::query("SELECT s.summary_id, s.actor_namespace, s.session_id, s.source_namespace, s.summary_namespace, s.source_view, s.source_revision, s.after_sequence, s.through_sequence, s.turn_id, s.invocation_id, s.record_format, s.summary FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace WHERE s.actor_namespace = ? AND s.summary_namespace = ? AND s.session_id = ? AND s.source_namespace = ? ORDER BY s.through_sequence DESC, s.summary_id DESC LIMIT ?")
+                    .bind(actor_namespace.as_bytes())
+                    .bind(summary_namespace.as_bytes())
+                    .bind(session_id.as_bytes())
+                    .bind(source_namespace.as_bytes())
+                    .bind(i64::try_from(limit).context("context summary limit exceeds integer range")?)
+                    ,
+                (Some(session_id), None) => sqlx::query("SELECT s.summary_id, s.actor_namespace, s.session_id, s.source_namespace, s.summary_namespace, s.source_view, s.source_revision, s.after_sequence, s.through_sequence, s.turn_id, s.invocation_id, s.record_format, s.summary FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace WHERE s.actor_namespace = ? AND s.summary_namespace = ? AND s.session_id = ? ORDER BY s.through_sequence DESC, s.summary_id DESC LIMIT ?")
+                    .bind(actor_namespace.as_bytes())
+                    .bind(summary_namespace.as_bytes())
+                    .bind(session_id.as_bytes())
+                    .bind(i64::try_from(limit).context("context summary limit exceeds integer range")?),
+                (None, Some(source_namespace)) => sqlx::query("SELECT s.summary_id, s.actor_namespace, s.session_id, s.source_namespace, s.summary_namespace, s.source_view, s.source_revision, s.after_sequence, s.through_sequence, s.turn_id, s.invocation_id, s.record_format, s.summary FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace WHERE s.actor_namespace = ? AND s.summary_namespace = ? AND s.source_namespace = ? ORDER BY s.through_sequence DESC, s.summary_id DESC LIMIT ?")
+                    .bind(actor_namespace.as_bytes())
+                    .bind(summary_namespace.as_bytes())
+                    .bind(source_namespace.as_bytes())
+                    .bind(i64::try_from(limit).context("context summary limit exceeds integer range")?),
+                (None, None) => sqlx::query("SELECT s.summary_id, s.actor_namespace, s.session_id, s.source_namespace, s.summary_namespace, s.source_view, s.source_revision, s.after_sequence, s.through_sequence, s.turn_id, s.invocation_id, s.record_format, s.summary FROM context_summary_cursors c JOIN context_summaries s ON s.summary_id = c.summary_id AND s.actor_namespace = c.actor_namespace AND s.session_id = c.session_id AND s.source_namespace = c.source_namespace WHERE s.actor_namespace = ? AND s.summary_namespace = ? ORDER BY s.through_sequence DESC, s.summary_id DESC LIMIT ?")
+                    .bind(actor_namespace.as_bytes())
+                    .bind(summary_namespace.as_bytes())
+                    .bind(i64::try_from(limit).context("context summary limit exceeds integer range")?)
+                    ,
+            };
+            let mut source = query.fetch(&mut *transaction);
+            let mut records = Vec::new();
+            let mut budget = SessionSourceBudget::new(limit);
+            while let Some(row) = source.try_next().await? {
+                let record = decode_context_summary_item(&row)?;
+                ensure!(
+                    record.record.actor_namespace == actor_namespace
+                        && record.record.summary_namespace == summary_namespace
+                        && session_id
+                            .is_none_or(|session| record.record.session_id == session)
+                        && source_namespace
+                            .is_none_or(|source| record.record.source_namespace == source),
+                    "context summary projection escaped its requested boundary"
+                );
+                let row_bytes = serde_json::to_vec(&record)?.len();
+                ensure!(
+                    !records.is_empty() || row_bytes <= MAX_SESSION_SOURCE_BYTES,
+                    "stored context summary exceeds the response byte bound"
+                );
+                if !budget.try_include(row_bytes)? {
+                    break;
+                }
+                records.push(record);
+            }
+            records.reverse();
+            Ok::<_, anyhow::Error>(records)
+        })
+        .await
+        .context("context summary window deadline exceeded")??;
+        transaction.commit().await?;
+        records.shrink_to_fit();
+        Ok(ContextSummaryWindow {
+            actor_namespace: actor_namespace.into(),
+            summary_namespace: summary_namespace.into(),
+            session_id: session_id.map(str::to_owned),
+            source_namespace: source_namespace.map(str::to_owned),
+            view: self.branch.clone(),
+            revision: captured_revision,
+            records,
+            total_rows: u64::try_from(total_rows).context("context summary count is negative")?,
+        })
+    }
     /// Read durable rows with their stable sequence for a caller that already
     /// owns namespace selection. This deliberately preserves every stored role.
     pub async fn notes(&self, namespace: &str, limit: usize) -> Result<Vec<StoredNote>> {
@@ -1770,6 +2223,15 @@ impl MemoryStore {
         self.mutate("state", Mutation::State(encoded)).await
     }
 
+    pub async fn put_reasoning_summaries(&self, records: &[ReasoningSummaryRecord]) -> Result<()> {
+        let encoded = encode_reasoning_summaries(records)?;
+        self.mutate(
+            "private reasoning summaries",
+            Mutation::PrivateReasoningSummaries(encoded),
+        )
+        .await
+    }
+
     /// Append messages to one namespace and update state in the same durable
     /// receipt-bearing transaction. This is the narrow turn-checkpoint seam;
     /// callers do not receive general SQL or cross-namespace authority.
@@ -1798,6 +2260,43 @@ impl MemoryStore {
             "checkpoint",
             Mutation::Checkpoint {
                 namespace: namespace.into(),
+                session_id: None,
+                messages: encoded_messages,
+                values: encoded_state,
+            },
+        )
+        .await
+    }
+
+    /// Atomically append session-attributed history and update state for one
+    /// turn checkpoint while retaining the global message sequence allocator.
+    pub async fn checkpoint_session(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        messages: &[Message],
+        values: &[(String, Value)],
+    ) -> Result<()> {
+        validate_session_checkpoint(namespace, session_id, messages, values)?;
+        ensure!(
+            self.schema_version().await? >= 5,
+            "session-attributed checkpoints require an upgraded memory view"
+        );
+        let mut encoded_messages = Vec::with_capacity(messages.len());
+        for message in messages {
+            identifier("role", &message.role, 128)?;
+            encoded_messages.push((message.role.clone(), encode_typed_message(message)?));
+        }
+        let encoded_state = encode_state(values)?;
+        ensure!(
+            !encoded_messages.is_empty() || !encoded_state.is_empty(),
+            "memory checkpoint must contain a message or state value"
+        );
+        self.mutate(
+            "session checkpoint",
+            Mutation::Checkpoint {
+                namespace: namespace.into(),
+                session_id: Some(session_id.into()),
                 messages: encoded_messages,
                 values: encoded_state,
             },
@@ -2499,6 +2998,14 @@ impl MemoryStore {
             read_only: self.shared.read_only,
         })
     }
+
+    pub(crate) fn try_acquire_dream_lease(&self) -> Option<OwnedMutexGuard<()>> {
+        self.shared.dream.clone().try_lock_owned().ok()
+    }
+
+    pub(crate) async fn acquire_dream_lease(&self) -> OwnedMutexGuard<()> {
+        self.shared.dream.clone().lock_owned().await
+    }
     /// Explicitly shut down this shared server handle and every view that
     /// clones it. Dropping a view only releases that view.
     pub async fn close(self) -> Result<()> {
@@ -2615,13 +3122,16 @@ async fn close_migration_worker(server: Server, _pool: Arc<MySqlPool>) -> Result
 enum Mutation {
     Append {
         namespace: String,
+        session_id: Option<String>,
         role: String,
         content: String,
         format: Option<&'static str>,
     },
     State(Vec<(String, String)>),
+    PrivateReasoningSummaries(Vec<(String, String)>),
     Checkpoint {
         namespace: String,
+        session_id: Option<String>,
         messages: Vec<(String, String)>,
         values: Vec<(String, String)>,
     },
@@ -2629,6 +3139,10 @@ enum Mutation {
     ForgetNote {
         namespace: String,
         sequence: i64,
+    },
+    ContextSummary {
+        record: ContextSummaryRecord,
+        summary_id: String,
     },
 }
 
@@ -2643,11 +3157,22 @@ async fn apply(
     match mutation {
         Mutation::Append {
             namespace,
+            session_id,
             role,
             content,
             format,
         } => {
-            if let Some(format) = format {
+            if let Some(session_id) = session_id {
+                let format = format.context("session message format is missing")?;
+                sqlx::query("INSERT INTO messages (namespace, session_id, role, content_format, content) VALUES (?, ?, ?, ?, ?)")
+                    .bind(namespace.as_bytes())
+                    .bind(session_id.as_bytes())
+                    .bind(role.as_bytes())
+                    .bind(format)
+                    .bind(content)
+                    .execute(&mut *transaction)
+                    .await?;
+            } else if let Some(format) = format {
                 sqlx::query("INSERT INTO messages (namespace, role, content_format, content) VALUES (?, ?, ?, ?)")
                     .bind(namespace.as_bytes())
                     .bind(role.as_bytes())
@@ -2670,19 +3195,51 @@ async fn apply(
                 sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)").bind(key.as_bytes()).bind(value).execute(&mut *transaction).await?;
             }
         }
+        Mutation::PrivateReasoningSummaries(values) => {
+            for (key, value) in values {
+                let existing: Option<String> =
+                    sqlx::query_scalar("SELECT value FROM state WHERE `key` = ? FOR UPDATE")
+                        .bind(key.as_bytes())
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if let Some(existing) = existing {
+                    if existing != value {
+                        return Err(ReasoningSummaryConflict.into());
+                    }
+                } else {
+                    sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                        .bind(key.as_bytes())
+                        .bind(value)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+            }
+        }
         Mutation::Checkpoint {
             namespace,
+            session_id,
             messages,
             values,
         } => {
             for (role, content) in messages {
-                sqlx::query("INSERT INTO messages (namespace, role, content_format, content) VALUES (?, ?, ?, ?)")
-                    .bind(namespace.as_bytes())
-                    .bind(role.as_bytes())
-                    .bind(TYPED_FORMAT)
-                    .bind(content)
-                    .execute(&mut *transaction)
-                    .await?;
+                if let Some(session_id) = &session_id {
+                    sqlx::query("INSERT INTO messages (namespace, session_id, role, content_format, content) VALUES (?, ?, ?, ?, ?)")
+                        .bind(namespace.as_bytes())
+                        .bind(session_id.as_bytes())
+                        .bind(role.as_bytes())
+                        .bind(TYPED_FORMAT)
+                        .bind(content)
+                        .execute(&mut *transaction)
+                        .await?;
+                } else {
+                    sqlx::query("INSERT INTO messages (namespace, role, content_format, content) VALUES (?, ?, ?, ?)")
+                        .bind(namespace.as_bytes())
+                        .bind(role.as_bytes())
+                        .bind(TYPED_FORMAT)
+                        .bind(content)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
             }
             for (key, value) in values {
                 sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)").bind(key.as_bytes()).bind(value).execute(&mut *transaction).await?;
@@ -2708,6 +3265,72 @@ async fn apply(
                 "note sequence {sequence} is not present in this notes namespace"
             );
         }
+        Mutation::ContextSummary { record, summary_id } => {
+            let current_revision: String = sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')")
+                .fetch_one(&mut *transaction)
+                .await?;
+            ensure!(
+                current_revision == record.source_revision,
+                ContextSummaryStale
+            );
+            let current_cursor: Option<i64> = sqlx::query_scalar(
+                "SELECT through_sequence FROM context_summary_cursors WHERE actor_namespace = ? AND session_id = ? AND source_namespace = ? FOR UPDATE",
+            )
+            .bind(record.actor_namespace.as_bytes())
+            .bind(record.session_id.as_bytes())
+            .bind(record.source_namespace.as_bytes())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            ensure!(
+                current_cursor.unwrap_or(0) == record.after_sequence,
+                ContextSummaryStale
+            );
+            ensure!(
+                context_summary_range_is_bounded(&mut transaction, &record).await?,
+                ContextSummaryStale
+            );
+            sqlx::query("INSERT INTO context_summaries (summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, invocation_id, record_format, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(&summary_id)
+                .bind(record.actor_namespace.as_bytes())
+                .bind(record.session_id.as_bytes())
+                .bind(record.source_namespace.as_bytes())
+                .bind(record.summary_namespace.as_bytes())
+                .bind(&record.source_view)
+                .bind(&record.source_revision)
+                .bind(record.after_sequence)
+                .bind(record.through_sequence)
+                .bind(record.turn_id.as_bytes())
+                .bind(record.invocation_id.as_bytes())
+                .bind(CONTEXT_SUMMARY_FORMAT)
+                .bind(&record.summary)
+                .execute(&mut *transaction)
+                .await?;
+            if current_cursor.is_some() {
+                let updated = sqlx::query("UPDATE context_summary_cursors SET through_sequence = ?, summary_id = ?, source_view = ?, source_revision = ? WHERE actor_namespace = ? AND session_id = ? AND source_namespace = ? AND through_sequence = ?")
+                    .bind(record.through_sequence)
+                    .bind(&summary_id)
+                    .bind(&record.source_view)
+                    .bind(&record.source_revision)
+                    .bind(record.actor_namespace.as_bytes())
+                    .bind(record.session_id.as_bytes())
+                    .bind(record.source_namespace.as_bytes())
+                    .bind(record.after_sequence)
+                    .execute(&mut *transaction)
+                    .await?;
+                ensure!(updated.rows_affected() == 1, ContextSummaryStale);
+            } else {
+                sqlx::query("INSERT INTO context_summary_cursors (actor_namespace, session_id, source_namespace, through_sequence, summary_id, source_view, source_revision) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                    .bind(record.actor_namespace.as_bytes())
+                    .bind(record.session_id.as_bytes())
+                    .bind(record.source_namespace.as_bytes())
+                    .bind(record.through_sequence)
+                    .bind(&summary_id)
+                    .bind(&record.source_view)
+                    .bind(&record.source_revision)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+        }
     }
     // Historical candidate views keep their committed schema and sole-receipt
     // behavior. Current writable views retain every indexed receipt so a later
@@ -2715,7 +3338,7 @@ async fn apply(
     let version: i32 = sqlx::query_scalar("SELECT version FROM kuru_schema WHERE id = 1")
         .fetch_one(&mut *transaction)
         .await?;
-    if version <= 3 {
+    if version <= 4 {
         sqlx::query("DELETE FROM operations")
             .execute(&mut *transaction)
             .await?;
@@ -2760,6 +3383,88 @@ fn encode_state(values: &[(String, Value)]) -> Result<Vec<(String, String)>> {
     Ok(encoded)
 }
 
+fn encode_reasoning_summaries(records: &[ReasoningSummaryRecord]) -> Result<Vec<(String, String)>> {
+    validate_reasoning_summaries(records)?;
+    Ok(records
+        .iter()
+        .map(|record| {
+            Ok((
+                reasoning_summary_key(record)?,
+                serde_json::to_string(record)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?
+        .into_iter()
+        .collect())
+}
+
+/// Validate one complete private-summary mutation before an attachment sends
+/// it. The owner invokes the same validation again because the RPC boundary is
+/// untrusted; callers use it to reject definite no-effect inputs without
+/// turning a local serialization failure into an uncertain remote write.
+pub(crate) fn validate_reasoning_summaries(records: &[ReasoningSummaryRecord]) -> Result<()> {
+    ensure!(
+        (1..=1024).contains(&records.len()),
+        "private reasoning summary batch must contain 1–1024 records"
+    );
+    let mut string_bytes = 0usize;
+    let mut identities = BTreeMap::new();
+    for record in records {
+        for (field, value, limit) in [
+            ("reasoning summary session", &record.session_id, 1024),
+            ("reasoning summary turn", &record.turn_id, 1024),
+            ("reasoning summary actor", &record.actor_id, 1024),
+            ("reasoning summary invocation", &record.invocation_id, 1024),
+            (
+                "reasoning summary text",
+                &record.text,
+                MAX_TYPED_MESSAGE_BYTES,
+            ),
+        ] {
+            identifier(field, value, limit)?;
+            string_bytes = string_bytes
+                .checked_add(value.len())
+                .context("private reasoning summary aggregate byte count overflow")?;
+        }
+        if let Some(item_id) = &record.item_id {
+            identifier("reasoning summary item", item_id, 1024)?;
+            string_bytes = string_bytes
+                .checked_add(item_id.len())
+                .context("private reasoning summary aggregate byte count overflow")?;
+        }
+        ensure!(
+            string_bytes <= MAX_REASONING_SUMMARY_BATCH_STRING_BYTES,
+            "private reasoning summary batch strings exceed 16 MiB"
+        );
+        let key = reasoning_summary_key(record)?;
+        let value = serde_json::to_string(record)?;
+        if let Some(existing) = identities.insert(key, value.clone()) {
+            ensure!(existing == value, ReasoningSummaryConflict);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reasoning_summary_key(record: &ReasoningSummaryRecord) -> Result<String> {
+    let encoded = serde_json::to_vec(&(
+        &record.session_id,
+        &record.turn_id,
+        &record.actor_id,
+        &record.invocation_id,
+        &record.item_id,
+        record.output_index,
+        record.summary_index,
+    ))?;
+    let digest = Sha256::digest(encoded);
+    Ok(format!(
+        "{PRIVATE_REASONING_SUMMARY_PREFIX}{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
 #[derive(Serialize)]
 struct TypedMessageRef<'a> {
     blocks: &'a [ContentBlock],
@@ -2769,6 +3474,277 @@ struct TypedMessageRef<'a> {
 #[serde(deny_unknown_fields)]
 struct TypedMessage {
     blocks: Vec<ContentBlock>,
+}
+
+pub(crate) fn validate_session_message(
+    namespace: &str,
+    session_id: &str,
+    message: &Message,
+) -> Result<()> {
+    identifier("namespace", namespace, 1024)?;
+    identifier("session identity", session_id, 128)?;
+    identifier("role", &message.role, 128)?;
+    encode_typed_message(message)?;
+    Ok(())
+}
+
+pub(crate) fn validate_session_source_request(
+    actor_namespace: &str,
+    session_id: &str,
+    source_namespace: &str,
+    after_exclusive: i64,
+    limit: usize,
+) -> Result<()> {
+    identifier("actor namespace", actor_namespace, 1024)?;
+    identifier("session identity", session_id, 128)?;
+    identifier("source namespace", source_namespace, 1024)?;
+    ensure!(after_exclusive >= 0, "source cursor cannot be negative");
+    ensure!(
+        (1..=MAX_SESSION_SOURCE_ROWS).contains(&limit),
+        "source snapshot limit must be between 1 and {MAX_SESSION_SOURCE_ROWS}"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_session_history_request(
+    namespace: &str,
+    session_id: &str,
+    limit: usize,
+) -> Result<()> {
+    identifier("namespace", namespace, 1024)?;
+    identifier("session identity", session_id, 128)?;
+    ensure!(
+        limit <= MAX_SESSION_SOURCE_ROWS,
+        "session history limit cannot exceed {MAX_SESSION_SOURCE_ROWS}"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_session_checkpoint(
+    namespace: &str,
+    session_id: &str,
+    messages: &[Message],
+    values: &[(String, Value)],
+) -> Result<()> {
+    identifier("namespace", namespace, 1024)?;
+    identifier("session identity", session_id, 128)?;
+    for message in messages {
+        identifier("role", &message.role, 128)?;
+        encode_typed_message(message)?;
+    }
+    encode_state(values)?;
+    ensure!(
+        !messages.is_empty() || !values.is_empty(),
+        "memory checkpoint must contain a message or state value"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_context_summary(record: &ContextSummaryRecord) -> Result<()> {
+    identifier("actor namespace", &record.actor_namespace, 1024)?;
+    identifier("session identity", &record.session_id, 128)?;
+    identifier("source namespace", &record.source_namespace, 1024)?;
+    identifier("summary namespace", &record.summary_namespace, 1024)?;
+    identifier("source view", &record.source_view, 64)?;
+    identifier("source revision", &record.source_revision, 64)?;
+    identifier("turn identity", &record.turn_id, 128)?;
+    identifier("invocation identity", &record.invocation_id, 128)?;
+    ensure!(
+        record.after_sequence >= 0 && record.through_sequence > record.after_sequence,
+        "context summary source range is invalid"
+    );
+    ensure!(!record.summary.is_empty(), "context summary is empty");
+    ensure!(
+        record.summary.len() <= MAX_TYPED_MESSAGE_BYTES,
+        "context summary exceeds {MAX_TYPED_MESSAGE_BYTES} bytes"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_context_summary_cursor(cursor: &ContextSummaryCursor) -> Result<()> {
+    identifier("actor namespace", &cursor.actor_namespace, 1024)?;
+    identifier("session identity", &cursor.session_id, 128)?;
+    identifier("source namespace", &cursor.source_namespace, 1024)?;
+    identifier("source view", &cursor.source_view, 64)?;
+    identifier("source revision", &cursor.source_revision, 64)?;
+    validate_context_summary_id(&cursor.summary_id)?;
+    ensure!(
+        cursor.through_sequence > 0,
+        "context summary cursor is invalid"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_context_summary_window_request(
+    actor_namespace: &str,
+    summary_namespace: &str,
+    session_id: Option<&str>,
+    source_namespace: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    identifier("actor namespace", actor_namespace, 1024)?;
+    identifier("summary namespace", summary_namespace, 1024)?;
+    if let Some(session_id) = session_id {
+        identifier("session identity", session_id, 128)?;
+    }
+    if let Some(source_namespace) = source_namespace {
+        identifier("source namespace", source_namespace, 1024)?;
+    }
+    ensure!(
+        limit <= MAX_SESSION_SOURCE_ROWS,
+        "context summary limit cannot exceed {MAX_SESSION_SOURCE_ROWS}"
+    );
+    Ok(())
+}
+
+fn validate_context_summary_id(summary_id: &str) -> Result<()> {
+    ensure!(
+        summary_id.len() == 64
+            && summary_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "context summary identity is malformed"
+    );
+    Ok(())
+}
+
+fn decode_context_summary_item(row: &sqlx::mysql::MySqlRow) -> Result<ContextSummaryItem> {
+    let utf8 = |column| -> Result<String> {
+        String::from_utf8(row.try_get(column)?)
+            .with_context(|| format!("context summary {column} is not UTF-8"))
+    };
+    let summary_id: String = row.try_get("summary_id")?;
+    validate_context_summary_id(&summary_id)?;
+    let format: String = row.try_get("record_format")?;
+    ensure!(
+        format == CONTEXT_SUMMARY_FORMAT,
+        "unsupported context summary record format"
+    );
+    let record = ContextSummaryRecord {
+        actor_namespace: utf8("actor_namespace")?,
+        session_id: utf8("session_id")?,
+        source_namespace: utf8("source_namespace")?,
+        summary_namespace: utf8("summary_namespace")?,
+        source_view: row.try_get("source_view")?,
+        source_revision: row.try_get("source_revision")?,
+        after_sequence: row.try_get("after_sequence")?,
+        through_sequence: row.try_get("through_sequence")?,
+        turn_id: utf8("turn_id")?,
+        invocation_id: utf8("invocation_id")?,
+        summary: row.try_get("summary")?,
+    };
+    validate_context_summary(&record)?;
+    Ok(ContextSummaryItem { summary_id, record })
+}
+
+fn decode_session_source_row(
+    row: &sqlx::mysql::MySqlRow,
+    after_exclusive: i64,
+) -> Result<SequencedMessage> {
+    let sequence: i64 = row.try_get("sequence")?;
+    ensure!(
+        sequence > after_exclusive,
+        "session source sequence is out of range"
+    );
+    let role = String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)?;
+    let format: String = row.try_get("content_format")?;
+    let content: String = row.try_get("content")?;
+    Ok(SequencedMessage {
+        sequence,
+        message: decode_message(role, &format, &content)
+            .with_context(|| format!("invalid session source message sequence {sequence}"))?,
+    })
+}
+
+fn serialized_session_source_row_bytes(row: &SequencedMessage) -> Result<usize> {
+    Ok(serde_json::to_vec(row)?.len())
+}
+
+struct SessionSourceBudget {
+    max_rows: usize,
+    rows: usize,
+    serialized_bytes: usize,
+}
+
+impl SessionSourceBudget {
+    fn new(max_rows: usize) -> Self {
+        Self {
+            max_rows,
+            rows: 0,
+            serialized_bytes: 0,
+        }
+    }
+
+    fn try_include(&mut self, row_bytes: usize) -> Result<bool> {
+        if self.rows >= self.max_rows {
+            return Ok(false);
+        }
+        let serialized_bytes = self
+            .serialized_bytes
+            .checked_add(row_bytes)
+            .context("session source snapshot byte count overflowed")?;
+        if serialized_bytes > MAX_SESSION_SOURCE_BYTES {
+            return Ok(false);
+        }
+        self.rows += 1;
+        self.serialized_bytes = serialized_bytes;
+        Ok(true)
+    }
+}
+
+async fn context_summary_range_is_bounded(
+    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    record: &ContextSummaryRecord,
+) -> Result<bool> {
+    let query_limit = i64::try_from(MAX_SESSION_SOURCE_ROWS + 1)
+        .context("session source row bound exceeds integer range")?;
+    let mut source = sqlx::query("SELECT sequence, role, content_format, content FROM messages WHERE namespace = ? AND session_id = ? AND sequence > ? AND sequence <= ? ORDER BY sequence LIMIT ?")
+        .bind(record.source_namespace.as_bytes())
+        .bind(record.session_id.as_bytes())
+        .bind(record.after_sequence)
+        .bind(record.through_sequence)
+        .bind(query_limit)
+        .fetch(&mut **transaction);
+    let mut budget = SessionSourceBudget::new(MAX_SESSION_SOURCE_ROWS);
+    let mut observed_through = None;
+    while let Some(row) = source.try_next().await? {
+        let row = decode_session_source_row(&row, record.after_sequence)?;
+        let row_bytes = serialized_session_source_row_bytes(&row)?;
+        if !budget.try_include(row_bytes)? {
+            return Ok(false);
+        }
+        observed_through = Some(row.sequence);
+    }
+    Ok(observed_through == Some(record.through_sequence))
+}
+
+fn context_summary_id(record: &ContextSummaryRecord) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        "kuru.context-summary.v1",
+        &record.actor_namespace,
+        &record.session_id,
+        &record.source_namespace,
+        &record.summary_namespace,
+        &record.source_view,
+        &record.source_revision,
+        &record.turn_id,
+        &record.invocation_id,
+    ] {
+        hash_context_field(&mut digest, value.as_bytes());
+    }
+    hash_context_field(&mut digest, &record.after_sequence.to_be_bytes());
+    hash_context_field(&mut digest, &record.through_sequence.to_be_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hash_context_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
 }
 
 fn encode_typed_message(message: &Message) -> Result<String> {
@@ -3272,6 +4248,135 @@ mod tests {
     use serde_json::json;
     use sha2::Digest;
 
+    fn reasoning_summary(text: impl Into<String>) -> ReasoningSummaryRecord {
+        ReasoningSummaryRecord {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            actor_id: "actor".into(),
+            invocation_id: "invocation".into(),
+            item_id: Some("item".into()),
+            output_index: Some(0),
+            summary_index: 0,
+            text: text.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn private_reasoning_summary_batch_is_atomic_and_idempotent() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let first = reasoning_summary("first");
+        store
+            .put_reasoning_summaries(std::slice::from_ref(&first))
+            .await?;
+        store
+            .put_reasoning_summaries(std::slice::from_ref(&first))
+            .await?;
+
+        let mut fresh = reasoning_summary("fresh");
+        fresh.summary_index = 1;
+        let mut conflicting = first.clone();
+        conflicting.text = "conflicting".into();
+        let error = store
+            .put_reasoning_summaries(&[fresh.clone(), conflicting])
+            .await
+            .unwrap_err();
+        ensure!(
+            error.downcast_ref::<ReasoningSummaryConflict>().is_some(),
+            "different payload for a settled summary identity was not a typed conflict: {error:#}"
+        );
+        let first_key = reasoning_summary_key(&first)?;
+        let fresh_key = reasoning_summary_key(&fresh)?;
+        ensure!(
+            store.get(&first_key).await? == Some(serde_json::to_value(&first)?),
+            "idempotent reasoning summary changed its original durable payload"
+        );
+        ensure!(
+            store.get(&fresh_key).await?.is_none(),
+            "summary batch committed a prefix before its later identity conflict"
+        );
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn private_reasoning_summary_identity_keeps_equal_text_in_its_admitted_tuple()
+    -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let first = reasoning_summary("same provider text");
+        let mut other_session = first.clone();
+        other_session.session_id = "other-session".into();
+        let mut other_actor = first.clone();
+        other_actor.actor_id = "other-actor".into();
+        let mut other_turn = first.clone();
+        other_turn.turn_id = "other-turn".into();
+        let mut other_invocation = first.clone();
+        other_invocation.invocation_id = "other-invocation".into();
+        let records = [
+            first.clone(),
+            other_session.clone(),
+            other_actor.clone(),
+            other_turn.clone(),
+            other_invocation.clone(),
+        ];
+        store.put_reasoning_summaries(&records).await?;
+
+        let keys = records
+            .iter()
+            .map(reasoning_summary_key)
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        ensure!(
+            keys.len() == records.len(),
+            "distinct admitted reasoning-summary identities shared one durable key"
+        );
+        for record in records {
+            let key = reasoning_summary_key(&record)?;
+            ensure!(
+                store.get(&key).await? == Some(serde_json::to_value(record)?),
+                "reasoning summary identity did not retain its exact admitted record"
+            );
+        }
+        store.close().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn private_reasoning_summary_batch_bounds_total_identity_and_text_bytes() -> Result<()> {
+        let mut at_limit = reasoning_summary("");
+        let identity_bytes = at_limit.session_id.len()
+            + at_limit.turn_id.len()
+            + at_limit.actor_id.len()
+            + at_limit.invocation_id.len()
+            + at_limit.item_id.as_ref().map_or(0, String::len);
+        at_limit.text = "x".repeat(MAX_REASONING_SUMMARY_BATCH_STRING_BYTES - identity_bytes);
+        encode_reasoning_summaries(&[at_limit.clone()])?;
+        at_limit.text.push('x');
+        ensure!(
+            encode_reasoning_summaries(&[at_limit]).is_err(),
+            "reasoning summary aggregate accepted one byte over its 16 MiB bound"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_source_budget_rejects_the_next_row_or_byte_without_partial_accounting() -> Result<()>
+    {
+        let mut row_budget = SessionSourceBudget::new(2);
+        assert!(row_budget.try_include(1)?);
+        assert!(row_budget.try_include(1)?);
+        assert!(!row_budget.try_include(1)?);
+        assert_eq!(row_budget.rows, 2);
+        assert_eq!(row_budget.serialized_bytes, 2);
+
+        let mut byte_budget = SessionSourceBudget::new(MAX_SESSION_SOURCE_ROWS);
+        assert!(byte_budget.try_include(MAX_SESSION_SOURCE_BYTES - 1)?);
+        assert!(!byte_budget.try_include(2)?);
+        assert_eq!(byte_budget.rows, 1);
+        assert_eq!(byte_budget.serialized_bytes, MAX_SESSION_SOURCE_BYTES - 1);
+        assert!(byte_budget.try_include(1)?);
+        assert_eq!(byte_budget.serialized_bytes, MAX_SESSION_SOURCE_BYTES);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn service_disconnect_and_owner_restart_preserve_unresolved_candidate() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(90), async {
@@ -3729,9 +4834,15 @@ mod tests {
         .bind(&grandparent)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let fourth_parent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&great_grandparent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            great_grandparent, base,
-            "v1 to v4 must contain three ordered upgrades"
+            fourth_parent, base,
+            "v1 to v5 must contain four ordered upgrades"
         );
         let commits: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
@@ -3751,6 +4862,12 @@ mod tests {
         .fetch_one(store.pool.as_ref())
         .await?;
         assert_eq!(receipt_commits, 1);
+        let session_commits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 5%'",
+        )
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(session_commits, 1);
         store.close().await?;
 
         let reopened = MemoryStore::open(options).await?;
@@ -3779,6 +4896,7 @@ mod tests {
             ("v2 attempt", Some(2), false),
             ("v3 attempt", Some(3), false),
             ("v4 attempt", Some(4), false),
+            ("v5 attempt", Some(5), false),
             ("future schema", None, true),
         ] {
             let root = crate::test_support::tempdir()?;
@@ -3798,7 +4916,7 @@ mod tests {
                     Some(name)
                 }
                 None if future_schema => {
-                    sqlx::query("UPDATE kuru_schema SET version = 5 WHERE id = 1")
+                    sqlx::query("UPDATE kuru_schema SET version = 6 WHERE id = 1")
                         .execute(pool.as_ref())
                         .await?;
                     None
@@ -3822,7 +4940,8 @@ mod tests {
                 (Some(2), false) => "attempt newer than its schema",
                 (Some(3), false) => "attempt newer than its schema",
                 (Some(4), false) => "attempt newer than its schema",
-                (None, true) => "unsupported Dolt memory schema version 5",
+                (Some(5), false) => "attempt newer than its schema",
+                (None, true) => "unsupported Dolt memory schema version 6",
                 _ => unreachable!(),
             };
             assert!(rendered.contains(expected), "{case}: {rendered}");
@@ -4043,7 +5162,7 @@ mod tests {
         let error = MemoryStore::open(readonly).await.unwrap_err();
         let error = format!("{error:#}");
         assert!(
-            error.contains("version 1 requires writable upgrade to 4"),
+            error.contains("version 1 requires writable upgrade to 5"),
             "unexpected read-only v1 open error: {error}"
         );
         assert_eq!(fs::read(directory.join("ready.json"))?, marker);
@@ -4091,9 +5210,15 @@ mod tests {
         .bind(&grandparent)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let v1_base: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&great_grandparent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            great_grandparent, base,
-            "upgrade must retain all three ordered commits"
+            v1_base, base,
+            "upgrade must retain all four ordered commits"
         );
         assert_eq!(
             sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
@@ -4119,7 +5244,7 @@ mod tests {
         let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kuru_migrations")
             .fetch_one(store.pool.as_ref())
             .await?;
-        assert_eq!(receipts, 3);
+        assert_eq!(receipts, i64::from(migrations::CURRENT_VERSION - 1));
         let receipt: Vec<(i32, String, String, String)> = sqlx::query_as(
             "SELECT version, id, digest, operation FROM kuru_migrations ORDER BY version",
         )
@@ -4127,7 +5252,7 @@ mod tests {
         .await?;
         assert_eq!(
             receipt.iter().map(|row| row.0).collect::<Vec<_>>(),
-            [2, 3, 4]
+            [2, 3, 4, 5]
         );
         assert!(receipt.iter().all(|row| Uuid::parse_str(&row.3).is_ok()));
         store.close().await?;
@@ -4313,6 +5438,7 @@ mod tests {
                 project_scope: scope,
                 read_only: true,
                 write: Arc::new(Mutex::new(())),
+                dream: Arc::new(Mutex::new(())),
                 uncertain: StdMutex::new(None),
                 usage_pool: StdMutex::new(None),
                 candidate_recovery_pause: None,
@@ -4408,8 +5534,22 @@ mod tests {
         store.close().await?;
 
         let store = MemoryStore::temporary().await?;
+        sqlx::query("ALTER TABLE messages DROP INDEX messages_namespace_session_sequence")
+            .execute(store.pool.as_ref())
+            .await?;
+        assert!(migrations::validate_current(&store.pool).await.is_err());
+        store.close().await?;
+
+        let store = MemoryStore::temporary().await?;
+        sqlx::query("ALTER TABLE context_summary_cursors ADD COLUMN forged BIGINT NULL")
+            .execute(store.pool.as_ref())
+            .await?;
+        assert!(migrations::validate_current(&store.pool).await.is_err());
+        store.close().await?;
+
+        let store = MemoryStore::temporary().await?;
         sqlx::query(
-            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (5, 'forged', ?, ?)",
+            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (6, 'forged', ?, ?)",
         )
         .bind("0".repeat(64))
         .bind(Uuid::new_v4().hyphenated().to_string())
@@ -4488,6 +5628,453 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_source_snapshot_and_context_checkpoint_preserve_exact_provenance() -> Result<()>
+    {
+        let store = MemoryStore::temporary().await?;
+        let actor = "project/example/ifs/identity/actor";
+        store
+            .append_message(actor, &Message::text("user", "legacy unattributed"))
+            .await?;
+        store
+            .append_session_message(actor, "session-a", &Message::text("user", "a-one"))
+            .await?;
+        store
+            .append_session_message(actor, "session-b", &Message::text("user", "b-one"))
+            .await?;
+        store
+            .append_session_message(actor, "session-a", &Message::text("assistant", "a-two"))
+            .await?;
+
+        let session_window = store.session_history_window(actor, "session-a", 16).await?;
+        assert_eq!(session_window.total_rows, 2);
+        assert_eq!(
+            session_window
+                .messages
+                .iter()
+                .map(Message::plain_text)
+                .collect::<Vec<_>>(),
+            [Some("a-one"), Some("a-two")]
+        );
+        let newest = store.session_history_window(actor, "session-a", 1).await?;
+        assert_eq!(newest.total_rows, 2);
+        assert_eq!(newest.messages[0].plain_text(), Some("a-two"));
+        let count_only = store.session_history_window(actor, "session-a", 0).await?;
+        assert_eq!(count_only.total_rows, 2);
+        assert!(count_only.messages.is_empty());
+        assert_eq!(
+            store
+                .session_history_window(actor, "session-b", 16)
+                .await?
+                .messages[0]
+                .plain_text(),
+            Some("b-one")
+        );
+        assert!(
+            store
+                .session_history_window(actor, "session-a", MAX_SESSION_SOURCE_ROWS + 1)
+                .await
+                .is_err()
+        );
+
+        assert!(
+            store
+                .session_source_snapshot(actor, "session-a", actor, 0, 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .session_source_snapshot(actor, "session-a", actor, 0, MAX_SESSION_SOURCE_ROWS + 1,)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .session_source_snapshot(actor, " ", actor, 0, 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .session_source_snapshot(actor, "session-a", actor, -1, 1)
+                .await
+                .is_err()
+        );
+
+        let snapshot = store
+            .session_source_snapshot(actor, "session-a", actor, 0, 16)
+            .await?;
+        assert_eq!(snapshot.view, "main");
+        assert_eq!(snapshot.rows.len(), 2);
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .map(|row| row.message.plain_text())
+                .collect::<Vec<_>>(),
+            [Some("a-one"), Some("a-two")]
+        );
+        assert!(
+            snapshot
+                .rows
+                .windows(2)
+                .all(|rows| rows[0].sequence < rows[1].sequence)
+        );
+        let through = snapshot
+            .through_inclusive
+            .context("missing source boundary")?;
+        let legacy_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE namespace = ? AND session_id IS NULL",
+        )
+        .bind(actor.as_bytes())
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(legacy_rows, 1);
+
+        let candidate = store.begin_candidate("session snapshot candidate").await?;
+        candidate
+            .view()
+            .append_session_message(
+                actor,
+                "session-a",
+                &Message::text("assistant", "candidate-only"),
+            )
+            .await?;
+        let candidate_snapshot = candidate
+            .view()
+            .session_source_snapshot(actor, "session-a", actor, through, 16)
+            .await?;
+        assert_ne!(candidate_snapshot.view, snapshot.view);
+        assert_ne!(candidate_snapshot.revision, snapshot.revision);
+        assert_eq!(candidate_snapshot.rows.len(), 1);
+        assert_eq!(
+            candidate
+                .view()
+                .session_history_window(actor, "session-a", 16)
+                .await?
+                .messages
+                .iter()
+                .map(Message::plain_text)
+                .collect::<Vec<_>>(),
+            [Some("a-one"), Some("a-two"), Some("candidate-only")]
+        );
+        assert_eq!(
+            store
+                .session_history_window(actor, "session-a", 16)
+                .await?
+                .messages
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .session_source_snapshot(actor, "session-a", actor, through, 16)
+                .await?
+                .rows
+                .is_empty()
+        );
+
+        let mut record = ContextSummaryRecord {
+            actor_namespace: actor.into(),
+            session_id: "session-a".into(),
+            source_namespace: actor.into(),
+            summary_namespace: format!("{actor}/session/session-a/summaries"),
+            source_view: snapshot.view.clone(),
+            source_revision: snapshot.revision.clone(),
+            after_sequence: snapshot.after_exclusive,
+            through_sequence: through,
+            turn_id: "turn-a".into(),
+            invocation_id: "invocation-a".into(),
+            summary: "a bounded summary".into(),
+        };
+        store.put("unrelated/revision-race", &json!(true)).await?;
+        let revision_stale = store
+            .checkpoint_context_summary(&record)
+            .await
+            .expect_err("an advanced source revision accepted the old snapshot");
+        assert!(
+            revision_stale
+                .downcast_ref::<ContextSummaryStale>()
+                .is_some()
+        );
+        assert!(
+            store
+                .context_summary_cursor(actor, "session-a", actor)
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM context_summaries")
+                .fetch_one(store.pool.as_ref())
+                .await?,
+            0
+        );
+        record.source_revision = store
+            .session_source_snapshot(actor, "session-a", actor, 0, 16)
+            .await?
+            .revision;
+        store.checkpoint_context_summary(&record).await?;
+        let cursor = store
+            .context_summary_cursor(actor, "session-a", actor)
+            .await?
+            .context("missing context summary cursor")?;
+        assert_eq!(cursor.through_sequence, through);
+        assert_eq!(cursor.source_view, "main");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM context_summaries")
+                .fetch_one(store.pool.as_ref())
+                .await?,
+            1
+        );
+        let format: String =
+            sqlx::query_scalar("SELECT record_format FROM context_summaries LIMIT 1")
+                .fetch_one(store.pool.as_ref())
+                .await?;
+        assert_eq!(format, CONTEXT_SUMMARY_FORMAT);
+
+        store
+            .append_session_message(
+                actor,
+                "session-a",
+                &Message::text("assistant", "after summary"),
+            )
+            .await?;
+        let later = store
+            .session_source_snapshot(actor, "session-a", actor, through, 16)
+            .await?;
+        let cursor_stale_record = ContextSummaryRecord {
+            source_revision: later.revision.clone(),
+            after_sequence: 0,
+            through_sequence: later
+                .through_inclusive
+                .context("missing later source boundary")?,
+            turn_id: "turn-b".into(),
+            invocation_id: "invocation-b".into(),
+            summary: "must not publish across a stale cursor".into(),
+            ..record.clone()
+        };
+        let stale = store
+            .checkpoint_context_summary(&cursor_stale_record)
+            .await
+            .expect_err("a competing cursor accepted an old source boundary");
+        assert!(stale.downcast_ref::<ContextSummaryStale>().is_some());
+        assert_eq!(
+            store
+                .context_summary_cursor(actor, "session-a", actor)
+                .await?
+                .context("missing retained cursor")?
+                .through_sequence,
+            through
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM context_summaries")
+                .fetch_one(store.pool.as_ref())
+                .await?,
+            1
+        );
+
+        let current_record = ContextSummaryRecord {
+            source_revision: later.revision,
+            after_sequence: through,
+            through_sequence: later
+                .through_inclusive
+                .context("missing current source boundary")?,
+            turn_id: "turn-c".into(),
+            invocation_id: "invocation-c".into(),
+            summary: "current rolling summary".into(),
+            ..record.clone()
+        };
+        store.checkpoint_context_summary(&current_record).await?;
+        let current_cursor = store
+            .context_summary_cursor(actor, "session-a", actor)
+            .await?
+            .context("missing advanced context cursor")?;
+        let current = store
+            .context_summary_window(
+                actor,
+                &current_record.summary_namespace,
+                Some("session-a"),
+                Some(actor),
+                16,
+            )
+            .await?;
+        assert_eq!(current.view, "main");
+        assert_eq!(current.total_rows, 1);
+        assert_eq!(current.records.len(), 1);
+        assert_eq!(current.records[0].summary_id, current_cursor.summary_id);
+        assert_eq!(current.records[0].record, current_record);
+        assert!(
+            candidate
+                .view()
+                .context_summary_window(
+                    actor,
+                    &record.summary_namespace,
+                    Some("session-a"),
+                    Some(actor),
+                    16,
+                )
+                .await?
+                .records
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .context_summary_window(actor, &record.summary_namespace, None, None, 16)
+                .await?
+                .records,
+            current.records
+        );
+        let count_only = store
+            .context_summary_window(
+                actor,
+                &record.summary_namespace,
+                Some("session-a"),
+                Some(actor),
+                0,
+            )
+            .await?;
+        assert_eq!(count_only.total_rows, 1);
+        assert!(count_only.records.is_empty());
+        assert_eq!(
+            store
+                .context_summary_window(
+                    actor,
+                    &record.summary_namespace,
+                    Some("session-b"),
+                    Some(actor),
+                    16,
+                )
+                .await?
+                .total_rows,
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM context_summaries")
+                .fetch_one(store.pool.as_ref())
+                .await?,
+            2
+        );
+
+        let export = store.begin_active_export().await?;
+        assert_eq!(export.provenance().message_count, 5);
+        assert_eq!(export.provenance().context_summary_count, 2);
+        assert_eq!(export.provenance().context_cursor_count, 1);
+        let mut export_cursor = None;
+        let mut exported = Vec::new();
+        loop {
+            let page = export.page(export_cursor).await?;
+            exported.extend(page.records);
+            export_cursor = page.next;
+            if export_cursor.is_none() {
+                break;
+            }
+        }
+        export.verify_counts(5, 1, 2, 1)?;
+        assert!(exported.iter().any(|row| matches!(
+            row,
+            StorageRecord::Message { session_id: None, content, .. }
+                if content.contains("legacy unattributed")
+        )));
+        assert_eq!(
+            exported
+                .iter()
+                .filter(|row| matches!(
+                    row,
+                    StorageRecord::Message { session_id: Some(session), .. }
+                        if session == "session-a"
+                ))
+                .count(),
+            3
+        );
+        assert!(exported.iter().any(|row| matches!(
+            row,
+            StorageRecord::ContextSummary { record: exported_record, record_format, .. }
+                if exported_record == &record && record_format == CONTEXT_SUMMARY_FORMAT
+        )));
+        assert!(exported.iter().any(|row| matches!(
+            row,
+            StorageRecord::ContextSummary { record: exported_record, record_format, .. }
+                if exported_record == &current_record && record_format == CONTEXT_SUMMARY_FORMAT
+        )));
+        assert!(exported.iter().any(|row| matches!(
+            row,
+            StorageRecord::ContextCursor { cursor: exported_cursor }
+                if exported_cursor == &current_cursor
+        )));
+
+        let bounded_actor = "project/example/ifs/identity/bounded";
+        let bounded_session = "session-bounded";
+        let bounded_messages = (0..=MAX_SESSION_SOURCE_ROWS)
+            .map(|index| Message::text("user", format!("bounded-{index}")))
+            .collect::<Vec<_>>();
+        store
+            .checkpoint_session(bounded_actor, bounded_session, &bounded_messages, &[])
+            .await?;
+        let bounded_page = store
+            .session_source_snapshot(
+                bounded_actor,
+                bounded_session,
+                bounded_actor,
+                0,
+                MAX_SESSION_SOURCE_ROWS,
+            )
+            .await?;
+        assert_eq!(bounded_page.rows.len(), MAX_SESSION_SOURCE_ROWS);
+        let retained_through = bounded_page
+            .through_inclusive
+            .context("bounded page omitted its retained boundary")?;
+        let actual_through: i64 = sqlx::query_scalar(
+            "SELECT MAX(sequence) FROM messages WHERE namespace = ? AND session_id = ?",
+        )
+        .bind(bounded_actor.as_bytes())
+        .bind(bounded_session.as_bytes())
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert!(actual_through > retained_through);
+        let over_bound = ContextSummaryRecord {
+            actor_namespace: bounded_actor.into(),
+            session_id: bounded_session.into(),
+            source_namespace: bounded_actor.into(),
+            summary_namespace: format!("{bounded_actor}/session/{bounded_session}/summaries"),
+            source_view: bounded_page.view,
+            source_revision: bounded_page.revision,
+            after_sequence: 0,
+            through_sequence: actual_through,
+            turn_id: "turn-bounded".into(),
+            invocation_id: "invocation-bounded".into(),
+            summary: "must not skip an oversized source range".into(),
+        };
+        let over_bound_error = store
+            .checkpoint_context_summary(&over_bound)
+            .await
+            .expect_err("an oversized source range advanced its cursor");
+        assert!(
+            over_bound_error
+                .downcast_ref::<ContextSummaryStale>()
+                .is_some()
+        );
+        assert!(
+            store
+                .context_summary_cursor(bounded_actor, bounded_session, bounded_actor)
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM context_summaries WHERE actor_namespace = ?",
+            )
+            .bind(bounded_actor.as_bytes())
+            .fetch_one(store.pool.as_ref())
+            .await?,
+            0
+        );
+
+        candidate.abandon().await?;
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn failed_database_batch_rolls_back_and_committed_receipt_reconciles() {
         let store = MemoryStore::temporary().await.unwrap();
         store.put("one", &json!(1)).await.unwrap();
@@ -4499,6 +6086,7 @@ mod tests {
             "receipt",
             Mutation::Checkpoint {
                 namespace: "turn".into(),
+                session_id: None,
                 messages: vec![(
                     "assistant".into(),
                     encode_typed_message(&Message::text("assistant", "answer")).unwrap(),
@@ -4519,6 +6107,7 @@ mod tests {
                 &"x".repeat(129),
                 Mutation::Checkpoint {
                     namespace: "turn".into(),
+                    session_id: None,
                     messages: vec![(
                         "assistant".into(),
                         encode_typed_message(&Message::text("assistant", "duplicate")).unwrap(),

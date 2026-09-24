@@ -47,6 +47,7 @@ pub struct ServiceRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServiceCall {
     RetireIfIdle,
+    TryAcquireDreamLease,
     AppendMessage {
         namespace: String,
         message: Message,
@@ -61,6 +62,9 @@ pub enum ServiceCall {
     },
     PutMany {
         values: Vec<(String, Value)>,
+    },
+    PutReasoningSummaries {
+        records: Vec<crate::ReasoningSummaryRecord>,
     },
     Get {
         key: String,
@@ -148,6 +152,7 @@ impl ServiceCall {
             Self::RetireIfIdle
             | Self::AppendMessage { .. }
             | Self::PutMany { .. }
+            | Self::PutReasoningSummaries { .. }
             | Self::BeginCandidate { .. }
             | Self::PromoteCandidate { .. }
             | Self::AbandonCandidate { .. } => true,
@@ -156,13 +161,17 @@ impl ServiceCall {
                 operation,
                 ViewOperation::Append { .. }
                     | ViewOperation::AppendMessage { .. }
+                    | ViewOperation::AppendSessionMessage { .. }
                     | ViewOperation::Checkpoint { .. }
+                    | ViewOperation::CheckpointSession { .. }
+                    | ViewOperation::CheckpointContextSummary { .. }
                     | ViewOperation::ForgetNote { .. }
                     | ViewOperation::PutMany { .. }
                     | ViewOperation::Clear { .. }
             ),
             Self::Ledger { operation } => !matches!(&**operation, LedgerOperation::Session { .. }),
             Self::HistoryWindow { .. }
+            | Self::TryAcquireDreamLease
             | Self::Notes { .. }
             | Self::Get { .. }
             | Self::Reconcile
@@ -185,10 +194,16 @@ impl ServiceCall {
         match self {
             Self::AppendMessage { .. } => Some("append_message"),
             Self::PutMany { .. } => Some("put_many"),
+            Self::PutReasoningSummaries { .. } => Some("put_reasoning_summaries"),
             Self::View { operation, .. } => match operation {
                 ViewOperation::Append { .. } => Some("view.append"),
                 ViewOperation::AppendMessage { .. } => Some("view.append_message"),
+                ViewOperation::AppendSessionMessage { .. } => Some("view.append_session_message"),
                 ViewOperation::Checkpoint { .. } => Some("view.checkpoint"),
+                ViewOperation::CheckpointSession { .. } => Some("view.checkpoint_session"),
+                ViewOperation::CheckpointContextSummary { .. } => {
+                    Some("view.checkpoint_context_summary")
+                }
                 ViewOperation::ForgetNote { .. } => Some("view.forget_note"),
                 ViewOperation::PutMany { .. } => Some("view.put_many"),
                 ViewOperation::Clear { .. } => Some("view.clear"),
@@ -241,8 +256,19 @@ pub enum ViewOperation {
         namespace: String,
         message: Message,
     },
+    AppendSessionMessage {
+        namespace: String,
+        session_id: String,
+        message: Message,
+    },
     Checkpoint {
         namespace: String,
+        messages: Vec<Message>,
+        values: Vec<(String, Value)>,
+    },
+    CheckpointSession {
+        namespace: String,
+        session_id: String,
         messages: Vec<Message>,
         values: Vec<(String, Value)>,
     },
@@ -252,6 +278,33 @@ pub enum ViewOperation {
     },
     HistoryWindow {
         namespace: String,
+        limit: usize,
+    },
+    SessionHistoryWindow {
+        namespace: String,
+        session_id: String,
+        limit: usize,
+    },
+    SessionSourceSnapshot {
+        actor_namespace: String,
+        session_id: String,
+        source_namespace: String,
+        after_exclusive: i64,
+        limit: usize,
+    },
+    CheckpointContextSummary {
+        record: crate::ContextSummaryRecord,
+    },
+    ContextSummaryCursor {
+        actor_namespace: String,
+        session_id: String,
+        source_namespace: String,
+    },
+    ContextSummaryWindow {
+        actor_namespace: String,
+        summary_namespace: String,
+        session_id: Option<String>,
+        source_namespace: Option<String>,
         limit: usize,
     },
     Notes {
@@ -358,11 +411,17 @@ pub enum ServiceResponse {
 )]
 pub enum ServiceValue {
     Unit,
+    DreamLease {
+        acquired: bool,
+    },
     Retirement {
         accepted: bool,
     },
     Messages(Vec<Message>),
     HistoryWindow(HistoryWindow),
+    SessionSourceSnapshot(crate::SessionSourceSnapshot),
+    ContextSummaryCursor(Option<crate::ContextSummaryCursor>),
+    ContextSummaryWindow(crate::ContextSummaryWindow),
     Notes(Vec<StoredNote>),
     StoredValue(Option<Value>),
     Reconciled(Option<bool>),
@@ -439,6 +498,8 @@ pub enum ServiceFault {
     GenerationChanged,
     StorageFailed,
     CandidateConflict,
+    ContextSummaryStale,
+    ReasoningSummaryConflict,
     ReceiptConflict,
     CandidateRefRejected(CandidateRefRefusal),
 }
@@ -447,6 +508,7 @@ pub enum ServiceFault {
 struct AttachmentState {
     candidates: HashMap<Uuid, Candidate>,
     exports: HashMap<Uuid, ActiveExportSnapshot>,
+    dream_lease: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 const COMPLETED_RECEIPT_WINDOW: usize = 4096;
@@ -873,6 +935,16 @@ async fn respond<S: AsyncWrite + Unpin>(
                 {
                     ServiceFault::CandidateConflict
                 } else if error
+                    .downcast_ref::<crate::store::ContextSummaryStale>()
+                    .is_some()
+                {
+                    ServiceFault::ContextSummaryStale
+                } else if error
+                    .downcast_ref::<crate::store::ReasoningSummaryConflict>()
+                    .is_some()
+                {
+                    ServiceFault::ReasoningSummaryConflict
+                } else if error
                     .downcast_ref::<crate::store::LogicalReceiptConflict>()
                     .is_some()
                 {
@@ -887,6 +959,8 @@ async fn respond<S: AsyncWrite + Unpin>(
                     let kind = match fault {
                         ServiceFault::CandidateRefRejected(_) => "ref_rejected",
                         ServiceFault::CandidateConflict => "candidate_conflict",
+                        ServiceFault::ContextSummaryStale => "context_summary_stale",
+                        ServiceFault::ReasoningSummaryConflict => "reasoning_summary_conflict",
                         ServiceFault::ReceiptConflict => "receipt_conflict",
                         ServiceFault::StorageFailed => "storage_failed",
                         ServiceFault::GenerationChanged => "generation_changed",
@@ -1310,6 +1384,12 @@ pub(super) fn resolve_response(response: ServiceResponse) -> Result<ServiceValue
         ServiceResponse::Rejected(ServiceFault::CandidateConflict) => {
             Err(crate::store::CandidateConflict.into())
         }
+        ServiceResponse::Rejected(ServiceFault::ContextSummaryStale) => {
+            Err(crate::store::ContextSummaryStale.into())
+        }
+        ServiceResponse::Rejected(ServiceFault::ReasoningSummaryConflict) => {
+            Err(crate::store::ReasoningSummaryConflict.into())
+        }
         ServiceResponse::Rejected(ServiceFault::ReceiptConflict) => {
             bail!("logical mutation ID conflicts with a different operation on this memory view")
         }
@@ -1344,8 +1424,21 @@ async fn dispatch(
         ServiceCall::RetireIfIdle => ServiceValue::Retirement {
             accepted: state.candidates.is_empty()
                 && state.exports.is_empty()
+                && state.dream_lease.is_none()
                 && retirement.is_some_and(Retirement::request_if_idle),
         },
+        ServiceCall::TryAcquireDreamLease => {
+            if state.dream_lease.is_none() {
+                ensure!(
+                    state.candidates.is_empty() && state.exports.is_empty(),
+                    "dream lease acquisition requires a dedicated main-view attachment"
+                );
+                state.dream_lease = store.try_acquire_dream_lease();
+            }
+            ServiceValue::DreamLease {
+                acquired: state.dream_lease.is_some(),
+            }
+        }
         ServiceCall::AppendMessage { namespace, message } => {
             let (method, encoded) = unit_receipt.as_ref().context("missing append receipt")?;
             store
@@ -1365,6 +1458,16 @@ async fn dispatch(
             store
                 .with_logical_receipt(request_id, method, encoded)
                 .put_many(&values)
+                .await?;
+            ServiceValue::Unit
+        }
+        ServiceCall::PutReasoningSummaries { records } => {
+            let (method, encoded) = unit_receipt
+                .as_ref()
+                .context("missing private reasoning summary receipt")?;
+            store
+                .with_logical_receipt(request_id, method, encoded)
+                .put_reasoning_summaries(&records)
                 .await?;
             ServiceValue::Unit
         }
@@ -1514,6 +1617,16 @@ async fn dispatch_view(store: &MemoryStore, operation: ViewOperation) -> Result<
             store.append_message(&namespace, &message).await?;
             ServiceValue::Unit
         }
+        ViewOperation::AppendSessionMessage {
+            namespace,
+            session_id,
+            message,
+        } => {
+            store
+                .append_session_message(&namespace, &session_id, &message)
+                .await?;
+            ServiceValue::Unit
+        }
         ViewOperation::Checkpoint {
             namespace,
             messages,
@@ -1522,12 +1635,79 @@ async fn dispatch_view(store: &MemoryStore, operation: ViewOperation) -> Result<
             store.checkpoint(&namespace, &messages, &values).await?;
             ServiceValue::Unit
         }
+        ViewOperation::CheckpointSession {
+            namespace,
+            session_id,
+            messages,
+            values,
+        } => {
+            store
+                .checkpoint_session(&namespace, &session_id, &messages, &values)
+                .await?;
+            ServiceValue::Unit
+        }
         ViewOperation::History { namespace, limit } => {
             ServiceValue::Messages(store.history(&namespace, limit).await?)
         }
         ViewOperation::HistoryWindow { namespace, limit } => {
             ServiceValue::HistoryWindow(store.history_window(&namespace, limit).await?)
         }
+        ViewOperation::SessionHistoryWindow {
+            namespace,
+            session_id,
+            limit,
+        } => ServiceValue::HistoryWindow(
+            store
+                .session_history_window(&namespace, &session_id, limit)
+                .await?,
+        ),
+        ViewOperation::SessionSourceSnapshot {
+            actor_namespace,
+            session_id,
+            source_namespace,
+            after_exclusive,
+            limit,
+        } => ServiceValue::SessionSourceSnapshot(
+            store
+                .session_source_snapshot(
+                    &actor_namespace,
+                    &session_id,
+                    &source_namespace,
+                    after_exclusive,
+                    limit,
+                )
+                .await?,
+        ),
+        ViewOperation::CheckpointContextSummary { record } => {
+            store.checkpoint_context_summary(&record).await?;
+            ServiceValue::Unit
+        }
+        ViewOperation::ContextSummaryCursor {
+            actor_namespace,
+            session_id,
+            source_namespace,
+        } => ServiceValue::ContextSummaryCursor(
+            store
+                .context_summary_cursor(&actor_namespace, &session_id, &source_namespace)
+                .await?,
+        ),
+        ViewOperation::ContextSummaryWindow {
+            actor_namespace,
+            summary_namespace,
+            session_id,
+            source_namespace,
+            limit,
+        } => ServiceValue::ContextSummaryWindow(
+            store
+                .context_summary_window(
+                    &actor_namespace,
+                    &summary_namespace,
+                    session_id.as_deref(),
+                    source_namespace.as_deref(),
+                    limit,
+                )
+                .await?,
+        ),
         ViewOperation::Notes { namespace, limit } => {
             ServiceValue::Notes(store.notes(&namespace, limit).await?)
         }
@@ -1599,7 +1779,42 @@ async fn dispatch_ledger(store: &MemoryStore, operation: LedgerOperation) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReasoningSummaryRecord;
     use tokio::io::{AsyncWriteExt, duplex};
+
+    #[test]
+    fn worst_escaped_reasoning_summary_request_fits_the_rpc_frame() -> Result<()> {
+        let count = 1024usize;
+        let identity_bytes_per_record = 4usize;
+        let text_bytes = crate::store::MAX_REASONING_SUMMARY_BATCH_STRING_BYTES
+            .checked_sub(identity_bytes_per_record * count)
+            .context("summary identity bytes exceed the aggregate limit")?;
+        let per_record = text_bytes / count;
+        let remainder = text_bytes % count;
+        let records = (0..count)
+            .map(|index| ReasoningSummaryRecord {
+                session_id: "s".into(),
+                turn_id: "t".into(),
+                actor_id: "a".into(),
+                invocation_id: "i".into(),
+                item_id: None,
+                output_index: None,
+                summary_index: u64::try_from(index).expect("summary index fits u64"),
+                text: "\u{0001}".repeat(per_record + usize::from(index < remainder)),
+            })
+            .collect::<Vec<_>>();
+        crate::store::validate_reasoning_summaries(&records)?;
+        let request = ServiceRequest::with_id(
+            "generation",
+            Uuid::nil(),
+            ServiceCall::PutReasoningSummaries { records },
+        );
+        ensure!(
+            serde_json::to_vec(&request)?.len() <= OPERATION_FRAME_LIMIT,
+            "worst escaped private reasoning summary request exceeds the RPC frame"
+        );
+        Ok(())
+    }
 
     #[test]
     fn selected_candidate_resolution_temporarily_excludes_new_attachments() -> Result<()> {

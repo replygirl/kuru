@@ -396,8 +396,9 @@ async fn fit_retries_same_invocation_with_whole_optional_rows_and_exact_current_
     let namespace = harness.namespace(&actor);
     for index in 0..5 {
         memory
-            .append_message(
+            .append_session_message(
                 &namespace,
+                &harness.session.id,
                 &Message::text("user", format!("old-{index}-🪶")),
             )
             .await
@@ -640,7 +641,11 @@ async fn demo_effective_prompt_retries_whole_multilingual_rows_under_one_admissi
         .collect::<Vec<_>>();
     for row in &older_private {
         memory
-            .append_message(&private_key, &Message::text("user", row))
+            .append_session_message(
+                &private_key,
+                &harness.session.id,
+                &Message::text("user", row),
+            )
             .await
             .unwrap();
     }

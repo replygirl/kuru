@@ -683,7 +683,9 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
     let page = snapshot.page(None).await.unwrap();
     assert!(page.records.iter().all(|record| match record {
         StorageRecord::Message { content, .. } => !content.contains("Memory is ready at"),
-        StorageRecord::State { .. } => true,
+        StorageRecord::State { .. }
+        | StorageRecord::ContextSummary { .. }
+        | StorageRecord::ContextCursor { .. } => true,
     }));
     reopened.close().await.unwrap();
     drop(project);

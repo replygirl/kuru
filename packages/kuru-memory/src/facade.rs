@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -35,11 +36,28 @@ pub type MemoryView = MemoryStore;
 // Leave room under the owner's 32-attachment ceiling for other local clients,
 // candidates and exports while allowing concurrent reads within one runtime.
 const MAX_PARALLEL_CLIENT_CONNECTIONS: usize = 16;
+const DREAM_LEASE_WAIT: Duration = Duration::from_secs(660);
+const DREAM_LEASE_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 enum Backend {
     Local(store::MemoryStore),
     Remote(RemoteView),
+}
+
+/// Exclusive project dream ownership. This guard holds no SQL transaction,
+/// pool connection or ordinary mutation lock while provider work runs.
+pub struct DreamLease {
+    _backend: DreamLeaseBackend,
+}
+
+enum DreamLeaseBackend {
+    Local {
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+    },
+    Remote {
+        _view: RemoteView,
+    },
 }
 
 #[derive(Clone)]
@@ -1228,6 +1246,34 @@ impl MemoryStore {
         }
     }
 
+    pub async fn append_session_message(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        message: &Message,
+    ) -> Result<()> {
+        store::validate_session_message(namespace, session_id, message)?;
+        match &self.backend {
+            Backend::Local(store) => {
+                store
+                    .append_session_message(namespace, session_id, message)
+                    .await
+            }
+            Backend::Remote(remote) => {
+                remote.ensure_writable()?;
+                unit(
+                    remote
+                        .call(ViewOperation::AppendSessionMessage {
+                            namespace: namespace.into(),
+                            session_id: session_id.into(),
+                            message: message.clone(),
+                        })
+                        .await?,
+                )
+            }
+        }
+    }
+
     pub async fn checkpoint(
         &self,
         namespace: &str,
@@ -1242,6 +1288,36 @@ impl MemoryStore {
                     remote
                         .call(ViewOperation::Checkpoint {
                             namespace: namespace.into(),
+                            messages: messages.to_vec(),
+                            values: values.to_vec(),
+                        })
+                        .await?,
+                )
+            }
+        }
+    }
+
+    pub async fn checkpoint_session(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        messages: &[Message],
+        values: &[(String, Value)],
+    ) -> Result<()> {
+        store::validate_session_checkpoint(namespace, session_id, messages, values)?;
+        match &self.backend {
+            Backend::Local(store) => {
+                store
+                    .checkpoint_session(namespace, session_id, messages, values)
+                    .await
+            }
+            Backend::Remote(remote) => {
+                remote.ensure_writable()?;
+                unit(
+                    remote
+                        .call(ViewOperation::CheckpointSession {
+                            namespace: namespace.into(),
+                            session_id: session_id.into(),
                             messages: messages.to_vec(),
                             values: values.to_vec(),
                         })
@@ -1279,6 +1355,205 @@ impl MemoryStore {
             {
                 ServiceValue::HistoryWindow(window) => Ok(window),
                 _ => bail!("memory service returned the wrong history-window response"),
+            },
+        }
+    }
+
+    pub async fn session_history_window(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<HistoryWindow> {
+        store::validate_session_history_request(namespace, session_id, limit)?;
+        match &self.backend {
+            Backend::Local(store) => {
+                store
+                    .session_history_window(namespace, session_id, limit)
+                    .await
+            }
+            Backend::Remote(remote) => match remote
+                .call(ViewOperation::SessionHistoryWindow {
+                    namespace: namespace.into(),
+                    session_id: session_id.into(),
+                    limit,
+                })
+                .await?
+            {
+                ServiceValue::HistoryWindow(window) => Ok(window),
+                _ => bail!("memory service returned the wrong session-history response"),
+            },
+        }
+    }
+
+    pub async fn acquire_dream_lease(&self) -> Result<DreamLease> {
+        match &self.backend {
+            Backend::Local(store) => {
+                let guard = tokio::time::timeout(DREAM_LEASE_WAIT, store.acquire_dream_lease())
+                    .await
+                    .context("dream lease acquisition deadline exceeded")?;
+                Ok(DreamLease {
+                    _backend: DreamLeaseBackend::Local { _guard: guard },
+                })
+            }
+            Backend::Remote(remote) => {
+                remote.ensure_writable()?;
+                tokio::time::timeout(DREAM_LEASE_WAIT, async {
+                    let dedicated = remote.fork().await?;
+                    loop {
+                        match dedicated
+                            .call_raw(ServiceCall::TryAcquireDreamLease)
+                            .await?
+                        {
+                            ServiceValue::DreamLease { acquired: true } => {
+                                return Ok(DreamLease {
+                                    _backend: DreamLeaseBackend::Remote { _view: dedicated },
+                                });
+                            }
+                            ServiceValue::DreamLease { acquired: false } => {
+                                tokio::time::sleep(DREAM_LEASE_POLL).await;
+                            }
+                            _ => bail!("memory service returned the wrong dream-lease response"),
+                        }
+                    }
+                })
+                .await
+                .context("dream lease acquisition deadline exceeded")?
+            }
+        }
+    }
+
+    pub async fn session_source_snapshot(
+        &self,
+        actor_namespace: &str,
+        session_id: &str,
+        source_namespace: &str,
+        after_exclusive: i64,
+        limit: usize,
+    ) -> Result<store::SessionSourceSnapshot> {
+        store::validate_session_source_request(
+            actor_namespace,
+            session_id,
+            source_namespace,
+            after_exclusive,
+            limit,
+        )?;
+        match &self.backend {
+            Backend::Local(store) => {
+                store
+                    .session_source_snapshot(
+                        actor_namespace,
+                        session_id,
+                        source_namespace,
+                        after_exclusive,
+                        limit,
+                    )
+                    .await
+            }
+            Backend::Remote(remote) => match remote
+                .call(ViewOperation::SessionSourceSnapshot {
+                    actor_namespace: actor_namespace.into(),
+                    session_id: session_id.into(),
+                    source_namespace: source_namespace.into(),
+                    after_exclusive,
+                    limit,
+                })
+                .await?
+            {
+                ServiceValue::SessionSourceSnapshot(snapshot) => Ok(snapshot),
+                _ => bail!("memory service returned the wrong session snapshot response"),
+            },
+        }
+    }
+
+    pub async fn checkpoint_context_summary(
+        &self,
+        record: &store::ContextSummaryRecord,
+    ) -> Result<()> {
+        store::validate_context_summary(record)?;
+        match &self.backend {
+            Backend::Local(store) => store.checkpoint_context_summary(record).await,
+            Backend::Remote(remote) => {
+                remote.ensure_writable()?;
+                unit(
+                    remote
+                        .call(ViewOperation::CheckpointContextSummary {
+                            record: record.clone(),
+                        })
+                        .await?,
+                )
+            }
+        }
+    }
+
+    pub async fn context_summary_cursor(
+        &self,
+        actor_namespace: &str,
+        session_id: &str,
+        source_namespace: &str,
+    ) -> Result<Option<store::ContextSummaryCursor>> {
+        store::identifier("actor namespace", actor_namespace, 1024)?;
+        store::identifier("session identity", session_id, 128)?;
+        store::identifier("source namespace", source_namespace, 1024)?;
+        match &self.backend {
+            Backend::Local(store) => {
+                store
+                    .context_summary_cursor(actor_namespace, session_id, source_namespace)
+                    .await
+            }
+            Backend::Remote(remote) => match remote
+                .call(ViewOperation::ContextSummaryCursor {
+                    actor_namespace: actor_namespace.into(),
+                    session_id: session_id.into(),
+                    source_namespace: source_namespace.into(),
+                })
+                .await?
+            {
+                ServiceValue::ContextSummaryCursor(cursor) => Ok(cursor),
+                _ => bail!("memory service returned the wrong context cursor response"),
+            },
+        }
+    }
+
+    pub async fn context_summary_window(
+        &self,
+        actor_namespace: &str,
+        summary_namespace: &str,
+        session_id: Option<&str>,
+        source_namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<store::ContextSummaryWindow> {
+        store::validate_context_summary_window_request(
+            actor_namespace,
+            summary_namespace,
+            session_id,
+            source_namespace,
+            limit,
+        )?;
+        match &self.backend {
+            Backend::Local(store) => {
+                store
+                    .context_summary_window(
+                        actor_namespace,
+                        summary_namespace,
+                        session_id,
+                        source_namespace,
+                        limit,
+                    )
+                    .await
+            }
+            Backend::Remote(remote) => match remote
+                .call(ViewOperation::ContextSummaryWindow {
+                    actor_namespace: actor_namespace.into(),
+                    summary_namespace: summary_namespace.into(),
+                    session_id: session_id.map(str::to_owned),
+                    source_namespace: source_namespace.map(str::to_owned),
+                    limit,
+                })
+                .await?
+            {
+                ServiceValue::ContextSummaryWindow(window) => Ok(window),
+                _ => bail!("memory service returned the wrong context-summary response"),
             },
         }
     }
@@ -1329,6 +1604,30 @@ impl MemoryStore {
                     remote
                         .call(ViewOperation::PutMany {
                             values: values.to_vec(),
+                        })
+                        .await?,
+                )
+            }
+        }
+    }
+
+    /// Persist one settled provider completion's private reasoning summaries
+    /// in one idempotent mutation. A conflicting settled identity is a typed,
+    /// definite no-effect response; a transport/storage failure remains fenced
+    /// by the ordinary remote-write reconciliation path.
+    pub async fn put_reasoning_summaries(
+        &self,
+        records: &[store::ReasoningSummaryRecord],
+    ) -> Result<()> {
+        store::validate_reasoning_summaries(records)?;
+        match &self.backend {
+            Backend::Local(store) => store.put_reasoning_summaries(records).await,
+            Backend::Remote(remote) => {
+                remote.ensure_writable()?;
+                unit(
+                    remote
+                        .call_raw(ServiceCall::PutReasoningSummaries {
+                            records: records.to_vec(),
                         })
                         .await?,
                 )
@@ -2018,14 +2317,27 @@ impl ActiveExportSnapshot {
         }
     }
 
-    pub fn verify_counts(&self, message_count: u64, state_count: u64) -> Result<()> {
+    pub fn verify_counts(
+        &self,
+        message_count: u64,
+        state_count: u64,
+        context_summary_count: u64,
+        context_cursor_count: u64,
+    ) -> Result<()> {
         match &self.backend {
-            ExportBackend::Local(snapshot) => snapshot.verify_counts(message_count, state_count),
+            ExportBackend::Local(snapshot) => snapshot.verify_counts(
+                message_count,
+                state_count,
+                context_summary_count,
+                context_cursor_count,
+            ),
             ExportBackend::Remote(snapshot) => {
                 snapshot.view.session.ensure_open()?;
                 ensure!(
                     message_count == snapshot.provenance.message_count
-                        && state_count == snapshot.provenance.state_count,
+                        && state_count == snapshot.provenance.state_count
+                        && context_summary_count == snapshot.provenance.context_summary_count
+                        && context_cursor_count == snapshot.provenance.context_cursor_count,
                     "export records do not match captured committed counts"
                 );
                 Ok(())
@@ -2146,6 +2458,361 @@ mod tests {
         })
         .await
         .context("accepted cancelled write fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_reasoning_summary_lost_reply_reconciles_one_atomic_receipt() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let served = tokio::spawn(owner.serve());
+            let executable = std::env::current_exe()?;
+            let open = || {
+                MemoryStore::open_managed_observed(
+                    options.clone(),
+                    project.clone(),
+                    executable.clone(),
+                )
+                .1
+            };
+            let memory = open().await?;
+            let sibling = open().await?;
+            let Backend::Remote(remote) = &memory.backend else {
+                bail!("reasoning summary fixture did not attach to the managed service")
+            };
+            let record = crate::ReasoningSummaryRecord {
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                actor_id: "actor".into(),
+                invocation_id: "invocation".into(),
+                item_id: Some("item".into()),
+                output_index: Some(0),
+                summary_index: 0,
+                text: "settled private summary".into(),
+            };
+            let expected = serde_json::to_value(&record)?;
+            let key = store::reasoning_summary_key(&record)?;
+            let pause = Arc::new(service::rpc::ReplyPause::default());
+            remote
+                .attachment
+                .lock()
+                .await
+                .pause_after_next_send(pause.clone());
+            let writer = tokio::spawn({
+                let memory = memory.clone();
+                let record = record.clone();
+                async move { memory.put_reasoning_summaries(&[record]).await }
+            });
+            let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                .await
+                .context("reasoning summary reply frame was not flushed")?;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if sibling.get(&key).await? == Some(expected.clone()) {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("owner did not durably commit the paused reasoning summary batch")??;
+            writer.abort();
+            let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .context("cancelled reasoning summary write did not end")?;
+            ensure!(
+                stopped.is_err_and(|error| error.is_cancelled()),
+                "paused reasoning summary write completed instead of being cancelled"
+            );
+            ensure!(
+                memory
+                    .put_reasoning_summaries(std::slice::from_ref(&record))
+                    .await
+                    .is_err(),
+                "a cancelled summary receipt failed to fence further mutations"
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match memory.reconcile().await {
+                        Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
+                        Err(error) if error.to_string().contains("remains uncertain") => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        other => {
+                            bail!("paused reasoning summary had unexpected outcome: {other:?}")
+                        }
+                    }
+                }
+            })
+            .await
+            .context("reasoning summary indexed-outcome deadline")??;
+            memory
+                .put_reasoning_summaries(std::slice::from_ref(&record))
+                .await?;
+            let mut conflicting = record.clone();
+            conflicting.text = "conflicting payload".into();
+            let error = memory
+                .put_reasoning_summaries(&[conflicting])
+                .await
+                .unwrap_err();
+            ensure!(
+                error
+                    .downcast_ref::<store::ReasoningSummaryConflict>()
+                    .is_some(),
+                "managed settled-identity conflict was not typed definite rejection: {error:#}"
+            );
+            let mut later = record;
+            later.summary_index = 1;
+            later.text = "later settled private summary".into();
+            memory.put_reasoning_summaries(&[later]).await?;
+            memory.close().await?;
+            sibling.close().await?;
+            let permit = service::acquire_maintenance_permit(&options).await?;
+            tokio::time::timeout(Duration::from_secs(10), served)
+                .await
+                .context("reasoning summary fixture owner did not reap")???;
+            drop(permit);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("remote reasoning summary lost-reply fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_session_checkpoint_lost_reply_preserves_pinned_provenance() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let served = tokio::spawn(owner.serve());
+            let executable = std::env::current_exe()?;
+            let open = || {
+                MemoryStore::open_managed_observed(
+                    options.clone(),
+                    project.clone(),
+                    executable.clone(),
+                )
+                .1
+            };
+            let memory = open().await?;
+            let inspector = open().await?;
+            let actor = "project/example/ifs/identity/actor";
+            memory
+                .append_message(actor, &Message::text("user", "legacy"))
+                .await?;
+            memory
+                .append_session_message(actor, "session-a", &Message::text("user", "source"))
+                .await?;
+            let session_window = memory
+                .session_history_window(actor, "session-a", 16)
+                .await?;
+            ensure!(
+                session_window.total_rows == 1
+                    && session_window.messages[0].plain_text() == Some("source"),
+                "managed session history included legacy or another-session rows"
+            );
+            let snapshot = memory
+                .session_source_snapshot(actor, "session-a", actor, 0, 16)
+                .await?;
+            ensure!(
+                snapshot.rows.len() == 1,
+                "session snapshot leaked another row"
+            );
+            let through = snapshot
+                .through_inclusive
+                .context("session snapshot omitted its inclusive boundary")?;
+            let record = store::ContextSummaryRecord {
+                actor_namespace: actor.into(),
+                session_id: "session-a".into(),
+                source_namespace: actor.into(),
+                summary_namespace: format!("{actor}/session/session-a/summaries"),
+                source_view: snapshot.view,
+                source_revision: snapshot.revision,
+                after_sequence: snapshot.after_exclusive,
+                through_sequence: through,
+                turn_id: "turn-a".into(),
+                invocation_id: "invocation-a".into(),
+                summary: "managed summary".into(),
+            };
+            let Backend::Remote(remote) = &memory.backend else {
+                bail!("session checkpoint fixture did not attach to the service")
+            };
+            let pause = Arc::new(service::rpc::ReplyPause::default());
+            remote
+                .attachment
+                .lock()
+                .await
+                .pause_after_next_send(pause.clone());
+            let writer = tokio::spawn({
+                let memory = memory.clone();
+                let record = record.clone();
+                async move { memory.checkpoint_context_summary(&record).await }
+            });
+            let _writer_cleanup = AbortOnDrop(writer.abort_handle());
+            tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
+                .await
+                .context("context checkpoint frame was not flushed")?;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if inspector
+                        .context_summary_cursor(actor, "session-a", actor)
+                        .await?
+                        .is_some()
+                    {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("owner did not atomically publish the context checkpoint")??;
+            writer.abort();
+            let stopped = tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .context("cancelled context checkpoint did not end")?;
+            ensure!(
+                stopped.is_err_and(|error| error.is_cancelled()),
+                "paused context checkpoint completed instead of being cancelled"
+            );
+            ensure!(
+                memory
+                    .append_session_message(actor, "session-a", &Message::text("user", "blocked"),)
+                    .await
+                    .is_err(),
+                "lost checkpoint reply did not fence its session"
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match memory.reconcile().await {
+                        Ok(Some(true)) => break Ok::<(), anyhow::Error>(()),
+                        Err(error) if error.to_string().contains("remains uncertain") => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        other => bail!("context checkpoint had unexpected outcome: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .context("context checkpoint indexed-outcome deadline")??;
+            let summaries = inspector
+                .context_summary_window(
+                    actor,
+                    &record.summary_namespace,
+                    Some("session-a"),
+                    Some(actor),
+                    16,
+                )
+                .await?;
+            ensure!(
+                summaries.total_rows == 1
+                    && summaries.records.len() == 1
+                    && summaries.records[0].record == record,
+                "managed summary projection did not return the cursor-selected record"
+            );
+            let stale = memory
+                .checkpoint_context_summary(&record)
+                .await
+                .expect_err("moved context cursor accepted a duplicate checkpoint");
+            ensure!(
+                stale.downcast_ref::<store::ContextSummaryStale>().is_some(),
+                "stale context checkpoint was not a typed definite refusal: {stale:#}"
+            );
+            memory
+                .append_session_message(
+                    actor,
+                    "session-a",
+                    &Message::text("assistant", "after proof"),
+                )
+                .await?;
+
+            let candidate = memory.begin_candidate("session candidate").await?;
+            candidate
+                .view()
+                .append_session_message(
+                    actor,
+                    "session-a",
+                    &Message::text("assistant", "candidate only"),
+                )
+                .await?;
+            let candidate_page = candidate
+                .view()
+                .session_source_snapshot(actor, "session-a", actor, through, 16)
+                .await?;
+            ensure!(
+                candidate_page
+                    .rows
+                    .iter()
+                    .any(|row| row.message.plain_text() == Some("candidate only")),
+                "candidate-pinned source snapshot omitted its private row"
+            );
+            ensure!(
+                candidate
+                    .view()
+                    .session_history_window(actor, "session-a", 16)
+                    .await?
+                    .messages
+                    .iter()
+                    .any(|message| message.plain_text() == Some("candidate only")),
+                "candidate-pinned session history omitted its private row"
+            );
+            ensure!(
+                memory
+                    .session_source_snapshot(actor, "session-a", actor, through, 16)
+                    .await?
+                    .rows
+                    .iter()
+                    .all(|row| row.message.plain_text() != Some("candidate only")),
+                "candidate row leaked into the main session snapshot"
+            );
+            ensure!(
+                memory
+                    .session_history_window(actor, "session-a", 16)
+                    .await?
+                    .messages
+                    .iter()
+                    .all(|message| message.plain_text() != Some("candidate only")),
+                "candidate row leaked into main session history"
+            );
+            candidate.abandon().await?;
+            memory.close().await?;
+            inspector.close().await?;
+            let permit = service::acquire_maintenance_permit(&options).await?;
+            tokio::time::timeout(Duration::from_secs(10), served)
+                .await
+                .context("session checkpoint fixture owner did not reap")???;
+            drop(permit);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("remote session checkpoint fixture exceeded 90 seconds")??;
         Ok(())
     }
 
@@ -2999,6 +3666,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_dream_lease_serializes_dreams_without_blocking_ordinary_memory() -> Result<()>
+    {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let root = crate::test_support::tempdir()?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let project = project.canonicalize()?;
+            let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+            let scope = format!(
+                "project/{}",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let options = crate::test_support::open_options(root.path().join("private"), scope)?;
+            let _gate = crate::spawn_gate::spawning().await;
+            let owner = service::ServiceOwner::open(options.clone(), &project).await?;
+            let served = tokio::spawn(owner.serve());
+            let _owner_cleanup = AbortOnDrop(served.abort_handle());
+            let executable = std::env::current_exe()?;
+            let open = || {
+                MemoryStore::open_managed_observed(
+                    options.clone(),
+                    project.clone(),
+                    executable.clone(),
+                )
+                .1
+            };
+            let first = open().await?;
+            let second = open().await?;
+
+            let first_lease = first.acquire_dream_lease().await?;
+            let mut waiting = tokio::spawn({
+                let second = second.clone();
+                async move { second.acquire_dream_lease().await }
+            });
+            let waiting_cleanup = AbortOnDrop(waiting.abort_handle());
+            ensure!(
+                tokio::time::timeout(Duration::from_millis(250), &mut waiting)
+                    .await
+                    .is_err(),
+                "a second managed dream acquired the project lease concurrently"
+            );
+            second
+                .append("private/actor", "user", "ordinary write while dreaming")
+                .await?;
+            ensure!(
+                second.history("private/actor", 10).await?.len() == 1,
+                "the dream lease blocked an ordinary memory write"
+            );
+
+            drop(first_lease);
+            let second_lease = tokio::time::timeout(Duration::from_secs(10), &mut waiting)
+                .await
+                .context("the waiting dream did not acquire after lease release")???;
+            drop(waiting_cleanup);
+
+            let mut cancelled = tokio::spawn({
+                let first = first.clone();
+                async move { first.acquire_dream_lease().await }
+            });
+            ensure!(
+                tokio::time::timeout(Duration::from_millis(250), &mut cancelled)
+                    .await
+                    .is_err(),
+                "the cancellation probe acquired while another dream held the lease"
+            );
+            cancelled.abort();
+            let cancelled = tokio::time::timeout(Duration::from_secs(5), cancelled)
+                .await
+                .context("the cancelled dream-lease acquisition did not end")?;
+            ensure!(
+                cancelled.is_err_and(|error| error.is_cancelled()),
+                "the dream-lease acquisition completed instead of being cancelled"
+            );
+            drop(second_lease);
+
+            let final_lease =
+                tokio::time::timeout(Duration::from_secs(10), first.acquire_dream_lease())
+                    .await
+                    .context("cancelled dream-lease acquisition retained owner authority")??;
+            drop(final_lease);
+
+            first.close().await?;
+            second.close().await?;
+            let permit = tokio::time::timeout(
+                Duration::from_secs(20),
+                service::acquire_maintenance_permit(&options),
+            )
+            .await
+            .context("managed owner did not retire after dream clients closed")??;
+            tokio::time::timeout(Duration::from_secs(5), served)
+                .await
+                .context("managed dream owner did not finish reaping")???;
+            drop(permit);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("managed dream-lease fixture exceeded 90 seconds")??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn managed_facade_preserves_views_ledger_export_and_independent_clients() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(90), async {
             let root = crate::test_support::tempdir()?;
@@ -3090,12 +3861,16 @@ mod tests {
             let mut cursor = None;
             let mut messages = 0;
             let mut state = 0;
+            let mut context_summaries = 0;
+            let mut context_cursors = 0;
             loop {
                 let page = export.page(cursor).await?;
                 for record in page.records {
                     match record {
                         StorageRecord::Message { .. } => messages += 1,
                         StorageRecord::State { .. } => state += 1,
+                        StorageRecord::ContextSummary { .. } => context_summaries += 1,
+                        StorageRecord::ContextCursor { .. } => context_cursors += 1,
                     }
                 }
                 cursor = page.next;
@@ -3103,7 +3878,7 @@ mod tests {
                     break;
                 }
             }
-            export.verify_counts(messages, state)?;
+            export.verify_counts(messages, state, context_summaries, context_cursors)?;
             drop(export);
             // A connection explicitly closed before transmission is a known
             // pre-write loss. Reattach and send normally; only an incomplete

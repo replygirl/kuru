@@ -74,6 +74,8 @@ impl Harness {
         cancellation.check()?;
         self.reconcile().await?;
         cancellation.check()?;
+        let _dream_lease = cancellation.wait(self.memory.acquire_dream_lease()).await?;
+        cancellation.check()?;
         let active = self
             .topology
             .parts
@@ -188,6 +190,7 @@ impl Harness {
 
     pub async fn apply_dream(&mut self, proposals: Vec<DreamProposal>) -> Result<DreamReport> {
         self.reconcile().await?;
+        let _dream_lease = self.memory.acquire_dream_lease().await?;
         let (topology, report) = self.plan_dream(proposals)?;
         let candidate = self.memory.begin_candidate("dream").await?;
         self.pending_candidate = Some(candidate.clone());

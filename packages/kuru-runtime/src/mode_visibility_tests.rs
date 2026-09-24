@@ -188,8 +188,9 @@ async fn observe_selection(
     let notes_key = format!("{history_key}/notes");
     let transcript_key = format!("{}/transcript/{}", harness.scope, harness.session.id);
     memory
-        .append_message(
+        .append_session_message(
             &history_key,
+            &harness.session.id,
             &Message::text("user", "HISTORY-SENTINEL-🪶".repeat(100)),
         )
         .await
