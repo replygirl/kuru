@@ -1300,6 +1300,22 @@ mod tests {
             let owner_end = 5 + owner_len;
             (token[0], &token[5..owner_end], &token[owner_end + 4..])
         }
+        fn used_aces(dacl: &[u8]) -> &[u8] {
+            let ace_count = u16::from_le_bytes(dacl[4..6].try_into().unwrap());
+            let mut end = 8;
+            for _ in 0..ace_count {
+                let ace_size =
+                    u16::from_le_bytes(dacl[end + 2..end + 4].try_into().unwrap()) as usize;
+                assert!(ace_size >= 4 && end + ace_size <= dacl.len());
+                end += ace_size;
+            }
+            &dacl[8..end]
+        }
+        fn used_dacl_equal(before: &[u8], after: &[u8]) -> bool {
+            before[0] == after[0]
+                && before[4..6] == after[4..6]
+                && used_aces(before) == used_aces(after)
+        }
         let before_publish = file_access_token(&old).unwrap();
         assert!(
             before_publish == file_access_token(&old).unwrap(),
@@ -1326,17 +1342,23 @@ mod tests {
             access_components(&after_publish);
         let (final_protected, final_owner, final_dacl) = access_components(&after_finalize);
         eprintln!(
-            "retained-old access after publish: protected={}, owner={}, dacl={}, dacl_lengths={}/{}; after finalize: protected={}, owner={}, dacl={}, dacl_lengths={}/{}",
+            "retained-old access after publish: protected={}, owner={}, dacl={}, used_dacl={}, dacl_lengths={}/{}, used_lengths={}/{}; after finalize: protected={}, owner={}, dacl={}, used_dacl={}, dacl_lengths={}/{}, used_lengths={}/{}",
             before_protected == published_protected,
             before_owner == published_owner,
             before_dacl == published_dacl,
+            used_dacl_equal(before_dacl, published_dacl),
             before_dacl.len(),
             published_dacl.len(),
+            used_aces(before_dacl).len() + 8,
+            used_aces(published_dacl).len() + 8,
             before_protected == final_protected,
             before_owner == final_owner,
             before_dacl == final_dacl,
+            used_dacl_equal(before_dacl, final_dacl),
             before_dacl.len(),
             final_dacl.len(),
+            used_aces(before_dacl).len() + 8,
+            used_aces(final_dacl).len() + 8,
         );
         crate::fs::verify_retained_file_access(&old, &access).unwrap();
         assert_eq!(crate::fs::retained_file_info(&old).unwrap().links, 0);
