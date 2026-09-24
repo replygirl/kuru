@@ -1,6 +1,6 @@
 ## 1. Windows replacement primitive
 
-- [x] 1.1 Implement exact-handle `FileRenameInfoEx` regular replacement with bounded relative-name encoding, pre-DACL-copy DELETE-only staged authority and unchanged uncertain error classification
+- [x] 1.1 Implement exact-handle `FileRenameInformationEx` regular replacement with bounded relative-name encoding, pre-DACL-copy DELETE/SYNCHRONIZE staged authority and unchanged uncertain error classification
 - [x] 1.2 Preserve the existing MoveFileEx new-only path, common source/target validation, source flush and same-volume checks
 
 ## 2. Regression coverage

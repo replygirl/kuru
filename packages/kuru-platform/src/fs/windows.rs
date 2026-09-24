@@ -8,19 +8,24 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Prefix;
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformationEx, NtSetInformationFile};
+use windows_sys::Win32::Foundation::{
+    GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, STATUS_PENDING,
+    WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ADD_FILE, FILE_ALL_ACCESS,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileDispositionInfo, FileIdInfo, FileRenameInfoEx, FileStandardInfo,
-    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, SYNCHRONIZE,
-    SetFileInformationByHandle, WRITE_DAC,
+    FileDispositionInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
+    GetVolumeInformationByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
+    READ_CONTROL, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 use windows_sys::Win32::System::WindowsProgramming::{
     FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
 };
@@ -299,7 +304,7 @@ pub(super) fn prepare_file_replacement(staged: &File) -> io::Result<Option<File>
     let replacement = unsafe {
         ReOpenFile(
             staged.as_raw_handle(),
-            DELETE,
+            DELETE | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             FILE_FLAG_OPEN_REPARSE_POINT,
         )
@@ -756,7 +761,7 @@ fn replace_open_destination(
                 invalid("native publication filename exceeds bound"),
             )
         })?;
-    // FileRenameInfoEx requires the full structure, including its trailing
+    // FileRenameInformationEx requires the full structure, including its trailing
     // FileName placeholder, plus the UTF-16 bytes named by FileNameLength.
     let record_bytes = size_of::<FILE_RENAME_INFO>()
         .checked_add(name_bytes as usize)
@@ -799,21 +804,53 @@ fn replace_open_destination(
     let renamed = prepared_replacement
         .or(reopened.as_ref())
         .expect("Windows replacement handle exists");
-    // SAFETY: renamed is the retained exact source with DELETE access; record
-    // is aligned, initialized and bounded, and its relative target is resolved
-    // through the retained exact destination-parent handle.
-    let status = unsafe {
-        SetFileInformationByHandle(
+    let mut io_status = IO_STATUS_BLOCK::default();
+    io_status.Anonymous.Status = STATUS_PENDING;
+    // SAFETY: the source, aligned record, status block and retained exact
+    // destination-parent handle remain live until authoritative completion.
+    // The same record and rights passed the isolated native Windows fixture;
+    // SetFileInformationByHandle(FileRenameInfoEx) rejected that fixture.
+    let mut status = unsafe {
+        NtSetInformationFile(
             renamed.as_raw_handle(),
-            FileRenameInfoEx,
+            &mut io_status,
             record.as_mut_ptr().cast(),
             record_len,
+            FileRenameInformationEx,
         )
     };
+    if status == STATUS_PENDING {
+        // ReOpenFile omitted FILE_FLAG_OVERLAPPED and retained SYNCHRONIZE.
+        // Pending is unexpected for that synchronous file object, but the
+        // caller cannot reconcile from a snapshot while its rename may still
+        // complete. Keep every kernel-referenced input alive and wait for the
+        // final IO_STATUS_BLOCK, just as the synchronous open normally does.
+        loop {
+            let waited = unsafe { WaitForSingleObject(renamed.as_raw_handle(), INFINITE) };
+            if waited == WAIT_OBJECT_0 {
+                // SAFETY: a completed file-object wait publishes IO_STATUS_BLOCK.
+                status = unsafe { io_status.Anonymous.Status };
+                if status != STATUS_PENDING {
+                    break;
+                }
+            }
+            // A spurious signal or failed wait still cannot release borrowed
+            // storage or permit a concurrent retry; avoid a busy loop.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     if status == 0 {
-        Err((PublicationPhase::Uncertain, io::Error::last_os_error()))
-    } else {
         Ok(())
+    } else {
+        // Keep the NTSTATUS as well as its Win32 mapping for exact diagnosis.
+        let mapped = unsafe { RtlNtStatusToDosError(status) };
+        Err((
+            PublicationPhase::Uncertain,
+            io::Error::new(
+                io::Error::from_raw_os_error(mapped as i32).kind(),
+                format!("native replacement NTSTATUS {status:#010x} (Win32 {mapped})"),
+            ),
+        ))
     }
 }
 
@@ -822,12 +859,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::{Read, Write};
-    use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformationEx, NtSetInformationFile};
-    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Storage::FileSystem::FileRenameInfoEx;
     use windows_sys::Win32::System::IO::DeviceIoControl;
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     #[derive(Clone, Copy)]
     enum RenameProbeApi {
