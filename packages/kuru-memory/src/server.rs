@@ -48,7 +48,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Mutex, OwnedMutexGuard},
-    time::{Instant, sleep, timeout},
+    time::{Instant, sleep, timeout, timeout_at},
 };
 use uuid::Uuid;
 
@@ -323,6 +323,28 @@ impl Server {
         options: ServerOptions,
         reap_guard: Arc<StdMutex<Option<File>>>,
     ) -> Result<Self> {
+        Self::open_inner_with_probe_delay(options, reap_guard, None).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_with_initial_probe_delay(
+        options: ServerOptions,
+        delay: Duration,
+        entered: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        Self::open_inner_with_probe_delay(
+            options,
+            Arc::new(StdMutex::new(None)),
+            Some((delay, entered)),
+        )
+        .await
+    }
+
+    async fn open_inner_with_probe_delay(
+        options: ServerOptions,
+        reap_guard: Arc<StdMutex<Option<File>>>,
+        _initial_probe_delay: Option<(Duration, Arc<AtomicBool>)>,
+    ) -> Result<Self> {
         ensure!(
             options.timeout >= Duration::from_millis(1)
                 && options.timeout <= Duration::from_secs(300),
@@ -363,6 +385,10 @@ impl Server {
             read_only: options.read_only,
             lifecycle_root: options.lifecycle_root.clone(),
         };
+        // Readiness, the first authenticated connection, and its identity
+        // check are one startup operation. The two seconds are the existing
+        // supervisor-transport allowance, not a fresh budget after Ready.
+        let startup_deadline = Instant::now() + options.timeout + Duration::from_secs(2);
         #[cfg(unix)]
         let (mut owner, response) = {
             let mut command = Command::new(options.supervisor);
@@ -406,7 +432,7 @@ impl Server {
                 .context("supervisor readiness pipe missing")?;
             owner.lifetime = Some(pipe::Sender::from_owned_fd(OwnedFd::from(lifetime))?);
             let mut output = pipe::Receiver::from_owned_fd(OwnedFd::from(output))?;
-            let response = timeout(options.timeout + Duration::from_secs(2), async {
+            let response = timeout_at(startup_deadline, async {
                 write_frame(owner.lifetime.as_mut().expect("owned lifetime"), &request).await?;
                 read_frame::<_, Response>(&mut output).await
             })
@@ -452,7 +478,7 @@ impl Server {
                 #[cfg(test)]
                 reaped_observer: None,
             };
-            let response = timeout(options.timeout + Duration::from_secs(2), async {
+            let response = timeout_at(startup_deadline, async {
                 owner.lifetime = Some(accept.await?);
                 let channel = owner.lifetime.as_mut().expect("owned lifetime");
                 write_frame(channel, &request).await?;
@@ -491,19 +517,33 @@ impl Server {
         let verified = async {
             let identity = load_identity(&directory, &options.project_scope)?
                 .context("memory identity missing after startup")?;
-            let probe = connect_pool(
-                &identity,
-                &endpoint,
-                &directory,
-                "main",
-                options.read_only,
-                1,
+            let remaining = startup_deadline.saturating_duration_since(Instant::now());
+            ensure!(
+                !remaining.is_zero(),
+                "post-readiness memory authentication deadline exceeded"
+            );
+            let probe = timeout_at(
+                startup_deadline,
+                connect_pool_with_timeout(
+                    &identity,
+                    &endpoint,
+                    &directory,
+                    "main",
+                    options.read_only,
+                    1,
+                    PoolAttemptOptions {
+                        acquire_timeout: remaining,
+                        _test_probe_delay: _initial_probe_delay,
+                    },
+                ),
             )
             .await
+            .context("post-readiness memory authentication deadline exceeded")?
             .context("authenticate post-readiness memory connection")?;
-            let verification = verify_identity(&probe, &directory, &identity)
-                .await
-                .context("verify post-readiness memory identity");
+            let verification =
+                verify_identity_until(&probe, &directory, &identity, startup_deadline)
+                    .await
+                    .context("verify post-readiness memory identity");
             let closed = timeout(CLOSE_GRACE, probe.close())
                 .await
                 .context("post-readiness memory pool close deadline exceeded");
@@ -1072,8 +1112,45 @@ async fn connect_pool(
     read_only: bool,
     max: u32,
 ) -> Result<MySqlPool> {
-    let (result, observation) =
-        connect_pool_attempt(identity, endpoint, directory, branch, read_only, max).await?;
+    connect_pool_with_timeout(
+        identity,
+        endpoint,
+        directory,
+        branch,
+        read_only,
+        max,
+        PoolAttemptOptions::ordinary(),
+    )
+    .await
+}
+
+struct PoolAttemptOptions {
+    acquire_timeout: Duration,
+    _test_probe_delay: Option<(Duration, Arc<AtomicBool>)>,
+}
+
+impl PoolAttemptOptions {
+    fn ordinary() -> Self {
+        Self {
+            acquire_timeout: Duration::from_secs(2),
+            _test_probe_delay: None,
+        }
+    }
+}
+
+async fn connect_pool_with_timeout(
+    identity: &Identity,
+    endpoint: &Endpoint,
+    directory: &Path,
+    branch: &str,
+    read_only: bool,
+    max: u32,
+    attempt: PoolAttemptOptions,
+) -> Result<MySqlPool> {
+    let (result, observation) = connect_pool_attempt(
+        identity, endpoint, directory, branch, read_only, max, attempt,
+    )
+    .await?;
     result.map_err(|error| connection_error(error, &observation))
 }
 
@@ -1091,6 +1168,7 @@ async fn connect_pool_attempt(
     branch: &str,
     read_only: bool,
     max: u32,
+    attempt: PoolAttemptOptions,
 ) -> Result<(
     std::result::Result<MySqlPool, sqlx::Error>,
     ConnectionObservation,
@@ -1118,14 +1196,22 @@ async fn connect_pool_attempt(
     let result = MySqlPoolOptions::new()
         .max_connections(max)
         .min_connections(0)
-        .acquire_timeout(Duration::from_secs(2))
+        .acquire_timeout(attempt.acquire_timeout)
         .idle_timeout(Duration::from_secs(30))
         .after_connect(move |connection, _| {
             let instance = instance.clone();
             let project_scope = project_scope.clone();
             let expected_directory = expected_directory.clone();
             let observation = callback_observation.clone();
+            #[cfg(test)]
+            let test_probe_delay = attempt._test_probe_delay.clone();
             Box::pin(async move {
+                #[cfg(test)]
+                if let Some((delay, entered)) = test_probe_delay {
+                    observation.phase("initial authentication callback entered");
+                    entered.store(true, Ordering::SeqCst);
+                    sleep(delay).await;
+                }
                 let result = async {
                     observation.phase("data directory query");
                     let datadir: String = sqlx::query_scalar("SELECT @@datadir")
@@ -1169,7 +1255,22 @@ async fn connect_pool_attempt(
 }
 
 async fn verify_identity(pool: &MySqlPool, directory: &Path, identity: &Identity) -> Result<()> {
-    timeout(Duration::from_secs(2), async {
+    verify_identity_until(
+        pool,
+        directory,
+        identity,
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await
+}
+
+async fn verify_identity_until(
+    pool: &MySqlPool,
+    directory: &Path,
+    identity: &Identity,
+    deadline: Instant,
+) -> Result<()> {
+    timeout_at(deadline, async {
         let datadir: String = sqlx::query_scalar("SELECT @@datadir")
             .fetch_one(pool)
             .await?;
@@ -1213,10 +1314,17 @@ async fn live_endpoint(
         Ok(Ok(stream)) => drop(stream),
         _ => return Ok(None),
     }
-    let (result, observation) =
-        connect_pool_attempt(identity, &endpoint, directory, "main", read_only, 1)
-            .await
-            .context("authenticate published memory endpoint")?;
+    let (result, observation) = connect_pool_attempt(
+        identity,
+        &endpoint,
+        directory,
+        "main",
+        read_only,
+        1,
+        PoolAttemptOptions::ordinary(),
+    )
+    .await
+    .context("authenticate published memory endpoint")?;
     let pool = match result {
         Ok(pool) => pool,
         Err(error) if observation.is_pre_callback_connection_reset(&error) => return Ok(None),
@@ -1829,6 +1937,9 @@ mod stale_endpoint_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "server/startup_budget_tests.rs"]
+mod startup_budget_tests;
 #[cfg(all(test, unix))]
 #[path = "server_tests.rs"]
 mod tests;
