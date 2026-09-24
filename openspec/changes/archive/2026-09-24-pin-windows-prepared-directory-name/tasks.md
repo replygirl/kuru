@@ -1,0 +1,4 @@
+## 1. Native Windows discriminator
+
+- [x] 1.1 Add a `packages/kuru-platform/src/fs/windows.rs` fixture that opens separate fresh private directories with the current metadata rights, metadata plus `FILE_TRAVERSE`, and metadata plus `FILE_LIST_DIRECTORY`; for each, verify exact directory identity and child bytes around an explicit DELETE open and an independent pathname rename, and report only fixed outcomes and OS codes.
+- [x] 1.2 Native Windows platform job 107807656183 on head `421c7ef5` passed: metadata DELETE-open and rename succeeded; adding `FILE_TRAVERSE` or `FILE_LIST_DIRECTORY` made both return sharing code 32; all same-path unpinned controls succeeded and identity/child-byte checks held. This selects the narrower traversal right for the separate `windows-pinned-directory-rename` fix; the existing connector consumer test still failed on this diagnostic-only head as expected.

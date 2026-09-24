@@ -1,0 +1,5 @@
+## 1. Windows pinned directory admission
+
+- [x] 1.1 Added Windows production-path `Directory::open(..., Pinned)` and checked-removal `pin_directory` regressions for held DELETE-open/rename refusal, exact identity and bytes, and same-path success after release. Native A/B/C on the original metadata-only rights establishes the pre-fix behavior; corrected-source Windows execution is deferred to final-head CI.
+- [x] 1.2 Pinned Windows directory opens now request only `FILE_TRAVERSE`; checked-removal ancestors use the same boundary, and enumerated directory children reopen and compare full identity/type before recursion. Movable and regular-file access and sharing remain unchanged (independent source review clear).
+- [x] 1.3 Windows cross-target platform typecheck and Clippy, package format, host platform tests after sandbox IPC denial rerun, three focused real-Dolt runtime fixtures and strict Cospec passed. Native corrected-head platform/connector regressions are unrun until the branch is published and remain mandatory merge gates.

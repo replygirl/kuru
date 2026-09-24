@@ -1416,8 +1416,9 @@ async fn mutation_and_opaque_calls_split_native_read_waves() {
         dream_on_exit: false,
         ..Config::default()
     };
+    let project_path = project.path().canonicalize().unwrap();
     let root = Arc::new(
-        Directory::open(project.path(), Privacy::Inherited, NameRetention::Pinned).unwrap(),
+        Directory::open(&project_path, Privacy::Inherited, NameRetention::Pinned).unwrap(),
     );
     let tools = ToolHost::with_retained_root(root.clone(), &config)
         .unwrap()
@@ -1428,7 +1429,7 @@ async fn mutation_and_opaque_calls_split_native_read_waves() {
     let memory = MemoryStore::temporary().await.unwrap();
     let mut harness = Harness::with_tool_host(
         config,
-        project.path(),
+        &project_path,
         memory.clone(),
         fake.clone(),
         None,
@@ -1544,8 +1545,9 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
         dream_on_exit: false,
         ..Config::default()
     };
+    let directory_path = directory.path().canonicalize().unwrap();
     let root = Arc::new(
-        Directory::open(directory.path(), Privacy::Inherited, NameRetention::Pinned).unwrap(),
+        Directory::open(&directory_path, Privacy::Inherited, NameRetention::Pinned).unwrap(),
     );
     let tools = ToolHost::with_retained_root(root.clone(), &config)
         .unwrap()
@@ -1557,7 +1559,7 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
     let memory = MemoryStore::temporary().await.unwrap();
     let harness = Harness::with_tool_host(
         config,
-        directory.path(),
+        &directory_path,
         memory.clone(),
         fake.clone(),
         None,
@@ -1667,8 +1669,9 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
         dream_on_exit: false,
         ..Config::default()
     };
+    let project_path = project.path().canonicalize().unwrap();
     let root = Arc::new(
-        Directory::open(project.path(), Privacy::Inherited, NameRetention::Pinned).unwrap(),
+        Directory::open(&project_path, Privacy::Inherited, NameRetention::Pinned).unwrap(),
     );
     let tools = ToolHost::with_retained_root(root.clone(), &config)
         .unwrap()
@@ -1680,7 +1683,7 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
     let memory = MemoryStore::temporary().await.unwrap();
     let harness = Harness::with_tool_host(
         config,
-        project.path(),
+        &project_path,
         memory.clone(),
         provider.clone(),
         None,
