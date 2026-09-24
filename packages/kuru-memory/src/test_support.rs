@@ -88,6 +88,21 @@ pub fn open_options(data_dir: PathBuf, project_scope: String) -> Result<OpenOpti
     Ok(options)
 }
 
+#[cfg(feature = "test-support")]
+pub use crate::service::FixtureLoggedOwner;
+
+/// Start the actual service executable with one caller-owned private stderr
+/// file, then wait for its authenticated endpoint before CLI children attach.
+#[cfg(feature = "test-support")]
+pub async fn spawn_logged_owner(
+    options: &OpenOptions,
+    project: &Path,
+    executable: &Path,
+    diagnostic: File,
+) -> Result<FixtureLoggedOwner> {
+    crate::service::spawn_logged_owner_fixture(options, project, executable, diagnostic).await
+}
+
 /// Open an explicit real-engine fixture with its private startup log available on failure.
 /// Ordinary `MemoryStore::open` retains its production error and log privacy behavior.
 pub async fn open_fixture(options: OpenOptions) -> Result<MemoryStore> {

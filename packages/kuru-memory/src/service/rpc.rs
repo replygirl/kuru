@@ -867,23 +867,33 @@ async fn respond<S: AsyncWrite + Unpin>(
             Ok(value) => ServiceResponse::Success(Box::new(value)),
             Err(error) => {
                 tracing::warn!(error = %error, "memory service operation failed");
-                ServiceResponse::Rejected(
-                    if error
-                        .downcast_ref::<crate::store::CandidateConflict>()
-                        .is_some()
-                    {
-                        ServiceFault::CandidateConflict
-                    } else if error
-                        .downcast_ref::<crate::store::LogicalReceiptConflict>()
-                        .is_some()
-                    {
-                        ServiceFault::ReceiptConflict
-                    } else if let Some(rejected) = error.downcast_ref::<CandidateRefRejected>() {
-                        ServiceFault::CandidateRefRejected(rejected.0)
-                    } else {
-                        ServiceFault::StorageFailed
-                    },
-                )
+                let fault = if error
+                    .downcast_ref::<crate::store::CandidateConflict>()
+                    .is_some()
+                {
+                    ServiceFault::CandidateConflict
+                } else if error
+                    .downcast_ref::<crate::store::LogicalReceiptConflict>()
+                    .is_some()
+                {
+                    ServiceFault::ReceiptConflict
+                } else if let Some(rejected) = error.downcast_ref::<CandidateRefRejected>() {
+                    ServiceFault::CandidateRefRejected(rejected.0)
+                } else {
+                    ServiceFault::StorageFailed
+                };
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(record) = crate::store::candidate_failure_record(&error) {
+                    let kind = match fault {
+                        ServiceFault::CandidateRefRejected(_) => "ref_rejected",
+                        ServiceFault::CandidateConflict => "candidate_conflict",
+                        ServiceFault::ReceiptConflict => "receipt_conflict",
+                        ServiceFault::StorageFailed => "storage_failed",
+                        ServiceFault::GenerationChanged => "generation_changed",
+                    };
+                    eprintln!("{record} fault={kind}");
+                }
+                ServiceResponse::Rejected(fault)
             }
         }
     } else {

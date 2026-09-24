@@ -3,6 +3,17 @@ use serde_json::json;
 
 const TEST_DEADLINE: Duration = Duration::from_secs(10);
 
+#[test]
+fn candidate_failure_record_exposes_only_fixed_stage_and_sql_class() {
+    let error = anyhow::Error::new(CandidateRefRejected(CandidateRefRefusal::Changed))
+        .context(CandidateFailureStage::RefInspection)
+        .context("private branch and SQL text must not appear");
+    assert_eq!(
+        candidate_failure_record(&error).as_deref(),
+        Some("candidate_owner stage=ref_inspection class=non_sql sqlstate=none vendor=0")
+    );
+}
+
 #[tokio::test]
 async fn lost_receipt_reply_settles_and_remains_indexed_after_later_write() -> Result<()> {
     let store = MemoryStore::temporary().await?;
@@ -283,6 +294,19 @@ async fn held_candidate_view_delays_explicit_abandonment_without_losing_history(
         .await
         .expect_err("live candidate session permitted force cleanup");
     assert!(format!("{error:#}").contains("in use"));
+    let record = candidate_failure_record(&error)
+        .context("held-session refusal lost its fixed owner-stage diagnostic")?;
+    assert!(
+        record.starts_with("candidate_owner stage=branch_rename class=database sqlstate="),
+        "held-session refusal was not classified at the branch rename"
+    );
+    let vendor: u16 = record
+        .rsplit_once(" vendor=")
+        .context("held-session diagnostic omitted its vendor code")?
+        .1
+        .parse()?;
+    assert_ne!(vendor, 0, "held-session diagnostic omitted the SQL code");
+    eprintln!("{record}");
     let heads = candidate_heads(&store.pool, &names).await?;
     assert_eq!(heads.get(&names.open), Some(&target));
     assert!(!heads.contains_key(&names.abandoned));
@@ -294,6 +318,125 @@ async fn held_candidate_view_delays_explicit_abandonment_without_losing_history(
     assert!(candidate_heads(&store.pool, &names).await?.is_empty());
     store.put("after held view", &json!(true)).await?;
     store.close().await
+}
+
+#[tokio::test]
+async fn candidate_pool_retirement_observes_exact_server_sessions_before_rename() -> Result<()> {
+    let store = MemoryStore::temporary().await?;
+    let observation = async {
+        let candidate = store.begin_candidate("retirement observation").await?;
+        candidate
+            .view()
+            .put("candidate write", &json!(true))
+            .await?;
+        let names = CandidateNames::from_open(&candidate.view.branch)?;
+        let target = candidate.view().revision().await?;
+        let pool = candidate.view.pool.clone();
+
+        // Keep all four pool permits checked out together. Repeated queries on one
+        // idle connection would not identify a different session in the same pool.
+        let mut connections = Vec::new();
+        let mut ids = BTreeSet::new();
+        for _ in 0..4 {
+            let mut connection = pool.acquire().await?;
+            let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(&mut *connection)
+                .await?;
+            let database: String = sqlx::query_scalar("SELECT DATABASE()")
+                .fetch_one(&mut *connection)
+                .await?;
+            assert!(
+                database == format!("kuru/{}", names.open),
+                "candidate session database mismatch"
+            );
+            assert!(
+                ids.insert(id),
+                "candidate pool reused a checked-out session"
+            );
+            let observed: Option<String> =
+                sqlx::query_scalar("SELECT DB FROM information_schema.processlist WHERE ID = ?")
+                    .bind(id)
+                    .fetch_one(store.pool.as_ref())
+                    .await?;
+            assert!(
+                observed.as_deref() == Some(database.as_str()),
+                "candidate processlist database mismatch"
+            );
+            connections.push(connection);
+        }
+        assert_eq!(ids.len(), 4);
+        drop(connections);
+
+        store.shared.server.retire_pool(&names.open).await?;
+        let mut active_after_close = 0;
+        for id in ids {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ?",
+            )
+            .bind(id)
+            .fetch_one(store.pool.as_ref())
+            .await?;
+            assert!(active <= 1);
+            active_after_close += active;
+        }
+        eprintln!(
+            "candidate_retirement stage=after_pool_close active_sessions={active_after_close}"
+        );
+
+        if let Err(error) =
+            transition_candidate(&store, &names.open, &names.promoting, &target).await
+        {
+            let mut sqlstate = "none";
+            let mut vendor = 0;
+            for cause in error.chain() {
+                if let Some(sqlx::Error::Database(database)) = cause.downcast_ref::<sqlx::Error>() {
+                    if let Some(mysql) =
+                        database.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                    {
+                        sqlstate = mysql
+                            .code()
+                            .filter(|code| {
+                                code.len() == 5
+                                    && code.bytes().all(|byte| {
+                                        byte.is_ascii_uppercase() || byte.is_ascii_digit()
+                                    })
+                            })
+                            .unwrap_or("other");
+                        vendor = mysql.number();
+                    }
+                    break;
+                }
+            }
+            eprintln!(
+                "candidate_retirement stage=rename_failed sqlstate={sqlstate} vendor={vendor}"
+            );
+            let heads = candidate_heads(&store.pool, &names).await?;
+            assert!(
+                heads.get(&names.open) == Some(&target),
+                "failed candidate rename changed the source head"
+            );
+            assert!(!heads.contains_key(&names.promoting));
+            bail!("candidate retirement stage=rename_failed sqlstate={sqlstate} vendor={vendor}");
+        }
+        eprintln!("candidate_retirement stage=rename_succeeded");
+        let heads = candidate_heads(&store.pool, &names).await?;
+        assert!(
+            heads.get(&names.promoting) == Some(&target),
+            "successful candidate rename lost the status head"
+        );
+        assert!(!heads.contains_key(&names.open));
+        ensure!(
+            active_after_close == 0,
+            "candidate retirement left an owned server session active before rename"
+        );
+        drop(pool);
+        drop(candidate);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let closed = store.close().await;
+    observation?;
+    closed
 }
 
 #[tokio::test]
