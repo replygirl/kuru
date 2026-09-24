@@ -98,25 +98,55 @@ jobs:
           # The Linux keyring backend requires the real Secret Service default
           # collection. Give this headless runner its own session and fixture
           # collection; never use a file-backed replacement or provider store.
+          fixture_root=$(mktemp -d "$RUNNER_TEMP/kuru-native-store.XXXXXX")
+          chmod 700 "$fixture_root"
+          mkdir -m 700 "$fixture_root/data" "$fixture_root/runtime"
+          # Preserve the installed pinned tools before XDG_DATA_HOME is made
+          # private for this test session's native keyring.
+          export MISE_DATA_DIR="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
+          export XDG_DATA_HOME="$fixture_root/data"
+          export XDG_RUNTIME_DIR="$fixture_root/runtime"
+          cleanup_fixture() {
+            status=$?
+            trap - EXIT
+            rm -rf -- "$fixture_root"
+            exit "$status"
+          }
+          trap cleanup_fixture EXIT
           dbus-run-session -- bash -euo pipefail <<'KURU_NATIVE_STORE'
-            fixture_root=$(mktemp -d "$RUNNER_TEMP/kuru-native-store.XXXXXX")
-            chmod 700 "$fixture_root"
-            mkdir -m 700 "$fixture_root/data" "$fixture_root/runtime"
-            export XDG_DATA_HOME="$fixture_root/data"
-            export XDG_RUNTIME_DIR="$fixture_root/runtime"
             printf '%s' 'kuru-ci-fixture-only-password' |
               gnome-keyring-daemon --foreground --unlock --components=secrets \
-                >"$fixture_root/daemon.log" 2>&1 &
+                >"$XDG_RUNTIME_DIR/daemon.log" 2>&1 &
             daemon_pid=$!
-            cleanup() {
+            cleanup_daemon() {
               status=$?
               trap - EXIT
               kill "$daemon_pid" 2>/dev/null || true
               wait "$daemon_pid" 2>/dev/null || true
-              rm -rf -- "$fixture_root"
               exit "$status"
             }
-            trap cleanup EXIT
+            trap cleanup_daemon EXIT
+            # NameHasOwner queries the bus itself and cannot auto-activate a
+            # second keyring daemon before this owned one claims the name.
+            owned=0
+            for attempt in {1..10}; do
+              if ! kill -0 "$daemon_pid" 2>/dev/null; then
+                break
+              fi
+              owner_reply=$(dbus-send --session --print-reply \
+                --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+                org.freedesktop.DBus.NameHasOwner \
+                string:org.freedesktop.secrets 2>/dev/null || true)
+              if [[ "$owner_reply" == *'boolean true'* ]]; then
+                owned=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$owned" -ne 1 ]; then
+              echo 'Owned Secret Service daemon did not claim the session bus' >&2
+              exit 1
+            fi
             # Probe the default collection with fake bytes before running the
             # actual OS-store tests. A missing service fails setup, not coverage.
             ready=0
