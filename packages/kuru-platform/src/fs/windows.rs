@@ -1295,9 +1295,22 @@ mod tests {
         candidate.write_all(b"new").unwrap();
         let access = crate::fs::copy_file_access(&old, &candidate).unwrap();
         crate::fs::verify_file_access(&old, &access).unwrap();
+        fn access_components(token: &[u8]) -> (u8, &[u8], &[u8]) {
+            let owner_len = u32::from_le_bytes(token[1..5].try_into().unwrap()) as usize;
+            let owner_end = 5 + owner_len;
+            (token[0], &token[5..owner_end], &token[owner_end + 4..])
+        }
+        let before_publish = file_access_token(&old).unwrap();
+        assert!(
+            before_publish == file_access_token(&old).unwrap(),
+            "source access token changed before publication"
+        );
+        let source =
+            Directory::open(stage.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
+        assert_eq!(source.identity(), stage.identity());
         directory
             .publish_file_with_access(
-                &stage,
+                &source,
                 OsStr::new("payload"),
                 &candidate,
                 &access,
@@ -1305,7 +1318,26 @@ mod tests {
                 Publication::ReplaceRegular,
             )
             .unwrap();
+        let after_publish = file_access_token(&old).unwrap();
         crate::fs::finalize_file_access(&old, &candidate).unwrap();
+        let after_finalize = file_access_token(&old).unwrap();
+        let (before_protected, before_owner, before_dacl) = access_components(&before_publish);
+        let (published_protected, published_owner, published_dacl) =
+            access_components(&after_publish);
+        let (final_protected, final_owner, final_dacl) = access_components(&after_finalize);
+        eprintln!(
+            "retained-old access after publish: protected={}, owner={}, dacl={}, dacl_lengths={}/{}; after finalize: protected={}, owner={}, dacl={}, dacl_lengths={}/{}",
+            before_protected == published_protected,
+            before_owner == published_owner,
+            before_dacl == published_dacl,
+            before_dacl.len(),
+            published_dacl.len(),
+            before_protected == final_protected,
+            before_owner == final_owner,
+            before_dacl == final_dacl,
+            before_dacl.len(),
+            final_dacl.len(),
+        );
         crate::fs::verify_retained_file_access(&old, &access).unwrap();
         assert_eq!(crate::fs::retained_file_info(&old).unwrap().links, 0);
         assert_eq!(
