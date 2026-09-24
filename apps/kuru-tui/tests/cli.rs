@@ -280,7 +280,7 @@ async fn candidate_commands_discover_and_abandon_one_exact_retained_ref() {
     let diagnostics = candidate_owner_diagnostic_records(&diagnostic_path);
     assert!(
         diagnostics.contains(
-            "candidate_owner stage=ref_inspection class=non_sql sqlstate=none vendor=0 fault=ref_rejected"
+            "candidate_owner stage=ref_inspection class=non_sql sqlstate=none vendor=0 reason=other fault=ref_rejected"
         ),
         "the actual owner did not report the controlled changed-head refusal: {diagnostics}"
     );
@@ -347,6 +347,12 @@ fn candidate_owner_diagnostic_records(path: &Path) -> String {
             else {
                 return false;
             };
+            let Some(reason) = fields
+                .next()
+                .and_then(|field| field.strip_prefix("reason="))
+            else {
+                return false;
+            };
             let Some(fault) = fields.next().and_then(|field| field.strip_prefix("fault=")) else {
                 return false;
             };
@@ -369,6 +375,7 @@ fn candidate_owner_diagnostic_records(path: &Path) -> String {
                             .bytes()
                             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())))
                 && vendor.parse::<u16>().is_ok()
+                && matches!(reason, "branch_in_use" | "other")
                 && matches!(
                     fault,
                     "ref_rejected"

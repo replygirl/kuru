@@ -318,11 +318,33 @@ impl std::fmt::Display for CandidateFailureStage {
 impl std::error::Error for CandidateFailureStage {}
 
 #[cfg(any(test, feature = "test-support"))]
+fn candidate_branch_rename_reason(
+    stage: CandidateFailureStage,
+    sqlstate: &str,
+    vendor: u16,
+    message: &str,
+) -> &'static str {
+    // Dolt 2.3.3's branch procedure returns this fixed message only when an
+    // active session prevents the checked rename. Keep its text private.
+    const BRANCH_IN_USE: &str = "unsafe to delete or rename branches in use in other sessions; use --force to force the change";
+    if matches!(stage, CandidateFailureStage::BranchRename)
+        && sqlstate == "HY000"
+        && vendor == 1105
+        && message == BRANCH_IN_USE
+    {
+        "branch_in_use"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn candidate_failure_record(error: &anyhow::Error) -> Option<String> {
     let stage = error.downcast_ref::<CandidateFailureStage>()?;
     let mut class = "non_sql";
     let mut sqlstate = "none";
     let mut vendor = 0;
+    let mut reason = "other";
     if let Some(sqlx_error) = error.downcast_ref::<sqlx::Error>() {
         class = "sqlx";
         if let sqlx::Error::Database(database) = sqlx_error {
@@ -338,11 +360,13 @@ pub(crate) fn candidate_failure_record(error: &anyhow::Error) -> Option<String> 
                     })
                     .unwrap_or("other");
                 vendor = mysql.number();
+                reason =
+                    candidate_branch_rename_reason(*stage, sqlstate, vendor, database.message());
             }
         }
     }
     Some(format!(
-        "candidate_owner stage={} class={class} sqlstate={sqlstate} vendor={vendor}",
+        "candidate_owner stage={} class={class} sqlstate={sqlstate} vendor={vendor} reason={reason}",
         stage.label()
     ))
 }
@@ -706,10 +730,30 @@ async fn transition_candidate(
     status: &str,
     expected: &str,
 ) -> Result<()> {
+    transition_candidate_with_retirement_deadline(store, source, status, expected, QUERY_TIMEOUT)
+        .await
+}
+
+async fn transition_candidate_with_retirement_deadline(
+    store: &MemoryStore,
+    source: &str,
+    status: &str,
+    expected: &str,
+    retirement_deadline: Duration,
+) -> Result<()> {
+    let source_admission = store
+        .shared
+        .server
+        .fence_pool(source)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)?;
     store
         .shared
         .server
         .retire_pool(source)
+        .await
+        .context(CandidateFailureStage::PoolRetirement)?;
+    await_branch_sessions_end(store, source, retirement_deadline)
         .await
         .context(CandidateFailureStage::PoolRetirement)?;
     let (mut connection, id) = owned_connection(&store.pool).await?;
@@ -740,6 +784,10 @@ async fn transition_candidate(
     let heads = candidate_heads(&store.pool, &names)
         .await
         .context(CandidateFailureStage::RefInspection)?;
+    // A successful transition may inspect the source again to verify its clean
+    // working set. Release admission only after the rename is reconciled and
+    // the exact refs are read, before that later inspection can reopen a pool.
+    drop(source_admission);
     if settled {
         for branch in [source, status] {
             if heads.contains_key(branch) {
@@ -2782,6 +2830,32 @@ async fn await_session_end(pool: &MySqlPool, id: u64, duration: Duration) -> Res
     })
     .await
     .context("memory SQL session teardown deadline exceeded")?
+}
+
+async fn await_branch_sessions_end(
+    store: &MemoryStore,
+    branch: &str,
+    duration: Duration,
+) -> Result<()> {
+    let database = format!("kuru/{branch}");
+    tokio::time::timeout(duration, async {
+        loop {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.processlist WHERE BINARY DB = BINARY ?",
+            )
+            .bind(&database)
+            .fetch_one(store.pool.as_ref())
+            .await?;
+            if active == 0 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            #[cfg(test)]
+            store.shared.server.notify_candidate_wait().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("candidate source session retirement deadline exceeded")?
 }
 
 async fn operation_exists(pool: &MySqlPool, operation: &str) -> Result<bool> {

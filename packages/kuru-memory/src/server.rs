@@ -47,7 +47,7 @@ use tokio::sync::oneshot;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::{Mutex, OwnedMutexGuard},
     time::{Instant, sleep, timeout},
 };
 use uuid::Uuid;
@@ -80,6 +80,9 @@ struct ServerInner {
     endpoint: Endpoint,
     read_only: bool,
     pools: Mutex<BTreeMap<String, Weak<MySqlPool>>>,
+    pool_admission: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+    #[cfg(test)]
+    candidate_wait_observer: Mutex<Option<oneshot::Sender<()>>>,
     owner: Mutex<Option<Owner>>,
     reap_guard: Arc<StdMutex<Option<File>>>,
     closed: AtomicBool,
@@ -550,6 +553,9 @@ impl Server {
             endpoint,
             read_only,
             pools: Mutex::new(BTreeMap::new()),
+            pool_admission: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            candidate_wait_observer: Mutex::new(None),
             owner: Mutex::new(owner),
             reap_guard,
             closed: AtomicBool::new(false),
@@ -557,7 +563,7 @@ impl Server {
     }
 
     pub async fn pool(&self, branch: &str) -> Result<Arc<MySqlPool>> {
-        validate_branch(branch)?;
+        let _admission = self.fence_pool(branch).await?;
         let mut pools = self.0.pools.lock().await;
         ensure!(
             !self.0.closed.load(Ordering::Acquire),
@@ -583,6 +589,43 @@ impl Server {
         let pool = Arc::new(pool);
         pools.insert(branch.to_owned(), Arc::downgrade(&pool));
         Ok(pool)
+    }
+
+    /// Prevent a new pool for one branch while its checked status transition
+    /// retires server sessions and observes the resulting ref. The short map
+    /// lookup never holds a global lock across Dolt work.
+    pub(crate) async fn fence_pool(&self, branch: &str) -> Result<OwnedMutexGuard<()>> {
+        validate_branch(branch)?;
+        let gate = {
+            let mut gates = self.0.pool_admission.lock().await;
+            if let Some(gate) = gates.get(branch).and_then(Weak::upgrade) {
+                gate
+            } else {
+                gates.retain(|_, gate| gate.strong_count() != 0);
+                let gate = Arc::new(Mutex::new(()));
+                gates.insert(branch.to_owned(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        Ok(gate.lock_owned().await)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_next_candidate_wait(&self) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        let mut observer = self.0.candidate_wait_observer.lock().await;
+        assert!(
+            observer.replace(sender).is_none(),
+            "candidate wait observer already installed"
+        );
+        receiver
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn notify_candidate_wait(&self) {
+        if let Some(observer) = self.0.candidate_wait_observer.lock().await.take() {
+            let _ = observer.send(());
+        }
     }
 
     pub(crate) async fn retire_pool(&self, branch: &str) -> Result<()> {
