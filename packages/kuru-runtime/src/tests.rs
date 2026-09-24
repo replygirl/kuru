@@ -16,8 +16,8 @@ use axum::{
 };
 use kuru_connectors::{Provider, ToolHost};
 use kuru_core::{
-    Completion, CompletionRequest, Config, ContentBlock, Mode, ModelInfo, RelationshipKind,
-    ToolCall, canonical_peer_instruction,
+    Completion, CompletionRequest, Config, ContentBlock, Message, Mode, ModelInfo,
+    RelationshipKind, ToolCall, canonical_peer_instruction,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -557,10 +557,10 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
         .unwrap();
     harness
         .memory
-        .append(
+        .append_session_message(
             &harness.namespace(&relation.id),
-            "user",
-            "RELATION-ONLY-NOTE",
+            &harness.session.id,
+            &Message::text("user", "RELATION-ONLY-NOTE"),
         )
         .await
         .unwrap();

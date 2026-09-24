@@ -747,8 +747,8 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dolt_branches WHERE LEFT(BINARY name, 15) = BINARY 'kuru_migration_'")
             .fetch_one(recovered.pool.as_ref())
             .await?,
-        4,
-        "cold recovery retains the failed branch and all three ordered migration attempts"
+        i64::from(migrations::CURRENT_VERSION),
+        "cold recovery retains the failed branch and every ordered migration attempt"
     );
     let retained_failed = recovered.shared.server.pool(&failed_branch).await?;
     assert_eq!(revision(&retained_failed).await?, failed_head);
@@ -782,6 +782,15 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
         .await?,
         1,
         "cold recovery must publish the v4 migration exactly once"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 5%'"
+        )
+        .fetch_one(recovered.pool.as_ref())
+        .await?,
+        1,
+        "cold recovery must publish the v5 migration exactly once"
     );
     let recovered_candidate = recovered.shared.server.pool(&candidate).await?;
     assert_eq!(revision(&recovered_candidate).await?, candidate_head);
@@ -1186,7 +1195,7 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kuru_migrations")
                 .fetch_one(store.pool.as_ref())
                 .await?,
-            3
+            i64::from(migrations::CURRENT_VERSION - 1)
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -1194,7 +1203,7 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
             )
             .fetch_one(store.pool.as_ref())
             .await?,
-            3
+            i64::from(migrations::CURRENT_VERSION - 1)
         );
         store.close().await?;
     }
@@ -1615,6 +1624,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
             project_scope: options.project_scope,
             read_only: false,
             write: Arc::new(Mutex::new(())),
+            dream: Arc::new(Mutex::new(())),
             uncertain: StdMutex::new(None),
             usage_pool: StdMutex::new(None),
             candidate_recovery_pause: None,
@@ -2322,7 +2332,7 @@ async fn usage_upgrade_publication_fixture(accepted: bool) -> Result<()> {
     super::tests::released_v1(&options).await?;
     let server = super::tests::released_server(&options).await?;
     let main = server.pool("main").await?;
-    migrations::upgrade(&server, &main).await?;
+    migrations::upgrade_main_to_v3_fixture(&server, &main).await?;
     let v3_branches: Vec<String> = tokio::time::timeout(
         QUERY_TIMEOUT,
         sqlx::query_scalar("SELECT name FROM dolt_branches WHERE LEFT(BINARY name, 27) = BINARY 'kuru_migration_v0000000003_' LIMIT 2")

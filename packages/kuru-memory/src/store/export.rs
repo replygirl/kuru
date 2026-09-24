@@ -19,6 +19,8 @@ pub struct ExportProvenance {
     pub schema_version: i32,
     pub message_count: u64,
     pub state_count: u64,
+    pub context_summary_count: u64,
+    pub context_cursor_count: u64,
 }
 
 /// One application storage row retained by a committed export.
@@ -28,6 +30,7 @@ pub enum StorageRecord {
     Message {
         sequence: i64,
         namespace: String,
+        session_id: Option<String>,
         role: String,
         content_format: String,
         content: String,
@@ -35,6 +38,14 @@ pub enum StorageRecord {
     State {
         key: String,
         value: Value,
+    },
+    ContextSummary {
+        summary_id: String,
+        record: super::ContextSummaryRecord,
+        record_format: String,
+    },
+    ContextCursor {
+        cursor: super::ContextSummaryCursor,
     },
 }
 
@@ -49,6 +60,8 @@ pub struct ExportCursor {
 enum Phase {
     Messages(Option<i64>),
     State(Option<Vec<u8>>),
+    ContextSummaries(Option<String>),
+    ContextCursors(Option<(Vec<u8>, Vec<u8>, Vec<u8>)>),
 }
 
 /// One bounded export page and its continuation, if another page exists.
@@ -84,6 +97,16 @@ impl MemoryStore {
         let schema_version = migrations::validate_historical(&pool).await?;
         let message_count = count(&pool, "messages").await?;
         let state_count = count(&pool, "state").await?;
+        let context_summary_count = if schema_version >= 5 {
+            count(&pool, "context_summaries").await?
+        } else {
+            0
+        };
+        let context_cursor_count = if schema_version >= 5 {
+            count(&pool, "context_summary_cursors").await?
+        } else {
+            0
+        };
         Ok(ActiveExportSnapshot {
             _shared: self.shared.clone(),
             pool,
@@ -94,6 +117,8 @@ impl MemoryStore {
                 schema_version,
                 message_count,
                 state_count,
+                context_summary_count,
+                context_cursor_count,
             },
             id: Uuid::new_v4(),
         })
@@ -148,6 +173,46 @@ impl ActiveExportSnapshot {
                     {
                         Some(self.cursor(Phase::State(Some(key.as_bytes().to_vec()))))
                     }
+                    _ => Some(self.cursor(Phase::ContextSummaries(None))),
+                };
+                Ok(ExportPage { records, next })
+            }
+            Phase::ContextSummaries(after) => {
+                if self.provenance.schema_version < 5 {
+                    return Ok(ExportPage {
+                        records: Vec::new(),
+                        next: Some(self.cursor(Phase::ContextCursors(None))),
+                    });
+                }
+                let records = context_summaries(&self.pool, after).await?;
+                let next = match records.last() {
+                    Some(StorageRecord::ContextSummary { summary_id, .. })
+                        if records.len() == PAGE_SIZE as usize =>
+                    {
+                        Some(self.cursor(Phase::ContextSummaries(Some(summary_id.clone()))))
+                    }
+                    _ => Some(self.cursor(Phase::ContextCursors(None))),
+                };
+                Ok(ExportPage { records, next })
+            }
+            Phase::ContextCursors(after) => {
+                if self.provenance.schema_version < 5 {
+                    return Ok(ExportPage {
+                        records: Vec::new(),
+                        next: None,
+                    });
+                }
+                let records = context_cursors(&self.pool, after).await?;
+                let next = match records.last() {
+                    Some(StorageRecord::ContextCursor { cursor })
+                        if records.len() == PAGE_SIZE as usize =>
+                    {
+                        Some(self.cursor(Phase::ContextCursors(Some((
+                            cursor.actor_namespace.as_bytes().to_vec(),
+                            cursor.session_id.as_bytes().to_vec(),
+                            cursor.source_namespace.as_bytes().to_vec(),
+                        )))))
+                    }
                     _ => None,
                 };
                 Ok(ExportPage { records, next })
@@ -156,10 +221,18 @@ impl ActiveExportSnapshot {
     }
 
     /// Fail if an application-side renderer did not emit this snapshot exactly.
-    pub fn verify_counts(&self, message_count: u64, state_count: u64) -> Result<()> {
+    pub fn verify_counts(
+        &self,
+        message_count: u64,
+        state_count: u64,
+        context_summary_count: u64,
+        context_cursor_count: u64,
+    ) -> Result<()> {
         ensure!(
             message_count == self.provenance.message_count
-                && state_count == self.provenance.state_count,
+                && state_count == self.provenance.state_count
+                && context_summary_count == self.provenance.context_summary_count
+                && context_cursor_count == self.provenance.context_cursor_count,
             "export records do not match captured committed counts"
         );
         Ok(())
@@ -182,6 +255,8 @@ async fn count(pool: &MySqlPool, table: &'static str) -> Result<u64> {
     let query = match table {
         "messages" => "SELECT COUNT(*) FROM messages",
         "state" => "SELECT COUNT(*) FROM state",
+        "context_summaries" => "SELECT COUNT(*) FROM context_summaries",
+        "context_summary_cursors" => "SELECT COUNT(*) FROM context_summary_cursors",
         _ => unreachable!("export registry is fixed"),
     };
     let count: i64 = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query_scalar(query).fetch_one(pool))
@@ -196,9 +271,12 @@ async fn messages(
     after: Option<i64>,
 ) -> Result<Vec<StorageRecord>> {
     let current = schema_version >= 3;
+    let session_provenance = schema_version >= 5;
     let rows = match after {
         Some(after) => {
-            let query = if current {
+            let query = if session_provenance {
+                "SELECT sequence, namespace, session_id, role, content_format, content FROM messages WHERE sequence > ? ORDER BY sequence LIMIT ?"
+            } else if current {
                 "SELECT sequence, namespace, role, content_format, content FROM messages WHERE sequence > ? ORDER BY sequence LIMIT ?"
             } else {
                 "SELECT sequence, namespace, role, content FROM messages WHERE sequence > ? ORDER BY sequence LIMIT ?"
@@ -213,7 +291,9 @@ async fn messages(
             .await
         }
         None => {
-            let query = if current {
+            let query = if session_provenance {
+                "SELECT sequence, namespace, session_id, role, content_format, content FROM messages ORDER BY sequence LIMIT ?"
+            } else if current {
                 "SELECT sequence, namespace, role, content_format, content FROM messages ORDER BY sequence LIMIT ?"
             } else {
                 "SELECT sequence, namespace, role, content FROM messages ORDER BY sequence LIMIT ?"
@@ -245,6 +325,14 @@ async fn messages(
                 sequence,
                 namespace: String::from_utf8(row.try_get("namespace")?)
                     .context("export message namespace is not UTF-8")?,
+                session_id: if session_provenance {
+                    row.try_get::<Option<Vec<u8>>, _>("session_id")?
+                        .map(String::from_utf8)
+                        .transpose()
+                        .context("export message session identity is not UTF-8")?
+                } else {
+                    None
+                },
                 role,
                 content_format,
                 content,
@@ -287,6 +375,108 @@ async fn state(pool: &MySqlPool, after: Option<Vec<u8>>) -> Result<Vec<StorageRe
                 key,
                 value: serde_json::from_str(&raw).context("export state contains invalid JSON")?,
             })
+        })
+        .collect()
+}
+
+async fn context_summaries(pool: &MySqlPool, after: Option<String>) -> Result<Vec<StorageRecord>> {
+    let rows = match after {
+        Some(after) => {
+            sqlx::query("SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, invocation_id, record_format, summary FROM context_summaries WHERE summary_id > ? ORDER BY summary_id LIMIT ?")
+                .bind(after)
+                .bind(PAGE_SIZE)
+                .fetch_all(pool)
+        }
+        None => {
+            sqlx::query("SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, invocation_id, record_format, summary FROM context_summaries ORDER BY summary_id LIMIT ?")
+                .bind(PAGE_SIZE)
+                .fetch_all(pool)
+        }
+    };
+    let rows = tokio::time::timeout(QUERY_TIMEOUT, rows)
+        .await
+        .context("export context summary page deadline exceeded")??;
+    rows.into_iter()
+        .map(|row| {
+            let utf8 = |column| -> Result<String> {
+                String::from_utf8(row.try_get(column)?)
+                    .with_context(|| format!("export context summary {column} is not UTF-8"))
+            };
+            let summary_id: String = row.try_get("summary_id")?;
+            ensure!(
+                summary_id.len() == 64
+                    && summary_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "export context summary identity is malformed"
+            );
+            let record = super::ContextSummaryRecord {
+                actor_namespace: utf8("actor_namespace")?,
+                session_id: utf8("session_id")?,
+                source_namespace: utf8("source_namespace")?,
+                summary_namespace: utf8("summary_namespace")?,
+                source_view: row.try_get("source_view")?,
+                source_revision: row.try_get("source_revision")?,
+                after_sequence: row.try_get("after_sequence")?,
+                through_sequence: row.try_get("through_sequence")?,
+                turn_id: utf8("turn_id")?,
+                invocation_id: utf8("invocation_id")?,
+                summary: row.try_get("summary")?,
+            };
+            super::validate_context_summary(&record)?;
+            let record_format: String = row.try_get("record_format")?;
+            ensure!(
+                record_format == super::CONTEXT_SUMMARY_FORMAT,
+                "export context summary format is unsupported"
+            );
+            Ok(StorageRecord::ContextSummary {
+                summary_id,
+                record,
+                record_format,
+            })
+        })
+        .collect()
+}
+
+async fn context_cursors(
+    pool: &MySqlPool,
+    after: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+) -> Result<Vec<StorageRecord>> {
+    let rows = match after {
+        Some((actor, session, source)) => {
+            sqlx::query("SELECT actor_namespace, session_id, source_namespace, through_sequence, summary_id, source_view, source_revision FROM context_summary_cursors WHERE (actor_namespace, session_id, source_namespace) > (?, ?, ?) ORDER BY actor_namespace, session_id, source_namespace LIMIT ?")
+                .bind(actor)
+                .bind(session)
+                .bind(source)
+                .bind(PAGE_SIZE)
+                .fetch_all(pool)
+        }
+        None => {
+            sqlx::query("SELECT actor_namespace, session_id, source_namespace, through_sequence, summary_id, source_view, source_revision FROM context_summary_cursors ORDER BY actor_namespace, session_id, source_namespace LIMIT ?")
+                .bind(PAGE_SIZE)
+                .fetch_all(pool)
+        }
+    };
+    let rows = tokio::time::timeout(QUERY_TIMEOUT, rows)
+        .await
+        .context("export context cursor page deadline exceeded")??;
+    rows.into_iter()
+        .map(|row| {
+            let utf8 = |column| -> Result<String> {
+                String::from_utf8(row.try_get(column)?)
+                    .with_context(|| format!("export context cursor {column} is not UTF-8"))
+            };
+            let cursor = super::ContextSummaryCursor {
+                actor_namespace: utf8("actor_namespace")?,
+                session_id: utf8("session_id")?,
+                source_namespace: utf8("source_namespace")?,
+                through_sequence: row.try_get("through_sequence")?,
+                summary_id: row.try_get("summary_id")?,
+                source_view: row.try_get("source_view")?,
+                source_revision: row.try_get("source_revision")?,
+            };
+            super::validate_context_summary_cursor(&cursor)?;
+            Ok(StorageRecord::ContextCursor { cursor })
         })
         .collect()
 }
@@ -402,7 +592,7 @@ mod tests {
             }
         }
         assert!(pages >= 4, "messages and state must use distinct pages");
-        snapshot.verify_counts(258, 257)?;
+        snapshot.verify_counts(258, 257, 0, 0)?;
         assert_eq!(
             records
                 .iter()
@@ -424,7 +614,7 @@ mod tests {
         )));
         assert!(records.iter().any(|record| matches!(
             record,
-            StorageRecord::Message { sequence: -2, namespace, role, content_format, content }
+            StorageRecord::Message { sequence: -2, namespace, role, content_format, content, .. }
                 if namespace == "export/unknown-namespace"
                     && role == "legacy/unknown-role"
                     && content_format == "text-v1"
@@ -439,7 +629,9 @@ mod tests {
             .iter()
             .filter_map(|record| match record {
                 StorageRecord::Message { sequence, .. } => Some(*sequence),
-                StorageRecord::State { .. } => None,
+                StorageRecord::State { .. }
+                | StorageRecord::ContextSummary { .. }
+                | StorageRecord::ContextCursor { .. } => None,
             })
             .collect();
         assert_eq!(sequences.first(), Some(&i64::MIN));
@@ -447,7 +639,9 @@ mod tests {
         let keys: Vec<_> = records
             .iter()
             .filter_map(|record| match record {
-                StorageRecord::Message { .. } => None,
+                StorageRecord::Message { .. }
+                | StorageRecord::ContextSummary { .. }
+                | StorageRecord::ContextCursor { .. } => None,
                 StorageRecord::State { key, .. } => Some(key.clone()),
             })
             .collect();
@@ -478,10 +672,20 @@ mod tests {
         let empty = store.begin_active_export().await?;
         let messages = empty.page(None).await?;
         assert!(messages.records.is_empty());
-        let state = empty.page(messages.next).await?;
-        assert!(state.records.is_empty());
-        assert!(state.next.is_none());
-        empty.verify_counts(0, 0)?;
+        let mut cursor = messages.next;
+        let mut empty_pages = 0;
+        while let Some(next) = cursor {
+            assert!(
+                empty_pages < 3,
+                "empty export must terminate after all phases"
+            );
+            let page = empty.page(Some(next)).await?;
+            assert!(page.records.is_empty());
+            cursor = page.next;
+            empty_pages += 1;
+        }
+        assert_eq!(empty_pages, 3, "empty v5 export must visit every phase");
+        empty.verify_counts(0, 0, 0, 0)?;
         store.append("export", "note", "one").await?;
         let first = store.begin_active_export().await?;
         let second = store.begin_active_export().await?;
@@ -549,7 +753,7 @@ mod tests {
             && content_format == "typed-v1"
             && serde_json::from_str::<Value>(content).ok()
                 == Some(json!({"blocks": typed.blocks.clone()}))));
-        snapshot.verify_counts(2, 0)?;
+        snapshot.verify_counts(2, 0, 0, 0)?;
         store.close().await?;
         Ok(())
     }
@@ -581,7 +785,7 @@ mod tests {
             if key.starts_with("kuru/private/reasoning-summary/v1/")
                 && value["text"] == "producer-only summary")
         );
-        snapshot.verify_counts(0, 1)?;
+        snapshot.verify_counts(0, 1, 0, 0)?;
         store.close().await?;
         Ok(())
     }

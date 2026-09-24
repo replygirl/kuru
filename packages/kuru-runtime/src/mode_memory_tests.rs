@@ -292,6 +292,90 @@ async fn alternate_suffix_survives_real_dolt_dream_promotion_undo_and_reopen() {
 }
 
 #[tokio::test]
+async fn actor_context_keeps_raw_history_in_session_but_retains_selected_notes() {
+    let project = tempfile::tempdir().unwrap();
+    let memory = MemoryStore::temporary().await.unwrap();
+    let provider = Arc::new(TaggedProvider::default());
+    let mut harness = Harness::new(
+        config(),
+        project.path(),
+        memory.clone(),
+        provider.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let target = harness.topology.parts[0].id.clone();
+    let namespace = harness.checked_namespace(&target).unwrap();
+    memory
+        .append_session_message(
+            &namespace,
+            &harness.session.id,
+            &kuru_core::Message::text("user", "current-session-private"),
+        )
+        .await
+        .unwrap();
+    memory
+        .append_session_message(
+            &namespace,
+            "other-session",
+            &kuru_core::Message::text("user", "other-session-private"),
+        )
+        .await
+        .unwrap();
+    memory
+        .append(&namespace, "user", "legacy-null-session-private")
+        .await
+        .unwrap();
+    memory
+        .append(
+            &format!("{namespace}/notes"),
+            "assistant",
+            "policy-selected-note",
+        )
+        .await
+        .unwrap();
+
+    harness
+        .run_for("session isolation request", Some(&target))
+        .await
+        .unwrap();
+    let requests = provider
+        .requests()
+        .into_iter()
+        .filter(|request| request.actor == namespace)
+        .collect::<Vec<_>>();
+    let projections = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .map(|message| message.text_projection())
+        .collect::<Vec<_>>();
+    assert!(
+        projections
+            .iter()
+            .any(|text| text == "current-session-private")
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.instructions.contains("policy-selected-note"))
+    );
+    assert!(
+        !projections
+            .iter()
+            .any(|text| text == "other-session-private")
+    );
+    assert!(
+        !projections
+            .iter()
+            .any(|text| text == "legacy-null-session-private")
+    );
+
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn cancelled_alternate_dream_abandons_its_candidate_without_live_effects() {
     let project = tempfile::tempdir().unwrap();
     let memory = MemoryStore::temporary().await.unwrap();

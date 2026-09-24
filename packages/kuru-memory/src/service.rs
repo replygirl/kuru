@@ -24,9 +24,9 @@ pub(crate) mod rpc;
 pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, ServiceValue};
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-// Exact-ref inventory and selected-abandon outcome calls require this owner
-// version. Older owners reject the new client before a mutating frame.
-pub const PROTOCOL_MINOR: u16 = 2;
+// Exact-ref recovery and session-provenance calls require this owner version.
+// Older owners reject the new client before a mutating frame.
+pub const PROTOCOL_MINOR: u16 = 4;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SERVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2138,7 +2138,8 @@ mod tests {
     #[tokio::test]
     async fn denying_outer_job_contains_owner_until_close_then_recovery_succeeds() -> Result<()> {
         use kuru_platform::windows::process::Lifetime;
-        tokio::time::timeout(Duration::from_secs(110), async {
+        let fixture_deadline = tokio::time::Instant::now() + Duration::from_secs(110);
+        tokio::time::timeout_at(fixture_deadline, async {
             let (root, project, options, executable) = windows_service_fixture()?;
             let ready = root.path().join("contained-ready");
             let release = root.path().join("contained-release");
@@ -2153,7 +2154,8 @@ mod tests {
             )
             .spawn()
             .await?;
-            let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+            // Leave the outer fixture time to report and reap a stalled starter.
+            let ready_deadline = fixture_deadline - Duration::from_secs(2);
             while !ready.exists() {
                 if let Some(status) = starter.try_wait()? {
                     bail!("contained memory starter exited before readiness: {status}");
@@ -2884,7 +2886,8 @@ mod tests {
     async fn crashed_owner_retains_accepted_receipt_after_sibling_write() -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        tokio::time::timeout(Duration::from_secs(120), async {
+        let fixture_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        tokio::time::timeout_at(fixture_deadline, async {
             let root = crate::test_support::tempdir()?;
             let project = root.path().join("project");
             std::fs::create_dir(&project)?;
@@ -2919,7 +2922,8 @@ mod tests {
                 )
                 .await?,
             ));
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            // Preserve the existing diagnostic and process cleanup path on expiry.
+            let deadline = fixture_deadline - Duration::from_secs(2);
             let mut observations = FixtureAttachObservations::default();
             let mut original = loop {
                 if let Some(attached) = try_attach_fixture_stage(

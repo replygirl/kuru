@@ -206,9 +206,14 @@ impl Actor {
                         .collect::<Result<Vec<_>>>()?;
                     let (mut optional_private, omitted_private_rows) = if own_history {
                         let older_limit = work.history_limit.saturating_sub(work.inputs.len());
-                        let window =
-                            read_window(&work.memory, &namespace, older_limit, &work.cancellation)
-                                .await?;
+                        let window = read_session_window(
+                            &work.memory,
+                            &namespace,
+                            &work.invocation.session_id,
+                            older_limit,
+                            &work.cancellation,
+                        )
+                        .await?;
                         let omitted = window
                             .total_rows
                             .saturating_sub(window.messages.len() as u64);
@@ -250,7 +255,7 @@ impl Actor {
                     for input in &work.inputs {
                         work.cancellation.check()?;
                         work.memory
-                            .append_message(&namespace, input)
+                            .append_session_message(&namespace, &work.invocation.session_id, input)
                             .await
                             .map_err(MemoryFailure)?;
                         work.cancellation.check()?;
@@ -415,8 +420,9 @@ impl Actor {
                     if !durable_blocks.is_empty() {
                         work.cancellation.check()?;
                         work.memory
-                            .append_message(
+                            .append_session_message(
                                 &namespace,
+                                &work.invocation.session_id,
                                 &Message {
                                     role: "assistant".into(),
                                     blocks: durable_blocks,
@@ -481,6 +487,24 @@ async fn read_window(
         .wait(async {
             memory
                 .history_window(namespace, limit)
+                .await
+                .map_err(MemoryFailure)
+                .map_err(Into::into)
+        })
+        .await
+}
+
+async fn read_session_window(
+    memory: &MemoryStore,
+    namespace: &str,
+    session_id: &str,
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<kuru_memory::HistoryWindow> {
+    cancellation
+        .wait(async {
+            memory
+                .session_history_window(namespace, session_id, limit)
                 .await
                 .map_err(MemoryFailure)
                 .map_err(Into::into)
