@@ -963,7 +963,7 @@ impl McpHosts {
                     if !state.close_attempted {
                         let _ = close_transport(&mut state).await;
                     }
-                    state.diagnostic = Some(error.to_string());
+                    state.diagnostic.get_or_insert_with(|| error.to_string());
                     self.routes
                         .write()
                         .await
