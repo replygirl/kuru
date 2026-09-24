@@ -69,7 +69,7 @@ async fn finish(login: impl Future<Output = Result<AuthStatus>>) -> Result<AuthS
 }
 
 #[cfg(unix)]
-async fn open_browser(url: &str) -> Result<()> {
+pub(crate) async fn open_browser(url: &str) -> Result<()> {
     use std::process::Stdio;
     let program = if cfg!(target_os = "macos") {
         "open"
@@ -145,7 +145,7 @@ mod tests {
 }
 
 #[cfg(windows)]
-async fn open_browser(url: &str) -> Result<()> {
+pub(crate) async fn open_browser(url: &str) -> Result<()> {
     kuru_platform::windows::browser::open_http_url(url)
         .await
         .map_err(Into::into)

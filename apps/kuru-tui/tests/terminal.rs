@@ -25,8 +25,8 @@ use axum::{
 };
 use futures::stream;
 use kuru_core::{
-    Config, McpConfig, Mode, ModeProfile, PermissionAction, PermissionRule, PermissionSelector,
-    SelectionOverrides,
+    Config, McpConfig, McpOAuthConfig, Mode, ModeProfile, PermissionAction, PermissionRule,
+    PermissionSelector, SelectionOverrides,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1894,6 +1894,60 @@ async fn real_pty_mcp_catalog_parity_and_mixed_call_batch_are_fail_closed() -> R
     );
     assert_eq!(disabled.started()?, 0, "disabled MCP process started");
     Ok(())
+}
+
+#[test]
+fn real_pty_mcp_oauth_status_uses_the_shared_command_family_without_network() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    kuru_platform::fs::Directory::ensure_private(&sandbox.data)?;
+    let mut config = sandbox.config()?;
+    config.mcp = BTreeMap::from([(
+        "auth".into(),
+        McpConfig {
+            enabled: false,
+            url: Some("https://disabled.example.test/mcp".into()),
+            oauth: Some(McpOAuthConfig {
+                enabled: true,
+                client_id: Some("native-client".into()),
+                client_secret_env: Some("KURU_TEST_MCP_CLIENT_SECRET".into()),
+                scopes: vec!["mcp.read".into()],
+                ..McpOAuthConfig::default()
+            }),
+            ..McpConfig::default()
+        },
+    )]);
+    let config_path = sandbox.root.path().join("mcp-oauth-pty.toml");
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+
+    let mut command = sandbox.command("demo");
+    command
+        .args(["--config"])
+        .arg(&config_path)
+        .arg("--trust-workspace-once")
+        .env(
+            "KURU_TEST_MCP_CLIENT_SECRET",
+            "recognizable-pty-client-secret",
+        )
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 45, 150)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command("/mcp status auth", None)?;
+    terminal.wait_composer_frame(
+        &[
+            "\"alias\": \"auth\"",
+            "\"state\": \"disabled\"",
+            "\"availability\": \"disabled\"",
+            "enter send",
+        ],
+        READY_TIMEOUT,
+    )?;
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    ensure!(
+        !String::from_utf8_lossy(&terminal.output).contains("recognizable-pty-client-secret"),
+        "MCP status terminal output disclosed the configured client secret"
+    );
+    terminal.assert_restored()
 }
 
 #[derive(Clone)]

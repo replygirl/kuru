@@ -207,6 +207,46 @@ fn mcp_catalog_controls_keep_native_and_schema_validation_in_parity() {
 }
 
 #[test]
+fn mcp_oauth_keeps_native_and_schema_validation_in_parity() {
+    let validator = schema();
+    for text in [
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={X-Tenant='MCP_TENANT'}\n[mcp.remote.oauth]\nenabled=true\nclient_id='kuru'\nclient_secret_env='MCP_SECRET'\nscopes=['files:read']",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nclient_metadata_url='https://client.example.test/kuru.json'",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={Authorization='MCP_AUTH'}\n[mcp.remote.oauth]\nenabled=false",
+    ] {
+        assert!(validator.is_valid(&json_from_toml(text)), "schema: {text}");
+        parse_config(text).unwrap();
+    }
+
+    for text in [
+        "[mcp.local]\ncommand='runner'\n[mcp.local.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='http://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={Authorization='MCP_AUTH'}\n[mcp.remote.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={'Proxy-Authorization'='MCP_AUTH'}\n[mcp.remote.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nclient_id='a'\nclient_metadata_url='https://client.example.test/kuru.json'",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nclient_secret_env='MCP_SECRET'",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nclient_metadata_url='http://client.example.test/kuru.json'",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nscopes=['same','same']",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nscopes=['bad scope']",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nrefresh_token='secret'",
+    ] {
+        assert!(!validator.is_valid(&json_from_toml(text)), "schema: {text}");
+        assert!(parse_config(text).is_err(), "parser: {text}");
+    }
+
+    let too_many = (0..65)
+        .map(|index| format!("'scope:{index}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let text = format!(
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nscopes=[{too_many}]"
+    );
+    assert!(!validator.is_valid(&json_from_toml(&text)));
+    assert!(parse_config(&text).is_err());
+}
+
+#[test]
 fn permission_schema_and_parser_agree_on_documented_and_invalid_rules() {
     let validator = schema();
     let documented = concat!(

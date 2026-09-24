@@ -27,6 +27,9 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | `/clear` | Clear this terminal's visible conversation while retaining stored history and session identity |
 | `/status` | Show local session, project, selections, turns, and known usage without a provider call |
 | `/tools` | Inspect filtered tools and disabled/live/stale/degraded MCP aliases without a provider call |
+| `/mcp login [--device\|--no-browser] ALIAS` | Sign in to one OAuth-enabled MCP alias |
+| `/mcp status ALIAS` | Inspect redacted local MCP authorization and availability state |
+| `/mcp logout ALIAS` | Delete the local credential and report remote revocation separately |
 | `/parts` | Inspect parts and relationships |
 | `/mode ifs` | Change the current framework |
 | `/model MODEL_ID` | Select a model |

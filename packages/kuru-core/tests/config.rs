@@ -574,6 +574,28 @@ fn manifest_binds_active_mcp_catalog_policy_and_omits_disabled_authority() {
 
     write(
         &config,
+        concat!(
+            "[mcp.remote]\n",
+            "enabled=false\n",
+            "url='https://resource.example.test/mcp'\n",
+            "[mcp.remote.oauth]\n",
+            "enabled=true\n",
+            "client_id='kuru-test'\n",
+            "client_secret_env='MCP_CLIENT_SECRET'\n",
+        ),
+    );
+    let disabled =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert!(
+        disabled
+            .manifest()
+            .claims()
+            .iter()
+            .all(|claim| claim.category() != AuthorityClaimCategory::McpHttp)
+    );
+
+    write(
+        &config,
         "[mcp.remote]\nenabled=false\nurl='https://example.test/mcp'\nheader_env={Authorization='OTHER_AUTH'}",
     );
     let disabled =
@@ -1367,6 +1389,24 @@ fn mcp_requires_one_transport_and_valid_process_arguments_and_environment() {
     ] {
         assert!(load_text(text).is_err(), "{text}");
     }
+
+    let literal_secret = "KURU_LITERAL_SECRET_MUST_NOT_ECHO_8E178B";
+    let error = load_text(&format!(
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\naccess_token='{literal_secret}'"
+    ))
+    .unwrap_err();
+    assert!(!format!("{error:#}").contains(literal_secret));
+
+    let too_many = (0..65)
+        .map(|index| format!("'scope:{index}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(
+        load_text(&format!(
+            "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nscopes=[{too_many}]"
+        ))
+        .is_err()
+    );
     let mcp = McpConfig {
         command: Some("server".into()),
         args: vec!["--safe".into()],
@@ -1434,6 +1474,73 @@ fn mcp_catalog_controls_are_default_enabled_bounded_and_deny_first() {
     oversized.deny_tools = vec!["?".into(); 129];
     config.mcp.insert("local".into(), oversized);
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn mcp_oauth_configuration_is_bounded_isolated_and_manifest_bound() {
+    let directory = TempDir::new().unwrap();
+    let project = directory.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let config = directory.path().join(".kuru/config.toml");
+    let configured = concat!(
+        "[mcp.remote]\n",
+        "url='https://resource.example.test/mcp'\n",
+        "header_env={X-Tenant='MCP_TENANT'}\n",
+        "[mcp.remote.oauth]\n",
+        "enabled=true\n",
+        "client_id='kuru-test'\n",
+        "client_secret_env='MCP_CLIENT_SECRET'\n",
+        "scopes=['files:read','files:write']\n",
+    );
+    write(&config, configured);
+    let first =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let parsed = load_text(configured).unwrap();
+    let oauth = parsed.mcp["remote"].oauth.as_ref().unwrap();
+    assert!(oauth.enabled);
+    assert_eq!(oauth.client_id.as_deref(), Some("kuru-test"));
+    assert_eq!(oauth.scopes, ["files:read", "files:write"]);
+    let first_digest = first.manifest().full_digest();
+
+    write(
+        &config,
+        concat!(
+            "[mcp.remote]\n",
+            "url='https://resource.example.test/mcp'\n",
+            "header_env={X-Tenant='MCP_TENANT'}\n",
+            "[mcp.remote.oauth]\n",
+            "enabled=true\n",
+            "client_id='kuru-test'\n",
+            "client_secret_env='MCP_CLIENT_SECRET'\n",
+            "scopes=['files:read']\n",
+        ),
+    );
+    let changed =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_ne!(changed.manifest().full_digest(), first_digest);
+
+    for text in [
+        "[mcp.local]\ncommand='runner'\n[mcp.local.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='http://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={Authorization='MCP_AUTH'}\n[mcp.remote.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={'Proxy-Authorization'='MCP_AUTH'}\n[mcp.remote.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nclient_id='configured'\nclient_metadata_url='https://client.example.test/kuru.json'",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nclient_secret_env='MCP_SECRET'",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nclient_metadata_url='http://client.example.test/kuru.json'",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nscopes=['files:read','files:read']",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nscopes=['bad scope']",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\naccess_token='secret'",
+    ] {
+        assert!(load_text(text).is_err(), "{text}");
+    }
+
+    for text in [
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true",
+        "[mcp.remote]\nurl='https://example.test/mcp'\n[mcp.remote.oauth]\nenabled=true\nclient_metadata_url='https://client.example.test/kuru.json'",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={Authorization='MCP_AUTH'}\n[mcp.remote.oauth]\nenabled=false",
+    ] {
+        load_text(text).unwrap();
+    }
 }
 
 #[test]

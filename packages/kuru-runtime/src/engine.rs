@@ -15,9 +15,10 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use kuru_connectors::{
-    ApprovalSender, CheckpointSummary, InstructionReviewSender, ParallelReadAdmission,
-    ParallelReadCancellation, PermissionService, PreparedRead, Provider, ToolHost, a2a_send,
-    is_permission_denied, project_text,
+    ApprovalSender, CheckpointSummary, InstructionReviewSender, McpBrowserLogin, McpDeviceLogin,
+    McpOAuthAliasStatus, McpOAuthLogout, ParallelReadAdmission, ParallelReadCancellation,
+    PermissionService, PreparedRead, Provider, ToolHost, a2a_send, is_permission_denied,
+    project_text,
 };
 use kuru_core::{
     ActorPhase, Completion, Config, ContextBudget, FacingInput, InvocationStart, Message, Mode,
@@ -696,6 +697,63 @@ impl Harness {
     /// making a provider request. Stale metadata never creates a live route.
     pub async fn tool_catalog(&self) -> Result<kuru_connectors::ToolCatalog> {
         self.tools.catalog().await
+    }
+
+    pub async fn begin_mcp_oauth_browser(&self, alias: &str) -> Result<McpBrowserLogin> {
+        self.tools.begin_mcp_oauth_browser(alias).await
+    }
+
+    pub async fn begin_mcp_oauth_device(&self, alias: &str) -> Result<McpDeviceLogin> {
+        self.tools.begin_mcp_oauth_device(alias).await
+    }
+
+    pub async fn mcp_oauth_status(&self, alias: &str) -> Result<McpOAuthAliasStatus> {
+        self.tools.mcp_oauth_status(alias).await
+    }
+
+    pub async fn mcp_oauth_logout(&self, alias: &str) -> Result<McpOAuthLogout> {
+        self.tools.mcp_oauth_logout(alias).await
+    }
+
+    pub fn publish_mcp_login_guidance(&self, detail: String) {
+        let _ = self.events.send(Event::Mcp {
+            actor: "kuru-auth".into(),
+            detail,
+        });
+    }
+
+    pub async fn finish_mcp_browser_login(
+        &self,
+        login: McpBrowserLogin,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let result = login
+            .finish_with_cancellation(async {
+                cancellation.cancelled().await;
+                Ok(())
+            })
+            .await;
+        if result.is_err() && cancellation.is_cancelled() {
+            cancellation.check()?;
+        }
+        result
+    }
+
+    pub async fn finish_mcp_device_login(
+        &self,
+        login: McpDeviceLogin,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let result = login
+            .finish_with_cancellation(async {
+                cancellation.cancelled().await;
+                Ok(())
+            })
+            .await;
+        if result.is_err() && cancellation.is_cancelled() {
+            cancellation.check()?;
+        }
+        result
     }
 
     pub fn file_checkpoints(&self, limit: usize) -> Result<Vec<CheckpointSummary>> {

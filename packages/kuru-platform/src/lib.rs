@@ -8,6 +8,7 @@
 //! Database, shell, updater and application policy remain with their consumers.
 
 pub mod fs;
+pub mod secret;
 
 #[cfg(unix)]
 pub mod local_ipc;

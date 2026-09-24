@@ -238,6 +238,14 @@ deny_tools = ["*_secret"]
 url = "https://example.com/mcp"
 header_env = { Authorization = "REMOTE_MCP_AUTH" }
 
+[mcp.oauth_service]
+url = "https://mcp.example.com/tools"
+
+[mcp.oauth_service.oauth]
+enabled = true
+client_id = "kuru-native-client"
+scopes = ["mcp.read", "mcp.write"]
+
 [mcp.disabled_service]
 enabled = false
 command = "/absolute/path/to/disabled-server"
@@ -247,6 +255,16 @@ research_peer = "https://example.com/a2a"
 ```
 
 MCP servers have exactly one transport: `command` or `url`. Stdio entries may have `args` and `env`; HTTP entries may not. HTTP `header_env` maps validated header names to environment-variable names, never literal values, and excludes protocol-owned headers. Resolved values are limited to 16 KiB each and 64 KiB across one server. Servers default enabled. A disabled alias performs no header resolution, spawn, connection, cache read, or route construction. `allow_tools` and `deny_tools` use bounded `*`/`?` patterns against original server names; deny wins and a nonempty allow list is selective. At most 64 MCP servers and 64 external agent endpoints are accepted. Endpoint URLs reject embedded credentials and fragments.
+
+An enabled OAuth table requires an HTTPS HTTP transport. Choose one configured
+`client_id`, one HTTPS `client_metadata_url`, or an authorization server that
+advertises dynamic registration. `scopes` is a restrictive ceiling; resource
+challenges remain authoritative. OAuth cannot share an alias with
+`Authorization` or `Proxy-Authorization` in `header_env`. Other validated
+headers remain resource-only. Credentials are stored in Kuru's native secret
+store and never in TOML, the workspace, catalog cache, status output, or a
+plaintext fallback. Use `kuru mcp login|status|logout ALIAS`; see [MCP](./mcp)
+for browser, device, refresh, and revocation behavior.
 
 Live discovery stores only bounded, versioned metadata in Kuru's owner-private data directory outside the workspace. A context-matching entry can be shown as stale after an offline restart, but stale metadata creates no route or permission. The binding includes the exact workspace authority, alias, endpoint, filters, header references, and resolved header context; malformed or mismatched records fail closed and do not prevent a healthy server from replacing them.
 
