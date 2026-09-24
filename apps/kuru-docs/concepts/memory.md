@@ -121,6 +121,15 @@ revisions, candidate branches, uncommitted rows, operations and schema tables ar
 provider-free and refuses fresh stores, legacy import, and overwriting an output
 path; it is not a history-rewrite, purge, or secure-erasure operation.
 
+The export is full-project data for its invoking owner and can contain
+producer-private state, including settled provider reasoning summaries. Keep its
+output private. Transcript, peer context, fork presentation, and session export
+do not project that state. During an active selected-speaker turn, the existing
+TUI may show a bounded transient text-only reasoning preview; it carries no
+provider coordinates, clears with the turn, and is never a durable record. The
+producing actor can use private state only through a policy-selected replay or
+compaction path; it is never injected into every request.
+
 History follows the Dolt commit graph from the current revision toward older
 ancestors, with a stable hash tie-break rather than wall-clock ordering. Kuru
 reconciles an interrupted write against its durable receipt before it continues,

@@ -22,7 +22,8 @@ pub use store::purge::PurgeOutcome;
 pub use store::{
     CandidateConflict, CandidateInventoryPage, CandidateRefRefusal, CandidateRefRejected,
     CandidateRefState, CandidateRefStatus, ExportProvenance, HistoryWindow, MemoryStatus,
-    OpenOptions, Revision, StorageRecord, StoredNote, UsageProof,
+    OpenOptions, ReasoningSummaryConflict, ReasoningSummaryRecord, Revision, StorageRecord,
+    StoredNote, UsageProof,
 };
 
 #[cfg(any(test, feature = "test-support"))]

@@ -62,6 +62,9 @@ pub enum ServiceCall {
     PutMany {
         values: Vec<(String, Value)>,
     },
+    PutReasoningSummaries {
+        records: Vec<crate::ReasoningSummaryRecord>,
+    },
     Get {
         key: String,
     },
@@ -148,6 +151,7 @@ impl ServiceCall {
             Self::RetireIfIdle
             | Self::AppendMessage { .. }
             | Self::PutMany { .. }
+            | Self::PutReasoningSummaries { .. }
             | Self::BeginCandidate { .. }
             | Self::PromoteCandidate { .. }
             | Self::AbandonCandidate { .. } => true,
@@ -185,6 +189,7 @@ impl ServiceCall {
         match self {
             Self::AppendMessage { .. } => Some("append_message"),
             Self::PutMany { .. } => Some("put_many"),
+            Self::PutReasoningSummaries { .. } => Some("put_reasoning_summaries"),
             Self::View { operation, .. } => match operation {
                 ViewOperation::Append { .. } => Some("view.append"),
                 ViewOperation::AppendMessage { .. } => Some("view.append_message"),
@@ -439,6 +444,7 @@ pub enum ServiceFault {
     GenerationChanged,
     StorageFailed,
     CandidateConflict,
+    ReasoningSummaryConflict,
     ReceiptConflict,
     CandidateRefRejected(CandidateRefRefusal),
 }
@@ -873,6 +879,11 @@ async fn respond<S: AsyncWrite + Unpin>(
                 {
                     ServiceFault::CandidateConflict
                 } else if error
+                    .downcast_ref::<crate::store::ReasoningSummaryConflict>()
+                    .is_some()
+                {
+                    ServiceFault::ReasoningSummaryConflict
+                } else if error
                     .downcast_ref::<crate::store::LogicalReceiptConflict>()
                     .is_some()
                 {
@@ -887,6 +898,7 @@ async fn respond<S: AsyncWrite + Unpin>(
                     let kind = match fault {
                         ServiceFault::CandidateRefRejected(_) => "ref_rejected",
                         ServiceFault::CandidateConflict => "candidate_conflict",
+                        ServiceFault::ReasoningSummaryConflict => "reasoning_summary_conflict",
                         ServiceFault::ReceiptConflict => "receipt_conflict",
                         ServiceFault::StorageFailed => "storage_failed",
                         ServiceFault::GenerationChanged => "generation_changed",
@@ -1310,6 +1322,9 @@ pub(super) fn resolve_response(response: ServiceResponse) -> Result<ServiceValue
         ServiceResponse::Rejected(ServiceFault::CandidateConflict) => {
             Err(crate::store::CandidateConflict.into())
         }
+        ServiceResponse::Rejected(ServiceFault::ReasoningSummaryConflict) => {
+            Err(crate::store::ReasoningSummaryConflict.into())
+        }
         ServiceResponse::Rejected(ServiceFault::ReceiptConflict) => {
             bail!("logical mutation ID conflicts with a different operation on this memory view")
         }
@@ -1365,6 +1380,16 @@ async fn dispatch(
             store
                 .with_logical_receipt(request_id, method, encoded)
                 .put_many(&values)
+                .await?;
+            ServiceValue::Unit
+        }
+        ServiceCall::PutReasoningSummaries { records } => {
+            let (method, encoded) = unit_receipt
+                .as_ref()
+                .context("missing private reasoning summary receipt")?;
+            store
+                .with_logical_receipt(request_id, method, encoded)
+                .put_reasoning_summaries(&records)
                 .await?;
             ServiceValue::Unit
         }
@@ -1599,7 +1624,42 @@ async fn dispatch_ledger(store: &MemoryStore, operation: LedgerOperation) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReasoningSummaryRecord;
     use tokio::io::{AsyncWriteExt, duplex};
+
+    #[test]
+    fn worst_escaped_reasoning_summary_request_fits_the_rpc_frame() -> Result<()> {
+        let count = 1024usize;
+        let identity_bytes_per_record = 4usize;
+        let text_bytes = crate::store::MAX_REASONING_SUMMARY_BATCH_STRING_BYTES
+            .checked_sub(identity_bytes_per_record * count)
+            .context("summary identity bytes exceed the aggregate limit")?;
+        let per_record = text_bytes / count;
+        let remainder = text_bytes % count;
+        let records = (0..count)
+            .map(|index| ReasoningSummaryRecord {
+                session_id: "s".into(),
+                turn_id: "t".into(),
+                actor_id: "a".into(),
+                invocation_id: "i".into(),
+                item_id: None,
+                output_index: None,
+                summary_index: u64::try_from(index).expect("summary index fits u64"),
+                text: "\u{0001}".repeat(per_record + usize::from(index < remainder)),
+            })
+            .collect::<Vec<_>>();
+        crate::store::validate_reasoning_summaries(&records)?;
+        let request = ServiceRequest::with_id(
+            "generation",
+            Uuid::nil(),
+            ServiceCall::PutReasoningSummaries { records },
+        );
+        ensure!(
+            serde_json::to_vec(&request)?.len() <= OPERATION_FRAME_LIMIT,
+            "worst escaped private reasoning summary request exceeds the RPC frame"
+        );
+        Ok(())
+    }
 
     #[test]
     fn selected_candidate_resolution_temporarily_excludes_new_attachments() -> Result<()> {

@@ -157,6 +157,77 @@ async fn subscription(peer: &Peer) -> (ResponsesProvider, AuthManager, tempfile:
 }
 
 #[tokio::test]
+async fn settled_reasoning_sidecar_follows_only_a_successful_terminal_response() {
+    let peer = Peer::new(vec![stream(vec![
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-1","output_index":4,"summary_index":0,"delta":"checked"}),
+        json!({"type":"response.completed","response":{
+            "id":"response-summary-fixture",
+            "usage":{"input_tokens":8,"output_tokens":5},
+            "output":[
+                {"type":"message","id":"message-1","content":[{"type":"output_text","text":"ready"}]},
+                {"type":"reasoning","id":"reasoning-1","summary":[{"type":"summary_text","text":"checked"}]}
+            ]
+        }}),
+    ])])
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    let (sender, mut receiver) = mpsc::channel(8);
+    provider
+        .stream(request(), &mut EventSink(sender))
+        .await
+        .unwrap();
+    let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+    let settled = events
+        .iter()
+        .position(|event| matches!(event, ProviderEvent::SettledReasoningSummaries(_)))
+        .expect("successful terminal response must settle its private sidecar");
+    let completed = events
+        .iter()
+        .position(|event| matches!(event, ProviderEvent::Completed(_)))
+        .expect("successful terminal response must complete");
+    assert!(settled < completed);
+    assert!(matches!(
+        &events[settled],
+        ProviderEvent::SettledReasoningSummaries(summaries)
+            if summaries == &vec![ProviderReasoningSummary {
+                item_id: Some("reasoning-1".into()),
+                output_index: Some(4),
+                summary_index: 0,
+                text: "checked".into(),
+            }]
+    ));
+}
+
+#[tokio::test]
+async fn incomplete_reasoning_stream_never_emits_a_settled_sidecar() {
+    let peer = Peer::new(vec![stream(vec![
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"reasoning-1","output_index":4,"summary_index":0,"delta":"partial"}),
+        json!({"type":"response.incomplete","response":{"usage":{"input_tokens":8,"output_tokens":5}}}),
+    ])])
+    .await;
+    let (provider, _manager, _directory) = subscription(&peer).await;
+    let (sender, mut receiver) = mpsc::channel(8);
+    assert!(
+        provider
+            .stream(request(), &mut EventSink(sender))
+            .await
+            .is_err()
+    );
+    let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, ProviderEvent::SettledReasoningSummaries(_)))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::Failed {
+            kind: ProviderFailureKind::Incomplete
+        }
+    )));
+}
+
+#[tokio::test]
 async fn mapped_native_continuation_fits_at_mixed_boundary_and_keeps_pending_wire_bytes() {
     let opaque = "fixture-native-output".repeat(160);
     let tool_reply = || {

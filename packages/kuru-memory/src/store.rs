@@ -48,6 +48,31 @@ const CANDIDATE_RECOVERY_BATCH: i64 = 16;
 const TEXT_FORMAT: &str = "text-v1";
 const TYPED_FORMAT: &str = "typed-v1";
 const MAX_TYPED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_REASONING_SUMMARY_BATCH_STRING_BYTES: usize = 16 * 1024 * 1024;
+const PRIVATE_REASONING_SUMMARY_PREFIX: &str = "kuru/private/reasoning-summary/v1/";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReasoningSummaryRecord {
+    pub session_id: String,
+    pub turn_id: String,
+    pub actor_id: String,
+    pub invocation_id: String,
+    pub item_id: Option<String>,
+    pub output_index: Option<u64>,
+    pub summary_index: u64,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReasoningSummaryConflict;
+
+impl std::fmt::Display for ReasoningSummaryConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("private reasoning summary conflicts with its settled identity")
+    }
+}
+
+impl std::error::Error for ReasoningSummaryConflict {}
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -1770,6 +1795,15 @@ impl MemoryStore {
         self.mutate("state", Mutation::State(encoded)).await
     }
 
+    pub async fn put_reasoning_summaries(&self, records: &[ReasoningSummaryRecord]) -> Result<()> {
+        let encoded = encode_reasoning_summaries(records)?;
+        self.mutate(
+            "private reasoning summaries",
+            Mutation::PrivateReasoningSummaries(encoded),
+        )
+        .await
+    }
+
     /// Append messages to one namespace and update state in the same durable
     /// receipt-bearing transaction. This is the narrow turn-checkpoint seam;
     /// callers do not receive general SQL or cross-namespace authority.
@@ -2620,6 +2654,7 @@ enum Mutation {
         format: Option<&'static str>,
     },
     State(Vec<(String, String)>),
+    PrivateReasoningSummaries(Vec<(String, String)>),
     Checkpoint {
         namespace: String,
         messages: Vec<(String, String)>,
@@ -2668,6 +2703,26 @@ async fn apply(
         Mutation::State(values) => {
             for (key, value) in values {
                 sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)").bind(key.as_bytes()).bind(value).execute(&mut *transaction).await?;
+            }
+        }
+        Mutation::PrivateReasoningSummaries(values) => {
+            for (key, value) in values {
+                let existing: Option<String> =
+                    sqlx::query_scalar("SELECT value FROM state WHERE `key` = ? FOR UPDATE")
+                        .bind(key.as_bytes())
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if let Some(existing) = existing {
+                    if existing != value {
+                        return Err(ReasoningSummaryConflict.into());
+                    }
+                } else {
+                    sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                        .bind(key.as_bytes())
+                        .bind(value)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
             }
         }
         Mutation::Checkpoint {
@@ -2758,6 +2813,88 @@ fn encode_state(values: &[(String, Value)]) -> Result<Vec<(String, String)>> {
         encoded.push((key.clone(), serde_json::to_string(value)?));
     }
     Ok(encoded)
+}
+
+fn encode_reasoning_summaries(records: &[ReasoningSummaryRecord]) -> Result<Vec<(String, String)>> {
+    validate_reasoning_summaries(records)?;
+    Ok(records
+        .iter()
+        .map(|record| {
+            Ok((
+                reasoning_summary_key(record)?,
+                serde_json::to_string(record)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?
+        .into_iter()
+        .collect())
+}
+
+/// Validate one complete private-summary mutation before an attachment sends
+/// it. The owner invokes the same validation again because the RPC boundary is
+/// untrusted; callers use it to reject definite no-effect inputs without
+/// turning a local serialization failure into an uncertain remote write.
+pub(crate) fn validate_reasoning_summaries(records: &[ReasoningSummaryRecord]) -> Result<()> {
+    ensure!(
+        (1..=1024).contains(&records.len()),
+        "private reasoning summary batch must contain 1–1024 records"
+    );
+    let mut string_bytes = 0usize;
+    let mut identities = BTreeMap::new();
+    for record in records {
+        for (field, value, limit) in [
+            ("reasoning summary session", &record.session_id, 1024),
+            ("reasoning summary turn", &record.turn_id, 1024),
+            ("reasoning summary actor", &record.actor_id, 1024),
+            ("reasoning summary invocation", &record.invocation_id, 1024),
+            (
+                "reasoning summary text",
+                &record.text,
+                MAX_TYPED_MESSAGE_BYTES,
+            ),
+        ] {
+            identifier(field, value, limit)?;
+            string_bytes = string_bytes
+                .checked_add(value.len())
+                .context("private reasoning summary aggregate byte count overflow")?;
+        }
+        if let Some(item_id) = &record.item_id {
+            identifier("reasoning summary item", item_id, 1024)?;
+            string_bytes = string_bytes
+                .checked_add(item_id.len())
+                .context("private reasoning summary aggregate byte count overflow")?;
+        }
+        ensure!(
+            string_bytes <= MAX_REASONING_SUMMARY_BATCH_STRING_BYTES,
+            "private reasoning summary batch strings exceed 16 MiB"
+        );
+        let key = reasoning_summary_key(record)?;
+        let value = serde_json::to_string(record)?;
+        if let Some(existing) = identities.insert(key, value.clone()) {
+            ensure!(existing == value, ReasoningSummaryConflict);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reasoning_summary_key(record: &ReasoningSummaryRecord) -> Result<String> {
+    let encoded = serde_json::to_vec(&(
+        &record.session_id,
+        &record.turn_id,
+        &record.actor_id,
+        &record.invocation_id,
+        &record.item_id,
+        record.output_index,
+        record.summary_index,
+    ))?;
+    let digest = Sha256::digest(encoded);
+    Ok(format!(
+        "{PRIVATE_REASONING_SUMMARY_PREFIX}{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
 }
 
 #[derive(Serialize)]
@@ -3271,6 +3408,115 @@ mod tests {
     use crate::service::{self, ServiceCall, ServiceValue};
     use serde_json::json;
     use sha2::Digest;
+
+    fn reasoning_summary(text: impl Into<String>) -> ReasoningSummaryRecord {
+        ReasoningSummaryRecord {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            actor_id: "actor".into(),
+            invocation_id: "invocation".into(),
+            item_id: Some("item".into()),
+            output_index: Some(0),
+            summary_index: 0,
+            text: text.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn private_reasoning_summary_batch_is_atomic_and_idempotent() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let first = reasoning_summary("first");
+        store
+            .put_reasoning_summaries(std::slice::from_ref(&first))
+            .await?;
+        store
+            .put_reasoning_summaries(std::slice::from_ref(&first))
+            .await?;
+
+        let mut fresh = reasoning_summary("fresh");
+        fresh.summary_index = 1;
+        let mut conflicting = first.clone();
+        conflicting.text = "conflicting".into();
+        let error = store
+            .put_reasoning_summaries(&[fresh.clone(), conflicting])
+            .await
+            .unwrap_err();
+        ensure!(
+            error.downcast_ref::<ReasoningSummaryConflict>().is_some(),
+            "different payload for a settled summary identity was not a typed conflict: {error:#}"
+        );
+        let first_key = reasoning_summary_key(&first)?;
+        let fresh_key = reasoning_summary_key(&fresh)?;
+        ensure!(
+            store.get(&first_key).await? == Some(serde_json::to_value(&first)?),
+            "idempotent reasoning summary changed its original durable payload"
+        );
+        ensure!(
+            store.get(&fresh_key).await?.is_none(),
+            "summary batch committed a prefix before its later identity conflict"
+        );
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn private_reasoning_summary_identity_keeps_equal_text_in_its_admitted_tuple()
+    -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let first = reasoning_summary("same provider text");
+        let mut other_session = first.clone();
+        other_session.session_id = "other-session".into();
+        let mut other_actor = first.clone();
+        other_actor.actor_id = "other-actor".into();
+        let mut other_turn = first.clone();
+        other_turn.turn_id = "other-turn".into();
+        let mut other_invocation = first.clone();
+        other_invocation.invocation_id = "other-invocation".into();
+        let records = [
+            first.clone(),
+            other_session.clone(),
+            other_actor.clone(),
+            other_turn.clone(),
+            other_invocation.clone(),
+        ];
+        store.put_reasoning_summaries(&records).await?;
+
+        let keys = records
+            .iter()
+            .map(reasoning_summary_key)
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        ensure!(
+            keys.len() == records.len(),
+            "distinct admitted reasoning-summary identities shared one durable key"
+        );
+        for record in records {
+            let key = reasoning_summary_key(&record)?;
+            ensure!(
+                store.get(&key).await? == Some(serde_json::to_value(record)?),
+                "reasoning summary identity did not retain its exact admitted record"
+            );
+        }
+        store.close().await?;
+        Ok(())
+    }
+
+    #[test]
+    fn private_reasoning_summary_batch_bounds_total_identity_and_text_bytes() -> Result<()> {
+        let mut at_limit = reasoning_summary("");
+        let identity_bytes = at_limit.session_id.len()
+            + at_limit.turn_id.len()
+            + at_limit.actor_id.len()
+            + at_limit.invocation_id.len()
+            + at_limit.item_id.as_ref().map_or(0, String::len);
+        at_limit.text = "x".repeat(MAX_REASONING_SUMMARY_BATCH_STRING_BYTES - identity_bytes);
+        encode_reasoning_summaries(&[at_limit.clone()])?;
+        at_limit.text.push('x');
+        ensure!(
+            encode_reasoning_summaries(&[at_limit]).is_err(),
+            "reasoning summary aggregate accepted one byte over its 16 MiB bound"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn service_disconnect_and_owner_restart_preserve_unresolved_candidate() -> Result<()> {

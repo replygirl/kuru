@@ -553,4 +553,36 @@ mod tests {
         store.close().await?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn full_fidelity_export_retains_producer_private_reasoning_summaries() -> Result<()> {
+        use crate::ReasoningSummaryRecord;
+
+        let store = MemoryStore::temporary().await?;
+        store
+            .put_reasoning_summaries(&[ReasoningSummaryRecord {
+                session_id: "session-private".into(),
+                turn_id: "turn-private".into(),
+                actor_id: "actor-private".into(),
+                invocation_id: "invocation-private".into(),
+                item_id: Some("provider-item-private".into()),
+                output_index: Some(7),
+                summary_index: 2,
+                text: "producer-only summary".into(),
+            }])
+            .await?;
+
+        let snapshot = store.begin_active_export().await?;
+        let messages = snapshot.page(None).await?;
+        assert!(messages.records.is_empty());
+        let state = snapshot.page(messages.next).await?;
+        assert!(
+            matches!(state.records.as_slice(), [StorageRecord::State { key, value }]
+            if key.starts_with("kuru/private/reasoning-summary/v1/")
+                && value["text"] == "producer-only summary")
+        );
+        snapshot.verify_counts(0, 1)?;
+        store.close().await?;
+        Ok(())
+    }
 }
