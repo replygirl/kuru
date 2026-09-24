@@ -412,6 +412,31 @@ fn apply_private_dacl(handle: BorrowedHandle<'_>, access_mask: u32) -> io::Resul
 /// Copy a held regular file's current effective DACL.
 /// The caller keeps the destination behind a checked private directory until
 /// publication, so broad access does not expose staged payload bytes.
+fn canonical_access_token(
+    protected: bool,
+    owner: &[u8],
+    dacl: &[u8],
+    used_bytes: usize,
+    ace_count: u32,
+) -> io::Result<Vec<u8>> {
+    if dacl.len() < size_of::<ACL>() || !(size_of::<ACL>()..=dacl.len()).contains(&used_bytes) {
+        return Err(denied("file DACL used extent is invalid"));
+    }
+    // A NULL DACL is refused by file_access_token before this point. Preserve
+    // the revision, count, and every ordered ACE byte, but not AclSize's free
+    // allocation space or reserved ACL-header padding.
+    let ace_bytes = &dacl[size_of::<ACL>()..used_bytes];
+    let mut token = Vec::with_capacity(1 + 4 + owner.len() + 1 + 4 + 4 + ace_bytes.len());
+    token.push(u8::from(protected));
+    token.extend_from_slice(&(owner.len() as u32).to_le_bytes());
+    token.extend_from_slice(owner);
+    token.push(dacl[0]);
+    token.extend_from_slice(&ace_count.to_le_bytes());
+    token.extend_from_slice(&(ace_bytes.len() as u32).to_le_bytes());
+    token.extend_from_slice(ace_bytes);
+    Ok(token)
+}
+
 pub(crate) fn file_access_token(source: BorrowedHandle<'_>) -> io::Result<Vec<u8>> {
     let mut owner = null_mut();
     let mut dacl = null_mut();
@@ -472,15 +497,30 @@ pub(crate) fn file_access_token(source: BorrowedHandle<'_>) -> io::Result<Vec<u8
     checked_bool(unsafe {
         GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision)
     })?;
-    let mut token = Vec::with_capacity(1 + 4 + sid_len + 4 + acl_len);
-    token.push(u8::from(control & SE_DACL_PROTECTED != 0));
-    token.extend_from_slice(&(sid_len as u32).to_le_bytes());
-    // SAFETY: bounded_sid validated the SID's complete extent above.
-    token.extend_from_slice(unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), sid_len) });
-    token.extend_from_slice(&(acl_len as u32).to_le_bytes());
-    // SAFETY: the ACL extent was checked against the retained descriptor.
-    token.extend_from_slice(unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), acl_len) });
-    Ok(token)
+    // SAFETY: IsValidAcl checked the DACL, and the integer-only result has
+    // exactly the native structure's writable extent.
+    let mut information: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+    checked_bool(unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    })?;
+    let used_bytes = information.AclBytesInUse as usize;
+    if information.AceCount != u32::from(unsafe { (*dacl).AceCount }) {
+        return Err(denied("file DACL entry count is inconsistent"));
+    }
+    // SAFETY: owner and DACL extents were checked against the retained
+    // descriptor above; the canonical encoder copies only within those bounds.
+    canonical_access_token(
+        control & SE_DACL_PROTECTED != 0,
+        unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), sid_len) },
+        unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), acl_len) },
+        used_bytes,
+        information.AceCount,
+    )
 }
 
 pub(crate) fn copy_file_dacl(
@@ -984,6 +1024,46 @@ mod tests {
         let user_owned = unsafe { EqualSid(owner, user.sid().unwrap()) } != 0;
         eprintln!("ordinary native child: TokenOwner equals TokenUser = {user_owned}");
         (file, user_owned)
+    }
+
+    #[test]
+    fn access_token_ignores_only_unused_acl_storage() {
+        let owner = [1, 1, 0, 0, 0, 0, 0, 5];
+        let dacl = [
+            2, 0, 24, 0, 1, 0, 0, 0, // ACL revision, allocated size, ACE count
+            0, 0, 16, 0, 1, 0, 0, 0, // ordered allow ACE and access mask
+            1, 1, 0, 0, 0, 0, 0, 5, // SID within that ACE
+        ];
+        let original = canonical_access_token(false, &owner, &dacl, 24, 1).unwrap();
+        let mut extra_capacity = dacl.to_vec();
+        extra_capacity[2..4].copy_from_slice(&32u16.to_le_bytes());
+        extra_capacity.extend_from_slice(&[0xa5; 8]);
+        assert_eq!(
+            original,
+            canonical_access_token(false, &owner, &extra_capacity, 24, 1).unwrap(),
+            "unused ACL allocation bytes changed the access policy token"
+        );
+
+        let mut changed_access = dacl;
+        changed_access[12] = 2;
+        assert_ne!(
+            original,
+            canonical_access_token(false, &owner, &changed_access, 24, 1).unwrap(),
+            "a changed ACE access mask was ignored"
+        );
+        assert_ne!(
+            original,
+            canonical_access_token(true, &owner, &dacl, 24, 1).unwrap()
+        );
+        assert_ne!(
+            original,
+            canonical_access_token(false, &[1, 1, 0, 0, 0, 0, 0, 6], &dacl, 24, 1).unwrap()
+        );
+        let empty_dacl = [2, 0, 8, 0, 0, 0, 0, 0];
+        assert_ne!(
+            original,
+            canonical_access_token(false, &owner, &empty_dacl, 8, 0).unwrap()
+        );
     }
 
     #[test]

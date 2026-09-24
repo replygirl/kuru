@@ -275,6 +275,7 @@ fn tools_command_projects_the_shared_catalog_without_starting_memory_or_a_provid
         b"hostile memory path",
         "catalog inspection must not inspect or initialize project memory"
     );
+    std::fs::remove_file(env.data.join("memory")).unwrap();
 }
 
 #[test]
@@ -875,7 +876,7 @@ fn cli_file_crud_and_shell_require_real_capabilities() {
         r#"{"command":"printf shell-ok"}"#
     };
     assert!(
-        tools
+        tools["tools"]
             .as_array()
             .unwrap()
             .iter()
