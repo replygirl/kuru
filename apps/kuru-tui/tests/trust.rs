@@ -567,7 +567,7 @@ async fn stdio_and_http_mcp_require_cli_approval_before_activation() {
         tokio::task::block_in_place(|| sandbox.run(&["--trust-workspace-once", "tools"]));
     assert!(approved.status.success(), "{}", text(&approved.stderr));
     let tools: Value = serde_json::from_slice(&approved.stdout).unwrap();
-    assert!(tools.as_array().is_some());
+    assert!(tools["tools"].as_array().is_some());
     assert_eq!(stdio.started(), 1, "approved stdio MCP did not start once");
     assert_eq!(
         stdio.completed(),
@@ -607,7 +607,7 @@ fn direct_tools_keeps_stdout_json_and_reports_filtered_failed_stdio() {
     let output = sandbox.success(&["--trust-workspace-once", "tools"]);
     let tools: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(
-        tools
+        tools["tools"]
             .as_array()
             .unwrap()
             .iter()
@@ -701,7 +701,7 @@ async fn direct_cli_mcp_tool_results_are_projected_before_stdout() {
     tokio::task::block_in_place(|| sandbox.success(&["trust", "approve", "--yes"]));
     let tools = tokio::task::block_in_place(|| sandbox.success(&["tools"]));
     let tools: Value = serde_json::from_slice(&tools.stdout).unwrap();
-    let name = tools
+    let name = tools["tools"]
         .as_array()
         .unwrap()
         .iter()
@@ -735,7 +735,7 @@ async fn direct_cli_mcp_tool_failures_are_projected_before_stderr() {
     tokio::task::block_in_place(|| sandbox.success(&["trust", "approve", "--yes"]));
     let tools = tokio::task::block_in_place(|| sandbox.success(&["tools"]));
     let tools: Value = serde_json::from_slice(&tools.stdout).unwrap();
-    let name = tools
+    let name = tools["tools"]
         .as_array()
         .unwrap()
         .iter()
@@ -776,7 +776,8 @@ async fn real_cli_commands_enforce_the_documented_claim_matrix_before_side_effec
     let file_args =
         json!({"path": "matrix-mutation", "content": "must not be written"}).to_string();
     let all = CLAIM_LABELS;
-    let tools = &CLAIM_LABELS[..6];
+    let tools = &CLAIM_LABELS[..4];
+    let tool = &CLAIM_LABELS[..6];
     let memory = &CLAIM_LABELS[4..6];
     let cases = [
         (vec!["run", "do not run"], all),
@@ -785,7 +786,7 @@ async fn real_cli_commands_enforce_the_documented_claim_matrix_before_side_effec
         (vec!["tools"], tools),
         (
             vec!["tool", "file_write", "--args", file_args.as_str()],
-            tools,
+            tool,
         ),
         (
             vec!["models"],
@@ -797,13 +798,7 @@ async fn real_cli_commands_enforce_the_documented_claim_matrix_before_side_effec
         (vec!["auth"], &["Responses route"][..]),
         (
             vec!["--allow-shell", "tools"],
-            &[
-                "workspace write",
-                "stdio MCP",
-                "HTTP MCP",
-                "memory executable",
-                "memory cache",
-            ][..],
+            &["workspace write", "stdio MCP", "HTTP MCP"][..],
         ),
         (
             vec!["--provider", "demo", "models"],
@@ -1347,7 +1342,7 @@ async fn reached_undo_uses_only_approved_memory_authority_and_no_provider_route(
 
 #[cfg(unix)]
 #[test]
-fn tools_and_models_gate_configured_memory_before_legacy_probe_or_engine_launch() {
+fn tools_inspection_ignores_memory_authority_and_models_gate_it_before_legacy_probe() {
     use std::os::unix::fs::PermissionsExt;
 
     let sandbox = Sandbox::new("");
@@ -1366,27 +1361,28 @@ fn tools_and_models_gate_configured_memory_before_legacy_probe_or_engine_launch(
         "provider = 'demo'\n[memory]\ndolt_binary = {:?}\n",
         engine.to_str().unwrap()
     ));
-    std::fs::create_dir(&sandbox.data).unwrap();
+    kuru_platform::fs::Directory::ensure_private(&sandbox.data).unwrap();
     let legacy = sandbox.data.join("memory.sqlite3");
     let sentinel = b"not-a-database-until-approved";
     std::fs::write(&legacy, sentinel).unwrap();
 
-    for command in [["models"].as_slice(), ["tools"].as_slice()] {
-        let output = sandbox.run(command);
-        assert!(!output.status.success(), "{command:?}");
-        assert!(
-            text(&output.stderr).contains("workspace authority is not approved"),
-            "{}",
-            text(&output.stderr)
-        );
-        assert!(
-            !marker.exists(),
-            "{command:?} launched the configured engine"
-        );
-        assert_eq!(std::fs::read(&legacy).unwrap(), sentinel);
-        assert!(!sandbox.data.join("memory").exists());
-        assert!(!sandbox.data.join("trust").exists());
-    }
+    let models = sandbox.run(&["models"]);
+    assert!(!models.status.success());
+    assert!(
+        text(&models.stderr).contains("workspace authority is not approved"),
+        "{}",
+        text(&models.stderr)
+    );
+    let tools = sandbox.success(&["tools"]);
+    let catalog: Value = serde_json::from_slice(&tools.stdout).unwrap();
+    assert!(catalog["tools"].as_array().is_some());
+    assert!(
+        !marker.exists(),
+        "inspection launched the configured engine"
+    );
+    assert_eq!(std::fs::read(&legacy).unwrap(), sentinel);
+    assert!(!sandbox.data.join("memory").exists());
+    assert!(!sandbox.data.join("trust").exists());
 }
 
 #[cfg(unix)]
