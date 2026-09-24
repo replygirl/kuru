@@ -442,14 +442,40 @@ mod tests {
                 .is_err()
         );
 
-        let replaced = fixture._project.path().with_extension("replaced");
-        std::fs::rename(fixture._project.path(), &replaced).unwrap();
-        std::fs::create_dir(fixture._project.path()).unwrap();
-        assert!(fixture.store.load("remote", context).is_err());
-        std::fs::remove_dir(fixture._project.path()).unwrap();
-        std::fs::rename(&replaced, fixture._project.path()).unwrap();
-        // Keep TempDir cleanup aligned with the restored checked object.
-        fixture.store.check_root().unwrap();
+        #[cfg(unix)]
+        {
+            let replaced = fixture._project.path().with_extension("replaced");
+            std::fs::rename(fixture._project.path(), &replaced).unwrap();
+            std::fs::create_dir(fixture._project.path()).unwrap();
+            assert!(fixture.store.load("remote", context).is_err());
+            std::fs::remove_dir(fixture._project.path()).unwrap();
+            std::fs::rename(&replaced, fixture._project.path()).unwrap();
+            // Keep TempDir cleanup aligned with the restored checked object.
+            fixture.store.check_root().unwrap();
+        }
+
+        #[cfg(windows)]
+        {
+            let root_path = fixture._project.path();
+            let retained_identity = fixture.store.root.identity().to_bytes();
+            let retained_bytes = b"pinned project root remains in place";
+            let retained_file = root_path.join("retained.bin");
+            std::fs::write(&retained_file, retained_bytes).unwrap();
+            let replaced = root_path.with_extension("replaced");
+            let error = std::fs::rename(root_path, &replaced).unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(32),
+                "pinned project-root rename must fail with Win32 sharing violation: {error}"
+            );
+            assert_eq!(fixture.store.root.identity().to_bytes(), retained_identity);
+            assert_eq!(
+                std::fs::read(&retained_file).unwrap().as_slice(),
+                retained_bytes
+            );
+            fixture.store.check_root().unwrap();
+            assert!(!replaced.exists());
+        }
     }
 
     #[cfg(unix)]
