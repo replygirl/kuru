@@ -51,7 +51,7 @@ const MAX_STATIC_HEADERS_BYTES: usize = 64 * 1024;
 pub(crate) struct McpHosts {
     clients: BTreeMap<String, Arc<McpClient>>,
     disabled: BTreeSet<String>,
-    routes: RwLock<BTreeMap<String, (String, String)>>,
+    routes: Arc<RwLock<BTreeMap<String, (String, String)>>>,
     admission: Arc<Admission>,
     cache: OnceLock<Arc<McpCatalogStore>>,
     credentials: OnceLock<Arc<McpCredentialStore>>,
@@ -479,7 +479,7 @@ impl McpHosts {
         Ok(Self {
             clients,
             disabled,
-            routes: RwLock::new(BTreeMap::new()),
+            routes: Arc::new(RwLock::new(BTreeMap::new())),
             admission,
             cache: OnceLock::new(),
             credentials: OnceLock::new(),
@@ -565,13 +565,13 @@ impl McpHosts {
                 diagnostic: None,
             });
         }
-        let catalog = self.catalog().await?;
+        let (client, store) = self.oauth_client_and_store(alias)?;
+        let catalog = self.catalog_selected(Some(alias)).await?;
         let catalog_status = catalog
             .statuses
             .into_iter()
             .find(|status| status.alias == alias)
             .with_context(|| format!("configured MCP alias {alias} is unavailable"))?;
-        let (client, store) = self.oauth_client_and_store(alias)?;
         let record = match store.acquire(alias).await {
             Ok(lease) => match lease.get().await {
                 Ok(record) => record,
@@ -641,38 +641,52 @@ impl McpHosts {
     pub(crate) async fn oauth_logout(&self, alias: &str) -> Result<McpOAuthLogout> {
         let (client, store) = self.oauth_client_and_store(alias)?;
         let alias = alias.to_owned();
+        let routes = Arc::clone(&self.routes);
         // Once admitted, logout owns one detached settlement task. Dropping a
         // CLI/TUI caller cannot interrupt an in-flight remote attempt between
         // dispatch and the authoritative generation-checked local deletion.
         tokio::spawn(async move {
-            let lease = store.acquire(&alias).await?;
-            let (lease, Some(record)) = lease.read_locked().await? else {
-                return Ok(McpOAuthLogout {
-                    alias,
-                    local_deleted: false,
-                    remote: "no_local_credential",
-                });
-            };
-            let generation = record.generation();
-            let remote = match McpOAuthCredential::decode(record.secret()) {
-                Ok(credential) => {
-                    let attempted =
-                        Self::remote_revocation(&alias, &client, &store, &credential).await;
-                    match attempted {
-                        Ok(outcome) => revocation_name(outcome),
-                        Err(_) => "remote_outcome_uncertain",
+            // Catalog, execution and logout use the same client-state gate.
+            // Retire the admitted route before touching the credential so a
+            // dropped caller cannot leave its prior authorized tool callable.
+            let mut state = client.state.lock().await;
+            client.available.store(false, Ordering::Release);
+            routes.write().await.retain(|_, (owner, _)| owner != &alias);
+            let result = async {
+                let lease = store.acquire(&alias).await?;
+                let (lease, Some(record)) = lease.read_locked().await? else {
+                    return Ok(McpOAuthLogout {
+                        alias,
+                        local_deleted: false,
+                        remote: "no_local_credential",
+                    });
+                };
+                let generation = record.generation();
+                let remote = match McpOAuthCredential::decode(record.secret()) {
+                    Ok(credential) => {
+                        let attempted =
+                            Self::remote_revocation(&alias, &client, &store, &credential).await;
+                        match attempted {
+                            Ok(outcome) => revocation_name(outcome),
+                            Err(_) => "remote_outcome_uncertain",
+                        }
                     }
-                }
-                Err(_) => "local_credential_invalid",
-            };
-            // Local deletion is unconditional after the bounded remote attempt,
-            // including malformed local records and uncertain network outcomes.
-            lease.delete(generation).await?;
-            Ok(McpOAuthLogout {
-                alias,
-                local_deleted: true,
-                remote,
-            })
+                    Err(_) => "local_credential_invalid",
+                };
+                // Local deletion is unconditional after the bounded remote
+                // attempt, including malformed records and uncertain network.
+                lease.delete(generation).await?;
+                Ok(McpOAuthLogout {
+                    alias,
+                    local_deleted: true,
+                    remote,
+                })
+            }
+            .await;
+            // A failed native operation still leaves the old route retired.
+            // Shutdown will retry transport cleanup if this attempt fails.
+            let _ = close_transport(&mut state).await;
+            result
         })
         .await
         .context("MCP OAuth logout settlement task stopped")?
@@ -879,188 +893,198 @@ impl McpHosts {
     }
 
     pub(crate) async fn catalog(&self) -> Result<McpCatalog> {
+        self.catalog_selected(None).await
+    }
+
+    async fn catalog_selected(&self, selected: Option<&str>) -> Result<McpCatalog> {
         ensure_open(&self.admission)?;
-        let discoveries = self.clients.iter().map(|(alias, client)| async move {
-            let mut state = client.state.lock().await;
-            ensure_open(&self.admission)?;
-            let mut disable = DisableOnDrop::new(&client.available);
-            let static_headers = match client.resolved_http_headers() {
-                Ok(headers) => headers,
-                Err(_) => {
-                    self.routes
-                        .write()
-                        .await
-                        .retain(|_, (owner, _)| owner != alias);
-                    return Ok::<_, anyhow::Error>((
-                        Vec::new(),
-                        BTreeMap::new(),
-                        McpStatus {
-                            alias: alias.clone(),
-                            availability: McpAvailability::Degraded,
-                            diagnostic: Some("configured MCP static header is unavailable".into()),
-                        },
-                    ));
-                }
-            };
-            let (mut headers, mut credential_generation) = match client
-                .oauth_headers(alias, self.credentials.get(), static_headers.clone(), false)
-                .await
-            {
-                Ok(headers) => headers,
-                Err(error) => {
-                    let _ = close_transport(&mut state).await;
-                    self.routes
-                        .write()
-                        .await
-                        .retain(|_, (owner, _)| owner != alias);
-                    state.diagnostic = Some(error.to_string());
-                    return Ok::<_, anyhow::Error>((
-                        Vec::new(),
-                        BTreeMap::new(),
-                        McpStatus {
-                            alias: alias.clone(),
-                            availability: McpAvailability::Degraded,
-                            diagnostic: state.diagnostic.clone(),
-                        },
-                    ));
-                }
-            };
-            let mut context =
-                catalog_context(alias, &client.config, &headers, credential_generation)?;
-            let cached = self.load_cache(alias, context).await;
-            let mut cache_invalid = cached.is_err();
-            let mut cached = cached.ok().flatten();
-            let mut listed = client.list(&mut state, headers.clone()).await;
-            if listed.as_ref().is_err_and(|error| {
-                error
-                    .downcast_ref::<McpHttpAuthorizationFailure>()
-                    .is_some_and(McpHttpAuthorizationFailure::invalid_token)
-            }) {
-                match client
-                    .oauth_headers(alias, self.credentials.get(), static_headers, true)
-                    .await
-                {
-                    Ok((refreshed_headers, refreshed_generation)) => {
-                        headers = refreshed_headers;
-                        credential_generation = refreshed_generation;
-                        context = catalog_context(
-                            alias,
-                            &client.config,
-                            &headers,
-                            credential_generation,
-                        )?;
-                        let refreshed_cache = self.load_cache(alias, context).await;
-                        cache_invalid = refreshed_cache.is_err();
-                        cached = refreshed_cache.ok().flatten();
-                        listed = client.list(&mut state, headers).await;
-                    }
-                    Err(error) => listed = Err(error),
-                }
-            }
-            let tools = match listed {
-                Ok(tools) => tools,
-                Err(error) => {
-                    if !state.close_attempted {
-                        let _ = close_transport(&mut state).await;
-                    }
-                    state.diagnostic.get_or_insert_with(|| error.to_string());
-                    self.routes
-                        .write()
-                        .await
-                        .retain(|_, (owner, _)| owner != alias);
-                    let (tools, selectors, availability) = match cached {
-                        Some(cached) => {
-                            let (tools, selectors) = project_cached(alias, cached)?;
-                            (tools, selectors, McpAvailability::Stale)
+        let discoveries =
+            self.clients
+                .iter()
+                .filter(|(alias, _)| selected.is_none_or(|selected| alias.as_str() == selected))
+                .map(|(alias, client)| async move {
+                    let mut state = client.state.lock().await;
+                    ensure_open(&self.admission)?;
+                    let mut disable = DisableOnDrop::new(&client.available);
+                    let static_headers = match client.resolved_http_headers() {
+                        Ok(headers) => headers,
+                        Err(_) => {
+                            self.routes
+                                .write()
+                                .await
+                                .retain(|_, (owner, _)| owner != alias);
+                            return Ok::<_, anyhow::Error>((
+                                Vec::new(),
+                                BTreeMap::new(),
+                                McpStatus {
+                                    alias: alias.clone(),
+                                    availability: McpAvailability::Degraded,
+                                    diagnostic: Some(
+                                        "configured MCP static header is unavailable".into(),
+                                    ),
+                                },
+                            ));
                         }
-                        None => (Vec::new(), BTreeMap::new(), McpAvailability::Degraded),
                     };
-                    return Ok::<_, anyhow::Error>((
-                        tools,
-                        selectors,
-                        McpStatus {
-                            alias: alias.clone(),
-                            availability,
-                            diagnostic: state.diagnostic.clone().or_else(|| {
-                                cache_invalid.then(|| {
+                    let (mut headers, mut credential_generation) = match client
+                        .oauth_headers(alias, self.credentials.get(), static_headers.clone(), false)
+                        .await
+                    {
+                        Ok(headers) => headers,
+                        Err(error) => {
+                            let _ = close_transport(&mut state).await;
+                            self.routes
+                                .write()
+                                .await
+                                .retain(|_, (owner, _)| owner != alias);
+                            state.diagnostic = Some(error.to_string());
+                            return Ok::<_, anyhow::Error>((
+                                Vec::new(),
+                                BTreeMap::new(),
+                                McpStatus {
+                                    alias: alias.clone(),
+                                    availability: McpAvailability::Degraded,
+                                    diagnostic: state.diagnostic.clone(),
+                                },
+                            ));
+                        }
+                    };
+                    let mut context =
+                        catalog_context(alias, &client.config, &headers, credential_generation)?;
+                    let cached = self.load_cache(alias, context).await;
+                    let mut cache_invalid = cached.is_err();
+                    let mut cached = cached.ok().flatten();
+                    let mut listed = client.list(&mut state, headers.clone()).await;
+                    if listed.as_ref().is_err_and(|error| {
+                        error
+                            .downcast_ref::<McpHttpAuthorizationFailure>()
+                            .is_some_and(McpHttpAuthorizationFailure::invalid_token)
+                    }) {
+                        match client
+                            .oauth_headers(alias, self.credentials.get(), static_headers, true)
+                            .await
+                        {
+                            Ok((refreshed_headers, refreshed_generation)) => {
+                                headers = refreshed_headers;
+                                credential_generation = refreshed_generation;
+                                context = catalog_context(
+                                    alias,
+                                    &client.config,
+                                    &headers,
+                                    credential_generation,
+                                )?;
+                                let refreshed_cache = self.load_cache(alias, context).await;
+                                cache_invalid = refreshed_cache.is_err();
+                                cached = refreshed_cache.ok().flatten();
+                                listed = client.list(&mut state, headers).await;
+                            }
+                            Err(error) => listed = Err(error),
+                        }
+                    }
+                    let tools = match listed {
+                        Ok(tools) => tools,
+                        Err(error) => {
+                            if !state.close_attempted {
+                                let _ = close_transport(&mut state).await;
+                            }
+                            state.diagnostic.get_or_insert_with(|| error.to_string());
+                            self.routes
+                                .write()
+                                .await
+                                .retain(|_, (owner, _)| owner != alias);
+                            let (tools, selectors, availability) = match cached {
+                                Some(cached) => {
+                                    let (tools, selectors) = project_cached(alias, cached)?;
+                                    (tools, selectors, McpAvailability::Stale)
+                                }
+                                None => (Vec::new(), BTreeMap::new(), McpAvailability::Degraded),
+                            };
+                            return Ok::<_, anyhow::Error>((
+                                tools,
+                                selectors,
+                                McpStatus {
+                                    alias: alias.clone(),
+                                    availability,
+                                    diagnostic: state.diagnostic.clone().or_else(|| {
+                                        cache_invalid.then(|| {
                                     "configured MCP server and its cached catalog are unavailable"
                                         .into()
                                 })
-                            }),
-                        },
-                    ));
-                }
-            };
-            let candidate = project_live(alias, &client.config, tools);
-            match candidate {
-                Ok((candidate_routes, candidate_specs, selectors, cached_tools)) => {
-                    let mut routes = self.routes.write().await;
-                    if candidate_routes
-                        .keys()
-                        .any(|name| routes.get(name).is_some_and(|(owner, _)| owner != alias))
-                    {
-                        routes.retain(|_, (owner, _)| owner != alias);
-                        drop(routes);
-                        let _ = close_transport(&mut state).await;
-                        return Ok::<_, anyhow::Error>((
-                            Vec::new(),
-                            BTreeMap::new(),
-                            McpStatus {
-                                alias: alias.clone(),
-                                availability: McpAvailability::Degraded,
-                                diagnostic: state.diagnostic.clone(),
-                            },
-                        ));
-                    }
-                    routes.retain(|_, (owner, _)| owner != alias);
-                    for (name, route) in candidate_routes {
-                        routes.insert(name, route);
-                    }
-                    client.available.store(true, Ordering::Release);
-                    disable.disarm();
-                    let cache_failure =
-                        self.save_cache(alias, context, cached_tools).await.is_err();
-                    Ok::<_, anyhow::Error>((
-                        candidate_specs,
-                        selectors,
-                        McpStatus {
-                            alias: alias.clone(),
-                            availability: McpAvailability::Live,
-                            diagnostic: cache_failure
-                                .then(|| "MCP catalog cache could not be updated".into()),
-                        },
-                    ))
-                }
-                Err(_) => {
-                    let _ = close_transport(&mut state).await;
-                    self.routes
-                        .write()
-                        .await
-                        .retain(|_, (owner, _)| owner != alias);
-                    let (tools, selectors, availability) = match cached {
-                        Some(cached) => {
-                            let (tools, selectors) = project_cached(alias, cached)?;
-                            (tools, selectors, McpAvailability::Stale)
+                                    }),
+                                },
+                            ));
                         }
-                        None => (Vec::new(), BTreeMap::new(), McpAvailability::Degraded),
                     };
-                    Ok::<_, anyhow::Error>((
-                        tools,
-                        selectors,
-                        McpStatus {
-                            alias: alias.clone(),
-                            availability,
-                            diagnostic: state.diagnostic.clone(),
-                        },
-                    ))
-                }
-            }
-        });
+                    let candidate = project_live(alias, &client.config, tools);
+                    match candidate {
+                        Ok((candidate_routes, candidate_specs, selectors, cached_tools)) => {
+                            let mut routes = self.routes.write().await;
+                            if candidate_routes.keys().any(|name| {
+                                routes.get(name).is_some_and(|(owner, _)| owner != alias)
+                            }) {
+                                routes.retain(|_, (owner, _)| owner != alias);
+                                drop(routes);
+                                let _ = close_transport(&mut state).await;
+                                return Ok::<_, anyhow::Error>((
+                                    Vec::new(),
+                                    BTreeMap::new(),
+                                    McpStatus {
+                                        alias: alias.clone(),
+                                        availability: McpAvailability::Degraded,
+                                        diagnostic: state.diagnostic.clone(),
+                                    },
+                                ));
+                            }
+                            routes.retain(|_, (owner, _)| owner != alias);
+                            for (name, route) in candidate_routes {
+                                routes.insert(name, route);
+                            }
+                            client.available.store(true, Ordering::Release);
+                            disable.disarm();
+                            let cache_failure =
+                                self.save_cache(alias, context, cached_tools).await.is_err();
+                            Ok::<_, anyhow::Error>((
+                                candidate_specs,
+                                selectors,
+                                McpStatus {
+                                    alias: alias.clone(),
+                                    availability: McpAvailability::Live,
+                                    diagnostic: cache_failure
+                                        .then(|| "MCP catalog cache could not be updated".into()),
+                                },
+                            ))
+                        }
+                        Err(_) => {
+                            let _ = close_transport(&mut state).await;
+                            self.routes
+                                .write()
+                                .await
+                                .retain(|_, (owner, _)| owner != alias);
+                            let (tools, selectors, availability) = match cached {
+                                Some(cached) => {
+                                    let (tools, selectors) = project_cached(alias, cached)?;
+                                    (tools, selectors, McpAvailability::Stale)
+                                }
+                                None => (Vec::new(), BTreeMap::new(), McpAvailability::Degraded),
+                            };
+                            Ok::<_, anyhow::Error>((
+                                tools,
+                                selectors,
+                                McpStatus {
+                                    alias: alias.clone(),
+                                    availability,
+                                    diagnostic: state.diagnostic.clone(),
+                                },
+                            ))
+                        }
+                    }
+                });
         let mut specs = Vec::new();
         let mut selectors = BTreeMap::new();
         let mut statuses = self
             .disabled
             .iter()
+            .filter(|alias| selected.is_none_or(|selected| alias.as_str() == selected))
             .map(|alias| McpStatus {
                 alias: alias.clone(),
                 availability: McpAvailability::Disabled,
@@ -2894,6 +2918,384 @@ mod tests {
         json!({"name":name,"description":"A fixture tool","inputSchema":{"type":"object"}})
     }
 
+    #[tokio::test]
+    async fn oauth_cached_catalog_rejects_changed_config_authority_and_generation() {
+        let project = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let data = private.path().join("data");
+        let (root, cache) = cache_store(project.path(), &data);
+        let credentials = credential_store(project.path(), private.path());
+        let resource = "http://127.0.0.1:9/mcp";
+        let config = McpConfig {
+            url: Some(resource.into()),
+            oauth: Some(McpOAuthConfig {
+                enabled: true,
+                client_id: Some("native-client".into()),
+                scopes: vec!["mcp.read".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut credential =
+            fixture_credential(&credentials, "auth", resource, unix_time().unwrap() + 300);
+        let first_generation = credentials
+            .acquire("auth")
+            .await
+            .unwrap()
+            .create(credential.encode().unwrap())
+            .await
+            .unwrap();
+        let context =
+            catalog_context("auth", &config, &HeaderMap::new(), Some(first_generation)).unwrap();
+        let cached = vec![CachedMcpTool {
+            original_name: "authorized-read".into(),
+            description: "synthetic authorized metadata".into(),
+            parameters: json!({"type":"object"}),
+        }];
+        cache.save("auth", context, cached.clone()).unwrap();
+        assert_eq!(cache.load("auth", context).unwrap(), Some(cached));
+
+        let mut changed_endpoint = config.clone();
+        changed_endpoint.url = Some("http://127.0.0.1:9/other".into());
+        let mut changed_client = config.clone();
+        changed_client.oauth.as_mut().unwrap().client_id = Some("another-client".into());
+        let mut changed_scopes = config.clone();
+        changed_scopes.oauth.as_mut().unwrap().scopes = vec!["mcp.write".into()];
+        for (field, changed) in [
+            ("endpoint", changed_endpoint),
+            ("client identity", changed_client),
+            ("scopes", changed_scopes),
+        ] {
+            let changed_context =
+                catalog_context("auth", &changed, &HeaderMap::new(), Some(first_generation))
+                    .unwrap();
+            assert_ne!(
+                changed_context, context,
+                "{field} kept the OAuth cache identity"
+            );
+            assert!(
+                cache.load("auth", changed_context).is_err(),
+                "{field} admitted the prior OAuth catalog record"
+            );
+        }
+
+        credential.access_token = "synthetic-rotated-access".into();
+        let next_generation = credentials
+            .acquire("auth")
+            .await
+            .unwrap()
+            .replace(first_generation, credential.encode().unwrap())
+            .await
+            .unwrap();
+        assert_ne!(first_generation, next_generation);
+        let rotated_context =
+            catalog_context("auth", &config, &HeaderMap::new(), Some(next_generation)).unwrap();
+        assert_ne!(rotated_context, context);
+        assert!(cache.load("auth", rotated_context).is_err());
+
+        let original_snapshot = ConfigSnapshot::parse_with_sources(
+            None,
+            None,
+            project.path(),
+            None,
+            None,
+            None,
+            &["/help", "/tools"],
+            InvocationOverrides::default(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.path().join(".kuru")).unwrap();
+        std::fs::write(
+            project.path().join(".kuru/config.toml"),
+            "allow_shell = true\n",
+        )
+        .unwrap();
+        let changed_snapshot = ConfigSnapshot::parse_with_sources(
+            None,
+            None,
+            project.path(),
+            None,
+            None,
+            None,
+            &["/help", "/tools"],
+            InvocationOverrides::default(),
+        )
+        .unwrap();
+        let changed_authority =
+            McpCatalogStore::new(&data, root, changed_snapshot.manifest().full_digest()).unwrap();
+        assert_ne!(
+            changed_snapshot.manifest().full_digest(),
+            original_snapshot.manifest().full_digest()
+        );
+        assert!(
+            changed_authority.load("auth", context).is_err(),
+            "a changed reviewed authority admitted the prior OAuth catalog record"
+        );
+        credentials
+            .acquire("auth")
+            .await
+            .unwrap()
+            .delete(next_generation)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_issuer_change_and_logout_revoke_cached_tool_routes_until_live_discovery() {
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", socket.local_addr().unwrap());
+        let resource = format!("{base}/mcp");
+        let changed_issuer = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicBool::new(true));
+        let tool_lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pause_revocation = Arc::new(AtomicBool::new(false));
+        let (revocation_entered, mut revocation_observed) = tokio::sync::watch::channel(false);
+        let revocation_release = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().fallback(axum::routing::any({
+            let base = base.clone();
+            let changed_issuer = changed_issuer.clone();
+            let live = live.clone();
+            let tool_lists = tool_lists.clone();
+            let tool_calls = tool_calls.clone();
+            let pause_revocation = pause_revocation.clone();
+            let revocation_entered = revocation_entered.clone();
+            let revocation_release = revocation_release.clone();
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: HeaderMap,
+                  body: Bytes| {
+                let base = base.clone();
+                let changed_issuer = changed_issuer.clone();
+                let live = live.clone();
+                let tool_lists = tool_lists.clone();
+                let tool_calls = tool_calls.clone();
+                let pause_revocation = pause_revocation.clone();
+                let revocation_entered = revocation_entered.clone();
+                let revocation_release = revocation_release.clone();
+                async move {
+                    let issuer = if changed_issuer.load(Ordering::Acquire) {
+                        format!("{base}/changed/")
+                    } else {
+                        format!("{base}/")
+                    };
+                    if method == axum::http::Method::GET
+                        && uri.path().contains("oauth-protected-resource")
+                    {
+                        return axum::Json(json!({
+                            "resource": format!("{base}/mcp"),
+                            "authorization_servers": [issuer],
+                            "scopes_supported": ["mcp.read"]
+                        }))
+                        .into_response();
+                    }
+                    if method == axum::http::Method::GET
+                        && uri.path().contains("oauth-authorization-server")
+                    {
+                        let mut metadata = json!({
+                            "issuer": issuer,
+                            "authorization_endpoint": format!("{base}/authorize"),
+                            "token_endpoint": format!("{base}/token"),
+                            "code_challenge_methods_supported": ["S256"],
+                            "grant_types_supported": ["authorization_code", "refresh_token"]
+                        });
+                        if pause_revocation.load(Ordering::Acquire) {
+                            metadata["revocation_endpoint"] = json!(format!("{base}/revoke"));
+                        }
+                        return axum::Json(metadata).into_response();
+                    }
+                    if method == axum::http::Method::POST && uri.path() == "/revoke" {
+                        let _ = revocation_entered.send(true);
+                        revocation_release.notified().await;
+                        return StatusCode::OK.into_response();
+                    }
+                    if method != axum::http::Method::POST || uri.path() != "/mcp" {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    if headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        != Some("Bearer synthetic-cache-access")
+                    {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    if !live.load(Ordering::Acquire) {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let result = match request["method"].as_str() {
+                        Some("initialize") => json!({
+                            "protocolVersion": VERSION,
+                            "capabilities": {"tools": {}}
+                        }),
+                        Some("tools/list") => {
+                            tool_lists.fetch_add(1, Ordering::Relaxed);
+                            json!({"tools":[tool("authorized-read")]})
+                        }
+                        Some("tools/call") => {
+                            tool_calls.fetch_add(1, Ordering::Relaxed);
+                            json!({"content":[{"type":"text","text":"synthetic result"}]})
+                        }
+                        Some("notifications/initialized") => {
+                            return StatusCode::ACCEPTED.into_response();
+                        }
+                        _ => return StatusCode::NOT_FOUND.into_response(),
+                    };
+                    axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": result
+                    }))
+                    .into_response()
+                }
+            }
+        }));
+        let task = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+
+        let project = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let (root, cache) = cache_store(project.path(), &private.path().join("data"));
+        let credentials = credential_store(project.path(), private.path());
+        let config = McpConfig {
+            url: Some(resource.clone()),
+            oauth: Some(McpOAuthConfig {
+                enabled: true,
+                client_id: Some("native-client".into()),
+                scopes: vec!["mcp.read".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut credential =
+            fixture_credential(&credentials, "auth", &resource, unix_time().unwrap() + 300);
+        credential.issuer = oauth_binding(b"issuer", &format!("{base}/"));
+        credential.client_secret = None;
+        credential.access_token = "synthetic-cache-access".into();
+        let generation = credentials
+            .acquire("auth")
+            .await
+            .unwrap()
+            .create(credential.encode().unwrap())
+            .await
+            .unwrap();
+        let hosts = Arc::new(
+            McpHosts::with_retained_root(root, &BTreeMap::from([("auth".into(), config.clone())]))
+                .unwrap(),
+        );
+        hosts.install_cache(cache.clone()).unwrap();
+        hosts.install_credentials(credentials.clone()).unwrap();
+
+        let route = projected_name("auth", "authorized-read");
+        let current = hosts.catalog().await.unwrap();
+        assert_eq!(current.statuses[0].availability, McpAvailability::Live);
+        assert_eq!(current.tools.len(), 1);
+        assert!(hosts.selector(&route).await.is_ok());
+        assert!(hosts.execute(&route, json!({})).await.is_ok());
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+        let old_context =
+            catalog_context("auth", &config, &HeaderMap::new(), Some(generation)).unwrap();
+        assert!(cache.load("auth", old_context).unwrap().is_some());
+        assert_eq!(tool_lists.load(Ordering::Relaxed), 1);
+
+        changed_issuer.store(true, Ordering::Release);
+        let mismatched = hosts.catalog().await.unwrap();
+        assert_eq!(
+            mismatched.statuses[0].availability,
+            McpAvailability::Degraded
+        );
+        assert!(mismatched.tools.is_empty());
+        assert!(hosts.selector(&route).await.is_err());
+        assert!(hosts.execute(&route, json!({})).await.is_err());
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(tool_lists.load(Ordering::Relaxed), 1);
+        changed_issuer.store(false, Ordering::Release);
+        assert_eq!(
+            hosts.catalog().await.unwrap().statuses[0].availability,
+            McpAvailability::Live
+        );
+        assert!(hosts.selector(&route).await.is_ok());
+        assert_eq!(tool_lists.load(Ordering::Relaxed), 2);
+
+        let logout = hosts.oauth_logout("auth").await.unwrap();
+        assert!(logout.local_deleted);
+        assert!(
+            credentials
+                .acquire("auth")
+                .await
+                .unwrap()
+                .get()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            hosts.selector(&route).await.is_err(),
+            "logout retained an executable route from the authorized session"
+        );
+        assert!(hosts.execute(&route, json!({})).await.is_err());
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+        let logged_out = hosts.catalog().await.unwrap();
+        assert!(logged_out.tools.is_empty());
+        assert!(hosts.selector(&route).await.is_err());
+        assert_eq!(tool_lists.load(Ordering::Relaxed), 2);
+
+        let next_generation = credentials
+            .acquire("auth")
+            .await
+            .unwrap()
+            .create(credential.encode().unwrap())
+            .await
+            .unwrap();
+        live.store(false, Ordering::Release);
+        let unavailable = hosts.catalog().await.unwrap();
+        assert!(unavailable.tools.is_empty());
+        assert!(hosts.selector(&route).await.is_err());
+        live.store(true, Ordering::Release);
+        let recovered = hosts.catalog().await.unwrap();
+        assert_eq!(recovered.statuses[0].availability, McpAvailability::Live);
+        assert_eq!(recovered.tools.len(), 1);
+        assert!(hosts.selector(&route).await.is_ok());
+        assert_eq!(tool_lists.load(Ordering::Relaxed), 3);
+        assert!(hosts.execute(&route, json!({})).await.is_ok());
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 2);
+
+        // The detached logout must retire a previously live route even if its
+        // caller disappears after the remote revocation request is accepted.
+        pause_revocation.store(true, Ordering::Release);
+        let caller = tokio::spawn({
+            let hosts = hosts.clone();
+            async move { hosts.oauth_logout("auth").await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), revocation_observed.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*revocation_observed.borrow());
+        caller.abort();
+        let _ = caller.await;
+        assert!(hosts.selector(&route).await.is_err());
+        assert!(hosts.execute(&route, json!({})).await.is_err());
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 2);
+        revocation_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if credentials.acquire("auth").await?.get().await?.is_none() {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(hosts.selector(&route).await.is_err());
+        assert!(hosts.execute(&route, json!({})).await.is_err());
+        assert_eq!(tool_calls.load(Ordering::Relaxed), 2);
+        hosts.shutdown().await.unwrap();
+        assert_ne!(generation, next_generation);
+        task.abort();
+    }
+
     fn cache_store(project: &Path, private: &Path) -> (Arc<Directory>, Arc<McpCatalogStore>) {
         let root =
             Arc::new(Directory::open(project, Privacy::Inherited, NameRetention::Pinned).unwrap());
@@ -3055,13 +3457,6 @@ mod tests {
         for secret in SECRETS {
             assert!(!projected.contains(secret), "catalog disclosed {secret}");
         }
-
-        let moved = project.path().with_extension("temporarily-moved");
-        std::fs::rename(project.path(), &moved).unwrap();
-        let unavailable = hosts.oauth_status("auth").await.unwrap();
-        assert_eq!(unavailable.state, "native_store_unavailable");
-        assert!(unavailable.diagnostic.is_some());
-        std::fs::rename(&moved, project.path()).unwrap();
 
         hosts.shutdown().await.unwrap();
     }

@@ -60,6 +60,8 @@ kuru-connectors = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 axum.workspace = true
 reqwest.workspace = true
+rcgen.workspace = true
+tokio-rustls.workspace = true
 rusqlite.workspace = true
 sqlx.workspace = true
 tar.workspace = true

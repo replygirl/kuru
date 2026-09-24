@@ -4,10 +4,22 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Output,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 #[path = "support/memory.rs"]
 mod memory;
+
+#[cfg(unix)]
+#[path = "support/terminal.rs"]
+#[allow(
+    dead_code,
+    reason = "this CLI fixture uses only the owned PTY browser-login path"
+)]
+mod terminal;
 
 // Windows PowerShell 5.1 engine/host cold start (module/format data load, first
 // runspace build) can stall well past a single `tool shell` call's own budget
@@ -72,6 +84,477 @@ impl Sandbox {
         );
         String::from_utf8(output.stdout).unwrap()
     }
+}
+
+#[test]
+#[ignore = "subprocess entry selected only by the MCP refusal fixture"]
+fn mcp_stdio_marker_child() {
+    let marker = std::env::var_os("KURU_TEST_MCP_STDIO_MARKER").unwrap();
+    std::fs::write(marker, b"started").unwrap();
+}
+
+#[test]
+fn mcp_cli_refuses_unselected_aliases_without_starting_stdio_or_memory() {
+    let env = Sandbox::new();
+    let marker = env.root.path().join("unrelated-stdio-started");
+    let fixture = std::env::current_exe().unwrap();
+    let config_path = env.root.path().join("config/kuru/config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+        r#"
+[mcp.stdio]
+command = {fixture}
+args = ["--ignored", "--exact", "mcp_stdio_marker_child", "--nocapture"]
+[mcp.stdio.env]
+KURU_TEST_MCP_STDIO_MARKER = {marker}
+
+[mcp.disabled]
+enabled = false
+url = "https://127.0.0.1:9/mcp"
+[mcp.disabled.oauth]
+enabled = true
+client_id = "synthetic-native-client"
+
+[mcp.selected]
+url = "https://127.0.0.1:9/mcp"
+[mcp.selected.oauth]
+enabled = true
+client_id = "synthetic-native-client"
+"#,
+        fixture = toml::Value::String(fixture.to_string_lossy().into_owned()),
+        marker = toml::Value::String(marker.to_string_lossy().into_owned())
+    ));
+    std::fs::write(config_path, config).unwrap();
+
+    let disabled: Value =
+        serde_json::from_str(&env.success(&["mcp", "status", "disabled"])).unwrap();
+    assert_eq!(disabled["state"], "disabled");
+    assert!(!marker.exists(), "disabled status started an STDIO alias");
+    let selected: Value =
+        serde_json::from_str(&env.success(&["mcp", "status", "selected"])).unwrap();
+    assert_eq!(selected["alias"], "selected");
+    assert!(
+        matches!(
+            selected["state"].as_str(),
+            Some("login_required" | "native_store_unavailable")
+        ),
+        "{selected}"
+    );
+    assert!(
+        !marker.exists(),
+        "selected status started an unrelated STDIO alias"
+    );
+    let logout: Value = serde_json::from_str(&env.success(&["mcp", "logout", "selected"])).unwrap();
+    assert_eq!(logout["alias"], "selected");
+    assert_eq!(logout["local_deleted"], false);
+    assert_eq!(logout["remote"], "no_local_credential");
+    assert!(!marker.exists(), "selected logout started unrelated STDIO");
+    let refuses = |args: &[&str], expected: &str| {
+        let output = env.run(args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains(expected), "{args:?}: {diagnostic}");
+    };
+
+    for alias in ["missing", "stdio", "disabled"] {
+        let expected = if alias == "stdio" {
+            "selected MCP alias does not enable OAuth".to_owned()
+        } else {
+            format!("configured MCP alias {alias} is unavailable")
+        };
+        refuses(&["mcp", "login", alias, "--no-browser"], &expected);
+        refuses(&["mcp", "logout", alias], &expected);
+        assert!(
+            !marker.exists(),
+            "unselected STDIO alias started for {alias}"
+        );
+        assert!(!env.data.join("memory").exists());
+    }
+
+    for alias in ["missing", "stdio"] {
+        let expected = if alias == "stdio" {
+            "selected MCP alias does not enable OAuth".to_owned()
+        } else {
+            format!("configured MCP alias {alias} is unavailable")
+        };
+        refuses(&["mcp", "status", alias], &expected);
+        assert!(
+            !marker.exists(),
+            "unselected STDIO alias started for {alias}"
+        );
+        assert!(!env.data.join("memory").exists());
+    }
+    assert!(!env.data.join("memory").exists());
+
+    let local = env.project.join(".kuru");
+    std::fs::create_dir(&local).unwrap();
+    std::fs::write(
+        local.join("config.toml"),
+        "[mcp.automatic]\nurl = 'https://127.0.0.1:9/mcp'\n[mcp.automatic.oauth]\nenabled = true\nclient_id = 'synthetic-native-client'\n",
+    )
+    .unwrap();
+    for args in [
+        ["mcp", "status", "automatic"].as_slice(),
+        ["mcp", "logout", "automatic"].as_slice(),
+        ["mcp", "login", "automatic", "--no-browser"].as_slice(),
+    ] {
+        let output = env.run(args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("workspace authority"),
+            "{args:?}: {diagnostic}"
+        );
+        assert!(!marker.exists(), "{args:?} started unrelated STDIO");
+        assert!(!env.data.join("memory").exists());
+    }
+}
+
+struct HttpsMcpFixture {
+    base: String,
+    ca_path: PathBuf,
+    device_requests: Arc<AtomicUsize>,
+    token_requests: Arc<AtomicUsize>,
+    revocations: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HttpsMcpFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl HttpsMcpFixture {
+    async fn start(root: &Path) -> Self {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        use tokio_rustls::rustls::{
+            ServerConfig,
+            pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+        };
+
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let issuer = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
+        let leaf_params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        let ca_path = root.join("synthetic-mcp-ca.pem");
+        std::fs::write(&ca_path, issuer.pem()).unwrap();
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("https://localhost:{port}");
+        let device_requests = Arc::new(AtomicUsize::new(0));
+        let token_requests = Arc::new(AtomicUsize::new(0));
+        let revocations = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let base = base.clone();
+            let device_requests = Arc::clone(&device_requests);
+            let token_requests = Arc::clone(&token_requests);
+            let revocations = Arc::clone(&revocations);
+            async move {
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let acceptor = acceptor.clone();
+                    let base = base.clone();
+                    let device_requests = Arc::clone(&device_requests);
+                    let token_requests = Arc::clone(&token_requests);
+                    let revocations = Arc::clone(&revocations);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let Ok(Ok(mut stream)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            acceptor.accept(socket),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        let mut request = Vec::new();
+                        let headers_end = loop {
+                            let mut chunk = [0u8; 1024];
+                            let Ok(Ok(count)) = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                stream.read(&mut chunk),
+                            )
+                            .await
+                            else {
+                                return;
+                            };
+                            if count == 0 || request.len() + count > 16 * 1024 {
+                                return;
+                            }
+                            request.extend_from_slice(&chunk[..count]);
+                            if let Some(end) =
+                                request.windows(4).position(|part| part == b"\r\n\r\n")
+                            {
+                                break end + 4;
+                            }
+                        };
+                        let headers = String::from_utf8_lossy(&request[..headers_end]).into_owned();
+                        let Some(first) = headers.lines().next() else {
+                            return;
+                        };
+                        let mut parts = first.split_whitespace();
+                        let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
+                            return;
+                        };
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if length > 8 * 1024 {
+                            return;
+                        }
+                        while request.len() - headers_end < length {
+                            let mut chunk = [0u8; 1024];
+                            let Ok(Ok(count)) = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                stream.read(&mut chunk),
+                            )
+                            .await
+                            else {
+                                return;
+                            };
+                            if count == 0 || request.len() + count > 24 * 1024 {
+                                return;
+                            }
+                            request.extend_from_slice(&chunk[..count]);
+                        }
+                        let payload = &request[headers_end..headers_end + length];
+                        let mut extra = String::new();
+                        let (status, body) = match (method, path) {
+                            ("GET", "/mcp") => {
+                                extra = format!(
+                                    "WWW-Authenticate: Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource/mcp\", scope=\"mcp.read\"\r\n"
+                                );
+                                (401, serde_json::json!({"error":"unauthorized"}))
+                            }
+                            ("GET", "/.well-known/oauth-protected-resource/mcp") => (
+                                200,
+                                serde_json::json!({"resource":format!("{base}/mcp"),"authorization_servers":[format!("{base}/")],"scopes_supported":["mcp.read"]}),
+                            ),
+                            ("GET", "/.well-known/oauth-authorization-server") => (
+                                200,
+                                serde_json::json!({"issuer":format!("{base}/"),"authorization_endpoint":format!("{base}/authorize"),"token_endpoint":format!("{base}/token"),"device_authorization_endpoint":format!("{base}/device"),"revocation_endpoint":format!("{base}/revoke"),"grant_types_supported":["authorization_code","urn:ietf:params:oauth:grant-type:device_code","refresh_token"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true}),
+                            ),
+                            ("POST", "/device") => {
+                                device_requests.fetch_add(1, Ordering::Relaxed);
+                                (
+                                    200,
+                                    serde_json::json!({"device_code":"synthetic-device","user_code":"TEST-CODE","verification_uri":format!("{base}/verify"),"expires_in":120,"interval":1}),
+                                )
+                            }
+                            ("POST", "/token") => {
+                                token_requests.fetch_add(1, Ordering::Relaxed);
+                                (
+                                    200,
+                                    serde_json::json!({"access_token":"synthetic-mcp-access","refresh_token":"synthetic-mcp-refresh","token_type":"Bearer","expires_in":120,"scope":"mcp.read"}),
+                                )
+                            }
+                            ("POST", "/revoke") => {
+                                revocations.fetch_add(1, Ordering::Relaxed);
+                                (200, serde_json::json!({}))
+                            }
+                            ("POST", "/mcp") => {
+                                let parsed: Value = serde_json::from_slice(payload).unwrap();
+                                let result = match parsed["method"].as_str() {
+                                    Some("initialize") => {
+                                        serde_json::json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}}})
+                                    }
+                                    Some("tools/list") => serde_json::json!({"tools":[]}),
+                                    Some("notifications/initialized") => serde_json::json!({}),
+                                    _ => serde_json::json!({}),
+                                };
+                                (
+                                    200,
+                                    serde_json::json!({"jsonrpc":"2.0","id":parsed["id"],"result":result}),
+                                )
+                            }
+                            _ => (404, serde_json::json!({"error":"not found"})),
+                        };
+                        let body = body.to_string();
+                        let response = format!(
+                            "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            }
+        });
+        Self {
+            base,
+            ca_path,
+            device_requests,
+            token_requests,
+            revocations,
+            task,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_cli_device_login_status_logout_uses_synthetic_verified_https() {
+    let env = Sandbox::new();
+    let server = HttpsMcpFixture::start(env.root.path()).await;
+    let config = env.root.path().join("config/kuru/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("\n[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n", format!("{}/mcp", server.base)));
+    std::fs::write(config, text).unwrap();
+    let root = server.ca_path.clone();
+    let run = |args: &'static [&'static str]| {
+        let mut command = env.command();
+        command
+            .env("KURU_TEST_MCP_CA_PEM", &root)
+            .arg("--trust-workspace-once")
+            .args(args);
+        tokio::task::spawn_blocking(move || command.output().unwrap())
+    };
+    let login = run(&["mcp", "login", "secure", "--device"]).await.unwrap();
+    assert!(
+        login.status.success(),
+        "{}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+    assert!(String::from_utf8_lossy(&login.stdout).contains("Signed in to MCP secure"));
+    assert_eq!(server.device_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(server.token_requests.load(Ordering::Relaxed), 1);
+    let status = run(&["mcp", "status", "secure"]).await.unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["state"], "authorized");
+    let logout = run(&["mcp", "logout", "secure"]).await.unwrap();
+    assert!(
+        logout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&logout.stderr)
+    );
+    let value: Value = serde_json::from_slice(&logout.stdout).unwrap();
+    assert_eq!(value["local_deleted"], true);
+    assert_eq!(server.revocations.load(Ordering::Relaxed), 1);
+    let status = run(&["mcp", "status", "secure"]).await.unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["state"], "login_required");
+
+    // The same synthetic CA must not make a different DNS identity valid.
+    let wrong_host = server.base.replace("localhost", "127.0.0.1");
+    let config = env.root.path().join("config/kuru/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("\n[mcp.wrong_host]\nurl = {:?}\n[mcp.wrong_host.oauth]\nenabled = true\nclient_id = 'synthetic-client'\n", format!("{wrong_host}/mcp")));
+    std::fs::write(config, text).unwrap();
+    let rejected = run(&["mcp", "login", "wrong_host", "--device"])
+        .await
+        .unwrap();
+    assert!(!rejected.status.success());
+    let diagnostic = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        diagnostic.contains("certificate") || diagnostic.contains("TLS"),
+        "hostname mismatch failed for an unrelated reason: {diagnostic}"
+    );
+    assert_eq!(server.device_requests.load(Ordering::Relaxed), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_cli_no_browser_prints_local_callback_guidance_and_settles_once() {
+    let env = Sandbox::new();
+    let server = HttpsMcpFixture::start(env.root.path()).await;
+    let config = env.root.path().join("config/kuru/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\n[mcp.browser]\nurl = {:?}\n[mcp.browser.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n",
+        format!("{}/mcp", server.base)
+    ));
+    std::fs::write(config, text).unwrap();
+
+    let mut command = env.command();
+    command.env("KURU_TEST_MCP_CA_PEM", &server.ca_path).args([
+        "--trust-workspace-once",
+        "mcp",
+        "login",
+        "browser",
+        "--no-browser",
+    ]);
+    let (url_send, url_receive) = std::sync::mpsc::sync_channel(1);
+    let child = std::thread::spawn(move || -> anyhow::Result<String> {
+        let mut terminal = terminal::Terminal::spawn(command, 24, 120)?;
+        terminal.wait(
+            "no-browser URL and forwarded-loopback guidance",
+            std::time::Duration::from_secs(15),
+            |terminal| {
+                let output = String::from_utf8_lossy(&terminal.output);
+                Ok(output.contains("Sign in to MCP browser:")
+                    && output
+                        .contains("use same-host browsing or forward the printed loopback port"))
+            },
+        )?;
+        let output = String::from_utf8_lossy(&terminal.output);
+        let url = output
+            .split_whitespace()
+            .find(|word| word.starts_with("https://localhost:") && word.contains("/authorize?"))
+            .ok_or_else(|| anyhow::anyhow!("CLI did not print its authorization URL"))?
+            .to_owned();
+        url_send.send(url).unwrap();
+        terminal.wait_exit(std::time::Duration::from_secs(15))?;
+        Ok(String::from_utf8_lossy(&terminal.output).into_owned())
+    });
+    let authorization = tokio::task::spawn_blocking(move || {
+        url_receive.recv_timeout(std::time::Duration::from_secs(20))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let authorization = reqwest::Url::parse(&authorization).unwrap();
+    let parameters = authorization
+        .query_pairs()
+        .into_owned()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let redirect = parameters
+        .get("redirect_uri")
+        .expect("authorization omitted redirect_uri");
+    let state = parameters
+        .get("state")
+        .expect("authorization omitted state");
+    let mut callback = reqwest::Url::parse(redirect).unwrap();
+    callback
+        .query_pairs_mut()
+        .append_pair("code", "synthetic-callback-code")
+        .append_pair("state", state)
+        .append_pair("iss", &format!("{}/", server.base));
+    let response = reqwest::Client::new().get(callback).send().await.unwrap();
+    assert!(
+        response.status().is_success(),
+        "callback refused: {}",
+        response.status()
+    );
+    let output = child.join().unwrap().unwrap();
+    assert!(output.contains("Signed in to MCP browser."), "{output}");
+    assert_eq!(server.device_requests.load(Ordering::Relaxed), 0);
+    assert_eq!(server.token_requests.load(Ordering::Relaxed), 1);
 }
 
 #[test]

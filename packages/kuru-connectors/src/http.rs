@@ -5,11 +5,37 @@ use serde_json::Value;
 use crate::{IO_TIMEOUT, MAX_BYTES};
 
 pub(crate) fn client() -> Result<Client> {
-    Ok(Client::builder()
+    let builder = Client::builder()
         .timeout(IO_TIMEOUT)
         .connect_timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
+        .redirect(reqwest::redirect::Policy::none());
+    #[cfg(feature = "test-support")]
+    let builder = with_fixture_root(builder)?;
+    Ok(builder.build()?)
+}
+
+// Only owned test children may add a synthetic CA. This keeps the normal
+// platform verifier, HTTPS requirement and hostname checks in place.
+#[cfg(feature = "test-support")]
+fn with_fixture_root(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+    use std::io::Read;
+
+    let Some(path) = std::env::var_os("KURU_TEST_MCP_CA_PEM") else {
+        return Ok(builder);
+    };
+    const MAX_FIXTURE_PEM_BYTES: u64 = 16 * 1024;
+    let mut pem = Vec::new();
+    std::fs::File::open(path)
+        .context("open synthetic MCP test CA")?
+        .take(MAX_FIXTURE_PEM_BYTES + 1)
+        .read_to_end(&mut pem)
+        .context("read synthetic MCP test CA")?;
+    ensure!(
+        !pem.is_empty() && pem.len() as u64 <= MAX_FIXTURE_PEM_BYTES,
+        "synthetic MCP test CA is empty or too large"
+    );
+    let root = reqwest::Certificate::from_pem(&pem).context("invalid synthetic MCP test CA")?;
+    Ok(builder.tls_certs_merge([root]))
 }
 
 pub(crate) fn endpoint(value: &str) -> Result<reqwest::Url> {
