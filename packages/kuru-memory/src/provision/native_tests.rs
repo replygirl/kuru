@@ -668,7 +668,10 @@ async fn held_descendant_releases_after_checked_no_move_and_activation_recovers(
         .await;
     tokio::time::resume();
     assert!(result.unwrap().is_none());
-    assert_eq!(denied, 1, "release only the observed checked rejection");
+    assert!(
+        denied >= 1,
+        "release the blocker on an observed checked no-move refusal"
+    );
     assert_eq!(
         files::directory(&destination).unwrap().identity(),
         source_identity

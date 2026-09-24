@@ -249,10 +249,15 @@ async fn native_model_tool_replay_preserves_authority_and_returns_real_receipts(
         );
     }
     let receipts = &observed.receipts;
+    let create_checkpoint = receipts["create"]
+        .strip_prefix("file_write completed; checkpoint file-")
+        .context("native file-write receipt omitted its durable checkpoint")?;
     ensure!(
-        receipts["create"].starts_with("Wrote "),
-        "{}",
-        receipts["create"]
+        create_checkpoint.len() == 64
+            && create_checkpoint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "native file-write receipt contained an invalid checkpoint ID"
     );
     ensure!(
         receipts["read"] == literal,
