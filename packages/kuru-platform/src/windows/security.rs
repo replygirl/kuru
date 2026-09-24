@@ -1154,7 +1154,10 @@ mod tests {
 
     #[test]
     fn replacement_retains_private_delete_authority_across_restrictive_target_dacl() {
-        use crate::fs::{Publication, copy_file_access, finalize_file_access, regular_file_info};
+        use crate::fs::{
+            Publication, copy_file_access, finalize_file_access, regular_file_info,
+            retained_file_info,
+        };
         use windows_sys::Win32::Storage::FileSystem::{DELETE, READ_CONTROL, WRITE_DAC};
 
         let temporary = tempfile::tempdir().unwrap();
@@ -1248,7 +1251,7 @@ mod tests {
         finalize_file_access(&original, &candidate).unwrap();
 
         assert_eq!(
-            regular_file_info(&original).unwrap().identity,
+            retained_file_info(&original).unwrap().identity,
             original_identity
         );
         original.rewind().unwrap();
@@ -1333,7 +1336,7 @@ mod tests {
 
     #[test]
     fn ordinary_create_and_unprotected_replacement_regain_parent_acl_inheritance() {
-        use crate::fs::{Publication, copy_file_access, finalize_file_access};
+        use crate::fs::{Publication, copy_file_access, finalize_file_access, retained_file_info};
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC,
@@ -1420,7 +1423,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            crate::fs::regular_file_info(&original).unwrap().identity,
+            retained_file_info(&original).unwrap().identity,
             original_identity,
             "retained replaced handle changed identity"
         );

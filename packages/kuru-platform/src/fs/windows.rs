@@ -104,7 +104,7 @@ unsafe fn query<T: Default>(file: &File, kind: i32) -> io::Result<T> {
     }
 }
 
-pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
+fn inspect_info(file: &File, allow_retained_delete_pending: bool) -> io::Result<ObjectInfo> {
     // SAFETY: each class below is paired with its exact plain native record.
     let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe { query(file, FileAttributeTagInfo)? };
     if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -112,7 +112,9 @@ pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
     }
     // SAFETY: FILE_STANDARD_INFO is the documented output for FileStandardInfo.
     let standard: FILE_STANDARD_INFO = unsafe { query(file, FileStandardInfo)? };
-    if standard.DeletePending || standard.EndOfFile < 0 {
+    if (standard.DeletePending && (!allow_retained_delete_pending || standard.NumberOfLinks != 0))
+        || standard.EndOfFile < 0
+    {
         return Err(denied(
             "filesystem object is pending deletion or has an invalid size",
         ));
@@ -130,6 +132,17 @@ pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
         },
         directory: standard.Directory,
     })
+}
+
+pub(super) fn info(file: &File) -> io::Result<ObjectInfo> {
+    inspect_info(file, false)
+}
+
+pub(super) fn retained_info(file: &File) -> io::Result<ObjectInfo> {
+    // POSIX replacement marks the old object for deletion while its already
+    // held, now-unlinked handle remains readable. Ordinary admission still
+    // uses strict info, and a delete-pending object with a live link is refused.
+    inspect_info(file, true)
 }
 
 fn persistent_acls(file: &File) -> io::Result<()> {

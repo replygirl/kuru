@@ -124,7 +124,7 @@ pub fn finalize_file_access(source: &File, published: &File) -> io::Result<()> {
     // A replaced source can have zero links after the checked publication,
     // while its retained handle still carries the access policy we copied.
     // It was checked before publication; reject any newly linked alias.
-    if regular_file_info(source)?.links > 1 {
+    if retained_file_info(source)?.links > 1 {
         return Err(denied("access source gained another hardlink"));
     }
     checked_file(published)?;
@@ -317,6 +317,19 @@ fn component(name: &OsStr) -> io::Result<()> {
 /// Metadata inspection reports hardlink identity; checked opens reject links.
 pub fn regular_file_info(file: &File) -> io::Result<FileInfo> {
     let info = native::info(file)?;
+    if info.directory {
+        return Err(denied("expected a regular disk file"));
+    }
+    Ok(info.file)
+}
+
+/// Inspect an already-retained file handle after a checked publication.
+///
+/// Windows may mark the displaced object delete-pending while its handle still
+/// supplies its exact identity and access policy. This metadata-only query is
+/// not an admission check for a new source, destination, or writable file.
+pub fn retained_file_info(file: &File) -> io::Result<FileInfo> {
+    let info = native::retained_info(file)?;
     if info.directory {
         return Err(denied("expected a regular disk file"));
     }

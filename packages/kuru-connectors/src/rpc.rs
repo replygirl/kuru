@@ -299,6 +299,16 @@ enum Startup {
     Retaining(StartupOwner),
 }
 
+fn rejected_startup(phase: &'static str, os_code: Option<i32>) -> Startup {
+    // Test output identifies only the bounded startup phase and OS code. Do
+    // not print configured commands, arguments, environment, or user paths.
+    #[cfg(test)]
+    eprintln!("MCP startup rejected: phase={phase}, os_code={os_code:?}");
+    #[cfg(not(test))]
+    let _ = (phase, os_code);
+    Startup::Rejected
+}
+
 struct StartupOwner {
     owner: Owner,
     completion: Arc<Completion>,
@@ -359,17 +369,18 @@ impl Session {
             cwd.to_path_buf()
         } else {
             let Ok(current) = std::env::current_dir() else {
-                return Startup::Rejected;
+                return rejected_startup("current-directory", None);
             };
             current.join(cwd)
         };
         let cwd_pin = match Directory::open(&cwd, Privacy::Inherited, NameRetention::Pinned) {
             Ok(cwd_pin) => cwd_pin,
-            Err(_) => return Startup::Rejected,
+            Err(error) => return rejected_startup("cwd-pin", error.raw_os_error()),
         };
         match cwd_pin.is_within(&root_guard) {
             Ok(true) => {}
-            Ok(false) | Err(_) => return Startup::Rejected,
+            Ok(false) => return rejected_startup("cwd-outside-root", None),
+            Err(error) => return rejected_startup("cwd-ancestry", error.raw_os_error()),
         }
         let cwd = cwd_pin.path().to_path_buf();
         #[cfg(unix)]
@@ -382,15 +393,15 @@ impl Session {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            if root_guard.revalidate().is_err() {
-                return Startup::Rejected;
+            if let Err(error) = root_guard.revalidate() {
+                return rejected_startup("root-revalidate", error.raw_os_error());
             }
             if admission.enter().is_err() {
-                return Startup::Rejected;
+                return rejected_startup("admission", None);
             }
             let mut owner = match OwnedProcessGroup::spawn(command) {
                 Ok(owner) => owner,
-                Err(_) => return Startup::Rejected,
+                Err(error) => return rejected_startup("unix-spawn", error.raw_os_error()),
             };
             drop(cwd_pin);
             #[cfg(test)]
@@ -425,20 +436,20 @@ impl Session {
         let (owner, input, output, error) = {
             let mut spec = match crate::process::configured(program, args, env, &cwd) {
                 Ok(spec) => spec,
-                Err(_) => return Startup::Rejected,
+                Err(_) => return rejected_startup("windows-configure", None),
             };
             spec.stdin = NativeStdio::Pipe;
             spec.stdout = NativeStdio::Pipe;
             spec.stderr = NativeStdio::Pipe;
-            if root_guard.revalidate().is_err() {
-                return Startup::Rejected;
+            if let Err(error) = root_guard.revalidate() {
+                return rejected_startup("root-revalidate", error.raw_os_error());
             }
             if admission.enter().is_err() {
-                return Startup::Rejected;
+                return rejected_startup("admission", None);
             }
             let mut owner = match spec.spawn().await {
                 Ok(owner) => owner,
-                Err(_) => return Startup::Rejected,
+                Err(error) => return rejected_startup("windows-spawn", error.raw_os_error()),
             };
             drop(cwd_pin);
             #[cfg(test)]

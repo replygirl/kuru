@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use kuru_platform::fs::retained_file_info;
 use kuru_platform::fs::{
     Directory, NameRetention, Privacy, Publication, PublicationPhase, make_executable,
     regular_file_info, require_private, seal_private,
@@ -388,7 +390,7 @@ fn checked_publication_preserves_occupied_targets_then_replaces_atomically() {
                 Publication::ReplaceRegular,
             )
             .unwrap();
-        assert_eq!(regular_file_info(&old).unwrap().identity, old_identity);
+        assert_eq!(retained_file_info(&old).unwrap().identity, old_identity);
         old.rewind().unwrap();
         assert_eq!(contents(old), b"old bytes");
     }
