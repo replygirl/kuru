@@ -334,6 +334,21 @@ pub(super) fn file_access_token(source: &File) -> io::Result<Vec<u8>> {
     security::file_access_token(source.as_handle())
 }
 
+pub(super) fn retired_access_matches(
+    source: &File,
+    before: &[u8],
+    after: &[u8],
+) -> io::Result<bool> {
+    // This exception cannot be used for a named or still-linked source. The
+    // caller has already checked this held file's full identity and metadata;
+    // the kernel's delete-pending bit proves it is the displaced old object.
+    // SAFETY: FileStandardInfo returns the plain FILE_STANDARD_INFO record.
+    let standard: FILE_STANDARD_INFO = unsafe { query(source, FileStandardInfo)? };
+    Ok(standard.DeletePending
+        && standard.NumberOfLinks == 0
+        && security::same_retired_file_access(before, after))
+}
+
 pub(super) fn finalize_file_access(source: &File, published: &File) -> io::Result<()> {
     security::restore_file_dacl_inheritance(source.as_handle(), published.as_handle())
 }
@@ -1330,6 +1345,20 @@ mod tests {
     fn access_token_difference(before: &[u8], after: &[u8]) -> String {
         let before = parse_access_token(before);
         let after = parse_access_token(after);
+        let inherited = windows_sys::Win32::Security::INHERITED_ACE as u8;
+        let mut inherited_cleared = 0;
+        let mut inherited_added = 0;
+        let mut other_flag_changes = 0;
+        for (left, right) in before.aces.iter().zip(&after.aces) {
+            if left.flags & inherited != 0 && right.flags & inherited == 0 {
+                inherited_cleared += 1;
+            } else if left.flags & inherited == 0 && right.flags & inherited != 0 {
+                inherited_added += 1;
+            }
+            if (left.flags ^ right.flags) & !inherited != 0 {
+                other_flag_changes += 1;
+            }
+        }
         let changed: Vec<_> = before
             .aces
             .iter()
@@ -1343,9 +1372,13 @@ mod tests {
                     && left.payload == right.payload;
                 (!same).then(|| {
                     format!(
-                        "{index}: type={}, flags={}, size={}, mask_slot={}, payload={}",
+                        "{index}: type={}, flags={}/0x{:02x}->0x{:02x}/xor=0x{:02x}/inherited_provenance_only={}, size={}, mask_slot={}, payload={}",
                         left.kind == right.kind,
                         left.flags == right.flags,
+                        left.flags,
+                        right.flags,
+                        left.flags ^ right.flags,
+                        left.flags ^ right.flags == windows_sys::Win32::Security::INHERITED_ACE as u8,
                         left.size == right.size,
                         left.mask_slot == right.mask_slot,
                         left.payload == right.payload,
@@ -1355,12 +1388,15 @@ mod tests {
             .take(16)
             .collect();
         format!(
-            "protected={}, owner={}, revision={}, ace_count={}/{}, changed_aces=[{}]",
+            "protected={}, owner={}, revision={}, ace_count={}/{}, inherited_cleared={}, inherited_added={}, other_flag_changes={}, changed_aces=[{}]",
             before.protected == after.protected,
             before.owner == after.owner,
             before.revision == after.revision,
             before.aces.len(),
             after.aces.len(),
+            inherited_cleared,
+            inherited_added,
+            other_flag_changes,
             changed.join("; "),
         )
     }
@@ -1406,6 +1442,10 @@ mod tests {
             before_publish == file_access_token(&old).unwrap(),
             "source access token changed before publication"
         );
+        assert!(
+            !retired_access_matches(&old, &before_publish, &before_publish).unwrap(),
+            "a still-linked source was treated as a retired file"
+        );
         let source =
             Directory::open(stage.path(), Privacy::Inherited, NameRetention::Movable).unwrap();
         assert_eq!(source.identity(), stage.identity());
@@ -1420,13 +1460,24 @@ mod tests {
             )
             .unwrap();
         let after_publish = file_access_token(&old).unwrap();
+        assert!(
+            security::same_retired_file_access(&before_publish, &after_publish),
+            "retired source changed more than inherited-ACE provenance: {}",
+            access_token_difference(&before_publish, &after_publish)
+        );
+        assert!(
+            retired_access_matches(&old, &before_publish, &after_publish).unwrap(),
+            "retained old file did not satisfy the checked zero-link retirement boundary"
+        );
         crate::fs::finalize_file_access(&old, &candidate).unwrap();
         let after_finalize = file_access_token(&old).unwrap();
-        eprintln!(
+        writeln!(
+            std::io::stderr().lock(),
             "retained-old access after publish: {}; after finalize: {}",
             access_token_difference(&before_publish, &after_publish),
             access_token_difference(&before_publish, &after_finalize),
-        );
+        )
+        .unwrap();
         crate::fs::verify_retained_file_access(&old, &access).unwrap();
         assert_eq!(crate::fs::retained_file_info(&old).unwrap().links, 0);
         assert_eq!(
@@ -1465,6 +1516,13 @@ mod tests {
         let candidate = stage.create_new(OsStr::new("payload")).unwrap();
         let access = crate::fs::copy_file_access(&source, &candidate).unwrap();
         crate::fs::verify_retained_file_access(&source, &access).unwrap();
+        let unrelated = directory.create_new(OsStr::new("unrelated")).unwrap();
+        assert_eq!(
+            crate::fs::verify_retained_file_access(&unrelated, &access)
+                .unwrap_err()
+                .to_string(),
+            "access source identity changed during publication"
+        );
 
         let alias = directory.path().join("unexpected-alias");
         std::fs::hard_link(directory.path().join("source"), &alias).unwrap();

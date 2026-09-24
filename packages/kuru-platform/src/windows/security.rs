@@ -15,10 +15,10 @@ use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
     DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
     GetSecurityDescriptorDacl, GetSecurityDescriptorLength, GetTokenInformation, INHERIT_ONLY_ACE,
-    IsValidAcl, IsValidSecurityDescriptor, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_OWNER,
-    TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
-    WinCreatorOwnerRightsSid,
+    INHERITED_ACE, IsValidAcl, IsValidSecurityDescriptor, IsValidSid, IsWellKnownSid,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+    SECURITY_ATTRIBUTES, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+    UNPROTECTED_DACL_SECURITY_INFORMATION, WinCreatorOwnerRightsSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
@@ -437,6 +437,46 @@ fn canonical_access_token(
     Ok(token)
 }
 
+/// Compare a retired regular file's policy after Windows removes its last
+/// name. Only the inherited-ACE provenance bit is irrelevant to access on an
+/// already-unlinked file; the caller must separately prove the retained file
+/// is delete-pending with zero links. Every other ordered ACE byte, including
+/// inherit-only/effective status and unknown payloads, remains significant.
+pub(crate) fn same_retired_file_access(before: &[u8], after: &[u8]) -> bool {
+    fn without_inherited_provenance(token: &[u8]) -> Option<Vec<u8>> {
+        let mut token = token.to_vec();
+        let owner_len = u32::from_le_bytes(token.get(1..5)?.try_into().ok()?) as usize;
+        let owner_end = 5usize.checked_add(owner_len)?;
+        let count =
+            u32::from_le_bytes(token.get(owner_end + 1..owner_end + 5)?.try_into().ok()?) as usize;
+        let ace_len =
+            u32::from_le_bytes(token.get(owner_end + 5..owner_end + 9)?.try_into().ok()?) as usize;
+        let mut cursor = owner_end.checked_add(9)?;
+        if cursor.checked_add(ace_len)? != token.len() || count > ace_len / 4 {
+            return None;
+        }
+        for _ in 0..count {
+            let size =
+                u16::from_le_bytes(token.get(cursor + 2..cursor + 4)?.try_into().ok()?) as usize;
+            let end = cursor.checked_add(size)?;
+            if size < 4 || end > token.len() {
+                return None;
+            }
+            token[cursor + 1] &= !(INHERITED_ACE as u8);
+            cursor = end;
+        }
+        (cursor == token.len()).then_some(token)
+    }
+
+    match (
+        without_inherited_provenance(before),
+        without_inherited_provenance(after),
+    ) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
+    }
+}
+
 pub(crate) fn file_access_token(source: BorrowedHandle<'_>) -> io::Result<Vec<u8>> {
     let mut owner = null_mut();
     let mut dacl = null_mut();
@@ -788,6 +828,67 @@ mod tests {
         PrivateSecurity {
             descriptor: LocalMemory(result),
         }
+    }
+
+    #[test]
+    fn retired_access_comparison_ignores_only_inherited_ace_provenance() {
+        fn token(flags: u8, mask: u32, payload: [u8; 4]) -> Vec<u8> {
+            let mut dacl = vec![2, 0, 0, 0, 0, 0, 1, 0];
+            dacl.extend_from_slice(&[ACCESS_ALLOWED_ACE_TYPE as u8, flags, 12, 0]);
+            dacl.extend_from_slice(&mask.to_le_bytes());
+            dacl.extend_from_slice(&payload);
+            let size = u16::try_from(dacl.len()).unwrap().to_le_bytes();
+            dacl[2..4].copy_from_slice(&size);
+            canonical_access_token(false, &[1, 2], &dacl, dacl.len(), 1).unwrap()
+        }
+
+        let inherited = token(INHERITED_ACE as u8, 0x12, [3, 4, 5, 6]);
+        let explicit = token(0, 0x12, [3, 4, 5, 6]);
+        assert!(same_retired_file_access(&inherited, &inherited));
+        assert!(same_retired_file_access(&inherited, &explicit));
+        assert!(same_retired_file_access(&explicit, &inherited));
+        assert!(!same_retired_file_access(
+            &inherited,
+            &token(INHERIT_ONLY_ACE as u8, 0x12, [3, 4, 5, 6])
+        ));
+        for flag in [0x01, 0x02, 0x04, 0x20, 0x80] {
+            assert!(!same_retired_file_access(
+                &inherited,
+                &token(flag, 0x12, [3, 4, 5, 6])
+            ));
+        }
+        assert!(!same_retired_file_access(
+            &inherited,
+            &token(0, 0x13, [3, 4, 5, 6])
+        ));
+        assert!(!same_retired_file_access(
+            &inherited,
+            &token(0, 0x12, [3, 4, 5, 7])
+        ));
+        for offset in [0, 5, 7, 8] {
+            let mut changed = explicit.clone();
+            changed[offset] ^= 1;
+            assert!(!same_retired_file_access(&inherited, &changed));
+        }
+        for offset in [16, 18] {
+            let mut changed = explicit.clone();
+            changed[offset] ^= 1; // ACE type or size, respectively.
+            assert!(!same_retired_file_access(&inherited, &changed));
+        }
+        let mut two_aces = explicit.clone();
+        two_aces[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        two_aces[12..16].copy_from_slice(&24_u32.to_le_bytes());
+        two_aces.extend_from_slice(&[ACCESS_ALLOWED_ACE_TYPE as u8, 0, 12, 0]);
+        two_aces.extend_from_slice(&0x34_u32.to_le_bytes());
+        two_aces.extend_from_slice(&[7, 8, 9, 10]);
+        let mut reordered = two_aces.clone();
+        reordered[16..28].copy_from_slice(&two_aces[28..40]);
+        reordered[28..40].copy_from_slice(&two_aces[16..28]);
+        assert!(!same_retired_file_access(&two_aces, &reordered));
+        assert!(!same_retired_file_access(
+            &inherited,
+            &explicit[..explicit.len() - 1]
+        ));
     }
 
     fn set_dacl_on_handle(handle: BorrowedHandle<'_>, dacl: *const ACL) {
