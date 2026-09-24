@@ -117,6 +117,19 @@ pub fn verify_file_access(source: &File, expected: &FileAccessToken) -> io::Resu
     Ok(())
 }
 
+/// Verify the same source policy after publication using only its already-held
+/// handle. Windows POSIX replacement can retire that object with zero links;
+/// ordinary name-based admission and the pre-publication check remain strict.
+pub fn verify_retained_file_access(source: &File, expected: &FileAccessToken) -> io::Result<()> {
+    if retained_file_info(source)?.links > 1 {
+        return Err(denied("access source gained another hardlink"));
+    }
+    if native::file_access_token(source)? != expected.bytes {
+        return Err(denied("file access policy changed during publication"));
+    }
+    Ok(())
+}
+
 /// After a checked move into the destination parent, restore the source's
 /// inheritance behavior through the still-retained published file handle.
 /// A caller must not settle its effect as applied until this succeeds.

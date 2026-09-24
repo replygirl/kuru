@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use kuru_platform::fs::{
     Directory, NameRetention, Privacy, Publication, copy_file_access, finalize_file_access,
-    regular_file_info, verify_file_access,
+    regular_file_info, verify_file_access, verify_retained_file_access,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -935,7 +935,7 @@ impl CheckpointLease<'_> {
                         "file was published but final access policy is unresolved; checkpoint retained",
                     );
                 }
-                if let Err(error) = verify_file_access(access_source, &access_token) {
+                if let Err(error) = verify_retained_file_access(access_source, &access_token) {
                     let _ = self.settle(id, CheckpointState::Uncertain, None);
                     return Err(error).context(
                         "file was published while source access changed; checkpoint retained",
