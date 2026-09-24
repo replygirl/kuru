@@ -1053,11 +1053,31 @@ mod tests {
     #[derive(Clone, Default)]
     struct SyntheticItems {
         records: Arc<Mutex<Vec<(NativeSecretAccount, NativeSecretRecord)>>>,
+        failure: Arc<Mutex<Option<(ItemOperation, ItemError)>>>,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum ItemOperation {
+        Get,
+        Create,
+        Replace,
+        Delete,
     }
 
     impl SyntheticItems {
         fn count(&self) -> usize {
             self.records.lock().unwrap().len()
+        }
+
+        fn fail(&self, operation: ItemOperation, error: ItemError) {
+            *self.failure.lock().unwrap() = Some((operation, error));
+        }
+
+        fn check(&self, operation: ItemOperation) -> std::result::Result<(), ItemError> {
+            match *self.failure.lock().unwrap() {
+                Some((selected, error)) if selected == operation => Err(error),
+                _ => Ok(()),
+            }
         }
     }
 
@@ -1066,6 +1086,7 @@ mod tests {
             &mut self,
             account: &NativeSecretAccount,
         ) -> std::result::Result<Option<NativeSecretRecord>, ItemError> {
+            self.check(ItemOperation::Get)?;
             Ok(self
                 .records
                 .lock()
@@ -1080,6 +1101,7 @@ mod tests {
             account: &NativeSecretAccount,
             record: &NativeSecretRecord,
         ) -> std::result::Result<(), ItemError> {
+            self.check(ItemOperation::Create)?;
             let mut records = self.records.lock().unwrap();
             if records.iter().any(|(candidate, _)| candidate == account) {
                 return Err(ItemError::Stale);
@@ -1094,6 +1116,7 @@ mod tests {
             expected: NativeSecretGeneration,
             record: &NativeSecretRecord,
         ) -> std::result::Result<(), ItemError> {
+            self.check(ItemOperation::Replace)?;
             let mut records = self.records.lock().unwrap();
             let (_, current) = records
                 .iter_mut()
@@ -1111,6 +1134,7 @@ mod tests {
             account: &NativeSecretAccount,
             expected: NativeSecretGeneration,
         ) -> std::result::Result<(), ItemError> {
+            self.check(ItemOperation::Delete)?;
             let mut records = self.records.lock().unwrap();
             let position = records
                 .iter()
@@ -1129,6 +1153,75 @@ mod tests {
         seed: [u8; 32],
     ) -> Vault<SyntheticItems> {
         Vault::new(store, manifest.clone(), seed)
+    }
+
+    #[test]
+    fn native_store_denial_or_unavailability_never_falls_back_to_plaintext() {
+        const SECRET: &[u8] = b"synthetic-private-token";
+        for (failure, message) in [
+            (
+                ItemError::Denied,
+                "native secret store denied the MCP OAuth credential operation",
+            ),
+            (
+                ItemError::Unavailable,
+                "native secret store is unavailable for MCP OAuth credentials",
+            ),
+        ] {
+            // Denied models a locked or refused backend when the platform
+            // reports NoStorageAccess. OS classification remains separate;
+            // there is no file or session fallback here.
+            for operation in [
+                ItemOperation::Get,
+                ItemOperation::Create,
+                ItemOperation::Replace,
+                ItemOperation::Delete,
+            ] {
+                let items = SyntheticItems::default();
+                let seed = [0x51; 32];
+                let manifest = NativeSecretAccount::from_digest(seed);
+                let prior = if operation == ItemOperation::Replace {
+                    Some(
+                        vault(items.clone(), &manifest, seed)
+                            .create(SECRET.to_vec())
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                if operation == ItemOperation::Delete {
+                    let pending = Manifest::PreparedCreate {
+                        new: descriptor(SECRET).unwrap(),
+                    };
+                    let record = manifest_record(native_generation().unwrap(), &pending).unwrap();
+                    items.clone().create(&manifest, &record).unwrap();
+                }
+                let before = items.records.lock().unwrap().clone();
+                items.fail(operation, failure);
+                let result: Result<()> = match operation {
+                    ItemOperation::Get | ItemOperation::Delete => {
+                        vault(items.clone(), &manifest, seed).read().map(|_| ())
+                    }
+                    ItemOperation::Create => vault(items.clone(), &manifest, seed)
+                        .create(SECRET.to_vec())
+                        .map(|_| ()),
+                    ItemOperation::Replace => vault(items.clone(), &manifest, seed)
+                        .replace(prior.unwrap(), b"replacement-private-token".to_vec())
+                        .map(|_| ()),
+                };
+                let diagnostic = result.unwrap_err().to_string();
+                assert_eq!(diagnostic, message);
+                assert!(!diagnostic.contains("private-token"));
+                assert!(items.records.lock().unwrap().as_slice() == before.as_slice());
+                *items.failure.lock().unwrap() = None;
+                let readable = vault(items.clone(), &manifest, seed).read().unwrap();
+                if operation == ItemOperation::Replace {
+                    assert_eq!(readable.unwrap().secret(), SECRET);
+                } else {
+                    assert!(readable.is_none());
+                }
+            }
+        }
     }
 
     fn maximum_credential() -> McpOAuthCredential {

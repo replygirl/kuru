@@ -1950,6 +1950,201 @@ fn real_pty_mcp_oauth_status_uses_the_shared_command_family_without_network() ->
     terminal.assert_restored()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_mcp_refusals_keep_composer_and_other_aliases_idle() -> Result<()> {
+    const SECRET: &str = "recognizable-pty-refusal-client-secret";
+    let sandbox = Sandbox::new()?;
+    kuru_platform::fs::Directory::ensure_private(&sandbox.data)?;
+    let unrelated_stdio = CatalogStdioPeer::new()?;
+    unrelated_stdio.plan("eof\n")?;
+
+    let unrelated_http_calls = Arc::new(AtomicUsize::new(0));
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let mcp_calls = Arc::clone(&unrelated_http_calls);
+    let response_calls = Arc::clone(&provider_calls);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route(
+            "/v1/responses",
+            post(move || {
+                let calls = Arc::clone(&response_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        )
+        .route(
+            "/mcp/unrelated",
+            axum::routing::any(move || {
+                let calls = Arc::clone(&mcp_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+
+    let mut config = sandbox.config()?;
+    config.provider = "responses".into();
+    config.model = "fixture".into();
+    config.api_base = format!("http://{address}/v1");
+    config.api_key_env = "KURU_FIXTURE_KEY".into();
+    config.mcp = BTreeMap::from([
+        (
+            "disabled".into(),
+            McpConfig {
+                enabled: false,
+                url: Some("https://127.0.0.1:9/mcp".into()),
+                oauth: Some(McpOAuthConfig {
+                    enabled: true,
+                    client_id: Some("synthetic-native-client".into()),
+                    client_secret_env: Some("KURU_TEST_MCP_CLIENT_SECRET".into()),
+                    ..McpOAuthConfig::default()
+                }),
+                ..McpConfig::default()
+            },
+        ),
+        (
+            "stdio".into(),
+            McpConfig {
+                command: Some(unrelated_stdio.command.to_string_lossy().into_owned()),
+                ..McpConfig::default()
+            },
+        ),
+        (
+            "unrelated_http".into(),
+            McpConfig {
+                url: Some(format!("http://{address}/mcp/unrelated")),
+                ..McpConfig::default()
+            },
+        ),
+    ]);
+    let config_path = sandbox.root.path().join("mcp-refusal-pty.toml");
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config_path)
+        .arg("--trust-workspace-once")
+        .env("KURU_FIXTURE_KEY", "fixture-key")
+        .env("KURU_TEST_MCP_CLIENT_SECRET", SECRET)
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 50, 160)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    let cases = [
+        (
+            "/mcp status missing",
+            "configured MCP alias missing is unavailable",
+        ),
+        (
+            "/mcp login --no-browser missing",
+            "configured MCP alias missing is unavailable",
+        ),
+        (
+            "/mcp logout missing",
+            "configured MCP alias missing is unavailable",
+        ),
+        (
+            "/mcp status stdio",
+            "selected MCP alias does not enable OAuth",
+        ),
+        (
+            "/mcp login --no-browser stdio",
+            "selected MCP alias does not enable OAuth",
+        ),
+        (
+            "/mcp logout stdio",
+            "selected MCP alias does not enable OAuth",
+        ),
+        ("/mcp status disabled", "\"state\": \"disabled\""),
+        (
+            "/mcp login --no-browser disabled",
+            "configured MCP alias disabled is unavailable",
+        ),
+        (
+            "/mcp logout disabled",
+            "configured MCP alias disabled is unavailable",
+        ),
+    ];
+    for (request, expected) in cases {
+        terminal.command(request, None)?;
+        terminal.wait_composer_frame(&[expected, "enter send"], READY_TIMEOUT)?;
+        ensure!(
+            unrelated_stdio.started()? == 0,
+            "{request} started an unrelated STDIO MCP"
+        );
+        ensure!(
+            unrelated_http_calls.load(Ordering::SeqCst) == 0,
+            "{request} contacted an unrelated HTTP MCP"
+        );
+        ensure!(
+            provider_calls.load(Ordering::SeqCst) == 0,
+            "{request} sent a provider request"
+        );
+    }
+    terminal.command("/help", None)?;
+    terminal.wait_composer_frame(&["/mcp", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    ensure!(
+        !String::from_utf8_lossy(&terminal.output).contains(SECRET),
+        "MCP refusal terminal output disclosed the configured client secret"
+    );
+    terminal.assert_restored()?;
+
+    // An unapproved automatic project claim stops before the TUI exists. It
+    // cannot share the composer assertion above because no session is opened.
+    let local = sandbox.project.join(".kuru");
+    std::fs::create_dir(&local)?;
+    std::fs::write(
+        local.join("config.toml"),
+        "[mcp.automatic]\nurl = 'https://127.0.0.1:9/mcp'\n[mcp.automatic.oauth]\nenabled = true\nclient_id = 'synthetic-native-client'\n",
+    )?;
+    let mut unapproved = sandbox.command("responses");
+    unapproved
+        .args(["--model", "fixture", "--config"])
+        .arg(&config_path)
+        .env("KURU_FIXTURE_KEY", "fixture-key")
+        .env("KURU_TEST_MCP_CLIENT_SECRET", SECRET);
+    let mut refused = Terminal::spawn(unapproved, 50, 160)?;
+    refused.wait_text(&["Choice [3]:"], &[])?;
+    refused.send(b"3\r")?;
+    let exit = refused.wait_exit(EXIT_TIMEOUT).unwrap_err();
+    ensure!(exit.to_string().contains("child failed"), "{exit:#}");
+    let output = String::from_utf8_lossy(&refused.output);
+    ensure!(
+        output.contains("workspace trust was not granted"),
+        "automatic MCP claim did not stop at trust preflight: {output}"
+    );
+    ensure!(
+        !output.contains("\x1b[?1049h") && !output.contains(SECRET),
+        "unapproved automatic MCP claim reached the TUI or disclosed a secret"
+    );
+    ensure!(
+        unrelated_stdio.started()? == 0,
+        "preflight started STDIO MCP"
+    );
+    ensure!(
+        unrelated_http_calls.load(Ordering::SeqCst) == 0,
+        "preflight sent HTTP MCP request"
+    );
+    ensure!(
+        provider_calls.load(Ordering::SeqCst) == 0,
+        "preflight sent provider request"
+    );
+    refused.assert_restored()
+}
+
 #[derive(Clone)]
 struct PermissionProvider {
     tool: String,
