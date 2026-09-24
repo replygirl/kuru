@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::cli::ExportFormat;
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const STAGED_PAYLOAD: &str = "export.json";
 
 pub async fn export(
@@ -40,7 +40,12 @@ pub async fn export(
     };
     let mut staged = StagedExport::new(staging_parent)?;
     let counts = render(&snapshot, format, staged.file_mut()).await?;
-    snapshot.verify_counts(counts.messages, counts.state)?;
+    snapshot.verify_counts(
+        counts.messages,
+        counts.state,
+        counts.context_summaries,
+        counts.context_cursors,
+    )?;
     staged.complete()?;
     match target {
         Some(target) => staged.publish(target),
@@ -83,6 +88,8 @@ impl OutputTarget {
 struct Counts {
     messages: u64,
     state: u64,
+    context_summaries: u64,
+    context_cursors: u64,
 }
 
 async fn render(
@@ -113,6 +120,8 @@ async fn render(
             match &record {
                 StorageRecord::Message { .. } => counts.messages += 1,
                 StorageRecord::State { .. } => counts.state += 1,
+                StorageRecord::ContextSummary { .. } => counts.context_summaries += 1,
+                StorageRecord::ContextCursor { .. } => counts.context_cursors += 1,
             }
             // JSON strings escape line breaks and fence-looking content, so a stored
             // record cannot terminate this Markdown record fence.
@@ -148,6 +157,7 @@ fn render_markdown_record(writer: &mut impl Write, record: &StorageRecord) -> Re
         StorageRecord::Message {
             sequence,
             namespace,
+            session_id,
             role,
             content_format,
             content,
@@ -167,6 +177,7 @@ fn render_markdown_record(writer: &mut impl Write, record: &StorageRecord) -> Re
                     "kind": "message",
                     "sequence": sequence,
                     "namespace": namespace,
+                    "session_id": session_id,
                     "role": role,
                     "content_format": content_format,
                     "content": content,
@@ -174,7 +185,9 @@ fn render_markdown_record(writer: &mut impl Write, record: &StorageRecord) -> Re
             )?;
             writeln!(writer, "\n```")?;
         }
-        StorageRecord::State { .. } => {
+        StorageRecord::State { .. }
+        | StorageRecord::ContextSummary { .. }
+        | StorageRecord::ContextCursor { .. } => {
             writeln!(writer, "\n```json")?;
             serde_json::to_writer(&mut *writer, record)?;
             writeln!(writer, "\n```")?;
@@ -350,6 +363,7 @@ mod render_tests {
         let record = StorageRecord::Message {
             sequence: 7,
             namespace: "project/transcript/session".into(),
+            session_id: Some("session".into()),
             role: "assistant".into(),
             content_format: "typed-v1".into(),
             content: r#"{"blocks":[{"type":"tool_result","call_id":"c1","output":{"ok":true},"is_error":false}]}"#.into(),
@@ -368,8 +382,10 @@ mod render_tests {
                 schema_version: 3,
                 message_count: 1,
                 state_count: 0,
+                context_summary_count: 0,
+                context_cursor_count: 0,
             })["format"],
-            2
+            3
         );
     }
 }

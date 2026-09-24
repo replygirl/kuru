@@ -165,7 +165,9 @@ recorded remaining identities.
 `kuru memory export [--format json|markdown] [--output PATH]` is provider-free
 inspection of the current committed `main` snapshot. Its JSON manifest includes
 revision, schema and row counts; Markdown contains the same manifest and each
-record as JSON. It excludes previous revisions, candidate branches, uncommitted
+message, state, context-summary and context-cursor record as JSON. Message
+records retain an optional physical session identity, including null for
+unattributed legacy rows. It excludes previous revisions, candidate branches, uncommitted
 working rows, operations and schema tables. A supplied output path is published
 only as a new file after private staging; it never overwrites an existing path.
 It does not create memory or import legacy SQLite data for a fresh project.

@@ -416,6 +416,7 @@ async fn all_four_modes_keep_pre_extraction_requests_and_facing_outcomes() {
                 note: "baseline unique maximum".into(),
             },
         );
+        harness.save().await.unwrap();
         let activated = harness.run("baseline activation").await.unwrap();
         assert_eq!(activated.speaker, ids[1]);
         assert_eq!(selection(&activated), "maximum-activation");
@@ -522,8 +523,9 @@ async fn all_four_modes_keep_builtin_dream_requests_and_own_memory_isolation() {
             let namespace = harness.namespace(id);
             assert_eq!(namespace, format!("{}/{mode}/identity/{id}", harness.scope));
             memory
-                .append_message(
+                .append_session_message(
                     &namespace,
+                    &harness.session.id,
                     &Message::text("user", format!("OWN-HISTORY-{id}")),
                 )
                 .await

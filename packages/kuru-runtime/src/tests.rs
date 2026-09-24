@@ -16,7 +16,7 @@ use axum::{
 };
 use kuru_connectors::{CheckpointState, CheckpointStore, ParallelReadTestGate, Provider, ToolHost};
 use kuru_core::{
-    Completion, CompletionRequest, Config, ContentBlock, Mode, ModelInfo, NativeTool,
+    Completion, CompletionRequest, Config, ContentBlock, Message, Mode, ModelInfo, NativeTool,
     PermissionAction, PermissionRule, PermissionSelector, RelationshipKind, ToolCall,
     canonical_peer_instruction,
 };
@@ -615,10 +615,10 @@ async fn relationships_preserve_their_own_history_without_access_to_part_notes()
         .unwrap();
     harness
         .memory
-        .append(
+        .append_session_message(
             &harness.namespace(&relation.id),
-            "user",
-            "RELATION-ONLY-NOTE",
+            &harness.session.id,
+            &Message::text("user", "RELATION-ONLY-NOTE"),
         )
         .await
         .unwrap();

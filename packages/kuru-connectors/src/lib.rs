@@ -48,8 +48,8 @@ pub use permissions::{
     PermissionOutcome, PermissionService, PersistentGrant,
 };
 pub use providers::{
-    DemoProvider, Provider, ProviderEvent, ProviderFailureKind, ProviderSink, ResponsesProvider,
-    TextDeltaSource, collect_completion, provider,
+    DemoProvider, Provider, ProviderEvent, ProviderFailureKind, ProviderReasoningSummary,
+    ProviderSink, ResponsesProvider, TextDeltaSource, collect_completion, provider,
 };
 pub use redaction::{
     ProjectionError, json as project_json, text as project_text, truncate_tool_output,
