@@ -7,6 +7,7 @@ mod file_edits;
 mod http;
 mod instruction_review;
 mod mcp;
+mod mcp_cache;
 pub mod permissions;
 #[cfg(windows)]
 mod process;
@@ -33,7 +34,8 @@ pub use instruction_review::{
     InstructionActivation, InstructionGate, InstructionGateOutcome, InstructionReviewAnswer,
     InstructionReviewRequest, InstructionReviewSender, SkillGate,
 };
-pub use mcp::McpStatus;
+pub use mcp::{McpAvailability, McpStatus};
+pub use mcp_cache::McpCatalogStore;
 pub use permissions::{
     ApprovalAnswer, ApprovalRequest, ApprovalSender, GrantInspection, GrantRevocation, GrantScope,
     PermissionBinding, PermissionDisplay, PermissionGrantStore, PermissionInvocation,

@@ -9,7 +9,11 @@ kuru -C /path/to/project tools
 kuru -C /path/to/project tool file_read --args '{"path":"README.md"}'
 ```
 
-`tools` lists the built-ins and tools from configured MCP servers. Use the returned identifier for an MCP tool; names are generated to stay distinct across servers.
+`tools` and the terminal UI's `/tools` command return one shared catalog with
+built-ins, filtered MCP metadata, and a `disabled`, `live`, `stale`, or
+`degraded` state for every configured alias. Use the returned identifier for a
+tool on a live MCP alias; names are generated to stay distinct across servers.
+Stale cached metadata is inspectable but cannot be routed or treated as a grant.
 
 ## Built-in tools
 
@@ -119,3 +123,6 @@ server does not hide built-in or healthy-server tools; its prior routes dispatch
 nothing until a later explicit discovery succeeds. Transport failures and
 ambiguous cancellation do not automatically retry mutating calls. MCP
 application errors remain useful results and do not disable a healthy server.
+Original-name allow/deny filters run before publication, with deny precedence.
+Private discovery cache metadata is bound to the reviewed workspace and exact
+server/authentication context; it contains no resolved static-header values.

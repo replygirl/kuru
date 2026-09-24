@@ -692,6 +692,12 @@ impl Harness {
         self.tools.permission_service()
     }
 
+    /// Inspect the current filtered tool catalog and MCP alias state without
+    /// making a provider request. Stale metadata never creates a live route.
+    pub async fn tool_catalog(&self) -> Result<kuru_connectors::ToolCatalog> {
+        self.tools.catalog().await
+    }
+
     pub fn file_checkpoints(&self, limit: usize) -> Result<Vec<CheckpointSummary>> {
         self.tools.list_file_checkpoints(limit)
     }

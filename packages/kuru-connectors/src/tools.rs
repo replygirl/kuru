@@ -209,7 +209,8 @@ use crate::{
     instruction_review::{
         InstructionGate, InstructionGateOutcome, InstructionReviewSender, SkillGate,
     },
-    mcp::{McpExecution, McpHosts, McpStatus},
+    mcp::{McpCatalog, McpExecution, McpHosts, McpStatus},
+    mcp_cache::McpCatalogStore,
     permissions::{ApprovalSender, PermissionInvocation, PermissionOutcome, PermissionService},
     redaction,
     tool_output::{ProjectedToolError, ToolContent, ToolExecution, ToolFailure, ToolFailureKind},
@@ -244,6 +245,7 @@ pub struct ToolHost {
     shells: ShellRegistry,
 }
 
+#[derive(Debug, serde::Serialize)]
 pub struct ToolCatalog {
     tools: Vec<ToolSpec>,
     mcp: Vec<McpStatus>,
@@ -380,6 +382,13 @@ impl ToolHost {
     pub fn with_checkpoint_store(mut self, store: Arc<CheckpointStore>) -> Result<Self> {
         store.validate_root(&self.root_guard)?;
         self.checkpoints = Some(store);
+        Ok(self)
+    }
+
+    /// Attach app-owned private discovery metadata. Cached entries can inform
+    /// catalogs but never install an executable MCP route.
+    pub fn with_mcp_catalog_store(self, store: Arc<McpCatalogStore>) -> Result<Self> {
+        self.mcp.install_cache(store)?;
         Ok(self)
     }
 
@@ -701,20 +710,22 @@ impl ToolHost {
                 json!({"type":"integer","minimum":1,"maximum":120000});
             specs.push(shell);
         }
-        let mcp = self.mcp.catalog().await?;
-        for spec in mcp.tools {
-            if self
-                .mcp
-                .selector(&spec.name)
-                .await
-                .is_ok_and(|selector| self.permissions.advertises(&selector))
+        let McpCatalog {
+            tools,
+            selectors,
+            statuses,
+        } = self.mcp.catalog().await?;
+        for spec in tools {
+            if selectors
+                .get(&spec.name)
+                .is_some_and(|selector| self.permissions.advertises(selector))
             {
                 specs.push(spec);
             }
         }
         Ok(ToolCatalog {
             tools: specs,
-            mcp: mcp.statuses,
+            mcp: statuses,
         })
     }
 
@@ -3881,6 +3892,7 @@ mod tests {
                         args: vec![],
                         url: Some(peer.url.clone()),
                         env: BTreeMap::new(),
+                        ..Default::default()
                     },
                 )]
                 .into(),
@@ -4090,6 +4102,7 @@ mod tests {
                         args: vec![],
                         url: None,
                         env: BTreeMap::new(),
+                        ..Default::default()
                     },
                 )]
                 .into(),
@@ -4175,6 +4188,7 @@ mod tests {
                         args: vec![],
                         url: None,
                         env: BTreeMap::new(),
+                        ..Default::default()
                     },
                 )]
                 .into(),
@@ -4244,6 +4258,7 @@ mod tests {
                         args: vec![],
                         url: None,
                         env: BTreeMap::new(),
+                        ..Default::default()
                     },
                 )]
                 .into(),
@@ -4314,6 +4329,7 @@ mod tests {
                         args: vec![],
                         url: Some(peer.url.clone()),
                         env: BTreeMap::new(),
+                        ..Default::default()
                     },
                 )]
                 .into(),
@@ -4405,6 +4421,7 @@ mod tests {
                         args: vec![],
                         url: Some(peer.url.clone()),
                         env: BTreeMap::new(),
+                        ..Default::default()
                     },
                 )]
                 .into(),
@@ -5051,6 +5068,7 @@ if ($launcher.ExitCode -ne 0) {{ throw 'stdout-retaining fixture launcher failed
                             args: vec![],
                             url: None,
                             env: BTreeMap::new(),
+                            ..Default::default()
                         },
                     )]
                     .into(),

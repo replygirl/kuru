@@ -544,6 +544,50 @@ fn manifest_binds_active_transports_and_safely_reports_every_automatic_source() 
 }
 
 #[test]
+fn manifest_binds_active_mcp_catalog_policy_and_omits_disabled_authority() {
+    let directory = TempDir::new().unwrap();
+    let project = directory.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let config = directory.path().join(".kuru/config.toml");
+    write(
+        &config,
+        "[mcp.remote]\nurl='https://example.test/mcp'\nallow_tools=['read_*']\nheader_env={Authorization='MCP_AUTH'}",
+    );
+    let first =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    let first_digest = first.manifest().full_digest();
+    assert!(
+        first
+            .manifest()
+            .claims()
+            .iter()
+            .any(|claim| claim.category() == AuthorityClaimCategory::McpHttp)
+    );
+
+    write(
+        &config,
+        "[mcp.remote]\nurl='https://example.test/mcp'\nallow_tools=['write_*']\nheader_env={Authorization='OTHER_AUTH'}",
+    );
+    let changed =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert_ne!(changed.manifest().full_digest(), first_digest);
+
+    write(
+        &config,
+        "[mcp.remote]\nenabled=false\nurl='https://example.test/mcp'\nheader_env={Authorization='OTHER_AUTH'}",
+    );
+    let disabled =
+        ConfigSnapshot::parse(None, &project, None, InvocationOverrides::default()).unwrap();
+    assert!(
+        disabled
+            .manifest()
+            .claims()
+            .iter()
+            .all(|claim| claim.category() != AuthorityClaimCategory::McpHttp)
+    );
+}
+
+#[test]
 fn external_agent_claims_follow_effective_automatic_values_and_provenance() {
     let dir = TempDir::new().unwrap();
     let parent = dir.path().join("parent");
@@ -1345,6 +1389,50 @@ fn mcp_requires_one_transport_and_valid_process_arguments_and_environment() {
         .unwrap()
         .env
         .insert("KEY".into(), "nul\0value".into());
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn mcp_catalog_controls_are_default_enabled_bounded_and_deny_first() {
+    let parsed = load_text(
+        "[mcp.remote]\nurl='https://example.test/mcp'\nenabled=true\nallow_tools=['read_*','shared']\ndeny_tools=['read_secret','shared']\nheader_env={Authorization='MCP_AUTH'}",
+    )
+    .unwrap();
+    let remote = &parsed.mcp["remote"];
+    assert!(remote.enabled);
+    assert!(remote.admits_tool("read_public"));
+    assert!(!remote.admits_tool("read_secret"));
+    assert!(!remote.admits_tool("shared"));
+    assert!(!remote.admits_tool("write_public"));
+
+    let default = load_text("[mcp.local]\ncommand='runner'").unwrap();
+    assert!(default.mcp["local"].enabled);
+    assert!(default.mcp["local"].admits_tool("anything"));
+
+    for text in [
+        "[mcp.local]\ncommand='runner'\nheader_env={Authorization='MCP_AUTH'}",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={Host='MCP_HOST'}",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={'bad name'='MCP_AUTH'}",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nheader_env={Authorization='BAD-NAME'}",
+        "[mcp.remote]\nurl='https://example.test/mcp'\nallow_tools=['']",
+        "[mcp.remote]\nurl='https://example.test/mcp'\ndeny_tools=['bad[set]']",
+    ] {
+        assert!(load_text(text).is_err(), "{text}");
+    }
+
+    let mut oversized = McpConfig {
+        command: Some("runner".into()),
+        allow_tools: vec!["*".into(); 129],
+        ..McpConfig::default()
+    };
+    let mut config = Config {
+        mcp: BTreeMap::from([("local".into(), oversized.clone())]),
+        ..Config::default()
+    };
+    assert!(config.validate().is_err());
+    oversized.allow_tools.clear();
+    oversized.deny_tools = vec!["?".into(); 129];
+    config.mcp.insert("local".into(), oversized);
     assert!(config.validate().is_err());
 }
 

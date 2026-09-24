@@ -346,7 +346,8 @@ The activation sets are command-specific:
 | `auth` | Active Responses route; under another provider its API-key availability is not checked |
 | `sessions`, `memory ...`, `undo-dream` | Configured memory executable and cache paths |
 | `models` | Configured memory paths used while loading saved selections, plus an active Responses route |
-| `tool`, `tools` | Configured memory paths used while loading saved selections, built-in write/shell defaults, permission rules, and stdio/HTTP MCP configuration |
+| `tool` | Configured memory paths used while loading saved selections, built-in write/shell defaults, permission rules, and stdio/HTTP MCP configuration |
+| `tools` | Built-in write/shell defaults, permission rules, and stdio/HTTP MCP configuration; catalog inspection does not activate memory paths |
 | `run`, `dream`, `serve`, interactive TUI | All applicable project-instruction, memory, provider, write, shell, permission-rule, MCP and external-agent claims |
 
 The other rows do not construct peer prompts, so they do not consume the
@@ -419,17 +420,43 @@ Aliases namespace the tools exposed to parts. At most 64 servers are accepted.
 [mcp.local_service]
 command = "/absolute/path/to/mcp-server"
 args = ["--stdio"]
+allow_tools = ["read_*", "search"]
+deny_tools = ["*_secret"]
 
 [mcp.remote_service]
 url = "https://example.com/mcp"
+header_env = { Authorization = "REMOTE_MCP_AUTH" }
+
+[mcp.disabled_service]
+enabled = false
+command = "/absolute/path/to/disabled-server"
 ```
 
 Stdio servers may have an `env` table; avoid storing credentials in shared
-configuration. HTTP entries cannot contain process arguments or an environment
-table. Enabling an MCP server gives the harness access to its tools after trust;
+configuration. HTTP entries cannot contain process arguments or an `env` table.
+Their optional `header_env` table maps bounded HTTP header names to environment
+variable names; literal header values and protocol-owned headers are rejected.
+Resolved values are limited to 16 KiB each and 64 KiB across one server.
+Resolved values stay out of configuration, status, diagnostics, and discovery
+cache records.
+
+Servers default to `enabled = true`. A disabled server is reported without
+resolving its headers, starting its process, connecting, or loading cached tools.
+`allow_tools` and `deny_tools` match original server tool names with `*` and `?`;
+deny wins, and a nonempty allow list omits unmatched names. Filtering happens
+before routes and provider-facing names are built. Enabling a server gives the
+harness access to its filtered tools after trust;
 permission rules can then ask or deny individual calls. Kuru's built-in
 `allow_write` and `allow_shell` fallbacks govern only its own tools. Call approval
 does not replace the separate trust check before MCP startup.
+
+Successful discovery writes bounded, versioned metadata to Kuru's owner-private
+data directory outside the workspace. When a later live discovery fails, a valid
+entry may appear as **stale** for inspection, but it never creates a route,
+establishes availability, or grants a call. Cache state is bound to the exact
+workspace authority, alias, endpoint, filters, header references, and resolved
+header context. Invalid cache bytes are ignored when a healthy live discovery can
+replace them.
 
 ## External agents
 

@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -16,18 +16,30 @@ use kuru_core::{McpConfig, PermissionSelector, ToolSpec};
 use kuru_platform::fs::Directory;
 #[cfg(test)]
 use kuru_platform::fs::{NameRetention, Privacy};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, RwLock};
 
-use crate::{IO_TIMEOUT, MAX_BYTES, http, rpc::Rpc, tool_output::ToolFailureKind};
+use crate::{
+    IO_TIMEOUT, MAX_BYTES, http,
+    mcp_cache::{CachedMcpTool, McpCatalogStore},
+    rpc::Rpc,
+    tool_output::ToolFailureKind,
+};
 
 const VERSION: &str = "2025-11-25";
 const SUPPORTED: &[&str] = &[VERSION, "2025-06-18", "2025-03-26", "2024-11-05"];
+const MAX_STATIC_HEADER_VALUE_BYTES: usize = 16 * 1024;
+const MAX_STATIC_HEADERS_BYTES: usize = 64 * 1024;
 
 pub(crate) struct McpHosts {
     clients: BTreeMap<String, Arc<McpClient>>,
+    disabled: BTreeSet<String>,
     routes: RwLock<BTreeMap<String, (String, String)>>,
     admission: Arc<Admission>,
+    cache: OnceLock<Arc<McpCatalogStore>>,
 }
 
 pub(crate) struct Admission {
@@ -86,9 +98,19 @@ impl Admission {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAvailability {
+    Disabled,
+    Live,
+    Stale,
+    Degraded,
+}
+
+#[derive(Debug, Serialize)]
 pub struct McpStatus {
     alias: String,
-    available: bool,
+    availability: McpAvailability,
     diagnostic: Option<String>,
 }
 
@@ -98,7 +120,11 @@ impl McpStatus {
     }
 
     pub fn available(&self) -> bool {
-        self.available
+        self.availability == McpAvailability::Live
+    }
+
+    pub const fn availability(&self) -> McpAvailability {
+        self.availability
     }
 
     pub fn diagnostic(&self) -> Option<&str> {
@@ -108,6 +134,7 @@ impl McpStatus {
 
 pub(crate) struct McpCatalog {
     pub(crate) tools: Vec<ToolSpec>,
+    pub(crate) selectors: BTreeMap<String, PermissionSelector>,
     pub(crate) statuses: Vec<McpStatus>,
 }
 
@@ -158,14 +185,23 @@ impl McpHosts {
         root_guard.revalidate()?;
         let root = root_guard.path().to_path_buf();
         let mut clients = BTreeMap::new();
+        let mut disabled = BTreeSet::new();
         let admission = Arc::new(Admission::new());
         for (name, config) in configs {
             ensure!(
                 config.command.is_some() != config.url.is_some(),
                 "MCP {name} needs exactly one command or URL"
             );
+            ensure!(
+                config.command.is_none() || config.header_env.is_empty(),
+                "stdio MCP {name} cannot specify HTTP headers"
+            );
             if let Some(url) = &config.url {
                 http::endpoint(url)?;
+            }
+            if !config.enabled {
+                disabled.insert(name.clone());
+                continue;
             }
             clients.insert(
                 name.clone(),
@@ -182,9 +218,17 @@ impl McpHosts {
         }
         Ok(Self {
             clients,
+            disabled,
             routes: RwLock::new(BTreeMap::new()),
             admission,
+            cache: OnceLock::new(),
         })
+    }
+
+    pub(crate) fn install_cache(&self, cache: Arc<McpCatalogStore>) -> Result<()> {
+        self.cache
+            .set(cache)
+            .map_err(|_| anyhow::anyhow!("MCP catalog cache is already installed"))
     }
 
     #[cfg(test)]
@@ -198,72 +242,78 @@ impl McpHosts {
             let mut state = client.state.lock().await;
             ensure_open(&self.admission)?;
             let mut disable = DisableOnDrop::new(&client.available);
-            let tools = match client.list(&mut state).await {
+            let headers = match client.resolved_http_headers() {
+                Ok(headers) => headers,
+                Err(_) => {
+                    self.routes
+                        .write()
+                        .await
+                        .retain(|_, (owner, _)| owner != alias);
+                    return Ok::<_, anyhow::Error>((
+                        Vec::new(),
+                        BTreeMap::new(),
+                        McpStatus {
+                            alias: alias.clone(),
+                            availability: McpAvailability::Degraded,
+                            diagnostic: Some("configured MCP static header is unavailable".into()),
+                        },
+                    ));
+                }
+            };
+            let context = catalog_context(alias, &client.config, &headers)?;
+            let cached = self.load_cache(alias, context).await;
+            let cache_invalid = cached.is_err();
+            let cached = cached.ok().flatten();
+            let tools = match client.list(&mut state, headers).await {
                 Ok(tools) => tools,
                 Err(_) => {
                     if !state.close_attempted {
                         let _ = close_transport(&mut state).await;
                     }
+                    self.routes
+                        .write()
+                        .await
+                        .retain(|_, (owner, _)| owner != alias);
+                    let (tools, selectors, availability) = match cached {
+                        Some(cached) => {
+                            let (tools, selectors) = project_cached(alias, cached)?;
+                            (tools, selectors, McpAvailability::Stale)
+                        }
+                        None => (Vec::new(), BTreeMap::new(), McpAvailability::Degraded),
+                    };
                     return Ok::<_, anyhow::Error>((
-                        Vec::new(),
+                        tools,
+                        selectors,
                         McpStatus {
                             alias: alias.clone(),
-                            available: false,
-                            diagnostic: state.diagnostic.clone(),
+                            availability,
+                            diagnostic: state.diagnostic.clone().or_else(|| {
+                                cache_invalid.then(|| {
+                                    "configured MCP server and its cached catalog are unavailable"
+                                        .into()
+                                })
+                            }),
                         },
                     ));
                 }
             };
-            let candidate = (|| {
-                let mut routes = BTreeMap::new();
-                let mut toolspecs = Vec::new();
-                for tool in tools {
-                    let original = tool["name"].as_str().context("MCP tool lacks name")?;
-                    let key = format!(
-                        "mcp_{}",
-                        uuid::Uuid::new_v5(
-                            &uuid::Uuid::NAMESPACE_URL,
-                            format!("{alias}\0{original}").as_bytes()
-                        )
-                        .simple()
-                    );
-                    ensure!(
-                        routes
-                            .insert(key.clone(), (alias.clone(), original.into()))
-                            .is_none(),
-                        "duplicate MCP tool name for {alias}"
-                    );
-                    ensure!(
-                        tool["inputSchema"].is_object(),
-                        "MCP tool lacks inputSchema object"
-                    );
-                    toolspecs.push(ToolSpec {
-                        name: key,
-                        description: format!(
-                            "MCP {alias}/{original}: {}",
-                            tool["description"]
-                                .as_str()
-                                .unwrap_or("Configured external tool")
-                        ),
-                        parameters: tool["inputSchema"].clone(),
-                    });
-                }
-                Ok::<_, anyhow::Error>((routes, toolspecs))
-            })();
+            let candidate = project_live(alias, &client.config, tools);
             match candidate {
-                Ok((candidate_routes, candidate_specs)) => {
+                Ok((candidate_routes, candidate_specs, selectors, cached_tools)) => {
                     let mut routes = self.routes.write().await;
                     if candidate_routes
                         .keys()
                         .any(|name| routes.get(name).is_some_and(|(owner, _)| owner != alias))
                     {
+                        routes.retain(|_, (owner, _)| owner != alias);
                         drop(routes);
                         let _ = close_transport(&mut state).await;
                         return Ok::<_, anyhow::Error>((
                             Vec::new(),
+                            BTreeMap::new(),
                             McpStatus {
                                 alias: alias.clone(),
-                                available: false,
+                                availability: McpAvailability::Degraded,
                                 diagnostic: state.diagnostic.clone(),
                             },
                         ));
@@ -274,22 +324,38 @@ impl McpHosts {
                     }
                     client.available.store(true, Ordering::Release);
                     disable.disarm();
+                    let cache_failure =
+                        self.save_cache(alias, context, cached_tools).await.is_err();
                     Ok::<_, anyhow::Error>((
                         candidate_specs,
+                        selectors,
                         McpStatus {
                             alias: alias.clone(),
-                            available: true,
-                            diagnostic: None,
+                            availability: McpAvailability::Live,
+                            diagnostic: cache_failure
+                                .then(|| "MCP catalog cache could not be updated".into()),
                         },
                     ))
                 }
                 Err(_) => {
                     let _ = close_transport(&mut state).await;
+                    self.routes
+                        .write()
+                        .await
+                        .retain(|_, (owner, _)| owner != alias);
+                    let (tools, selectors, availability) = match cached {
+                        Some(cached) => {
+                            let (tools, selectors) = project_cached(alias, cached)?;
+                            (tools, selectors, McpAvailability::Stale)
+                        }
+                        None => (Vec::new(), BTreeMap::new(), McpAvailability::Degraded),
+                    };
                     Ok::<_, anyhow::Error>((
-                        Vec::new(),
+                        tools,
+                        selectors,
                         McpStatus {
                             alias: alias.clone(),
-                            available: false,
+                            availability,
                             diagnostic: state.diagnostic.clone(),
                         },
                     ))
@@ -297,16 +363,62 @@ impl McpHosts {
             }
         });
         let mut specs = Vec::new();
-        let mut statuses = Vec::with_capacity(self.clients.len());
+        let mut selectors = BTreeMap::new();
+        let mut statuses = self
+            .disabled
+            .iter()
+            .map(|alias| McpStatus {
+                alias: alias.clone(),
+                availability: McpAvailability::Disabled,
+                diagnostic: None,
+            })
+            .collect::<Vec<_>>();
         for result in join_all(discoveries).await {
-            let (candidate_specs, status) = result?;
+            let (candidate_specs, candidate_selectors, status) = result?;
             specs.extend(candidate_specs);
+            for (name, selector) in candidate_selectors {
+                ensure!(
+                    selectors.insert(name, selector).is_none(),
+                    "duplicate projected MCP tool name"
+                );
+            }
             statuses.push(status);
         }
+        statuses.sort_by(|left, right| left.alias.cmp(&right.alias));
         Ok(McpCatalog {
             tools: specs,
+            selectors,
             statuses,
         })
+    }
+
+    async fn load_cache(
+        &self,
+        alias: &str,
+        context: [u8; 32],
+    ) -> Result<Option<Vec<CachedMcpTool>>> {
+        let Some(cache) = self.cache.get().cloned() else {
+            return Ok(None);
+        };
+        let alias = alias.to_owned();
+        tokio::task::spawn_blocking(move || cache.load(&alias, context))
+            .await
+            .context("MCP catalog cache reader stopped")?
+    }
+
+    async fn save_cache(
+        &self,
+        alias: &str,
+        context: [u8; 32],
+        tools: Vec<CachedMcpTool>,
+    ) -> Result<()> {
+        let Some(cache) = self.cache.get().cloned() else {
+            return Ok(());
+        };
+        let alias = alias.to_owned();
+        tokio::task::spawn_blocking(move || cache.save(&alias, context, tools))
+            .await
+            .context("MCP catalog cache writer stopped")?
     }
 
     pub(crate) async fn execute(
@@ -406,6 +518,134 @@ struct McpClient {
     stop: Notify,
 }
 
+type ProjectedCatalog = (
+    BTreeMap<String, (String, String)>,
+    Vec<ToolSpec>,
+    BTreeMap<String, PermissionSelector>,
+    Vec<CachedMcpTool>,
+);
+
+fn project_live(alias: &str, config: &McpConfig, tools: Vec<Value>) -> Result<ProjectedCatalog> {
+    let mut routes = BTreeMap::new();
+    let mut specs = Vec::new();
+    let mut selectors = BTreeMap::new();
+    let mut cached = Vec::new();
+    for tool in tools {
+        let original = tool["name"].as_str().context("MCP tool lacks name")?;
+        if !config.admits_tool(original) {
+            continue;
+        }
+        let selector = PermissionSelector::mcp(alias, original)?;
+        ensure!(
+            tool["inputSchema"].is_object(),
+            "MCP tool lacks inputSchema object"
+        );
+        let name = projected_name(alias, original);
+        ensure!(
+            routes
+                .insert(name.clone(), (alias.to_owned(), original.to_owned()))
+                .is_none(),
+            "duplicate MCP tool name for {alias}"
+        );
+        ensure!(
+            selectors.insert(name.clone(), selector).is_none(),
+            "duplicate MCP tool selector for {alias}"
+        );
+        let description = tool["description"]
+            .as_str()
+            .unwrap_or("Configured external tool")
+            .to_owned();
+        let parameters = tool["inputSchema"].clone();
+        specs.push(ToolSpec {
+            name,
+            description: format!("MCP {alias}/{original}: {description}"),
+            parameters: parameters.clone(),
+        });
+        cached.push(CachedMcpTool {
+            original_name: original.to_owned(),
+            description,
+            parameters,
+        });
+    }
+    Ok((routes, specs, selectors, cached))
+}
+
+fn project_cached(
+    alias: &str,
+    tools: Vec<CachedMcpTool>,
+) -> Result<(Vec<ToolSpec>, BTreeMap<String, PermissionSelector>)> {
+    let mut specs = Vec::with_capacity(tools.len());
+    let mut selectors = BTreeMap::new();
+    for tool in tools {
+        let selector = PermissionSelector::mcp(alias, &tool.original_name)?;
+        let name = projected_name(alias, &tool.original_name);
+        ensure!(
+            selectors.insert(name.clone(), selector).is_none(),
+            "duplicate cached MCP tool name for {alias}"
+        );
+        specs.push(ToolSpec {
+            name,
+            description: format!(
+                "MCP {alias}/{} (stale; unavailable until rediscovered): {}",
+                tool.original_name, tool.description
+            ),
+            parameters: tool.parameters,
+        });
+    }
+    Ok((specs, selectors))
+}
+
+fn projected_name(alias: &str, original: &str) -> String {
+    format!(
+        "mcp_{}",
+        uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("{alias}\0{original}").as_bytes()
+        )
+        .simple()
+    )
+}
+
+fn catalog_context(alias: &str, config: &McpConfig, headers: &HeaderMap) -> Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    digest.update(b"kuru.mcp.catalog-context.v1\0");
+    hash_field(&mut digest, alias.as_bytes());
+    hash_field(&mut digest, &serde_json::to_vec(config)?);
+    for (name, environment) in &config.header_env {
+        hash_field(&mut digest, name.as_bytes());
+        hash_field(&mut digest, environment.as_bytes());
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| anyhow::anyhow!("configured MCP static header name is invalid"))?;
+        let value = headers
+            .get(name)
+            .context("configured MCP static header value is unavailable")?;
+        hash_field(&mut digest, value.as_bytes());
+    }
+    Ok(digest.finalize().into())
+}
+
+fn hash_field(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
+fn is_reserved_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept"
+            | "connection"
+            | "content-length"
+            | "content-type"
+            | "host"
+            | "mcp-protocol-version"
+            | "mcp-session-id"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
 #[derive(Default)]
 struct ClientState {
     transport: Option<Transport>,
@@ -440,6 +680,38 @@ impl Drop for DisableOnDrop<'_> {
 }
 
 impl McpClient {
+    fn resolved_http_headers(&self) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        let mut total_bytes = 0_usize;
+        for (name, environment) in &self.config.header_env {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| anyhow::anyhow!("configured MCP static header name is invalid"))?;
+            ensure!(
+                !is_reserved_header(&name),
+                "configured MCP static header is reserved for protocol ownership"
+            );
+            let value = static_header_value(
+                environment,
+                std::env::var_os(environment).with_context(|| {
+                    format!("configured MCP static header environment {environment} is missing")
+                })?,
+            )?;
+            total_bytes = total_bytes
+                .checked_add(name.as_str().len())
+                .and_then(|bytes| bytes.checked_add(value.as_bytes().len()))
+                .context("configured MCP static headers exceed their aggregate byte limit")?;
+            ensure!(
+                total_bytes <= MAX_STATIC_HEADERS_BYTES,
+                "configured MCP static headers exceed their aggregate byte limit"
+            );
+            ensure!(
+                headers.insert(name, value).is_none(),
+                "duplicate configured MCP static header"
+            );
+        }
+        Ok(headers)
+    }
+
     async fn while_open<T>(
         &self,
         operation: impl std::future::Future<Output = Result<T>>,
@@ -455,11 +727,12 @@ impl McpClient {
         }
     }
 
-    async fn initialize(&self, state: &mut ClientState) -> Result<()> {
+    async fn initialize(&self, state: &mut ClientState, headers: HeaderMap) -> Result<()> {
         state.transport = Some(if let Some(url) = &self.config.url {
             Transport::Http(HttpRpc {
                 client: http::client()?,
                 url: url.clone(),
+                headers,
                 session: None,
                 version: None,
                 next_id: 0,
@@ -500,7 +773,8 @@ impl McpClient {
 
     async fn request(&self, state: &mut ClientState, method: &str, params: Value) -> Result<Value> {
         if state.transport.is_none() {
-            self.initialize(state).await?;
+            self.initialize(state, self.resolved_http_headers()?)
+                .await?;
         }
         let result = self
             .while_open(
@@ -519,11 +793,21 @@ impl McpClient {
         result
     }
 
-    async fn list(&self, state: &mut ClientState) -> Result<Vec<Value>> {
+    async fn list(&self, state: &mut ClientState, headers: HeaderMap) -> Result<Vec<Value>> {
         if !self.available.load(Ordering::Acquire) {
             close_transport(state).await?;
         }
         state.diagnostic = None;
+        if state
+            .transport
+            .as_ref()
+            .is_some_and(|transport| !transport.matches_http_headers(&headers))
+        {
+            close_transport(state).await?;
+        }
+        if state.transport.is_none() {
+            self.initialize(state, headers).await?;
+        }
         let mut cursor = Value::Null;
         let mut seen = BTreeSet::new();
         let mut tools = Vec::new();
@@ -572,6 +856,21 @@ impl McpClient {
     }
 }
 
+fn static_header_value(environment: &str, value: std::ffi::OsString) -> Result<HeaderValue> {
+    let value = value.into_string().map_err(|_| {
+        anyhow::anyhow!("configured MCP static header environment {environment} is not Unicode")
+    })?;
+    ensure!(
+        value.len() <= MAX_STATIC_HEADER_VALUE_BYTES,
+        "configured MCP static header environment {environment} exceeds its byte limit"
+    );
+    HeaderValue::from_str(&value).map_err(|_| {
+        anyhow::anyhow!(
+            "configured MCP static header environment {environment} is not a valid header value"
+        )
+    })
+}
+
 async fn close_transport(state: &mut ClientState) -> Result<()> {
     let Some(transport) = state.transport.as_mut() else {
         state.close_attempted = false;
@@ -597,6 +896,13 @@ enum Transport {
 }
 
 impl Transport {
+    fn matches_http_headers(&self, headers: &HeaderMap) -> bool {
+        match self {
+            Self::Stdio(_) => headers.is_empty(),
+            Self::Http(rpc) => rpc.headers == *headers,
+        }
+    }
+
     async fn ready(&mut self) -> Result<()> {
         match self {
             Self::Stdio(rpc) => rpc.ready().await,
@@ -647,6 +953,9 @@ impl Transport {
                         .client
                         .delete(&rpc.url)
                         .header("Mcp-Session-Id", session);
+                    for (name, value) in &rpc.headers {
+                        request = request.header(name, value);
+                    }
                     if let Some(version) = &rpc.version {
                         request = request.header("MCP-Protocol-Version", version);
                     }
@@ -668,6 +977,7 @@ impl Transport {
 struct HttpRpc {
     client: reqwest::Client,
     url: String,
+    headers: HeaderMap,
     session: Option<String>,
     version: Option<String>,
     next_id: u64,
@@ -679,6 +989,9 @@ impl HttpRpc {
             .client
             .post(&self.url)
             .header("Accept", "application/json, text/event-stream");
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
         if let Some(session) = &self.session {
             request = request.header("Mcp-Session-Id", session);
         }
@@ -782,6 +1095,7 @@ mod tests {
     #[cfg(unix)]
     use crate::test_support::drain_bounded;
     use crate::test_support::{HttpFixture, Reply, StdioFixture, Step};
+    use kuru_core::{ConfigSnapshot, InvocationOverrides};
     #[cfg(unix)]
     use tokio::time::{Duration, timeout};
 
@@ -793,6 +1107,7 @@ mod tests {
                 args: vec![],
                 url: Some(url.into()),
                 env: BTreeMap::new(),
+                ..Default::default()
             },
         )]
         .into()
@@ -804,6 +1119,523 @@ mod tests {
     }
     fn tool(name: &str) -> Value {
         json!({"name":name,"description":"A fixture tool","inputSchema":{"type":"object"}})
+    }
+
+    fn cache_store(project: &Path, private: &Path) -> (Arc<Directory>, Arc<McpCatalogStore>) {
+        let root =
+            Arc::new(Directory::open(project, Privacy::Inherited, NameRetention::Pinned).unwrap());
+        let snapshot = ConfigSnapshot::parse_with_sources(
+            None,
+            None,
+            project,
+            None,
+            None,
+            None,
+            &["/help", "/tools"],
+            InvocationOverrides::default(),
+        )
+        .unwrap();
+        let store = Arc::new(
+            McpCatalogStore::new(private, root.clone(), snapshot.manifest().full_digest()).unwrap(),
+        );
+        (root, store)
+    }
+
+    #[tokio::test]
+    async fn disabled_and_filtered_aliases_never_publish_routes_or_omitted_metadata() {
+        let disabled = StdioFixture::new([Step::Read, Step::Eof]);
+        let disabled_http = HttpFixture::new(Vec::new()).await;
+        let peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[
+                tool("read_public"),
+                tool("read_secret"),
+                tool("write"),
+                {"name":"ignored_without_schema"},
+                tool(&"x".repeat(257))
+            ]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let config = BTreeMap::from([
+            (
+                "disabled".into(),
+                McpConfig {
+                    enabled: false,
+                    command: Some(disabled.command().into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "disabled-http".into(),
+                McpConfig {
+                    enabled: false,
+                    url: Some(disabled_http.url.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "http".into(),
+                McpConfig {
+                    url: Some(peer.url.clone()),
+                    allow_tools: vec!["read_*".into()],
+                    deny_tools: vec!["*_secret".into()],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let (root_guard, cache) = cache_store(root.path(), &private.path().join("data"));
+        let hosts = McpHosts::with_retained_root(root_guard, &config).unwrap();
+        hosts.install_cache(cache).unwrap();
+        let catalog = hosts.catalog().await.unwrap();
+        assert_eq!(catalog.statuses.len(), 3);
+        assert_eq!(
+            catalog.statuses[0].availability(),
+            McpAvailability::Disabled
+        );
+        assert_eq!(
+            catalog.statuses[1].availability(),
+            McpAvailability::Disabled
+        );
+        assert_eq!(catalog.statuses[2].availability(), McpAvailability::Live);
+        assert_eq!(catalog.tools.len(), 1);
+        assert!(catalog.tools[0].description.contains("read_public"));
+        assert!(!catalog.tools[0].description.contains("secret"));
+        assert!(disabled.conversations().is_empty());
+        assert!(disabled_http.requests.lock().await.is_empty());
+        assert!(
+            hosts
+                .selector(&projected_name("http", "read_secret"))
+                .await
+                .is_err()
+        );
+        assert!(
+            hosts
+                .selector(&projected_name("http", "write"))
+                .await
+                .is_err()
+        );
+        hosts.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_restart_projects_cache_as_stale_without_an_executable_route() {
+        let peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("read")]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let project = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let config = http_config(&peer.url);
+        let (root, cache) = cache_store(project.path(), &private.path().join("data"));
+        let hosts = McpHosts::with_retained_root(root, &config).unwrap();
+        hosts.install_cache(cache).unwrap();
+        let live = hosts.catalog().await.unwrap();
+        assert_eq!(live.statuses[0].availability(), McpAvailability::Live);
+        assert_eq!(live.tools.len(), 1);
+        hosts.shutdown().await.unwrap();
+        drop(hosts);
+        drop(peer);
+
+        let (root, cache) = cache_store(project.path(), &private.path().join("data"));
+        let restarted = McpHosts::with_retained_root(root, &config).unwrap();
+        restarted.install_cache(cache).unwrap();
+        let stale = restarted.catalog().await.unwrap();
+        assert_eq!(stale.statuses[0].availability(), McpAvailability::Stale);
+        assert_eq!(stale.tools.len(), 1);
+        let name = projected_name("test", "read");
+        assert!(stale.tools[0].description.contains("stale"));
+        assert!(restarted.selector(&name).await.is_err());
+        assert!(restarted.execute(&name, json!({})).await.is_err());
+        restarted.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthy_rediscovery_repairs_a_corrupt_cache_without_losing_its_route() {
+        let peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("read")]})),
+            Reply::rpc(json!({"tools":[tool("read")]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let project = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let config = http_config(&peer.url);
+        let (root, cache) = cache_store(project.path(), &private.path().join("data"));
+        let hosts = McpHosts::with_retained_root(root, &config).unwrap();
+        hosts.install_cache(cache).unwrap();
+        assert_eq!(
+            hosts.catalog().await.unwrap().statuses[0].availability(),
+            McpAvailability::Live
+        );
+        let catalog_directory = std::fs::read_dir(private.path().join("data"))
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.is_dir().then_some(path)
+            })
+            .unwrap();
+        let record = std::fs::read_dir(catalog_directory)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.extension().and_then(|value| value.to_str()) == Some("json")).then_some(path)
+            })
+            .unwrap();
+        std::fs::write(&record, b"{").unwrap();
+
+        let repaired = hosts.catalog().await.unwrap();
+        assert_eq!(repaired.statuses[0].availability(), McpAvailability::Live);
+        assert!(repaired.statuses[0].diagnostic().is_none());
+        assert!(
+            hosts
+                .selector(&projected_name("test", "read"))
+                .await
+                .is_ok()
+        );
+        let repaired: Value = serde_json::from_slice(&std::fs::read(record).unwrap()).unwrap();
+        assert_eq!(repaired["schema"], 1);
+        hosts.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_write_failure_keeps_live_route_and_reports_safe_diagnostic() {
+        let peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("read")]})),
+            Reply::rpc(json!({"content":[{"type":"text","text":"done"}]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let project = tempfile::tempdir().unwrap();
+        let private_parent = tempfile::tempdir().unwrap();
+        let private = private_parent.path().join("not-a-directory");
+        let config = http_config(&peer.url);
+        let (root, cache) = cache_store(project.path(), &private);
+        std::fs::write(&private, b"fixture").unwrap();
+        let hosts = McpHosts::with_retained_root(root, &config).unwrap();
+        hosts.install_cache(cache).unwrap();
+        let catalog = hosts.catalog().await.unwrap();
+        assert_eq!(catalog.statuses[0].availability(), McpAvailability::Live);
+        assert_eq!(
+            catalog.statuses[0].diagnostic(),
+            Some("MCP catalog cache could not be updated")
+        );
+        let name = projected_name("test", "read");
+        assert!(matches!(
+            hosts.execute(&name, json!({})).await.unwrap(),
+            McpExecution::Success(_)
+        ));
+        hosts.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mixed_alias_failures_preserve_live_and_stale_catalogs_independently() {
+        let live_peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("live-read")]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let disabled_peer = HttpFixture::new(Vec::new()).await;
+        let stale_peer = HttpFixture::new(vec![Reply::json(json!({}))]).await;
+        let failed_peer = HttpFixture::new(vec![Reply::json(json!({}))]).await;
+        let corrupt_peer = HttpFixture::new(vec![Reply::json(json!({}))]).await;
+
+        let config = BTreeMap::from([
+            (
+                "corrupt".into(),
+                McpConfig {
+                    url: Some(corrupt_peer.url.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "disabled".into(),
+                McpConfig {
+                    enabled: false,
+                    url: Some(disabled_peer.url.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "failed".into(),
+                McpConfig {
+                    url: Some(failed_peer.url.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "live".into(),
+                McpConfig {
+                    url: Some(live_peer.url.clone()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "stale".into(),
+                McpConfig {
+                    url: Some(stale_peer.url.clone()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let project = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let (root, cache) = cache_store(project.path(), &private.path().join("data"));
+        let stale_context = catalog_context("stale", &config["stale"], &HeaderMap::new()).unwrap();
+        cache
+            .save(
+                "stale",
+                stale_context,
+                vec![CachedMcpTool {
+                    original_name: "cached-read".into(),
+                    description: "retained metadata".into(),
+                    parameters: json!({"type":"object"}),
+                }],
+            )
+            .unwrap();
+        cache
+            .save(
+                "corrupt",
+                [0xff; 32],
+                vec![CachedMcpTool {
+                    original_name: "must-not-project".into(),
+                    description: "wrong context".into(),
+                    parameters: json!({"type":"object"}),
+                }],
+            )
+            .unwrap();
+
+        let hosts = McpHosts::with_retained_root(root, &config).unwrap();
+        hosts.install_cache(cache).unwrap();
+        let catalog = hosts.catalog().await.unwrap();
+        let states = catalog
+            .statuses
+            .iter()
+            .map(|status| (status.alias(), status.availability()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(states["corrupt"], McpAvailability::Degraded);
+        assert_eq!(states["disabled"], McpAvailability::Disabled);
+        assert_eq!(states["failed"], McpAvailability::Degraded);
+        assert_eq!(states["live"], McpAvailability::Live);
+        assert_eq!(states["stale"], McpAvailability::Stale);
+        assert_eq!(catalog.tools.len(), 2);
+        assert!(
+            catalog
+                .tools
+                .iter()
+                .any(|tool| tool.description.contains("live-read"))
+        );
+        assert!(
+            catalog
+                .tools
+                .iter()
+                .any(|tool| tool.description.contains("stale"))
+        );
+        assert!(
+            hosts
+                .selector(&projected_name("live", "live-read"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            hosts
+                .selector(&projected_name("stale", "cached-read"))
+                .await
+                .is_err()
+        );
+        assert!(disabled_peer.requests.lock().await.is_empty());
+        assert_eq!(stale_peer.requests.lock().await.len(), 1);
+        assert_eq!(failed_peer.requests.lock().await.len(), 1);
+        assert_eq!(corrupt_peer.requests.lock().await.len(), 1);
+        hosts.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn static_header_environment_reference_applies_to_the_whole_http_session() {
+        let expected = std::env::var("PATH").expect("test runner PATH is required");
+        HeaderValue::from_str(&expected).expect("test runner PATH must be a valid HTTP value");
+        let peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("read")]})),
+            Reply::rpc(json!({"content":[{"type":"text","text":"done"}]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let config = BTreeMap::from([(
+            "http".into(),
+            McpConfig {
+                url: Some(peer.url.clone()),
+                header_env: BTreeMap::from([("X-Kuru-Test".into(), "PATH".into())]),
+                ..Default::default()
+            },
+        )]);
+        let (root_guard, cache) = cache_store(root.path(), &private.path().join("data"));
+        let hosts = McpHosts::with_retained_root(root_guard, &config).unwrap();
+        hosts.install_cache(cache).unwrap();
+        let name = hosts.catalog().await.unwrap().tools[0].name.clone();
+        assert!(matches!(
+            hosts.execute(&name, json!({})).await.unwrap(),
+            McpExecution::Success(_)
+        ));
+        hosts.shutdown().await.unwrap();
+        let requests = peer.requests.lock().await;
+        assert_eq!(requests.len(), 5);
+        for request in requests.iter() {
+            assert_eq!(
+                request
+                    .headers
+                    .get("x-kuru-test")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(requests[0].headers.get("mcp-protocol-version").is_none());
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.headers.get("mcp-protocol-version").is_some())
+        );
+        let cached = std::fs::read_dir(private.path().join("data"))
+            .unwrap()
+            .flat_map(|entry| std::fs::read_dir(entry.unwrap().path()).unwrap())
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .map(std::fs::read)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !cached
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes()),
+            "resolved header values must not enter catalog records"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_http_headers_close_the_captured_session_before_rediscovery() {
+        let peer = HttpFixture::new(vec![
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("first")]})),
+            Reply::json(json!({})),
+            initialized(),
+            Reply::json(json!({})),
+            Reply::rpc(json!({"tools":[tool("second")]})),
+            Reply::json(json!({})),
+        ])
+        .await;
+        let workspace = tempfile::tempdir().unwrap();
+        let root = Arc::new(
+            Directory::open(workspace.path(), Privacy::Inherited, NameRetention::Pinned).unwrap(),
+        );
+        let client = McpClient {
+            config: http_config(&peer.url).remove("test").unwrap(),
+            root: root.path().to_path_buf(),
+            root_guard: root,
+            state: Mutex::new(ClientState::default()),
+            available: AtomicBool::new(true),
+            admission: Arc::new(Admission::new()),
+            stop: Notify::new(),
+        };
+        let mut first = HeaderMap::new();
+        first.insert("x-kuru-test", HeaderValue::from_static("first"));
+        let mut second = HeaderMap::new();
+        second.insert("x-kuru-test", HeaderValue::from_static("second"));
+
+        let mut state = client.state.lock().await;
+        assert_eq!(
+            client.list(&mut state, first).await.unwrap()[0]["name"],
+            "first"
+        );
+        assert_eq!(
+            client.list(&mut state, second).await.unwrap()[0]["name"],
+            "second"
+        );
+        drop(state);
+        client.close().await.unwrap();
+
+        let requests = peer.requests.lock().await;
+        assert_eq!(requests.len(), 8);
+        for request in &requests[..4] {
+            assert_eq!(request.headers["x-kuru-test"], "first");
+        }
+        for request in &requests[4..] {
+            assert_eq!(request.headers["x-kuru-test"], "second");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_static_header_reference_degrades_without_dispatch_or_value_diagnostic() {
+        let peer = HttpFixture::new(Vec::new()).await;
+        let root = tempfile::tempdir().unwrap();
+        let environment = "KURU_TEST_MCP_HEADER_ENVIRONMENT_MUST_REMAIN_ABSENT_6F9320";
+        assert!(std::env::var_os(environment).is_none());
+        let config = BTreeMap::from([(
+            "http".into(),
+            McpConfig {
+                url: Some(peer.url.clone()),
+                header_env: BTreeMap::from([("Authorization".into(), environment.into())]),
+                ..Default::default()
+            },
+        )]);
+        let hosts = McpHosts::new(root.path(), &config).unwrap();
+        let catalog = hosts.catalog().await.unwrap();
+        assert!(catalog.tools.is_empty());
+        assert_eq!(
+            catalog.statuses[0].availability(),
+            McpAvailability::Degraded
+        );
+        assert_eq!(
+            catalog.statuses[0].diagnostic(),
+            Some("configured MCP static header is unavailable")
+        );
+        assert!(peer.requests.lock().await.is_empty());
+        hosts.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn static_header_values_are_bounded_and_value_free_on_rejection() {
+        let secret = "recognizable-static-header-secret";
+        let invalid = static_header_value("MCP_AUTH", format!("{secret}\n").into())
+            .expect_err("a newline-bearing header value was accepted")
+            .to_string();
+        assert!(!invalid.contains(secret));
+
+        let oversized_value = format!("{secret}{}", "x".repeat(MAX_STATIC_HEADER_VALUE_BYTES));
+        let oversized = static_header_value("MCP_AUTH", oversized_value.into())
+            .expect_err("an oversized header value was accepted")
+            .to_string();
+        assert!(!oversized.contains(secret));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let non_unicode = static_header_value(
+                "MCP_AUTH",
+                std::ffi::OsString::from_vec(vec![b's', b'e', b'c', b'r', b'e', b't', 0xff]),
+            )
+            .expect_err("a non-Unicode header value was accepted")
+            .to_string();
+            assert!(!non_unicode.contains("secret"));
+        }
     }
 
     #[tokio::test]
@@ -865,6 +1697,7 @@ mod tests {
                 args: vec![],
                 url: None,
                 env: BTreeMap::new(),
+                ..Default::default()
             },
         )]
         .into();
@@ -1045,6 +1878,7 @@ mod tests {
                 args: vec![],
                 url: None,
                 env: BTreeMap::new(),
+                ..Default::default()
             },
         )]
         .into();
@@ -1089,7 +1923,7 @@ mod tests {
             let mut state = client.state.lock().await;
             assert!(
                 client
-                    .list(&mut state)
+                    .list(&mut state, HeaderMap::new())
                     .await
                     .unwrap_err()
                     .to_string()
@@ -1176,6 +2010,7 @@ mod tests {
                 args: vec![],
                 url: None,
                 env: BTreeMap::new(),
+                ..Default::default()
             },
         )]
         .into();
