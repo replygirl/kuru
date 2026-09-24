@@ -10,13 +10,16 @@ use kuru_connectors::{DemoProvider, Provider};
 use kuru_core::{
     Completion, CompletionRequest, Config, Mode, ModelInfo, ToolCall, canonical_peer_instruction,
 };
-use kuru_memory::MemoryStore;
+use kuru_memory::{CandidateConflict, CandidateRefState, MemoryStore};
 use serde_json::json;
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::{
     CancellationToken, DreamProposal, Harness, Topology,
-    engine::{PendingPublication, turn_was_cancelled},
+    engine::{
+        CandidatePromotionStatus, CandidateResolutionRequired, PendingPublication,
+        PublicationProof, turn_was_cancelled,
+    },
 };
 
 fn config() -> Config {
@@ -345,6 +348,88 @@ async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
     assert!(matches!(output.events.last(), Some(event) if event.kind() == "response"));
     assert!(!output.events.iter().any(|event| event.kind() == "dream"));
     let calls = provider.calls.load(Ordering::SeqCst);
+    let retained = harness
+        .pending_candidate
+        .as_ref()
+        .expect("stale periodic dream discarded its candidate");
+    let branch = retained.branch().to_owned();
+    let base = retained.base().to_owned();
+    let head = retained.view().revision().await.unwrap();
+    let (proof_base, proof_target, proof_report) = match &harness
+        .pending_publication
+        .as_ref()
+        .expect("stale periodic dream discarded its publication report")
+        .proof
+    {
+        PublicationProof::CandidatePromotion {
+            base: proof_base,
+            target: proof_target,
+            report,
+            status,
+        } => {
+            assert!(matches!(status, CandidatePromotionStatus::OpenConflict));
+            (
+                proof_base.clone(),
+                proof_target.clone(),
+                serde_json::to_value(report).unwrap(),
+            )
+        }
+        PublicationProof::LiveValues => {
+            panic!("stale periodic dream changed its publication proof")
+        }
+    };
+    assert_eq!(proof_base, base);
+    assert_eq!(proof_target, head);
+    let topology_after_output = serde_json::to_value(&harness.topology).unwrap();
+    let retry_error = harness
+        .run_controlled(
+            "finish despite stale dream",
+            Some(&target),
+            "failed-periodic-boundary",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(retry_error.is::<CandidateResolutionRequired>());
+    let status = harness.candidate_ref_status(&branch).await.unwrap();
+    assert!(matches!(status.state, CandidateRefState::OpenConflict));
+    assert_eq!(status.base.as_deref(), Some(base.as_str()));
+    assert_eq!(status.head.as_deref(), Some(head.as_str()));
+    assert!(harness.pending_candidate.is_some());
+    let PendingPublication {
+        proof:
+            PublicationProof::CandidatePromotion {
+                base: retry_base,
+                target: retry_target,
+                report: retry_report,
+                status: retry_status,
+            },
+        ..
+    } = harness
+        .pending_publication
+        .as_ref()
+        .expect("rejected retry discarded its publication report")
+    else {
+        panic!("rejected retry changed its publication proof");
+    };
+    assert_eq!(retry_base, &base);
+    assert_eq!(retry_target, &head);
+    assert!(matches!(
+        retry_status,
+        CandidatePromotionStatus::OpenConflict
+    ));
+    assert_eq!(serde_json::to_value(retry_report).unwrap(), proof_report);
+    assert_eq!(
+        serde_json::to_value(&harness.topology).unwrap(),
+        topology_after_output
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+    harness
+        .abandon_candidate_ref_exact(&branch, &base, &head)
+        .await
+        .unwrap();
+    assert!(harness.pending_candidate.is_none());
+    assert!(harness.pending_publication.is_none());
     let retry = harness
         .run_controlled(
             "finish despite stale dream",
@@ -359,6 +444,10 @@ async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
         serde_json::to_vec(&output).unwrap()
     );
     assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+    assert_eq!(
+        serde_json::to_value(&harness.topology).unwrap(),
+        topology_after_output
+    );
     let mut observed_failure = false;
     while let Ok(event) = events.try_recv() {
         observed_failure |=
@@ -429,11 +518,20 @@ async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effect
         .unwrap();
     let before_topology = serde_json::to_value(&harness.topology).unwrap();
     let error = harness.dream().await.unwrap_err();
-    assert!(
-        format!("{error:#}").contains("candidate is stale"),
-        "{error:#}"
-    );
-    harness.reconcile().await.unwrap();
+    assert!(error.is::<CandidateConflict>(), "{error:#}");
+    let retained = harness
+        .pending_candidate
+        .as_ref()
+        .expect("stale promotion discarded its candidate");
+    let branch = retained.branch().to_owned();
+    let base = retained.base().to_owned();
+    let head = retained.view().revision().await.unwrap();
+    let rejection = harness.reconcile().await.unwrap_err();
+    assert!(rejection.is::<CandidateResolutionRequired>());
+    let status = harness.candidate_ref_status(&branch).await.unwrap();
+    assert!(matches!(status.state, CandidateRefState::OpenConflict));
+    assert_eq!(status.base.as_deref(), Some(base.as_str()));
+    assert_eq!(status.head.as_deref(), Some(head.as_str()));
     assert_eq!(
         serde_json::to_value(&harness.topology).unwrap(),
         before_topology
@@ -473,6 +571,33 @@ async fn stale_promotion_keeps_later_live_data_and_discards_all_candidate_effect
             .unwrap()
             .is_none()
     );
+    let pending = harness
+        .pending_publication
+        .as_ref()
+        .expect("stale promotion discarded its publication report");
+    let PendingPublication {
+        proof:
+            PublicationProof::CandidatePromotion {
+                base: proof_base,
+                target: proof_target,
+                report,
+                status,
+            },
+        ..
+    } = pending
+    else {
+        panic!("stale promotion changed its pending publication proof");
+    };
+    assert_eq!(proof_base, &base);
+    assert_eq!(proof_target, &head);
+    assert!(matches!(status, CandidatePromotionStatus::OpenConflict));
+    assert_eq!(report.accepted.len(), 1);
+    harness
+        .abandon_candidate_ref_exact(&branch, &base, &head)
+        .await
+        .unwrap();
+    assert!(harness.pending_candidate.is_none());
+    assert!(harness.pending_publication.is_none());
     let output = harness.run("Continue after failed dream").await.unwrap();
     assert_eq!(output.text, "Another candidate summary");
     harness.shutdown(false).await.unwrap();
@@ -845,6 +970,7 @@ async fn reconciliation_publishes_only_durable_choices_before_the_next_mutation(
         topology: harness.topology.clone(),
         session: harness.session.clone(),
         updates: updates.clone(),
+        proof: super::engine::PublicationProof::LiveValues,
     });
     memory.put_many(&updates).await.unwrap();
     assert_eq!(harness.config.model, "demo");
@@ -865,6 +991,7 @@ async fn reconciliation_publishes_only_durable_choices_before_the_next_mutation(
         topology: harness.topology.clone(),
         session: harness.session.clone(),
         updates: vec![("missing-write".into(), json!(true))],
+        proof: super::engine::PublicationProof::LiveValues,
     });
     harness.reconcile().await.unwrap();
     assert_eq!(harness.config.model, "durable-model");

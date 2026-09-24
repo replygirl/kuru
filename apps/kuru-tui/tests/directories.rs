@@ -1,8 +1,14 @@
 use kuru_delivery::command::BlockingCommand as Command;
 use std::path::Path;
 
+#[cfg(windows)]
+#[path = "support/memory.rs"]
+mod memory;
+
 fn isolated(root: &Path, project: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kuru"));
+    #[cfg(windows)]
+    command.fixture_allow_independent_service();
     command
         .env_clear()
         .current_dir(root)
@@ -125,11 +131,15 @@ fn native_path_selection_preserves_drive_and_unc_roots_and_uses_the_invocation_d
 #[cfg(windows)]
 #[test]
 fn native_roaming_and_local_defaults_and_explicit_precedence_survive_real_reopen() {
-    let root = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir().unwrap();
+    let root_path = temporary.path().to_owned();
+    let local = root_path.join("Local space");
+    let override_data = root_path.join("explicit native data");
+    let mut root = memory::ServiceCleanup::new(temporary, &local.join("kuru"));
+    root.add_data(&override_data);
     let project = root.path().join("workspace 日本語");
     std::fs::create_dir(&project).unwrap();
     let roaming = root.path().join("Roaming space");
-    let local = root.path().join("Local space");
     std::fs::create_dir_all(roaming.join("kuru")).unwrap();
     let config = format!(
         "mode = 'freudian'\n[memory]\noffline = true\ncache_dir = {}\n",
@@ -187,7 +197,6 @@ fn native_roaming_and_local_defaults_and_explicit_precedence_survive_real_reopen
         )
         .contains("mode = \"polyvagal\"")
     );
-    let override_data = root.path().join("explicit native data");
     text(
         native()
             .env("XDG_DATA_HOME", root.path().join("unused data"))

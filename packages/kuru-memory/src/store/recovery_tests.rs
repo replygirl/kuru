@@ -1618,6 +1618,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
             uncertain: StdMutex::new(None),
             usage_pool: StdMutex::new(None),
             candidate_recovery_pause: None,
+            candidate_cleanup_failure: None,
             _permit: None,
         }),
         pool,

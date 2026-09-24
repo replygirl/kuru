@@ -267,6 +267,10 @@ fn denied(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
+fn not_found(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, message)
+}
+
 /// Child operations take one literal native component, preserving Unix names.
 pub fn validate_component(name: &OsStr) -> io::Result<()> {
     let mut parts = Path::new(name).components();
@@ -338,7 +342,10 @@ pub fn make_executable(file: &File) -> io::Result<()> {
 
 fn checked_file(file: &File) -> io::Result<FileInfo> {
     let info = regular_file_info(file)?;
-    if info.links != 1 {
+    if info.links == 0 {
+        return Err(not_found("regular file was unlinked"));
+    }
+    if info.links > 1 {
         return Err(denied("regular file must have exactly one hardlink"));
     }
     Ok(info)

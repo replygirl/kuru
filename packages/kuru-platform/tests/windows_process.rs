@@ -124,6 +124,17 @@ async fn unlocked(path: &Path) {
     }
 }
 
+async fn root_exited(child: &NativeChild) {
+    let deadline = tokio::time::Instant::now() + LIMIT;
+    while !child.fixture_root_has_exited().unwrap() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture root did not exit"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn independent_service_breaks_away_from_permitting_job_after_starter_exits() {
     let root = tempfile::tempdir().unwrap();
@@ -161,7 +172,7 @@ async fn independent_service_breaks_away_from_permitting_job_after_starter_exits
 }
 
 #[tokio::test]
-async fn independent_service_rejects_a_job_that_forbids_breakaway() {
+async fn independent_service_remains_in_a_job_that_forbids_breakaway() {
     let root = tempfile::tempdir().unwrap();
     let lock_path = root.path().join("forbidden.lock");
     let release = root.path().join("release");
@@ -174,16 +185,28 @@ async fn independent_service_rejects_a_job_that_forbids_breakaway() {
         ],
     );
     starter.lifetime = Lifetime::OwnedJob;
+    starter.stdout = Stdio::Pipe;
     let mut starter = starter.spawn().await.unwrap();
+    let mut reader = BufReader::new(starter.take_stdout().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(LIMIT, reader.read_line(&mut line))
+        .await
+        .expect("contained starter readiness deadline")
+        .unwrap();
+    assert_eq!(line, "starter-exited\n");
+    root_exited(&starter).await;
+    let held = File::options()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
     assert!(
-        !starter.wait(LIMIT).await.unwrap().success(),
-        "a denied breakaway must fail before the independent service starts"
+        matches!(held.try_lock(), Err(TryLockError::WouldBlock)),
+        "contained service exited with its starter"
     );
+    drop(held);
     drop(starter);
-    assert!(
-        !lock_path.exists(),
-        "denied breakaway unexpectedly launched an independent leaf"
-    );
+    unlocked(&lock_path).await;
 }
 
 #[tokio::test]

@@ -129,6 +129,14 @@ before they run, so concurrent Cargo builds cannot replace their executable.
 Coverage explicitly clears that snapshot opt-in and does not compile an unused
 ordinary supervisor first.
 
+Ordinary application opens start or attach to the internal per-project memory
+service from the same Kuru executable. The service owns the prepared Dolt child
+and may remain alive for its 30-second idle grace after the last client exits;
+it is not an installed system daemon. CLI and PTY fixtures that use a temporary
+project must explicitly retire that idle service before removing their fixture
+directory. The application still holds the project conversation-driver lease,
+so this service boundary does not make simultaneous conversation tests valid.
+
 Development and test builds optimize only the pinned SHA-2 0.11.0 dependency to
 keep repeated full-executable update verification responsive. Cargo requires
 this version-specific profile override in the workspace root. Workspace code,
