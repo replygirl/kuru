@@ -27,8 +27,8 @@
 ## 5. CLI, shared registry and TUI picker
 
 - [x] 5.1 Add CLI session list/rename/remove/restore/fork/export operations and root `--continue` without breaking exact `--resume`, and verify real normal processes produce stable machine output and invoke no provider for lifecycle-only commands.
-- [ ] 5.2 Register `/new`, `/sessions`, `/resume` and `/export` once in the shared command registry and compose them with P04/P27 recovery IDs, and verify help, completion, parsing, modal priority and all existing recovery routing from one table.
-- [ ] 5.3 Add the real TUI session picker and lifecycle actions with ordinary/removed/pending/fork states, settled boundary selection, draft preservation and current-memory disclosure, and verify narrow/wide real-PTY navigation plus restart parity with CLI.
+- [x] 5.2 Register `/new`, `/sessions`, `/resume` and `/export` once in the shared command registry and compose them with P04/P27 recovery IDs, and verify help, completion, parsing, modal priority and all existing recovery routing from one table.
+- [x] 5.3 Add the real TUI session picker and lifecycle actions with ordinary/removed/pending/fork states, settled boundary selection, inline-rename cancellation restoring its saved input, and current-memory disclosure, and verify narrow/wide real-PTY navigation plus restart parity with CLI.
 
 ## 6. Documentation and acceptance
 

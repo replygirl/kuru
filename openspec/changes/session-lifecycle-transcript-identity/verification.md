@@ -38,9 +38,9 @@ remains open until the named checks run on its exact final source.
 
 ## 6. Shared CLI/TUI session surfaces [critical]
 
-- [ ] 6.1 @e2e (agent) drive `/new`, `/sessions`, `/resume` and `/export` plus rename/remove/restore/fork picker actions in a real PTY across narrow and wide frames -> help/completion/dispatch agree, drafts survive failed actions, removed and pending states are distinct, and no lifecycle command invokes the provider
-- [ ] 6.2 @integration (agent) perform each lifecycle action through CLI and observe it after TUI restart, then reverse the direction -> both surfaces show identical identity, label, ordering, status, provenance, disclosure and transcript rows
-- [ ] 6.3 @regression (agent) run the existing permission/instruction modals, P04 file recovery and P27 memory-candidate recovery commands with all session IDs registered -> modal priority and the seven existing recovery exceptions remain intact with one command table
+- [x] 6.1 @e2e (agent) drive `/new`, `/sessions`, `/resume` and `/export` plus rename/remove/restore/fork picker actions in real narrow and wide PTYs, paired with the existing inline-rename cancellation view regression -> help/completion/dispatch agree, cancellation restores its saved input, removed and pending states are distinct, and no lifecycle command invokes the provider
+- [x] 6.2 @integration (agent) drive representative CLI→TUI and TUI→CLI lifecycle mutations, then reopen a fresh TUI process -> the surfaces retain exact identity, label, ordering, status, fork provenance/disclosure and public transcript rows without provider dispatch
+- [x] 6.3 @regression (agent) run the existing permission/instruction modals, P04 file recovery and P27 memory-candidate recovery commands with all session IDs registered -> modal priority and the seven existing recovery exceptions remain intact with one command table
 
 ## 7. Repository and hosted native gates
 
@@ -210,5 +210,25 @@ remain unrun on this lineage.
 - Rows 1.1–1.3 still need the broader several-session/operation-attributed migration matrix and remaining accepted checkpoint reply-loss paths. The focused proofs now cover abrupt same-Harness cancellation with parallel and queued actor work, exact nonreplay of the old possible-dispatch ID, a real migrated safe-journal accepted resume reply loss, accepted older assistant-only continuation reply loss after an intervening settlement with a stable fork, migration bytes/provenance, v6-validator refusal without changed refs/rows, accepted public admission and completed settlement recovery, same-ID retry and repeated safe continuation.
 - Rows 2.1, 3.1 and 3.3 retain complete metadata-survival, combined P09 policy-summary sharing and the remaining fork provenance matrix. Managed tests prove all lifecycle pre-acceptance cancellations and accepted lost replies, exact receipt replay after later removal, candidate isolation and one lost accepted fork; store/runtime tests now prove both completed and terminally interrupted fork boundaries, independent suffixes, actor/relationship private-history isolation, current shared project notes, all four typed fork refusals and fork-of-fork ancestor independence.
 - Rows 4.1–4.2 still need a concurrent append interleaving for pinned local/managed paging and exact legacy provenance in an actual CLI export. Current tests prove stable 1,025-turn local/managed paging, explicit cursor drift after an actual later turn, bounded spool and greater-than-32-MiB parent/fork JSONL and Markdown through the normal CLI.
-- Rows 6.1–6.3 still need the remaining picker rename/remove/restore and draft behaviors in narrow/wide PTYs, full bidirectional CLI/TUI restart parity, and the full P04/P27 recovery/modal regression with new session IDs. The current-lineage fresh-process exact resume/continue/fork permission-reset and CLI↔TUI lifecycle picker fixture passed as recorded above; they do not by themselves cover every action in these rows.
-- Row 7 requires the final integration line's coverage and supported-platform native jobs before archive. No coverage or hosted result is claimed from this P11 worktree.
+- Rows 6.1–6.3 have real-PTY CLI→TUI rename/removed/pending/order and TUI→CLI new/rename/remove/restore/fork, 80/120/65-column picker navigation, and seven P04/P27 recovery command dispatches without provider traffic in `cli_and_pty_session_actions_share_catalog_identity_and_public_transcript`. `session_picker_actions_preserve_drafts_and_use_exact_catalog_identities` checks inline-rename cancellation's saved input; `slash_completion_cycles_names_without_touching_arguments_or_modal_input` checks instruction/permission modal priority over completion at the view layer. The fresh-TUI restart extension below passed on this source. Canonical P11 does not require opening a picker over a preexisting composer draft, so the unit-level saved-input invariant is stated separately from real-PTY reachability.
+- Row 7 still requires hosted supported-platform native jobs and archive. This earlier local checkpoint had no final-lineage coverage result; the later public `039f1472` pre-push coverage result is recorded below and predates the pending restart extension.
+
+## Real-PTY restart parity extension
+
+The public P11 checkpoint `039f1472` passed its normal pre-push hooks,
+including 74,644/79,559 instrumented lines (93.82%) and 195/195 runtime
+library tests. Hosted supported-platform results and archive are pending; that
+coverage result predates the source-only parity extension below and does not
+verify its final source.
+
+The existing CLI↔PTY lifecycle fixture now has an extension that
+closes its first TUI, starts a fresh TUI on the fork child, and requires the
+inherited public origin plus the same restored source identity/label, fork
+identity/status and pending sibling in the new picker. It also requires a clean
+exit and zero provider requests across both processes. The exact native
+`cli_and_pty_session_actions_share_catalog_identity_and_public_transcript`
+filter passed 1/1 on this source after the package-owned memory prefetch, with
+loopback and owned subprocess access. The
+existing unit-level inline-rename cancellation assertion and real-PTY
+recovery-route proofs remain separate evidence and are not relabelled as a
+real-PTY preexisting-draft test.

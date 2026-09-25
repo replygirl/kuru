@@ -1234,6 +1234,51 @@ async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcrip
     terminal.wait_exit(EXIT_TIMEOUT)?;
     terminal.assert_restored()?;
     ensure!(sandbox.sessions()?.iter().any(|row| row.id == child_id));
+
+    // The first TUI's lifecycle mutations must be visible to a separately
+    // opened TUI, not only to CLI reads made while that process was alive.
+    let mut reopened_command = sandbox.command("responses");
+    reopened_command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config)
+        .arg("--resume")
+        .arg(&child_id)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut reopened = Terminal::spawn(reopened_command, 48, 120)?;
+    reopened.wait_composer_frame(
+        &["CLI-PARITY-ORIGIN", "enter send"],
+        sandbox.startup_timeout,
+    )?;
+    reopened.command("/sessions", Some("Sessions"))?;
+    reopened.wait_text(&["TUI-LABEL", &child_id, "CLI-PENDING"], &[])?;
+    let reopened_picker = reopened.screen();
+    ensure!(
+        reopened_picker.lines().any(|line| {
+            line.contains(&source) && line.contains("active") && line.contains("TUI-LABEL")
+        }),
+        "fresh TUI lost the restored, renamed source: {reopened_picker}"
+    );
+    ensure!(
+        reopened_picker
+            .lines()
+            .any(|line| { line.contains(&child_id) && line.contains("active fork") }),
+        "fresh TUI lost the fork identity or provenance: {reopened_picker}"
+    );
+    ensure!(
+        reopened_picker
+            .lines()
+            .any(|line| { line.contains(&cli_pending) && line.contains("pending") }),
+        "fresh TUI lost the CLI pending boundary: {reopened_picker}"
+    );
+    reopened.close_picker(b"\x1b")?;
+    reopened.send(b"/quit\r")?;
+    reopened.wait_exit(EXIT_TIMEOUT)?;
+    reopened.assert_restored()?;
+    ensure!(
+        requests.load(Ordering::SeqCst) == 0,
+        "session lifecycle restart dispatched a provider request"
+    );
     Ok(())
 }
 

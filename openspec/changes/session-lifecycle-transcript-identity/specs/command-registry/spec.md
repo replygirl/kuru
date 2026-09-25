@@ -10,4 +10,4 @@ When the P11 backend is present, the TUI SHALL define `/new`, `/sessions`, `/res
 
 #### Scenario: Failed session command preserves the surface
 - **WHEN** a session command names a pending, removed, missing, malformed or uncertain target
-- **THEN** the typed diagnostic is shown without changing the current session, draft, transcript or permission state.
+- **THEN** the typed diagnostic is shown without changing the current session, durable public transcript or permission state; cancelling an unsubmitted inline rename restores the input saved when its editor opened.

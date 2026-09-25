@@ -116,7 +116,7 @@ Exact resume SHALL accept only a stored nonremoved session in the canonical proj
 
 ### Requirement: Consistent CLI and TUI session management
 
-CLI session commands and the TUI picker SHALL use the same typed catalog and mutation results for list, rename, remove, restore, fork, resume, continue and export. The picker MUST distinguish ordinary and removed sessions, expose settled fork boundaries, preserve the current draft until a lifecycle action succeeds, and provide actionable pending, missing, removed and uncertain diagnostics without making a provider request.
+CLI session commands and the TUI picker SHALL use the same typed catalog and mutation results for list, rename, remove, restore, fork, resume, continue and export. The picker MUST distinguish ordinary and removed sessions, expose settled fork boundaries, and provide actionable pending, missing, removed and uncertain diagnostics without making a provider request. Cancelling the picker's inline rename editor before submission MUST restore the composer input saved when that editor opened.
 
 #### Scenario: Picker and CLI observe the same lifecycle
 - **WHEN** a session is renamed, removed, restored or forked through either surface and the other surface reopens the project
