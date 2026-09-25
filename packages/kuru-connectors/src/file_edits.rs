@@ -174,6 +174,16 @@ pub struct CheckpointLease<'a> {
     lock: File,
 }
 
+#[cfg(unix)]
+impl Drop for CheckpointLease<'_> {
+    fn drop(&mut self) {
+        // flock belongs to the open file description. Closing this descriptor
+        // alone can retain the lock if a concurrent child briefly duplicated it.
+        // This lease, not the last descriptor, owns the critical-section end.
+        let _ = self.lock.unlock();
+    }
+}
+
 struct TargetSnapshot {
     file: File,
     bytes: Vec<u8>,
@@ -1119,6 +1129,42 @@ mod tests {
     use super::*;
 
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_checkpoint_lease_releases_lock_despite_live_duplicate() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project)?;
+        let root = Arc::new(Directory::open(
+            &project,
+            Privacy::Inherited,
+            NameRetention::Movable,
+        )?);
+        let store = CheckpointStore::new(&temporary.path().join("state"), root)?;
+        let owner = store.lease()?;
+        // A duplicate refers to the same flock open-file description, as a
+        // child can briefly do between process creation and CLOEXEC.
+        let duplicate = owner.lock.try_clone()?;
+        let Err(active_error) = store.lease() else {
+            anyhow::bail!("a live checkpoint lease admitted a second owner");
+        };
+        ensure!(
+            matches!(
+                active_error.downcast_ref::<std::fs::TryLockError>(),
+                Some(std::fs::TryLockError::WouldBlock)
+            ),
+            "active owner refusal was not WouldBlock: {active_error:#}"
+        );
+
+        drop(owner);
+        let reacquired = store
+            .lease()
+            .context("ended checkpoint lease retained its lock through a duplicate")?;
+        drop(reacquired);
+        drop(duplicate);
+        Ok(())
+    }
 
     #[test]
     fn checked_receipts_support_restart_undo_but_never_infer_a_prepared_create() -> Result<()> {
