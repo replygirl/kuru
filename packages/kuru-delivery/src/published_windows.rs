@@ -386,6 +386,7 @@ struct MiseInstall {
     data: PathBuf,
     engine_cache: PathBuf,
     commands: Vec<CommandEvidence>,
+    memory_attempted: bool,
 }
 
 impl MiseInstall {
@@ -419,11 +420,16 @@ impl MiseInstall {
             data: root.join("cold-kuru-data"),
             engine_cache,
             commands: Vec::new(),
+            memory_attempted: false,
         })
     }
 
     fn command(&self) -> command::Command {
         let mut command = command::Command::new(&self.executable);
+        // Kuru's selected memory owner must outlive each short mise command.
+        // Only an explicit IndependentService request may leave this Job.
+        #[cfg(windows)]
+        command.fixture_allow_independent_service();
         command.env_clear().current_dir(&self.project);
         for (name, value) in &self.environment {
             command.env(name, value);
@@ -431,17 +437,17 @@ impl MiseInstall {
         command
     }
 
-    async fn output(&self, arguments: &[OsString]) -> Result<Output> {
+    async fn output(&self, phase: &'static str, arguments: &[OsString]) -> Result<Output> {
         let mut child = self.command();
         child.args(arguments);
         command::bounded_output(&mut child, COMMAND_DEADLINE, OUTPUT_LIMIT)
             .await
-            .context("native mise command did not settle")
+            .with_context(|| format!("native mise {phase} command did not settle"))
     }
 
     async fn success(&mut self, name: &'static str, arguments: &[&str]) -> Result<String> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
-        let output = self.output(&arguments).await?;
+        let output = self.output(name, &arguments).await?;
         ensure!(
             output.status.success(),
             "{name} failed: {}",
@@ -470,7 +476,8 @@ impl MiseInstall {
             "--no-dream".into(),
         ];
         command.extend(arguments.iter().map(OsString::from));
-        let output = self.output(&command).await?;
+        self.memory_attempted = true;
+        let output = self.output(name, &command).await?;
         ensure!(
             output.status.success(),
             "{name} failed: {}",
@@ -481,6 +488,36 @@ impl MiseInstall {
             status: "success",
         });
         machine_json(&output.stdout)
+    }
+
+    async fn retire_memory(&mut self) -> Result<()> {
+        if !self.memory_attempted {
+            return Ok(());
+        }
+        ensure!(
+            self.project == self.root.join("project")
+                && self.data == self.root.join("cold-kuru-data"),
+            "published verification cleanup changed its isolated project or data root"
+        );
+        let arguments = vec![
+            OsString::from("exec"),
+            OsString::from("--"),
+            OsString::from("kuru"),
+            OsString::from("-C"),
+            self.project.as_os_str().to_owned(),
+            OsString::from("--data-dir"),
+            self.data.as_os_str().to_owned(),
+            OsString::from("memory"),
+            OsString::from("purge"),
+            OsString::from("--yes"),
+        ];
+        let output = self.output("memory-cleanup", &arguments).await?;
+        ensure!(
+            output.status.success(),
+            "isolated memory cleanup returned {}",
+            output.status
+        );
+        Ok(())
     }
 
     async fn config_count(&mut self, name: &'static str) -> Result<usize> {
@@ -599,6 +636,42 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     })
 }
 
+fn finish_isolated_verification(
+    temporary: tempfile::TempDir,
+    verified: Result<Receipt>,
+    cleanup: Result<()>,
+) -> Result<Receipt> {
+    let mut receipt = match (verified, cleanup) {
+        (Ok(receipt), Ok(())) => receipt,
+        (Err(error), Ok(())) => {
+            let close = temporary.close();
+            return match close {
+                Ok(()) => Err(error),
+                Err(close) => Err(error).context(format!(
+                    "isolated verification also failed to remove its retired root: {close}"
+                )),
+            };
+        }
+        (Ok(_), Err(cleanup)) => {
+            let retained = temporary.keep();
+            return Err(cleanup).with_context(|| {
+                format!("isolated memory cleanup failed; root retained at {retained:?}")
+            });
+        }
+        (Err(error), Err(cleanup)) => {
+            let retained = temporary.keep();
+            return Err(error).context(format!(
+                "isolated memory cleanup also failed: {cleanup:#}; root retained at {retained:?}"
+            ));
+        }
+    };
+    temporary
+        .close()
+        .context("isolated published verification cleanup was not confirmed")?;
+    receipt.cleanup_confirmed = true;
+    Ok(receipt)
+}
+
 pub async fn run(options: Options) -> Result<()> {
     ensure!(
         cfg!(windows),
@@ -680,182 +753,188 @@ pub async fn run(options: Options) -> Result<()> {
         "evidence path must be outside the isolated verification root"
     );
     let mut install = MiseInstall::new(&root, &mise)?;
-    let mise_version = install.success("mise-version", &["--version"]).await?;
-    ensure!(
-        mise_version.trim().starts_with("2026.9.4") && mise_version.trim().len() <= 256,
-        "workflow mise version differs from 2026.9.4"
-    );
-    let isolated_config_count = install.verify_isolation().await?;
-    let selector = format!("github:{REPOSITORY}@{version}");
-    install.success("mise-use", &["use", &selector]).await?;
-    install.config_count("mise-config-after").await?;
-    let selected = install.success("mise-which", &["which", "kuru"]).await?;
-    let selected = within(
-        Path::new(selected.trim()),
-        &environment_path(&install.environment, "MISE_DATA_DIR")?.join("installs"),
-        "mise-installed executable",
-    )?;
-    let installed = read_bounded(
-        &selected,
-        archive::MAX_ARCHIVE_BYTES,
-        "mise-installed executable",
-    )?;
-    let installed_sha256 = archive::digest(&installed);
-    ensure!(
-        installed_sha256 == executable_sha256,
-        "mise-installed executable differs from the independently verified archive"
-    );
-    let reported = install
-        .success("installed-version", &["exec", "--", "kuru", "--version"])
-        .await?;
-    ensure!(
-        reported.trim() == format!("kuru {version}"),
-        "installed Kuru reports a different version"
-    );
-    ensure!(
-        !install.data.exists() && !install.engine_cache.exists(),
-        "published runtime acceptance did not begin with cold state"
-    );
-
-    let first = install
-        .kuru(
-            "demo-conversation",
-            &[
-                "run".into(),
-                "Published Windows verification".into(),
-                "--json".into(),
-            ],
-        )
-        .await?;
-    ensure!(
-        !value_string(&first, "text", "first conversation")?.is_empty(),
-        "published Kuru returned an empty first response"
-    );
-    let session = value_string(&first, "session", "first conversation")?.to_owned();
-    let before = install
-        .kuru("memory-status-before", &["memory".into(), "status".into()])
-        .await?;
-    ensure!(
-        before["engine"] == "dolt",
-        "published runtime did not use Dolt"
-    );
-    let first_revision = value_string(&before, "revision", "first memory status")?.to_owned();
-    let second = install
-        .kuru(
-            "resumed-conversation",
-            &[
-                "--resume".into(),
-                session.clone(),
-                "run".into(),
-                "Resume the exact published verification session".into(),
-                "--json".into(),
-            ],
-        )
-        .await?;
-    ensure!(
-        !value_string(&second, "text", "resumed conversation")?.is_empty(),
-        "published Kuru returned an empty resumed response"
-    );
-    ensure!(
-        second["session"] == session,
-        "published Kuru did not resume the same session"
-    );
-    let after = install
-        .kuru("memory-status-after", &["memory".into(), "status".into()])
-        .await?;
-    let second_revision = value_string(&after, "revision", "second memory status")?.to_owned();
-    ensure!(
-        first_revision != second_revision,
-        "published conversations did not create distinct revisions"
-    );
-    let history = install
-        .kuru(
-            "memory-history",
-            &[
-                "memory".into(),
-                "history".into(),
-                "--limit".into(),
-                "100".into(),
-            ],
-        )
-        .await?;
-    for revision in [&first_revision, &second_revision] {
+    let verified: Result<Receipt> = async {
+        let mise_version = install.success("mise-version", &["--version"]).await?;
         ensure!(
-            history
-                .as_array()
-                .context("memory history is not an array")?
-                .iter()
-                .any(|entry| entry["hash"] == *revision),
-            "published conversation revision is absent from memory history"
+            mise_version.trim().starts_with("2026.9.4") && mise_version.trim().len() <= 256,
+            "workflow mise version differs from 2026.9.4"
         );
+        let isolated_config_count = install.verify_isolation().await?;
+        let selector = format!("github:{REPOSITORY}@{version}");
+        install.success("mise-use", &["use", &selector]).await?;
+        install.config_count("mise-config-after").await?;
+        let selected = install.success("mise-which", &["which", "kuru"]).await?;
+        let selected = within(
+            Path::new(selected.trim()),
+            &environment_path(&install.environment, "MISE_DATA_DIR")?.join("installs"),
+            "mise-installed executable",
+        )?;
+        let installed = read_bounded(
+            &selected,
+            archive::MAX_ARCHIVE_BYTES,
+            "mise-installed executable",
+        )?;
+        let installed_sha256 = archive::digest(&installed);
+        ensure!(
+            installed_sha256 == executable_sha256,
+            "mise-installed executable differs from the independently verified archive"
+        );
+        let reported = install
+            .success("installed-version", &["exec", "--", "kuru", "--version"])
+            .await?;
+        ensure!(
+            reported.trim() == format!("kuru {version}"),
+            "installed Kuru reports a different version"
+        );
+        ensure!(
+            !install.data.exists() && !install.engine_cache.exists(),
+            "published runtime acceptance did not begin with cold state"
+        );
+
+        let first = install
+            .kuru(
+                "demo-conversation",
+                &[
+                    "run".into(),
+                    "Published Windows verification".into(),
+                    "--json".into(),
+                ],
+            )
+            .await?;
+        ensure!(
+            !value_string(&first, "text", "first conversation")?.is_empty(),
+            "published Kuru returned an empty first response"
+        );
+        let session = value_string(&first, "session", "first conversation")?.to_owned();
+        let before = install
+            .kuru("memory-status-before", &["memory".into(), "status".into()])
+            .await?;
+        ensure!(
+            before["engine"] == "dolt",
+            "published runtime did not use Dolt"
+        );
+        let first_revision = value_string(&before, "revision", "first memory status")?.to_owned();
+        let second = install
+            .kuru(
+                "resumed-conversation",
+                &[
+                    "--resume".into(),
+                    session.clone(),
+                    "run".into(),
+                    "Resume the exact published verification session".into(),
+                    "--json".into(),
+                ],
+            )
+            .await?;
+        ensure!(
+            !value_string(&second, "text", "resumed conversation")?.is_empty(),
+            "published Kuru returned an empty resumed response"
+        );
+        ensure!(
+            second["session"] == session,
+            "published Kuru did not resume the same session"
+        );
+        let after = install
+            .kuru("memory-status-after", &["memory".into(), "status".into()])
+            .await?;
+        let second_revision = value_string(&after, "revision", "second memory status")?.to_owned();
+        ensure!(
+            first_revision != second_revision,
+            "published conversations did not create distinct revisions"
+        );
+        let history = install
+            .kuru(
+                "memory-history",
+                &[
+                    "memory".into(),
+                    "history".into(),
+                    "--limit".into(),
+                    "100".into(),
+                ],
+            )
+            .await?;
+        for revision in [&first_revision, &second_revision] {
+            ensure!(
+                history
+                    .as_array()
+                    .context("memory history is not an array")?
+                    .iter()
+                    .any(|entry| entry["hash"] == *revision),
+                "published conversation revision is absent from memory history"
+            );
+        }
+        let sessions = install.kuru("sessions", &["sessions".into()]).await?;
+        ensure!(
+            sessions
+                .as_array()
+                .context("sessions is not an array")?
+                .iter()
+                .any(|entry| entry["id"] == session && entry["turns"] == 2),
+            "published session listing does not contain two durable turns"
+        );
+
+        let engine_root = install
+            .engine_cache
+            .join(&manifest.version)
+            .join(WINDOWS_TARGET);
+        let engine_bytes = read_bounded(
+            &engine_root.join("dolt.exe"),
+            archive::MAX_ARCHIVE_BYTES,
+            "extracted Dolt executable",
+        )?;
+        let license_bytes = read_bounded(
+            &engine_root.join("LICENSES"),
+            archive::MAX_ARCHIVE_BYTES,
+            "extracted Dolt licenses",
+        )?;
+        ensure!(
+            engine_bytes.len() as u64 == engine_asset.executable_bytes
+                && archive::digest(&engine_bytes) == engine_asset.executable_sha256,
+            "extracted Dolt executable differs from the checked-out manifest"
+        );
+        ensure!(
+            license_bytes.len() as u64 == engine_asset.license_bytes
+                && archive::digest(&license_bytes) == engine_asset.license_sha256,
+            "extracted Dolt licenses differ from the checked-out manifest"
+        );
+
+        let commands = std::mem::take(&mut install.commands);
+        let receipt = Receipt {
+            schema_version: 1,
+            runner_os: std::env::consts::OS,
+            runner_arch: std::env::consts::ARCH,
+            repository: REPOSITORY,
+            release_url,
+            run_url,
+            version,
+            commit: expected_sha,
+            checksum_manifest_sha256,
+            archive_sha256,
+            executable_sha256,
+            installed_sha256,
+            mise_version: mise_version.trim().to_owned(),
+            isolated_config_count,
+            commands,
+            session,
+            first_revision,
+            second_revision,
+            engine: EngineEvidence {
+                version: manifest.version,
+                executable_sha256: engine_asset.executable_sha256.clone(),
+                license_sha256: engine_asset.license_sha256.clone(),
+            },
+            cleanup_confirmed: false,
+        };
+        Ok(receipt)
     }
-    let sessions = install.kuru("sessions", &["sessions".into()]).await?;
-    ensure!(
-        sessions
-            .as_array()
-            .context("sessions is not an array")?
-            .iter()
-            .any(|entry| entry["id"] == session && entry["turns"] == 2),
-        "published session listing does not contain two durable turns"
-    );
+    .await;
 
-    let engine_root = install
-        .engine_cache
-        .join(&manifest.version)
-        .join(WINDOWS_TARGET);
-    let engine_bytes = read_bounded(
-        &engine_root.join("dolt.exe"),
-        archive::MAX_ARCHIVE_BYTES,
-        "extracted Dolt executable",
-    )?;
-    let license_bytes = read_bounded(
-        &engine_root.join("LICENSES"),
-        archive::MAX_ARCHIVE_BYTES,
-        "extracted Dolt licenses",
-    )?;
-    ensure!(
-        engine_bytes.len() as u64 == engine_asset.executable_bytes
-            && archive::digest(&engine_bytes) == engine_asset.executable_sha256,
-        "extracted Dolt executable differs from the checked-out manifest"
-    );
-    ensure!(
-        license_bytes.len() as u64 == engine_asset.license_bytes
-            && archive::digest(&license_bytes) == engine_asset.license_sha256,
-        "extracted Dolt licenses differ from the checked-out manifest"
-    );
-
-    let commands = std::mem::take(&mut install.commands);
-    let mut receipt = Receipt {
-        schema_version: 1,
-        runner_os: std::env::consts::OS,
-        runner_arch: std::env::consts::ARCH,
-        repository: REPOSITORY,
-        release_url,
-        run_url,
-        version,
-        commit: expected_sha,
-        checksum_manifest_sha256,
-        archive_sha256,
-        executable_sha256,
-        installed_sha256,
-        mise_version: mise_version.trim().to_owned(),
-        isolated_config_count,
-        commands,
-        session,
-        first_revision,
-        second_revision,
-        engine: EngineEvidence {
-            version: manifest.version,
-            executable_sha256: engine_asset.executable_sha256.clone(),
-            license_sha256: engine_asset.license_sha256.clone(),
-        },
-        cleanup_confirmed: false,
-    };
+    // The installed CLI's purge takes the project's authenticated maintenance
+    // permit, retires its idle owner and removes only this disposable root's
+    // memory. It must settle before TempDir may remove the enclosing files.
+    let cleanup = install.retire_memory().await;
     drop(install);
-    temporary
-        .close()
-        .context("isolated published verification cleanup was not confirmed")?;
-    receipt.cleanup_confirmed = true;
+    let receipt = finish_isolated_verification(temporary, verified, cleanup)?;
     let bytes = serde_json::to_vec_pretty(&receipt)?;
     ensure!(
         bytes.len() <= RECEIPT_LIMIT,
@@ -1046,6 +1125,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_verification_retains_uncertain_root_and_primary_phase() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().to_owned();
+        let primary: Result<Receipt> = Err(anyhow::anyhow!("demo-conversation phase failed"));
+        let cleanup = Err(anyhow::anyhow!("authenticated retirement refused"));
+        let error = finish_isolated_verification(temporary, primary, cleanup).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("demo-conversation phase failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("authenticated retirement refused"),
+            "{message}"
+        );
+        assert!(message.contains("root retained"), "{message}");
+        assert!(root.is_dir(), "uncertain root was deleted");
+        fs::remove_dir_all(root).unwrap();
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().to_owned();
+        let primary: Result<Receipt> = Err(anyhow::anyhow!("memory-status phase failed"));
+        let error = finish_isolated_verification(temporary, primary, Ok(())).unwrap_err();
+        assert!(format!("{error:#}").contains("memory-status phase failed"));
+        assert!(
+            !root.exists(),
+            "retired fixture root remained after failure"
+        );
+    }
+
+    #[test]
     fn optional_url_replacements_require_a_json_object_of_safe_strings() {
         validate_url_replacements("{}").unwrap();
         validate_url_replacements(r#"{"url_replacements":{"regex:^github$":"mirror"}}"#).unwrap();
@@ -1110,5 +1220,168 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("mise-url-replacements failed"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn published_command_names_failed_phase_and_refuses_substituted_cleanup_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("missing-mise.exe");
+        let mut install = MiseInstall::new(temporary.path(), &missing).unwrap();
+        let error = install
+            .output("demo-conversation", &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("native mise demo-conversation command did not settle"),
+            "{error}"
+        );
+
+        let foreign = tempfile::tempdir().unwrap();
+        let marker = foreign.path().join("untouched");
+        fs::write(&marker, b"foreign").unwrap();
+        install.memory_attempted = true;
+        install.data = foreign.path().to_owned();
+        let error = install.retire_memory().await.unwrap_err().to_string();
+        assert!(error.contains("changed its isolated project or data root"));
+        assert_eq!(fs::read(marker).unwrap(), b"foreign");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn independent_service_child() {
+        let Some(lock) = std::env::var_os("KURU_PUBLISHED_TEST_LOCK") else {
+            return;
+        };
+        let release = PathBuf::from(std::env::var_os("KURU_PUBLISHED_TEST_RELEASE").unwrap());
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock)
+            .unwrap();
+        held.try_lock().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !release.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            release.exists(),
+            "independent fixture release was not signaled"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn independent_service_starter() {
+        use kuru_platform::windows::process::{Lifetime, NativeSpawnSpec};
+
+        let Some(lock) = std::env::var_os("KURU_PUBLISHED_TEST_LOCK") else {
+            return;
+        };
+        let release = std::env::var_os("KURU_PUBLISHED_TEST_RELEASE").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut child = NativeSpawnSpec::new(executable, std::env::current_dir().unwrap());
+        child.args = vec![
+            "--exact".into(),
+            "published_windows::tests::independent_service_child".into(),
+            "--nocapture".into(),
+        ];
+        child.lifetime = Lifetime::IndependentService;
+        child.environment = [
+            ("KURU_PUBLISHED_TEST_LOCK".into(), lock),
+            ("KURU_PUBLISHED_TEST_RELEASE".into(), release),
+        ]
+        .into();
+        for name in ["SystemRoot", "LLVM_PROFILE_FILE"] {
+            if let Some(value) = std::env::var_os(name) {
+                child.environment.push((name.into(), value));
+            }
+        }
+        let service = child.spawn().await.unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(std::env::var_os("KURU_PUBLISHED_TEST_LOCK").unwrap())
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match held.try_lock() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Ok(()) => held.unlock().unwrap(),
+                Err(error) => panic!("service lock check failed: {error}"),
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "service did not retain its lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(service);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn published_command_allows_only_explicit_service_breakaway() {
+        struct ReleaseOnDrop(PathBuf);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.0, b"release");
+            }
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let lock = temporary.path().join("service.lock");
+        let release = temporary.path().join("release");
+        let release_guard = ReleaseOnDrop(release.clone());
+        let mut install =
+            MiseInstall::new(temporary.path(), &std::env::current_exe().unwrap()).unwrap();
+        install.environment.extend([
+            (
+                "KURU_PUBLISHED_TEST_LOCK".into(),
+                lock.as_os_str().to_owned(),
+            ),
+            (
+                "KURU_PUBLISHED_TEST_RELEASE".into(),
+                release.as_os_str().to_owned(),
+            ),
+        ]);
+        let output = install
+            .output(
+                "independent-service-regression",
+                &[
+                    "--exact".into(),
+                    "published_windows::tests::independent_service_starter".into(),
+                    "--nocapture".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(output.status.success(), "starter did not complete");
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert!(matches!(
+            held.try_lock(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        drop(release_guard);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if held.try_lock().is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "service did not retire"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
