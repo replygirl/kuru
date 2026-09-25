@@ -169,6 +169,51 @@ that observe peer routing, context isolation, persistence, bounded failure,
 protocol payloads and real CLI output. Live authenticated-provider checks are
 separate from deterministic fixture tests and must be reported accurately.
 
+## Shared build cache
+
+Root mise routes Cargo through [mr-boxington](https://mr-boxington.jdx.dev)
+(`mbx`), pinned beside Rust, whenever it runs Cargo for `mise run`, `mise exec`,
+activated shells or mise shims. It needs mise 2026.9.4 or later, the root
+`min_version`. mbx stores compiled outputs in one content-addressed cache and
+restores matching compilations into each checkout's own `target/`, so a new
+worktree mostly restores its dependencies instead of recompiling them while
+concurrent worktrees keep separate Cargo locks. Calling rustup's `cargo`
+directly bypasses the wrapper; use `mise exec -- cargo` from editors and agents.
+Do not run `mbx setup`, which writes machine-wide Cargo and editor
+configuration.
+
+Root mise sets `MBX_TARGET_VIEWS=0`. mbx would otherwise replace `target/` with
+a symlink into its cache root, and the prepared engine inputs under
+`target/kuru-bundles` and the private supervisor snapshots refuse symlinked
+paths. Keep each checkout's target directory local to it: remove any per-user
+`CARGO_TARGET_DIR` override, such as one in an untracked `mise.local.toml`.
+Worktrees nested below a checkout inherit its local mise configuration, and a
+shared target directory serializes their builds on one Cargo lock. The
+checked-in `.mbx.toml` holds only scheduler policy. Cache location, disk budgets
+and remote caches belong to each maintainer's own mbx configuration.
+
+Set `KURU_MBX=0` in the process environment to build with plain Cargo. mise
+reads it while resolving tools, before any mise `[env]` applies, so setting it
+in `mise.local.toml` has no effect. CI workflows, the source installers and
+`kuru update --source` set it, so published and user-built executables never
+depend on a maintainer cache. mbx publishes no Intel macOS binary; mise skips it
+there and Cargo runs unwrapped. Instrumented coverage never reads or writes the
+cache: cargo-llvm-cov supplies its own `RUSTC_WRAPPER`, which mbx defers to.
+
+mbx restores outputs by copy-on-write clone on APFS, Btrfs, XFS with reflink,
+and ReFS. On filesystems without cloning, such as ext4, it hard-links the
+cache's object into `target/` and makes that object read-only first; NTFS
+falls back to copies. A hard-linked output therefore has several links and
+cannot be written in place. That matches the existing rule to treat Cargo
+outputs as read-only inputs whose other links must not be modified, and mbx
+unlinks such an output before recompiling it. Plain Cargo, for example after
+switching to `KURU_MBX=0` in the same checkout, can report that a restored
+output is not writeable; run `mbx clean` or remove `target/` first, or set
+`restore_hardlink = false` in your own mbx configuration to restore copies. Local
+checks covered only APFS clones; the hard-link path is described by the mbx
+documentation and has not been exercised against Kuru's packaging or snapshot
+tests.
+
 ## Bundled engine build inputs
 
 Every Kuru executable contains its target's pinned full-Dolt archive and license

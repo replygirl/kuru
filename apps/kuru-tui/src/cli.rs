@@ -2133,6 +2133,8 @@ async fn build_windows_source(source: &Path) -> Result<PathBuf> {
             .current_dir(&source)
             .env("MISE_NO_HOOKS", "1")
             .env("MISE_TASK_RUN_AUTO_INSTALL", "false")
+            // The mr-boxington build cache is a maintainer tool.
+            .env("KURU_MBX", "0")
             .env_remove("CARGO_BUILD_TARGET");
         let result = output(&mut command, Duration::from_secs(1800))
             .await

@@ -876,6 +876,7 @@ function Snapshot {
     return @{
         no_hooks = [Environment]::GetEnvironmentVariable('MISE_NO_HOOKS', 'Process')
         auto_install = [Environment]::GetEnvironmentVariable('MISE_TASK_RUN_AUTO_INSTALL', 'Process')
+        mbx = [Environment]::GetEnvironmentVariable('KURU_MBX', 'Process')
         install_dir = [Environment]::GetEnvironmentVariable('KURU_INSTALL_DIR', 'Process')
     }
 }
@@ -930,13 +931,14 @@ fn source_install_entrypoint_scopes_first_mise_and_restores_environment_on_succe
                 child
                     .env("MISE_NO_HOOKS", "0")
                     .env("MISE_TASK_RUN_AUTO_INSTALL", "true")
+                    .env("KURU_MBX", "1")
                     .env("KURU_INSTALL_DIR", "caller relative destination 日本語");
                 serde_json::json!({
-                    "no_hooks": "0", "auto_install": "true",
+                    "no_hooks": "0", "auto_install": "true", "mbx": "1",
                     "install_dir": "caller relative destination 日本語",
                 })
             } else {
-                serde_json::json!({"no_hooks": null, "auto_install": null, "install_dir": null})
+                serde_json::json!({"no_hooks": null, "auto_install": null, "mbx": null, "install_dir": null})
             };
             let output = child.output().unwrap();
             let diagnostic = format!(
@@ -954,6 +956,7 @@ fn source_install_entrypoint_scopes_first_mise_and_restores_environment_on_succe
             let actual = &calls[0];
             assert_eq!(actual["no_hooks"], "1", "{diagnostic}");
             assert_eq!(actual["auto_install"], "false", "{diagnostic}");
+            assert_eq!(actual["mbx"], "0", "{diagnostic}");
             let arguments = actual["arguments"].as_array().unwrap();
             assert_eq!(arguments.len(), 4);
             assert_eq!(arguments[0], "-C");
@@ -997,6 +1000,7 @@ fn source_install_entrypoint_rejects_release_options_before_mise_or_environment_
         .env("KURU_ENTRYPOINT_INVALID", "1")
         .env("MISE_NO_HOOKS", "0")
         .env("MISE_TASK_RUN_AUTO_INSTALL", "true")
+        .env("KURU_MBX", "1")
         .env("KURU_INSTALL_DIR", "caller relative destination")
         .output()
         .unwrap();
@@ -1005,7 +1009,8 @@ fn source_install_entrypoint_rejects_release_options_before_mise_or_environment_
     let report: serde_json::Value =
         serde_json::from_slice(&fs::read(root.path().join("restoration.json")).unwrap()).unwrap();
     let before = serde_json::json!({
-        "no_hooks": "0", "auto_install": "true", "install_dir": "caller relative destination",
+        "no_hooks": "0", "auto_install": "true", "mbx": "1",
+        "install_dir": "caller relative destination",
     });
     assert_eq!(report["before"], before);
     assert_eq!(report["after"], before);

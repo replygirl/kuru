@@ -206,6 +206,9 @@ a successful build is not evidence of a successful deployment.
 Instrumented child fixtures must explicitly retain the runner's LLVM_PROFILE_FILE
 destination when clearing their environments, so their coverage is collected and
 profile files do not appear in source or private-state fixture directories.
+Root mise routes local Cargo through the pinned mr-boxington shared build cache;
+workflows and source installation set `KURU_MBX=0`, and coverage stays outside
+it. See [shared build cache](docs/development.md#shared-build-cache).
 Cargo may hard-link its executable outputs. Treat explicitly selected build
 artifacts as read-only inputs: retain their identity, bound and verify the bytes
 being copied, and check the source name again. Keep private cache, installation

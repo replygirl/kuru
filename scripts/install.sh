@@ -10,7 +10,9 @@ if [[ "${1:-}" == "--source" ]]; then
   fi
   kuru_install_dir=${KURU_INSTALL_DIR:-"${HOME}/.local/bin"}
   # Source installation needs the pinned compiler and bundled engine input.
-  # Repository hook installation and maintainer-only tools belong to setup.
+  # Repository hook installation and maintainer-only tools, including the
+  # mr-boxington build cache, belong to setup.
+  export KURU_MBX=0
   MISE_NO_HOOKS=1 mise -C "$kuru_repo" install rust
   kuru_host_target=$(mise -C "$kuru_repo" exec rust -- rustc --print host-tuple)
   if [[ -n "${CARGO_BUILD_TARGET:-}" && "$CARGO_BUILD_TARGET" != host && "$CARGO_BUILD_TARGET" != "$kuru_host_target" ]]; then

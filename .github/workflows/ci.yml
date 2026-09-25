@@ -16,6 +16,8 @@ concurrency:
 env:
   MISE_LOCKED: "1"
   MISE_NO_HOOKS: "1"
+  # CI and release builds stay outside the maintainer mr-boxington cache.
+  KURU_MBX: "0"
 
 jobs:
   quality:

@@ -229,8 +229,8 @@ once clients and accepted work have drained. See [memory storage](memory.md).
 
 ## Build from source
 
-Building requires mise, a C compiler for the legacy SQLite importer, and standard
-platform build tools:
+Building requires mise 2026.9.4 or later, a C compiler for the legacy SQLite
+importer, and standard platform build tools:
 
 ```sh
 git clone https://github.com/replygirl/kuru.git
@@ -265,8 +265,9 @@ the executable. It refuses a symlink or directory at the destination and uses
 your selected checkout revision. Maintainers with the repository toolchain can
 run `mise run install`; see [development](development.md) for setup and platform
 requirements. Source installation does not require the full maintainer toolchain;
-it omits mise's repository-setup postinstall hook while preparing Rust. It does
-not alter Git commit or push hooks.
+it omits mise's repository-setup postinstall hook while preparing Rust and
+builds without the maintainer build cache. It does not alter Git commit or push
+hooks.
 
 For direct Cargo builds or offline source preparation, see the
 [bundled engine build inputs](development.md#bundled-engine-build-inputs) guide.

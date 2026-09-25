@@ -1,0 +1,8 @@
+# Repository policy for mr-boxington (https://mr-boxington.jdx.dev). mbx accepts
+# only build-policy and scheduler keys here; cache paths, budgets and remote
+# caches belong to each maintainer's own mbx configuration.
+
+[scheduler]
+# Concurrent worktree builds share one machine-wide compiler pool. Keep headroom
+# for editors and real-memory test fixtures.
+reserve_cpus = 2

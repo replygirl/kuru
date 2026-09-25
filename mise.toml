@@ -1,4 +1,4 @@
-min_version = "2026.7.7"
+min_version = "2026.9.4"
 monorepo_root = true
 
 [settings]
@@ -8,6 +8,9 @@ lockfile = true
 [env]
 HK_MISE = "1"
 HK_PKL_BACKEND = "pklr"
+# Private build inputs under target/ refuse symlinked paths, so mr-boxington
+# shares compiled outputs while each checkout keeps a real target directory.
+MBX_TARGET_VIEWS = "0"
 
 [tool_alias]
 # Root task discovery must resolve the docs app's npm pin with the same backend.
@@ -15,7 +18,10 @@ HK_PKL_BACKEND = "pklr"
 npm = "npm:npm"
 
 [tools]
-rust = "1.98.1"
+# Cargo runs through mr-boxington's shared build cache unless KURU_MBX=0 (CI and
+# source installation) or on Intel macOS, which has no mbx release build.
+rust = { version = "1.98.1", mr_boxington = "{{ get_env(name='KURU_MBX', default='1') != '0' and not (os() == 'macos' and arch() == 'x64') }}" }
+mr-boxington = { version = "1.17.0", os = ["linux", "macos/arm64", "windows"] }
 "github:aligned-team/cospec" = "0.7.1"
 "aqua:jdx/hk" = "1.58.1"
 "aqua:tamasfe/taplo" = "0.10.0"

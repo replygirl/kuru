@@ -23,6 +23,8 @@ permissions:
 
 env:
   MISE_LOCKED: "1"
+  # CI and release builds stay outside the maintainer mr-boxington cache.
+  KURU_MBX: "0"
   MISE_NO_HOOKS: "1"
   MISE_TASK_RUN_AUTO_INSTALL: "false"
   CARGO_INCREMENTAL: "0"
