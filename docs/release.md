@@ -117,8 +117,13 @@ runtime is involved.
    GitHub metadata that serves the exact staged Windows ZIP. In parallel,
    `build-docs` checks out the selected commit and builds and validates the site.
    The Windows check verifies candidate checksums and bytes, installation,
-   activation, bundled Dolt, an offline conversation and durable reopen. The
-   loopback fixture is not an actual public download.
+   activation, bundled Dolt, an offline conversation and durable reopen. It
+   also authenticates the published v0.4.2 Windows executable against pinned
+   release digests, runs that old executable's updater against the same staged
+   candidate, checks the exact replacement bytes, and regenerates the five
+   support files explicitly from the upgraded binary. The loopback mise
+   fixture and local old-updater release base are not public downloads of the
+   new release. A failure in either path blocks `publish`.
 7. Run `deploy-docs` only after both staged Windows acceptance and `build-docs`
    succeed. Pages deployment and GitHub release promotion are separate service
    operations; this ordering does not claim they update atomically.

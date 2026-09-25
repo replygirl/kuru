@@ -13,7 +13,7 @@ use axum::{
 use kuru_delivery::{
     archive,
     command::{self, Command},
-    targets,
+    shell_support, targets,
 };
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use kuru_platform::windows::process::configured_command;
@@ -33,6 +33,14 @@ mod mise_isolation;
 const DEADLINE: Duration = Duration::from_secs(180);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const TARGET: &str = "x86_64-pc-windows-msvc";
+const OLD_VERSION: &str = "0.4.2";
+const OLD_RELEASE: &str = "https://github.com/replygirl/kuru/releases/download/v0.4.2";
+// Digests of the immutable public v0.4.2 assets, independent of their
+// downloaded SHA256SUMS contents. Never execute an unverified old image.
+const OLD_MANIFEST_SHA256: &str =
+    "1cadb599c8cacfbd1161af733a22126454249c76a5be9d2dc9e31732f2df52a4";
+const OLD_WINDOWS_ARCHIVE_SHA256: &str =
+    "e85a5a378f12827eb9bb5666eb7af522c1ba9c19f7e3bd79f4f07ca4b8e860b3";
 
 fn checked_file_within(path: &Path, root: &Path) -> Result<bool> {
     let ancestor = Directory::open(root, Privacy::Inherited, NameRetention::Movable)?;
@@ -914,5 +922,129 @@ pub async fn run_staged(archive_path: &Path) -> Result<()> {
         support.is_some(),
         "staged new release is missing its paired shell support"
     );
-    run_archive(bytes, archive::digest(&executable), support.as_ref()).await
+    run_archive(bytes, archive::digest(&executable), support.as_ref()).await?;
+    old_updater_accepts_staged_release(directory, &executable, support.as_ref().unwrap()).await
+}
+
+async fn old_updater_accepts_staged_release(
+    staged_directory: &str,
+    staged_executable: &[u8],
+    staged_support: &shell_support::Files,
+) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let old_release = root.path().join("verified-old-release");
+    fs::create_dir(&old_release)?;
+    let old_name = archive::archive_name(OLD_VERSION, TARGET)?;
+    let old_manifest = archive::read_asset(OLD_RELEASE, "SHA256SUMS", 64 * 1024).await?;
+    ensure!(
+        archive::digest(&old_manifest) == OLD_MANIFEST_SHA256,
+        "published v0.4.2 checksum manifest differs from the pinned asset"
+    );
+    ensure!(
+        archive::expected_digest(&old_manifest, &old_name)? == OLD_WINDOWS_ARCHIVE_SHA256,
+        "published v0.4.2 manifest names an unexpected Windows archive digest"
+    );
+    let old_archive =
+        archive::read_asset(OLD_RELEASE, &old_name, archive::MAX_ARCHIVE_BYTES).await?;
+    ensure!(
+        archive::digest(&old_archive) == OLD_WINDOWS_ARCHIVE_SHA256,
+        "published v0.4.2 Windows archive differs from the pinned asset"
+    );
+    fs::write(old_release.join("SHA256SUMS"), &old_manifest)?;
+    fs::write(old_release.join(&old_name), &old_archive)?;
+    let old_directory = old_release
+        .to_str()
+        .context("isolated old release directory is not Unicode")?;
+    let (old_executable, old_support) =
+        archive::verified_release(old_directory, OLD_VERSION, TARGET).await?;
+    ensure!(
+        old_support.is_none(),
+        "published v0.4.2 core unexpectedly declares managed shell support"
+    );
+
+    let installation = root.path().join("old-installed-bin");
+    let project = root.path().join("project");
+    fs::create_dir(&installation)?;
+    fs::create_dir(&project)?;
+    let installed = installation.join("kuru.exe");
+    fs::write(&installed, &old_executable)?;
+    let environment = mise_isolation::prepare(root.path(), &project)?;
+    let command = || {
+        let mut command = Command::new(&installed);
+        command.env_clear().current_dir(&project);
+        for (name, value) in &environment {
+            command.env(name, value);
+        }
+        command
+    };
+    let mut old_version = command();
+    old_version.arg("--version");
+    let output = command::output(&mut old_version, DEADLINE).await?;
+    ensure!(
+        output.status.success() && output.stdout.as_slice() == b"kuru 0.4.2\n",
+        "verified old executable did not identify as v0.4.2: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut update = command();
+    update
+        .args(["update", "--version", VERSION, "--release-base"])
+        .arg(staged_directory);
+    let output = command::output(&mut update, DEADLINE).await?;
+    ensure!(
+        output.status.success(),
+        "actual v0.4.2 updater rejected the staged release: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        fs::read(&installed)? == staged_executable,
+        "old updater did not install the exact verified staged executable"
+    );
+    ensure!(
+        !installation.join("share").exists(),
+        "old executable-only updater unexpectedly claimed managed shell support"
+    );
+    let mut new_version = command();
+    new_version.arg("--version");
+    let output = command::output(&mut new_version, DEADLINE).await?;
+    ensure!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).trim() == format!("kuru {VERSION}"),
+        "upgraded executable did not report the staged version"
+    );
+
+    let repair = root.path().join("explicit-support-repair");
+    for (name, args) in [
+        ("completions/kuru.bash", &["completions", "bash"][..]),
+        ("completions/_kuru", &["completions", "zsh"][..]),
+        ("completions/kuru.fish", &["completions", "fish"][..]),
+        ("completions/kuru.ps1", &["completions", "powershell"][..]),
+        ("man/kuru.1", &["man"][..]),
+    ] {
+        let mut generator = command();
+        generator.args(args);
+        let output = command::output(&mut generator, DEADLINE).await?;
+        ensure!(
+            output.status.success() && staged_support.get(name) == Some(output.stdout.as_slice()),
+            "upgraded executable did not regenerate exact staged support {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let destination = repair.join(name);
+        fs::create_dir_all(
+            destination
+                .parent()
+                .context("repair member has no parent")?,
+        )?;
+        fs::write(&destination, &output.stdout)?;
+        ensure!(
+            fs::read(&destination)? == output.stdout,
+            "explicit support repair changed generated bytes for {name}"
+        );
+    }
+    ensure!(
+        !root.path().join("xdg-data/kuru").exists() && !root.path().join("appdata/kuru").exists(),
+        "old update or pure support repair created application private data"
+    );
+    root.close()
+        .context("retire isolated old-updater acceptance root")
 }
