@@ -178,6 +178,7 @@ fn shell_support_generation_bypasses_invalid_workspace_authority_without_state()
             .args(command)
             .output()
             .unwrap();
+        let repeated = child.output().unwrap();
         assert!(
             output.status.success(),
             "{command:?}: {}",
@@ -185,14 +186,74 @@ fn shell_support_generation_bypasses_invalid_workspace_authority_without_state()
         );
         assert!(!output.stdout.is_empty() && output.stdout.len() <= 512 * 1024);
         assert!(output.stderr.is_empty(), "{command:?}: {output:?}");
+        assert!(repeated.status.success(), "{command:?}: {repeated:?}");
+        assert_eq!(output.stdout, repeated.stdout, "{command:?} changed bytes");
+        assert_eq!(output.stderr, repeated.stderr, "{command:?} changed stderr");
         if command == ["man"] {
             let manual = String::from_utf8(output.stdout).unwrap();
-            assert!(manual.contains(".SH \"KURU MEMORY EXPORT\""), "{manual}");
+            assert!(manual.contains("MEMORY EXPORT"), "{manual}");
+            assert!(!manual.contains("COMPLETE-WORD"), "{manual}");
+        } else {
+            let script = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                script.contains("__complete_word__"),
+                "{command:?}: {script}"
+            );
+            assert!(script.contains("kuru"), "{command:?}: {script}");
         }
         assert!(!data.exists(), "{command:?} created private state");
         assert!(!user_config.exists(), "{command:?} read user configuration");
     }
     assert_eq!(std::fs::read(&invalid_config).unwrap(), b"[");
+}
+
+#[test]
+fn usage_completion_answer_and_external_option_stay_pure() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("foreign-project");
+    std::fs::create_dir(&project).unwrap();
+    let invalid_config = project.join("invalid-config.toml");
+    std::fs::write(&invalid_config, b"[").unwrap();
+    let data = root.path().join("private-data");
+
+    for shell in ["bash", "zsh", "fish", "powershell"] {
+        let mut answer = Command::new(env!("CARGO_BIN_EXE_kuru"));
+        #[cfg(windows)]
+        answer.fixture_allow_independent_service();
+        let output = answer
+            .current_dir(&project)
+            .env("KURU_DATA_DIR", &data)
+            .env("XDG_CONFIG_HOME", root.path().join("user-config"))
+            .args(["__complete_word__", "--shell", shell, "--line", "kuru mem"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("memory"),
+            "{shell}: {output:?}"
+        );
+        assert!(output.stderr.is_empty(), "{shell}: {output:?}");
+
+        let mut external = Command::new(env!("CARGO_BIN_EXE_kuru"));
+        #[cfg(windows)]
+        external.fixture_allow_independent_service();
+        let script = external
+            .args(["completions", shell, "--external-usage"])
+            .output()
+            .unwrap();
+        assert!(script.status.success(), "{shell}: {script:?}");
+        let text = String::from_utf8(script.stdout).unwrap();
+        assert!(
+            text.contains("complete-word") && text.contains("usage"),
+            "{shell}: {text}"
+        );
+    }
+    assert!(!data.exists());
+    assert_eq!(std::fs::read(invalid_config).unwrap(), b"[");
 }
 
 #[test]

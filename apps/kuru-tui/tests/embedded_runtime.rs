@@ -32,7 +32,9 @@ const BOOTSTRAP_INVENTORY_BYTES: usize = 4096;
 // 30-second bound, then includes their handshakes and bounded shutdowns.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(100);
 const PREPARE_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_FIXTURE_INPUT_BYTES: u64 = archive::MAX_ARCHIVE_BYTES as u64 + 32 * 1024 * 1024;
+// The selected debug input may contain symbols removed only from the verified
+// independent copy. Keep this input bound separate from the shipping archive cap.
+const MAX_FIXTURE_INPUT_BYTES: u64 = archive::MAX_ARCHIVE_BYTES as u64 + 33 * 1024 * 1024;
 const MANIFEST: &str = include_str!("../../../packages/kuru-memory/support/dolt-assets.json");
 #[cfg(windows)]
 const BOOTSTRAP_PHASES: &[&str] = &[
@@ -951,13 +953,23 @@ async fn verify_installed_shell_activation(
 ) -> Result<()> {
     let isolated_home = root.join("shell activation home");
     fs::create_dir(&isolated_home)?;
+    let shadow_bin = root.join("shadowed shell command");
+    fs::create_dir(&shadow_bin)?;
+    let shadow = shadow_bin.join("kuru");
+    fs::write(&shadow, b"#!/bin/sh\nprintf 'wrong helper\\n'\n")?;
+    fs::set_permissions(&shadow, fs::Permissions::from_mode(0o700))?;
+    let selected_path = format!(
+        "{}:{}:/usr/bin:/bin",
+        install_dir.display(),
+        shadow_bin.display()
+    );
     ensure!(Path::new("/bin/bash").is_file(), "stock Bash is required");
     for (shell, args, script, expected) in [
         (
             "/bin/bash",
             &["--noprofile", "--norc", "-c"][..],
-            "eval \"$(\"$KURU_INSTALLED\" completions bash)\"; complete -p kuru",
-            "kuru",
+            "eval \"$(\"$KURU_INSTALLED\" completions bash)\"; complete -p kuru; COMP_WORDS=(kuru mem); COMP_CWORD=1; COMP_LINE='kuru mem'; COMP_POINT=${#COMP_LINE}; _usage_complete_kuru; printf '%s\\n' \"${COMPREPLY[@]}\"",
+            "memory",
         ),
         (
             "/bin/zsh",
@@ -973,7 +985,7 @@ async fn verify_installed_shell_activation(
         command
             .env_clear()
             .env("HOME", &isolated_home)
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", &selected_path)
             .env("KURU_INSTALLED", installed)
             .args(args)
             .arg(script);

@@ -186,6 +186,16 @@ The current direct installer places verified support snapshots at
 file `INSTALL_DIR/share/man/man1/kuru.1`. For the default Unix install, load
 completions from the fixed installed executable in your chosen shell:
 
+Kuru uses the Usage completion engine and derives its completion scripts and
+manual from the same Clap command tree that parses commands. The default scripts
+ask the installed Kuru executable for candidates; no separate Usage installation
+is required. This completion request runs before project configuration, trust,
+memory or provider startup. Put the selected install directory first in `PATH`
+before loading a script, including when you chose a custom `--install-dir` or
+`-InstallDir`, so the script's `kuru` command resolves to that same executable.
+For example, on Unix use `export PATH="INSTALL_DIR:$PATH"`; in PowerShell use
+`$env:PATH = "INSTALL_DIR;$env:PATH"` for the current session.
+
 ```bash
 eval "$("$HOME/.local/bin/kuru" completions bash)"
 ```
@@ -203,6 +213,14 @@ On Windows, load PowerShell completions from the installed executable:
 ```powershell
 & "$env:LOCALAPPDATA\Programs\kuru\bin\kuru.exe" completions powershell | Out-String | Invoke-Expression
 ```
+
+If you have installed the Usage executable and prefer it to answer completion
+requests, add `--external-usage` when generating a script, for example
+`kuru completions bash --external-usage`. The four default scripts remain
+self-contained; the external option changes the generated script's helper and
+uses Usage's generic completion script. Its Bash variant also requires the
+`bash-completion` shell package to be loaded. The default Bash script uses the
+installed Kuru executable and needs no such package.
 
 For ordinary Unix `man kuru`, include the selected install root's manual
 directory in `MANPATH`, for example
