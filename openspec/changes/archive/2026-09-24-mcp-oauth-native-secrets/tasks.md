@@ -35,6 +35,8 @@
 ## 6. Integrated verification and delivery
 
 - [x] 6.1 Run the deterministic fake authorization/resource matrix and secret-exclusion scan across config, cache, status, stdout, stderr and errors, and record exact observed results in `verification.md` without live or paid provider calls.
-- [ ] 6.2 Run granular format, lint, typecheck and affected core/platform/connectors/TUI suites plus real native keychain and PTY cases on macOS, Linux and Windows, and record each executed count/result separately from unavailable hosted evidence.
-- [ ] 6.3 Run combined workspace coverage with its package-owned instrumented fixtures, retain the 90% gate, inspect practical login/status/logout terminal output, and record the current official-protocol comparison.
-- [ ] 6.4 Complete every verification row, strict-validate, confirm the apply gate, archive the change through Cospec, run normal hooks and hand Delivery the clean scoped commit with exact native/CI evidence.
+- [x] 6.2 Run granular format, lint, typecheck and affected core/platform/connectors/TUI suites plus real native keychain and PTY cases on macOS, Linux and Windows, and record each executed count/result separately from unavailable hosted evidence.
+- [x] 6.3 Run combined workspace coverage with its package-owned instrumented fixtures, retain the 90% gate, inspect practical login/status/logout terminal output, and record the current official-protocol comparison.
+- [x] 6.4 Complete every verification row, strict-validate, confirm the apply gate, archive the change through Cospec, run normal hooks and hand Delivery the clean scoped commit with exact native/CI evidence.
+
+The observed prearchive evidence is in `verification.md`. The archive command and normal archive-head hooks are the immediate finalization steps; their outcomes must be checked before merge. Whole-run corrected-head and final archive-head CI remain mandatory delivery gates, not prearchive passes.
