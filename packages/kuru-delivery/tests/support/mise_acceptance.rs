@@ -288,16 +288,18 @@ impl MiseMemoryCleanup {
         self.options = Some(options);
     }
 
-    async fn finish(&mut self) -> Result<()> {
-        let Some(options) = self.options.take() else {
-            return Ok(());
-        };
-        if let Err(error) = kuru_memory::test_support::retire_idle_service(&options).await {
-            let retained = self.retain();
-            return Err(error).context(format!(
-                "retire native mise fixture memory owner; fixture root retained in place at {retained:?}"
-            ));
-        }
+    fn finish_after_installed_purge(&mut self) -> Result<()> {
+        self.options
+            .take()
+            .context("native mise purge had no armed project owner")?;
+        let root = self
+            .root
+            .take()
+            .context("native mise fixture root is absent")?;
+        let path = root.path().to_owned();
+        root.close()
+            .context("remove retired native mise fixture root")?;
+        ensure!(!path.exists(), "retired native mise fixture root remains");
         Ok(())
     }
 
@@ -502,6 +504,33 @@ impl Installation {
         );
         Ok(serde_json::from_slice(&output.stdout)?)
     }
+
+    async fn purge_with_installed_kuru(&self) -> Result<()> {
+        let mut command = self.command();
+        command
+            .args(["exec", "--", "kuru", "-C"])
+            .arg(&self.project)
+            .arg("--data-dir")
+            .arg(&self.kuru_data)
+            .args(["memory", "purge", "--yes"]);
+        let output = command::output(&mut command, DEADLINE).await?;
+        ensure!(
+            output.status.success(),
+            "installed Kuru refused isolated memory purge: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let outcome: Value = serde_json::from_slice(&output.stdout)?;
+        let scope = kuru_runtime::project_scope(&self.project)?;
+        ensure!(
+            outcome["project"] == scope
+                && outcome["removed_trees"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 1)
+                && !kuru_memory::MemoryStore::exists(&self.kuru_data, &scope)?,
+            "installed Kuru did not remove the exact isolated project memory"
+        );
+        Ok(())
+    }
     fn memory_options(&self, binary: &Path, scope: String) -> kuru_memory::OpenOptions {
         let mut options = kuru_memory::OpenOptions::new(self.kuru_data.clone(), scope);
         options.config = kuru_core::MemoryConfig {
@@ -521,9 +550,13 @@ impl Installation {
         let scope = kuru_runtime::project_scope(&self.project)?;
         self.memory_cleanup
             .arm(self.memory_options(binary, scope.clone()));
-        let result = self.conversation_inner(binary, &scope).await;
+        let result = async {
+            self.conversation_inner(binary, &scope).await?;
+            self.purge_with_installed_kuru().await
+        }
+        .await;
         match result {
-            Ok(()) => self.memory_cleanup.finish().await,
+            Ok(()) => self.memory_cleanup.finish_after_installed_purge(),
             Err(error) => {
                 let (retained, retirement) = self.memory_cleanup.retain_after_error().await;
                 let cleanup = retirement.map_or_else(
