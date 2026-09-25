@@ -17,4 +17,4 @@
 ## 4. Integrated acceptance and documentation
 
 - [x] 4.1 Document direct-install versioned files and fixed installed-executable Bash/Zsh/Fish/PowerShell/man activation without claiming Homebrew tap delivery, and verify docs build, links and examples.
-- [ ] 4.2 Run and record the verification ledger's actual native generation/install/update/offline and release-inventory cases, affected formatting/lint/typecheck/bootstrap checks, strict Cospec and normal 90% combined coverage before archive.
+- [ ] 4.2 Run and record the verification ledger's pre-merge native install/update/offline cases, affected formatting/lint/typecheck/bootstrap checks, strict Cospec and normal 90% combined coverage before archive. Record exact target-binary generation, full release-candidate/staged-Windows inventory and published-download checks as explicit Release-only deferrals with their owning jobs; complete them in the single Release workflow after merge, without claiming them as pre-merge passes.
