@@ -2484,7 +2484,10 @@ mod tests {
         assert_eq!(parse_attempt(&name).unwrap(), (2, Uuid::nil()));
         let future_version = CURRENT_VERSION + 1;
         let future = attempt_name(future_version, Uuid::nil());
-        assert_eq!(parse_attempt(&future).unwrap(), (future_version, Uuid::nil()));
+        assert_eq!(
+            parse_attempt(&future).unwrap(),
+            (future_version, Uuid::nil())
+        );
         assert!(REGISTRY.definition(future_version).is_err());
         for invalid in [
             "kuru_migration_v2_bad",
