@@ -735,7 +735,13 @@ async fn aliases_hardlinks_private_acl_and_busy_install_lease_fail_closed() {
         fixture.install.join("alternate:stream"),
     ] {
         let result = fixture
-            .run(fixture.command().arg("-InstallDir").arg(path))
+            .run(
+                fixture
+                    .command()
+                    .arg("-Verbose")
+                    .arg("-InstallDir")
+                    .arg(path),
+            )
             .await;
         assert!(!result.status.success());
         fixture.unchanged();
@@ -797,13 +803,19 @@ $acl.AddAccessRule($rule)
 async fn actual_post_move_fault_retains_stage_and_reports_new_namespace_without_rollback_guess() {
     let fixture = Fixture::new();
     let result = fixture.run(&mut fixture.script(r#"
+[Console]::Error.WriteLine('Kuru bootstrap fixture checkpoint: encoded wrapper entered')
+[Console]::Error.Flush()
 $ErrorActionPreference = 'Stop'
-. $env:KURU_BOOTSTRAP_SCRIPT -Recover
+. $env:KURU_BOOTSTRAP_SCRIPT -Recover -Verbose
+[Console]::Error.WriteLine('Kuru bootstrap fixture checkpoint: recovery returned')
+[Console]::Error.Flush()
 $fixtureParent = [Kuru.Bootstrap.Native+DirectoryLease]::new($env:KURU_INSTALL_DIR, $false, $false)
 $fixtureStage = [Kuru.Bootstrap.Native+DirectoryLease]::new($fixtureParent.Child('.kuru-install-fault'), $true, $true)
 try {
     $payload = [IO.File]::ReadAllBytes($env:KURU_TEST_CANDIDATE)
     $failed = $false
+    [Console]::Error.WriteLine('Kuru bootstrap fixture checkpoint: native fault starting')
+    [Console]::Error.Flush()
     try { [Kuru.Bootstrap.Native]::Publish($fixtureStage, $fixtureParent, $payload, [Action]{ throw 'fixture failure after actual write-through move' }) }
     catch { $failed = $true }
     if (-not $failed -or -not $fixtureStage.PublicationUncertain) { throw 'Native post-move fault did not retain uncertainty.' }
