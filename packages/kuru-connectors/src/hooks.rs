@@ -990,6 +990,9 @@ mod tests {
     }
 
     #[cfg(windows)]
+    const WINDOWS_HOOK_STARTUP_MS: u64 = 120_000;
+
+    #[cfg(windows)]
     fn windows_command(script: &str) -> HookCommand {
         let powershell = kuru_platform::windows::process::system_directory()
             .unwrap()
@@ -1003,7 +1006,9 @@ mod tests {
                 "-Command".into(),
                 script.into(),
             ],
-            timeout_ms: 5_000,
+            // Stock PowerShell's first runspace can take longer than a short
+            // hook assertion under instrumented Windows CI; see shell_warmup.
+            timeout_ms: WINDOWS_HOOK_STARTUP_MS,
             max_output_bytes: 1024,
         }
     }
@@ -1013,6 +1018,7 @@ mod tests {
     async fn windows_owned_hooks_rewrite_annotate_and_stop_after_timeout() {
         let root = tempfile::tempdir().unwrap();
         let hooks = LifecycleHooks {
+            max_total_ms: 3 * WINDOWS_HOOK_STARTUP_MS,
             pre_turn: vec![
                 windows_command(
                     r#"$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('{"decision":"rewrite","value":{"input":"windows-rewrite"}}')"#,
@@ -1031,6 +1037,7 @@ mod tests {
         );
         let host = HookHost::new(Arc::clone(&directory), hooks);
         let budget = host.budget();
+        let pre_started = Instant::now();
         let pre = host
             .run_pre(
                 &budget,
@@ -1042,6 +1049,16 @@ mod tests {
                 serde_json::json!({"input":"original"}),
             )
             .await;
+        if let Err(error) = &pre.outcome {
+            panic!(
+                "first Windows hook failed after {:?}; observations: {:?}; cause: {error:#}",
+                pre_started.elapsed(),
+                pre.observations
+                    .iter()
+                    .map(|observation| observation.outcome)
+                    .collect::<Vec<_>>()
+            );
+        }
         assert_eq!(
             pre.outcome.unwrap(),
             PreHookOutcome::Allowed(serde_json::json!({"input":"windows-rewrite"}))
