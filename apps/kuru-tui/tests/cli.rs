@@ -1520,6 +1520,108 @@ async fn session_lifecycle_cli_is_provider_free_and_matches_resume_continue_and_
 }
 
 #[tokio::test]
+async fn session_export_keeps_legacy_speaker_and_turn_unknown_in_both_formats() {
+    use kuru_core::{Message, Mode};
+    use kuru_memory::{
+        LEGACY_PREFIX_RECORD_FORMAT, LegacyTranscriptPrefix, MemoryStore,
+        SESSION_CATALOG_RECORD_FORMAT, SessionCatalogRecord, SessionLifecycleState,
+    };
+    use kuru_runtime::project_scope;
+
+    let env = Sandbox::new();
+    let scope = project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let session = "00000000-0000-4000-8000-000000000031";
+    let namespace = format!("{scope}/transcript/{session}");
+    let memory = MemoryStore::open(options.clone()).await.unwrap();
+    memory
+        .append_session_message(
+            &namespace,
+            session,
+            &Message::text("assistant", "legacy public answer"),
+        )
+        .await
+        .unwrap();
+    let window = memory
+        .session_history_window_after(&namespace, session, 0, 16)
+        .await
+        .unwrap();
+    let sequence = window.rows[0].sequence;
+    let prefix = LegacyTranscriptPrefix {
+        namespace,
+        source_session_id: session.into(),
+        source_revision: window.revision,
+        first_sequence: sequence,
+        through_sequence: sequence,
+        row_count: 1,
+        record_format: LEGACY_PREFIX_RECORD_FORMAT.into(),
+    };
+    memory.close().await.unwrap();
+    kuru_memory::test_support::seed_public_session(
+        options,
+        &SessionCatalogRecord {
+            session_id: session.into(),
+            mode: Mode::Ifs,
+            label: "legacy attribution".into(),
+            created_order: 1,
+            updated_order: 1,
+            lifecycle_generation: 0,
+            lifecycle_state: SessionLifecycleState::Active,
+            head_node_id: None,
+            pending_node_id: None,
+            legacy_prefix: Some(prefix),
+            fork_provenance: None,
+            record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+        },
+        &[],
+    )
+    .await
+    .unwrap();
+
+    for format in ["jsonl", "markdown"] {
+        let path = env.root.path().join(format!("legacy.{format}"));
+        let output = env
+            .command_for("responses")
+            .env_remove("OPENAI_API_KEY")
+            .args([
+                "sessions",
+                "export",
+                session,
+                "--format",
+                format,
+                "--output",
+                path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        let contents = std::fs::read_to_string(path).unwrap();
+        let records = contents
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2, "{format}: {contents}");
+        assert_eq!(records[0]["kind"], "manifest");
+        assert_eq!(records[0]["session"]["session_id"], session);
+        assert_eq!(records[0]["total_rows"], 1);
+        assert_eq!(records[1]["kind"], "legacy");
+        assert_eq!(records[1]["sequence"], sequence);
+        assert_eq!(
+            records[1]["message"],
+            serde_json::to_value(Message::text("assistant", "legacy public answer")).unwrap()
+        );
+        assert!(records[1].get("speaker_id").is_none());
+        assert!(records[1].get("turn_id").is_none());
+    }
+}
+
+#[tokio::test]
 async fn normal_cli_exports_large_parent_and_fork_in_complete_chronological_records() {
     use kuru_core::{Message, Mode};
     use kuru_memory::{

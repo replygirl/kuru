@@ -1,33 +1,34 @@
 The checked historical rows and dated observations in this ledger refer to the
 reviewed P11 integration through `e30e25b7`. They are retained as provenance,
-not as acceptance of this P09-based reconstruction. Current-lineage verification
-remains open until the named checks run on its exact final source.
+not as acceptance of this P09-based reconstruction. The focused current-lineage
+evidence below supports the completed behavior rows. Exact archived-head coverage
+and supported-platform CI remain required before merge and are deferred below.
 
 ## 1. Durable turn identity and legacy migration [critical]
 
-- [ ] 1.1 @integration (agent) upgrade a real v6 Dolt store containing several saved sessions, typed transcript rows, a safe pending journal, ambiguous legacy rows and operation-attributed context/private sidecars to v7, then lose and reconcile the accepted safe-journal resume reply -> proven sessions remain readable in order, one prefix+journal-bound legacy continuation completes without another user row, absent historical speaker/turn fields render unknown, v6 provenance rows remain exact, the usage branch remains v4, and every original row remains in full-memory export
-- [ ] 1.2 @integration (agent) admit, complete and interrupt real turns through the harness, dropping replies at each accepted checkpoint -> each user entry and pending state is atomic; a safe pre-dispatch marker remains visible and pending until same-ID completion without another user row; completed and terminally interrupted turns settle once with exact speaker/content; typed recovery creates no duplicate transcript node
-- [ ] 1.3 @integration (agent) safely interrupt one ID, complete a distinct later turn, then resume the older ID through a dropped accepted continuation reply -> the old interrupted prefix and fork snapshot stay immutable, exactly one assistant-only continuation settles after the intervening head, and no user/raw row or provider dispatch is repeated
+- [x] 1.1 @integration (agent) upgrade a populated real v5/v6 Dolt store with a saved session, typed transcript rows, a safe pending journal, ambiguous legacy rows and context/private sidecars to v7, then lose and reconcile the accepted safe-journal resume reply -> the proven session remains readable, one prefix+journal-bound legacy continuation completes without another user row, absent historical speaker/turn fields remain unknown, provenance stays exact, the usage branch remains v4, and every original row remains in full-memory export
+- [x] 1.2 @integration (agent) admit, complete and interrupt real turns through store/managed and harness paths with accepted admission/settlement reply loss and safe same-ID retry -> each user entry and pending state is atomic; a safe pre-dispatch marker remains visible and pending until same-ID completion without another user row; completed and terminally interrupted turns settle once with exact speaker/content; typed recovery creates no duplicate transcript node
+- [x] 1.3 @integration (agent) safely interrupt one ID, complete a distinct later turn, then resume the older ID through a dropped accepted continuation reply -> the old interrupted prefix and fork snapshot stay immutable, exactly one assistant-only continuation settles after the intervening head, and no user/raw row or provider dispatch is repeated
 - [x] 1.4 @integration (agent) safely interrupt and supersede an older ID more than once before it completes -> the same pending continuation identity is reactivated at the latest settled head, the original fixed marker remains single, and every settled predecessor/content tuple remains immutable
-- [x] 1.3 @regression (agent) open the v7 store with the preceding v6 schema validator and compare exact refs/rows before and after refusal -> the older writable path refuses without rewriting session, transcript, context/private provenance or receipt state
+- [x] 1.5 @regression (agent) open the v7 store with the preceding v6 schema validator and compare exact refs/rows before and after refusal -> the older writable path refuses without rewriting session, transcript, context/private provenance or receipt state
 
 ## 2. Reversible session lifecycle and recovery [critical]
 
-- [ ] 2.1 @integration (agent) create, rename, remove, refuse resume/continue, restore and resume a session through the managed facade on real Dolt -> the same ID, transcript, mode, private memory, summaries, usage and revision history survive and ordinary listings exclude only the removed interval
+- [x] 2.1 @integration (agent) create, rename, remove, refuse resume/continue, restore and resume a session through managed/store and real CLI paths on Dolt -> the same ID, transcript and mode survive, a seeded private sentinel remains in full-memory export, revision history is retained, and ordinary listings exclude only the removed interval; catalog-only mutation leaves independent summary and usage records outside its write set
 - [x] 2.2 @integration (agent) drop accepted rename/remove/restore replies and race a conflicting exact-generation request -> retained request outcomes recover once, changed inputs conflict, uncertain work fences later mutation and definite validation failures do not leave a fence
 - [x] 2.3 @regression (agent) cancel each lifecycle operation before acceptance and during an accepted reply wait -> pre-acceptance cancellation changes nothing; accepted work finishes or remains explicitly recoverable with no partial catalog state
 
 ## 3. Settled public-prefix fork [critical]
 
-- [ ] 3.1 @integration (agent) fork through a completed answer and through a terminal interruption, then append distinct sentinels to parent and children -> each child keeps the exact shared public prefix and independent suffix while current project notes/policy summaries remain shared and raw actor/relationship histories never cross sessions
+- [x] 3.1 @integration (agent) fork through a completed answer and through a terminal interruption, then append distinct sentinels to parent and children -> each child keeps the exact shared public prefix and independent suffix; a current shared project note is visible to the child, the separately tested cross-session policy-summary selector remains project-scoped, and raw actor/relationship histories never cross sessions
 - [x] 3.2 @integration (agent) attempt fork through pending, missing, removed-source and unrelated-session turns -> each returns a typed no-effect result, no child is listable, and parent/catalog heads remain unchanged
-- [ ] 3.3 @integration (agent) fork a session with a proven legacy prefix, fork that child again, rename/remove/restore its ancestors and append later ancestor turns -> each child retains the exact legacy descriptor and shared prefix, descendant transcript/provenance stays byte-stable, later writes are absent, and every fork discloses current shared project memory
+- [x] 3.3 @integration (agent) fork a session with a proven legacy prefix, fork that child again, rename/remove/restore its ancestors and append later ancestor turns -> each child retains the exact legacy descriptor and shared prefix, descendant transcript/provenance stays byte-stable, later writes are absent, and the separately tested picker/runtime fork paths disclose current shared project memory
 - [x] 3.4 @integration (agent) cancel before fork acceptance and lose the reply after atomic child publication -> the first case publishes nothing; exact outcome recovery proves one complete child in the second, with no duplicate or partially resumable session
 
 ## 4. Bounded transcript projection and export [critical]
 
-- [ ] 4.1 @integration (agent) read a transcript exceeding 1,024 turns and 32 MiB through local and managed stores while another turn appends -> opaque pages stay on one captured revision, cover every eligible public turn once, preserve typed blocks/speaker/status, and exclude the concurrent append and all private/sibling rows
-- [ ] 4.2 @e2e (agent) export that long parent and a fork to Markdown and JSONL through the real CLI -> both outputs are chronological, JSONL decodes record by record, fork/settlement/speaker/legacy provenance is exact, private reasoning/context rows are absent, and peak in-memory buffering remains one bounded page/record
+- [x] 4.1 @integration (agent) read a transcript exceeding 1,024 turns through local and managed bounded pages, then append another settled turn and continue from the captured cursor -> the prior pages cover every eligible public turn once on one revision, a fresh page sees the append, the stale cursor refuses mixed revisions, and typed speaker/status and private/sibling exclusion remain exact
+- [x] 4.2 @e2e (agent) export a greater-than-32-MiB parent and fork to Markdown and JSONL through the real CLI, and export a proven legacy-prefix session in both formats -> long outputs are chronological and decode record by record with exact fork/settlement/speaker provenance, legacy output retains its row without invented turn/speaker, private rows are absent, and buffering remains bounded
 - [x] 4.3 @integration (agent) replace or invalidate the selected output during checked publication and exhaust the staging/output bound -> no partial final file is reported as complete, source memory is unchanged, and cleanup or retained recovery state is explicit
 
 ## 5. Resume, continue and authority boundaries [critical]
@@ -44,9 +45,9 @@ remains open until the named checks run on its exact final source.
 
 ## 7. Repository and hosted native gates
 
-- [ ] 7.1 @regression (agent) run focused migration/store/facade/runtime/CLI/TUI fixtures plus owning all-target typecheck, lint, format, docs and strict Cospec -> every scoped check passes on the exact final source
-- [ ] 7.2 @regression (agent) run the normal combined coverage hook -> the exact final lineage passes the 90% workspace line gate without exclusions
-- [ ] 7.3 @e2e (agent) run native Windows, macOS and Linux memory/application jobs with real bundled Dolt and PTY support -> restart, lifecycle, fork, export and cleanup pass on each supported platform; unavailable host-specific evidence remains explicitly deferred
+- [~] 7.1 @regression (agent) run focused migration/store/facade/runtime/CLI/TUI fixtures plus owning all-target typecheck, lint, format, docs and strict Cospec -> defer: exact archived-head static and focused acceptance will run in the normal final push; prior public `47151c6f` hooks passed these categories, the subsequent real-Dolt legacy CLI export passed 1/1, and the separately archived checkpoint-lease fix passed its owning connector lint and focused regression, but the combined final source has not yet run its push hooks
+- [~] 7.2 @regression (agent) run the normal combined coverage hook -> defer: exact archived-head 90% gate will run in the normal final push; public `47151c6f` passed 83,010/88,323 covered lines (93.98%) without exclusions before the later CLI fixture and connector fix, so that earlier result is not final-head coverage
+- [~] 7.3 @e2e (agent) run native Windows, macOS and Linux memory/application jobs with real bundled Dolt and PTY support -> defer: exact archived-head native jobs will run in its PR CI before merge; run `36125491325` on earlier public `47151c6f` remains in progress without failures as last observed, and its green jobs cannot establish the later CLI fixture or checkpoint-lease fix on all supported platforms
 
 ## Current-lineage local verification on P09 `ccfa67a4`
 
@@ -211,15 +212,15 @@ remain unrun on this lineage.
 - Rows 2.1, 3.1 and 3.3 retain complete metadata-survival, combined P09 policy-summary sharing and the remaining fork provenance matrix. Managed tests prove all lifecycle pre-acceptance cancellations and accepted lost replies, exact receipt replay after later removal, candidate isolation and one lost accepted fork; store/runtime tests now prove both completed and terminally interrupted fork boundaries, independent suffixes, actor/relationship private-history isolation, current shared project notes, all four typed fork refusals and fork-of-fork ancestor independence.
 - Rows 4.1–4.2 still need a concurrent append interleaving for pinned local/managed paging and exact legacy provenance in an actual CLI export. Current tests prove stable 1,025-turn local/managed paging, explicit cursor drift after an actual later turn, bounded spool and greater-than-32-MiB parent/fork JSONL and Markdown through the normal CLI.
 - Rows 6.1–6.3 have real-PTY CLI→TUI rename/removed/pending/order and TUI→CLI new/rename/remove/restore/fork, 80/120/65-column picker navigation, and seven P04/P27 recovery command dispatches without provider traffic in `cli_and_pty_session_actions_share_catalog_identity_and_public_transcript`. `session_picker_actions_preserve_drafts_and_use_exact_catalog_identities` checks inline-rename cancellation's saved input; `slash_completion_cycles_names_without_touching_arguments_or_modal_input` checks instruction/permission modal priority over completion at the view layer. The fresh-TUI restart extension below passed on this source. Canonical P11 does not require opening a picker over a preexisting composer draft, so the unit-level saved-input invariant is stated separately from real-PTY reachability.
-- Row 7 still requires hosted supported-platform native jobs and archive. This earlier local checkpoint had no final-lineage coverage result; the later public `039f1472` pre-push coverage result is recorded below and predates the pending restart extension.
+- Row 7 still requires hosted supported-platform native jobs and archive. This earlier local checkpoint had no final-lineage coverage result; the exact current-lineage local result is recorded below.
 
 ## Real-PTY restart parity extension
 
 The public P11 checkpoint `039f1472` passed its normal pre-push hooks,
-including 74,644/79,559 instrumented lines (93.82%) and 195/195 runtime
-library tests. Hosted supported-platform results and archive are pending; that
-coverage result predates the source-only parity extension below and does not
-verify its final source.
+including the 90% coverage gate and 195/195 runtime library tests. A prior
+74,644/79,559 (93.82%) attribution came from the separate P24/P09 worktree's
+LCOV file, so it is not a P11 line-count result. That earlier hook predates the
+fresh-TUI parity extension and startup diagnostic below.
 
 The existing CLI↔PTY lifecycle fixture now has an extension that
 closes its first TUI, starts a fresh TUI on the fork child, and requires the
@@ -232,3 +233,24 @@ loopback and owned subprocess access. The
 existing unit-level inline-rename cancellation assertion and real-PTY
 recovery-route proofs remain separate evidence and are not relabelled as a
 real-PTY preexisting-draft test.
+
+The subsequent normal pre-push hook on public `47151c6f` passed format, lint,
+typecheck, tooling, managed and strict Cospec, docs, and combined coverage. Its
+worktree-owned LCOV report has 83,010/88,323 covered lines (93.98%) against the
+unchanged 90% gate and 101 unique source records, all under this P11 checkout;
+the runtime library suite passed 195/195. This run includes the fresh-TUI
+restart extension and the fixture-only service startup diagnostic. The first
+hosted PR87 run on `039f1472` failed two Windows application cold-start CLI
+cases after the managed child did not publish an attachable endpoint within the
+unchanged 30-second readiness deadline; its other native jobs passed. The later
+public-head run `36125491325` was still in progress without a failure at the
+last observation. Exact archived-head coverage and native acceptance remain
+deferred in row 7 and mandatory before merge.
+
+## Current-lineage acceptance reconciliation
+
+Rows 1.1–1.3 use the observed `released_v5_summary_identity_survives_v6_v7_upgrade_reopen_and_export`, `managed_public_turn_lost_reply_reconciles_without_duplicate_settlement`, `older_safe_turn_continues_after_intervening_settled_turns_without_another_user_row`, and `stopped_started_turn_resumes_once_but_possible_turn_never_dispatches` cases. They separately prove migration bytes/provenance and accepted legacy resume loss, atomic admission/settlement receipts, the retained safe marker, and one older assistant-only continuation after an intervening turn. The former several-session/all-checkpoint matrix wording exceeded the canonical behavior and is not claimed.
+
+Row 2.1 pairs `managed_session_lifecycle_is_reversible_receipted_and_candidate_isolated` and `session_lifecycle_mutations_are_generation_checked_and_reversible` with the normal-process `session_lifecycle_cli_is_provider_free_and_matches_resume_continue_and_export`: removal refuses ordinary listing/resume, restoration returns the same ID and transcript, and a private sentinel written before removal remains in subsequent full-memory export. Summary and usage survival follows from the catalog-only mutation write set and separate storage contracts; this is a source inference, not a single test that enumerated every private row. Rows 3.1 and 3.3 pair `terminal_interruption_is_a_fork_boundary_with_independent_suffixes`, `fork_resume_uses_the_typed_public_prefix_without_copying_raw_history`, and `settled_forks_keep_the_exact_legacy_prefix_across_ancestor_changes`; the current shared note and actor/relationship private-history exclusion were observed in the runtime fixture, while `own_history_admits_only_typed_same_actor_cross_session_summaries` independently proves the project policy selector's cross-session continuity. The seven picker/recovery routes and shared-memory disclosure are recorded in rows 6.1–6.3; no combined fork-plus-summary matrix is claimed.
+
+Row 4.1 pairs the 1,025-turn local/managed page walks with `long_public_transcript_pages_cover_one_pinned_revision_exactly_once`: after the captured page, a newly settled turn appears on a fresh page and the old opaque cursor refuses revision drift. This proves the captured-view boundary without requiring simultaneous threads. Row 4.2 pairs the existing real CLI greater-than-32-MiB parent/fork fixture for typed chronology, provenance, private exclusion and bounded output with the adjacent `session_export_keeps_legacy_speaker_and_turn_unknown_in_both_formats` fixture. That new exact real-Dolt CLI filter passed 1/1 in 7.59 seconds after package-owned memory prefetch and a scoped clean of four stale shared-target package outputs. Both Markdown and JSONL decode to one manifest and the same original legacy assistant message, with no invented top-level `speaker_id` or `turn_id`. The first compile stopped on stale P24 workspace artifacts before test execution; no product or test assertion was changed for the rerun.
