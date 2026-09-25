@@ -1110,6 +1110,7 @@ async fn verify_installed_powershell_activation(root: &Path, installed: &Path) -
             system.parent().context("Windows system root")?,
         )
         .env("PROCESSOR_ARCHITECTURE", "AMD64")
+        .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
         .env("USERPROFILE", &isolated)
         .env("APPDATA", &isolated)
         .env("LOCALAPPDATA", &isolated)
