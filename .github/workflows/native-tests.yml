@@ -195,11 +195,14 @@ jobs:
 
   windows-coverage:
     if: inputs.os == 'windows-2025'
-    # Receipts name their exact run attempt. Rerunning failed jobs reruns only
-    # the failed shards and the report, which takes each shard's latest attempt
-    # and requires identical source, tree, toolchain and inventory across them.
-    # The shard's inner test deadline sits inside this job limit, derived from
-    # KURU_COVERAGE_JOB_MINUTES, so a stall fails with evidence, not a cancel.
+    # Receipts name their exact run attempt, and each uploaded artifact holds
+    # one attempt-<n> directory. Rerunning failed jobs reruns only the failed
+    # shards and the report, which requires every shard job to have succeeded,
+    # takes each shard's latest uploaded (successful) attempt and requires
+    # identical source, tree, toolchain and inventory across them. The shard's
+    # inner test deadline sits inside this job limit, derived from
+    # KURU_COVERAGE_JOB_MINUTES, so a stalled test executable fails with
+    # evidence, not a cancel; compilation is not under that deadline.
     name: Windows coverage (${{ matrix.shard }})
     runs-on: windows-2025
     timeout-minutes: 90
@@ -277,8 +280,21 @@ jobs:
     needs: windows-coverage
     name: Windows coverage report
     runs-on: windows-2025
+    # Downloads include every uploaded attempt of each shard in this run, each
+    # bounded by the receipt profile limits. If repeated reruns push the report
+    # past this limit, dispatch a fresh run instead of rerunning this one.
     timeout-minutes: 30
     steps:
+      # Failed shards upload no receipt, so an older successful attempt would
+      # otherwise stand in for a shard whose latest attempt failed.
+      - name: Require every coverage shard job to have succeeded
+        shell: pwsh
+        env:
+          KURU_COVERAGE_SHARDS_RESULT: ${{ needs.windows-coverage.result }}
+        run: |
+          if ($env:KURU_COVERAGE_SHARDS_RESULT -ne 'success') {
+              throw "Windows coverage shards finished as '$env:KURU_COVERAGE_SHARDS_RESULT'; the report requires success"
+          }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
@@ -320,8 +336,11 @@ jobs:
           pattern: ${{ inputs.artifact-prefix }}-coverage-windows-connectors-core-platform-attempt-*
           merge-multiple: false
           path: ${{ runner.temp }}/kuru-coverage-inputs/connectors-core-platform
-      # Pattern downloads include earlier attempts of this run, one directory
-      # per artifact; collection validates each shard's latest attempt.
+      # Pattern downloads include earlier attempts of this run. download-artifact
+      # extracts one matching artifact directly into the shard directory
+      # (<shard>/attempt-<n>) and several into one directory per artifact name
+      # (<shard>/<name>/attempt-<n>); collection accepts both layouts and
+      # validates each shard's latest uploaded attempt.
       - name: Collect all checked profiles and require 90% coverage
         shell: pwsh
         env:

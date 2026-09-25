@@ -45,27 +45,36 @@ require Communiqué or maintainer setup.
 
 CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
 managed-file checks and documentation as separate Ubuntu jobs. Native coverage
-runs as one workspace suite on Linux x86_64 and macOS arm64. Windows x86_64
-runs four package shards in parallel, validates their exact source, toolchain,
+runs as one workspace suite on Linux x86_64 and macOS arm64. Windows x86_64 runs
+four package shards in parallel, validates their exact source, toolchain,
 artifact inventory, Cargo-native runner ledger and raw-profile receipts, and
 then enforces one 90% workspace report. Each shard compiles the same full
 workspace/all-target/all-feature graph; its task-private runner executes only
 the assigned standard test targets while Cargo retains package cwd and runtime
-environment. That runner stops tests at a deadline derived from the job's
-`timeout-minutes`, less a fixed evidence reserve. A test executable still
-running then is terminated through its owned Job, and the shard fails with a
-`…-<shard>-diagnostics-attempt-<n>` artifact holding each executable's output
-log, a stall report naming the tests libtest reported as unfinished, and the
-shard's manifests and runner ledger; any other shard failure uploads the same
-diagnostics. Rerunning only the failed jobs is enough: the report takes each
-shard's latest attempt from the same run, validates it exactly, and never falls
-back to an older attempt when the latest one is invalid. Its source installation
-and installed offline-runtime checks run beside the coverage shards after independently preparing their locked inputs. Linux Clippy does not
-analyze platform-specific conditional code; the native suites compile and test
-those branches. Intel macOS and Linux arm64 additionally build and package the
-native executable, exercise real memory and verify the packaged offline runtime.
-Windows primitives retain a separate native coverage job for early feedback.
-The required `ci-gate` accepts only success from every branch of this graph.
+environment. That runner stops test executables at a deadline derived from the
+job's `timeout-minutes`, less a fixed evidence reserve. Compilation is not under
+that deadline: only the hosted job limit bounds it, without evidence. A test
+executable still running at the deadline is terminated through its owned Job,
+and the shard fails with a `…-<shard>-diagnostics-attempt-<n>` artifact holding
+each executable's output log, a stall report naming the tests libtest reported
+as unfinished, the error in `failure.txt`, and the shard's manifests and runner
+ledger; any other shard failure uploads the same diagnostics. Only a successful
+shard uploads its receipt artifact, whose root holds one `attempt-<n>`
+directory. Rerunning only the failed jobs is enough. The report refuses unless
+every shard job succeeded, then takes each shard's latest uploaded (successful)
+attempt from the same run and validates it exactly; an invalid latest attempt is
+never replaced by an older one. It accepts both download layouts: one artifact
+extracted directly into the shard directory, or several in directories named
+after their artifacts. Each rerun adds one more artifact download per rerun
+shard, bounded by the receipt profile limits, inside the report's 30-minute
+limit; if repeated reruns exhaust it, dispatch a fresh run. The source
+installation and installed offline-runtime checks run beside the coverage shards
+after independently preparing their locked inputs. Linux Clippy does not analyze
+platform-specific conditional code; the native suites compile and test those
+branches. Intel macOS and Linux arm64 additionally build and package the native
+executable, exercise real memory and verify the packaged offline runtime.
+Windows primitives retain a separate native coverage job for early feedback. The
+required `ci-gate` accepts only success from every branch of this graph.
 
 Ubuntu's coverage step disables Rust test-profile debug information so its
 instrumented Kuru executable remains a valid input to the same production

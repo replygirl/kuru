@@ -291,6 +291,13 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
         )));
     }
     assert!(!report.contains("-attempt-${{ github.run_attempt }}\n          path: ${{ runner.temp }}/kuru-coverage-inputs"));
+    // An older successful attempt must not stand in for a shard whose latest
+    // attempt failed: the report refuses before any other step unless every
+    // shard job succeeded.
+    let steps = report.split("    steps:\n").nth(1).unwrap();
+    assert!(steps.starts_with(
+        "      # Failed shards upload no receipt, so an older successful attempt would\n      # otherwise stand in for a shard whose latest attempt failed.\n      - name: Require every coverage shard job to have succeeded\n        shell: pwsh\n        env:\n          KURU_COVERAGE_SHARDS_RESULT: ${{ needs.windows-coverage.result }}\n        run: |\n          if ($env:KURU_COVERAGE_SHARDS_RESULT -ne 'success') {\n"
+    ));
 }
 
 #[cfg(unix)]

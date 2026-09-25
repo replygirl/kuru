@@ -249,7 +249,8 @@ enum CoverageCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Verify each shard's latest attempt and copy only accepted profiles for reporting.
+    /// Verify each shard's latest uploaded (successful) attempt and copy only
+    /// accepted profiles for reporting.
     Collect {
         #[arg(long, default_value = ".")]
         root: PathBuf,

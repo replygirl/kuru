@@ -129,6 +129,32 @@ fn windows_coverage_tasks_launch_pwsh_without_cmd_metacharacters() {
         );
     }
     assert!(!script.contains("--run-attempt $RunAttempt --llvm-cov $llvmCov\n"));
+
+    // One try covers every step after the shard's diagnostics directory exists,
+    // so verifier, toolchain and inventory failures also leave diagnostics.
+    let diagnostics = script
+        .find("$diagnosticsDir = (Resolve-Path -LiteralPath $Diagnostics).Path")
+        .unwrap();
+    let guarded = script.find("\ntry {\n").unwrap();
+    assert!(diagnostics < guarded);
+    for step in [
+        "Set-Location $root",
+        "& cargo build -p kuru-delivery",
+        "coverage verify-source",
+        "coverage inventory",
+        "coverage runner-config",
+        "& cargo @runArgs",
+        "coverage receipt",
+    ] {
+        assert!(
+            script.find(step).unwrap() > guarded,
+            "{step} precedes the diagnostics try"
+        );
+    }
+    let handler = &script[script.rfind("\n} catch {\n").unwrap()..];
+    assert!(handler.contains("'failure.txt'"));
+    assert!(handler.contains("if ($null -ne $state)"));
+    assert!(handler.trim_end().ends_with("throw\n}"));
 }
 
 #[cfg(windows)]
