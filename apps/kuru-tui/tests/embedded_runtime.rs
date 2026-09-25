@@ -1154,12 +1154,18 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
     let expected_support = shell_support::read_generated(&generated)?;
     ensure!(
         shell_support::read_generated(&install_dir.join("share/kuru").join(version).join(target))?
-            == expected_support
-            && fs::read(install_dir.join("share/man/man1/kuru.1"))?
-                == expected_support
-                    .get("man/kuru.1")
-                    .context("generated man file")?,
+            == expected_support,
         "direct installation changed its paired shell support"
+    );
+    // The stable MANPATH file is a Unix direct-install contract. Stock Windows
+    // PowerShell installs the exact five files in the versioned support tree.
+    #[cfg(unix)]
+    ensure!(
+        fs::read(install_dir.join("share/man/man1/kuru.1"))?
+            == expected_support
+                .get("man/kuru.1")
+                .context("generated man file")?,
+        "direct installation changed its stable man page"
     );
     let first = Installation::new(root, "direct", &project, &installed)?;
     first.native_auth_status().await?;
@@ -1213,12 +1219,16 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
     );
     ensure!(
         shell_support::read_generated(&install_dir.join("share/kuru").join(version).join(target))?
-            == expected_support
-            && fs::read(install_dir.join("share/man/man1/kuru.1"))?
-                == expected_support
-                    .get("man/kuru.1")
-                    .context("generated man file")?,
+            == expected_support,
         "self-update changed its paired shell support"
+    );
+    #[cfg(unix)]
+    ensure!(
+        fs::read(install_dir.join("share/man/man1/kuru.1"))?
+            == expected_support
+                .get("man/kuru.1")
+                .context("generated man file")?,
+        "self-update changed its stable man page"
     );
     let second = Installation::new(root, "updated", &project, &installed)?;
     second.native_auth_status().await?;
