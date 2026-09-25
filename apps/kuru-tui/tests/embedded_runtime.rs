@@ -32,9 +32,10 @@ const BOOTSTRAP_INVENTORY_BYTES: usize = 4096;
 // 30-second bound, then includes their handshakes and bounded shutdowns.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(100);
 const PREPARE_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
-// The selected debug input may contain symbols removed only from the verified
-// independent copy. Keep this input bound separate from the shipping archive cap.
-const MAX_FIXTURE_INPUT_BYTES: u64 = archive::MAX_ARCHIVE_BYTES as u64 + 33 * 1024 * 1024;
+// The selected debug or instrumented input may contain compiler metadata removed
+// only from the verified independent copy. This is separate from the 128 MiB
+// shipping archive cap, which is still checked after stripping.
+const MAX_FIXTURE_INPUT_BYTES: u64 = 192 * 1024 * 1024;
 const MANIFEST: &str = include_str!("../../../packages/kuru-memory/support/dolt-assets.json");
 #[cfg(windows)]
 const BOOTSTRAP_PHASES: &[&str] = &[
@@ -89,7 +90,9 @@ async fn prepare_bounded_packaging_input(root: &Path, source: &Path) -> Result<P
     let before = regular_file_info(&held)?;
     ensure!(
         before.len > 0 && before.len <= MAX_FIXTURE_INPUT_BYTES,
-        "selected Cargo artifact exceeds the bounded fixture input"
+        "selected Cargo artifact exceeds the bounded fixture input: bytes={}, maximum_bytes={}",
+        before.len,
+        MAX_FIXTURE_INPUT_BYTES
     );
     let source_digest = digest_file(&mut held)?;
     let staged = root.join(if cfg!(windows) {
