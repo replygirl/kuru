@@ -461,6 +461,33 @@ async fn stock_ps51_accepts_a_verified_unmarked_historical_core_without_support(
 }
 
 #[tokio::test]
+async fn retained_v041_v042_powershell_reader_accepts_the_new_three_member_core() {
+    // v0.4.1 and v0.4.2 shipped byte-identical install.ps1 readers. Retain
+    // their actual script so this native compatibility check needs no checkout.
+    const OLD_READER_SHA256: &str =
+        "2425cfa02eea191752a7617b3c1cafffdd96f584348a36ea9c9b0e938d97084d";
+    let fixture = Fixture::new();
+    let old = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/install-v0.4.2.ps1");
+    assert_eq!(digest(&fs::read(&old).unwrap()), OLD_READER_SHA256);
+    let mut command = Command::new(fixture.powershell());
+    command
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+        .arg(old)
+        .args(["-Version", VERSION])
+        .current_dir(fixture.root.path())
+        .env_clear()
+        .envs(fixture.environment());
+    success(&fixture.run(&mut command).await);
+    assert_eq!(
+        fs::read(fixture.install.join("kuru.exe")).unwrap(),
+        fixture.replacement
+    );
+    assert!(!fixture.install.join("share").exists());
+    assert!(!fixture.root.path().join("executed").exists());
+    assert_no_stage(&fixture.install);
+}
+
+#[tokio::test]
 async fn malformed_manifest_hash_and_zip_fail_before_changing_existing_native_identity() {
     let fixture = Fixture::new();
     // A bootstrap startup failure cannot satisfy any rejection below. Exercise
@@ -796,6 +823,12 @@ async fn omitted_version_freezes_simulated_release_roots_before_fetching_real_na
     fs::create_dir_all(&frozen).unwrap();
     let name = archive_name(VERSION, TARGET).unwrap();
     fs::copy(fixture.release.join(&name), frozen.join(&name)).unwrap();
+    let support_name = shell_support::archive_name(VERSION, TARGET).unwrap();
+    fs::copy(
+        fixture.release.join(&support_name),
+        frozen.join(&support_name),
+    )
+    .unwrap();
     let manifest = fs::read(fixture.release.join("SHA256SUMS")).unwrap();
     fs::write(latest.join("SHA256SUMS"), &manifest).unwrap();
     // The actual bootstrap is unchanged except its fixed release-origin literal.

@@ -185,11 +185,11 @@ file `INSTALL_DIR/share/man/man1/kuru.1`. For the default Unix install, load
 completions from the fixed installed executable in your chosen shell:
 
 ```bash
-source <("$HOME/.local/bin/kuru" completions bash)
+eval "$("$HOME/.local/bin/kuru" completions bash)"
 ```
 
 ```zsh
-source <("$HOME/.local/bin/kuru" completions zsh)
+eval "$("$HOME/.local/bin/kuru" completions zsh)"
 ```
 
 ```fish
