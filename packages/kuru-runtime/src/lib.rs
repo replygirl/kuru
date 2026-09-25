@@ -88,6 +88,9 @@ mod permission_tests;
 mod accounting_tests;
 
 #[cfg(test)]
+mod public_test_support;
+
+#[cfg(test)]
 mod reasoning_summary_tests;
 
 #[cfg(all(test, windows))]

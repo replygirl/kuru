@@ -10040,9 +10040,15 @@ mod tests {
         .bind(&fourth_parent)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let sixth_parent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&fifth_parent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            fifth_parent, base,
-            "v1 to v6 must contain five ordered upgrades"
+            sixth_parent, base,
+            "v1 to v7 must contain six ordered upgrades"
         );
         let commits: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 2%'",
@@ -10074,6 +10080,12 @@ mod tests {
         .fetch_one(store.pool.as_ref())
         .await?;
         assert_eq!(provenance_commits, 1);
+        let public_turn_commits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dolt_log WHERE message LIKE 'Upgrade Kuru memory schema 7%'",
+        )
+        .fetch_one(store.pool.as_ref())
+        .await?;
+        assert_eq!(public_turn_commits, 1);
         store.close().await?;
 
         let reopened = MemoryStore::open(options).await?;
@@ -10104,6 +10116,7 @@ mod tests {
             ("v4 attempt", Some(4), false),
             ("v5 attempt", Some(5), false),
             ("v6 attempt", Some(6), false),
+            ("v7 attempt", Some(7), false),
             ("future schema", None, true),
         ] {
             let root = crate::test_support::tempdir()?;
@@ -10123,7 +10136,7 @@ mod tests {
                     Some(name)
                 }
                 None if future_schema => {
-                    sqlx::query("UPDATE kuru_schema SET version = 7 WHERE id = 1")
+                    sqlx::query("UPDATE kuru_schema SET version = 8 WHERE id = 1")
                         .execute(pool.as_ref())
                         .await?;
                     None
@@ -10149,7 +10162,8 @@ mod tests {
                 (Some(4), false) => "attempt newer than its schema",
                 (Some(5), false) => "attempt newer than its schema",
                 (Some(6), false) => "attempt newer than its schema",
-                (None, true) => "unsupported Dolt memory schema version 7",
+                (Some(7), false) => "attempt newer than its schema",
+                (None, true) => "unsupported Dolt memory schema version 8",
                 _ => unreachable!(),
             };
             assert!(rendered.contains(expected), "{case}: {rendered}");

@@ -473,6 +473,8 @@ impl RemoteSession {
             committed,
             candidate: Candidate {
                 backend: CandidateBackend::Remote(RemoteCandidate { view, handle, base }),
+                #[cfg(any(test, feature = "test-support"))]
+                reject_next_state_write: Arc::new(AtomicBool::new(false)),
             },
         }))
     }
@@ -641,6 +643,8 @@ impl RemoteSession {
             };
             Some(Candidate {
                 backend: CandidateBackend::Remote(RemoteCandidate { view, handle, base }),
+                #[cfg(any(test, feature = "test-support"))]
+                reject_next_state_write: Arc::new(AtomicBool::new(false)),
             })
         } else {
             None
@@ -800,6 +804,8 @@ impl RemoteSession {
         }
         Ok(Some(Candidate {
             backend: CandidateBackend::Remote(RemoteCandidate { view, handle, base }),
+            #[cfg(any(test, feature = "test-support"))]
+            reject_next_state_write: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
@@ -2141,6 +2147,10 @@ impl MemoryStore {
         match &self.backend {
             Backend::Local(store) => Ok(Candidate {
                 backend: CandidateBackend::Local(store.begin_candidate(label).await?),
+                #[cfg(any(test, feature = "test-support"))]
+                reject_next_state_write: Arc::new(AtomicBool::new(
+                    self.reject_next_state_write.swap(false, Ordering::AcqRel),
+                )),
             }),
             Backend::Remote(remote) => {
                 remote.ensure_writable()?;
@@ -2174,6 +2184,10 @@ impl MemoryStore {
                 };
                 Ok(Candidate {
                     backend: CandidateBackend::Remote(RemoteCandidate { view, handle, base }),
+                    #[cfg(any(test, feature = "test-support"))]
+                    reject_next_state_write: Arc::new(AtomicBool::new(
+                        self.reject_next_state_write.swap(false, Ordering::AcqRel),
+                    )),
                 })
             }
         }
@@ -2352,6 +2366,9 @@ impl MemoryStore {
 #[derive(Clone, Debug)]
 pub struct Candidate {
     backend: CandidateBackend,
+    /// One test-only pre-send refusal belongs to this exact new candidate.
+    #[cfg(any(test, feature = "test-support"))]
+    reject_next_state_write: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -2435,12 +2452,12 @@ impl Candidate {
             CandidateBackend::Local(candidate) => MemoryStore {
                 backend: Backend::Local(candidate.view()),
                 #[cfg(any(test, feature = "test-support"))]
-                reject_next_state_write: Arc::new(AtomicBool::new(false)),
+                reject_next_state_write: self.reject_next_state_write.clone(),
             },
             CandidateBackend::Remote(candidate) => MemoryStore {
                 backend: Backend::Remote(candidate.view.clone()),
                 #[cfg(any(test, feature = "test-support"))]
-                reject_next_state_write: Arc::new(AtomicBool::new(false)),
+                reject_next_state_write: self.reject_next_state_write.clone(),
             },
         }
     }
@@ -3436,13 +3453,13 @@ mod tests {
             let memory = open().await?;
             let sibling = open().await?;
             let session = "managed-fork-parent";
-            let namespace = "project/transcript/managed-fork-parent";
+            let namespace = format!("{}/transcript/managed-fork-parent", options.project_scope);
             memory
                 .create_session(session, Mode::Ifs, "fork parent")
                 .await?;
             memory
                 .checkpoint_session_turn(
-                    namespace,
+                    &namespace,
                     session,
                     &[Message::text("user", "shared question")],
                     &[("managed-fork-journal".into(), json!({"state": "started"}))],
@@ -3456,7 +3473,7 @@ mod tests {
                 .await?;
             memory
                 .checkpoint_session_turn(
-                    namespace,
+                    &namespace,
                     session,
                     &[Message::text("assistant", "shared answer")],
                     &[("managed-fork-journal".into(), json!({"state": "ended"}))],

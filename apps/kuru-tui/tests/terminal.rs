@@ -3,7 +3,7 @@
 use kuru_memory::MemoryStore;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, Read, Write},
     path::PathBuf,
     process::Command,
@@ -714,10 +714,13 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
         READY_TIMEOUT,
     )?;
     terminal.command("/help", None)?;
-    terminal.wait_composer_frame(
-        &["/clear", "/compact [ID]", "/status", "enter send"],
-        READY_TIMEOUT,
-    )?;
+    // Help is a real scrollable transcript at this height. Inspect both
+    // completed pages instead of requiring top and bottom commands at once.
+    terminal.wait_composer_frame(&["/status", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"\x1b[5~")?;
+    terminal.wait_composer_frame(&["/clear", "/compact [ID]", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"\x1b[6~")?;
+    terminal.wait_composer_frame(&["/status", "enter send"], READY_TIMEOUT)?;
 
     let before_compact = requests.lock().unwrap().len();
     terminal.send(b"/comp\t")?;
@@ -4319,15 +4322,16 @@ fn memory_options(sandbox: &Sandbox) -> Result<kuru_memory::OpenOptions> {
 
 // Fault injection owns no application handle: the real UI remains the sole
 // writer owner. Only this test's generated endpoint and credentials are read.
-struct InvalidSessionIndex {
+struct InvalidSessionCatalogMode {
     connection: MySqlConnection,
-    key: String,
+    session_id: String,
     previous: String,
     revision: String,
 }
 
-impl InvalidSessionIndex {
-    async fn inject(sandbox: &Sandbox) -> Result<Self> {
+impl InvalidSessionCatalogMode {
+    async fn inject(sandbox: &Sandbox, selected_session_id: &str) -> Result<Self> {
+        let session_id = selected_session_id.to_owned();
         let mut options = memory_options(sandbox)?;
         options.read_only = true;
         let inspector = MemoryStore::open(options).await?;
@@ -4367,26 +4371,29 @@ impl InvalidSessionIndex {
             .ssl_mode(MySqlSslMode::Disabled);
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut connection = MySqlConnection::connect_with(&options).await?;
-            let key = format!("{}/sessions", status.project);
-            let previous = sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
-                .bind(key.as_bytes())
-                .fetch_one(&mut connection)
-                .await?;
+            let previous =
+                sqlx::query_scalar("SELECT mode FROM session_catalog WHERE session_id = ?")
+                    .bind(session_id.as_bytes())
+                    .fetch_one(&mut connection)
+                    .await?;
             let revision = sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')")
                 .fetch_one(&mut connection)
                 .await?;
-            let updated = sqlx::query("UPDATE state SET value = ? WHERE `key` = ?")
-                .bind(json!("invalid-session-index").to_string())
-                .bind(key.as_bytes())
-                .execute(&mut connection)
-                .await?;
+            let updated = sqlx::query(
+                "UPDATE session_catalog SET mode = ? WHERE session_id = ? AND mode = ?",
+            )
+            .bind("not-a-kuru-mode")
+            .bind(session_id.as_bytes())
+            .bind(&previous)
+            .execute(&mut connection)
+            .await?;
             ensure!(
                 updated.rows_affected() == 1,
-                "fixture session index missing"
+                "fixture selected session catalog row changed"
             );
             Ok(Self {
                 connection,
-                key,
+                session_id,
                 previous,
                 revision,
             })
@@ -4397,14 +4404,17 @@ impl InvalidSessionIndex {
 
     async fn restore(mut self) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let updated = sqlx::query("UPDATE state SET value = ? WHERE `key` = ?")
-                .bind(&self.previous)
-                .bind(self.key.as_bytes())
-                .execute(&mut self.connection)
-                .await?;
+            let updated = sqlx::query(
+                "UPDATE session_catalog SET mode = ? WHERE session_id = ? AND mode = ?",
+            )
+            .bind(&self.previous)
+            .bind(self.session_id.as_bytes())
+            .bind("not-a-kuru-mode")
+            .execute(&mut self.connection)
+            .await?;
             ensure!(
                 updated.rows_affected() == 1,
-                "fixture session index missing"
+                "fixture selected session catalog mode changed"
             );
             let revision: String = sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')")
                 .fetch_one(&mut self.connection)
@@ -4434,6 +4444,17 @@ async fn preferences_session(
     selections: &[Selection<'_>],
     reject: bool,
 ) -> Result<()> {
+    let prior_sessions = if reject {
+        Some(
+            sandbox
+                .sessions()?
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<BTreeSet<_>>(),
+        )
+    } else {
+        None
+    };
     let mut command = sandbox.command("demo");
     command.env("KURU_REDUCED_MOTION", "1");
     let mut terminal = Terminal::spawn(command, 38, 130)?;
@@ -4441,8 +4462,18 @@ async fn preferences_session(
         let screen = terminal.screen().to_lowercase();
         Ok(screen.contains("enter send") && expected.iter().all(|value| screen.contains(value)))
     })?;
-    let rejected_index = if reject {
-        Some(InvalidSessionIndex::inject(sandbox).await?)
+    let rejected_index = if let Some(prior_sessions) = prior_sessions {
+        let created = sandbox
+            .sessions()?
+            .into_iter()
+            .map(|session| session.id)
+            .filter(|id| !prior_sessions.contains(id))
+            .collect::<Vec<_>>();
+        ensure!(
+            created.len() == 1,
+            "fixture TUI launch did not create exactly one selected session"
+        );
+        Some(InvalidSessionCatalogMode::inject(sandbox, &created[0]).await?)
     } else {
         None
     };
@@ -4462,9 +4493,8 @@ async fn preferences_session(
             let screen = terminal.screen();
             Ok(screen.contains("enter send")
                 && (!reject
-                    || "invalid saved session index"
-                        .split_whitespace()
-                        .all(|word| screen.contains(word))))
+                    || (screen.contains("memory service write outcome is uncertain")
+                        && !screen.contains("not-a-kuru-mode"))))
         })?;
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
@@ -4586,10 +4616,10 @@ async fn terminal_selections_survive_restarts_picker_changes_and_failed_database
             .map(|session| session.mode)
             .collect::<Vec<_>>(),
         [
-            Mode::Jungian,
             Mode::Freudian,
             Mode::Freudian,
-            Mode::Freudian
+            Mode::Freudian,
+            Mode::Jungian
         ]
     );
     Ok(())

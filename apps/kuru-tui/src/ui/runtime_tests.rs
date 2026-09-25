@@ -54,6 +54,14 @@ async fn harness_with_provider(
     provider: Arc<dyn Provider>,
 ) -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
     let directory = tempfile::tempdir().unwrap();
+    harness_with_provider_in(directory, memory, provider).await
+}
+
+async fn harness_with_provider_in(
+    directory: tempfile::TempDir,
+    memory: MemoryStore,
+    provider: Arc<dyn Provider>,
+) -> (tempfile::TempDir, Harness, Vec<ModelInfo>) {
     let harness = Harness::new(
         Config {
             provider: "demo".into(),
@@ -772,11 +780,17 @@ impl Backend for FailingBackend {
     }
 }
 
-async fn persistent_store() -> (tempfile::TempDir, kuru_memory::OpenOptions, MemoryStore) {
+async fn persistent_store() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    kuru_memory::OpenOptions,
+    MemoryStore,
+) {
     let root = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
     let options = open_options(
         root.path().join("data"),
-        format!("project/{}", "1".repeat(64)),
+        kuru_runtime::project_scope(project.path()).unwrap(),
     )
     .unwrap();
     let store = {
@@ -784,7 +798,7 @@ async fn persistent_store() -> (tempfile::TempDir, kuru_memory::OpenOptions, Mem
         let _gate = crate::spawn_gate::spawning().await;
         MemoryStore::open(options.clone()).await.unwrap()
     };
-    (root, options, store)
+    (root, project, options, store)
 }
 
 async fn reopen_store(options: kuru_memory::OpenOptions) -> MemoryStore {
@@ -795,9 +809,10 @@ async fn reopen_store(options: kuru_memory::OpenOptions) -> MemoryStore {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_history() {
-    let (data_root, options, store) = persistent_store().await;
+    let (data_root, project, options, store) = persistent_store().await;
     let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
-    let (project, harness, models) = fixture_with_memory(store.clone()).await;
+    let (project, harness, models) =
+        harness_with_provider_in(project, store.clone(), Arc::new(DemoProvider)).await;
     assert!(harness.history().await.unwrap().is_empty());
 
     let (input_tx, input_rx) = mpsc::channel(1);
@@ -904,10 +919,11 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
 
 #[tokio::test]
 async fn failed_initial_tui_draw_never_marks_the_notice_shown() {
-    let (data_root, options, store) = persistent_store().await;
+    let (data_root, project, options, store) = persistent_store().await;
     let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
     let provider = BlockingProvider::new();
-    let (project, harness, models) = fixture_with_memory(store.clone()).await;
+    let (project, harness, models) =
+        harness_with_provider_in(project, store.clone(), Arc::new(DemoProvider)).await;
     let mut terminal = Terminal::new(FailingBackend::initially_failing(provider)).unwrap();
     let input = Box::pin(stream::empty());
     let error = run_loop_with_stream_and_notice(
@@ -937,10 +953,11 @@ async fn failed_initial_tui_draw_never_marks_the_notice_shown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notice_text_never_reaches_the_provider_request_for_a_real_tui_turn() {
-    let (data_root, _options, store) = persistent_store().await;
+    let (data_root, project, _options, store) = persistent_store().await;
     let notice = MemoryNotice::pending(store.clone()).await.unwrap().unwrap();
     let provider = CapturingProvider::new();
-    let (project, harness, models) = harness_with_provider(store, provider.clone()).await;
+    let (project, harness, models) =
+        harness_with_provider_in(project, store, provider.clone()).await;
     let (input_tx, input_rx) = mpsc::channel(8);
     let input = Box::pin(stream::unfold(input_rx, |mut input_rx| async move {
         input_rx.recv().await.map(|event| (Ok(event), input_rx))

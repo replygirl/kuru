@@ -100,6 +100,59 @@ workspace-local artifact clean preceded these checks; it preserved the separate
 live coverage target. These checks do not replace final combined coverage,
 supported-platform native jobs, or archive.
 
+## Current-lineage correction evidence after the first combined hook failure
+
+The normal P11 push from `c4a78e79` failed during combined coverage and did
+not advance a remote ref. Its exact log is retained at
+`/private/tmp/kuru-p11-push-c4a78.log`. The failures exposed distinct test
+fixture drift across v7 catalog authority, selected-session public context,
+PTY paging, and instrumented package size, plus one runtime interruption-retry
+defect. The fixture corrections retain the original no-effect, privacy,
+identity, and exact-session assertions. The interruption correction requires
+an already-settled exact public turn before treating a repeated marker as a
+no-op; its real-Dolt regression passed 1/1 with unchanged revision, public
+page, and event count for the exact retry, refusal for a different turn, and
+an untouched later pending admission. Delivery reviewed that product delta.
+
+Focused real-Dolt reruns on this corrected local source passed the released-v1
+stage upgrade and managed fork lost-reply fixtures 1/1 each. The candidate
+dream-save definite pre-send refusal, failed preference update, failed
+mode/focus/relationship saves, and failed undo recovery each passed 1/1 with
+their no-effect or recoverability assertions. Three first-run notice tests
+passed 1/1 each, covering visible notice, failure-before-marking, and absence
+from the provider request. The real PTY help paging and selected-session
+preference failure tests passed 1/1 each; the latter binds the injected catalog
+fault to the newly created selected ID, observes the fixed public uncertain
+write error without the private SQL value, restores by exact mode CAS, and
+checks unchanged preference/HEAD, clean Dolt status, and all four zero-turn
+session modes in the catalog's newest-first order. The UI adapter's real
+relationship completion and selected public speaker test passed 1/1. The
+real PTY trust fixture passed 1/1 after the two preflight-only refusals kept
+their five-second bound and the persistent approval path used the configured
+cold-memory startup bound; it required the exact missing Responses key error,
+no alternate screen, and the saved approval. A sandbox-only attempt of the v1
+fixture failed before its logic because native Dolt could not bind loopback;
+the identical native rerun passed with loopback access.
+
+An earlier independent-copy measurement on the previous instrumented source
+reduced 148,132,824 bytes to 132,622,296 with macOS `strip -x -S`; that was
+feasibility only. The exact filtered `cargo llvm-cov` embedded-runtime test
+then passed 1/1 on this corrected local source. Its selected instrumented Kuru
+executable was 147,840,200 bytes, inode 664816725, one link, SHA-256
+`be2b446fc1ec0ae3025b31ccd6c0620e3b3fa85bb0bd308d49d7631f2fae9c4c`.
+The fixture verified an independent exact copy before stripping and an
+unchanged named source identity/digest afterward; the prepared private input
+was 132,393,624 bytes under the unchanged 134,217,728-byte cap. Actual direct
+install and self-update each persisted a chat from an empty offline engine
+cache using the 58,795,497-byte bundled archive and Dolt 2.3.3. The fixture
+also required one nonempty profile from that prepared executable; the matching
+profile under the shared nested `llvm-cov-target` was 536,776 bytes. This is
+focused instrumented behavior and profile evidence, not the final 90% workspace
+coverage result. Affected memory/runtime/TUI all-target Clippy, Rust format,
+strict Cospec validation (0 errors, 0 warnings), and diff check passed after
+these corrections. Full combined coverage, supported-platform CI, and archive
+remain open.
+
 ## Historical local evidence on the reviewed P11 source (2026-09-23)
 
 The observations below belong to the earlier reviewed P11 integration through

@@ -216,13 +216,17 @@ async fn observe_selection(
         )
         .await
         .unwrap();
-    memory
-        .append_message(
-            &transcript_key,
-            &Message::text("user", "PUBLIC-SENTINEL-🌊".repeat(100)),
-        )
-        .await
-        .unwrap();
+    crate::public_test_support::settled_public_turn(
+        &memory,
+        &harness.scope,
+        &harness.session.id,
+        "selected-visibility-public",
+        &actor,
+        &"PUBLIC-SENTINEL-🌊".repeat(100),
+        "PUBLIC-ANSWER-SENTINEL",
+    )
+    .await
+    .unwrap();
     memory
         .append(&notes_key, "note", &"NOTE-SENTINEL-é".repeat(100))
         .await
@@ -336,7 +340,7 @@ async fn selected_ambient_sources_change_real_demo_body_and_fit_without_erasing_
     );
     assert_eq!(
         source_units(&notes_hidden.context, ContextSourceKind::PublicTranscript),
-        1
+        2
     );
     assert_eq!(
         source_units(&notes_hidden.context, ContextSourceKind::Notes),
@@ -362,7 +366,14 @@ async fn selected_ambient_sources_change_real_demo_body_and_fit_without_erasing_
         ContextSourceKind::PublicTranscript,
         ContextSourceKind::Notes,
     ] {
-        assert_eq!(source_units(&full.context, kind), 1);
+        assert_eq!(
+            source_units(&full.context, kind),
+            if kind == ContextSourceKind::PublicTranscript {
+                2
+            } else {
+                1
+            }
+        );
         assert_eq!(source_units(&hidden.context, kind), 0);
     }
     assert_eq!(
@@ -378,11 +389,11 @@ async fn selected_ambient_sources_change_real_demo_body_and_fit_without_erasing_
     assert_eq!(hidden.context.omitted_note_rows, 0);
     assert_eq!(
         (full.history_rows, full.public_rows, full.note_rows),
-        (4, 1, 1)
+        (4, 2, 1)
     );
     assert_eq!(
         (hidden.history_rows, hidden.public_rows, hidden.note_rows),
-        (4, 1, 1)
+        (4, 2, 1)
     );
 }
 

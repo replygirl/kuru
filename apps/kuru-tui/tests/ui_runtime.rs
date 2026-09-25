@@ -43,7 +43,7 @@ fn screen(view: &View) -> String {
 #[tokio::test]
 async fn runtime_adapter_projects_real_relationship_completion_and_sanitized_route() {
     let (project, mut harness) = fixture().await;
-    harness.run("history seed").await.unwrap();
+    let seeded = harness.run("history seed").await.unwrap();
     let members = harness.topology.parts[..2]
         .iter()
         .map(|part| part.id.clone())
@@ -55,13 +55,10 @@ async fn runtime_adapter_projects_real_relationship_completion_and_sanitized_rou
     let initial = project_initial_view(&harness).await.unwrap();
     assert_eq!(
         initial.transcript,
-        harness
-            .history()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|message| (message.role.clone(), message.text_projection()))
-            .collect::<Vec<_>>()
+        vec![
+            ("user".into(), "history seed".into()),
+            (seeded.speaker, seeded.text),
+        ]
     );
     assert_eq!(initial.session, harness.session.id);
     assert_eq!(

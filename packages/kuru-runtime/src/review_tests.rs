@@ -1429,7 +1429,7 @@ async fn unavailable_mcp_status_stays_out_of_provider_input_and_memory() {
     let data = TempDir::new().unwrap();
     let options = kuru_memory::test_support::open_options(
         data.path().join("private"),
-        format!("project/{}", "a".repeat(64)),
+        crate::project_scope(workspace.path()).unwrap(),
     )
     .unwrap();
     let memory = MemoryStore::open(options.clone()).await.unwrap();
@@ -1693,12 +1693,17 @@ async fn different_actors_share_leading_instructions_before_private_identity() {
 async fn shared_transcript_keeps_whole_unicode_rows_without_byte_slicing() {
     let provider = RecordingProvider::new(|_| reply("Ready"));
     let (_dir, harness) = fixture(config(Mode::Freudian), provider.clone()).await;
-    let key = format!("{}/transcript/{}", harness.scope, harness.session.id);
-    harness
-        .memory
-        .append(&key, "assistant", &format!("a{}", "🪶".repeat(20_000)))
-        .await
-        .unwrap();
+    crate::public_test_support::settled_public_turn(
+        &harness.memory,
+        &harness.scope,
+        &harness.session.id,
+        "whole-unicode-public",
+        &harness.topology.parts[0].id,
+        "Remember the whole Unicode answer",
+        &format!("a{}", "🪶".repeat(20_000)),
+    )
+    .await
+    .unwrap();
     harness
         .ask(
             &harness.topology.parts[0].id,
@@ -1847,19 +1852,17 @@ async fn failed_dream_save_restores_topology_and_leaves_undo_state_untouched() {
     let provider = RecordingProvider::new(|_| reply("Ready"));
     let (_dir, mut harness) = fixture(config(Mode::Freudian), provider).await;
     let before = serde_json::to_value(&harness.topology).unwrap();
-    let sessions_key = format!("{}/sessions", harness.scope);
-    harness
-        .memory
-        .put(&sessions_key, &json!("invalid-session-index"))
-        .await
-        .unwrap();
+    let before_revision = harness.memory.revision().await.unwrap();
     let proposal = DreamProposal::Add {
         name: "Experiment".into(),
         role: "id".into(),
         instruction: "Explore".into(),
     };
-    assert!(harness.apply_dream(vec![proposal]).await.is_err());
+    harness.memory.reject_next_state_write_for_test();
+    let error = harness.apply_dream(vec![proposal]).await.unwrap_err();
+    assert!(format!("{error:#}").contains("injected state-save refusal before request send"));
     assert_eq!(serde_json::to_value(&harness.topology).unwrap(), before);
+    assert_eq!(harness.memory.revision().await.unwrap(), before_revision);
     assert_eq!(
         harness
             .memory
@@ -1890,26 +1893,22 @@ async fn failed_mode_focus_and_relationship_saves_leave_the_running_pool_intact(
     let (_dir, mut harness) = fixture(config(Mode::Freudian), provider).await;
     let before = serde_json::to_value(&harness.topology).unwrap();
     let actors = harness.actors.keys().cloned().collect::<Vec<_>>();
-    harness
-        .memory
-        .put(
-            &format!("{}/sessions", harness.scope),
-            &json!("corrupt index"),
-        )
-        .await
-        .unwrap();
     let first = harness.topology.parts[0].id.clone();
     let second = harness.topology.parts[1].id.clone();
-    assert!(harness.focus(Some(&first)).await.is_err());
+    harness.memory.reject_next_state_write_for_test();
+    let error = harness.focus(Some(&first)).await.unwrap_err();
+    assert!(format!("{error:#}").contains("injected state-save refusal before request send"));
     assert_eq!(serde_json::to_value(&harness.topology).unwrap(), before);
-    assert!(
-        harness
-            .relate(RelationshipKind::Alliance, vec![first, second])
-            .await
-            .is_err()
-    );
+    harness.memory.reject_next_state_write_for_test();
+    let error = harness
+        .relate(RelationshipKind::Alliance, vec![first, second])
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("injected state-save refusal before request send"));
     assert_eq!(serde_json::to_value(&harness.topology).unwrap(), before);
-    assert!(harness.set_mode(Mode::Jungian).await.is_err());
+    harness.memory.reject_next_state_write_for_test();
+    let error = harness.set_mode(Mode::Jungian).await.unwrap_err();
+    assert!(format!("{error:#}").contains("injected state-save refusal before request send"));
     assert_eq!(harness.config.mode, Mode::Freudian);
     assert_eq!(harness.session.mode, Mode::Freudian);
     assert_eq!(serde_json::to_value(&harness.topology).unwrap(), before);
@@ -2212,16 +2211,10 @@ async fn dreaming_accepts_a_valid_model_proposal_and_failed_undo_remains_recover
     assert_eq!(report.accepted.len(), 1);
     assert!(report.rejected.is_empty());
     let new_part = harness.resolve("Possibility").unwrap();
-    let saved = serde_json::to_value(harness.sessions().await.unwrap()).unwrap();
-    let key = format!("{}/sessions", harness.scope);
-    harness
-        .memory
-        .put(&key, &json!("corrupt index"))
-        .await
-        .unwrap();
-    assert!(harness.undo_dream().await.is_err());
+    harness.memory.reject_next_state_write_for_test();
+    let error = harness.undo_dream().await.unwrap_err();
+    assert!(format!("{error:#}").contains("injected state-save refusal before request send"));
     assert!(harness.resolve(&new_part).is_ok());
-    harness.memory.put(&key, &saved).await.unwrap();
     harness.undo_dream().await.unwrap();
     assert!(harness.resolve(&new_part).is_err());
     assert!(harness.memory_for(&new_part).await.is_ok());

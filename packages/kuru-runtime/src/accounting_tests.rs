@@ -166,6 +166,12 @@ async fn resumed_preledger_session_remains_historically_incomplete_after_new_usa
     let scope = original.scope.clone();
     let mut old_session = original.session.clone();
     old_session.id = "pre-ledger-session".into();
+    // The legacy usage record is absent, but the selected session still has
+    // durable v7 catalog identity before a new invocation can resume it.
+    memory
+        .create_session(&old_session.id, old_session.mode, &old_session.label)
+        .await
+        .unwrap();
     memory
         .put(
             &format!("{scope}/session/{}", old_session.id),
@@ -1292,6 +1298,8 @@ async fn compacted_sessions_and_export_keep_sibling_and_legacy_rows_isolated() {
     .unwrap();
     let actor = harness.topology.parts[0].id.clone();
     let namespace = harness.namespace(&actor);
+    let session_one = harness.session.id.clone();
+    let session_two = harness.new_session().await.unwrap();
     memory
         .append(&namespace, "user", "legacy-null-session-sentinel")
         .await
@@ -1299,7 +1307,7 @@ async fn compacted_sessions_and_export_keep_sibling_and_legacy_rows_isolated() {
     memory
         .append_session_message(
             &namespace,
-            "compact-session-one",
+            &session_one,
             &Message::text(
                 "user",
                 "session-one-private-sentinel ADMITTED_CONTINUITY_FACT \
@@ -1311,19 +1319,19 @@ async fn compacted_sessions_and_export_keep_sibling_and_legacy_rows_isolated() {
     memory
         .append_session_message(
             &namespace,
-            "compact-session-two",
+            &session_two,
             &Message::text("user", "session-two-private-sentinel"),
         )
         .await
         .unwrap();
 
-    harness.session.id = "compact-session-one".into();
+    harness.resume_session(&session_one).await.unwrap();
     harness.operation_id = "compact-session-one-operation".into();
     harness
         .compact_controlled(Some(&actor), &CancellationToken::new())
         .await
         .unwrap();
-    harness.session.id = "compact-session-two".into();
+    harness.resume_session(&session_two).await.unwrap();
     harness.operation_id = "compact-session-two-operation".into();
     harness
         .compact_controlled(Some(&actor), &CancellationToken::new())
@@ -1354,8 +1362,8 @@ async fn compacted_sessions_and_export_keep_sibling_and_legacy_rows_isolated() {
 
     let summary_namespace = crate::context_compaction::summary_namespace(&namespace);
     for (session, sentinel) in [
-        ("compact-session-one", "session-one-private-sentinel"),
-        ("compact-session-two", "session-two-private-sentinel"),
+        (session_one.as_str(), "session-one-private-sentinel"),
+        (session_two.as_str(), "session-two-private-sentinel"),
     ] {
         let current = memory
             .context_summary_window(
@@ -1381,28 +1389,28 @@ async fn compacted_sessions_and_export_keep_sibling_and_legacy_rows_isolated() {
         );
     }
 
-    let session_one = memory
+    let first_summary = memory
         .context_summary_window(
             &namespace,
             &summary_namespace,
-            Some("compact-session-one"),
+            Some(&session_one),
             Some(&namespace),
             1,
         )
         .await
         .unwrap();
     assert_eq!(
-        session_one.records[0].record.summary,
+        first_summary.records[0].record.summary,
         "ADMITTED_CONTINUITY_RETAINED"
     );
     assert!(
-        !session_one.records[0]
+        !first_summary.records[0]
             .record
             .summary
             .contains("INSTRUCTION_AUTHORITY_SENTINEL")
     );
 
-    harness.session.id = "compact-session-one".into();
+    harness.resume_session(&session_one).await.unwrap();
     harness.operation_id = "compact-session-one-followup".into();
     harness
         .ask(
@@ -1442,8 +1450,8 @@ async fn compacted_sessions_and_export_keep_sibling_and_legacy_rows_isolated() {
             if content.contains("legacy-null-session-sentinel")
     )));
     for (session, sentinel) in [
-        ("compact-session-one", "session-one-private-sentinel"),
-        ("compact-session-two", "session-two-private-sentinel"),
+        (session_one.as_str(), "session-one-private-sentinel"),
+        (session_two.as_str(), "session-two-private-sentinel"),
     ] {
         assert!(exported.iter().any(|record| matches!(
             record,
@@ -2968,14 +2976,41 @@ async fn fit_omits_public_and_note_rows_whole_without_deleting_them() {
     let actor = harness.topology.parts[0].id.clone();
     let transcript = format!("{}/transcript/{}", harness.scope, harness.session.id);
     let notes = format!("{}/notes", harness.namespace(&actor));
+    let catalog = memory
+        .session_catalog_record(&harness.session.id)
+        .await
+        .unwrap()
+        .unwrap();
     memory
-        .append_message(&transcript, &Message::text("user", "PUBLIC-OLD 🪶"))
+        .checkpoint_session_turn(
+            &transcript,
+            &harness.session.id,
+            &[Message::text("user", "PUBLIC-OLD 🪶")],
+            &[],
+            &kuru_memory::SessionTurnCheckpoint::Admit {
+                expected_generation: catalog.lifecycle_generation,
+                turn_id: "public-fit-fixture".into(),
+                label: None,
+                expected_transcript_rows: Some(0),
+            },
+        )
         .await
         .unwrap();
     memory
-        .append_message(
+        .checkpoint_session_turn(
             &transcript,
-            &Message::text(crate::INTERRUPTION_ROLE, crate::INTERRUPTION_TEXT),
+            &harness.session.id,
+            &[Message::text(
+                crate::INTERRUPTION_ROLE,
+                crate::INTERRUPTION_TEXT,
+            )],
+            &[],
+            &kuru_memory::SessionTurnCheckpoint::Settle {
+                expected_generation: catalog.lifecycle_generation,
+                turn_id: "public-fit-fixture".into(),
+                settlement: kuru_memory::PublicTurnSettlement::Interrupted,
+                speaker_id: crate::INTERRUPTION_ROLE.into(),
+            },
         )
         .await
         .unwrap();
@@ -3127,10 +3162,18 @@ async fn demo_effective_prompt_retries_whole_multilingual_rows_under_one_admissi
     }
     let public = format!("PUBLIC-{}", "🌊".repeat(80));
     let note = format!("NOTE-{}", "é".repeat(120));
-    memory
-        .append_message(&transcript_key, &Message::text("user", &public))
-        .await
-        .unwrap();
+    let public_answer = "PUBLIC-ANSWER-ROW";
+    crate::public_test_support::settled_public_turn(
+        &memory,
+        &harness.scope,
+        &harness.session.id,
+        "demo-fit-public",
+        &actor,
+        &public,
+        public_answer,
+    )
+    .await
+    .unwrap();
     memory.append(&notes_key, "note", &note).await.unwrap();
     let required = vec![
         Message::text("user", "current user 🦉"),
@@ -3197,10 +3240,14 @@ async fn demo_effective_prompt_retries_whole_multilingual_rows_under_one_admissi
             assert_eq!(row.plain_text(), Some(expected.as_str()));
         }
         let public_retained = final_request.instructions.contains(&public);
+        let public_answer_retained = final_request.instructions.contains(public_answer);
         let note_retained = final_request.instructions.contains(&note);
         let context = harness.subscribe_context().borrow().latest.clone().unwrap();
         assert_eq!(context.omitted_private_rows, omitted_private as u64);
-        assert_eq!(context.omitted_public_rows, u64::from(!public_retained));
+        assert_eq!(
+            context.omitted_public_rows,
+            u64::from(!public_retained) + u64::from(!public_answer_retained)
+        );
         assert_eq!(context.omitted_note_rows, u64::from(!note_retained));
         for (kind, units) in [
             (
@@ -3209,7 +3256,7 @@ async fn demo_effective_prompt_retries_whole_multilingual_rows_under_one_admissi
             ),
             (
                 kuru_core::ContextSourceKind::PublicTranscript,
-                u64::from(public_retained),
+                u64::from(public_retained) + u64::from(public_answer_retained),
             ),
             (
                 kuru_core::ContextSourceKind::Notes,
@@ -3245,7 +3292,7 @@ async fn demo_effective_prompt_retries_whole_multilingual_rows_under_one_admissi
             .await
             .unwrap()
             .total_rows,
-        1
+        2
     );
     assert_eq!(
         memory

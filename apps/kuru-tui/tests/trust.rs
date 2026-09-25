@@ -1527,9 +1527,9 @@ fn terminal_command(sandbox: &Sandbox) -> ProcessCommand {
 }
 
 #[cfg(unix)]
-fn wait_for_refusal(terminal: &mut terminal::Terminal) {
+fn wait_for_refusal(terminal: &mut terminal::Terminal, timeout: Duration) {
     let error = terminal
-        .wait("trust command exits", Duration::from_secs(5), |_| Ok(false))
+        .wait("trust command exits", timeout, |_| Ok(false))
         .unwrap_err();
     assert!(error.to_string().contains("process exited"), "{error}");
     assert!(
@@ -1594,7 +1594,7 @@ fn real_pty_refusal_eof_and_persistent_choice_precede_the_alternate_screen() {
             .unwrap();
         assert!(!sandbox.data.exists());
         terminal.send(response).unwrap();
-        wait_for_refusal(&mut terminal);
+        wait_for_refusal(&mut terminal, Duration::from_secs(5));
         assert!(!sandbox.data.exists());
     }
 
@@ -1614,7 +1614,21 @@ fn real_pty_refusal_eof_and_persistent_choice_precede_the_alternate_screen() {
         )
         .unwrap();
     terminal.send(b"2\r").unwrap();
-    wait_for_refusal(&mut terminal);
+    // This accepted launch reaches cold managed memory startup before provider
+    // authentication. Its two server starts and cleanup have a configured
+    // bound; decline and EOF above still use the short preflight-only wait.
+    wait_for_refusal(
+        &mut terminal,
+        terminal::startup_timeout(Duration::from_secs(
+            kuru_core::MemoryConfig::default().startup_timeout_secs,
+        )),
+    );
+    assert!(
+        String::from_utf8_lossy(&terminal.output)
+            .contains("Responses API authentication environment variable is not set"),
+        "approved launch did not reach its missing-key refusal: {}",
+        terminal.screen()
+    );
     let status = sandbox.success(&["trust", "status"]);
     assert!(text(&status.stdout).contains("Status: approved"));
 }
