@@ -32,6 +32,87 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SERVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ATTACHMENTS: usize = 32;
 
+#[cfg(feature = "test-support")]
+const STARTUP_STAGE_DIAGNOSTIC_ENV: &str = "KURU_TEST_MEMORY_STARTUP_STAGES";
+
+#[cfg(feature = "test-support")]
+fn fixture_startup_stages_enabled() -> bool {
+    std::env::var_os(STARTUP_STAGE_DIAGNOSTIC_ENV).as_deref() == Some(OsStr::new("1"))
+}
+
+#[cfg(feature = "test-support")]
+async fn open_owner_store_with_fixture_stages(
+    options: crate::store::OpenOptions,
+) -> Result<crate::store::MemoryStore> {
+    if !fixture_startup_stages_enabled() {
+        return crate::store::MemoryStore::open(options).await;
+    }
+    let (mut progress, opening) = crate::store::MemoryStore::open_observed(options);
+    tokio::pin!(opening);
+    let mut progress_open = true;
+    loop {
+        tokio::select! {
+            result = &mut opening => return result,
+            stage = progress.recv(), if progress_open => match stage {
+                Some(stage) => eprintln!("memory startup stage: {stage:?}"),
+                None => progress_open = false,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn fixture_startup_observations(
+    options: &crate::store::OpenOptions,
+    diagnostic: &mut File,
+) -> String {
+    use std::io::Seek as _;
+
+    let last_stage = diagnostic
+        .rewind()
+        .ok()
+        .and_then(|()| {
+            let mut contents = String::new();
+            diagnostic.take(4096).read_to_string(&mut contents).ok()?;
+            contents
+                .lines()
+                .filter_map(|line| line.strip_prefix("memory startup stage: "))
+                .rfind(|stage| {
+                    matches!(
+                        *stage,
+                        "WaitingForProjectOwnership"
+                            | "WaitingForRuntimeCache"
+                            | "VerifyingRuntimeCache"
+                            | "ExtractingEmbeddedRuntime"
+                            | "CheckingRuntimeVersion"
+                            | "PreparingDatabase"
+                            | "OpeningDatabase"
+                            | "Ready"
+                    )
+                })
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "none".into());
+    let owner = match ServiceLock::try_acquire(
+        &options.data_dir,
+        &options.project_scope,
+        ServiceLockKind::Owner,
+    ) {
+        Ok(Some(lock)) => {
+            drop(lock);
+            "free"
+        }
+        Ok(None) => "held",
+        Err(_) => "observation-failed",
+    };
+    let endpoint = match EndpointRecord::read(&options.data_dir, &options.project_scope) {
+        Ok(Some(_)) => "present",
+        Ok(None) => "absent",
+        Err(_) => "observation-failed",
+    };
+    format!("test startup observations: stage={last_stage}; owner={owner}; endpoint={endpoint}")
+}
+
 /// Internal process entry used by both the ordinary executable and native
 /// fixtures. Paths arrive as native OS arguments so non-UTF-8 names survive.
 pub async fn service_entry(arguments: impl IntoIterator<Item = OsString>) -> Result<()> {
@@ -357,8 +438,21 @@ pub async fn attach_or_start(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    #[cfg(feature = "test-support")]
+    let mut startup_diagnostic = fixture_startup_stages_enabled()
+        .then(|| tempfile::tempfile_in(&options.data_dir))
+        .transpose()
+        .context("create private test startup diagnostic")?;
+    #[cfg(feature = "test-support")]
+    let child_stderr = startup_diagnostic
+        .as_ref()
+        .map(File::try_clone)
+        .transpose()
+        .context("reopen private test startup diagnostic")?;
+    #[cfg(not(feature = "test-support"))]
+    let child_stderr = None;
     let mut child = ServiceProcess::new(
-        spawn_service(options, project, executable, None)
+        spawn_service(options, project, executable, child_stderr)
             .await
             .context("spawn elected memory service owner")?,
     );
@@ -382,10 +476,14 @@ pub async fn attach_or_start(
         if let Some(status) = child.try_wait()? {
             bail!("memory service exited before readiness: {status}");
         }
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "memory service readiness deadline exceeded"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            #[cfg(feature = "test-support")]
+            if let Some(diagnostic) = &mut startup_diagnostic {
+                let observations = fixture_startup_observations(options, diagnostic);
+                bail!("memory service readiness deadline exceeded; {observations}");
+            }
+            bail!("memory service readiness deadline exceeded");
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -552,6 +650,12 @@ async fn spawn_service(
             .environment
             .push(("LLVM_PROFILE_FILE".into(), profile));
     }
+    #[cfg(feature = "test-support")]
+    if fixture_startup_stages_enabled() {
+        command
+            .environment
+            .push((STARTUP_STAGE_DIAGNOSTIC_ENV.into(), OsString::from("1")));
+    }
     command
         .spawn()
         .await
@@ -701,6 +805,9 @@ impl ServiceOwner {
         )?
         .context("project already has a memory service owner; wait for its validated endpoint")?;
         lock.verify()?;
+        #[cfg(feature = "test-support")]
+        let store = open_owner_store_with_fixture_stages(options.clone()).await?;
+        #[cfg(not(feature = "test-support"))]
         let store = crate::store::MemoryStore::open(options.clone()).await?;
         let prepared = async {
             let (listener, address) =

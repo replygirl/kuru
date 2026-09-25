@@ -2755,7 +2755,12 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     .unwrap();
 
     let cold_started = std::time::Instant::now();
-    let cold = env.run(&["run", "cold memory", "--json"]);
+    let cold = env
+        .command()
+        .env("KURU_TEST_MEMORY_STARTUP_STAGES", "1")
+        .args(["run", "cold memory", "--json"])
+        .output()
+        .unwrap();
     let cold_elapsed = cold_started.elapsed();
     assert!(
         cold.status.success(),
@@ -2922,7 +2927,12 @@ fn cli_imports_a_real_legacy_wal_without_changing_its_layout() {
     let original_wal = std::fs::read(&wal_path).unwrap();
     assert!(env.data.join("memory.sqlite3-shm").is_file());
 
-    let output = env.run(&["sessions"]);
+    let output = env
+        .command()
+        .env("KURU_TEST_MEMORY_STARTUP_STAGES", "1")
+        .arg("sessions")
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",
