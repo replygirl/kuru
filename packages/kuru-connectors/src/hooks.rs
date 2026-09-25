@@ -1099,7 +1099,7 @@ mod tests {
             ..LifecycleHooks::default()
         };
         let timed = Arc::new(HookHost::new(directory, timeout_hooks));
-        let pending = tokio::spawn({
+        let run = {
             let timed = Arc::clone(&timed);
             async move {
                 let budget = timed.budget();
@@ -1115,26 +1115,31 @@ mod tests {
                     )
                     .await
             }
-        });
-        let observed_start = tokio::time::timeout(Duration::from_secs(8), async {
-            while !started.exists() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
+        };
+        let observe = async {
+            let observed_start = tokio::time::timeout(Duration::from_secs(8), async {
+                while !started.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            let held_lock = observed_start.is_ok()
+                && std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock)
+                    .is_err();
+            (observed_start, held_lock)
+        };
+        let (refused, (observed_start, held_lock)) = tokio::join!(run, observe);
         assert!(
             observed_start.is_ok(),
             "owned hook did not start before its timeout"
         );
         assert!(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&lock)
-                .is_err(),
+            held_lock,
             "owned hook did not hold its exclusive file handle"
         );
-        let refused = pending.await.unwrap();
         assert!(refused.outcome.is_err());
         assert_eq!(refused.observations.len(), 1);
         assert_eq!(refused.observations[0].outcome, HookOutcomeKind::Failed);
