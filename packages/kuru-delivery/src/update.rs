@@ -758,8 +758,23 @@ pub async fn replace_running(
     version: &str,
     helper_cache: &Path,
 ) -> Result<UpdateOutcome> {
-    let bytes =
-        crate::archive::verified_binary(base, version, crate::archive::host_target()?).await?;
+    let target = crate::archive::host_target()?;
+    let (bytes, support) = crate::archive::verified_release(base, version, target).await?;
+    if let Some(files) = &support {
+        let mut running =
+            current_image().context("verify the loaded updater before support staging")?;
+        let current = running.path().to_owned();
+        let parent = current
+            .parent()
+            .context("loaded updater has no installation directory")?;
+        ensure!(
+            current.file_name() == Some(OsStr::new("kuru.exe")),
+            "running updater must be installed as kuru.exe"
+        );
+        let _ = image(running.file_mut())?;
+        crate::shell_support::install_versioned(files, parent, version, target)
+            .context("shell support could not be staged; executable unchanged")?;
+    }
     replace_bytes(&bytes, helper_cache).await
 }
 

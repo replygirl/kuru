@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use kuru_connectors::permissions::{PermissionBinding, PermissionService};
 use kuru_connectors::{
     CheckpointStore, McpAvailability, McpCatalogStore, McpCredentialStore, McpStatus, Provider,
@@ -91,6 +91,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Print shell completions derived from the current command tree.
+    Completions {
+        shell: CompletionShell,
+    },
+    /// Print the current command manual in roff format.
+    Man,
     /// Execute a prompt without the terminal UI.
     Run {
         prompt: String,
@@ -167,6 +173,77 @@ pub enum Command {
         #[command(subcommand)]
         command: TrustCommand,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    #[value(name = "powershell")]
+    PowerShell,
+}
+
+impl CompletionShell {
+    fn generator(self) -> clap_complete::Shell {
+        match self {
+            Self::Bash => clap_complete::Shell::Bash,
+            Self::Zsh => clap_complete::Shell::Zsh,
+            Self::Fish => clap_complete::Shell::Fish,
+            Self::PowerShell => clap_complete::Shell::PowerShell,
+        }
+    }
+}
+
+const SHELL_SUPPORT_OUTPUT_LIMIT: usize = 512 * 1024;
+
+fn shell_support_output(command: &Command) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    match command {
+        Command::Completions { shell } => {
+            clap_complete::generate(shell.generator(), &mut Cli::command(), "kuru", &mut output);
+        }
+        Command::Man => {
+            let mut tree = Cli::command().disable_help_subcommand(true);
+            tree.build();
+            clap_mangen::Man::new(tree.clone()).render(&mut output)?;
+
+            fn append_subcommands(
+                parent: &clap::Command,
+                names: &mut Vec<String>,
+                output: &mut Vec<u8>,
+            ) -> Result<()> {
+                for child in parent
+                    .get_subcommands()
+                    .filter(|child| !child.is_hide_set())
+                {
+                    names.push(child.get_name().to_owned());
+                    let mut heading = clap_mangen::roff::Roff::default();
+                    let title = format!("KURU {}", names.join(" ").to_uppercase());
+                    heading.control("SH", [title.as_str()]);
+                    heading.to_writer(output)?;
+
+                    let manual = clap_mangen::Man::new(child.clone());
+                    manual.render_synopsis_section(output)?;
+                    manual.render_description_section(output)?;
+                    if child.get_arguments().next().is_some() {
+                        manual.render_options_section(output)?;
+                    }
+                    append_subcommands(child, names, output)?;
+                    names.pop();
+                }
+                Ok(())
+            }
+
+            append_subcommands(&tree, &mut Vec::new(), &mut output)?;
+        }
+        _ => bail!("shell-support output requires a generation command"),
+    }
+    ensure!(
+        !output.is_empty() && output.len() <= SHELL_SUPPORT_OUTPUT_LIMIT,
+        "generated shell support exceeds its bounded output limit"
+    );
+    Ok(output)
 }
 
 #[derive(Debug, Subcommand)]
@@ -845,6 +922,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
 }
 
 async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
+    if let Some(command @ (Command::Completions { .. } | Command::Man)) = &cli.command {
+        io::stdout().write_all(&shell_support_output(command)?)?;
+        return Ok(());
+    }
     if let Some(Command::Update {
         version,
         release_base,
@@ -1766,7 +1847,9 @@ fn command_claim_categories(
             Category::ProjectCommands,
         ],
         Some(
-            Command::Login { .. }
+            Command::Completions { .. }
+            | Command::Man
+            | Command::Login { .. }
             | Command::Logout
             | Command::Config
             | Command::Update { .. }

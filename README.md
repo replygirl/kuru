@@ -1,5 +1,7 @@
 # Kuru
 
+<!-- kuru-shell-support-format: 1 -->
+
 A Rust terminal chat harness whose native architecture is a pool of persistent
 peers. Each part has private memory, can address any other part, and can form a
 temporary relationship with its own speaking identity and durable history.

@@ -113,7 +113,11 @@ run = "mise run tool -- repo --root ."
 [tasks.package]
 run = "mise run tool -- package"
 
+[tasks."package:shell-support"]
+run = "mise run tool -- package-shell-support"
+
 [tasks."test:install"]
+env.RUST_TEST_THREADS = "2"
 run = [
   "cargo test -p kuru-delivery --all-features --locked archive::tests",
   "cargo test -p kuru-delivery --all-features --locked --test bootstrap_install",

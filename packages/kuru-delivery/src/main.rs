@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
-use kuru_delivery::{advisory, archive, bundle, coverage, docs, published_windows, repo};
+use kuru_delivery::{
+    advisory, archive, bundle, coverage, docs, published_windows, repo, shell_support,
+};
 use std::{ffi::OsString, path::PathBuf};
 
 #[derive(Parser)]
@@ -51,6 +53,17 @@ enum Command {
     Package {
         #[arg(long)]
         binary: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long, default_value = "dist")]
+        output: PathBuf,
+    },
+    /// Package the five generated shell/man files for one native target.
+    PackageShellSupport {
+        #[arg(long)]
+        input: PathBuf,
         #[arg(long)]
         target: String,
         #[arg(long)]
@@ -455,6 +468,17 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 archive::package(&binary, &target, &version, &output)?.display()
+            );
+        }
+        Command::PackageShellSupport {
+            input,
+            target,
+            version,
+            output,
+        } => {
+            println!(
+                "{}",
+                shell_support::package(&input, &target, &version, &output)?.display()
             );
         }
         Command::VerifyPublishedWindows {

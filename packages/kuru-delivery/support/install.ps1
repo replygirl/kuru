@@ -389,25 +389,33 @@ public static class Native {
     }
     static readonly uint[] CrcTable = MakeCrcTable();
     static uint[] MakeCrcTable() { uint[] table = new uint[256]; for (uint n = 0; n < 256; n++) { uint c = n; for (int k = 0; k < 8; k++) c = (c & 1) != 0 ? 0xedb88320 ^ (c >> 1) : c >> 1; table[n] = c; } return table; }
-    public static byte[] Executable(byte[] bytes) {
-        Require(bytes.Length <= Limit && bytes.Length >= 22, "ZIP exceeds bounds or is truncated");
+    public static Dictionary<string,byte[]> Members(byte[] bytes, bool support) {
+        int limit = support ? 4 * 1024 * 1024 : Limit;
+        int memberLimit = support ? 512 * 1024 : Limit;
+        string[] allowed = support
+            ? new string[]{"completions/kuru.bash","completions/_kuru","completions/kuru.fish","completions/kuru.ps1","man/kuru.1"}
+            : new string[]{"kuru.exe","LICENSE","README.md"};
+        int expectedCount = allowed.Length;
+        Require(bytes.Length <= limit && bytes.Length >= 22, "ZIP exceeds bounds or is truncated");
         int end = bytes.Length - 22;
-        Require(U32(bytes,end) == 0x06054b50 && U16(bytes,end+4) == 0 && U16(bytes,end+6) == 0 && U16(bytes,end+8) == 3 && U16(bytes,end+10) == 3 && U16(bytes,end+20) == 0, "ZIP must have exactly three members, one disk and no trailer");
+        Require(U32(bytes,end) == 0x06054b50 && U16(bytes,end+4) == 0 && U16(bytes,end+6) == 0 && U16(bytes,end+8) == expectedCount && U16(bytes,end+10) == expectedCount && U16(bytes,end+20) == 0, "ZIP has the wrong member count, disk or trailer");
         uint centralValue = U32(bytes,end+16), sizeValue = U32(bytes,end+12);
         Require((ulong)centralValue + sizeValue == (ulong)end, "ZIP central bounds disagree");
         int central = checked((int)centralValue), cursor = central; long total = 0;
         HashSet<string> names = new HashSet<string>(StringComparer.Ordinal); List<Record> records = new List<Record>();
-        for (int index = 0; index < 3; index++) {
+        for (int index = 0; index < expectedCount; index++) {
             Require(U32(bytes,cursor) == 0x02014b50 && bytes[cursor+5] == 3 && (U16(bytes,cursor+6) == 10 || U16(bytes,cursor+6) == 20), "unsupported ZIP header or creator");
             Require(U16(bytes,cursor+8) == 0 && U16(bytes,cursor+30) == 0 && U16(bytes,cursor+32) == 0 && U16(bytes,cursor+34) == 0 && U16(bytes,cursor+36) == 0, "ZIP flags, extra fields or comments are forbidden");
             int length = U16(bytes,cursor+28); Require(cursor <= end - 46 - length, "truncated ZIP name");
             string name = Encoding.ASCII.GetString(bytes,cursor+46,length);
-            Require((name == "kuru.exe" || name == "LICENSE" || name == "README.md") && names.Add(name), "ZIP inventory must be exactly kuru.exe, LICENSE and README.md without duplicates");
-            uint expectedMode = name == "kuru.exe" ? 0x81ed0000u : 0x81a40000u;
+            Require(Array.IndexOf(allowed,name) >= 0 && names.Add(name), support ? "shell-support ZIP inventory must be exactly five support files without duplicates" : "ZIP inventory must be exactly kuru.exe, LICENSE and README.md without duplicates");
+            uint expectedMode = !support && name == "kuru.exe" ? 0x81ed0000u : 0x81a40000u;
             Require(U32(bytes,cursor+38) == expectedMode, "ZIP entry is not a regular file with the expected mode");
             Record record = new Record(); record.name = name; record.offset = checked((int)U32(bytes,cursor+42)); record.method = U16(bytes,cursor+10); record.crc = U32(bytes,cursor+16); record.compressed = checked((int)U32(bytes,cursor+20)); record.expanded = checked((int)U32(bytes,cursor+24));
-            Require((record.method == 0 || record.method == 8) && record.compressed <= Limit && record.expanded <= Limit && (record.method != 0 || record.compressed == record.expanded), "ZIP compression or member size is invalid");
-            total += record.expanded; Require(total <= Limit, "expanded ZIP exceeds limit");
+            Require((record.method == 0 || record.method == 8) && record.compressed <= limit && record.expanded <= memberLimit && (record.method != 0 || record.compressed == record.expanded), "ZIP compression or member size is invalid");
+            if (support) Require(record.expanded > 0, "shell-support ZIP member is empty");
+            if (name == "README.md") Require(record.expanded <= 65536, "release README exceeds size limit");
+            total += record.expanded; Require(total <= limit, "expanded ZIP exceeds limit");
             Require(U32(bytes,record.offset) == 0x04034b50 && U16(bytes,record.offset+26) == length && U16(bytes,record.offset+28) == 0, "invalid ZIP local header");
             for (int n = 0; n < 22; n++) Require(bytes[record.offset+4+n] == bytes[cursor+6+n], "ZIP local metadata disagrees");
             for (int n = 0; n < length; n++) Require(bytes[record.offset+30+n] == bytes[cursor+46+n], "ZIP local names disagree");
@@ -415,7 +423,7 @@ public static class Native {
         }
         Require(cursor == end, "unaccounted ZIP central bytes");
         records.Sort(delegate(Record a, Record b) { return a.offset.CompareTo(b.offset); });
-        int next = 0; byte[] executable = null;
+        int next = 0; Dictionary<string,byte[]> outputFiles = new Dictionary<string,byte[]>(StringComparer.Ordinal);
         foreach (Record record in records) {
             Require(record.offset == next, "unaccounted or overlapping ZIP physical records"); next = checked(record.start + record.compressed);
             if(record.method==8) DeflateFrame(bytes,record);
@@ -427,11 +435,64 @@ public static class Native {
                 byte[] value = output.ToArray(); uint crc = UInt32.MaxValue;
                 foreach (byte item in value) crc = CrcTable[(crc ^ item) & 255] ^ (crc >> 8);
                 Require((crc ^ UInt32.MaxValue) == record.crc, "ZIP member CRC mismatch");
-                if (record.name == "kuru.exe") executable = value;
+                outputFiles.Add(record.name,value);
             }
         }
-        Require(next == central && executable != null && executable.Length > 0, "ZIP executable is absent or physical bytes are unaccounted");
-        Pe(executable); return executable;
+        Require(next == central && outputFiles.Count == expectedCount, "ZIP members are absent or physical bytes are unaccounted");
+        if (!support) { Require(outputFiles["kuru.exe"].Length > 0, "ZIP executable is empty"); Pe(outputFiles["kuru.exe"]); }
+        return outputFiles;
+    }
+    public static byte[] Executable(byte[] bytes) { return Members(bytes,false)["kuru.exe"]; }
+    public static bool RequiresSupport(byte[] readme) {
+        Require(readme.Length <= 65536, "release README exceeds size limit");
+        string text = new UTF8Encoding(false,true).GetString(readme);
+        Require(text.IndexOf('\0') < 0, "release README contains NUL bytes");
+        string[] lines = text.Split('\n'); int count = 0;
+        for (int i=0;i<lines.Length;i++) {
+            if (lines[i].IndexOf("kuru-shell-support-format",StringComparison.Ordinal) < 0) continue;
+            Require(i < 64 && lines[i] == "<!-- kuru-shell-support-format: 1 -->", "release README has an invalid shell-support marker");
+            count++; Require(count == 1, "release README has duplicate shell-support markers");
+        }
+        return count == 1;
+    }
+    static void ExactChildren(DirectoryLease parent, string[] expected) {
+        parent.Verify(); HashSet<string> names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string path in Directory.GetFileSystemEntries(parent.Path)) {
+            string name = System.IO.Path.GetFileName(path);
+            Require(Array.IndexOf(expected,name) >= 0 && names.Add(name), "shell-support destination has unexpected entries");
+        }
+        Require(names.Count == expected.Length, "shell-support destination is incomplete");
+        parent.Verify();
+    }
+    public static void PublishSupport(DirectoryLease install, string version, string target, Dictionary<string,byte[]> files) {
+        install.Verify(); Component(version); Component(target);
+        Require(files.Count == 5, "shell-support set is incomplete");
+        using (DirectoryLease share = new DirectoryLease(install.Child("share"),true,true))
+        using (DirectoryLease kuru = new DirectoryLease(share.Child("kuru"),true,true))
+        using (DirectoryLease release = new DirectoryLease(kuru.Child(version),true,true))
+        using (DirectoryLease selected = new DirectoryLease(release.Child(target),true,true))
+        using (DirectoryLease completions = new DirectoryLease(selected.Child("completions"),true,true))
+        using (DirectoryLease man = new DirectoryLease(selected.Child("man"),true,true)) {
+            string[] names={"completions/kuru.bash","completions/_kuru","completions/kuru.fish","completions/kuru.ps1","man/kuru.1"};
+            foreach (string name in names) {
+                byte[] bytes; Require(files.TryGetValue(name,out bytes) && bytes.Length > 0 && bytes.Length <= 512*1024, "shell-support member is missing or oversized");
+                bool manual=name.StartsWith("man/",StringComparison.Ordinal);
+                DirectoryLease directory=manual?man:completions;
+                string path=directory.Child(name.Substring(name.IndexOf('/')+1));
+                directory.Verify();
+                if (Exists(path)) {
+                    using (FileLease old = new FileLease(path,true,false,3)) Require(ReadBytes(old,512*1024).Length == bytes.Length && FileHash(old) == Hash(bytes), "retained shell-support member differs from verified archive");
+                } else {
+                    using (FileLease write = new FileLease(path,true,true,4)) { write.Stream.Write(bytes,0,bytes.Length); write.Stream.Flush(true); }
+                    using (FileLease checkedFile = new FileLease(path,true,false,3)) Require(checkedFile.Stream.Length == bytes.Length && FileHash(checkedFile) == Hash(bytes), "shell-support publication did not settle");
+                }
+                directory.Verify();
+            }
+            ExactChildren(selected,new string[]{"completions","man"});
+            ExactChildren(completions,new string[]{"kuru.bash","_kuru","kuru.fish","kuru.ps1"});
+            ExactChildren(man,new string[]{"kuru.1"});
+            install.Verify();
+        }
     }
     public static void Pe(byte[] value) {
         Require(value.Length >= 64 && value[0] == 'M' && value[1] == 'Z', "release executable is not PE");
@@ -628,7 +689,24 @@ try {
         if ([Kuru.Bootstrap.Native]::Hash($archive) -cne $chosen[0].hash) { throw 'Release archive checksum mismatch; existing executable unchanged.' }
         Write-Verbose 'Kuru bootstrap phase: release archive verified'
         Write-Output 'Verifying Kuru release archive.'
-        $payload = [Kuru.Bootstrap.Native]::Executable($archive)
+        $core = [Kuru.Bootstrap.Native]::Members($archive, $false)
+        $payload = $core['kuru.exe']
+        $requiresSupport = [Kuru.Bootstrap.Native]::RequiresSupport($core['README.md'])
+        if ($requiresSupport) {
+            $supportName = "kuru-$Version-x86_64-pc-windows-msvc-shell-support.zip"
+            $supportMatches = @()
+            foreach ($line in ($manifest -split "`n")) {
+                $line = $line.TrimEnd("`r")
+                if (-not $line) { continue }
+                if ($line -cnotmatch '^([0-9a-fA-F]{64}) [ *]([^\s]+)$') { throw 'Malformed checksum manifest.' }
+                if ($Matches[2] -ceq $supportName) { $supportMatches += $Matches[1].ToLowerInvariant() }
+            }
+            if ($supportMatches.Count -ne 1) { throw 'Checksum manifest must name the paired shell-support archive exactly once; existing executable unchanged.' }
+            $supportArchive = [Kuru.Bootstrap.Native]::Fetch($ReleaseBase, $supportName, 4 * 1024 * 1024)
+            if ([Kuru.Bootstrap.Native]::Hash($supportArchive) -cne $supportMatches[0]) { throw 'Shell-support archive checksum mismatch; existing executable unchanged.' }
+            $supportFiles = [Kuru.Bootstrap.Native]::Members($supportArchive, $true)
+            [Kuru.Bootstrap.Native]::PublishSupport($parent, $Version, 'x86_64-pc-windows-msvc', $supportFiles)
+        }
         Write-Verbose 'Kuru bootstrap phase: release archive validated'
         $stage = [Kuru.Bootstrap.Native+DirectoryLease]::new($parent.Child(".kuru-install-$([Guid]::NewGuid().ToString('D'))"), $true, $true)
         Write-Verbose 'Kuru bootstrap phase: installation stage opened'

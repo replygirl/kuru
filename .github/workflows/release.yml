@@ -171,8 +171,15 @@ jobs:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: |
           mise run //apps/kuru-tui:build:release -- --target "$RELEASE_TARGET"
-          test "$("target/$RELEASE_TARGET/release/kuru" --version)" = "kuru $RELEASE_VERSION"
-          mise run package -- --binary "target/$RELEASE_TARGET/release/kuru" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
+          binary="$PWD/target/$RELEASE_TARGET/release/kuru"
+          test "$("$binary" --version)" = "kuru $RELEASE_VERSION"
+          before="$(openssl dgst -sha256 "$binary")"
+          export KURU_SHELL_SUPPORT_BINARY="$binary"
+          export KURU_SHELL_SUPPORT_OUTPUT="$RUNNER_TEMP/kuru-shell-support-$RELEASE_TARGET"
+          mise run //apps/kuru-tui:shell-support:generate
+          mise run package -- --binary "$binary" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
+          mise run //packages/kuru-delivery:package:shell-support -- --input "$KURU_SHELL_SUPPORT_OUTPUT" --target "$RELEASE_TARGET" --version "$RELEASE_VERSION"
+          test "$before" = "$(openssl dgst -sha256 "$binary")"
       - name: Build and package native Windows executable
         if: runner.os == 'Windows'
         shell: pwsh
@@ -182,11 +189,19 @@ jobs:
         run: |
           mise run //apps/kuru-tui:build:release -- --target $env:RELEASE_TARGET
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
-          $binary = "target/$env:RELEASE_TARGET/release/kuru.exe"
+          $binary = (Resolve-Path "target/$env:RELEASE_TARGET/release/kuru.exe").Path
           $version = & $binary --version
           if ($LASTEXITCODE -ne 0 -or $version -ne "kuru $env:RELEASE_VERSION") { throw 'Release version mismatch' }
+          $before = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash
+          $env:KURU_SHELL_SUPPORT_BINARY = $binary
+          $env:KURU_SHELL_SUPPORT_OUTPUT = Join-Path $env:RUNNER_TEMP "kuru-shell-support-$env:RELEASE_TARGET"
+          mise run //apps/kuru-tui:shell-support:generate
+          if ($LASTEXITCODE -ne 0) { throw 'Shell support generation failed' }
           mise run package -- --binary $binary --target $env:RELEASE_TARGET --version $env:RELEASE_VERSION
           if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed' }
+          mise run //packages/kuru-delivery:package:shell-support -- --input $env:KURU_SHELL_SUPPORT_OUTPUT --target $env:RELEASE_TARGET --version $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Shell support packaging failed' }
+          if ($before -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash) { throw 'Release binary changed during support generation' }
       - name: Verify packaged offline runtime
         env:
           KURU_EMBEDDED_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/kuru${{ runner.os == 'Windows' && '.exe' || '' }}

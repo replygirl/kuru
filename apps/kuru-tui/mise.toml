@@ -30,6 +30,11 @@ depends = [
 run = 'cargo build -p kuru --release --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
 run_windows = 'cargo build -p kuru --release --locked --target {% if usage.target == "host" %}x86_64-pc-windows-msvc{% else %}"%usage_target%"{% endif %}'
 
+[tasks."shell-support:generate"]
+description = "Generate the selected release binary's exact shell and man files into a new private output directory"
+run = "bash support/generate-shell-support.sh"
+run_windows = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/generate-shell-support.ps1"
+
 [tasks."test"]
 env.RUST_TEST_THREADS = "2"
 env.KURU_TEST_SUPERVISOR_PREPARED = "1"

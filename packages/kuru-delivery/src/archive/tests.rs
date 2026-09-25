@@ -4,6 +4,19 @@ use crate::command::BlockingCommand as Command;
 mod files;
 use files::symlink;
 
+#[test]
+fn shell_support_marker_is_strict_without_rejecting_historical_readmes() {
+    assert!(!shell_support_marker(b"# Historical Kuru\n").unwrap());
+    assert!(shell_support_marker(format!("# Kuru\n{SHELL_SUPPORT_MARKER}\n").as_bytes()).unwrap());
+    for readme in [
+        "# Kuru\n<!-- kuru-shell-support-format: 2 -->\n",
+        "# Kuru\n<!-- kuru-shell-support-format: 1 -->\n<!-- kuru-shell-support-format: 1 -->\n",
+        "# Kuru\n<!-- kuru-shell-support-format: 1 --> extra\n",
+    ] {
+        assert!(shell_support_marker(readme.as_bytes()).is_err());
+    }
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     releases: PathBuf,
@@ -188,7 +201,7 @@ async fn duplicate_entries_and_missing_binary_are_rejected() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("exactly one")
+            .contains("exactly three members")
     );
     fixture.unchanged();
 }
@@ -312,6 +325,25 @@ async fn packager_roundtrip_is_reproducible_and_includes_documentation() {
         fixture.releases.join("SHA256SUMS"),
     )
     .unwrap();
+    let generated = fixture._root.path().join("generated support");
+    fs::create_dir_all(generated.join("completions")).unwrap();
+    fs::create_dir_all(generated.join("man")).unwrap();
+    for name in crate::shell_support::NAMES {
+        fs::write(generated.join(name), format!("generated {name}\n")).unwrap();
+    }
+    let support =
+        crate::shell_support::package(&generated, TARGETS[0], "0.2.0", &fixture.releases).unwrap();
+    let support_sum = fs::read_to_string(fixture.releases.join(format!(
+        "{}.sha256",
+        support.file_name().unwrap().to_str().unwrap()
+    )))
+    .unwrap();
+    let core_sum = fs::read_to_string(fixture.releases.join("SHA256SUMS")).unwrap();
+    fs::write(
+        fixture.releases.join("SHA256SUMS"),
+        format!("{core_sum}{support_sum}"),
+    )
+    .unwrap();
     let installed = install(
         fixture.releases.to_str().unwrap(),
         "0.2.0",
@@ -341,6 +373,102 @@ async fn packager_roundtrip_is_reproducible_and_includes_documentation() {
             PathBuf::from("LICENSE"),
             PathBuf::from("README.md")
         ]
+    );
+}
+
+#[tokio::test]
+async fn marked_core_requires_exact_paired_support_before_executable_replacement() {
+    let fixture = Fixture::new();
+    let binary = fixture._root.path().join("new-kuru");
+    files::executable(&binary, b"#!/bin/sh\nprintf new\n");
+    let archive = package(&binary, TARGETS[0], "0.8.0", &fixture.releases).unwrap();
+    let core_name = archive.file_name().unwrap().to_str().unwrap();
+    let core_sum =
+        fs::read_to_string(fixture.releases.join(format!("{core_name}.sha256"))).unwrap();
+    fs::write(fixture.releases.join("SHA256SUMS"), &core_sum).unwrap();
+    let base = fixture.releases.to_str().unwrap();
+    assert!(
+        install(base, "0.8.0", &fixture.destination, Some(TARGETS[0]))
+            .await
+            .is_err()
+    );
+    fixture.unchanged();
+
+    let generated = fixture._root.path().join("generated");
+    fs::create_dir_all(generated.join("completions")).unwrap();
+    fs::create_dir_all(generated.join("man")).unwrap();
+    for name in crate::shell_support::NAMES {
+        fs::write(generated.join(name), format!("generated {name}\n")).unwrap();
+    }
+    let support =
+        crate::shell_support::package(&generated, TARGETS[0], "0.8.0", &fixture.releases).unwrap();
+    let support_name = support.file_name().unwrap().to_str().unwrap();
+    let support_sum =
+        fs::read_to_string(fixture.releases.join(format!("{support_name}.sha256"))).unwrap();
+    fs::write(
+        fixture.releases.join("SHA256SUMS"),
+        format!("{core_sum}{support_sum}"),
+    )
+    .unwrap();
+    let installed = install(base, "0.8.0", &fixture.destination, Some(TARGETS[0]))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(installed).unwrap(), fs::read(&binary).unwrap());
+    let snapshot = fixture
+        .destination
+        .join(format!("share/kuru/0.8.0/{}/man/kuru.1", TARGETS[0]));
+    assert_eq!(
+        fs::read(&snapshot).unwrap(),
+        fs::read(generated.join("man/kuru.1")).unwrap()
+    );
+    assert_eq!(
+        fs::read(fixture.destination.join("share/man/man1/kuru.1")).unwrap(),
+        fs::read(generated.join("man/kuru.1")).unwrap()
+    );
+
+    // A failed stable-man publication is a partial install after the new
+    // executable settles. Keep the obstruction intact and allow an explicit
+    // retry to finish support publication without claiming cross-file atomicity.
+    files::executable(&binary, b"#!/bin/sh\nprintf newer\n");
+    let updated = package(&binary, TARGETS[0], "0.8.0", &fixture.releases).unwrap();
+    let updated_sum = fs::read_to_string(fixture.releases.join(format!(
+        "{}.sha256",
+        updated.file_name().unwrap().to_str().unwrap()
+    )))
+    .unwrap();
+    fs::write(
+        fixture.releases.join("SHA256SUMS"),
+        format!("{updated_sum}{support_sum}"),
+    )
+    .unwrap();
+    let stable_man = fixture.destination.join("share/man/man1/kuru.1");
+    fs::remove_file(&stable_man).unwrap();
+    fs::create_dir(&stable_man).unwrap();
+    let error = install(base, "0.8.0", &fixture.destination, Some(TARGETS[0]))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("executable installed, but stable man page publication is incomplete"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fs::read(fixture.destination.join("kuru")).unwrap(),
+        fs::read(&binary).unwrap()
+    );
+    assert!(stable_man.is_dir());
+    assert_eq!(
+        fs::read(&snapshot).unwrap(),
+        fs::read(generated.join("man/kuru.1")).unwrap()
+    );
+    fs::remove_dir(&stable_man).unwrap();
+    install(base, "0.8.0", &fixture.destination, Some(TARGETS[0]))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read(stable_man).unwrap(),
+        fs::read(generated.join("man/kuru.1")).unwrap()
     );
 }
 
