@@ -190,7 +190,20 @@ remain unrun on this lineage.
 - The first capacity test attempt failed because an outer `anyhow` context hid the inner capacity error in `to_string`; the assertion now prints the full chain and the corrected test passed. The first Rust format check after CLI assertions found one long line, which was corrected. Final Rust formatting, `git diff --check`, and strict Cospec validation passed (0 warnings).
 - The first privacy fixture revision tried to open a second writable Dolt owner after normal CLI processes had left their managed service alive. Its startup timed out before assertions. Moving the private fixture writes before the first CLI process gave that setup its own complete lifecycle; the corrected test passed 1/1. It did not change application code.
 - Memory, runtime and TUI owning all-target typechecks and Clippy tasks passed on the final adjusted source. The first lint attempts exposed enum layout and test-only lifetime/type warnings; each was corrected before the final passes.
-- Combined coverage on this exact final source, hosted Linux/Windows/macOS jobs and archive remain open. The critical rows still open above distinguish exact end-to-end interleavings/surfaces not proved by the focused local checks from those later repository gates.
+- The first normal pre-push combined-coverage run on the P11 branch failed in one
+  runtime fixture after 194/195 runtime library cases passed. The selected-source
+  fit-retry test still expected one public row after `observe_selection` began
+  settling a user and assistant pair; the actual `(history, public, notes)`
+  count was `(4, 2, 1)` against its stale `(4, 1, 1)` expectation. The adjacent
+  unbounded fixture already expected two. Only that assertion was corrected;
+  the measured window, retry count, omission and current-receipt checks remain.
+  The corrected focused real-Dolt test passed 1/1 in 9.91 seconds. Its first
+  sandboxed attempt could not reserve Dolt's private loopback port; the same
+  filtered test passed with process permission. The normal combined coverage
+  gate on the corrected source, hosted Linux/Windows/macOS jobs and archive
+  remain open. The critical rows still open above distinguish exact end-to-end
+  interleavings/surfaces not proved by the focused local checks from those
+  later repository gates.
 
 ## Open after this local checkpoint
 

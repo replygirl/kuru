@@ -446,7 +446,7 @@ async fn selected_sources_change_real_fit_retry_under_the_same_reserved_window()
                 observed.public_rows,
                 observed.note_rows
             ),
-            (4, 1, 1)
+            (4, 2, 1)
         );
     }
 }
