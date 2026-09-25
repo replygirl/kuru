@@ -49,7 +49,6 @@
       "Bash(gh run download:*)",
 
       "Bash(mise run:*)",
-      "Bash(mise exec:*)",
       "Bash(mise install:*)",
 
       "Bash(cargo build:*)",
@@ -78,6 +77,9 @@
       "Bash(gh workflow run:*)",
       "Bash(gh repo:*)",
       "Bash(mise run release:*)",
+      "Bash(mise run release:tool:*)",
+      "Bash(mise run release:version:*)",
+      "Bash(mise run release:set-version:*)",
       "Bash(mise run package:*)",
       "Bash(mise run tool:*)",
       "Bash(mise run //packages/kuru-delivery:release:*)",

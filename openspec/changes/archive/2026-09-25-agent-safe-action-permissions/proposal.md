@@ -14,12 +14,19 @@ one-time approval.
   covering read-only git/gh/mise inspection; everyday git mutations (add,
   commit, switch, checkout -b, branch, worktree add/remove/prune, fetch,
   pull/merge --ff-only, rebase, cherry-pick, stash); `git push` including
-  `--force-with-lease`; `gh pr`/`gh run` workflow commands; `mise run/exec/
+  `--force-with-lease`; `gh pr`/`gh run` workflow commands; `mise run/
   install`; and `cargo build/test/check/clippy/fmt/llvm-cov/tree/metadata`.
   Added explicit deny rules for plain force push, push to `main`, remote
   branch deletion, `git reset --hard`, `gh pr merge --admin`,
   `gh release create/delete/edit`, `gh workflow run`, `gh repo`, and the
-  kuru-delivery release/package/tool mise tasks.
+  kuru-delivery release/package/tool mise tasks (including the
+  `release:tool`/`release:version`/`release:set-version` root aliases).
+  `mise exec`/`mise x` was deliberately left off the allow list, even
+  though it was in the original ask: it runs an arbitrary command inside
+  mise's tool environment, so e.g. `mise exec -- git push --force origin
+  main` would match only the `mise exec` prefix and bypass every git deny
+  rule above — confirmed with `codex execpolicy check` and corrected
+  before this change was committed.
 - Added a new hand-authored Codex execpolicy rules file,
   `.codex/rules/agent-safe-actions.rules`, as a sibling of the
   cospec-managed `.codex/rules/cospec.rules`, mirroring the same scope with

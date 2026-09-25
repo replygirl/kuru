@@ -95,18 +95,24 @@ prefix_rule(pattern=["gh", "repo"], decision="forbidden")
 # this allowlists only the routine root tasks AGENTS.md documents
 # (`mise run build|build:release|run|format:fix|format:check|lint|test|
 # typecheck|coverage|test:install|lint:tooling|check|docs:dev|
-# docs:build|docs:preview|docs:check|setup`) plus `mise exec`/
-# `mise install` for tool provisioning. `mise run release`,
-# `release:tool`, `release:version`, `release:set-version`,
+# docs:build|docs:preview|docs:check|setup`) plus `mise install` for
+# tool provisioning. `mise run release`, `release:tool`,
+# `release:version`, `release:set-version`,
 # `//packages/kuru-delivery:release|package|tool`, and any
 # package-scoped task not listed here (e.g. `mise run
 # //packages/kuru-core:test`) are intentionally NOT pre-approved and
 # fall through to the default policy (prompt). Add specific
 # `//packages/<name>:<verb>` entries here if that friction becomes
 # common — do not switch this section to a blanket allow.
+#
+# `mise exec`/`mise x` is deliberately NOT pre-approved, even though it
+# was in the original ask: it runs an arbitrary command inside mise's
+# tool environment, so `mise exec -- git push --force origin main`
+# would match only the `["mise","exec"]` prefix and bypass every git
+# deny rule above (confirmed with `codex execpolicy check`). It stays a
+# one-time-approval command.
 
 prefix_rule(pattern=["mise", "run", ["build", "build:release", "run", "format:fix", "format:check", "lint", "test", "typecheck", "coverage", "test:install", "lint:tooling", "check", "docs:dev", "docs:build", "docs:preview", "docs:check", "setup"]], decision="allow")
-prefix_rule(pattern=["mise", "exec"], decision="allow")
 prefix_rule(pattern=["mise", "install"], decision="allow")
 
 # --- cargo ---
