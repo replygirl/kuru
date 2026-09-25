@@ -39,6 +39,7 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 | `/retry`                                     | Safely retry the last durably retained local submission                       |
 | `/cost`                                      | Show this session's reported usage and estimated API cost                     |
 | `/permissions`                               | Inspect session and saved tool grants                                         |
+| `/tools`                                     | Inspect built-in and effective MCP tool aliases and their current status      |
 | `/memory-status`                             | Inspect the project's memory store and current revision                       |
 | `/memory-history`                            | List committed memory revisions                                               |
 | `/dream`                                     | Run bounded consolidation                                                     |
@@ -79,7 +80,7 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru memory export`                                           | Export every application record from one committed active-memory snapshot                   |
 | `kuru dream`                                                   | Run explicit consolidation                                                                  |
 | `kuru undo-dream`                                              | Restore the previous topology change                                                        |
-| `kuru tools`                                                   | Discover built-in and configured MCP tools                                                  |
+| `kuru tools`                                                   | Inspect filtered tools and disabled/live/stale/degraded MCP aliases                         |
 | `kuru tool NAME --args '{}'`                                   | Invoke a tool with JSON arguments                                                           |
 | `kuru serve`                                                   | Start authenticated loopback [A2A ingress](./a2a)                                           |
 | `kuru update`                                                  | [Install an explicit release or source checkout](/guide/installation#update-deliberately)   |

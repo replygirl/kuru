@@ -3,6 +3,7 @@
 use kuru_memory::MemoryStore;
 
 use std::{
+    collections::BTreeMap,
     io::{self, Read, Write},
     path::PathBuf,
     process::Command,
@@ -23,7 +24,10 @@ use axum::{
     routing::{get, post},
 };
 use futures::stream;
-use kuru_core::{Config, Mode, ModeProfile, SelectionOverrides};
+use kuru_core::{
+    Config, McpConfig, Mode, ModeProfile, PermissionAction, PermissionRule, PermissionSelector,
+    SelectionOverrides,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{
@@ -1346,6 +1350,8 @@ fn smoke(sandbox: &Sandbox, reduced: bool, full: bool, expect_notice: bool) -> R
 
     if full {
         terminal.command("/help", None)?;
+        terminal.command("/tools", None)?;
+        terminal.wait_composer_frame(&["\"mcp\": []", "enter send"], READY_TIMEOUT)?;
         let resume = terminal.pause_for(Duration::from_secs(1))?;
         terminal.command("hello from a terminal", None)?;
         drop(resume);
@@ -1440,6 +1446,454 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+struct CatalogStdioPeer {
+    directory: tempfile::TempDir,
+    command: PathBuf,
+}
+
+impl CatalogStdioPeer {
+    fn new() -> Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("stdio_peer.rs");
+        let command = directory.path().join("stdio_peer");
+        std::fs::write(
+            &source,
+            include_str!("../../../packages/kuru-connectors/tests/fixtures/stdio_peer.rs"),
+        )?;
+        let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .args([
+                "--edition=2024",
+                "--forbid",
+                "unsafe_code",
+                "-C",
+                "opt-level=1",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&command)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "stdio MCP fixture failed to compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o500))?;
+        Ok(Self { directory, command })
+    }
+
+    fn plan(&self, text: &str) -> Result<()> {
+        std::fs::write(self.command.with_extension("plan"), text)?;
+        Ok(())
+    }
+
+    fn started(&self) -> Result<usize> {
+        Ok(std::fs::read_dir(self.directory.path())?
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "started")
+            })
+            .count())
+    }
+
+    fn requests(&self) -> Result<String> {
+        std::fs::read_dir(self.directory.path())?
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "requests")
+            })
+            .map(|entry| std::fs::read_to_string(entry.path()))
+            .collect::<std::io::Result<String>>()
+            .map_err(Into::into)
+    }
+}
+
+#[derive(Clone)]
+struct MixedCatalogState {
+    calls: Arc<Mutex<Vec<String>>>,
+    provider_receipts: Arc<Mutex<Vec<Value>>>,
+    issued: Arc<AtomicBool>,
+}
+
+fn mcp_response(alias: &str, request: &Value, state: &MixedCatalogState) -> Value {
+    let result = match request["method"].as_str() {
+        Some("initialize") => json!({
+            "protocolVersion":"2025-11-25",
+            "capabilities":{"tools":{}}
+        }),
+        Some("tools/list") => {
+            let tool = if alias == "live" { "effect" } else { "blocked" };
+            json!({"tools":[{
+                "name":tool,
+                "description":format!("{alias} integrated acceptance fixture"),
+                "inputSchema":{"type":"object","additionalProperties":false}
+            }]})
+        }
+        Some("tools/call") => {
+            state.calls.lock().unwrap().push(alias.to_owned());
+            json!({
+                "content":[{"type":"text","text":format!("{alias}-effect")}],
+                "isError":false
+            })
+        }
+        _ => json!({}),
+    };
+    json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+}
+
+async fn live_mcp(
+    State(state): State<MixedCatalogState>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    Json(mcp_response("live", &request, &state))
+}
+
+async fn denied_mcp(
+    State(state): State<MixedCatalogState>,
+    Json(request): Json<Value>,
+) -> Json<Value> {
+    Json(mcp_response("denied", &request, &state))
+}
+
+fn projected_mcp_name(alias: &str, tool: &str) -> String {
+    format!(
+        "mcp_{}",
+        uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("{alias}\0{tool}").as_bytes(),
+        )
+        .simple()
+    )
+}
+
+async fn mixed_catalog_complete(
+    State(state): State<MixedCatalogState>,
+    Json(request): Json<Value>,
+) -> Response {
+    let speaking = request["instructions"]
+        .as_str()
+        .is_some_and(|text| text.contains("Phase: speak and act"));
+    let receipts = request["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "function_call_output")
+        .cloned()
+        .collect::<Vec<_>>();
+    let output = if !speaking {
+        json!([{"type":"message","content":[{
+            "type":"output_text","text":"MCP_CATALOG_READY"
+        }]}])
+    } else if !receipts.is_empty() {
+        state
+            .provider_receipts
+            .lock()
+            .unwrap()
+            .clone_from(&receipts);
+        json!([{"type":"message","content":[{
+            "type":"output_text","text":"MCP_MIXED_FINAL"
+        }]}])
+    } else if !state.issued.swap(true, Ordering::SeqCst) {
+        let live = request["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|tool| {
+                tool["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("MCP live/effect"))
+            })
+            .and_then(|tool| tool["name"].as_str())
+            .expect("live MCP route must be advertised");
+        let stale = request["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|tool| {
+                tool["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("MCP stale/cached"))
+            })
+            .and_then(|tool| tool["name"].as_str())
+            .expect("stale MCP metadata must be advertised");
+        json!([
+            {"type":"function_call","call_id":"mixed-live","name":live,
+                "arguments":"{}"},
+            {"type":"function_call","call_id":"mixed-stale","name":stale,
+                "arguments":"{}"},
+            {"type":"function_call","call_id":"mixed-denied",
+                "name":projected_mcp_name("denied", "blocked"),"arguments":"{}"}
+        ])
+    } else {
+        json!([{"type":"message","content":[{
+            "type":"output_text","text":"MCP_UNEXPECTED_EXTRA_ROUND"
+        }]}])
+    };
+    (
+        [(CONTENT_TYPE, "text/event-stream")],
+        format!(
+            "data: {}\n\n",
+            json!({"type":"response.completed","response":{
+                "id":"mixed-catalog-response","status":"completed","output":output,
+                "usage":{"input_tokens":8,"output_tokens":5}
+            }})
+        ),
+    )
+        .into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_mcp_catalog_parity_and_mixed_call_batch_are_fail_closed() -> Result<()> {
+    const FIXTURE_SECRET: &str = "mcp-fixture-secret-must-not-render";
+    let sandbox = Sandbox::new()?;
+    kuru_platform::fs::Directory::ensure_private(&sandbox.data)?;
+    let stale = CatalogStdioPeer::new()?;
+    stale.plan(concat!(
+        "read\n",
+        "write {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}}}}\n",
+        "read\n",
+        "read\n",
+        "write {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"cached\",\"description\":\"stale fixture metadata\",\"inputSchema\":{\"type\":\"object\",\"additionalProperties\":false}}]}}\n",
+        "eof\n",
+    ))?;
+    let degraded = CatalogStdioPeer::new()?;
+    degraded.plan(concat!(
+        "read\n",
+        "write {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"degraded fixture\"}}\n",
+        "eof\n",
+    ))?;
+    let disabled = CatalogStdioPeer::new()?;
+    disabled.plan("eof\n")?;
+
+    let state = MixedCatalogState {
+        calls: Arc::new(Mutex::new(vec![])),
+        provider_receipts: Arc::new(Mutex::new(vec![])),
+        issued: Arc::new(AtomicBool::new(false)),
+    };
+    let app = Router::new()
+        .route("/mcp/live", post(live_mcp))
+        .route("/mcp/denied", post(denied_mcp))
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(mixed_catalog_complete))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+
+    let mut config = sandbox.config()?;
+    config.provider = "responses".into();
+    config.model = "fixture".into();
+    config.api_base = format!("http://{address}/v1");
+    config.api_key_env = "KURU_FIXTURE_KEY".into();
+    config.max_rounds = 2;
+    config.mcp = BTreeMap::from([
+        (
+            "degraded".into(),
+            McpConfig {
+                command: Some(degraded.command.to_string_lossy().into_owned()),
+                ..McpConfig::default()
+            },
+        ),
+        (
+            "denied".into(),
+            McpConfig {
+                url: Some(format!("http://{address}/mcp/denied")),
+                ..McpConfig::default()
+            },
+        ),
+        (
+            "disabled".into(),
+            McpConfig {
+                enabled: false,
+                command: Some(disabled.command.to_string_lossy().into_owned()),
+                ..McpConfig::default()
+            },
+        ),
+        (
+            "live".into(),
+            McpConfig {
+                url: Some(format!("http://{address}/mcp/live")),
+                ..McpConfig::default()
+            },
+        ),
+        (
+            "stale".into(),
+            McpConfig {
+                command: Some(stale.command.to_string_lossy().into_owned()),
+                ..McpConfig::default()
+            },
+        ),
+    ]);
+    config.permissions = vec![
+        PermissionRule {
+            action: PermissionAction::Allow,
+            selector: PermissionSelector::mcp("live", "effect")?,
+            path: None,
+        },
+        PermissionRule {
+            action: PermissionAction::Allow,
+            selector: PermissionSelector::mcp("stale", "cached")?,
+            path: None,
+        },
+        PermissionRule {
+            action: PermissionAction::Deny,
+            selector: PermissionSelector::mcp("denied", "blocked")?,
+            path: None,
+        },
+    ];
+    let config_path = sandbox.root.path().join("mixed-mcp.toml");
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+
+    let run_tools = || -> Result<std::process::Output> {
+        Ok(sandbox
+            .command("responses")
+            .args(["--model", "fixture", "--config"])
+            .arg(&config_path)
+            .args(["--trust-workspace-once", "tools"])
+            .env("KURU_FIXTURE_KEY", FIXTURE_SECRET)
+            .output()?)
+    };
+    let seed = run_tools()?;
+    ensure!(
+        seed.status.success(),
+        "initial MCP cache seed failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    stale.plan(concat!(
+        "read\n",
+        "write {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"stale fixture offline\"}}\n",
+        "eof\n",
+    ))?;
+
+    let inspected = run_tools()?;
+    ensure!(
+        inspected.status.success(),
+        "mixed MCP CLI inspection failed: {}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let catalog: Value = serde_json::from_slice(&inspected.stdout)?;
+    assert!(!String::from_utf8_lossy(&inspected.stdout).contains(FIXTURE_SECRET));
+    assert!(!String::from_utf8_lossy(&inspected.stderr).contains(FIXTURE_SECRET));
+    let statuses = catalog["mcp"]
+        .as_array()
+        .context("CLI tool catalog omitted MCP statuses")?
+        .iter()
+        .map(|status| {
+            (
+                status["alias"].as_str().unwrap().to_owned(),
+                status["availability"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        statuses,
+        BTreeMap::from([
+            ("degraded".into(), "degraded".into()),
+            ("denied".into(), "live".into()),
+            ("disabled".into(), "disabled".into()),
+            ("live".into(), "live".into()),
+            ("stale".into(), "stale".into()),
+        ])
+    );
+    let projected = catalog["tools"]
+        .as_array()
+        .context("CLI tool catalog omitted tools")?;
+    assert!(projected.iter().any(|tool| {
+        tool["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("MCP live/effect"))
+    }));
+    assert!(projected.iter().any(|tool| {
+        tool["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("MCP stale/cached (stale"))
+    }));
+    assert!(projected.iter().all(|tool| {
+        !tool["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("MCP denied/blocked"))
+    }));
+
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config_path)
+        .arg("--trust-workspace-once")
+        .env("KURU_FIXTURE_KEY", FIXTURE_SECRET)
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 50, 160)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command("/tools", None)?;
+    terminal.wait_composer_frame(
+        &[
+            "\"degraded\"",
+            "\"denied\"",
+            "\"disabled\"",
+            "\"live\"",
+            "\"stale\"",
+        ],
+        READY_TIMEOUT,
+    )?;
+    let tools_frame = terminal.screen();
+    assert!(!tools_frame.contains(FIXTURE_SECRET));
+    for (alias, availability) in &statuses {
+        let alias_marker = format!("\"alias\": \"{alias}\"");
+        let alias_start = tools_frame
+            .find(&alias_marker)
+            .with_context(|| format!("/tools omitted MCP alias {alias}: {tools_frame}"))?;
+        let after_alias = &tools_frame[alias_start + alias_marker.len()..];
+        let status_block =
+            &after_alias[..after_alias.find("\"alias\":").unwrap_or(after_alias.len())];
+        ensure!(
+            status_block.contains(&format!("\"availability\": \"{availability}\"")),
+            "/tools disagreed with CLI state for {alias}: {tools_frame}"
+        );
+    }
+    terminal.command("Exercise the mixed MCP batch", None)?;
+    terminal.wait_composer_frame(&["MCP_MIXED_FINAL", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()?;
+
+    assert_eq!(state.calls.lock().unwrap().as_slice(), ["live"]);
+    let receipts = state.provider_receipts.lock().unwrap();
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|item| item["call_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["mixed-live", "mixed-stale", "mixed-denied"]
+    );
+    let outputs = receipts
+        .iter()
+        .map(|item| item["output"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(outputs[0].contains("live-effect"), "{}", outputs[0]);
+    assert!(outputs[1].contains("MCP route failed"), "{}", outputs[1]);
+    assert!(outputs[2].contains("permission denied"), "{}", outputs[2]);
+    ensure!(
+        !stale.requests()?.contains("\"method\":\"tools/call\""),
+        "stale MCP received an effect request"
+    );
+    ensure!(
+        !degraded.requests()?.contains("\"method\":\"tools/call\""),
+        "degraded MCP received an effect request"
+    );
+    assert_eq!(disabled.started()?, 0, "disabled MCP process started");
+    Ok(())
 }
 
 #[derive(Clone)]

@@ -74,7 +74,8 @@ If an actor reaches new nested instructions, the terminal offers a separate work
 | `auth`                                             | Active Responses route. Under another provider the API-key route is reported as not checked.                                           |
 | `sessions`, `memory ...`, `undo-dream`             | Configured memory executable and cache paths                                                                                           |
 | `models`                                           | Configured memory paths used for saved selections and the active Responses route                                                       |
-| `tool`, `tools`                                    | Configured memory paths used for saved selections, write/shell grants, and stdio/HTTP MCP configuration                                |
+| `tool`                                             | Configured memory paths used for saved selections, write/shell grants, and stdio/HTTP MCP configuration                                |
+| `tools`                                            | Write/shell grants and stdio/HTTP MCP configuration; catalog inspection does not activate memory paths                                 |
 | `run`, `dream`, `serve`, terminal UI               | All applicable project-instruction, memory, provider, write, shell, MCP, and external-agent claims                                     |
 
 Review text and configuration diagnostics are bounded and escaped. They do not print MCP arguments or environment values, URL queries, credential values, or raw parser excerpts. Private approval records under `<data-dir>/trust/workspaces` contain root/manifest identities and digests, not configuration values, and remain outside Dolt and workspace tools.
@@ -230,15 +231,24 @@ The shell has your process authority; the project working directory does not con
 [mcp.local_service]
 command = "/absolute/path/to/mcp-server"
 args = ["--stdio"]
+allow_tools = ["read_*", "search"]
+deny_tools = ["*_secret"]
 
 [mcp.remote_service]
 url = "https://example.com/mcp"
+header_env = { Authorization = "REMOTE_MCP_AUTH" }
+
+[mcp.disabled_service]
+enabled = false
+command = "/absolute/path/to/disabled-server"
 
 [external_agents]
 research_peer = "https://example.com/a2a"
 ```
 
-MCP servers have exactly one transport: `command` or `url`. Stdio entries may have `args` and `env`; HTTP entries may not. At most 64 MCP servers and 64 external agent endpoints are accepted. Endpoint URLs reject embedded credentials and fragments.
+MCP servers have exactly one transport: `command` or `url`. Stdio entries may have `args` and `env`; HTTP entries may not. HTTP `header_env` maps validated header names to environment-variable names, never literal values, and excludes protocol-owned headers. Resolved values are limited to 16 KiB each and 64 KiB across one server. Servers default enabled. A disabled alias performs no header resolution, spawn, connection, cache read, or route construction. `allow_tools` and `deny_tools` use bounded `*`/`?` patterns against original server names; deny wins and a nonempty allow list is selective. At most 64 MCP servers and 64 external agent endpoints are accepted. Endpoint URLs reject embedded credentials and fragments.
+
+Live discovery stores only bounded, versioned metadata in Kuru's owner-private data directory outside the workspace. A context-matching entry can be shown as stale after an offline restart, but stale metadata creates no route or permission. The binding includes the exact workspace authority, alias, endpoint, filters, header references, and resolved header context; malformed or mismatched records fail closed and do not prevent a healthy server from replacing them.
 
 The example endpoints are placeholders. Choose trusted services and keep secrets out of shared configuration. [MCP](./mcp) and [A2A](./a2a) describe supported behavior and limitations.
 
