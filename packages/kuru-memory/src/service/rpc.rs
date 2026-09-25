@@ -2,7 +2,9 @@
 //! A failed response or broken connection is never permission to replay a write.
 
 use anyhow::{Context, Result, bail, ensure};
-use kuru_core::{InvocationOutcome, InvocationStart, Message, SessionUsage, UsageObservation};
+use kuru_core::{
+    InvocationOutcome, InvocationStart, Message, Mode, SessionUsage, UsageObservation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -165,6 +167,11 @@ impl ServiceCall {
                     | ViewOperation::Checkpoint { .. }
                     | ViewOperation::CheckpointSession { .. }
                     | ViewOperation::CheckpointContextSummary { .. }
+                    | ViewOperation::CreateSession { .. }
+                    | ViewOperation::RenameSession { .. }
+                    | ViewOperation::RemoveSession { .. }
+                    | ViewOperation::RestoreSession { .. }
+                    | ViewOperation::ForkSession { .. }
                     | ViewOperation::ForgetNote { .. }
                     | ViewOperation::PutMany { .. }
                     | ViewOperation::Clear { .. }
@@ -204,6 +211,11 @@ impl ServiceCall {
                 ViewOperation::CheckpointContextSummary { .. } => {
                     Some("view.checkpoint_context_summary")
                 }
+                ViewOperation::CreateSession { .. } => Some("view.create_session"),
+                ViewOperation::RenameSession { .. } => Some("view.rename_session"),
+                ViewOperation::RemoveSession { .. } => Some("view.remove_session"),
+                ViewOperation::RestoreSession { .. } => Some("view.restore_session"),
+                ViewOperation::ForkSession { .. } => Some("view.fork_session"),
                 ViewOperation::ForgetNote { .. } => Some("view.forget_note"),
                 ViewOperation::PutMany { .. } => Some("view.put_many"),
                 ViewOperation::Clear { .. } => Some("view.clear"),
@@ -271,6 +283,10 @@ pub enum ViewOperation {
         session_id: String,
         messages: Vec<Message>,
         values: Vec<(String, Value)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public_turn: Option<crate::SessionTurnCheckpoint>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<crate::SessionModeCheckpoint>,
     },
     History {
         namespace: String,
@@ -289,6 +305,45 @@ pub enum ViewOperation {
         namespace: String,
         session_id: String,
         after_exclusive: i64,
+        limit: usize,
+    },
+    SessionCatalogPage {
+        lifecycle_state: Option<crate::SessionLifecycleState>,
+        cursor: Option<crate::SessionCatalogCursor>,
+        expected_revision: Option<String>,
+        limit: usize,
+    },
+    SessionCatalogRecord {
+        session_id: String,
+    },
+    CreateSession {
+        session_id: String,
+        mode: Mode,
+        label: String,
+    },
+    RenameSession {
+        session_id: String,
+        expected_generation: u64,
+        label: String,
+    },
+    RemoveSession {
+        session_id: String,
+        expected_generation: u64,
+    },
+    RestoreSession {
+        session_id: String,
+        expected_generation: u64,
+    },
+    ForkSession {
+        source_session_id: String,
+        expected_source_generation: u64,
+        source_node_id: String,
+        child_session_id: String,
+        label: String,
+    },
+    PublicTranscriptPage {
+        session_id: String,
+        cursor: Option<crate::PublicTranscriptCursor>,
         limit: usize,
     },
     SessionSourceSnapshot {
@@ -428,6 +483,10 @@ pub enum ServiceValue {
     Messages(Vec<Message>),
     HistoryWindow(HistoryWindow),
     SessionHistoryWindowAfter(crate::SessionHistoryWindowAfter),
+    SessionCatalogPage(crate::SessionCatalogPage),
+    SessionCatalogRecord(Option<crate::SessionCatalogRecord>),
+    SessionLifecycleOutcome(crate::SessionLifecycleOutcome),
+    PublicTranscriptPage(crate::PublicTranscriptPage),
     SessionSourceSnapshot(crate::SessionSourceSnapshot),
     ContextSummaryCursor(Option<crate::ContextSummaryCursor>),
     ContextSummaryWindow(crate::ContextSummaryWindow),
@@ -511,6 +570,8 @@ pub enum ServiceFault {
     ReasoningSummaryConflict,
     ReceiptConflict,
     CandidateRefRejected(CandidateRefRefusal),
+    SessionLifecycleRejected(crate::SessionLifecycleRefusal),
+    SessionTurnRejected(crate::SessionTurnRefusal),
 }
 
 #[derive(Default)]
@@ -982,6 +1043,12 @@ async fn respond<S: AsyncWrite + Unpin>(
                     ServiceFault::ReceiptConflict
                 } else if let Some(rejected) = error.downcast_ref::<CandidateRefRejected>() {
                     ServiceFault::CandidateRefRejected(rejected.0)
+                } else if let Some(rejected) =
+                    error.downcast_ref::<crate::SessionLifecycleRejected>()
+                {
+                    ServiceFault::SessionLifecycleRejected(rejected.0)
+                } else if let Some(rejected) = error.downcast_ref::<crate::SessionTurnRejected>() {
+                    ServiceFault::SessionTurnRejected(rejected.0)
                 } else {
                     ServiceFault::StorageFailed
                 };
@@ -993,6 +1060,8 @@ async fn respond<S: AsyncWrite + Unpin>(
                         ServiceFault::ContextSummaryStale => "context_summary_stale",
                         ServiceFault::ReasoningSummaryConflict => "reasoning_summary_conflict",
                         ServiceFault::ReceiptConflict => "receipt_conflict",
+                        ServiceFault::SessionLifecycleRejected(_) => "session_lifecycle_rejected",
+                        ServiceFault::SessionTurnRejected(_) => "session_turn_rejected",
                         ServiceFault::StorageFailed => "storage_failed",
                         ServiceFault::GenerationChanged => "generation_changed",
                     };
@@ -1427,6 +1496,12 @@ pub(super) fn resolve_response(response: ServiceResponse) -> Result<ServiceValue
         ServiceResponse::Rejected(ServiceFault::CandidateRefRejected(reason)) => {
             Err(CandidateRefRejected(reason).into())
         }
+        ServiceResponse::Rejected(ServiceFault::SessionLifecycleRejected(reason)) => {
+            Err(crate::SessionLifecycleRejected(reason).into())
+        }
+        ServiceResponse::Rejected(ServiceFault::SessionTurnRejected(reason)) => {
+            Err(crate::SessionTurnRejected(reason).into())
+        }
     }
 }
 
@@ -1671,10 +1746,32 @@ async fn dispatch_view(store: &MemoryStore, operation: ViewOperation) -> Result<
             session_id,
             messages,
             values,
+            public_turn,
+            mode,
         } => {
-            store
-                .checkpoint_session(&namespace, &session_id, &messages, &values)
-                .await?;
+            if let Some(mode) = mode {
+                ensure!(
+                    public_turn.is_none() && messages.is_empty(),
+                    "mode checkpoint cannot carry a public turn or transcript entries"
+                );
+                store
+                    .checkpoint_session_mode(&namespace, &session_id, &values, &mode)
+                    .await?;
+            } else if let Some(public_turn) = public_turn {
+                store
+                    .checkpoint_session_turn(
+                        &namespace,
+                        &session_id,
+                        &messages,
+                        &values,
+                        &public_turn,
+                    )
+                    .await?;
+            } else {
+                store
+                    .checkpoint_session(&namespace, &session_id, &messages, &values)
+                    .await?;
+            }
             ServiceValue::Unit
         }
         ViewOperation::History { namespace, limit } => {
@@ -1700,6 +1797,84 @@ async fn dispatch_view(store: &MemoryStore, operation: ViewOperation) -> Result<
         } => ServiceValue::SessionHistoryWindowAfter(
             store
                 .session_history_window_after(&namespace, &session_id, after_exclusive, limit)
+                .await?,
+        ),
+        ViewOperation::SessionCatalogPage {
+            lifecycle_state,
+            cursor,
+            expected_revision,
+            limit,
+        } => ServiceValue::SessionCatalogPage(
+            store
+                .session_catalog_page(
+                    lifecycle_state,
+                    cursor.as_ref(),
+                    expected_revision.as_deref(),
+                    limit,
+                )
+                .await?,
+        ),
+        ViewOperation::SessionCatalogRecord { session_id } => {
+            ServiceValue::SessionCatalogRecord(store.session_catalog_record(&session_id).await?)
+        }
+        ViewOperation::CreateSession {
+            session_id,
+            mode,
+            label,
+        } => ServiceValue::SessionLifecycleOutcome(
+            store
+                .create_session_catalog(&session_id, mode, &label)
+                .await?,
+        ),
+        ViewOperation::RenameSession {
+            session_id,
+            expected_generation,
+            label,
+        } => ServiceValue::SessionLifecycleOutcome(
+            store
+                .rename_session_catalog(&session_id, expected_generation, &label)
+                .await?,
+        ),
+        ViewOperation::RemoveSession {
+            session_id,
+            expected_generation,
+        } => ServiceValue::SessionLifecycleOutcome(
+            store
+                .remove_session_catalog(&session_id, expected_generation)
+                .await?,
+        ),
+        ViewOperation::RestoreSession {
+            session_id,
+            expected_generation,
+        } => ServiceValue::SessionLifecycleOutcome(
+            store
+                .restore_session_catalog(&session_id, expected_generation)
+                .await?,
+        ),
+        ViewOperation::ForkSession {
+            source_session_id,
+            expected_source_generation,
+            source_node_id,
+            child_session_id,
+            label,
+        } => ServiceValue::SessionLifecycleOutcome(
+            store
+                .fork_session_catalog(
+                    &source_session_id,
+                    expected_source_generation,
+                    &source_node_id,
+                    &child_session_id,
+                    &label,
+                )
+                .await?,
+        ),
+        ViewOperation::PublicTranscriptPage {
+            session_id,
+            cursor,
+            limit,
+        } => ServiceValue::PublicTranscriptPage(
+            store
+                .public_transcript_page(&session_id, cursor.as_ref(), limit)
                 .await?,
         ),
         ViewOperation::SessionSourceSnapshot {
@@ -1991,6 +2166,86 @@ mod tests {
         };
         assert!(!call.may_mutate());
         assert!(call.unit_receipt_bytes("main")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn optional_public_turn_checkpoint_preserves_legacy_wire_and_receipt_shape() -> Result<()> {
+        let operation = ViewOperation::CheckpointSession {
+            namespace: "transcript".into(),
+            session_id: "session".into(),
+            messages: vec![Message::text("user", "hello")],
+            values: vec![("journal".into(), Value::String("started".into()))],
+            public_turn: None,
+            mode: None,
+        };
+        let encoded = serde_json::to_value(&operation)?;
+        ensure!(
+            encoded.get("public_turn").is_none(),
+            "legacy checkpoint wire unexpectedly gained a public-turn field"
+        );
+        ensure!(
+            encoded.get("mode").is_none(),
+            "legacy checkpoint wire unexpectedly gained a mode field"
+        );
+        let decoded: ViewOperation = serde_json::from_value(encoded.clone())?;
+        ensure!(
+            matches!(
+                decoded,
+                ViewOperation::CheckpointSession {
+                    public_turn: None,
+                    mode: None,
+                    ..
+                }
+            ),
+            "legacy checkpoint wire did not decode without public-turn metadata"
+        );
+        let legacy = ServiceCall::View {
+            candidate: None,
+            operation: Box::new(operation),
+        };
+        let public = ServiceCall::View {
+            candidate: None,
+            operation: Box::new(ViewOperation::CheckpointSession {
+                namespace: "transcript".into(),
+                session_id: "session".into(),
+                messages: vec![Message::text("user", "hello")],
+                values: vec![("journal".into(), Value::String("started".into()))],
+                public_turn: Some(crate::SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "turn".into(),
+                    label: None,
+                    expected_transcript_rows: None,
+                }),
+                mode: None,
+            }),
+        };
+        assert_ne!(
+            legacy.unit_receipt_fingerprint("main")?,
+            public.unit_receipt_fingerprint("main")?
+        );
+        let changed_mode = ServiceCall::View {
+            candidate: None,
+            operation: Box::new(ViewOperation::CheckpointSession {
+                namespace: "project/transcript/session".into(),
+                session_id: "session".into(),
+                messages: vec![],
+                values: vec![(
+                    "project/session/session".into(),
+                    serde_json::json!({"id":"session", "mode":"jungian", "lifecycle_generation":0}),
+                )],
+                public_turn: None,
+                mode: Some(crate::SessionModeCheckpoint {
+                    expected_generation: 0,
+                    expected_mode: Mode::Ifs,
+                    mode: Mode::Jungian,
+                }),
+            }),
+        };
+        assert_ne!(
+            legacy.unit_receipt_fingerprint("main")?,
+            changed_mode.unit_receipt_fingerprint("main")?
+        );
         Ok(())
     }
 

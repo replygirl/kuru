@@ -1622,6 +1622,7 @@ async fn stopped_released_v1_store() -> MemoryStore {
             server,
             directory,
             project_scope: options.project_scope,
+            fixture_unbound_scope: false,
             read_only: false,
             write: Arc::new(Mutex::new(())),
             dream: Arc::new(Mutex::new(())),

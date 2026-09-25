@@ -379,7 +379,7 @@ async fn stale_periodic_dream_failure_preserves_the_exact_completed_output() {
                 serde_json::to_value(report).unwrap(),
             )
         }
-        PublicationProof::LiveValues => {
+        PublicationProof::LiveValues | PublicationProof::LiveValuesAndCatalogMode(_) => {
             panic!("stale periodic dream changed its publication proof")
         }
     };

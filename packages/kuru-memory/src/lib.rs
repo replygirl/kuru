@@ -23,9 +23,18 @@ pub use store::{
     CandidateConflict, CandidateInventoryPage, CandidateRefRefusal, CandidateRefRejected,
     CandidateRefState, CandidateRefStatus, ContextSummaryCheckpoint, ContextSummaryCursor,
     ContextSummaryItem, ContextSummaryRecord, ContextSummaryStale, ContextSummaryWindow,
-    ExportProvenance, HistoryWindow, MemoryStatus, OpenOptions, ReasoningSummaryConflict,
-    ReasoningSummaryRecord, Revision, SequencedMessage, SessionHistoryWindowAfter,
-    SessionSourceSnapshot, StorageRecord, StoredNote, UsageProof, context_summary_id,
+    ExportProvenance, FORK_PROVENANCE_RECORD_FORMAT, HistoryWindow, LEGACY_PREFIX_RECORD_FORMAT,
+    LegacySessionTurnResume, LegacyTranscriptPrefix, MAX_SESSION_LABEL_BYTES, MemoryStatus,
+    OpenOptions, PUBLIC_TURN_RECORD_FORMAT, PublicTranscriptCursor, PublicTranscriptEntry,
+    PublicTranscriptPage, PublicTranscriptPosition, PublicTurnKind, PublicTurnRecord,
+    PublicTurnSettlement, ReasoningSummaryConflict, ReasoningSummaryRecord, Revision,
+    SESSION_CATALOG_RECORD_FORMAT, SESSION_LIFECYCLE_OUTCOME_FORMAT, SequencedMessage,
+    SessionCatalogCursor, SessionCatalogPage, SessionCatalogRecord, SessionForkProvenance,
+    SessionHistoryWindowAfter, SessionLifecycleOutcome, SessionLifecycleRefusal,
+    SessionLifecycleRejected, SessionLifecycleState, SessionModeCheckpoint, SessionSourceSnapshot,
+    SessionTurnCheckpoint, SessionTurnRefusal, SessionTurnRejected, StorageRecord, StoredNote,
+    UsageProof, context_summary_id, public_turn_continuation_node_id,
+    public_turn_legacy_continuation_node_id, public_turn_node_id,
 };
 
 #[cfg(any(test, feature = "test-support"))]

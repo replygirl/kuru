@@ -3,8 +3,14 @@
 //! A migration changes a versioned database, never an activation record or the
 //! sidecar identity protocol.  Keeping the definitions here makes the receipt
 //! validator the authority for both cold discovery and ordinary startup.
-use super::{AUTHOR, QUERY_TIMEOUT, revision, validate_schema_v1};
+use super::{
+    AUTHOR, LEGACY_PREFIX_RECORD_FORMAT, LegacyTranscriptPrefix, QUERY_TIMEOUT,
+    SESSION_CATALOG_RECORD_FORMAT, SessionCatalogRecord, SessionLifecycleState, revision,
+    validate_schema_v1, validate_session_catalog,
+};
 use anyhow::{Context, Result, bail, ensure};
+use kuru_core::Mode;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{MySqlPool, Row};
 use std::collections::BTreeSet;
@@ -12,7 +18,7 @@ use uuid::Uuid;
 
 use crate::server::Server;
 
-pub(super) const CURRENT_VERSION: i32 = 6;
+pub(super) const CURRENT_VERSION: i32 = 7;
 pub(super) const USAGE_CURRENT_VERSION: i32 = 4;
 const RESERVED_PREFIX: &str = "kuru_migration_";
 const USAGE_RESERVED_PREFIX: &str = "kuru_usage_migration_";
@@ -318,6 +324,16 @@ struct StatusRow {
     status: &'static str,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct LegacySession {
+    id: String,
+    mode: Mode,
+    turns: usize,
+    label: String,
+    #[serde(default)]
+    last_completed_speaker: Option<String>,
+}
+
 const V2: Definition = Definition {
     from: 1,
     to: 2,
@@ -415,7 +431,31 @@ const V6: Definition = Definition {
     }],
 };
 
-const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5, V6];
+const V7: Definition = Definition {
+    from: 6,
+    to: 7,
+    id: "kuru.memory.session-lifecycle.v7",
+    sql: &[
+        "CREATE TABLE session_catalog (session_id VARBINARY(128) PRIMARY KEY, mode VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, label VARCHAR(1024) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, created_order BIGINT NOT NULL, updated_order BIGINT NOT NULL, lifecycle_generation BIGINT NOT NULL, lifecycle_state VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, head_node_id CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL, pending_node_id CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL, legacy_prefix LONGTEXT CHARACTER SET utf8mb4 NULL, fork_provenance LONGTEXT CHARACTER SET utf8mb4 NULL, record_format VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, UNIQUE INDEX session_catalog_created_order (created_order, session_id), INDEX session_catalog_lifecycle_order (lifecycle_state, updated_order, session_id))",
+        "CREATE TABLE session_public_turns (node_id CHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY, origin_session_id VARBINARY(128) NOT NULL, turn_id VARBINARY(128) NOT NULL, record_kind VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, continuation_of_node_id CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL, predecessor_node_id CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL, settlement VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, user_entry LONGTEXT CHARACTER SET utf8mb4 NULL, speaker_id VARBINARY(1024) NULL, terminal_entries LONGTEXT CHARACTER SET utf8mb4 NULL, record_format VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, UNIQUE INDEX session_public_turn_identity (origin_session_id, turn_id, record_kind), INDEX session_public_turn_predecessor (predecessor_node_id), INDEX session_public_turn_continuation (continuation_of_node_id))",
+    ],
+    transform: "validated legacy session metadata may acquire catalog and immutable prefix descriptors; source state, messages and v6 provenance remain unchanged",
+    postcondition: "version=7;typed session catalog and immutable public-turn chain;legacy bytes and v6 compact provenance retained;v4 usage registry retained",
+    failed_status: &[
+        StatusRow {
+            table: "session_catalog",
+            staged: 0,
+            status: "new table",
+        },
+        StatusRow {
+            table: "session_public_turns",
+            staged: 0,
+            status: "new table",
+        },
+    ],
+};
+
+const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5, V6, V7];
 
 #[derive(Clone, Copy)]
 struct Registry {
@@ -694,13 +734,109 @@ async fn validate_schema_with(registry: Registry, pool: &MySqlPool, found: i32) 
     if found >= 5 {
         validate_session_provenance_shape(pool, found).await?;
     }
+    if found >= 7 {
+        validate_session_lifecycle_shape(pool).await?;
+    }
     #[cfg(test)]
-    if registry.current >= 7 && found >= 7 {
+    if registry.current >= 8 && found >= 8 {
         bounded_query(
-            sqlx::query("SELECT marker FROM kuru_migration_test_v7 LIMIT 0").fetch_all(pool),
+            sqlx::query("SELECT marker FROM kuru_migration_test_v8 LIMIT 0").fetch_all(pool),
         )
         .await?;
     }
+    Ok(())
+}
+
+async fn validate_session_lifecycle_shape(pool: &MySqlPool) -> Result<()> {
+    bounded_query(
+        sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog LIMIT 0")
+            .fetch_all(pool),
+    )
+    .await?;
+    bounded_query(
+        sqlx::query("SELECT node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format FROM session_public_turns LIMIT 0")
+            .fetch_all(pool),
+    )
+    .await?;
+    validate_columns(
+        pool,
+        "session_catalog",
+        &[
+            ("session_id", "varbinary", Some(128), false),
+            ("mode", "varchar", Some(16), false),
+            ("label", "varchar", Some(1024), false),
+            ("created_order", "bigint", None, false),
+            ("updated_order", "bigint", None, false),
+            ("lifecycle_generation", "bigint", None, false),
+            ("lifecycle_state", "varchar", Some(16), false),
+            ("head_node_id", "char", Some(64), true),
+            ("pending_node_id", "char", Some(64), true),
+            ("legacy_prefix", "longtext", None, true),
+            ("fork_provenance", "longtext", None, true),
+            ("record_format", "varchar", Some(32), false),
+        ],
+    )
+    .await?;
+    validate_columns(
+        pool,
+        "session_public_turns",
+        &[
+            ("node_id", "char", Some(64), false),
+            ("origin_session_id", "varbinary", Some(128), false),
+            ("turn_id", "varbinary", Some(128), false),
+            ("record_kind", "varchar", Some(16), false),
+            ("continuation_of_node_id", "char", Some(64), true),
+            ("predecessor_node_id", "char", Some(64), true),
+            ("settlement", "varchar", Some(16), false),
+            ("user_entry", "longtext", None, true),
+            ("speaker_id", "varbinary", Some(1024), true),
+            ("terminal_entries", "longtext", None, true),
+            ("record_format", "varchar", Some(32), false),
+        ],
+    )
+    .await?;
+    validate_index(pool, "session_catalog", "PRIMARY", true, &["session_id"]).await?;
+    validate_index(
+        pool,
+        "session_catalog",
+        "session_catalog_created_order",
+        true,
+        &["created_order", "session_id"],
+    )
+    .await?;
+    validate_index(
+        pool,
+        "session_catalog",
+        "session_catalog_lifecycle_order",
+        false,
+        &["lifecycle_state", "updated_order", "session_id"],
+    )
+    .await?;
+    validate_index(pool, "session_public_turns", "PRIMARY", true, &["node_id"]).await?;
+    validate_index(
+        pool,
+        "session_public_turns",
+        "session_public_turn_identity",
+        true,
+        &["origin_session_id", "turn_id", "record_kind"],
+    )
+    .await?;
+    validate_index(
+        pool,
+        "session_public_turns",
+        "session_public_turn_predecessor",
+        false,
+        &["predecessor_node_id"],
+    )
+    .await?;
+    validate_index(
+        pool,
+        "session_public_turns",
+        "session_public_turn_continuation",
+        false,
+        &["continuation_of_node_id"],
+    )
+    .await?;
     Ok(())
 }
 
@@ -1593,6 +1729,11 @@ async fn build_attempt(
     operation: Uuid,
     hooks: &MigrationRunnerHooks,
 ) -> Result<()> {
+    let source_revision = if definition.to == V7.to {
+        Some(revision(pool).await?)
+    } else {
+        None
+    };
     let routed = routed_pool(pool, hooks, MigrationBoundary::BeforeCommit).await?;
     let command_pool = routed.as_ref().unwrap_or(pool);
     let (mut connection, id) = super::owned_connection(command_pool).await?;
@@ -1602,6 +1743,9 @@ async fn build_attempt(
         }
         hooks.reach(MigrationBoundary::AfterDdl).await?;
         bounded_query(sqlx::query("START TRANSACTION").execute(&mut connection)).await?;
+        if let Some(source_revision) = source_revision.as_deref() {
+            migrate_legacy_session_catalog(&mut connection, source_revision).await?;
+        }
         let advanced = bounded_query(
             sqlx::query("UPDATE kuru_schema SET version = ? WHERE id = 1 AND version = ?")
                 .bind(definition.to)
@@ -1657,6 +1801,156 @@ async fn build_attempt(
         return Ok(());
     }
     result.context("Dolt migration commit failed")
+}
+
+async fn migrate_legacy_session_catalog(
+    connection: &mut sqlx::MySqlConnection,
+    source_revision: &str,
+) -> Result<()> {
+    const MAX_LEGACY_SESSION_INDEX_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_LEGACY_SESSIONS: usize = 100_000;
+    let candidates = bounded_query(
+        sqlx::query("SELECT `key`, value FROM state WHERE BINARY `key` LIKE _binary '%/sessions' ORDER BY BINARY `key` LIMIT 65")
+            .fetch_all(&mut *connection),
+    )
+    .await?;
+    ensure!(
+        candidates.len() <= 64,
+        "legacy session-index candidates exceed the migration bound"
+    );
+    let mut indexes = Vec::new();
+    for row in candidates {
+        let key = String::from_utf8(row.try_get::<Vec<u8>, _>("key")?)
+            .context("legacy session-index key is not UTF-8")?;
+        let Some(scope) = key.strip_suffix("/sessions") else {
+            continue;
+        };
+        if !valid_project_scope(scope) {
+            continue;
+        }
+        let value: String = row.try_get("value")?;
+        ensure!(
+            value.len() <= MAX_LEGACY_SESSION_INDEX_BYTES,
+            "legacy session index exceeds the migration byte bound"
+        );
+        indexes.push((scope.to_owned(), value));
+    }
+    ensure!(
+        indexes.len() <= 1,
+        "multiple durable project session indexes are ambiguous"
+    );
+    let Some((scope, value)) = indexes.pop() else {
+        return Ok(());
+    };
+    let values: Vec<serde_json::Value> = match serde_json::from_str(&value) {
+        Ok(values) => values,
+        Err(_) => return Ok(()),
+    };
+    ensure!(
+        values.len() <= MAX_LEGACY_SESSIONS,
+        "legacy session index exceeds the migration row bound"
+    );
+    let mut decoded = Vec::with_capacity(values.len());
+    let mut occurrences = std::collections::BTreeMap::<String, usize>::new();
+    for value in values {
+        let Ok(session) = serde_json::from_value::<LegacySession>(value) else {
+            continue;
+        };
+        *occurrences.entry(session.id.clone()).or_default() += 1;
+        decoded.push(session);
+    }
+    for (index, session) in decoded.into_iter().enumerate() {
+        if occurrences.get(&session.id) != Some(&1) {
+            continue;
+        }
+        let detail_key = format!("{scope}/session/{}", session.id);
+        if detail_key.len() > 1024 {
+            continue;
+        }
+        let detail: Option<String> = bounded_query(
+            sqlx::query_scalar("SELECT value FROM state WHERE BINARY `key` = BINARY ? LIMIT 1")
+                .bind(detail_key.as_bytes())
+                .fetch_optional(&mut *connection),
+        )
+        .await?;
+        let Some(detail) = detail else {
+            continue;
+        };
+        let Ok(detail) = serde_json::from_str::<LegacySession>(&detail) else {
+            continue;
+        };
+        if detail != session {
+            continue;
+        }
+        let order = i64::try_from(index + 1).context("legacy session order exceeds SQL range")?;
+        let transcript_namespace = format!("{scope}/transcript/{}", session.id);
+        if transcript_namespace.len() > 1024 {
+            continue;
+        }
+        let range: (i64, Option<i64>, Option<i64>, i64) = bounded_query(
+            sqlx::query_as("SELECT COUNT(*), MIN(sequence), MAX(sequence), COUNT(CASE WHEN session_id IS NULL OR BINARY session_id = BINARY ? THEN 1 END) FROM messages WHERE BINARY namespace = BINARY ?")
+                .bind(session.id.as_bytes())
+                .bind(transcript_namespace.as_bytes())
+                .fetch_one(&mut *connection),
+        )
+        .await?;
+        if range.0 != range.3 {
+            continue;
+        }
+        let legacy_prefix = match (range.0, range.1, range.2) {
+            (0, None, None) => None,
+            (count, Some(first), Some(through)) if count > 0 => Some(LegacyTranscriptPrefix {
+                namespace: transcript_namespace,
+                source_session_id: session.id.clone(),
+                source_revision: source_revision.to_owned(),
+                first_sequence: first,
+                through_sequence: through,
+                row_count: u64::try_from(count).context("legacy transcript count is negative")?,
+                record_format: LEGACY_PREFIX_RECORD_FORMAT.into(),
+            }),
+            _ => continue,
+        };
+        let catalog = SessionCatalogRecord {
+            session_id: session.id,
+            mode: session.mode,
+            label: session.label,
+            created_order: u64::try_from(order).expect("positive legacy order"),
+            updated_order: u64::try_from(order).expect("positive legacy order"),
+            lifecycle_generation: 0,
+            lifecycle_state: SessionLifecycleState::Active,
+            head_node_id: None,
+            pending_node_id: None,
+            legacy_prefix,
+            fork_provenance: None,
+            record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+        };
+        if validate_session_catalog(&catalog).is_err() {
+            continue;
+        }
+        bounded_query(
+            sqlx::query("INSERT INTO session_catalog (session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format) VALUES (?, ?, ?, ?, ?, ?, 'active', NULL, NULL, ?, NULL, ?)")
+                .bind(catalog.session_id.as_bytes())
+                .bind(catalog.mode.to_string())
+                .bind(&catalog.label)
+                .bind(order)
+                .bind(order)
+                .bind(0_i64)
+                .bind(catalog.legacy_prefix.as_ref().map(serde_json::to_string).transpose()?)
+                .bind(SESSION_CATALOG_RECORD_FORMAT)
+                .execute(&mut *connection),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn valid_project_scope(scope: &str) -> bool {
+    scope.strip_prefix("project/").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 async fn validate_attempt(
@@ -1742,6 +2036,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    struct AbortOnDrop(tokio::task::AbortHandle);
+
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct DurableSnapshot {
         head: String,
@@ -1749,22 +2051,30 @@ mod tests {
         status: Vec<(String, i64, String)>,
     }
 
-    const V7: Definition = Definition {
-        from: 6,
-        to: 7,
-        id: "kuru.memory.test-marker.v7",
-        sql: &["CREATE TABLE kuru_migration_test_v7 (marker INT PRIMARY KEY)"],
+    const V8: Definition = Definition {
+        from: 7,
+        to: 8,
+        id: "kuru.memory.test-marker.v8",
+        sql: &["CREATE TABLE kuru_migration_test_v8 (marker INT PRIMARY KEY)"],
         transform: "none",
-        postcondition: "version=7;test marker table exists;v6 compact provenance remains exact",
+        postcondition: "version=8;test marker table exists;v7 session lifecycle remains exact",
         failed_status: &[StatusRow {
-            table: "kuru_migration_test_v7",
+            table: "kuru_migration_test_v8",
             staged: 0,
             status: "new table",
         }],
     };
-    const TEST_DEFINITIONS: &[Definition] = &[V2, super::V3, super::V4, super::V5, super::V6, V7];
+    const TEST_DEFINITIONS: &[Definition] = &[
+        V2,
+        super::V3,
+        super::V4,
+        super::V5,
+        super::V6,
+        super::V7,
+        V8,
+    ];
     const TEST_REGISTRY: Registry = Registry {
-        current: 7,
+        current: 8,
         definitions: TEST_DEFINITIONS,
     };
     const RELEASED_V3_DEFINITIONS: &[Definition] = &[V2, super::V3];
@@ -1776,6 +2086,12 @@ mod tests {
     const RELEASED_V5_REGISTRY: Registry = Registry {
         current: 5,
         definitions: RELEASED_V5_DEFINITIONS,
+    };
+    const RELEASED_V6_DEFINITIONS: &[Definition] =
+        &[V2, super::V3, super::V4, super::V5, super::V6];
+    const RELEASED_V6_REGISTRY: Registry = Registry {
+        current: 6,
+        definitions: RELEASED_V6_DEFINITIONS,
     };
 
     const RELEASED_V4_REGISTRY: Registry = Registry {
@@ -1812,6 +2128,22 @@ mod tests {
         main.close().await;
         drop(main);
         server.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v6_registry_rejects_v7_store_without_mutating_it() -> Result<()> {
+        let store = super::super::MemoryStore::temporary().await?;
+        let before = durable_snapshot(&store.pool).await?;
+        let error = validate_active_with(RELEASED_V6_REGISTRY, &store.shared.server, &store.pool)
+            .await
+            .expect_err("a v6 binary must reject v7 memory before opening it for writes");
+        assert!(
+            format!("{error:#}").contains("unsupported Dolt memory schema version 7"),
+            "unexpected older-registry refusal: {error:#}"
+        );
+        assert_eq!(durable_snapshot(&store.pool).await?, before);
+        store.close().await?;
         Ok(())
     }
 
@@ -2150,9 +2482,13 @@ mod tests {
         assert_eq!(digest(definition).len(), 64);
         let name = attempt_name(2, Uuid::nil());
         assert_eq!(parse_attempt(&name).unwrap(), (2, Uuid::nil()));
-        let future = attempt_name(7, Uuid::nil());
-        assert_eq!(parse_attempt(&future).unwrap(), (7, Uuid::nil()));
-        assert!(REGISTRY.definition(7).is_err());
+        let future_version = CURRENT_VERSION + 1;
+        let future = attempt_name(future_version, Uuid::nil());
+        assert_eq!(
+            parse_attempt(&future).unwrap(),
+            (future_version, Uuid::nil())
+        );
+        assert!(REGISTRY.definition(future_version).is_err());
         for invalid in [
             "kuru_migration_v2_bad",
             "kuru_migration_v0000000002_NOT-A-UUID",
@@ -2301,8 +2637,9 @@ mod tests {
                 }
                 Corruption::ExtraReceipt => {
                     bounded_query(
-                        sqlx::query("INSERT INTO kuru_migrations VALUES (7, ?, ?, ?)")
-                            .bind("fixture.extra.v7")
+                        sqlx::query("INSERT INTO kuru_migrations VALUES (?, ?, ?, ?)")
+                            .bind(CURRENT_VERSION + 1)
+                            .bind(format!("fixture.extra.v{}", CURRENT_VERSION + 1))
                             .bind("0".repeat(64))
                             .bind(Uuid::new_v4().hyphenated().to_string())
                             .execute(store.pool.as_ref()),
@@ -2381,7 +2718,7 @@ mod tests {
             let mut attempts = Vec::new();
             for _ in 0..count {
                 let operation = Uuid::new_v4();
-                let name = attempt_name(7, operation);
+                let name = attempt_name(TEST_REGISTRY.current, operation);
                 bounded_query(
                     sqlx::query("CALL DOLT_BRANCH(?, ?)")
                         .bind(&name)
@@ -2399,7 +2736,7 @@ mod tests {
                         let built = build_attempt(
                             TEST_REGISTRY,
                             &attempt,
-                            &V7,
+                            &V8,
                             *operation,
                             &MigrationRunnerHooks::none(),
                         )
@@ -2414,7 +2751,7 @@ mod tests {
                     let built = build_attempt(
                         TEST_REGISTRY,
                         &attempt,
-                        &V7,
+                        &V8,
                         mismatched,
                         &MigrationRunnerHooks::none(),
                     )
@@ -2507,13 +2844,13 @@ mod tests {
         commit_fixture(&main, "Create branch-free schema v2 capacity fixture").await?;
         validate_version_with(TEST_REGISTRY, &main, 2).await?;
         upgrade_with(REGISTRY, &server, &main, &MigrationRunnerHooks::none()).await?;
-        validate_version_with(TEST_REGISTRY, &main, 6).await?;
+        validate_version_with(TEST_REGISTRY, &main, CURRENT_VERSION).await?;
 
         let base = revision(&main).await?;
         let mut names = Vec::with_capacity(INVENTORY_LIMIT);
         let existing = reserved_names(&main).await?.len();
         for _ in existing..INVENTORY_LIMIT {
-            let name = attempt_name(7, Uuid::new_v4());
+            let name = attempt_name(TEST_REGISTRY.current, Uuid::new_v4());
             bounded_query(
                 sqlx::query("CALL DOLT_BRANCH(?, ?)")
                     .bind(&name)
@@ -2522,7 +2859,7 @@ mod tests {
             )
             .await?;
             let attempt = server.pool(&name).await?;
-            let prepared = bounded_query(sqlx::query(V7.sql[0]).execute(attempt.as_ref())).await;
+            let prepared = bounded_query(sqlx::query(V8.sql[0]).execute(attempt.as_ref())).await;
             after_cleanup(prepared.map(|_| ()), close_branch_pool(&attempt).await)?;
             names.push(name);
         }
@@ -2565,7 +2902,7 @@ mod tests {
             let names = match invalid {
                 InvalidInventory::Malformed => vec!["kuru_migration_bad".to_owned()],
                 InvalidInventory::UnknownTarget => {
-                    vec![attempt_name(8, Uuid::new_v4())]
+                    vec![attempt_name(TEST_REGISTRY.current + 1, Uuid::new_v4())]
                 }
                 InvalidInventory::Excess => {
                     let existing = reserved_names(&store.pool).await?.len();
@@ -2574,7 +2911,7 @@ mod tests {
                         "fixture inventory is already excessive"
                     );
                     (0..=(INVENTORY_LIMIT - existing))
-                        .map(|_| attempt_name(7, Uuid::new_v4()))
+                        .map(|_| attempt_name(TEST_REGISTRY.current, Uuid::new_v4()))
                         .collect()
                 }
             };
@@ -2608,7 +2945,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v7_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
+    async fn test_v8_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
         for repeated_operation in [false, true] {
             let store = super::super::MemoryStore::temporary().await?;
             upgrade_with(
@@ -2630,7 +2967,7 @@ mod tests {
                 )
                 .await?;
                 bounded_query(
-                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 7")
+                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 8")
                         .bind(operation)
                         .execute(store.pool.as_ref()),
                 )
@@ -2845,15 +3182,16 @@ mod tests {
         completed.close().await;
         drop(completed);
         let before = durable_snapshot(&store.pool).await?;
+        let expected = format!(
+            "schema version {CURRENT_VERSION}, expected {}",
+            CURRENT_VERSION - 1
+        );
         assert_failed_runner_unchanged(
             TEST_REGISTRY,
             &store.shared.server,
             &store.pool,
             &before,
-            &format!(
-                "schema version {CURRENT_VERSION}, expected {}",
-                CURRENT_VERSION - 1
-            ),
+            &expected,
         )
         .await?;
         let completed = store.shared.server.pool(&completed_name).await?;
@@ -2889,7 +3227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_v2_attempts_and_candidate_survive_test_v7_progression() -> Result<()> {
+    async fn retained_v2_attempts_and_candidate_survive_test_v8_progression() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let options = crate::test_support::open_options(
             root.path().join("private"),
@@ -2899,10 +3237,10 @@ mod tests {
         store
             .append("conversation", "user", "written after the v2 upgrade")
             .await?;
-        let candidate = store.begin_candidate("pre-v7 candidate").await?;
+        let candidate = store.begin_candidate("pre-v8 candidate").await?;
         candidate
             .view()
-            .append("candidate", "assistant", "kept on schema v6")
+            .append("candidate", "assistant", "kept on schema v7")
             .await?;
         let candidate_head = candidate.view().revision().await?;
 
@@ -2942,14 +3280,14 @@ mod tests {
 
         assert_eq!(
             validate_ready_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?,
-            6
+            7
         );
-        let v7_operation = Uuid::new_v4();
-        let v7_name = attempt_name(7, v7_operation);
+        let v8_operation = Uuid::new_v4();
+        let v8_name = attempt_name(8, v8_operation);
         let current_base = store.revision().await?;
         bounded_query(
             sqlx::query("CALL DOLT_BRANCH(?, ?)")
-                .bind(&v7_name)
+                .bind(&v8_name)
                 .bind(&current_base)
                 .fetch_all(store.pool.as_ref()),
         )
@@ -2958,7 +3296,7 @@ mod tests {
             validate_ready_with(TEST_REGISTRY, &store.shared.server, &store.pool)
                 .await
                 .is_err(),
-            "a ready v7 stage must reject while an earlier failed attempt remains"
+            "a ready v8 stage must reject while an earlier failed attempt remains"
         );
 
         upgrade_with(
@@ -2969,25 +3307,25 @@ mod tests {
         )
         .await?;
         validate_active_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 7);
-        let v7_attempt = store.shared.server.pool(&v7_name).await?;
-        assert_eq!(revision(&v7_attempt).await?, store.revision().await?);
-        let v7_receipt: String = bounded_query(
-            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 7")
-                .fetch_one(v7_attempt.as_ref()),
+        assert_eq!(version(&store.pool).await?, 8);
+        let v8_attempt = store.shared.server.pool(&v8_name).await?;
+        assert_eq!(revision(&v8_attempt).await?, store.revision().await?);
+        let v8_receipt: String = bounded_query(
+            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 8")
+                .fetch_one(v8_attempt.as_ref()),
         )
         .await?;
-        assert_eq!(v7_receipt, v7_operation.hyphenated().to_string());
-        v7_attempt.close().await;
-        drop(v7_attempt);
+        assert_eq!(v8_receipt, v8_operation.hyphenated().to_string());
+        v8_attempt.close().await;
+        drop(v8_attempt);
         assert_eq!(
             reserved_names(&store.pool)
                 .await?
                 .into_iter()
-                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 7))
+                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 8))
                 .count(),
             1,
-            "the pristine exact-base v7 attempt must be reused"
+            "the pristine exact-base v8 attempt must be reused"
         );
         // This is a synthetic future schema, beyond the current store API's
         // validated open contract. Inspect the test-registry-backed SQL view.
@@ -3015,11 +3353,11 @@ mod tests {
         assert_eq!(old_view.revision().await?, candidate_head);
         assert_eq!(
             validate_supported_with(TEST_REGISTRY, &old_view.pool).await?,
-            6
+            CURRENT_VERSION
         );
         assert_eq!(
             old_view.history("candidate", 10).await?[0].plain_text(),
-            Some("kept on schema v6")
+            Some("kept on schema v7")
         );
         let before_stale_merge = durable_snapshot(&store.pool).await?;
         assert!(
@@ -3030,11 +3368,11 @@ mod tests {
             )
             .await
             .is_err(),
-            "pre-v7 candidate unexpectedly fast-forwarded into v7 main"
+            "pre-v8 candidate unexpectedly fast-forwarded into v8 main"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before_stale_merge);
 
-        // Model a future v7 writer through its test registry and SQL view.
+        // Model a future v8 writer through its test registry and SQL view.
         // Released-v5 reopen refusal is checked in the separate old-registry fixture.
         let fresh_name = format!("candidate_{}", Uuid::new_v4().simple());
         let fresh_base = revision(&store.pool).await?;
@@ -3046,15 +3384,15 @@ mod tests {
         )
         .await?;
         let fresh = store.shared.server.pool(&fresh_name).await?;
-        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 7);
+        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 8);
         bounded_query(
             sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
-                .bind(b"post-v6".as_slice())
+                .bind(b"post-v8".as_slice())
                 .bind(json!({"preserved": true}).to_string())
                 .execute(fresh.as_ref()),
         )
         .await?;
-        commit_fixture(&fresh, "Test future-schema candidate write").await?;
+        commit_fixture(&fresh, "Test future-v8 candidate write").await?;
         let fresh_head = revision(&fresh).await?;
         fresh.close().await;
         drop(fresh);
@@ -3072,16 +3410,16 @@ mod tests {
             .bind(b"conversation".as_slice())
             .bind(b"assistant".as_slice())
             .bind("text-v1")
-            .bind("written after schema v6")
+            .bind("written after schema v8")
             .execute(store.pool.as_ref()),
         )
         .await?;
-        commit_fixture(&store.pool, "Test future-schema conversation write").await?;
+        commit_fixture(&store.pool, "Test future-v8 conversation write").await?;
         validate_active_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 7);
+        assert_eq!(version(&store.pool).await?, 8);
         let promoted_value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
-                .bind(b"post-v6".as_slice())
+                .bind(b"post-v8".as_slice())
                 .fetch_one(store.pool.as_ref()),
         )
         .await?;
@@ -3141,11 +3479,11 @@ mod tests {
         .await?;
         assert_eq!(
             messages,
-            ["written after the v2 upgrade", "written after schema v6"]
+            ["written after the v2 upgrade", "written after schema v8"]
         );
         let value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
-                .bind(b"post-v6".as_slice())
+                .bind(b"post-v8".as_slice())
                 .fetch_one(main.as_ref()),
         )
         .await?;
@@ -3170,7 +3508,7 @@ mod tests {
         assert_eq!(revision(&old_candidate).await?, candidate_head);
         assert_eq!(
             validate_supported_with(TEST_REGISTRY, &old_candidate).await?,
-            6
+            CURRENT_VERSION
         );
         let old_content: String = bounded_query(
             sqlx::query_scalar("SELECT content FROM messages WHERE namespace = ?")
@@ -3178,7 +3516,7 @@ mod tests {
                 .fetch_one(old_candidate.as_ref()),
         )
         .await?;
-        assert_eq!(old_content, "kept on schema v6");
+        assert_eq!(old_content, "kept on schema v7");
         old_candidate.close().await;
         drop(old_candidate);
         main.close().await;
@@ -3329,12 +3667,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn released_v5_summary_identity_survives_v6_upgrade_reopen_and_export() -> Result<()> {
+    async fn released_v5_summary_identity_survives_v6_v7_upgrade_reopen_and_export() -> Result<()> {
         let root = crate::test_support::tempdir()?;
-        let options = crate::test_support::open_options(
-            root.path().join("private"),
-            format!("project/{}", "6".repeat(64)),
-        )?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let digest = Sha256::digest(project.as_os_str().as_encoded_bytes());
+        let scope = format!(
+            "project/{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let options =
+            crate::test_support::open_options(root.path().join("private"), scope.clone())?;
         released_v2(&options).await?;
         let server = super::super::tests::released_server(&options).await?;
         let main = server.pool("main").await?;
@@ -3388,6 +3735,65 @@ mod tests {
         };
         let reasoning_key = super::super::reasoning_summary_key(&reasoning)?;
         let reasoning_json = serde_json::to_string(&reasoning)?;
+        let legacy_session = json!({
+            "id": "legacy-session",
+            "mode": "freudian",
+            "turns": 1,
+            "label": "legacy label",
+            "last_completed_speaker": "Desire"
+        });
+        let legacy_index = serde_json::to_string(&vec![legacy_session.clone()])?;
+        let legacy_detail = serde_json::to_string(&legacy_session)?;
+        let legacy_turn_id = "legacy-safe-turn";
+        let legacy_journal_key = format!("{scope}/session/legacy-session/turn/{}", "a".repeat(64));
+        let legacy_pending_journal = json!({
+            "format": 2,
+            "id": legacy_turn_id,
+            "prompt": "legacy visible transcript",
+            "target": null,
+            "transitions": ["Started", "Interrupted"],
+            "possible_dispatch": false,
+            "interruption_marker": true,
+            "output": null
+        });
+        let ambiguous_value = r#"{"legacy":{"bytes":"retained exactly"}}"#;
+        for (key, value) in [
+            (format!("{scope}/sessions"), legacy_index),
+            (format!("{scope}/session/legacy-session"), legacy_detail),
+            (
+                legacy_journal_key.clone(),
+                serde_json::to_string(&legacy_pending_journal)?,
+            ),
+            (
+                format!("{scope}/session/ambiguous-only"),
+                ambiguous_value.to_owned(),
+            ),
+        ] {
+            bounded_query(
+                sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                    .bind(key.as_bytes())
+                    .bind(value)
+                    .execute(main.as_ref()),
+            )
+            .await?;
+        }
+        bounded_query(
+            sqlx::query("INSERT INTO messages (namespace, session_id, role, content_format, content) VALUES (?, ?, ?, 'text-v1', ?)")
+                .bind(format!("{scope}/transcript/legacy-session").into_bytes())
+                .bind(b"legacy-session".as_slice())
+                .bind(b"user".as_slice())
+                .bind("legacy visible transcript")
+                .execute(main.as_ref()),
+        )
+        .await?;
+        bounded_query(
+            sqlx::query("INSERT INTO messages (namespace, session_id, role, content_format, content) VALUES (?, NULL, ?, 'text-v1', ?)")
+                .bind(format!("{scope}/transcript/ambiguous-only").into_bytes())
+                .bind(b"assistant".as_slice())
+                .bind("ambiguous transcript retained")
+                .execute(main.as_ref()),
+        )
+        .await?;
         bounded_query(
             sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
                 .bind(reasoning_key.as_bytes())
@@ -3426,14 +3832,242 @@ mod tests {
         )
         .await?;
         commit_fixture(&main, "Released v5 summary fixture").await?;
+        upgrade_with(
+            RELEASED_V6_REGISTRY,
+            &server,
+            &main,
+            &MigrationRunnerHooks::none(),
+        )
+        .await?;
+        assert_eq!(version(&main).await?, 6);
+        let v6_head = revision(&main).await?;
         main.close().await;
         drop(main);
         server.close().await?;
 
         let store = super::super::MemoryStore::open(options.clone()).await?;
         assert_eq!(version(&store.pool).await?, CURRENT_VERSION);
-        type MigratedSummaryRow = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, String);
-        let row: MigratedSummaryRow = bounded_query(
+        assert_ne!(store.revision().await?, v6_head);
+        assert_eq!(
+            bounded_query(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM session_catalog")
+                    .fetch_one(store.pool.as_ref()),
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            bounded_query(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM session_public_turns")
+                    .fetch_one(store.pool.as_ref()),
+            )
+            .await?,
+            0
+        );
+        let catalog_page = store.session_catalog_page(None, None, None, 16).await?;
+        assert_eq!(catalog_page.view, "main");
+        assert_eq!(catalog_page.revision, store.revision().await?);
+        assert_eq!(catalog_page.total_rows, 1);
+        assert_eq!(catalog_page.records.len(), 1);
+        assert!(catalog_page.next.is_none());
+        assert_eq!(
+            store
+                .session_catalog_page(Some(SessionLifecycleState::Removed), None, None, 0)
+                .await?
+                .total_rows,
+            0
+        );
+        let migrated: (Vec<u8>, String, String, i64, i64, i64, String, String) = bounded_query(
+            sqlx::query_as("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, legacy_prefix FROM session_catalog LIMIT 1")
+                .fetch_one(store.pool.as_ref()),
+        )
+        .await?;
+        assert_eq!(migrated.0, b"legacy-session");
+        assert_eq!(migrated.1, "freudian");
+        assert_eq!(migrated.2, "legacy label");
+        assert_eq!((migrated.3, migrated.4, migrated.5), (1, 1, 0));
+        assert_eq!(migrated.6, "active");
+        let prefix: LegacyTranscriptPrefix = serde_json::from_str(&migrated.7)?;
+        assert_eq!(
+            prefix.namespace,
+            format!("{scope}/transcript/legacy-session")
+        );
+        assert_eq!(prefix.source_session_id, "legacy-session");
+        assert_eq!(prefix.source_revision, v6_head);
+        assert_eq!(prefix.row_count, 1);
+        let transcript = store
+            .public_transcript_page("legacy-session", None, 16)
+            .await?;
+        assert_eq!(transcript.view, "main");
+        assert_eq!(transcript.revision, store.revision().await?);
+        assert_eq!(transcript.total_rows, 1);
+        assert!(transcript.pending.is_none());
+        assert!(transcript.next.is_none());
+        assert!(matches!(
+            transcript.records.as_slice(),
+            [super::super::PublicTranscriptEntry::Legacy { message, .. }]
+                if message.text_projection() == "legacy visible transcript"
+        ));
+        let legacy_resumed_journal = json!({
+            "format": 2,
+            "id": legacy_turn_id,
+            "prompt": "legacy visible transcript",
+            "target": null,
+            "transitions": ["Started", "Interrupted", "Resumed"],
+            "possible_dispatch": false,
+            "interruption_marker": true,
+            "output": null
+        });
+        store.close().await?;
+        let _gate = crate::spawn_gate::spawning().await;
+        let owner = crate::service::ServiceOwner::open(options.clone(), &project).await?;
+        let served = tokio::spawn(owner.serve());
+        let executable = std::env::current_exe()?;
+        let open = || {
+            crate::MemoryStore::open_managed_observed(
+                options.clone(),
+                project.clone(),
+                executable.clone(),
+            )
+            .1
+        };
+        let managed = open().await?;
+        let sibling = open().await?;
+        let barrier = crate::test_support::ReplyBarrier::default();
+        managed.fixture_pause_next_service_reply(&barrier).await?;
+        let mut resume = tokio::spawn({
+            let managed = managed.clone();
+            let namespace = format!("{scope}/transcript/legacy-session");
+            let journal_key = legacy_journal_key.clone();
+            let expected_journal = legacy_pending_journal.clone();
+            let prefix = prefix.clone();
+            async move {
+                managed
+                    .checkpoint_session_turn(
+                        &namespace,
+                        "legacy-session",
+                        &[],
+                        &[(journal_key.clone(), legacy_resumed_journal)],
+                        &super::super::SessionTurnCheckpoint::Resume {
+                            expected_generation: 0,
+                            turn_id: "legacy-safe-turn".into(),
+                            legacy: Some(super::super::LegacySessionTurnResume {
+                                legacy_prefix: prefix,
+                                journal_key,
+                                expected_journal,
+                            }),
+                        },
+                    )
+                    .await
+            }
+        });
+        let _resume_cleanup = AbortOnDrop(resume.abort_handle());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                () = barrier.wait_sent() => Ok(()),
+                result = &mut resume => bail!("migrated safe-journal resume completed before reply pause: {result:?}"),
+            }
+        })
+        .await
+        .context("migrated safe-journal resume frame was not flushed")??;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let page = sibling
+                    .public_transcript_page("legacy-session", None, 16)
+                    .await?;
+                if matches!(page.pending.as_ref(), Some(record)
+                    if record.kind == super::super::PublicTurnKind::LegacyContinuation
+                        && record.turn_id == legacy_turn_id)
+                {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("migrated safe-journal resume was not committed before reply loss")??;
+        resume.abort();
+        ensure!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), resume)
+                .await
+                .context("cancelled migrated safe-journal resume did not end")?
+                .is_err_and(|error| error.is_cancelled()),
+            "migrated safe-journal resume completed before its reply was lost"
+        );
+        ensure!(managed.reconcile().await? == Some(true));
+        managed.close().await?;
+        sibling.close().await?;
+        let permit = crate::service::acquire_maintenance_permit(&options).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), served)
+            .await
+            .context("migrated safe-journal service owner did not reap")???;
+        drop(permit);
+        let store = super::super::MemoryStore::open(options.clone()).await?;
+        let pending_legacy = store
+            .public_transcript_page("legacy-session", None, 16)
+            .await?;
+        assert!(matches!(
+            pending_legacy.pending.as_ref(),
+            Some(record)
+                if record.kind == super::super::PublicTurnKind::LegacyContinuation
+                    && record.user_entry.is_none()
+                    && record.continuation_of_node_id.is_none()
+        ));
+        store
+            .checkpoint_session_turn(
+                &format!("{scope}/transcript/legacy-session"),
+                "legacy-session",
+                &[kuru_core::Message::text("assistant", "legacy retry answer")],
+                &[(
+                    legacy_journal_key.clone(),
+                    json!({"state": "ended after legacy retry"}),
+                )],
+                &super::super::SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: legacy_turn_id.into(),
+                    settlement: super::super::PublicTurnSettlement::Completed,
+                    speaker_id: "legacy-speaker".into(),
+                },
+            )
+            .await?;
+        let resumed_legacy = store
+            .public_transcript_page("legacy-session", None, 16)
+            .await?;
+        assert!(resumed_legacy.pending.is_none());
+        assert_eq!(resumed_legacy.records.len(), 2);
+        assert!(resumed_legacy.records.iter().any(|entry| matches!(
+            entry,
+            super::super::PublicTranscriptEntry::Turn { record }
+                if record.kind == super::super::PublicTurnKind::LegacyContinuation
+                    && record.user_entry.is_none()
+                    && record.terminal_entries
+                        == [kuru_core::Message::text("assistant", "legacy retry answer")]
+        )));
+        assert_eq!(
+            store
+                .history(&format!("{scope}/transcript/legacy-session"), 16)
+                .await?,
+            [
+                kuru_core::Message::text("user", "legacy visible transcript"),
+                kuru_core::Message::text("assistant", "legacy retry answer")
+            ]
+        );
+        let retained_ambiguous: String = bounded_query(
+            sqlx::query_scalar("SELECT value FROM state WHERE BINARY `key` = BINARY ?")
+                .bind(format!("{scope}/session/ambiguous-only").into_bytes())
+                .fetch_one(store.pool.as_ref()),
+        )
+        .await?;
+        assert_eq!(retained_ambiguous, ambiguous_value);
+        let retained_ambiguous_message: String = bounded_query(
+            sqlx::query_scalar("SELECT content FROM messages WHERE BINARY namespace = BINARY ?")
+                .bind(format!("{scope}/transcript/ambiguous-only").into_bytes())
+                .fetch_one(store.pool.as_ref()),
+        )
+        .await?;
+        assert_eq!(retained_ambiguous_message, "ambiguous transcript retained");
+        type LegacyProvenanceColumns = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, String);
+        let row: LegacyProvenanceColumns = bounded_query(
             sqlx::query_as("SELECT turn_id, operation_id, producer_actor_id, record_format FROM context_summaries WHERE summary_id = ?")
                 .bind(&summary_id)
                 .fetch_one(store.pool.as_ref()),
@@ -3479,6 +4113,46 @@ mod tests {
             super::super::StorageRecord::State { key, value }
                 if key == &reasoning_key && value == &reasoning_value
         )));
+        let ambiguous_key = format!("{scope}/session/ambiguous-only");
+        let ambiguous_export_value: serde_json::Value = serde_json::from_str(ambiguous_value)?;
+        assert!(records.iter().any(|record| matches!(record,
+            super::super::StorageRecord::State { key, value }
+                if key == &ambiguous_key && value == &ambiguous_export_value
+        )));
+        let ambiguous_namespace = format!("{scope}/transcript/ambiguous-only");
+        assert!(records.iter().any(|record| matches!(record,
+            super::super::StorageRecord::Message { namespace, session_id: None, role, content_format, content, .. }
+                if namespace == &ambiguous_namespace
+                    && role == "assistant"
+                    && content_format == "text-v1"
+                    && content == "ambiguous transcript retained"
+        )));
+        let before_refusal = durable_snapshot(&store.pool).await?;
+        let exported_before_refusal = serde_json::to_value(&records)?;
+        let error = validate_active_with(RELEASED_V6_REGISTRY, &store.shared.server, &store.pool)
+            .await
+            .expect_err("a v6 validator must refuse this populated v7 store");
+        assert!(
+            format!("{error:#}").contains("unsupported Dolt memory schema version 7"),
+            "unexpected v6-validator refusal: {error:#}"
+        );
+        assert_eq!(durable_snapshot(&store.pool).await?, before_refusal);
+        let after_refusal = store.begin_active_export().await?;
+        let mut cursor = None;
+        let mut exported_after_refusal = Vec::new();
+        loop {
+            let page = after_refusal.page(cursor).await?;
+            exported_after_refusal.extend(page.records);
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&exported_after_refusal)?,
+            exported_before_refusal,
+            "v6-validator refusal changed v7 application rows"
+        );
         let upgraded_head = store.revision().await?;
         store.close().await?;
 

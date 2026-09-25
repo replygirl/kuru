@@ -10,7 +10,7 @@ use axum::{Json, Router, routing::post};
 use kuru_connectors::{
     ApprovalAnswer, ApprovalRequest, ApprovalSender, InstructionActivation, InstructionGate,
     InstructionGateOutcome, InstructionReviewSender, PermissionInvocation, PermissionOutcome,
-    Provider, ProviderEvent, ProviderSink, ToolHost,
+    PermissionService, Provider, ProviderEvent, ProviderSink, ToolHost,
 };
 use kuru_core::{
     Completion, CompletionRequest, Config, ContentBlock, Mode, ModelInfo, NativeTool,
@@ -449,6 +449,104 @@ async fn new_harness_clears_grants_from_a_reused_permission_service() {
     .unwrap();
     assert!(service.inspect().unwrap().session.is_empty());
     assert!(Arc::ptr_eq(&service, &harness.permission_service()));
+    harness.shutdown(false).await.unwrap();
+    harness.memory.close().await.unwrap();
+}
+
+async fn grant_session_for_test(
+    service: &PermissionService,
+    invocation: &PermissionInvocation<'_>,
+) {
+    let (sender, mut receiver) = mpsc::channel::<ApprovalRequest>(1);
+    let decision = tokio::spawn(async move {
+        receiver
+            .recv()
+            .await
+            .unwrap()
+            .reply
+            .send(ApprovalAnswer::Session)
+            .unwrap();
+    });
+    assert_eq!(
+        service
+            .authorize(invocation, Some(&ApprovalSender::new(sender)))
+            .await
+            .unwrap(),
+        PermissionOutcome::SessionAuthorized
+    );
+    decision.await.unwrap();
+    assert_eq!(
+        service.authorize(invocation, None).await.unwrap(),
+        PermissionOutcome::Authorized
+    );
+}
+
+#[tokio::test]
+async fn resume_new_and_fork_clear_session_only_tool_authority() {
+    let project = tempfile::tempdir().unwrap();
+    let config = config("http://127.0.0.1:1/".into(), Some(PermissionAction::Ask));
+    let tools = ToolHost::new(project.path(), &config).unwrap();
+    let service = tools.permission_service();
+    let mut harness = Harness::with_tool_host(
+        config,
+        project.path(),
+        MemoryStore::temporary().await.unwrap(),
+        provider(false),
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    let source = harness.session.id.clone();
+    let target = harness.topology.parts[0].id.clone();
+    harness
+        .run_controlled(
+            "one settled fork boundary",
+            Some(&target),
+            "permission-boundary",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let node = harness
+        .memory
+        .session_catalog_record(&source)
+        .await
+        .unwrap()
+        .unwrap()
+        .head_node_id
+        .unwrap();
+    let arguments = json!({"agent":"reviewer","message":"one explicit request"});
+    let invocation = PermissionInvocation::new(
+        PermissionSelector::a2a("reviewer").unwrap(),
+        None,
+        &arguments,
+    )
+    .unwrap();
+
+    grant_session_for_test(&service, &invocation).await;
+    let fresh = harness.new_session().await.unwrap();
+    assert_ne!(fresh, source);
+    assert_eq!(
+        service.authorize(&invocation, None).await.unwrap(),
+        PermissionOutcome::PermissionRequired
+    );
+    grant_session_for_test(&service, &invocation).await;
+    harness.resume_session(&source).await.unwrap();
+    assert_eq!(
+        service.authorize(&invocation, None).await.unwrap(),
+        PermissionOutcome::PermissionRequired
+    );
+    grant_session_for_test(&service, &invocation).await;
+    let child = harness
+        .fork_session(&source, &node, "permission fork")
+        .await
+        .unwrap();
+    assert_ne!(child, source);
+    assert_eq!(
+        service.authorize(&invocation, None).await.unwrap(),
+        PermissionOutcome::PermissionRequired
+    );
     harness.shutdown(false).await.unwrap();
     harness.memory.close().await.unwrap();
 }

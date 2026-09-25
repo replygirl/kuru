@@ -21,6 +21,8 @@ pub struct ExportProvenance {
     pub state_count: u64,
     pub context_summary_count: u64,
     pub context_cursor_count: u64,
+    pub session_catalog_count: u64,
+    pub public_turn_count: u64,
 }
 
 /// One application storage row retained by a committed export.
@@ -47,6 +49,12 @@ pub enum StorageRecord {
     ContextCursor {
         cursor: super::ContextSummaryCursor,
     },
+    SessionCatalog {
+        record: super::SessionCatalogRecord,
+    },
+    PublicTurn {
+        record: super::PublicTurnRecord,
+    },
 }
 
 /// Opaque continuation for an [`ActiveExportSnapshot`].
@@ -62,6 +70,8 @@ enum Phase {
     State(Option<Vec<u8>>),
     ContextSummaries(Option<String>),
     ContextCursors(Option<(Vec<u8>, Vec<u8>, Vec<u8>)>),
+    SessionCatalog(Option<Vec<u8>>),
+    PublicTurns(Option<String>),
 }
 
 /// One bounded export page and its continuation, if another page exists.
@@ -107,6 +117,16 @@ impl MemoryStore {
         } else {
             0
         };
+        let session_catalog_count = if schema_version >= 7 {
+            count(&pool, "session_catalog").await?
+        } else {
+            0
+        };
+        let public_turn_count = if schema_version >= 7 {
+            count(&pool, "session_public_turns").await?
+        } else {
+            0
+        };
         Ok(ActiveExportSnapshot {
             _shared: self.shared.clone(),
             pool,
@@ -119,6 +139,8 @@ impl MemoryStore {
                 state_count,
                 context_summary_count,
                 context_cursor_count,
+                session_catalog_count,
+                public_turn_count,
             },
             id: Uuid::new_v4(),
         })
@@ -200,7 +222,7 @@ impl ActiveExportSnapshot {
                 if self.provenance.schema_version < 5 {
                     return Ok(ExportPage {
                         records: Vec::new(),
-                        next: None,
+                        next: Some(self.cursor(Phase::SessionCatalog(None))),
                     });
                 }
                 let records = context_cursors(&self.pool, after).await?;
@@ -213,6 +235,44 @@ impl ActiveExportSnapshot {
                             cursor.session_id.as_bytes().to_vec(),
                             cursor.source_namespace.as_bytes().to_vec(),
                         )))))
+                    }
+                    _ => Some(self.cursor(Phase::SessionCatalog(None))),
+                };
+                Ok(ExportPage { records, next })
+            }
+            Phase::SessionCatalog(after) => {
+                if self.provenance.schema_version < 7 {
+                    return Ok(ExportPage {
+                        records: Vec::new(),
+                        next: Some(self.cursor(Phase::PublicTurns(None))),
+                    });
+                }
+                let records = session_catalog(&self.pool, after).await?;
+                let next = match records.last() {
+                    Some(StorageRecord::SessionCatalog { record })
+                        if records.len() == PAGE_SIZE as usize =>
+                    {
+                        Some(self.cursor(Phase::SessionCatalog(Some(
+                            record.session_id.as_bytes().to_vec(),
+                        ))))
+                    }
+                    _ => Some(self.cursor(Phase::PublicTurns(None))),
+                };
+                Ok(ExportPage { records, next })
+            }
+            Phase::PublicTurns(after) => {
+                if self.provenance.schema_version < 7 {
+                    return Ok(ExportPage {
+                        records: Vec::new(),
+                        next: None,
+                    });
+                }
+                let records = public_turns(&self.pool, after).await?;
+                let next = match records.last() {
+                    Some(StorageRecord::PublicTurn { record })
+                        if records.len() == PAGE_SIZE as usize =>
+                    {
+                        Some(self.cursor(Phase::PublicTurns(Some(record.node_id.clone()))))
                     }
                     _ => None,
                 };
@@ -228,12 +288,16 @@ impl ActiveExportSnapshot {
         state_count: u64,
         context_summary_count: u64,
         context_cursor_count: u64,
+        session_catalog_count: u64,
+        public_turn_count: u64,
     ) -> Result<()> {
         ensure!(
             message_count == self.provenance.message_count
                 && state_count == self.provenance.state_count
                 && context_summary_count == self.provenance.context_summary_count
-                && context_cursor_count == self.provenance.context_cursor_count,
+                && context_cursor_count == self.provenance.context_cursor_count
+                && session_catalog_count == self.provenance.session_catalog_count
+                && public_turn_count == self.provenance.public_turn_count,
             "export records do not match captured committed counts"
         );
         Ok(())
@@ -258,6 +322,8 @@ async fn count(pool: &MySqlPool, table: &'static str) -> Result<u64> {
         "state" => "SELECT COUNT(*) FROM state",
         "context_summaries" => "SELECT COUNT(*) FROM context_summaries",
         "context_summary_cursors" => "SELECT COUNT(*) FROM context_summary_cursors",
+        "session_catalog" => "SELECT COUNT(*) FROM session_catalog",
+        "session_public_turns" => "SELECT COUNT(*) FROM session_public_turns",
         _ => unreachable!("export registry is fixed"),
     };
     let count: i64 = tokio::time::timeout(QUERY_TIMEOUT, sqlx::query_scalar(query).fetch_one(pool))
@@ -497,6 +563,50 @@ async fn context_cursors(
         .collect()
 }
 
+async fn session_catalog(pool: &MySqlPool, after: Option<Vec<u8>>) -> Result<Vec<StorageRecord>> {
+    let rows = match after {
+        Some(after) => sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id > ? ORDER BY session_id LIMIT ?")
+            .bind(after)
+            .bind(PAGE_SIZE)
+            .fetch_all(pool),
+        None => sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog ORDER BY session_id LIMIT ?")
+            .bind(PAGE_SIZE)
+            .fetch_all(pool),
+    };
+    tokio::time::timeout(QUERY_TIMEOUT, rows)
+        .await
+        .context("export session catalog page deadline exceeded")??
+        .into_iter()
+        .map(|row| {
+            Ok(StorageRecord::SessionCatalog {
+                record: super::decode_session_catalog_row(&row)?,
+            })
+        })
+        .collect()
+}
+
+async fn public_turns(pool: &MySqlPool, after: Option<String>) -> Result<Vec<StorageRecord>> {
+    let rows = match after {
+        Some(after) => sqlx::query("SELECT node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format FROM session_public_turns WHERE node_id > ? ORDER BY node_id LIMIT ?")
+            .bind(after)
+            .bind(PAGE_SIZE)
+            .fetch_all(pool),
+        None => sqlx::query("SELECT node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format FROM session_public_turns ORDER BY node_id LIMIT ?")
+            .bind(PAGE_SIZE)
+            .fetch_all(pool),
+    };
+    tokio::time::timeout(QUERY_TIMEOUT, rows)
+        .await
+        .context("export public turn page deadline exceeded")??
+        .into_iter()
+        .map(|row| {
+            Ok(StorageRecord::PublicTurn {
+                record: super::decode_public_turn_row(&row)?,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,7 +718,7 @@ mod tests {
             }
         }
         assert!(pages >= 4, "messages and state must use distinct pages");
-        snapshot.verify_counts(258, 257, 0, 0)?;
+        snapshot.verify_counts(258, 257, 0, 0, 0, 0)?;
         assert_eq!(
             records
                 .iter()
@@ -647,7 +757,9 @@ mod tests {
                 StorageRecord::Message { sequence, .. } => Some(*sequence),
                 StorageRecord::State { .. }
                 | StorageRecord::ContextSummary { .. }
-                | StorageRecord::ContextCursor { .. } => None,
+                | StorageRecord::ContextCursor { .. }
+                | StorageRecord::SessionCatalog { .. }
+                | StorageRecord::PublicTurn { .. } => None,
             })
             .collect();
         assert_eq!(sequences.first(), Some(&i64::MIN));
@@ -657,7 +769,9 @@ mod tests {
             .filter_map(|record| match record {
                 StorageRecord::Message { .. }
                 | StorageRecord::ContextSummary { .. }
-                | StorageRecord::ContextCursor { .. } => None,
+                | StorageRecord::ContextCursor { .. }
+                | StorageRecord::SessionCatalog { .. }
+                | StorageRecord::PublicTurn { .. } => None,
                 StorageRecord::State { key, .. } => Some(key.clone()),
             })
             .collect();
@@ -686,13 +800,14 @@ mod tests {
     async fn export_cursor_cannot_cross_committed_snapshots() -> Result<()> {
         let store = MemoryStore::temporary().await?;
         let empty = store.begin_active_export().await?;
-        let messages = empty.page(None).await?;
-        assert!(messages.records.is_empty());
-        let mut cursor = messages.next;
+        let first = empty.page(None).await?;
+        assert!(first.records.is_empty());
+        let foreign_cursor = first.next.clone().context("empty export cursor")?;
+        let mut cursor = first.next;
         let mut empty_pages = 0;
         while let Some(next) = cursor {
             assert!(
-                empty_pages < 3,
+                empty_pages < 5,
                 "empty export must terminate after all phases"
             );
             let page = empty.page(Some(next)).await?;
@@ -700,13 +815,16 @@ mod tests {
             cursor = page.next;
             empty_pages += 1;
         }
-        assert_eq!(empty_pages, 3, "empty v5 export must visit every phase");
-        empty.verify_counts(0, 0, 0, 0)?;
+        assert_eq!(empty_pages, 5, "empty v7 export must visit every phase");
+        empty.verify_counts(0, 0, 0, 0, 0, 0)?;
         store.append("export", "note", "one").await?;
         let first = store.begin_active_export().await?;
         let second = store.begin_active_export().await?;
-        let cursor = first.page(None).await?.next.expect("message cursor");
-        let error = second.page(Some(cursor)).await.expect_err("foreign cursor");
+        let _ = first;
+        let error = second
+            .page(Some(foreign_cursor))
+            .await
+            .expect_err("foreign cursor");
         assert!(error.to_string().contains("different snapshot"));
         store.close().await?;
         Ok(())
@@ -769,7 +887,7 @@ mod tests {
             && content_format == "typed-v1"
             && serde_json::from_str::<Value>(content).ok()
                 == Some(json!({"blocks": typed.blocks.clone()}))));
-        snapshot.verify_counts(2, 0, 0, 0)?;
+        snapshot.verify_counts(2, 0, 0, 0, 0, 0)?;
         store.close().await?;
         Ok(())
     }
@@ -802,7 +920,7 @@ mod tests {
             if key.starts_with("kuru/private/reasoning-summary/v1/")
                 && value["text"] == "producer-only summary")
         );
-        snapshot.verify_counts(0, 1, 0, 0)?;
+        snapshot.verify_counts(0, 1, 0, 0, 0, 0)?;
         store.close().await?;
         Ok(())
     }

@@ -57,6 +57,8 @@ pub struct Cli {
     pub effort: Option<String>,
     #[arg(long, global = true)]
     pub resume: Option<String>,
+    #[arg(long = "continue", global = true, conflicts_with = "resume")]
+    pub continue_session: bool,
     #[arg(
         long,
         global = true,
@@ -113,7 +115,11 @@ pub enum Command {
     Models,
     /// Print merged effective configuration.
     Config,
-    Sessions,
+    /// List or change durable sessions without invoking a provider.
+    Sessions {
+        #[command(subcommand)]
+        command: Option<SessionCommand>,
+    },
     /// Inspect this project's memory store and revision history.
     Memory {
         #[command(subcommand)]
@@ -179,6 +185,39 @@ pub enum McpCommand {
     Status { alias: String },
     /// Delete the local credential after a bounded remote revocation attempt.
     Logout { alias: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// Rename one active or removed session.
+    Rename { session: String, label: String },
+    /// Remove one session from ordinary listing and resume selection.
+    Remove { session: String },
+    /// Restore one reversibly removed session.
+    Restore { session: String },
+    /// Fork an immutable settled public prefix into a new session.
+    Fork {
+        session: String,
+        node: String,
+        #[arg(long)]
+        child_id: Option<String>,
+        #[arg(long, default_value = "Fork")]
+        label: String,
+    },
+    /// Export one session's public transcript without private memory.
+    Export {
+        session: String,
+        #[arg(long, value_enum, default_value_t = SessionExportFormat::Markdown)]
+        format: SessionExportFormat,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SessionExportFormat {
+    Jsonl,
+    Markdown,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1035,20 +1074,32 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
 
     let scope = kuru_runtime::project_scope(&cwd)?;
     let memory_config = snapshot.memory_config().clone();
-    let writer = matches!(
-        cli.command,
-        None | Some(
-            Command::Run { .. }
-                | Command::Dream
-                | Command::UndoDream
-                | Command::Serve { .. }
-                | Command::Memory {
-                    command: MemoryCommand::Forget { .. }
-                        | MemoryCommand::CandidateAbandon { .. }
-                        | MemoryCommand::Purge { .. }
-                }
-        )
+    let session_writer = matches!(
+        &cli.command,
+        Some(Command::Sessions {
+            command: Some(
+                SessionCommand::Rename { .. }
+                    | SessionCommand::Remove { .. }
+                    | SessionCommand::Restore { .. }
+                    | SessionCommand::Fork { .. }
+            )
+        })
     );
+    let writer = session_writer
+        || matches!(
+            cli.command,
+            None | Some(
+                Command::Run { .. }
+                    | Command::Dream
+                    | Command::UndoDream
+                    | Command::Serve { .. }
+                    | Command::Memory {
+                        command: MemoryCommand::Forget { .. }
+                            | MemoryCommand::CandidateAbandon { .. }
+                            | MemoryCommand::Purge { .. }
+                    }
+            )
+        );
     let runtime_owner = matches!(
         cli.command,
         None | Some(
@@ -1167,13 +1218,87 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         };
         let mut config = snapshot.finalize(&preferences)?;
         match &cli.command {
-            Some(Command::Sessions) => {
-                let sessions = if let Some(memory) = &existing_memory {
-                    Harness::list_sessions(memory, &cwd).await?
-                } else {
-                    vec![]
+            Some(Command::Sessions { command }) => {
+                let Some(command) = command else {
+                    let sessions = if let Some(memory) = &existing_memory {
+                        Harness::list_sessions(memory, &cwd).await?
+                    } else {
+                        vec![]
+                    };
+                    println!("{}", serde_json::to_string_pretty(&sessions)?);
+                    return Ok(());
                 };
-                println!("{}", serde_json::to_string_pretty(&sessions)?);
+                let memory = existing_memory
+                    .as_ref()
+                    .context("this project has no memory yet; start a conversation first")?;
+                if let SessionCommand::Export {
+                    session,
+                    format,
+                    output,
+                } = command
+                {
+                    crate::session_export::export(
+                        memory,
+                        session,
+                        *format,
+                        output.as_deref(),
+                        &cwd,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let source = match command {
+                    SessionCommand::Rename { session, .. }
+                    | SessionCommand::Remove { session }
+                    | SessionCommand::Restore { session }
+                    | SessionCommand::Fork { session, .. } => memory
+                        .session_catalog_record(session)
+                        .await?
+                        .context("session is absent from this project")?,
+                    SessionCommand::Export { .. } => unreachable!("session export returned above"),
+                };
+                let outcome = match command {
+                    SessionCommand::Rename { label, .. } => {
+                        memory
+                            .rename_session(
+                                &source.session_id,
+                                source.lifecycle_generation,
+                                label,
+                            )
+                            .await?
+                    }
+                    SessionCommand::Remove { .. } => {
+                        memory
+                            .remove_session(&source.session_id, source.lifecycle_generation)
+                            .await?
+                    }
+                    SessionCommand::Restore { .. } => {
+                        memory
+                            .restore_session(&source.session_id, source.lifecycle_generation)
+                            .await?
+                    }
+                    SessionCommand::Fork {
+                        node,
+                        child_id,
+                        label,
+                        ..
+                    } => {
+                        let child_id = child_id
+                            .clone()
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        memory
+                            .fork_session(
+                                &source.session_id,
+                                source.lifecycle_generation,
+                                node,
+                                &child_id,
+                                label,
+                            )
+                            .await?
+                    }
+                    SessionCommand::Export { .. } => unreachable!("session export returned above"),
+                };
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
                 return Ok(());
             }
             Some(Command::Memory { command }) => {
@@ -1309,15 +1434,14 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             println!("Previous membership restored.");
             return Ok(());
         }
-        let provider = provider(&config, &cwd, &data).await?;
         if matches!(cli.command, Some(Command::Models)) {
+            let provider = provider(&config, &cwd, &data).await?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&provider.models().await?)?
             );
             return Ok(());
         }
-        let models = select_model(&mut config, &provider).await?;
         std::fs::create_dir_all(&data)?;
         let data = data.canonicalize()?;
         ensure!(
@@ -1333,6 +1457,15 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             }
         };
         memory_to_close = Some(memory.clone());
+        let resume = if cli.continue_session {
+            Some(Harness::continuation_session(&memory, &cwd).await?)
+        } else if let Some(session_id) = cli.resume.as_deref() {
+            Some(Harness::resumable_session(&memory, &cwd, session_id).await?)
+        } else {
+            None
+        };
+        let provider = provider(&config, &cwd, &data).await?;
+        let models = select_model(&mut config, &provider).await?;
         let notice = crate::memory_notice::MemoryNotice::pending(memory.clone()).await?;
         if matches!(
             cli.command,
@@ -1357,7 +1490,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
             snapshot.instructions().to_owned(),
             memory,
             provider,
-            cli.resume.as_deref(),
+            resume.as_deref(),
             tools,
         )
         .await?;
@@ -1589,7 +1722,7 @@ fn command_claim_categories(
     use AuthorityClaimCategory as Category;
     let categories: &[Category] = match command {
         Some(Command::Auth) => &[Category::ResponsesRoute],
-        Some(Command::Sessions | Command::Memory { .. } | Command::UndoDream) => {
+        Some(Command::Sessions { .. } | Command::Memory { .. } | Command::UndoDream) => {
             &[Category::MemoryDoltBinary, Category::MemoryCacheDir]
         }
         Some(Command::File {

@@ -19,7 +19,7 @@ use kuru_core::{
 };
 use kuru_memory::{
     ContextSummaryCheckpoint, ContextSummaryRecord, ContextSummaryStale, MemoryStore,
-    ReasoningSummaryRecord, UsageLedger, context_summary_id,
+    PublicTranscriptEntry, ReasoningSummaryRecord, UsageLedger, context_summary_id,
 };
 use serde_json::Value;
 use tokio::{
@@ -59,7 +59,6 @@ pub(crate) struct Work {
     pub turn_id: Option<String>,
     pub inputs: Vec<Message>,
     pub instructions: String,
-    pub transcript_key: String,
     pub context_sources: Vec<ContextSource>,
     pub context_budget: ContextBudget,
     pub compaction_policy: ContextCompactionPolicy,
@@ -79,8 +78,15 @@ pub(crate) struct Work {
 
 pub(crate) struct Actor {
     namespace: String,
-    pub tx: mpsc::Sender<Work>,
+    pub tx: mpsc::Sender<ActorCommand>,
     task: JoinHandle<()>,
+    #[cfg(test)]
+    started_work: Arc<AtomicU64>,
+}
+
+pub(crate) enum ActorCommand {
+    Work(Box<Work>),
+    Drain(oneshot::Sender<()>),
 }
 
 #[derive(Debug)]
@@ -200,10 +206,23 @@ impl ProviderSink for AccountingObserver {
 
 impl Actor {
     pub fn spawn(namespace: String, provider: Arc<dyn Provider>, permits: Arc<Semaphore>) -> Self {
-        let (tx, mut rx) = mpsc::channel::<Work>(16);
+        let (tx, mut rx) = mpsc::channel::<ActorCommand>(16);
         let captured_namespace = namespace.clone();
+        #[cfg(test)]
+        let started_work = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let worker_started_work = started_work.clone();
         let task = tokio::spawn(async move {
-            while let Some(mut work) = rx.recv().await {
+            while let Some(command) = rx.recv().await {
+                let mut work = match command {
+                    ActorCommand::Work(work) => *work,
+                    ActorCommand::Drain(reply) => {
+                        let _ = reply.send(());
+                        continue;
+                    }
+                };
+                #[cfg(test)]
+                worker_started_work.fetch_add(1, Ordering::SeqCst);
                 let span = work.span.clone();
                 let started = Instant::now();
                 let mut reply = work
@@ -303,18 +322,13 @@ impl Actor {
                         (vec![], 0)
                     };
                     let (mut optional_public, omitted_public_rows) = if public_transcript {
-                        let window =
-                            read_window(&work.memory, &work.transcript_key, 16, &work.cancellation)
-                                .await?;
-                        let omitted = window
-                            .total_rows
-                            .saturating_sub(window.messages.len() as u64);
-                        let visible = window
-                            .messages
-                            .into_iter()
-                            .filter(|message| message.role != crate::engine::INTERRUPTION_ROLE)
-                            .collect();
-                        (visible, omitted)
+                        read_public_window(
+                            &work.memory,
+                            &work.invocation.session_id,
+                            16,
+                            &work.cancellation,
+                        )
+                        .await?
                     } else {
                         (vec![], 0)
                     };
@@ -586,11 +600,30 @@ impl Actor {
             namespace: captured_namespace,
             tx,
             task,
+            #[cfg(test)]
+            started_work,
         }
     }
 
     pub(crate) fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn started_work_counter(&self) -> Arc<AtomicU64> {
+        self.started_work.clone()
+    }
+
+    /// A FIFO acknowledgement after every earlier work item has fully exited.
+    pub(crate) async fn drain(&self) -> Result<()> {
+        let (reply, received) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::Drain(reply))
+            .await
+            .context("actor stopped before cleanup barrier")?;
+        received
+            .await
+            .context("actor stopped during cleanup barrier")
     }
 
     pub(crate) fn abort(&self) {
@@ -622,6 +655,38 @@ async fn read_window(
                 .map_err(Into::into)
         })
         .await
+}
+
+async fn read_public_window(
+    memory: &MemoryStore,
+    session_id: &str,
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<Message>, u64)> {
+    let page = cancellation
+        .wait(async {
+            memory
+                .public_transcript_page(session_id, None, limit)
+                .await
+                .map_err(MemoryFailure)
+                .map_err(Into::into)
+        })
+        .await?;
+    let omitted = page.total_rows.saturating_sub(page.records.len() as u64);
+    let mut visible = Vec::new();
+    for entry in page.records.into_iter().rev() {
+        match entry {
+            PublicTranscriptEntry::Turn { record } => {
+                if let Some(user) = record.user_entry {
+                    visible.push(user);
+                }
+                visible.extend(record.terminal_entries);
+            }
+            PublicTranscriptEntry::Legacy { message, .. } => visible.push(message),
+        }
+    }
+    visible.retain(|message| message.role != crate::engine::INTERRUPTION_ROLE);
+    Ok((visible, omitted))
 }
 
 async fn read_private_context(

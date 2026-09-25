@@ -223,7 +223,7 @@ impl Harness {
             extra.push((keys.dream_undo, serde_json::to_value(&self.topology)?));
         }
         let updates = self
-            .state_updates(&memory, &self.profile, &topology, &self.session, extra)
+            .state_updates(&self.profile, &topology, &self.session, extra)
             .await?;
         cancellation.check()?;
         memory.put_many(&updates).await?;
@@ -890,13 +890,7 @@ mod cancellation_tests {
         let actor_namespaces =
             prepared_actor_namespaces(&harness.scope, &harness.profile, &topology).unwrap();
         let updates = harness
-            .state_updates(
-                &candidate.view(),
-                &harness.profile,
-                &topology,
-                &harness.session,
-                vec![],
-            )
+            .state_updates(&harness.profile, &topology, &harness.session, vec![])
             .await
             .unwrap();
         candidate.view().put_many(&updates).await.unwrap();

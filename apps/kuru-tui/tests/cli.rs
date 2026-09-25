@@ -1312,6 +1312,525 @@ fn cli_turn_id_reuses_only_the_exact_request_in_its_session() {
     );
 }
 
+#[tokio::test]
+async fn session_lifecycle_cli_is_provider_free_and_matches_resume_continue_and_export() {
+    use kuru_memory::MemoryStore;
+    use kuru_runtime::project_scope;
+
+    let env = Sandbox::new();
+    let scope = project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let memory = MemoryStore::open(options).await.unwrap();
+    memory
+        .append(
+            &format!("{scope}/ifs/identity/export-private/notes"),
+            "note",
+            "PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT",
+        )
+        .await
+        .unwrap();
+    memory
+        .put(
+            &format!("{scope}/private/export-probe"),
+            &serde_json::json!({"secret": "PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"}),
+        )
+        .await
+        .unwrap();
+    memory.close().await.unwrap();
+    let first: Value = serde_json::from_str(&env.success(&[
+        "run",
+        "create one public session boundary",
+        "--json",
+    ]))
+    .unwrap();
+    let source = first["session"].as_str().unwrap().to_owned();
+    let sessions: Value = serde_json::from_str(&env.success(&["sessions"])).unwrap();
+    let source_record = sessions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["id"] == source)
+        .unwrap();
+    let source_node = source_record["head_node_id"].as_str().unwrap().to_owned();
+
+    let provider_free = |args: &[&str]| {
+        let output = env
+            .command_for("responses")
+            .env_remove("OPENAI_API_KEY")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let renamed: Value = serde_json::from_slice(
+        &provider_free(&["sessions", "rename", &source, "durable source"]).stdout,
+    )
+    .unwrap();
+    assert_eq!(renamed["session_id"], source);
+    let child = "00000000-0000-4000-8000-000000000011";
+    let forked: Value = serde_json::from_slice(
+        &provider_free(&[
+            "sessions",
+            "fork",
+            &source,
+            &source_node,
+            "--child-id",
+            child,
+            "--label",
+            "durable fork",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(forked["session_id"], child);
+    let newest: Value = serde_json::from_str(&env.success(&[
+        "run",
+        "create a newer session that will be removed",
+        "--json",
+    ]))
+    .unwrap();
+    let newest_id = newest["session"].as_str().unwrap();
+    let newest_removed: Value =
+        serde_json::from_slice(&provider_free(&["sessions", "remove", newest_id]).stdout).unwrap();
+    assert_eq!(newest_removed["lifecycle_state"], "removed");
+    let removed: Value =
+        serde_json::from_slice(&provider_free(&["sessions", "remove", &source]).stdout).unwrap();
+    assert_eq!(removed["lifecycle_state"], "removed");
+    let active: Value = serde_json::from_slice(&provider_free(&["sessions"]).stdout).unwrap();
+    assert!(
+        active
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"] != source)
+    );
+    assert!(
+        active
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == child)
+    );
+
+    let refused = env.run(&["--resume", &source, "run", "must not dispatch"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("session is removed; restore it before resuming")
+    );
+    let missing = env.run(&[
+        "--resume",
+        "00000000-0000-4000-8000-000000000099",
+        "run",
+        "must not dispatch a missing session",
+    ]);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("session is absent"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let continued: Value = serde_json::from_str(&env.success(&[
+        "--continue",
+        "run",
+        "append only to the latest active fork",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(continued["session"], child);
+
+    let restored: Value =
+        serde_json::from_slice(&provider_free(&["sessions", "restore", &source]).stdout).unwrap();
+    assert_eq!(restored["lifecycle_state"], "active");
+    let exact: Value = serde_json::from_str(&env.success(&[
+        "--resume",
+        &source,
+        "run",
+        "resume the restored exact source",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(exact["session"], source);
+
+    let exported = env.root.path().join("fork.jsonl");
+    std::fs::write(&exported, "selected output sentinel").unwrap();
+    let export_path = exported.to_str().unwrap();
+    let output = provider_free(&[
+        "sessions",
+        "export",
+        child,
+        "--format",
+        "jsonl",
+        "--output",
+        export_path,
+    ]);
+    assert!(output.stdout.is_empty());
+    let lines = std::fs::read_to_string(exported).unwrap();
+    let records = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records[0]["kind"], "manifest");
+    assert_eq!(records[0]["session"]["session_id"], child);
+    assert!(records.iter().any(|record| {
+        record["kind"] == "turn"
+            && record["record"]["terminal_entries"]
+                .to_string()
+                .contains("demo")
+    }));
+    assert!(lines.contains("create one public session boundary"));
+    assert!(lines.contains("append only to the latest active fork"));
+    assert!(!lines.contains("resume the restored exact source"));
+    assert!(!lines.contains("selected output sentinel"));
+    assert!(!lines.contains("PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT"));
+    assert!(!lines.contains("PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"));
+
+    let markdown = env.root.path().join("fork.md");
+    let markdown_path = markdown.to_str().unwrap();
+    let output = provider_free(&[
+        "sessions",
+        "export",
+        child,
+        "--format",
+        "markdown",
+        "--output",
+        markdown_path,
+    ]);
+    assert!(output.stdout.is_empty());
+    let markdown = std::fs::read_to_string(markdown).unwrap();
+    assert!(markdown.contains("# Kuru public session export"));
+    let inherited = markdown.find("create one public session boundary").unwrap();
+    let own = markdown
+        .find("append only to the latest active fork")
+        .unwrap();
+    assert!(inherited < own, "Markdown transcript was not chronological");
+    assert!(!markdown.contains("resume the restored exact source"));
+    assert!(!markdown.contains("PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT"));
+    assert!(!markdown.contains("PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"));
+
+    let complete_memory = provider_free(&["memory", "export"]);
+    let complete_memory = String::from_utf8(complete_memory.stdout).unwrap();
+    assert!(complete_memory.contains("PRIVATE_NOTE_EXCLUDED_FROM_SESSION_EXPORT"));
+    assert!(complete_memory.contains("PRIVATE_STATE_EXCLUDED_FROM_SESSION_EXPORT"));
+}
+
+#[tokio::test]
+async fn session_export_keeps_legacy_speaker_and_turn_unknown_in_both_formats() {
+    use kuru_core::{Message, Mode};
+    use kuru_memory::{
+        LEGACY_PREFIX_RECORD_FORMAT, LegacyTranscriptPrefix, MemoryStore,
+        SESSION_CATALOG_RECORD_FORMAT, SessionCatalogRecord, SessionLifecycleState,
+    };
+    use kuru_runtime::project_scope;
+
+    let env = Sandbox::new();
+    let scope = project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let session = "00000000-0000-4000-8000-000000000031";
+    let namespace = format!("{scope}/transcript/{session}");
+    let memory = MemoryStore::open(options.clone()).await.unwrap();
+    memory
+        .append_session_message(
+            &namespace,
+            session,
+            &Message::text("assistant", "legacy public answer"),
+        )
+        .await
+        .unwrap();
+    let window = memory
+        .session_history_window_after(&namespace, session, 0, 16)
+        .await
+        .unwrap();
+    let sequence = window.rows[0].sequence;
+    let prefix = LegacyTranscriptPrefix {
+        namespace,
+        source_session_id: session.into(),
+        source_revision: window.revision,
+        first_sequence: sequence,
+        through_sequence: sequence,
+        row_count: 1,
+        record_format: LEGACY_PREFIX_RECORD_FORMAT.into(),
+    };
+    memory.close().await.unwrap();
+    kuru_memory::test_support::seed_public_session(
+        options,
+        &SessionCatalogRecord {
+            session_id: session.into(),
+            mode: Mode::Ifs,
+            label: "legacy attribution".into(),
+            created_order: 1,
+            updated_order: 1,
+            lifecycle_generation: 0,
+            lifecycle_state: SessionLifecycleState::Active,
+            head_node_id: None,
+            pending_node_id: None,
+            legacy_prefix: Some(prefix),
+            fork_provenance: None,
+            record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+        },
+        &[],
+    )
+    .await
+    .unwrap();
+
+    for format in ["jsonl", "markdown"] {
+        let path = env.root.path().join(format!("legacy.{format}"));
+        let output = env
+            .command_for("responses")
+            .env_remove("OPENAI_API_KEY")
+            .args([
+                "sessions",
+                "export",
+                session,
+                "--format",
+                format,
+                "--output",
+                path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        let contents = std::fs::read_to_string(path).unwrap();
+        let records = contents
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2, "{format}: {contents}");
+        assert_eq!(records[0]["kind"], "manifest");
+        assert_eq!(records[0]["session"]["session_id"], session);
+        assert_eq!(records[0]["total_rows"], 1);
+        assert_eq!(records[1]["kind"], "legacy");
+        assert_eq!(records[1]["sequence"], sequence);
+        assert_eq!(
+            records[1]["message"],
+            serde_json::to_value(Message::text("assistant", "legacy public answer")).unwrap()
+        );
+        assert!(records[1].get("speaker_id").is_none());
+        assert!(records[1].get("turn_id").is_none());
+    }
+}
+
+#[tokio::test]
+async fn normal_cli_exports_large_parent_and_fork_in_complete_chronological_records() {
+    use kuru_core::{Message, Mode};
+    use kuru_memory::{
+        MemoryStore, PUBLIC_TURN_RECORD_FORMAT, PublicTurnKind, PublicTurnRecord,
+        PublicTurnSettlement, SESSION_CATALOG_RECORD_FORMAT, SessionCatalogRecord,
+        SessionLifecycleState, SessionTurnCheckpoint, public_turn_node_id,
+    };
+    use kuru_runtime::project_scope;
+    use std::io::{BufRead, BufReader};
+
+    let env = Sandbox::new();
+    let scope = project_scope(&env.project).unwrap();
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope.clone()).unwrap();
+    let parent = "00000000-0000-4000-8000-000000000021";
+    let child = "00000000-0000-4000-8000-000000000022";
+    let large_answer = "🪶".repeat(8_192);
+    let mut turns = Vec::with_capacity(1_025);
+    let mut predecessor = None;
+    for index in 0..1_025 {
+        let turn_id = format!("bulk-{index:04}");
+        let node_id = public_turn_node_id(parent, &turn_id).unwrap();
+        turns.push(PublicTurnRecord {
+            node_id: node_id.clone(),
+            origin_session_id: parent.into(),
+            turn_id,
+            kind: PublicTurnKind::Primary,
+            continuation_of_node_id: None,
+            predecessor_node_id: predecessor,
+            settlement: PublicTurnSettlement::Completed,
+            user_entry: Some(Message::text("user", format!("question-{index:04}"))),
+            speaker_id: Some("fixture-speaker".into()),
+            terminal_entries: vec![Message::text(
+                "assistant",
+                format!("answer-{index:04}:{large_answer}"),
+            )],
+            record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
+        });
+        predecessor = Some(node_id);
+    }
+    let catalog = SessionCatalogRecord {
+        session_id: parent.into(),
+        mode: Mode::Ifs,
+        label: "long parent".into(),
+        created_order: 1,
+        updated_order: 1,
+        lifecycle_generation: 0,
+        lifecycle_state: SessionLifecycleState::Active,
+        head_node_id: predecessor,
+        pending_node_id: None,
+        legacy_prefix: None,
+        fork_provenance: None,
+        record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+    };
+    kuru_memory::test_support::seed_public_session(options.clone(), &catalog, &turns)
+        .await
+        .unwrap();
+    drop(turns);
+
+    let memory = MemoryStore::open(options).await.unwrap();
+    memory
+        .put(
+            &format!("{scope}/private/export-probe"),
+            &serde_json::json!("PRIVATE_STATE_EXCLUDED_FROM_LONG_EXPORT"),
+        )
+        .await
+        .unwrap();
+    memory
+        .append(
+            &format!("{scope}/ifs/identity/private/notes"),
+            "note",
+            "PRIVATE_NOTE_EXCLUDED_FROM_LONG_EXPORT",
+        )
+        .await
+        .unwrap();
+    let fork_node = public_turn_node_id(parent, "bulk-1023").unwrap();
+    memory
+        .fork_session(parent, 0, &fork_node, child, "long fork")
+        .await
+        .unwrap();
+    let child_namespace = format!("{scope}/transcript/{child}");
+    memory
+        .checkpoint_session_turn(
+            &child_namespace,
+            child,
+            &[Message::text("user", "CHILD-OWN-QUESTION")],
+            &[],
+            &SessionTurnCheckpoint::Admit {
+                expected_generation: 0,
+                turn_id: "child-own".into(),
+                label: None,
+                expected_transcript_rows: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+    memory
+        .checkpoint_session_turn(
+            &child_namespace,
+            child,
+            &[Message::text("assistant", "CHILD-OWN-ANSWER")],
+            &[],
+            &SessionTurnCheckpoint::Settle {
+                expected_generation: 0,
+                turn_id: "child-own".into(),
+                settlement: PublicTurnSettlement::Completed,
+                speaker_id: "fixture-speaker".into(),
+            },
+        )
+        .await
+        .unwrap();
+    memory.close().await.unwrap();
+
+    for (session, fork) in [(parent, false), (child, true)] {
+        for format in ["jsonl", "markdown"] {
+            let path = env.root.path().join(format!("{session}.{format}"));
+            let output = env
+                .command_for("responses")
+                .env_remove("OPENAI_API_KEY")
+                .args([
+                    "sessions",
+                    "export",
+                    session,
+                    "--format",
+                    format,
+                    "--output",
+                    path.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{session} {format}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stdout.is_empty());
+            assert!(
+                std::fs::metadata(&path).unwrap().len() > 32 * 1024 * 1024,
+                "{session} {format} export did not exceed the page-memory bound"
+            );
+            let mut manifest = false;
+            let mut rows = 0;
+            for line in BufReader::new(std::fs::File::open(&path).unwrap()).lines() {
+                let line = line.unwrap();
+                assert!(!line.contains("PRIVATE_STATE_EXCLUDED_FROM_LONG_EXPORT"));
+                assert!(!line.contains("PRIVATE_NOTE_EXCLUDED_FROM_LONG_EXPORT"));
+                if !line.starts_with('{') {
+                    continue;
+                }
+                let record: Value = serde_json::from_str(&line).unwrap();
+                match record["kind"].as_str().unwrap() {
+                    "manifest" => {
+                        assert!(!manifest);
+                        assert_eq!(record["session"]["session_id"], session);
+                        assert_eq!(record["total_rows"], 1_025);
+                        if fork {
+                            assert_eq!(
+                                record["session"]["fork_provenance"]["source_session_id"],
+                                parent
+                            );
+                            assert_eq!(
+                                record["session"]["fork_provenance"]["source_node_id"],
+                                fork_node
+                            );
+                        }
+                        manifest = true;
+                    }
+                    "turn" => {
+                        assert!(manifest);
+                        let expected = if fork && rows == 1_024 {
+                            "child-own".to_owned()
+                        } else {
+                            format!("bulk-{rows:04}")
+                        };
+                        assert_eq!(record["record"]["turn_id"], expected);
+                        assert_eq!(record["record"]["speaker_id"], "fixture-speaker");
+                        assert_eq!(record["record"]["settlement"], "completed");
+                        let turn: PublicTurnRecord =
+                            serde_json::from_value(record["record"].clone()).unwrap();
+                        let (question, answer) = if fork && rows == 1_024 {
+                            (
+                                "CHILD-OWN-QUESTION".to_owned(),
+                                "CHILD-OWN-ANSWER".to_owned(),
+                            )
+                        } else {
+                            (
+                                format!("question-{rows:04}"),
+                                format!("answer-{rows:04}:{large_answer}"),
+                            )
+                        };
+                        assert_eq!(turn.user_entry, Some(Message::text("user", question)));
+                        assert_eq!(
+                            turn.terminal_entries,
+                            vec![Message::text("assistant", answer)]
+                        );
+                        assert_eq!(
+                            turn.origin_session_id,
+                            if fork && rows == 1_024 { child } else { parent }
+                        );
+                        rows += 1;
+                    }
+                    kind => panic!("unexpected {format} export record {kind}"),
+                }
+            }
+            assert!(manifest);
+            assert_eq!(rows, 1_025);
+        }
+    }
+}
+
 #[test]
 fn cli_requires_explicit_project_purge_confirmation_and_removes_its_diagnostics_ring() {
     let env = Sandbox::new();
@@ -2338,7 +2857,12 @@ fn cli_memory_progress_is_bounded_and_keeps_json_on_stdout() {
     .unwrap();
 
     let cold_started = std::time::Instant::now();
-    let cold = env.run(&["run", "cold memory", "--json"]);
+    let cold = env
+        .command()
+        .env("KURU_TEST_MEMORY_STARTUP_STAGES", "1")
+        .args(["run", "cold memory", "--json"])
+        .output()
+        .unwrap();
     let cold_elapsed = cold_started.elapsed();
     assert!(
         cold.status.success(),
@@ -2505,7 +3029,12 @@ fn cli_imports_a_real_legacy_wal_without_changing_its_layout() {
     let original_wal = std::fs::read(&wal_path).unwrap();
     assert!(env.data.join("memory.sqlite3-shm").is_file());
 
-    let output = env.run(&["sessions"]);
+    let output = env
+        .command()
+        .env("KURU_TEST_MEMORY_STARTUP_STAGES", "1")
+        .arg("sessions")
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",

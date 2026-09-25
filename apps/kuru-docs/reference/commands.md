@@ -23,6 +23,10 @@ Run `kuru --help` for the installed CLI's options, or `/help` inside the termina
 | -------------------------------------------- | ----------------------------------------------------------------------------- |
 | `/help`                                      | Show terminal help                                                            |
 | `/clear`                                     | Clear the visible conversation; keep stored turns and the session             |
+| `/new`                                       | Start another session using current shared project memory                     |
+| `/sessions`                                  | Open the session picker for resume, rename, remove, restore and fork          |
+| `/resume SESSION_ID`                         | Resume one exact active session                                               |
+| `/export [PATH]`                             | Export this public session as Markdown                                        |
 | `/status`                                    | Show the current session, project, selections, turns, and known usage locally |
 | `/parts`                                     | Inspect active parts and relationships                                        |
 | `/mode ifs`                                  | Select `ifs`, `polyvagal`, `freudian`, or `jungian`                           |
@@ -69,6 +73,11 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru trust approve [--yes]`                                   | Review and persist approval for the complete current authority manifest                     |
 | `kuru trust revoke`                                            | Remove the exact workspace's approval without confirmation                                  |
 | `kuru sessions`                                                | List saved sessions                                                                         |
+| `kuru sessions rename ID LABEL`                                | Change one session's label                                                                  |
+| `kuru sessions remove ID`                                      | Reversibly remove a session from ordinary listing and resume                                |
+| `kuru sessions restore ID`                                     | Restore one removed session with its identity and transcript                                |
+| `kuru sessions fork ID SETTLED_NODE_ID`                        | Fork the public prefix through one settled boundary, sharing current project memory         |
+| `kuru sessions export ID --format jsonl --output PATH`         | Export one public transcript as chronological JSONL; Markdown is also supported             |
 | `kuru memory status`                                           | Inspect the project store, branch and revision                                              |
 | `kuru memory history`                                          | List committed memory updates; use `--limit` to select 1–1000 entries                       |
 | `kuru memory candidates`                                       | List retained dream candidate refs; use `--limit` and the opaque `--after` cursor           |
@@ -111,6 +120,7 @@ unchanged. For API-key access, set `OPENAI_API_KEY` and select
 | `--model ID`             | Choose a model                                                             |
 | `--effort LEVEL`         | Set reasoning effort                                                       |
 | `--resume ID`            | Resume a saved conversation                                                |
+| `--continue`             | Select the latest nonremoved saved conversation by durable catalog order   |
 | `--allow-write`          | Permit built-in file mutation tools                                        |
 | `--allow-shell`          | Permit shell processes with your account's authority                       |
 | `--trust-workspace-once` | Approve only this command's applicable workspace claims without persisting |

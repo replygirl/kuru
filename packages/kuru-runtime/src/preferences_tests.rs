@@ -199,16 +199,18 @@ async fn failed_preference_updates_leave_live_choices_topology_and_saved_prefere
         .unwrap();
     assert!(harness.set_model("", None).await.is_err());
     assert!(harness.set_effort(Some("".into())).await.is_err());
-    memory
-        .put(
-            &format!("{}/sessions", harness.scope),
-            &json!("invalid index"),
-        )
-        .await
-        .unwrap();
-    assert!(harness.set_mode(Mode::Jungian).await.is_err());
-    assert!(harness.set_model("next-model", None).await.is_err());
-    assert!(harness.set_effort(None).await.is_err());
+    for update in 0..3 {
+        memory.reject_next_state_write_for_test();
+        let error = match update {
+            0 => harness.set_mode(Mode::Jungian).await.unwrap_err(),
+            1 => harness.set_model("next-model", None).await.unwrap_err(),
+            _ => harness.set_effort(None).await.unwrap_err(),
+        };
+        assert!(
+            format!("{error:#}").contains("injected state-save refusal before request send"),
+            "unexpected failed preference update: {error:#}"
+        );
+    }
     assert_eq!(harness.config, before_config);
     assert_eq!(harness.session.mode, before_config.mode);
     assert_eq!(

@@ -515,10 +515,17 @@ async fn all_four_modes_keep_builtin_dream_requests_and_own_memory_isolation() {
             .map(|part| part.id.clone())
             .collect::<Vec<_>>();
         let transcript = format!("{}/transcript/{}", harness.scope, harness.session.id);
-        memory
-            .append_message(&transcript, &Message::text("user", "DREAM-PUBLIC-BASELINE"))
-            .await
-            .unwrap();
+        crate::public_test_support::settled_public_turn(
+            &memory,
+            &harness.scope,
+            &harness.session.id,
+            "dream-public-baseline",
+            &ids[0],
+            "DREAM-PUBLIC-BASELINE",
+            "Dream baseline answer",
+        )
+        .await
+        .unwrap();
         for id in &ids {
             let namespace = harness.namespace(id);
             assert_eq!(namespace, format!("{}/{mode}/identity/{id}", harness.scope));
@@ -615,7 +622,11 @@ async fn all_four_modes_keep_builtin_dream_requests_and_own_memory_isolation() {
                     .find(|source| source.kind == kind)
                     .unwrap()
                     .units,
-                1
+                if kind == ContextSourceKind::PublicTranscript {
+                    2
+                } else {
+                    1
+                }
             );
         }
         for id in &ids {
@@ -634,7 +645,7 @@ async fn all_four_modes_keep_builtin_dream_requests_and_own_memory_isolation() {
                 .await
                 .unwrap()
                 .total_rows,
-            1
+            2
         );
         assert_eq!(
             harness
