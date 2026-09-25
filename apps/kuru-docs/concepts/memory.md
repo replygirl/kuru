@@ -88,8 +88,12 @@ Schema 5 retains physical session identity on new transcript and actor-history
 rows while leaving ambiguous legacy rows unattributed. It also adds strict
 context-summary and cursor records for bounded same-view compaction. Existing
 single conversation-driver admission remains active while later Phase 2 work
-integrates policy-selected continuity and concurrent drivers. Older binaries
-refuse schema 5 rather than assigning or dropping session provenance.
+integrates concurrent drivers. Policy-selected continuity already admits bounded
+same-actor current summaries from other sessions through own-history visibility,
+while keeping the current session's cursor and raw suffix separate. Older shared
+summaries are omitted whole when needed for model fit; foreign raw rows and
+producer-private reasoning sidecars are never projected. Older binaries refuse
+schema 5 rather than assigning or dropping session provenance.
 
 JSON and Markdown memory exports use export format version 3 and include each
 message's optional session identity and content-format discriminator, plus

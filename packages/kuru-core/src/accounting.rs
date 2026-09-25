@@ -18,6 +18,7 @@ pub enum UsagePhase {
     Speak,
     Consult,
     Dream,
+    Compact,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

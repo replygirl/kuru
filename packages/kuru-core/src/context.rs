@@ -13,6 +13,69 @@ use crate::Sourced;
 
 pub const DEFAULT_OUTPUT_RESERVE_TOKENS: u64 = 8_192;
 pub const MAX_CONFIGURED_OUTPUT_RESERVE_TOKENS: u64 = 2_000_000;
+pub const DEFAULT_COMPACTION_THRESHOLD_PERCENT: u8 = 75;
+pub const DEFAULT_COMPACTION_OUTPUT_RESERVE_TOKENS: u64 = 1_024;
+
+/// Local policy for deciding whether one ordinary request should first compact
+/// its actor-private context. It grants no visibility or provider authority.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextCompactionPolicy {
+    pub threshold_percent: u8,
+    pub output_reserve_tokens: u64,
+}
+
+impl Default for ContextCompactionPolicy {
+    fn default() -> Self {
+        Self {
+            threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+            output_reserve_tokens: DEFAULT_COMPACTION_OUTPUT_RESERVE_TOKENS,
+        }
+    }
+}
+
+impl ContextCompactionPolicy {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (50..=95).contains(&self.threshold_percent),
+            "context compaction threshold must be between 50 and 95 percent"
+        );
+        ensure!(
+            (1..=MAX_CONFIGURED_OUTPUT_RESERVE_TOKENS).contains(&self.output_reserve_tokens),
+            "context compaction output reserve must be between 1 and 2000000 tokens"
+        );
+        Ok(())
+    }
+
+    /// Compare the full pre-omission ordinary request, including its ordinary
+    /// output reserve, with the selected effective model window.
+    pub fn threshold_reached(&self, estimate: &ContextEstimate) -> Result<bool> {
+        self.validate()?;
+        estimate.budget.validate()?;
+        let occupied = estimate
+            .estimated_input_tokens
+            .saturating_add(estimate.budget.output_reserve_tokens);
+        let threshold = estimate
+            .budget
+            .window
+            .value
+            .saturating_mul(u64::from(self.threshold_percent))
+            .saturating_add(99)
+            / 100;
+        Ok(occupied >= threshold)
+    }
+
+    /// Resolve the compaction request's independent output reserve against the
+    /// same effective model window, refusing before inference when it cannot fit.
+    pub fn request_budget(&self, window: Sourced<u64>) -> Result<ContextBudget> {
+        self.validate()?;
+        ensure!(
+            self.output_reserve_tokens <= window.value,
+            "context compaction output reserve exceeds the effective model window"
+        );
+        ContextBudget::resolve(window, None, Some(self.output_reserve_tokens))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +160,7 @@ pub enum ContextSourceKind {
     ToolSchemas,
     PublicTranscript,
     PrivateHistory,
+    ContextSummary,
     Notes,
     /// Connector-level aggregate; runtime classifies its constituent rows.
     SelectedInput,
@@ -259,5 +323,47 @@ mod tests {
         let estimate = ContextEstimate::for_final_body(budget, 9, false, vec![]);
         assert_eq!(estimate.estimated_input_tokens, 5);
         assert!(estimate.ensure_fits().is_ok());
+    }
+
+    #[test]
+    fn compaction_policy_uses_full_reserved_request_and_refuses_impossible_reserve() {
+        let policy = ContextCompactionPolicy::default();
+        let budget = ContextBudget::resolve(Sourced::built_in(1_000), None, Some(100)).unwrap();
+        let below = ContextEstimate::from_measured_final_body(
+            budget.clone(),
+            1,
+            649,
+            ContextSizing::ConservativeByteFallback,
+            false,
+            vec![],
+        );
+        let exact = ContextEstimate::from_measured_final_body(
+            budget,
+            1,
+            650,
+            ContextSizing::ConservativeByteFallback,
+            false,
+            vec![],
+        );
+        assert!(!policy.threshold_reached(&below).unwrap());
+        assert!(policy.threshold_reached(&exact).unwrap());
+        assert_eq!(
+            policy
+                .request_budget(Sourced::built_in(2_000))
+                .unwrap()
+                .output_reserve_tokens,
+            1_024
+        );
+        assert!(policy.request_budget(Sourced::built_in(1_000)).is_err());
+        for threshold_percent in [49, 96] {
+            assert!(
+                ContextCompactionPolicy {
+                    threshold_percent,
+                    ..policy
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 }

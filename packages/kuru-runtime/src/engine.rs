@@ -378,6 +378,7 @@ struct AskControl<'a> {
     cancellation: &'a CancellationToken,
     progress: Option<ProgressDescriptor>,
     phase: ActorPhase,
+    operation_id: Option<&'a str>,
 }
 
 /// A bounded, current-mode projection of one identity's durable notes.
@@ -2088,6 +2089,7 @@ impl Harness {
                 cancellation,
                 progress: Some(progress),
                 phase: phase.1,
+                operation_id: None,
             },
         )
         .await
@@ -2114,10 +2116,75 @@ impl Harness {
                     cancellation,
                     progress: None,
                     phase: phase.1,
+                    operation_id: None,
                 },
             )
             .await?
             .0)
+    }
+
+    /// Run one explicit, local compaction operation without admitting a prompt turn.
+    pub async fn compact_controlled(
+        &self,
+        identity: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>> {
+        cancellation.check()?;
+        let topology = read_topology_with_profile(&self.memory, &self.scope, &self.profile).await?;
+        validate_topology_with_profile(&topology, &self.config, &self.profile)?;
+        let identities = if let Some(identity) = identity {
+            vec![resolve_active_identity(&topology, identity)?]
+        } else {
+            let mut identities = topology
+                .parts
+                .iter()
+                .filter(|part| part.active && self.actors.contains_key(&part.id))
+                .map(|part| part.id.clone())
+                .collect::<Vec<_>>();
+            identities.extend(
+                topology
+                    .relationships
+                    .iter()
+                    .filter(|relationship| {
+                        self.actors.contains_key(&relationship.id)
+                            && relationship.members.iter().all(|member| {
+                                topology
+                                    .parts
+                                    .iter()
+                                    .any(|part| part.active && &part.id == member)
+                            })
+                    })
+                    .map(|relationship| relationship.id.clone()),
+            );
+            identities
+        };
+        ensure!(
+            !identities.is_empty(),
+            "no active identities can be compacted"
+        );
+        let operation_id = Uuid::new_v4().to_string();
+        let mut notices = Vec::with_capacity(identities.len());
+        for identity in identities {
+            cancellation.check()?;
+            let (completion, _) = self
+                .ask_in_controlled_with_progress(
+                    &self.memory,
+                    &identity,
+                    None,
+                    vec![],
+                    "context maintenance: compact",
+                    vec![],
+                    AskControl {
+                        cancellation,
+                        progress: None,
+                        phase: ActorPhase::Compact,
+                        operation_id: Some(&operation_id),
+                    },
+                )
+                .await?;
+            notices.push(completion.text_projection());
+        }
+        Ok(notices)
     }
 
     #[expect(
@@ -2158,15 +2225,12 @@ impl Harness {
             ActorPhase::Speak => UsagePhase::Speak,
             ActorPhase::Consult => UsagePhase::Consult,
             ActorPhase::Dream => UsagePhase::Dream,
+            ActorPhase::Compact => UsagePhase::Compact,
         };
+        let operation_id = control.operation_id.unwrap_or(&self.operation_id);
         let ordinal = self.invocation_ordinal.fetch_add(1, Ordering::Relaxed);
         let mut digest = Sha256::new();
-        for component in [
-            "kuru-invocation-v1",
-            &self.session.id,
-            &self.operation_id,
-            id,
-        ] {
+        for component in ["kuru-invocation-v1", &self.session.id, operation_id, id] {
             digest.update((component.len() as u64).to_be_bytes());
             digest.update(component.as_bytes());
         }
@@ -2175,6 +2239,7 @@ impl Harness {
             UsagePhase::Speak => 2,
             UsagePhase::Consult => 3,
             UsagePhase::Dream => 4,
+            UsagePhase::Compact => 5,
         };
         digest.update([phase_tag]);
         digest.update(ordinal.to_be_bytes());
@@ -2189,7 +2254,7 @@ impl Harness {
         let invocation = InvocationStart {
             session_id: self.session.id.clone(),
             invocation_id: invocation_id.clone(),
-            operation_id: self.operation_id.clone(),
+            operation_id: operation_id.into(),
             phase: phase_kind,
             actor_id: id.into(),
             route: self.config.provider.clone(),
@@ -2213,6 +2278,11 @@ impl Harness {
             instructions,
             transcript_key: checked_transcript_key(&self.scope, &self.session.id, &self.profile)?,
             context_budget,
+            compaction_policy: kuru_core::ContextCompactionPolicy {
+                threshold_percent: self.config.context_compaction_threshold_percent,
+                output_reserve_tokens: self.config.context_compaction_output_reserve_tokens,
+            },
+            manual_compaction: matches!(control.phase, ActorPhase::Compact),
             context: self.context.clone(),
             context_epoch: self.context_epoch.clone(),
             context_generation: self.context_epoch.load(Ordering::Acquire),
@@ -2223,7 +2293,7 @@ impl Harness {
             cancellation: control.cancellation.clone(),
             progress: control.progress,
             span: tracing::info_span!(target: "kuru.actor", "actor", actor = self.actor_correlation(id), operation = "completion"),
-            reply,
+            reply: Some(reply),
         };
         control
             .cancellation

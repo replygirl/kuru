@@ -25,6 +25,18 @@
       "maximum": 2000000,
       "default": null
     },
+    "context_compaction_threshold_percent": {
+      "type": "integer",
+      "minimum": 50,
+      "maximum": 95,
+      "default": 75
+    },
+    "context_compaction_output_reserve_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2000000,
+      "default": 1024
+    },
     "max_rounds": { "type": "integer", "minimum": 1, "maximum": 64, "default": 3 },
     "max_tool_calls": { "type": "integer", "minimum": 1, "maximum": 1024, "default": 12 },
     "max_parallel": { "type": "integer", "minimum": 1, "maximum": 64, "default": 4 },

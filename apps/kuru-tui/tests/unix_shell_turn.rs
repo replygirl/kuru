@@ -594,7 +594,7 @@ async fn kuru_run_uses_the_owned_shell_and_preserves_the_responses_continuation(
         normalize_tool_elapsed(&mut normal_turn)?;
         ensure!(
             normal_turn == debug_turn,
-            "--debug changed the JSON turn beyond its session identity and measured tool duration"
+            "--debug changed the JSON turn beyond its session identity and measured tool duration: debug={debug_turn}; normal={normal_turn}"
         );
         let normal_logs = diagnostics(&normal)?;
         ensure!(

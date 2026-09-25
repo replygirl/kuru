@@ -184,7 +184,8 @@ impl ActiveExportSnapshot {
                         next: Some(self.cursor(Phase::ContextCursors(None))),
                     });
                 }
-                let records = context_summaries(&self.pool, after).await?;
+                let records =
+                    context_summaries(&self.pool, self.provenance.schema_version, after).await?;
                 let next = match records.last() {
                     Some(StorageRecord::ContextSummary { summary_id, .. })
                         if records.len() == PAGE_SIZE as usize =>
@@ -379,19 +380,26 @@ async fn state(pool: &MySqlPool, after: Option<Vec<u8>>) -> Result<Vec<StorageRe
         .collect()
 }
 
-async fn context_summaries(pool: &MySqlPool, after: Option<String>) -> Result<Vec<StorageRecord>> {
+async fn context_summaries(
+    pool: &MySqlPool,
+    schema_version: i32,
+    after: Option<String>,
+) -> Result<Vec<StorageRecord>> {
+    let projection = if schema_version >= 6 {
+        "SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, operation_id, producer_actor_id, invocation_id, record_format, summary FROM context_summaries"
+    } else {
+        "SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, NULL AS operation_id, NULL AS producer_actor_id, invocation_id, record_format, summary FROM context_summaries"
+    };
+    let after_query = format!("{projection} WHERE summary_id > ? ORDER BY summary_id LIMIT ?");
+    let first_query = format!("{projection} ORDER BY summary_id LIMIT ?");
     let rows = match after {
-        Some(after) => {
-            sqlx::query("SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, invocation_id, record_format, summary FROM context_summaries WHERE summary_id > ? ORDER BY summary_id LIMIT ?")
-                .bind(after)
-                .bind(PAGE_SIZE)
-                .fetch_all(pool)
-        }
-        None => {
-            sqlx::query("SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, invocation_id, record_format, summary FROM context_summaries ORDER BY summary_id LIMIT ?")
-                .bind(PAGE_SIZE)
-                .fetch_all(pool)
-        }
+        Some(after) => sqlx::query(sqlx::AssertSqlSafe(after_query))
+            .bind(after)
+            .bind(PAGE_SIZE)
+            .fetch_all(pool),
+        None => sqlx::query(sqlx::AssertSqlSafe(first_query))
+            .bind(PAGE_SIZE)
+            .fetch_all(pool),
     };
     let rows = tokio::time::timeout(QUERY_TIMEOUT, rows)
         .await
@@ -400,6 +408,12 @@ async fn context_summaries(pool: &MySqlPool, after: Option<String>) -> Result<Ve
         .map(|row| {
             let utf8 = |column| -> Result<String> {
                 String::from_utf8(row.try_get(column)?)
+                    .with_context(|| format!("export context summary {column} is not UTF-8"))
+            };
+            let optional_utf8 = |column| -> Result<Option<String>> {
+                row.try_get::<Option<Vec<u8>>, _>(column)?
+                    .map(String::from_utf8)
+                    .transpose()
                     .with_context(|| format!("export context summary {column} is not UTF-8"))
             };
             let summary_id: String = row.try_get("summary_id")?;
@@ -419,14 +433,16 @@ async fn context_summaries(pool: &MySqlPool, after: Option<String>) -> Result<Ve
                 source_revision: row.try_get("source_revision")?,
                 after_sequence: row.try_get("after_sequence")?,
                 through_sequence: row.try_get("through_sequence")?,
-                turn_id: utf8("turn_id")?,
+                turn_id: optional_utf8("turn_id")?,
+                operation_id: optional_utf8("operation_id")?,
+                producer_actor_id: optional_utf8("producer_actor_id")?,
                 invocation_id: utf8("invocation_id")?,
                 summary: row.try_get("summary")?,
             };
             super::validate_context_summary(&record)?;
             let record_format: String = row.try_get("record_format")?;
             ensure!(
-                record_format == super::CONTEXT_SUMMARY_FORMAT,
+                record_format == super::context_summary_format(&record)?,
                 "export context summary format is unsupported"
             );
             Ok(StorageRecord::ContextSummary {
@@ -766,7 +782,8 @@ mod tests {
         store
             .put_reasoning_summaries(&[ReasoningSummaryRecord {
                 session_id: "session-private".into(),
-                turn_id: "turn-private".into(),
+                turn_id: Some("turn-private".into()),
+                operation_id: None,
                 actor_id: "actor-private".into(),
                 invocation_id: "invocation-private".into(),
                 item_id: Some("provider-item-private".into()),

@@ -24,9 +24,10 @@ pub use config::{
     SelectionOverrides, load_instructions,
 };
 pub use context::{
-    ContextBudget, ContextEstimate, ContextSizing, ContextSourceKind, ContextSourceSize,
-    ContextTooLarge, DEFAULT_OUTPUT_RESERVE_TOKENS, MAX_CONFIGURED_OUTPUT_RESERVE_TOKENS,
-    estimated_tokens_for_bytes,
+    ContextBudget, ContextCompactionPolicy, ContextEstimate, ContextSizing, ContextSourceKind,
+    ContextSourceSize, ContextTooLarge, DEFAULT_COMPACTION_OUTPUT_RESERVE_TOKENS,
+    DEFAULT_COMPACTION_THRESHOLD_PERCENT, DEFAULT_OUTPUT_RESERVE_TOKENS,
+    MAX_CONFIGURED_OUTPUT_RESERVE_TOKENS, estimated_tokens_for_bytes,
 };
 pub use framework::{
     Framework, Mode, Part, Relationship, RelationshipKind, canonical_peer_instruction,

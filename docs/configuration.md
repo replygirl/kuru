@@ -200,6 +200,8 @@ For an unfamiliar model you can configure the fallback window and output reserve
 ```toml
 assumed_context_window_tokens = 128000
 context_output_reserve_tokens = 8192
+context_compaction_threshold_percent = 75
+context_compaction_output_reserve_tokens = 1024
 ```
 
 Both optional settings accept 1–2,000,000 tokens. The window setting is a fallback
@@ -208,11 +210,25 @@ smallest of 8,192 tokens, the model's reported output limit, and a quarter of th
 window, with a minimum of one token. A configured reserve is never silently
 reduced to fit the window.
 
-Older optional history can be omitted as complete rows to fit a request; the
-interface reports actual omitted counts. Stored memory and conversations remain
-intact. Current input, required tool receipts and native continuation are kept
-together. If mandatory material plus the reserve cannot fit, the request fails
-before inference is sent. Transport byte limits still apply separately.
+The compaction threshold accepts 50–95 percent and defaults to 75. Kuru
+compares it with the full policy-admitted request before optional history rows
+are omitted for fit. The compaction output reserve accepts 1–2,000,000 tokens
+and is separate from the ordinary answer reserve; if it exceeds the effective
+model window, compaction refuses before inference. A compaction request is
+accounted provider work. It retains every original history row and publishes a
+rolling summary only after its exact source revision and cursor still match.
+
+After at most one eligible compaction attempt, older optional cross-session
+summaries and history can still be omitted as complete records to fit a request;
+the interface reports each actual omission count. The current session's rolling
+summary stays mandatory because its raw suffix begins after that summary's exact
+cursor. Shared summaries are admitted only for the same actor through the mode's
+own-history visibility and memory namespace; another session's raw rows and
+producer-private reasoning records are never projected through this path. Stored
+memory and conversations remain intact. Current input, required tool receipts and
+native continuation are kept together. If mandatory material plus the reserve
+cannot fit, the request fails before inference is sent. Transport byte limits
+still apply separately.
 
 ## Tool permissions
 

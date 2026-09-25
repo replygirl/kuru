@@ -21,10 +21,11 @@ pub use progress::{MemoryOpenProgress, MemoryOpenStage};
 pub use store::purge::PurgeOutcome;
 pub use store::{
     CandidateConflict, CandidateInventoryPage, CandidateRefRefusal, CandidateRefRejected,
-    CandidateRefState, CandidateRefStatus, ContextSummaryCursor, ContextSummaryItem,
-    ContextSummaryRecord, ContextSummaryStale, ContextSummaryWindow, ExportProvenance,
-    HistoryWindow, MemoryStatus, OpenOptions, ReasoningSummaryConflict, ReasoningSummaryRecord,
-    Revision, SequencedMessage, SessionSourceSnapshot, StorageRecord, StoredNote, UsageProof,
+    CandidateRefState, CandidateRefStatus, ContextSummaryCheckpoint, ContextSummaryCursor,
+    ContextSummaryItem, ContextSummaryRecord, ContextSummaryStale, ContextSummaryWindow,
+    ExportProvenance, HistoryWindow, MemoryStatus, OpenOptions, ReasoningSummaryConflict,
+    ReasoningSummaryRecord, Revision, SequencedMessage, SessionHistoryWindowAfter,
+    SessionSourceSnapshot, StorageRecord, StoredNote, UsageProof, context_summary_id,
 };
 
 #[cfg(any(test, feature = "test-support"))]

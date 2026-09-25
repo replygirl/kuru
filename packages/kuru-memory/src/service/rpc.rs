@@ -81,7 +81,7 @@ pub enum ServiceCall {
     /// The ordinary main view or one candidate owned by this attachment.
     View {
         candidate: Option<Uuid>,
-        operation: ViewOperation,
+        operation: Box<ViewOperation>,
     },
     BeginCandidate {
         label: String,
@@ -158,7 +158,7 @@ impl ServiceCall {
             | Self::AbandonCandidate { .. } => true,
             Self::AbandonCandidateRef { .. } => true,
             Self::View { operation, .. } => matches!(
-                operation,
+                &**operation,
                 ViewOperation::Append { .. }
                     | ViewOperation::AppendMessage { .. }
                     | ViewOperation::AppendSessionMessage { .. }
@@ -195,7 +195,7 @@ impl ServiceCall {
             Self::AppendMessage { .. } => Some("append_message"),
             Self::PutMany { .. } => Some("put_many"),
             Self::PutReasoningSummaries { .. } => Some("put_reasoning_summaries"),
-            Self::View { operation, .. } => match operation {
+            Self::View { operation, .. } => match &**operation {
                 ViewOperation::Append { .. } => Some("view.append"),
                 ViewOperation::AppendMessage { .. } => Some("view.append_message"),
                 ViewOperation::AppendSessionMessage { .. } => Some("view.append_session_message"),
@@ -285,6 +285,12 @@ pub enum ViewOperation {
         session_id: String,
         limit: usize,
     },
+    SessionHistoryWindowAfter {
+        namespace: String,
+        session_id: String,
+        after_exclusive: i64,
+        limit: usize,
+    },
     SessionSourceSnapshot {
         actor_namespace: String,
         session_id: String,
@@ -294,6 +300,8 @@ pub enum ViewOperation {
     },
     CheckpointContextSummary {
         record: crate::ContextSummaryRecord,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        private_reasoning: Vec<crate::ReasoningSummaryRecord>,
     },
     ContextSummaryCursor {
         actor_namespace: String,
@@ -419,6 +427,7 @@ pub enum ServiceValue {
     },
     Messages(Vec<Message>),
     HistoryWindow(HistoryWindow),
+    SessionHistoryWindowAfter(crate::SessionHistoryWindowAfter),
     SessionSourceSnapshot(crate::SessionSourceSnapshot),
     ContextSummaryCursor(Option<crate::ContextSummaryCursor>),
     ContextSummaryWindow(crate::ContextSummaryWindow),
@@ -701,6 +710,28 @@ impl ServiceRequest {
             call,
         }
     }
+}
+
+pub(crate) fn validate_context_summary_checkpoint_request(
+    checkpoint: &crate::ContextSummaryCheckpoint,
+) -> Result<()> {
+    crate::store::validate_context_summary_checkpoint(checkpoint)?;
+    let request = ServiceRequest::with_id(
+        "00000000-0000-0000-0000-000000000000",
+        Uuid::nil(),
+        ServiceCall::View {
+            candidate: Some(Uuid::nil()),
+            operation: Box::new(ViewOperation::CheckpointContextSummary {
+                record: checkpoint.record.clone(),
+                private_reasoning: checkpoint.private_reasoning.clone(),
+            }),
+        },
+    );
+    ensure!(
+        serde_json::to_vec(&request)?.len() <= OPERATION_FRAME_LIMIT,
+        "context summary checkpoint request exceeds the managed operation frame"
+    );
+    Ok(())
 }
 
 /// One request at a time per authenticated connection keeps reply ownership
@@ -1524,7 +1555,7 @@ async fn dispatch(
             } else {
                 view
             };
-            dispatch_view(&view, operation).await?
+            dispatch_view(&view, *operation).await?
         }
         ServiceCall::BeginCandidate { label } => {
             ensure!(
@@ -1661,6 +1692,16 @@ async fn dispatch_view(store: &MemoryStore, operation: ViewOperation) -> Result<
                 .session_history_window(&namespace, &session_id, limit)
                 .await?,
         ),
+        ViewOperation::SessionHistoryWindowAfter {
+            namespace,
+            session_id,
+            after_exclusive,
+            limit,
+        } => ServiceValue::SessionHistoryWindowAfter(
+            store
+                .session_history_window_after(&namespace, &session_id, after_exclusive, limit)
+                .await?,
+        ),
         ViewOperation::SessionSourceSnapshot {
             actor_namespace,
             session_id,
@@ -1678,8 +1719,16 @@ async fn dispatch_view(store: &MemoryStore, operation: ViewOperation) -> Result<
                 )
                 .await?,
         ),
-        ViewOperation::CheckpointContextSummary { record } => {
-            store.checkpoint_context_summary(&record).await?;
+        ViewOperation::CheckpointContextSummary {
+            record,
+            private_reasoning,
+        } => {
+            let checkpoint = crate::ContextSummaryCheckpoint {
+                record,
+                private_reasoning,
+            };
+            validate_context_summary_checkpoint_request(&checkpoint)?;
+            store.checkpoint_context_summary(&checkpoint).await?;
             ServiceValue::Unit
         }
         ViewOperation::ContextSummaryCursor {
@@ -1779,7 +1828,7 @@ async fn dispatch_ledger(store: &MemoryStore, operation: LedgerOperation) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ReasoningSummaryRecord;
+    use crate::{ContextSummaryCheckpoint, ContextSummaryRecord, ReasoningSummaryRecord};
     use tokio::io::{AsyncWriteExt, duplex};
 
     #[test]
@@ -1794,7 +1843,8 @@ mod tests {
         let records = (0..count)
             .map(|index| ReasoningSummaryRecord {
                 session_id: "s".into(),
-                turn_id: "t".into(),
+                turn_id: Some("t".into()),
+                operation_id: None,
                 actor_id: "a".into(),
                 invocation_id: "i".into(),
                 item_id: None,
@@ -1812,6 +1862,74 @@ mod tests {
         ensure!(
             serde_json::to_vec(&request)?.len() <= OPERATION_FRAME_LIMIT,
             "worst escaped private reasoning summary request exceeds the RPC frame"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_checkpoint_enforces_exact_serialized_bound_below_rpc_frame() -> Result<()> {
+        let mut checkpoint = ContextSummaryCheckpoint {
+            record: ContextSummaryRecord {
+                actor_namespace: "actor namespace".into(),
+                session_id: "session".into(),
+                source_namespace: "source namespace".into(),
+                summary_namespace: "summary namespace".into(),
+                source_view: "main".into(),
+                source_revision: "a".repeat(64),
+                after_sequence: 0,
+                through_sequence: 1,
+                turn_id: None,
+                operation_id: Some("operation".into()),
+                producer_actor_id: Some("producer".into()),
+                invocation_id: "invocation".into(),
+                summary: String::new(),
+            },
+            private_reasoning: Vec::new(),
+        };
+        let empty_len = serde_json::to_vec(&checkpoint)?.len();
+        let mut exact = None;
+        for trim in 1..=5 {
+            let text_len = 16 * 1024 * 1024 - trim;
+            let escaped = crate::store::MAX_CONTEXT_SUMMARY_CHECKPOINT_BYTES
+                .checked_sub(empty_len + text_len)
+                .context("checkpoint fixed fields exceed their serialized bound")?;
+            if escaped % 5 == 0 && escaped / 5 <= text_len {
+                exact = Some((text_len, escaped / 5));
+                break;
+            }
+        }
+        let (text_len, escaped) =
+            exact.context("fixture could not reach exact checkpoint bound")?;
+        checkpoint.record.summary = format!(
+            "{}{}",
+            "\u{0001}".repeat(escaped),
+            "x".repeat(text_len - escaped)
+        );
+        assert_eq!(
+            serde_json::to_vec(&checkpoint)?.len(),
+            crate::store::MAX_CONTEXT_SUMMARY_CHECKPOINT_BYTES
+        );
+        validate_context_summary_checkpoint_request(&checkpoint)?;
+        let request = ServiceRequest::with_id(
+            "00000000-0000-0000-0000-000000000000",
+            Uuid::nil(),
+            ServiceCall::View {
+                candidate: Some(Uuid::nil()),
+                operation: Box::new(ViewOperation::CheckpointContextSummary {
+                    record: checkpoint.record.clone(),
+                    private_reasoning: Vec::new(),
+                }),
+            },
+        );
+        assert!(serde_json::to_vec(&request)?.len() < OPERATION_FRAME_LIMIT);
+
+        checkpoint.record.summary.push('x');
+        let error = validate_context_summary_checkpoint_request(&checkpoint)
+            .expect_err("checkpoint accepted one serialized byte over its bound");
+        assert!(
+            error
+                .to_string()
+                .contains("context summary checkpoint exceeds 64 MiB")
         );
         Ok(())
     }
@@ -1842,11 +1960,11 @@ mod tests {
         };
         let first = ServiceCall::View {
             candidate: Some(Uuid::new_v4()),
-            operation: operation(),
+            operation: Box::new(operation()),
         };
         let reattached = ServiceCall::View {
             candidate: Some(Uuid::new_v4()),
-            operation: operation(),
+            operation: Box::new(operation()),
         };
         let view = format!("candidate_{}", Uuid::new_v4().simple());
         assert_eq!(
@@ -1857,6 +1975,22 @@ mod tests {
             first.unit_receipt_fingerprint(&view)?,
             reattached.unit_receipt_fingerprint("main")?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn session_cursor_history_is_read_only_and_has_no_unit_receipt() -> Result<()> {
+        let call = ServiceCall::View {
+            candidate: None,
+            operation: Box::new(ViewOperation::SessionHistoryWindowAfter {
+                namespace: "actor".into(),
+                session_id: "session".into(),
+                after_exclusive: 7,
+                limit: 16,
+            }),
+        };
+        assert!(!call.may_mutate());
+        assert!(call.unit_receipt_bytes("main")?.is_none());
         Ok(())
     }
 

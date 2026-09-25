@@ -120,11 +120,85 @@ fn estimate_native_input(
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn models(&self) -> Result<Vec<ModelInfo>>;
+    /// Measure the request that this connector would dispatch without sending
+    /// it. Provider-private continuation state remains inside the connector.
+    /// Implementations MUST preserve whole-message prefix monotonicity: when
+    /// every other request field is fixed, appending one complete message may
+    /// not reduce either `final_body_bytes` or `estimated_input_tokens`. This
+    /// lets bounded callers find the largest fitting prefix without quadratic
+    /// serialization.
+    async fn estimate_context(&self, request: &CompletionRequest) -> Result<ContextEstimate> {
+        estimate_demo_context(request)
+    }
     async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()>;
 
     async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
         collect_completion(self, request, None).await
     }
+}
+
+/// Pure sizing result for the largest whole oldest source prefix that fits one
+/// compaction request. The caller retains the source rows and selects this
+/// count; connectors never gain memory or policy authority through sizing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextPrefixEstimate {
+    pub selected_messages: usize,
+    pub estimate: ContextEstimate,
+}
+
+/// Measure complete source prefixes without provider dispatch. The base
+/// request contains the fixed instruction and prior rolling summary; `source`
+/// is ordered oldest first and is never split or reordered.
+pub async fn largest_fitting_context_prefix(
+    provider: &dyn Provider,
+    base: &CompletionRequest,
+    source: &[Message],
+) -> Result<ContextPrefixEstimate> {
+    ensure!(source.len() <= 1_024, "context source exceeds 1024 rows");
+    let measure = |count: usize| {
+        let mut request = base.clone();
+        request.messages.extend_from_slice(&source[..count]);
+        async move { provider.estimate_context(&request).await }
+    };
+    let fits = |estimate: &ContextEstimate| {
+        estimate.final_body_bytes <= crate::MAX_BYTES as u64 && estimate.ensure_fits().is_ok()
+    };
+
+    let base_estimate = measure(0).await?;
+    if source.is_empty() || !fits(&base_estimate) {
+        return Ok(ContextPrefixEstimate {
+            selected_messages: 0,
+            estimate: base_estimate,
+        });
+    }
+    let all = measure(source.len()).await?;
+    if fits(&all) {
+        return Ok(ContextPrefixEstimate {
+            selected_messages: source.len(),
+            estimate: all,
+        });
+    }
+
+    // Serialized request size and the connector estimators grow with a whole
+    // appended message. Binary search keeps a 1,024-row/32-MiB storage page
+    // from requiring quadratic serialization solely to find its fitting edge.
+    let mut low = 0usize;
+    let mut high = source.len();
+    let mut selected = base_estimate;
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        let estimate = measure(middle).await?;
+        if fits(&estimate) {
+            low = middle;
+            selected = estimate;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(ContextPrefixEstimate {
+        selected_messages: low,
+        estimate: selected,
+    })
 }
 
 /// A bounded, protocol-neutral observation from a provider response stream.
@@ -310,6 +384,35 @@ pub async fn provider(config: &Config, cwd: &Path, data_dir: &Path) -> Result<Ar
 /// Offline transport for installation checks; never masquerades as inference.
 pub struct DemoProvider;
 
+fn estimate_demo_context(request: &CompletionRequest) -> Result<ContextEstimate> {
+    for message in &request.messages {
+        provider_text(message)?;
+    }
+    let prompt = json!({
+        "instructions": request.instructions,
+        "messages": request.messages,
+        "tools": request.tools,
+    });
+    let prompt_bytes = serde_json::to_vec(&prompt)?.len() as u64;
+    let effective_budget = request
+        .context_budget
+        .clone()
+        .unwrap_or_else(ContextBudget::legacy_default);
+    effective_budget.validate()?;
+    Ok(ContextEstimate::for_final_body(
+        effective_budget,
+        prompt_bytes,
+        false,
+        vec![ContextSourceSize {
+            kind: ContextSourceKind::CurrentInput,
+            serialized_bytes: prompt_bytes,
+            estimated_tokens: estimated_tokens_for_bytes(prompt_bytes),
+            units: 1,
+            mandatory: true,
+        }],
+    ))
+}
+
 #[async_trait]
 impl Provider for DemoProvider {
     async fn models(&self) -> Result<Vec<ModelInfo>> {
@@ -322,37 +425,14 @@ impl Provider for DemoProvider {
         }])
     }
 
+    async fn estimate_context(&self, request: &CompletionRequest) -> Result<ContextEstimate> {
+        estimate_demo_context(request)
+    }
+
     async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
-        // Keep demo behavior aligned with the native route: unsupported media
-        // is a request validation failure, never silently ignored content.
-        for message in &request.messages {
-            provider_text(message)?;
-        }
         // Demo has no HTTP body, but it is still a harness provider. Measure
         // its effective prompt rather than silently bypassing the same budget.
-        let prompt = json!({
-            "instructions": request.instructions,
-            "messages": request.messages,
-            "tools": request.tools,
-        });
-        let prompt_bytes = serde_json::to_vec(&prompt)?.len() as u64;
-        let effective_budget = request
-            .context_budget
-            .clone()
-            .unwrap_or_else(ContextBudget::legacy_default);
-        effective_budget.validate()?;
-        let context = ContextEstimate::for_final_body(
-            effective_budget,
-            prompt_bytes,
-            false,
-            vec![ContextSourceSize {
-                kind: ContextSourceKind::CurrentInput,
-                serialized_bytes: prompt_bytes,
-                estimated_tokens: estimated_tokens_for_bytes(prompt_bytes),
-                units: 1,
-                mandatory: true,
-            }],
-        );
+        let context = self.estimate_context(&request).await?;
         sink.emit(ProviderEvent::ContextMeasured(context.clone()))
             .await?;
         context.ensure_fits()?;
@@ -792,6 +872,116 @@ fn input_items_selected(
     })
 }
 
+struct PreparedResponsesRequest {
+    input: Vec<Value>,
+    native_output_ranges: Option<Vec<Range<usize>>>,
+    body: Value,
+    payload: Vec<u8>,
+    context: ContextEstimate,
+}
+
+fn prepare_responses_request(
+    route: ModelRoute,
+    subscription: bool,
+    request: &CompletionRequest,
+    pending: Option<&Pending>,
+) -> Result<PreparedResponsesRequest> {
+    ensure!(
+        request.model != "auto",
+        "select an explicit model for the Responses provider"
+    );
+    let SelectedInput {
+        items: input,
+        native_output_ranges,
+    } = input_items_selected(&request.messages, pending, request.current_message_count)?;
+    let native_continuation_mandatory = native_output_ranges.is_some();
+    let input_bytes = serde_json::to_vec(&input)?.len() as u64;
+    let mut tools = request
+        .tools
+        .iter()
+        .map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false}))
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| {
+        left["name"]
+            .as_str()
+            .cmp(&right["name"].as_str())
+            .then_with(|| left.to_string().cmp(&right.to_string()))
+    });
+    let mut body = json!({"model":request.model,"instructions":request.instructions,"input":input,"store":false,"include":["reasoning.encrypted_content"],"tools":tools});
+    if let Some(effort) = &request.effort {
+        body["reasoning"] = json!({"effort":effort});
+    }
+    body["stream"] = json!(true);
+    if subscription {
+        body["tool_choice"] = json!("auto");
+        body["parallel_tool_calls"] = json!(true);
+    }
+    let payload = serde_json::to_vec(&body)?;
+    let instructions_bytes = serde_json::to_vec(&body["instructions"])?.len() as u64;
+    let tools_bytes = serde_json::to_vec(&body["tools"])?.len() as u64;
+    let source = |kind, serialized_bytes, units, mandatory| ContextSourceSize {
+        kind,
+        serialized_bytes,
+        estimated_tokens: estimated_tokens_for_bytes(serialized_bytes),
+        units,
+        mandatory,
+    };
+    let accounted = instructions_bytes
+        .saturating_add(tools_bytes)
+        .saturating_add(input_bytes);
+    let effective_budget = request
+        .context_budget
+        .clone()
+        .unwrap_or_else(ContextBudget::legacy_default);
+    effective_budget.validate()?;
+    let (estimated_input_tokens, sizing) =
+        estimate_native_input(route, &body, &payload, native_output_ranges.as_deref())?;
+    let context = ContextEstimate::from_measured_final_body(
+        effective_budget,
+        payload.len() as u64,
+        estimated_input_tokens,
+        sizing,
+        native_continuation_mandatory,
+        vec![
+            source(
+                ContextSourceKind::SelectedInstructions,
+                instructions_bytes,
+                1,
+                false,
+            ),
+            source(
+                ContextSourceKind::ToolSchemas,
+                tools_bytes,
+                request.tools.len() as u64,
+                true,
+            ),
+            source(
+                if native_continuation_mandatory {
+                    ContextSourceKind::NativeContinuation
+                } else {
+                    ContextSourceKind::SelectedInput
+                },
+                input_bytes,
+                body["input"].as_array().map_or(0, Vec::len) as u64,
+                native_continuation_mandatory,
+            ),
+            source(
+                ContextSourceKind::WireOverhead,
+                (payload.len() as u64).saturating_sub(accounted),
+                1,
+                true,
+            ),
+        ],
+    );
+    Ok(PreparedResponsesRequest {
+        input,
+        native_output_ranges,
+        body,
+        payload,
+        context,
+    })
+}
+
 #[cfg(test)]
 fn input_items(
     messages: &[Message],
@@ -902,6 +1092,18 @@ impl Provider for ResponsesProvider {
         .context("model catalog exceeded 60-second total limit")?
     }
 
+    async fn estimate_context(&self, request: &CompletionRequest) -> Result<ContextEstimate> {
+        let actor = self.actor(&request.actor).await?;
+        let pending = actor.lock().await;
+        Ok(prepare_responses_request(
+            self.model_route(),
+            self.is_subscription(),
+            request,
+            pending.as_ref(),
+        )?
+        .context)
+    }
+
     async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
         let budget = OperationBudget::new(self.completion_timeout);
         let settled = tokio::time::timeout(
@@ -988,101 +1190,23 @@ impl ResponsesProvider {
         budget: &OperationBudget,
         sink: &mut dyn ProviderSink,
     ) -> Result<SettledCompletion> {
-        ensure!(
-            request.model != "auto",
-            "select an explicit model for the Responses provider"
-        );
         let actor = self.actor(&request.actor).await?;
         let mut pending = actor.lock().await;
-        let SelectedInput {
-            items: input,
+        let PreparedResponsesRequest {
+            input,
             native_output_ranges,
-        } = input_items_selected(
-            &request.messages,
+            body,
+            payload,
+            context,
+        } = prepare_responses_request(
+            self.model_route(),
+            self.is_subscription(),
+            &request,
             pending.as_ref(),
-            request.current_message_count,
         )?;
-        let native_continuation_mandatory = native_output_ranges.is_some();
-        let input_bytes = serde_json::to_vec(&input)?.len() as u64;
-        let mut tools = request.tools.iter().map(|tool| json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters,"strict":false})).collect::<Vec<_>>();
-        tools.sort_by(|left, right| {
-            left["name"]
-                .as_str()
-                .cmp(&right["name"].as_str())
-                .then_with(|| left.to_string().cmp(&right.to_string()))
-        });
-        let mut body = json!({"model":request.model,"instructions":request.instructions,"input":input,"store":false,"include":["reasoning.encrypted_content"],"tools":tools});
-        if let Some(effort) = request.effort {
-            body["reasoning"] = json!({"effort":effort});
-        }
-        body["stream"] = json!(true);
-        if self.is_subscription() {
-            body["tool_choice"] = json!("auto");
-            body["parallel_tool_calls"] = json!(true);
-        }
-        let payload = serde_json::to_vec(&body)?;
         ensure!(
             payload.len() <= crate::MAX_BYTES,
             "Responses request exceeds 2 MiB transport limit; shorten actor context"
-        );
-        let instructions_bytes = serde_json::to_vec(&body["instructions"])?.len() as u64;
-        let tools_bytes = serde_json::to_vec(&body["tools"])?.len() as u64;
-        let source = |kind, serialized_bytes, units, mandatory| ContextSourceSize {
-            kind,
-            serialized_bytes,
-            estimated_tokens: estimated_tokens_for_bytes(serialized_bytes),
-            units,
-            mandatory,
-        };
-        let accounted = instructions_bytes
-            .saturating_add(tools_bytes)
-            .saturating_add(input_bytes);
-        let effective_budget = request
-            .context_budget
-            .unwrap_or_else(ContextBudget::legacy_default);
-        effective_budget.validate()?;
-        let (estimated_input_tokens, sizing) = estimate_native_input(
-            self.model_route(),
-            &body,
-            &payload,
-            native_output_ranges.as_deref(),
-        )?;
-        let context = ContextEstimate::from_measured_final_body(
-            effective_budget,
-            payload.len() as u64,
-            estimated_input_tokens,
-            sizing,
-            native_continuation_mandatory,
-            vec![
-                source(
-                    ContextSourceKind::SelectedInstructions,
-                    instructions_bytes,
-                    1,
-                    false,
-                ),
-                source(
-                    ContextSourceKind::ToolSchemas,
-                    tools_bytes,
-                    request.tools.len() as u64,
-                    true,
-                ),
-                source(
-                    if native_continuation_mandatory {
-                        ContextSourceKind::NativeContinuation
-                    } else {
-                        ContextSourceKind::SelectedInput
-                    },
-                    input_bytes,
-                    body["input"].as_array().map_or(0, |items| items.len()) as u64,
-                    native_continuation_mandatory,
-                ),
-                source(
-                    ContextSourceKind::WireOverhead,
-                    (payload.len() as u64).saturating_sub(accounted),
-                    1,
-                    true,
-                ),
-            ],
         );
         tracing::debug!(
             target: "kuru.provider",
@@ -1153,6 +1277,156 @@ struct SettledCompletion {
 mod tests {
     use super::*;
     use crate::test_support::{HttpFixture, Reply, request};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EstimateOnlyProvider {
+        dispatches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for EstimateOnlyProvider {
+        async fn models(&self) -> Result<Vec<ModelInfo>> {
+            Ok(vec![])
+        }
+
+        async fn stream(&self, _: CompletionRequest, _: &mut dyn ProviderSink) -> Result<()> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            bail!("estimate-only provider must not dispatch")
+        }
+    }
+
+    #[tokio::test]
+    async fn pure_context_estimates_preserve_native_mapping_without_dispatch() {
+        let mapped = ResponsesProvider::new("https://api.openai.com/v1", "UNUSED").unwrap();
+        let fallback = ResponsesProvider::new("https://provider.invalid/v1", "UNUSED").unwrap();
+        let mut input = request();
+        input.model = "gpt-5.6-sol".into();
+        let mapped_initial = mapped.estimate_context(&input).await.unwrap();
+        let fallback_initial = fallback.estimate_context(&input).await.unwrap();
+        assert_eq!(mapped_initial.sizing, ContextSizing::O200kBaseEstimate);
+        assert_eq!(
+            fallback_initial.sizing,
+            ContextSizing::ConservativeByteFallback
+        );
+        assert_eq!(
+            mapped_initial.final_body_bytes,
+            fallback_initial.final_body_bytes
+        );
+        let mut previous = [mapped_initial, fallback_initial];
+        for suffix in ["a", "東京", "{}[]()", "longer source row"] {
+            input.messages.push(Message::text("user", suffix));
+            for (index, provider) in [&mapped as &dyn Provider, &fallback as &dyn Provider]
+                .into_iter()
+                .enumerate()
+            {
+                let estimate = provider.estimate_context(&input).await.unwrap();
+                assert!(estimate.final_body_bytes >= previous[index].final_body_bytes);
+                assert!(estimate.estimated_input_tokens >= previous[index].estimated_input_tokens);
+                previous[index] = estimate;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pure_prefix_estimate_selects_whole_oldest_rows_before_dispatch() {
+        let provider = EstimateOnlyProvider {
+            dispatches: AtomicUsize::new(0),
+        };
+        let mut base = request();
+        base.model = "demo".into();
+        base.instructions = "Produce one bounded rolling context summary.".into();
+        base.messages = vec![Message::text("assistant", "prior rolling summary")];
+        base.current_message_count = None;
+        base.tools.clear();
+        base.context_budget = Some(
+            ContextBudget::resolve(kuru_core::Sourced::built_in(1_000_000), None, Some(16))
+                .unwrap(),
+        );
+        let source = [
+            Message::text("user", "oldest ".repeat(96)),
+            Message::text("assistant", "middle ".repeat(96)),
+            Message::text("user", "newest ".repeat(96)),
+        ];
+        let mut two = base.clone();
+        two.messages.extend_from_slice(&source[..2]);
+        let two_estimate = provider.estimate_context(&two).await.unwrap();
+        base.context_budget = Some(
+            ContextBudget::resolve(
+                kuru_core::Sourced::built_in(
+                    two_estimate.estimated_input_tokens.saturating_add(16),
+                ),
+                None,
+                Some(16),
+            )
+            .unwrap(),
+        );
+        let fit = largest_fitting_context_prefix(&provider, &base, &source)
+            .await
+            .unwrap();
+        assert_eq!(fit.selected_messages, 2);
+        fit.estimate.ensure_fits().unwrap();
+        let mut overflow = base.clone();
+        overflow.messages.extend_from_slice(&source);
+        let overflow = provider.estimate_context(&overflow).await.unwrap();
+        assert!(overflow.ensure_fits().is_err());
+        assert!(
+            kuru_core::ContextCompactionPolicy {
+                threshold_percent: 75,
+                output_reserve_tokens: 16,
+            }
+            .threshold_reached(&overflow)
+            .unwrap(),
+            "the full pre-omission candidate must expose the threshold"
+        );
+
+        let mut previous = provider.estimate_context(&base).await.unwrap();
+        let mut brute_force = 0;
+        for count in 1..=source.len() {
+            let mut candidate = base.clone();
+            candidate.messages.extend_from_slice(&source[..count]);
+            let estimate = provider.estimate_context(&candidate).await.unwrap();
+            assert!(estimate.final_body_bytes >= previous.final_body_bytes);
+            assert!(estimate.estimated_input_tokens >= previous.estimated_input_tokens);
+            if estimate.ensure_fits().is_ok()
+                && estimate.final_body_bytes <= crate::MAX_BYTES as u64
+            {
+                brute_force = count;
+            }
+            previous = estimate;
+        }
+        assert_eq!(fit.selected_messages, brute_force);
+
+        let base_estimate = provider.estimate_context(&base).await.unwrap();
+        let mut base_overflow = base.clone();
+        base_overflow.context_budget =
+            Some(ContextBudget::resolve(kuru_core::Sourced::built_in(1), None, Some(1)).unwrap());
+        assert_eq!(
+            largest_fitting_context_prefix(&provider, &base_overflow, &source)
+                .await
+                .unwrap()
+                .selected_messages,
+            0
+        );
+        let mut one_row_overflow = base.clone();
+        one_row_overflow.context_budget = Some(
+            ContextBudget::resolve(
+                kuru_core::Sourced::built_in(
+                    base_estimate.estimated_input_tokens.saturating_add(16),
+                ),
+                None,
+                Some(16),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            largest_fitting_context_prefix(&provider, &one_row_overflow, &source[..1])
+                .await
+                .unwrap()
+                .selected_messages,
+            0
+        );
+        assert_eq!(provider.dispatches.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn final_wire_tokenizer_eligibility_and_fallback_are_explicit() {

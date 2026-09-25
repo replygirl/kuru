@@ -94,6 +94,7 @@ pub enum ActorPhase {
     Speak,
     Consult,
     Dream,
+    Compact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +210,7 @@ impl ModeProfile {
                 ActorPhase::Speak,
                 ActorPhase::Consult,
                 ActorPhase::Dream,
+                ActorPhase::Compact,
             ] {
                 validate_context_sources(
                     &seed.id,
