@@ -15,7 +15,9 @@ pub use engine::{
     INTERRUPTION_TEXT, NotesView, ResponseOutcome, Session, SessionSummary, Topology, TurnOutput,
     forget_note, project_scope, read_notes, turn_was_cancelled,
 };
-pub use event::{Event, StateReport, ToolObservation, ToolOutcome, TurnLimitReason};
+pub use event::{
+    Event, HookObservation, StateReport, ToolObservation, ToolOutcome, TurnLimitReason,
+};
 pub use progress::{ContextSnapshot, FacingProgress, RequestContext};
 
 #[cfg(test)]
@@ -92,6 +94,9 @@ mod public_test_support;
 
 #[cfg(test)]
 mod reasoning_summary_tests;
+
+#[cfg(all(test, unix))]
+mod hook_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tool_tests;

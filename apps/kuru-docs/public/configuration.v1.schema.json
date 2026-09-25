@@ -51,6 +51,19 @@
       "items": { "$ref": "#/$defs/permission" },
       "default": []
     },
+    "hooks": {
+      "$ref": "#/$defs/hooks",
+      "default": {
+        "max_invocations": 256,
+        "max_total_ms": 120000,
+        "max_annotation_bytes": 262144,
+        "pre_turn": [],
+        "post_turn": [],
+        "pre_tool": [],
+        "post_tool": [],
+        "speaker_selected": []
+      }
+    },
     "api_base": { "type": "string", "format": "uri", "default": "https://api.openai.com/v1" },
     "api_key_env": {
       "type": "string",
@@ -117,6 +130,57 @@
           }
         }
       ]
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_invocations": { "type": "integer", "minimum": 1, "maximum": 1024, "default": 256 },
+        "max_total_ms": { "type": "integer", "minimum": 1, "maximum": 600000, "default": 120000 },
+        "max_annotation_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576,
+          "default": 262144
+        },
+        "pre_turn": { "$ref": "#/$defs/hookList" },
+        "post_turn": { "$ref": "#/$defs/hookList" },
+        "pre_tool": { "$ref": "#/$defs/hookList" },
+        "post_tool": { "$ref": "#/$defs/hookList" },
+        "speaker_selected": { "$ref": "#/$defs/hookList" }
+      }
+    },
+    "hookList": {
+      "type": "array",
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/hookCommand" },
+      "default": []
+    },
+    "hookCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "args": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "type": "string", "maxLength": 4096 },
+          "default": []
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000,
+          "default": 5000
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 262144,
+          "default": 65536
+        }
+      }
     },
     "permissionSelector": {
       "oneOf": [

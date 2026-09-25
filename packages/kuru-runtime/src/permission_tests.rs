@@ -94,7 +94,7 @@ impl Provider for TwoStaleFileCalls {
 async fn newly_activated_instructions_settle_stale_parallel_calls_without_effects() -> Result<()> {
     let project = tempfile::tempdir().unwrap();
     std::fs::create_dir(project.path().join("src")).unwrap();
-    let config = Config {
+    let mut config = Config {
         mode: Mode::Freudian,
         provider: "demo".into(),
         model: "demo".into(),
@@ -104,6 +104,16 @@ async fn newly_activated_instructions_settle_stale_parallel_calls_without_effect
         dream_on_exit: false,
         ..Config::default()
     };
+    #[cfg(unix)]
+    config.hooks.pre_tool.push(kuru_core::HookCommand {
+        command: "/bin/sh".into(),
+        args: vec![
+            "-c".into(),
+            "cat >/dev/null; printf x >> pre-tool-hook-ran; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"name\":\"file_write\",\"arguments\":{\"path\":\"src/first.txt\",\"content\":\"hook-rewritten\"}}}'".into(),
+        ],
+        timeout_ms: 5_000,
+        max_output_bytes: 64 * 1024,
+    });
     let gate = Arc::new(FirstPathInstructions {
         active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
@@ -133,6 +143,11 @@ async fn newly_activated_instructions_settle_stale_parallel_calls_without_effect
     assert_eq!(output.text, "replanned");
     assert!(!project.path().join("src/first.txt").exists());
     assert!(!project.path().join("src/second.txt").exists());
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read(project.path().join("pre-tool-hook-ran"))?,
+        b"x"
+    );
     {
         let requests = provider.speaking_requests.lock().unwrap();
         assert_eq!(requests.len(), 2);

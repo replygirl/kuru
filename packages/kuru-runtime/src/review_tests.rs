@@ -11,6 +11,8 @@ use kuru_core::{
     Completion, CompletionRequest, Config, ConfigSnapshot, InvocationOverrides, McpConfig, Mode,
     ModelInfo, RelationshipKind, ToolCall,
 };
+#[cfg(unix)]
+use kuru_core::{HookCommand, LifecycleHooks};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -85,6 +87,45 @@ fn config(mode: Mode) -> Config {
         dream_on_exit: false,
         ..Config::default()
     }
+}
+#[cfg(unix)]
+fn cancelled_post_tool_hook() -> LifecycleHooks {
+    LifecycleHooks {
+        post_tool: vec![HookCommand {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "cat > cancelled-post-tool.json; printf '%s' '{\"decision\":\"observe\"}'".into(),
+            ],
+            ..HookCommand::default()
+        }],
+        ..LifecycleHooks::default()
+    }
+}
+
+#[cfg(unix)]
+fn assert_cancelled_post_tool(project: &TempDir, events: &[crate::Event], call_id: &str) {
+    let request: Value = serde_json::from_slice(
+        &std::fs::read(project.path().join("cancelled-post-tool.json"))
+            .expect("post-tool hook did not run after cancelled settlement"),
+    )
+    .unwrap();
+    assert_eq!(request["event"], "post_tool");
+    assert_eq!(request["call_id"], call_id);
+    assert_eq!(request["payload"]["is_error"], true);
+    assert_eq!(request["payload"]["result"], "ERROR: turn cancelled");
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |event| matches!(event, crate::Event::Hook { observation, .. }
+                if observation.event == "post_tool"
+                    && observation.call_id.as_deref() == Some(call_id)
+                    && observation.outcome == "observed")
+            )
+            .count(),
+        1,
+    );
 }
 async fn fixture(config: Config, provider: Arc<dyn Provider>) -> (TempDir, Harness) {
     let dir = TempDir::new().unwrap();
@@ -628,7 +669,14 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
         }
         reply("the later cognitive turn completed")
     });
-    let (_project, mut harness) = fixture(config(Mode::Freudian), provider).await;
+    let settings = Config {
+        #[cfg(unix)]
+        hooks: cancelled_post_tool_hook(),
+        ..config(Mode::Freudian)
+    };
+    let (project, mut harness) = fixture(settings, provider).await;
+    #[cfg(not(unix))]
+    let _ = &project;
     *identities.lock().unwrap() = harness
         .topology
         .parts
@@ -663,6 +711,9 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
             .expect("cancelled cognitive turn did not settle")
             .unwrap();
     assert!(turn_was_cancelled(&result.unwrap_err()));
+    let events = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    #[cfg(unix)]
+    assert_cancelled_post_tool(&project, &events, "accepted-state");
     assert_eq!(harness.topology.states[&target].activation, 0.75);
     assert_eq!(
         harness
@@ -676,7 +727,7 @@ async fn accepted_cognitive_writes_reconcile_before_cancellation_stops_peer_work
         1
     );
     assert!(
-        std::iter::from_fn(|| events.try_recv().ok()).all(|event| event.kind() != "peer"),
+        events.iter().all(|event| event.kind() != "peer"),
         "cognitive calls after observed cancellation must not start"
     );
     let retry = harness
@@ -731,6 +782,7 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
     let (project, mut harness) = fixture(
         Config {
             allow_shell: true,
+            hooks: cancelled_post_tool_hook(),
             ..config(Mode::Freudian)
         },
         provider.clone(),
@@ -794,6 +846,7 @@ async fn cancelled_shell_turn_reaps_the_observed_owned_process_without_replay() 
         1,
         "no second settlement can be hidden behind a different outcome"
     );
+    assert_cancelled_post_tool(&project, &events, "held-shell");
     let retry = harness
         .run_controlled(
             "start one owned shell",
@@ -1074,7 +1127,14 @@ async fn cancelled_admitted_peer_consultation_is_not_replayed() {
         calls: AtomicUsize::new(0),
         started: tokio::sync::Notify::new(),
     });
-    let (_project, mut harness) = fixture(config(Mode::Freudian), provider.clone()).await;
+    let settings = Config {
+        #[cfg(unix)]
+        hooks: cancelled_post_tool_hook(),
+        ..config(Mode::Freudian)
+    };
+    let (project, mut harness) = fixture(settings, provider.clone()).await;
+    #[cfg(not(unix))]
+    let _ = &project;
     let target = harness.topology.parts[0].id.clone();
     *provider.recipient.lock().unwrap() = harness.topology.parts[1].id.clone();
     let mut events = harness.subscribe();
@@ -1126,6 +1186,8 @@ async fn cancelled_admitted_peer_consultation_is_not_replayed() {
         1,
         "the initial cognitive result must not settle before consultation completes"
     );
+    #[cfg(unix)]
+    assert_cancelled_post_tool(&project, &events, "accepted-peer");
     let retry = harness
         .run_controlled(
             "consult one peer",

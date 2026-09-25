@@ -19,9 +19,9 @@ pub use accounting::{
 };
 pub use config::{
     AuthorityClaim, AuthorityClaimCategory, AuthorityManifest, ClaimDigest, Config, ConfigSnapshot,
-    InvocationOverrides, ManifestDigest, McpConfig, McpOAuthConfig, MemoryConfig, ModelPreference,
-    ProjectPreferences, ResponsesRouteConfig, SafeClaimDisplay, SafeManifest, SafeSource,
-    SelectionOverrides, load_instructions,
+    HookCommand, HookEvent, InvocationOverrides, LifecycleHooks, ManifestDigest, McpConfig,
+    McpOAuthConfig, MemoryConfig, ModelPreference, ProjectPreferences, ResponsesRouteConfig,
+    SafeClaimDisplay, SafeManifest, SafeSource, SelectionOverrides, load_instructions,
 };
 pub use context::{
     ContextBudget, ContextCompactionPolicy, ContextEstimate, ContextSizing, ContextSourceKind,

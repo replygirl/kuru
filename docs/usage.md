@@ -262,6 +262,13 @@ no result has zero result bytes and no digest. Completed journals now write
 format 2 and replay older format-1 event triplets through their legacy
 projector without rewriting historical revisions.
 
+A `hook` event records only the lifecycle event name, configured one-based
+ordinal, opaque invocation/turn/call correlation, and `allowed`, `rewritten`,
+`denied`, `observed`, `stopped`, `annotated`, or `failed`. It omits hook command
+details and all payload, output, result, and annotation bodies. Hook annotations
+remain separate private context records; they do not replace the displayed
+answer or tool result. See [lifecycle hooks](configuration.md#lifecycle-hooks).
+
 `kuru memory notes ID` reads an existing project's selected-mode durable notes
 without starting a conversation, provider, or tool. It returns the same bounded
 notes view as `/notes`: `mode`, canonical `identity`, chronological `notes`,

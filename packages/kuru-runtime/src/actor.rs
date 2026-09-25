@@ -59,6 +59,7 @@ pub(crate) struct Work {
     pub turn_id: Option<String>,
     pub inputs: Vec<Message>,
     pub instructions: String,
+    pub public_input_override: Option<PublicInputOverride>,
     pub context_sources: Vec<ContextSource>,
     pub context_budget: ContextBudget,
     pub compaction_policy: ContextCompactionPolicy,
@@ -74,6 +75,14 @@ pub(crate) struct Work {
     pub progress: Option<ProgressDescriptor>,
     pub span: tracing::Span,
     pub reply: Option<oneshot::Sender<Result<Completion>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PublicInputOverride {
+    pub session_id: String,
+    pub operation_id: String,
+    pub turn_id: String,
+    pub original: Message,
 }
 
 pub(crate) struct Actor {
@@ -246,6 +255,37 @@ impl Actor {
                     let public_transcript = work
                         .context_sources
                         .contains(&ContextSource::PublicTranscript);
+                    if let Some(override_input) = &work.public_input_override {
+                        ensure!(
+                            override_input.session_id == work.invocation.session_id
+                                && override_input.operation_id == work.invocation.operation_id
+                                && work
+                                    .turn_id
+                                    .as_deref()
+                                    .is_none_or(|turn_id| turn_id == override_input.turn_id),
+                            "active turn identity changed before provider dispatch"
+                        );
+                        let page = work
+                            .cancellation
+                            .wait(async {
+                                work.memory
+                                    .public_transcript_page(&work.invocation.session_id, None, 0)
+                                    .await
+                                    .map_err(MemoryFailure)
+                                    .map_err(Into::into)
+                            })
+                            .await?;
+                        ensure!(
+                            page.pending.as_ref().is_some_and(|pending| {
+                                pending.origin_session_id == override_input.session_id
+                                    && pending.turn_id == override_input.turn_id
+                                    && pending.settlement
+                                        == kuru_memory::PublicTurnSettlement::Pending
+                                    && pending.user_entry.as_ref() == Some(&override_input.original)
+                            }),
+                            "active turn transcript changed before provider dispatch"
+                        );
+                    }
                     let required = work
                         .inputs
                         .iter()

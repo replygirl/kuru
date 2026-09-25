@@ -25,8 +25,8 @@ use axum::{
 };
 use futures::stream;
 use kuru_core::{
-    Config, McpConfig, McpOAuthConfig, Mode, ModeProfile, PermissionAction, PermissionRule,
-    PermissionSelector, SelectionOverrides,
+    Config, HookCommand, LifecycleHooks, McpConfig, McpOAuthConfig, Mode, ModeProfile,
+    PermissionAction, PermissionRule, PermissionSelector, SelectionOverrides,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1278,6 +1278,294 @@ async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcrip
     ensure!(
         requests.load(Ordering::SeqCst) == 0,
         "session lifecycle restart dispatched a provider request"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_lifecycle_hooks_rewrite_and_annotate_without_exposing_hook_output() -> Result<()>
+{
+    let sandbox = Sandbox::new()?;
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route(
+            "/v1/responses",
+            post(move |Json(request): Json<Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().unwrap().push(request);
+                    priced_complete(Json(json!({}))).await
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let mut config = sandbox.config()?;
+    config.api_base = format!("http://{}/v1", listener.local_addr()?);
+    config.api_key_env = "KURU_FIXTURE_KEY".into();
+    config.max_rounds = 1;
+    let config_path = sandbox.root.path().join("lifecycle-hooks.toml");
+    let nested_marker = sandbox.root.path().join("nested-tools-ran");
+    config.hooks = LifecycleHooks {
+        pre_turn: vec![HookCommand {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "set -e; cat >/dev/null; \"$1\" -C \"$2\" --data-dir \"$3\" --config \"$4\" --provider responses tools >/dev/null; printf x >> \"$5\"; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"input\":\"REWRITTEN_HOOK_INPUT\"}}'".into(),
+                "hook".into(),
+                env!("CARGO_BIN_EXE_kuru").into(),
+                sandbox.project.to_string_lossy().into_owned(),
+                sandbox.data.to_string_lossy().into_owned(),
+                config_path.to_string_lossy().into_owned(),
+                nested_marker.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: 5_000,
+            max_output_bytes: 64 * 1024,
+        }],
+        post_turn: vec![HookCommand {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "cat >/dev/null; printf '%s' '{\"decision\":\"annotate\",\"annotation\":\"HOOK_PRIVATE_ANNOTATION_SECRET\"}'"
+                    .into(),
+            ],
+            timeout_ms: 5_000,
+            max_output_bytes: 64 * 1024,
+        }],
+        ..LifecycleHooks::default()
+    };
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config_path)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 48, 120)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command("ORIGINAL_HOOK_INPUT", None)?;
+    terminal.wait_composer_frame(&["PRICED_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
+    let first_count = requests.lock().unwrap().len();
+    ensure!(
+        first_count > 0,
+        "the rewritten turn never reached the provider"
+    );
+    let first_requests = requests.lock().unwrap();
+    ensure!(
+        first_requests
+            .iter()
+            .any(|request| request.to_string().contains("REWRITTEN_HOOK_INPUT")),
+        "the pre-turn rewrite was absent from provider input: {first_requests:?}"
+    );
+    ensure!(
+        first_requests
+            .iter()
+            .all(|request| !request.to_string().contains("ORIGINAL_HOOK_INPUT")),
+        "the durable original input leaked into rewritten provider input: {first_requests:?}"
+    );
+    drop(first_requests);
+    ensure!(
+        !terminal.screen().contains("HOOK_PRIVATE_ANNOTATION_SECRET"),
+        "the private hook annotation was rendered: {}",
+        terminal.screen()
+    );
+
+    terminal.command("SECOND_HOOK_INPUT", None)?;
+    terminal.wait_composer_frame(&["PRICED_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
+    let later = requests.lock().unwrap();
+    ensure!(
+        later.len() > first_count
+            && later[first_count..].iter().any(|request| request
+                .to_string()
+                .contains("HOOK_PRIVATE_ANNOTATION_SECRET")),
+        "the settled post-turn annotation was absent from later actor context: {later:?}"
+    );
+    drop(later);
+    let screen = terminal.screen();
+    ensure!(screen.contains("ORIGINAL_HOOK_INPUT"), "{screen}");
+    ensure!(screen.contains("SECOND_HOOK_INPUT"), "{screen}");
+    ensure!(
+        std::fs::read(&nested_marker)? == b"xx",
+        "a nested `kuru tools` inspection reentered or skipped the two pre-turn hooks"
+    );
+    ensure!(
+        !screen.contains("HOOK_PRIVATE_ANNOTATION_SECRET"),
+        "{screen}"
+    );
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_hook_refusals_and_speaker_stop_leave_the_session_usable() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route(
+            "/v1/responses",
+            post(move |Json(request): Json<Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().unwrap().push(request);
+                    priced_complete(Json(json!({}))).await
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let mut config = sandbox.config()?;
+    config.api_base = format!("http://{}/v1", listener.local_addr()?);
+    config.api_key_env = "KURU_FIXTURE_KEY".into();
+    config.max_rounds = 1;
+    config.hooks = LifecycleHooks {
+        pre_turn: vec![HookCommand {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "request=$(cat); case \"$request\" in *PTY_DENY*) printf '%s' '{\"decision\":\"deny\",\"reason\":\"PTY_DENIED\"}';; *PTY_MALFORMED*) printf '{';; *) printf '%s' '{\"decision\":\"allow\"}';; esac".into(),
+            ],
+            timeout_ms: 5_000,
+            max_output_bytes: 64 * 1024,
+        }],
+        speaker_selected: vec![HookCommand {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "cat >/dev/null; if [ ! -e speaker-stopped ]; then : > speaker-stopped; printf '%s' '{\"decision\":\"stop\",\"reason\":\"PTY_STOPPED\"}'; else printf '%s' '{\"decision\":\"observe\"}'; fi".into(),
+            ],
+            timeout_ms: 5_000,
+            max_output_bytes: 64 * 1024,
+        }],
+        ..LifecycleHooks::default()
+    };
+    let config_path = sandbox.root.path().join("hook-refusals.toml");
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config_path)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 48, 120)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+
+    terminal.command("PTY_DENY", None)?;
+    terminal.wait_composer_frame(&["PTY_DENIED", "enter send"], READY_TIMEOUT)?;
+    ensure!(
+        requests.lock().unwrap().is_empty(),
+        "denied turn dispatched provider work"
+    );
+
+    terminal.command("PTY_MALFORMED", None)?;
+    terminal.wait_composer_frame(&["hook", "enter send"], READY_TIMEOUT)?;
+    ensure!(
+        requests.lock().unwrap().is_empty(),
+        "malformed hook dispatched provider work"
+    );
+
+    terminal.command("PTY_STOP", None)?;
+    terminal.wait_composer_frame(&["PTY_STOPPED", "enter send"], READY_TIMEOUT)?;
+    let stopped = requests.lock().unwrap().clone();
+    ensure!(
+        !stopped.is_empty(),
+        "speaker stop did not reach deliberation"
+    );
+    ensure!(
+        stopped
+            .iter()
+            .all(|request| !request.to_string().contains("Phase: speak")),
+        "speaker stop dispatched speaking provider work: {stopped:?}"
+    );
+    ensure!(sandbox.project.join("speaker-stopped").exists());
+
+    terminal.command("PTY_ALLOWED", None)?;
+    terminal.wait_composer_frame(&["PRICED_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
+    let later = requests.lock().unwrap();
+    ensure!(
+        later.len() > stopped.len()
+            && later[stopped.len()..]
+                .iter()
+                .any(|request| request.to_string().contains("Phase: speak")),
+        "allowed continuation did not reach speaking dispatch: {later:?}"
+    );
+    drop(later);
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_started_kuru_run_reaches_provider_without_reentering_hooks() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let nested_project = sandbox.root.path().join("nested-project");
+    std::fs::create_dir(&nested_project)?;
+    let config_path = sandbox.root.path().join("nested-hooks.toml");
+    let hook_marker = sandbox.root.path().join("hook-invocations");
+    let nested_output = sandbox.root.path().join("nested-output.json");
+    let mut config = sandbox.config()?;
+    config.max_rounds = 1;
+    config.dream_every = 0;
+    config.dream_on_exit = false;
+    config.hooks = LifecycleHooks {
+        pre_turn: vec![HookCommand {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "set -e; cat >/dev/null; printf x >> \"$5\"; if [ \"$(wc -c < \"$5\")\" -eq 1 ]; then \"$1\" -C \"$2\" --data-dir \"$3\" --config \"$4\" --provider demo --no-dream run 'nested hook boundary' --json > \"$6\"; fi; printf '%s' '{\"decision\":\"allow\"}'".into(),
+                "hook".into(),
+                env!("CARGO_BIN_EXE_kuru").into(),
+                nested_project.to_string_lossy().into_owned(),
+                sandbox.data.to_string_lossy().into_owned(),
+                config_path.to_string_lossy().into_owned(),
+                hook_marker.to_string_lossy().into_owned(),
+                nested_output.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: 15_000,
+            max_output_bytes: 64 * 1024,
+        }],
+        ..LifecycleHooks::default()
+    };
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+
+    let output = sandbox
+        .command("demo")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["run", "outer hook boundary", "--json"])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "outer run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let outer: Value = serde_json::from_slice(&output.stdout)?;
+    let nested: Value = serde_json::from_slice(&std::fs::read(&nested_output)?)?;
+    ensure!(
+        outer["text"].as_str().is_some_and(|text| !text.is_empty())
+            && nested["text"].as_str().is_some_and(|text| !text.is_empty()),
+        "a run ended before the outer or nested provider lifecycle"
+    );
+    ensure!(
+        std::fs::read(&hook_marker)? == b"x",
+        "nested Kuru reentered the originating hook chain"
     );
     Ok(())
 }

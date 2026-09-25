@@ -230,6 +230,91 @@ native continuation are kept together. If mandatory material plus the reserve
 cannot fit, the request fails before inference is sent. Transport byte limits
 still apply separately.
 
+## Lifecycle hooks
+
+Lifecycle hooks are ordered one-shot commands around admitted actor work. All
+five events apply to `run`, `serve`, and interactive conversations. A standalone
+`dream` has provider `dream_suggest` tool calls, so only `pre_tool` and
+`post_tool` apply there; it has no user turn or selected speaker. They do not run
+for configuration or tool inspection, and a direct `kuru tool` remains an
+explicit user-authorized one-shot operation. Hooks are not a universal shell
+policy or a generic plugin system.
+
+```toml
+[hooks]
+max_invocations = 256
+max_total_ms = 120000
+max_annotation_bytes = 262144
+
+[[hooks.pre_turn]]
+command = "/usr/local/bin/check-turn"
+args = ["--project", "kuru"]
+timeout_ms = 5000
+max_output_bytes = 65536
+
+[[hooks.pre_tool]]
+command = "/usr/local/bin/check-tool"
+
+[[hooks.post_tool]]
+command = "/usr/local/bin/record-tool"
+
+[[hooks.speaker_selected]]
+command = "/usr/local/bin/check-speaker"
+
+[[hooks.post_turn]]
+command = "/usr/local/bin/record-turn"
+```
+
+Each event accepts at most 16 commands. A command accepts at most 64 arguments;
+its timeout is 1–120,000 milliseconds and its stdout limit is 1–262,144 bytes.
+The defaults are 5,000 milliseconds and 65,536 bytes. A request is at most
+256 KiB, stderr capture is at most 64 KiB, and one annotation is at most 16 KiB.
+Each conversation or standalone dream operation also permits 1–1,024 hook
+invocations (default 256), 1–600,000 milliseconds of shared active hook time
+(default 120,000), and 1–1,048,576 aggregate annotation bytes (default 262,144).
+Overlapping commands consume the shared wall-time budget once; time spent in
+provider inference or ordinary tools does not consume it. Cleanup after timeout
+or cancellation still holds the owned hook process and consumes active time.
+Exhausted pre or speaker budgets prevent dispatch; exhausted post or annotation
+budgets record a separate failure and leave settled work unchanged. A
+higher-priority configuration layer replaces an
+event's complete command array in normal TOML layering order.
+
+Commands run in declaration order. `pre_turn` and `pre_tool` may allow, deny, or
+rewrite the pending input or operation. Every rewrite then passes the same input,
+schema, budget, root, instruction, and permission checks as an unmodified value;
+a hook cannot reuse an earlier grant or widen authority. `speaker_selected` may
+observe or stop the already-validated selection. It cannot name another speaker
+or cause a second selection. `post_tool` and `post_turn` may observe or annotate
+settled work. A post failure does not change a tool effect, result, receipt,
+usage, answer, or durable conversation, and later post hooks still run.
+In a dream, a rewrite must still be `dream_suggest` and pass the authored
+proposal cap and dream validation. Dream annotations stay in the candidate
+memory view and disappear if that candidate is abandoned.
+
+Annotations are separate private hook records. Post-tool annotations are
+eligible for the receiving actor's next request alongside the unchanged result;
+post-turn annotations are eligible only for later context. Ordinary visibility
+and context fitting may omit older annotations, and no annotation starts an
+implicit provider turn. Completed exact retries return their stored outcome and
+do not rerun hooks, providers, or tools. A refused `pre_turn` has no provider or
+tool dispatch, so an explicit retry of that unfinished turn may run its pre
+hooks again. Configured commands can have external effects; Kuru does not
+promise exactly-once effects for a retried hook command.
+
+Configured hook commands are reviewed process authority under [workspace
+trust](#workspace-trust). Kuru retains the reviewed project directory, supplies a
+finite compatibility environment without provider credentials, closes stdin
+after one request, bounds and drains output, and owns the child process tree
+through success, failure, timeout, cancellation, or caller loss. This is not an
+OS sandbox: an approved command runs with the user's filesystem, process, and
+network authority. Hook protocol handling never invokes another lifecycle hook.
+A Kuru run started by an owned hook command keeps ordinary trust, admission,
+provider, and tool checks but suppresses lifecycle-hook dispatch for that nested
+process, preventing the hook chain from starting itself again.
+See [hook protocol](protocols.md#lifecycle-hook-protocol) for the exact request
+and decision shapes.
+
 ## Tool permissions
 
 Tools use `allow`, `ask` or `deny` decisions after workspace trust and the
@@ -364,7 +449,7 @@ The activation sets are command-specific:
 | `models` | Configured memory paths used while loading saved selections, plus an active Responses route |
 | `tool` | Configured memory paths used while loading saved selections, built-in write/shell defaults, permission rules, and stdio/HTTP MCP configuration |
 | `tools` | Built-in write/shell defaults, permission rules, and stdio/HTTP MCP configuration; catalog inspection does not activate memory paths |
-| `run`, `dream`, `serve`, interactive TUI | All applicable project-instruction, memory, provider, write, shell, permission-rule, MCP and external-agent claims |
+| `run`, `dream`, `serve`, interactive TUI | All applicable project-instruction, memory, provider, lifecycle-hook, write, shell, permission-rule, MCP and external-agent claims |
 
 The other rows do not construct peer prompts, so they do not consume the
 project-instructions claim. Reading a snapshot for `config` or trust inspection

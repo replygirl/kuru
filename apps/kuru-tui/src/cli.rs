@@ -1597,6 +1597,43 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                     }
                 }
                 let cleanup = harness.shutdown(succeeded).await;
+                if succeeded {
+                    let mut reports = std::collections::BTreeSet::new();
+                    loop {
+                        let event = match events.try_recv() {
+                            Ok(event) => event,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                            | tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                        };
+                        let report = match event {
+                            Event::Hook { observation, .. }
+                                if observation.event == "post_turn" =>
+                            {
+                                Some(format!(
+                                    "post-turn hook {}: {}",
+                                    observation.hook_index, observation.outcome
+                                ))
+                            }
+                            Event::Error { detail, .. }
+                                if detail
+                                    == "hook annotation persistence unresolved after settled answer" =>
+                            {
+                                Some(detail)
+                            }
+                            _ => None,
+                        };
+                        if let Some(report) = report
+                            && reports.len() < 8
+                        {
+                            reports.insert(report);
+                        }
+                    }
+                    for report in reports {
+                        // A closed stderr cannot undo a durably completed turn.
+                        let _ = writeln!(io::stderr().lock(), "{report}");
+                    }
+                }
                 result.map_err(|error| {
                     let mut failures = std::collections::BTreeSet::new();
                     while let Ok(event) = events.try_recv() {
@@ -1792,6 +1829,7 @@ pub(crate) fn all_claim_categories() -> std::collections::BTreeSet<AuthorityClai
         Category::ProjectSkillMaterial,
         Category::ProjectCommands,
         Category::ToolPermissions,
+        Category::LifecycleHooks,
     ]
     .into_iter()
     .collect()
@@ -1845,6 +1883,7 @@ fn command_claim_categories(
             Category::ProjectInstructions,
             Category::ProjectSkillMetadata,
             Category::ProjectCommands,
+            Category::LifecycleHooks,
         ],
         Some(
             Command::Completions { .. }

@@ -256,6 +256,46 @@ initializes the shipped `Microsoft.PowerShell.Management` and
 autoloading remains available. Configured stdio MCP servers keep their own
 inherited environment and explicit configuration overrides.
 
+## Lifecycle hook protocol
+
+Kuru writes one JSON object followed by a newline to each lifecycle hook's
+stdin, then closes stdin. The version-1 request has `format`, `event`,
+`invocation_id`, `actor`, optional `turn_id`, optional `call_id`, and `payload`.
+Identifiers are opaque correlation values. The payload is limited to the event:
+
+- `pre_turn`: `{ "input": string }`
+- `pre_tool`: `{ "name": string, "arguments": object }`
+- `speaker_selected`: `{ "speaker": string, "reason": string }`
+- `post_tool`: `{ "name", "arguments", "result", "is_error" }`, using the
+  same bounded credential-projected result used by runtime observations
+- `post_turn`: `{ "answer": string, "outcome": "text" | "empty" }`
+
+Dream `dream_suggest` calls use `pre_tool` and `post_tool` with their real
+actor, invocation, and call IDs and no `turn_id`. Dreams have no `pre_turn`,
+`post_turn`, or `speaker_selected` event. A dream rewrite cannot add another
+tool class or bypass its proposal cap and candidate validation.
+
+The command must write exactly one JSON response and no trailing value. Pre
+events accept `{ "decision": "allow" }`,
+`{ "decision": "deny", "reason": string? }`, or
+`{ "decision": "rewrite", "value": object }`. Speaker selection accepts
+`{ "decision": "observe" }` or `{ "decision": "stop", "reason": string? }`;
+neither response can name another actor. Post events accept `observe` or
+`annotate` with an annotation string. Denial reasons and annotations redact
+recognized credentials and escape terminal controls. Unknown fields, malformed
+or trailing
+JSON, invalid UTF-8, an event-incompatible decision, a failed exit status, or a
+size or time violation fails that hook. Pre and speaker failures stop dispatch;
+post failures are recorded separately and the remaining post chain continues.
+
+Hook events expose only event type, configured ordinal, invocation/turn/call
+correlation, and outcome classification. They never expose the command, its
+arguments, stdin, stdout, stderr, rewritten value, result body, or annotation
+body. Recognized credentials are projected before a post-tool result reaches a
+hook, but an approved hook still has ordinary process authority and is not
+sandboxed. See [lifecycle hooks](configuration.md#lifecycle-hooks) for bounds,
+trust, ordering, cancellation, and direct-command scope.
+
 Before a built-in file, shell, or MCP result crosses into the CLI or runtime,
 Kuru projects a finite set of recognizable credential forms to
 `[REDACTED:recognized-secret]`. It recognizes Basic/Bearer Authorization and
