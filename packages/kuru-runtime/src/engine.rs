@@ -1518,6 +1518,31 @@ impl Harness {
         if already_marked && !journal.possible_dispatch {
             return Ok(None);
         }
+        if already_marked && journal.possible_dispatch {
+            // A settled terminal interruption may be observed again after its
+            // reply is lost. Only the exact current public head proves that
+            // this journal has already settled; a different or pending turn
+            // must still be refused by the checked store mutation below.
+            let page = self
+                .memory
+                .public_transcript_page(&self.session.id, None, 1)
+                .await?;
+            if page.pending.is_none()
+                && matches!(
+                    page.records.as_slice(),
+                    [PublicTranscriptEntry::Turn { record }]
+                        if record.origin_session_id == self.session.id
+                            && record.turn_id == id
+                            && Some(record.node_id.as_str()) == page.head_node_id.as_deref()
+                            && record.settlement == PublicTurnSettlement::Interrupted
+                            && record.speaker_id.as_deref() == Some(INTERRUPTION_ROLE)
+                            && record.terminal_entries
+                                == [Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT)]
+                )
+            {
+                return Ok(None);
+            }
+        }
         if !already_marked {
             journal.push(TurnTransition::Interrupted)?;
         }
@@ -5212,16 +5237,60 @@ mod publication_tests {
                         == [Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT)]
         ));
 
+        let settled_revision = memory.revision().await.unwrap();
+        let settled_history = harness.history().await.unwrap();
+        let mut events = harness.subscribe();
         harness.record_interruption(&key, stored).await.unwrap();
+        assert_eq!(memory.revision().await.unwrap(), settled_revision);
+        assert_eq!(harness.history().await.unwrap(), settled_history);
         assert_eq!(
-            harness
-                .history()
+            memory
+                .public_transcript_page(&harness.session.id, None, 16)
                 .await
-                .unwrap()
-                .iter()
-                .filter(|message| message.role == INTERRUPTION_ROLE)
-                .count(),
-            1
+                .unwrap(),
+            public
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "exact retry emitted another event"
+        );
+
+        let stored: TurnJournal =
+            serde_json::from_value(memory.get(&key).await.unwrap().unwrap()).unwrap();
+        let mut wrong = stored;
+        wrong.id = "different-turn".into();
+        assert!(harness.record_interruption(&key, wrong).await.is_err());
+        assert_eq!(memory.revision().await.unwrap(), settled_revision);
+
+        let TurnAdmission::Run { .. } = harness
+            .admit_turn(
+                "later pending request",
+                Some(&target),
+                "later-pending",
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("later request must admit a pending turn");
+        };
+        let pending = memory
+            .public_transcript_page(&harness.session.id, None, 16)
+            .await
+            .unwrap();
+        assert_eq!(pending.pending.as_ref().unwrap().turn_id, "later-pending");
+        let pending_revision = memory.revision().await.unwrap();
+        let old: TurnJournal =
+            serde_json::from_value(memory.get(&key).await.unwrap().unwrap()).unwrap();
+        assert!(harness.record_interruption(&key, old).await.is_err());
+        assert_eq!(memory.revision().await.unwrap(), pending_revision);
+        assert_eq!(
+            memory
+                .public_transcript_page(&harness.session.id, None, 16)
+                .await
+                .unwrap(),
+            pending
         );
         harness.shutdown(false).await.unwrap();
         memory.close().await.unwrap();
@@ -6282,16 +6351,16 @@ mod publication_tests {
                 .unwrap(),
             serde_json::to_value(&harness.session).unwrap()
         );
-        let sessions: Vec<Session> = serde_json::from_value(
-            memory
-                .get(&format!("{}/sessions", harness.scope))
+        let catalog = memory
+            .session_catalog_record(&harness.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(catalog.session_id, harness.session.id);
+        assert_eq!(
+            Harness::list_sessions(&memory, project.path())
                 .await
                 .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            sessions
                 .iter()
                 .filter(|session| session.id == harness.session.id)
                 .count(),
