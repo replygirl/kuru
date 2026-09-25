@@ -4,6 +4,7 @@ use kuru_archive::zip::{self, Archive, Limits, MemberKind, MemberSpec, WriteMemb
 use kuru_delivery::{
     archive::{self, MAX_ARCHIVE_BYTES},
     command::BlockingCommand as Command,
+    shell_support,
     targets::{self, ArchiveFormat},
 };
 use std::{fs, path::Path};
@@ -65,9 +66,20 @@ async fn real_packager_writes_exact_reproducible_windows_zip_and_installer_runs_
     drop(zip);
     archive::package(binary, WINDOWS, "0.2.0", &releases).unwrap();
     assert_eq!(fs::read(&path).unwrap(), bytes);
-    fs::copy(
-        path.with_extension("zip.sha256"),
+    let generated = root.path().join("generated support");
+    for name in shell_support::NAMES {
+        let file = generated.join(name);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, format!("generated {name} for {WINDOWS}\n")).unwrap();
+    }
+    let support = shell_support::package(&generated, WINDOWS, "0.2.0", &releases).unwrap();
+    fs::write(
         releases.join("SHA256SUMS"),
+        format!(
+            "{}{}",
+            fs::read_to_string(path.with_extension("zip.sha256")).unwrap(),
+            fs::read_to_string(support.with_extension("zip.sha256")).unwrap()
+        ),
     )
     .unwrap();
     let destination = root.path().join("installed Unicode λ");
@@ -88,9 +100,18 @@ async fn real_packager_writes_exact_reproducible_windows_zip_and_installer_runs_
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(result.stdout, b"native fixture 0.2.0\n");
+    let installed_support = destination.join("share/kuru/0.2.0").join(WINDOWS);
+    assert_eq!(
+        shell_support::read_generated(&installed_support).unwrap(),
+        shell_support::read_generated(&generated).unwrap()
+    );
+    assert_eq!(
+        fs::read(destination.join("share/man/man1/kuru.1")).unwrap(),
+        fs::read(generated.join("man/kuru.1")).unwrap()
+    );
     assert_eq!(
         fs::read_dir(destination).unwrap().count(),
-        1 + usize::from(cfg!(windows))
+        2 + usize::from(cfg!(windows))
     );
 }
 

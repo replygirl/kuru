@@ -7,7 +7,7 @@ mod update_profiles;
 
 use anyhow::{Context, Result, ensure};
 use kuru_core::MemoryConfig;
-use kuru_delivery::{archive, command::Command};
+use kuru_delivery::{archive, command::Command, shell_support};
 use kuru_memory::{MemoryStore, OpenOptions};
 use kuru_platform::fs::{Directory, regular_file_info};
 use serde_json::Value;
@@ -1106,9 +1106,38 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         .file_name()
         .and_then(OsStr::to_str)
         .context("archive name")?;
-    fs::copy(
-        releases.join(format!("{name}.sha256")),
+    // Package the marked core's support from this exact selected executable,
+    // including the private instrumented copy under coverage.
+    let generated = root.join("generated shell support");
+    for (name, args) in [
+        ("completions/kuru.bash", &["completions", "bash"][..]),
+        ("completions/_kuru", &["completions", "zsh"]),
+        ("completions/kuru.fish", &["completions", "fish"]),
+        ("completions/kuru.ps1", &["completions", "powershell"]),
+        ("man/kuru.1", &["man"][..]),
+    ] {
+        let path = generated.join(name);
+        fs::create_dir_all(path.parent().context("support file has no parent")?)?;
+        let output = execute(Command::new(&binary).args(args)).await?;
+        ensure!(
+            output.status.success(),
+            "selected binary could not generate {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(path, output.stdout)?;
+    }
+    let support_path = shell_support::package(&generated, target, version, &releases)?;
+    let support_name = support_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("shell support archive name")?;
+    fs::write(
         releases.join("SHA256SUMS"),
+        format!(
+            "{}{}",
+            fs::read_to_string(releases.join(format!("{name}.sha256")))?,
+            fs::read_to_string(releases.join(format!("{support_name}.sha256")))?
+        ),
     )?;
     let installed = install_packaged(root, &releases, version, &install_dir, target)
         .await
@@ -1119,8 +1148,18 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         "direct installation changed the packaged executable"
     );
     ensure!(
-        fs::read_dir(&install_dir)?.count() == if cfg!(windows) { 2 } else { 1 },
-        "installation must contain only Kuru and the Windows update coordination directory"
+        fs::read_dir(&install_dir)?.count() == 2 + usize::from(cfg!(windows)),
+        "installation must contain Kuru, shell support and only the Windows update coordination directory when applicable"
+    );
+    let expected_support = shell_support::read_generated(&generated)?;
+    ensure!(
+        shell_support::read_generated(&install_dir.join("share/kuru").join(version).join(target))?
+            == expected_support
+            && fs::read(install_dir.join("share/man/man1/kuru.1"))?
+                == expected_support
+                    .get("man/kuru.1")
+                    .context("generated man file")?,
+        "direct installation changed its paired shell support"
     );
     let first = Installation::new(root, "direct", &project, &installed)?;
     first.native_auth_status().await?;
@@ -1172,6 +1211,15 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         digest(&installed)? == original_digest,
         "self-update lost or changed the bundled executable"
     );
+    ensure!(
+        shell_support::read_generated(&install_dir.join("share/kuru").join(version).join(target))?
+            == expected_support
+            && fs::read(install_dir.join("share/man/man1/kuru.1"))?
+                == expected_support
+                    .get("man/kuru.1")
+                    .context("generated man file")?,
+        "self-update changed its paired shell support"
+    );
     let second = Installation::new(root, "updated", &project, &installed)?;
     second.native_auth_status().await?;
     second
@@ -1188,8 +1236,8 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         .await
         .context("retire the updated installation's managed memory owner")?;
     ensure!(
-        fs::read_dir(&install_dir)?.count() == if cfg!(windows) { 2 } else { 1 },
-        "self-update left a required companion executable"
+        fs::read_dir(&install_dir)?.count() == 2 + usize::from(cfg!(windows)),
+        "self-update left an unexpected companion alongside Kuru and shell support"
     );
     eprintln!(
         "embedded runtime accepted: target={target} executable_bytes={} archive_bytes={} engine={dolt_version}; direct install and self-update each persisted chat from an empty offline cache",

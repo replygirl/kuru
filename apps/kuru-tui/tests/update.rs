@@ -63,13 +63,19 @@ fn updater_replaces_the_running_binary_only_after_checksum_validation() {
     let compressed = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut archive = tar::Builder::new(compressed);
     let payload = b"#!/bin/sh\necho updated-kuru\n";
-    let mut member = tar::Header::new_ustar();
-    member.set_size(payload.len() as u64);
-    member.set_mode(0o755);
-    member.set_cksum();
-    archive
-        .append_data(&mut member, "kuru", &payload[..])
-        .unwrap();
+    // This is an explicitly unmarked legacy core. Its full three-member
+    // inventory must pass structural checks before the checksum control runs.
+    for (name, bytes, mode) in [
+        ("kuru", &payload[..], 0o755),
+        ("LICENSE", &b"fixture license\n"[..], 0o644),
+        ("README.md", &b"unmarked legacy fixture\n"[..], 0o644),
+    ] {
+        let mut member = tar::Header::new_ustar();
+        member.set_size(bytes.len() as u64);
+        member.set_mode(mode);
+        member.set_cksum();
+        archive.append_data(&mut member, name, bytes).unwrap();
+    }
     archive.into_inner().unwrap().finish().unwrap();
     let digest: String = Sha256::digest(std::fs::read(release.join(&name)).unwrap())
         .iter()
@@ -91,7 +97,11 @@ fn updater_replaces_the_running_binary_only_after_checksum_validation() {
         b"updated-kuru\n"
     );
     copy_executable(&executable);
-    std::fs::write(release.join("SHA256SUMS"), "bad checksum").unwrap();
+    std::fs::write(
+        release.join("SHA256SUMS"),
+        format!("{}  {name}\n", "0".repeat(64)),
+    )
+    .unwrap();
     let before = std::fs::read(&executable).unwrap();
     let output = Command::new(&executable)
         .args(["update", "--version", "0.2.0", "--release-base"])
@@ -99,6 +109,11 @@ fn updater_replaces_the_running_binary_only_after_checksum_validation() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("checksum mismatch"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(std::fs::read(&executable).unwrap(), before);
     assert!(
         Command::new(&executable)
