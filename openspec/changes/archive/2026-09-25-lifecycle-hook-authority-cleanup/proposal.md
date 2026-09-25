@@ -14,7 +14,7 @@ The P14 lifecycle-hook review (PR #89) found authority, cleanup and calibration 
 
 ## What Changes
 
-- **`pre_tool` rewrites.** A rewrite may change only the arguments. A changed tool name fails closed and no later hook runs. The runtime admits a final call, whether hook-rewritten or model-proposed, only when its name is among the tools offered for that exact request and phase. Permission evaluation still runs on the final arguments.
+- **`pre_tool` rewrites.** A rewrite may change only the arguments. A changed tool name fails closed and no later hook runs. The runtime admits a call it dispatches itself (every deliberation and dream call, and cognitive speaking calls), whether hook-rewritten or model-proposed, only when its name is among the tools offered for that exact request and phase. Other speaking calls pass the ToolHost admission and permission evaluation of their exact final name and arguments.
 - **Awaited cleanup.** Each `HookHost` tracks its in-flight owned hook workers. A turn, dream or harness/tool shutdown awaits their bounded cleanup (signal before reap) before it completes, and unconfirmed cleanup is surfaced.
 - **Bounded reads after exit.** After the root process exits, stdout and stderr are drained only within the remaining deadline. If the drain expires, the hook fails closed.
 - **Pre-turn rewrite provenance.** When a pre-turn hook rewrites the input, each current input is preceded by a `kuru-hook` provenance record in durable history. The rewritten text is therefore attributable to a hook and never stands alone as user speech. The original stays in the public transcript.

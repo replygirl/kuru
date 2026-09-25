@@ -1903,6 +1903,7 @@ mod tests {
         hooks.pre_turn.push(command(
             r#"request=$(cat); case "$request" in *'"invocation_id":"one"'*) id=one;; *'"invocation_id":"two"'*) id=two;; *) id=;; esac; if [ -n "$id" ]; then : > "started-$id"; while [ ! -e "release-$id" ]; do sleep 0.01; done; fi; printf '%s' '{"decision":"allow"}'"#,
         ));
+        hooks.pre_turn[0].timeout_ms = HookCommand::default().timeout_ms;
         let budget_wait = Duration::from_millis(hooks.pre_turn[0].timeout_ms);
         let host = Arc::new(host_with_hooks(root.path(), hooks));
         let budget = host.budget();

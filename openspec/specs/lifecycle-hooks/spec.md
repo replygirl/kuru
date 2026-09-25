@@ -23,7 +23,26 @@ An operation's aggregate time limit SHALL count active hook command wall time, i
 
 ### Requirement: Pre-event rewrites receive final validation
 
-`pre_turn` hooks SHALL allow, deny, or rewrite only the pending actor input, and `pre_tool` hooks SHALL allow, deny, or rewrite only the proposed tool name and arguments. Hooks for one event MUST run sequentially in effective configuration order, with each valid rewrite becoming the next hook's input. Before external dispatch, Kuru MUST apply the ordinary input shape, budget, schema, tool-root, permission, workspace-authority, and mode-policy checks that apply to the exact final value. A prior grant or evaluation MUST NOT authorize a changed operation. Original durable user/raw input MUST NOT be rewritten.
+`pre_turn` hooks SHALL allow, deny, or rewrite only the pending actor input.
+
+`pre_tool` hooks SHALL allow, deny, or rewrite only the proposed tool arguments:
+- A `pre_tool` rewrite MUST repeat the unchanged proposed tool name.
+- A rewrite that changes the tool name MUST fail closed before any later hook, permission evaluation or dispatch.
+
+Hooks for one event MUST run sequentially in effective configuration order, with each valid rewrite becoming the next hook's input.
+
+Before dispatch, Kuru MUST admit a call the runtime dispatches itself only when its exact final name is among the tools offered to that actor for that exact request and phase. This covers every cognitive call, every deliberation call and every dream call, whether hook-rewritten or model-proposed. Every other call MUST pass the ToolHost admission and permission evaluation of its exact final name and arguments. Kuru MUST then apply every ordinary check that applies to the exact final value:
+- input shape
+- budget
+- schema
+- tool-root
+- permission
+- workspace-authority
+- mode-policy
+
+A prior grant or evaluation MUST NOT authorize a changed operation.
+
+Original durable user and raw input MUST NOT be rewritten. A pre-turn rewrite changes the current turn's provider view. Wherever the rewritten input is durably retained in an actor's private history, it MUST be accompanied by a hook-provenance record, so hook-authored text is never stored as indistinguishable user speech.
 
 #### Scenario: Ordered tool rewrite narrows authority
 
@@ -34,6 +53,21 @@ An operation's aggregate time limit SHALL count active hook command wall time, i
 
 - **WHEN** a pre-turn hook denies an admitted user input
 - **THEN** Kuru makes no provider or tool request, preserves the original durable input without replacing it with hook output, and reports the hook refusal truthfully
+
+#### Scenario: Tool name substitution is refused
+
+- **WHEN** a pre-tool hook for a deliberating peer's `remember` call returns a rewrite naming `a2a_send`
+- **THEN** Kuru settles the original call as a failed hook outcome, runs no later pre-tool hook, requests no approval, and dispatches neither tool
+
+#### Scenario: Call outside the offered phase tools
+
+- **WHEN** a deliberating peer proposes a tool that deliberation does not offer
+- **THEN** Kuru settles that call as refused without permission evaluation or dispatch, even when no pre-tool hook is configured
+
+#### Scenario: Rewritten pre-turn input keeps provenance
+
+- **WHEN** a pre-turn hook rewrites the input and the turn settles
+- **THEN** each participating actor's private history retains a `kuru-hook` pre-turn provenance record immediately before the rewritten current input, and the public transcript retains the original input
 
 ### Requirement: Post-event hooks preserve settled work
 
@@ -60,17 +94,38 @@ Kuru SHALL invoke `speaker_selected` only after the active mode policy selects a
 
 ### Requirement: Hook process ownership and non-recursion
 
-Every hook process SHALL use Kuru's owned connector launch boundary with a retained reviewed workspace, finite inherited compatibility environment, bounded pipe draining, and child/tree reaping on success, failure, timeout, cancellation, and caller loss. Lifecycle-hook execution and response handling MUST NOT recursively trigger another lifecycle hook. Documentation and diagnostics MUST describe hook commands as process authority and MUST NOT claim an OS sandbox.
+Every hook process SHALL use Kuru's owned connector launch boundary, with:
+- a retained reviewed workspace
+- a finite inherited compatibility environment
+- bounded pipe draining
+- child and tree reaping on success, failure, timeout, cancellation, and caller loss
+
+Owned hook cleanup MUST signal before reap. It MUST complete, or be reported as unconfirmed, before:
+- the cancelled or completed turn or dream returns
+- tool-host shutdown returns, and therefore before the project writer lease can be released
+
+After the root process exits, stdout and stderr MUST be drained only within the remaining invocation deadline. A pipe still held after that deadline MUST fail the hook closed without using partial output.
+
+Lifecycle-hook execution and response handling MUST NOT recursively trigger another lifecycle hook. When the internal hook-origin marker suppresses configured hooks, Kuru MUST report each suppressed configured hook as a typed `suppressed` outcome at its lifecycle boundary instead of silently skipping it.
+
+On Windows, hook launches MUST remove an inherited `PSModulePath` only when the command explicitly selects stock Windows PowerShell. They MUST NOT receive the ToolHost stock-shell module bootstrap.
+
+Documentation and diagnostics MUST describe hook commands as process authority and MUST NOT claim an OS sandbox.
 
 #### Scenario: Cancellation during a pre hook
 
-- **WHEN** a turn is cancelled while a pre-turn command holds stdout open and has a descendant process
-- **THEN** Kuru terminates and reaps the owned tree, drains bounded output, releases the workspace capability, and performs no provider dispatch
+- **WHEN** a turn is cancelled after a pre-turn command has started and spawned a descendant process
+- **THEN** Kuru terminates and reaps the owned tree, drains bounded output, releases the workspace capability, and performs no provider dispatch before the cancelled operation returns
+
+#### Scenario: Escaped descendant holds stdout
+
+- **WHEN** a hook's root process exits after starting a descendant that leaves the owned process group and keeps stdout open
+- **THEN** the hook fails closed within its deadline and the operation does not wait for the escaped descendant
 
 #### Scenario: Hook starts Kuru internally
 
 - **WHEN** a hook command invokes a Kuru operation that would otherwise cross a configured lifecycle boundary
-- **THEN** the originating hook chain does not recursively invoke its own or another lifecycle hook through hook protocol handling
+- **THEN** the originating hook chain does not recursively invoke its own or another lifecycle hook through hook protocol handling, and the nested operation reports its configured hooks as suppressed
 
 #### Scenario: Dream has only real tool events
 

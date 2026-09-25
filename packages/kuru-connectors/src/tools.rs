@@ -1688,7 +1688,7 @@ impl ToolHost {
         #[cfg(not(unix))]
         let (shell, mcp, hooks) = {
             let (mcp, hooks) = tokio::join!(self.mcp.shutdown(), self.hooks.quiesce());
-            (Ok(()), mcp, hooks)
+            (Ok::<(), anyhow::Error>(()), mcp, hooks)
         };
         let mut failures = [
             shell.err(),
