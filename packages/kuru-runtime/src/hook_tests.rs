@@ -1675,17 +1675,18 @@ async fn denied_pre_tool_hook_reaches_the_model_without_dropping_its_call() {
         .await
         .unwrap();
     assert_eq!(output.text, "final answer");
-    let requests = provider.requests.lock().unwrap();
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.messages.iter().any(|message| {
-                message.role == "tool"
-                    && message.text_projection().contains("denied")
-                    && !message.text_projection().contains("unread content")
-            }))
-    );
-    drop(requests);
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.messages.iter().any(|message| {
+                    message.role == "tool"
+                        && message.text_projection().contains("denied")
+                        && !message.text_projection().contains("unread content")
+                }))
+        );
+    }
     harness.shutdown(false).await.unwrap();
 }
 
