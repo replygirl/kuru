@@ -36,7 +36,7 @@
 ## 6. Final compatibility and quality
 
 - [x] 6.1 @regression (agent) run core, connectors, memory, runtime and TUI all-target typecheck/lint plus docs checks -> final source and published configuration/usage documentation pass owning checks
-- [ ] 6.2 @regression (agent) run combined coverage and native Linux/macOS/Windows memory and PTY groups -> final tree retains the workspace coverage gate and platform lifecycle behavior
+- [x] 6.2 @regression (agent) run combined coverage and native Linux/macOS/Windows memory and PTY groups -> final tree retains the workspace coverage gate and platform lifecycle behavior
 - [x] 6.3 @eval (agent) give a deterministic compaction provider policy-admitted rows plus adversarial sibling-session, legacy, reasoning and instruction sentinels -> the settled rolling summary preserves admitted continuity, contains none of the forbidden sentinels or instruction authority, and later context uses it only through policy selection
 - [x] 6.4 @e2e (agent) repeat the native CLI and PTY multi-peer fixtures that exposed peer errors -> all intended peer calls finish, the stored shell receipt and final answer remain correct, and usage includes every settled invocation under both debug and ordinary presentation
 
@@ -75,3 +75,31 @@ Current-main local preparation, base `9ac13ab25d3dac54f7ff84c872258605b1b34918`:
 Failed combined-coverage attempt on `ae2cd8ea`, 2026-09-25: normal push hooks passed static checks, then combined behavioral coverage failed in eight memory migration fixtures, three runtime context fixtures and one existing cancellation PTY; the public ref did not advance and the 90% gate did not pass. P09 registered schema v6 while those migration fixtures still used v6 as synthetic future/corrupt authority or expected a v5 live/candidate view. The runtime's two Demo retry fixtures expected provider-side late rejection, but the new accurate preflight compacted or omitted optional rows before streaming. A third fixture's 64 required large receipts measured 1,156,229 input tokens against the default 128,000-token window, so pre-dispatch refusal was correct. The shared PTY fake provider marked `started` only for compaction, leaving the ordinary cancellation fixture waiting after its response had already completed. These are distinct observed failures, not a successful coverage result.
 
 Focused correction evidence on the same local source, 2026-09-25: all eight exact formerly failing real-Dolt memory filters passed natively after moving synthetic future attempts to v7, unknown target to v8, forged extra receipts beyond real v6, and current/candidate expectations to v6; the retained-v2 fixture also kept its exact old-candidate content through the synthetic v7 progression. The multilingual and selected-source Demo late-retry filters each passed 1/1 with test-only optimistic preflight and unchanged authoritative in-stream measurement, preserving whole-row retries and one ordinary admission. The 64-receipt filter passed 1/1 with every original large payload exact and all 16 optional notes whole and durable under an explicit valid 1,300,000-token window; `mandatory_overflow_after_one_compaction_refuses_without_ordinary_dispatch` remains the separate observed required-input refusal proof. The ordinary cancellation/draft/next-turn and manual-compaction cancellation real PTYs each passed 1/1 with the shared fake provider's start signal restored. Memory, runtime and TUI owning all-target Clippy, Rust format, strict Cospec validation and apply gate passed; independent source review was clear. The first focused Dolt attempt failed only because the sandbox denied private loopback and was rerun natively. A root format aggregate also hit taplo's macOS system-configuration panic in the sandbox; targeted Rust format passed. Combined coverage, hosted native platforms, archive and publication remain open on the final release-integrated head.
+
+Exact release-base normal push, 2026-09-25: public `delivery/p09-current-main`
+advanced to `be261442` after the ordinary format, lint, typecheck, docs,
+tooling and Cospec hooks passed. Its combined instrumented suite passed the
+90% gate with 74,607/79,480 covered lines (93.87%), including 247 memory,
+188 runtime and 33 terminal integration tests. This supersedes the earlier
+failed local combined attempts for the final source. Hosted exact-head Linux,
+macOS and Windows evidence is recorded below; this paragraph records the
+local hook result only.
+
+Exact-head native acceptance, 2026-09-25: GitHub Actions run `36095993300`
+on `be26144230ac405997b23ea78e5f493b84d61b74` completed successfully.
+Ubuntu native coverage job `107948274562` passed 247 memory and 188 runtime
+tests, including the named manual compaction, stale/candidate and summary/raw
+context cases; its packaged cold offline install/update fixture passed 3/3.
+macOS native coverage job `107948274697` passed the same 247 memory and 188
+runtime targets and packaged offline fixture 3/3. Windows application job
+`107948274568` passed 102 application tests, including local `/compact`
+dispatch and the six native ConPTY tests; Windows memory/runtime job
+`107948274689` passed 187 runtime tests, including the manual compaction,
+accepted-lost-reply, candidate-isolation and summary-retention cases. Windows
+platform, connector, delivery/archive and install/offline jobs passed. The
+Windows coverage report `107956315159` and aggregate native gate
+`107958271319` completed successfully with the required 90% coverage check;
+Ubuntu, macOS and quality aggregate gates passed. These are hosted results on
+the public P09 head, separate from the 93.87% local push result. No paid model
+or live credential request was used. This closes critical row 6.2; archive
+execution remains a separate final gate.

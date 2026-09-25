@@ -35,4 +35,11 @@
 
 - [x] 6.1 Run the real-Dolt isolation, stale/lost-reply, candidate and cancellation fixtures plus deterministic provider threshold/accounting groups, and record exact observed outcomes in `verification.md` without upgrading unrun hosted evidence.
 - [x] 6.2 Run the registered command runtime tests and a real deterministic PTY through manual/automatic compaction notices and cancellation, and record effective model selection if any paid live request is separately authorized.
-- [ ] 6.3 Run core/connectors/memory/runtime/TUI all-target lint/typecheck, strict Cospec validation, docs checks and combined coverage; archive only after every critical ledger row is observed or explicitly deferred with an owner and reason.
+- [x] 6.3 Run core/connectors/memory/runtime/TUI all-target lint/typecheck, strict Cospec validation, docs checks and combined coverage; archive only after every critical ledger row is observed or explicitly deferred with an owner and reason.
+
+The normal push at exact public head `be261442` passed its static hooks and
+combined coverage at 74,607/79,480 lines (93.87%), including 247 memory tests,
+188 runtime tests and 33 terminal integration tests. The exact-head hosted
+run `36095993300` completed successfully on Linux, macOS and Windows,
+including the required Windows coverage aggregate. Its observed native
+evidence is recorded in `verification.md`; archive is a separate command.
