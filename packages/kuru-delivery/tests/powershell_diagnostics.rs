@@ -90,6 +90,89 @@ async fn pwsh_set_content_preserves_long_cargo_json_lines() {
     assert_eq!(parsed, value);
 }
 
+/// Offsets and names of `Verb-Noun` command tokens in PowerShell source.
+fn command_tokens(source: &str) -> Vec<(usize, &str)> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    for (index, character) in source.char_indices().chain([(source.len(), ' ')]) {
+        if character.is_ascii_alphanumeric() || character == '-' {
+            start.get_or_insert(index);
+            continue;
+        }
+        let Some(begin) = start.take() else { continue };
+        let word = &source[begin..index];
+        let command = word.split_once('-').is_some_and(|(verb, noun)| {
+            [verb, noun].iter().all(|part| {
+                part.starts_with(|c: char| c.is_ascii_uppercase())
+                    && part.chars().all(|c| c.is_ascii_alphabetic())
+            })
+        });
+        if command {
+            tokens.push((begin, word));
+        }
+    }
+    tokens
+}
+
+#[test]
+fn stock_installer_imports_pshome_modules_before_any_discovered_command() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("support/install.ps1"),
+    )
+    .unwrap();
+    // The native bridge's C# here-string is not PowerShell command text.
+    let bridge = source.find("Add-Type -TypeDefinition @'\n").unwrap() + "Add-Type".len();
+    let bridge_end = bridge + source[bridge..].find("\n'@\n").unwrap();
+    let script = format!("{}{}", &source[..bridge], &source[bridge_end..]);
+
+    let imports_end = ["Management", "Utility"]
+        .map(|module| {
+            let import = format!(
+                "$null = Microsoft.PowerShell.Core\\Import-Module -Name ([IO.Path]::Combine($PSHOME, 'Modules\\Microsoft.PowerShell.{module}\\Microsoft.PowerShell.{module}.psd1')) -Verbose:$false -ErrorAction Stop\n"
+            );
+            let offset = script
+                .find(&import)
+                .unwrap_or_else(|| panic!("install.ps1 must import exact PSHOME {module}"));
+            offset + import.len()
+        })
+        .into_iter()
+        .max()
+        .unwrap();
+
+    let functions: Vec<&str> = script
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("function "))
+        .filter_map(|rest| rest.split(|c: char| c == '(' || c.is_whitespace()).next())
+        .collect();
+    // Loaded with the engine; never reached through module auto-discovery.
+    let core = ["Import-Module", "Set-StrictMode"];
+    let imported = [
+        "Join-Path",
+        "Add-Type",
+        "ConvertFrom-Json",
+        "ConvertTo-Json",
+        "Write-Output",
+        "Write-Verbose",
+        "Write-Warning",
+    ];
+    let mut discovered = 0;
+    for (offset, command) in command_tokens(&script) {
+        if functions.contains(&command) || core.contains(&command) {
+            continue;
+        }
+        assert!(
+            imported.contains(&command),
+            "install.ps1 uses {command}; import its exact stock PSHOME module before first use"
+        );
+        assert!(
+            offset >= imports_end,
+            "install.ps1 reaches {command} before its exact PSHOME module imports"
+        );
+        discovered += 1;
+    }
+    assert!(discovered > 0, "command inventory found no stock commands");
+}
+
 #[test]
 fn windows_coverage_tasks_launch_pwsh_without_cmd_metacharacters() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

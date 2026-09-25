@@ -62,7 +62,7 @@ $env:PATH = "$env:LOCALAPPDATA\Programs\kuru\bin;$env:PATH"
 kuru --version
 ```
 
-The default destination is `$env:LOCALAPPDATA\Programs\kuru\bin`. Add it to your user `PATH` for future terminals. Installation uses stock PowerShell/.NET facilities and needs no separately installed compiler, Dolt server or MSVC redistributable.
+The default destination is `$env:LOCALAPPDATA\Programs\kuru\bin`. Add it to your user `PATH` for future terminals. Installation uses stock PowerShell/.NET facilities and needs no separately installed compiler, Dolt server or MSVC redistributable. It loads PowerShell's own Management and Utility modules directly from `$PSHOME`, so a fresh Windows profile does not search every installed module before the first stage.
 
 To select a release and destination, download the script first:
 

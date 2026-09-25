@@ -13,6 +13,21 @@ if ($PSBoundParameters.ContainsKey('Verbose') -and [bool]$PSBoundParameters['Ver
 }
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+# Load the two stock modules this script uses from their exact PSHOME manifests
+# before the first command outside Microsoft.PowerShell.Core. A bare first cmdlet
+# would enter module auto-discovery, which analyzes every module on the default
+# path and can stall indefinitely on a fresh profile's cold analysis cache.
+# Other modules keep ordinary autoloading; imports stay off the -Verbose stream.
+$null = Microsoft.PowerShell.Core\Import-Module -Name ([IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1')) -Verbose:$false -ErrorAction Stop
+if ($PSBoundParameters.ContainsKey('Verbose') -and [bool]$PSBoundParameters['Verbose']) {
+    [Console]::Error.WriteLine('Kuru bootstrap direct checkpoint: management module ready')
+    [Console]::Error.Flush()
+}
+$null = Microsoft.PowerShell.Core\Import-Module -Name ([IO.Path]::Combine($PSHOME, 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1')) -Verbose:$false -ErrorAction Stop
+if ($PSBoundParameters.ContainsKey('Verbose') -and [bool]$PSBoundParameters['Verbose']) {
+    [Console]::Error.WriteLine('Kuru bootstrap direct checkpoint: utility module ready')
+    [Console]::Error.Flush()
+}
 Write-Verbose 'Kuru bootstrap phase: entered'
 
 # This is the compiler-free entrypoint. Add-Type uses the compiler shipped with
