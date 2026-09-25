@@ -320,7 +320,7 @@ async fn native_conpty_chat_selectors_resize_focus_and_persistent_choices() -> R
     )?;
     reopened.send(b"reduced draft")?;
     reopened.composer("reduced draft")?;
-    reopened.quiet(
+    reopened.quiet_with_optional_style_reset(
         "reduced-motion console continued drawing",
         Duration::from_millis(450),
     )?;

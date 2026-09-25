@@ -7,8 +7,8 @@
 ## 2. Native secret storage
 
 - [x] 2.1 Add the small `kuru-platform` exact-record get/expected-absence-create/generation-replace/generation-delete interface and typed not-found/stale/denied/unavailable/corrupt outcomes, and verify the platform-neutral contract with an isolated synthetic backend.
-- [ ] 2.2 Implement macOS Keychain Services and Windows Credential Manager records under Kuru's exact service/account namespace, and verify native create/reopen/stale-replace/delete/cleanup plus adjacent foreign-record isolation on their supported CI hosts.
-- [ ] 2.3 Implement Linux Secret Service records with an actionable unavailable path when no usable collection/session exists, and verify native persistence on a supported fixture plus locked/missing-service behavior without a plaintext or session fallback.
+- [x] 2.2 Implement macOS Keychain Services and Windows Credential Manager records under Kuru's exact service/account namespace, and verify native create/reopen/stale-replace/delete/cleanup plus adjacent foreign-record isolation on their supported CI hosts.
+- [x] 2.3 Implement Linux Secret Service records with an actionable unavailable path when no usable collection/session exists, and verify native persistence plus an owned-child missing-service refusal and unaffected static-header route without a plaintext or session fallback. Synthetic denied/locked classification is separate from a real locked OS collection.
 - [x] 2.4 Add connector-owned nonsecret cross-process serialization plus the bounded versioned prepared/committed-cleanup/stable manifest and generation-named chunk credential format with exact binding, generation, complete-length and digest validation, and verify interrupted publication and retired-secret cleanup recovery, login/refresh/logout races, stale publication refusal and cancellation after accepted rotation.
 
 ## 3. OAuth discovery and grants

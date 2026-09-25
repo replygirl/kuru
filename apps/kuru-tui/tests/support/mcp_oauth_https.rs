@@ -42,7 +42,10 @@ impl Drop for HttpsMcpFixture {
 
 impl HttpsMcpFixture {
     pub(crate) async fn start(root: &Path) -> Self {
-        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
+            ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+        };
         use tokio_rustls::rustls::{
             ServerConfig,
             pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
@@ -50,8 +53,19 @@ impl HttpsMcpFixture {
 
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.distinguished_name = DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "Kuru synthetic MCP test CA");
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         let issuer = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
-        let leaf_params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        let mut leaf_params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        leaf_params.distinguished_name = DistinguishedName::new();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let leaf_key = KeyPair::generate().unwrap();
         let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
         let ca_path = root.join("synthetic-mcp-ca.pem");

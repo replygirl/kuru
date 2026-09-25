@@ -3876,6 +3876,13 @@ mod tests {
         view.key(key(KeyCode::Char('b')));
         assert!(!view.advance_animation(Duration::from_secs(9)));
         assert_eq!(view.frame, still);
+        let mut reduced_ticks = fixture();
+        reduced_ticks.motion = false;
+        let reduced_frame = reduced_ticks.frame;
+        for elapsed_ms in [0, 80, 160, 250, 450, 1_000] {
+            assert!(!reduced_ticks.advance_animation(Duration::from_millis(elapsed_ms)));
+            assert_eq!(reduced_ticks.frame, reduced_frame);
+        }
         // Accessibility pauses ornament; the actual elapsed operation clock remains useful.
         view.begin_operation();
         assert!(view.advance_animation(Duration::from_secs(10)));
