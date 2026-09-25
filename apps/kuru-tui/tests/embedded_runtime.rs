@@ -125,7 +125,7 @@ async fn prepare_bounded_packaging_input(root: &Path, source: &Path) -> Result<P
     #[cfg(target_os = "macos")]
     let mut strip = Command::new("/usr/bin/strip");
     #[cfg(target_os = "macos")]
-    strip.args(["-u", "-r"]).arg(&staged);
+    strip.args(["-x", "-S"]).arg(&staged);
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut strip = Command::new("strip");
     #[cfg(all(unix, not(target_os = "macos")))]
