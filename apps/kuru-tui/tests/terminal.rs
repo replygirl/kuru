@@ -1637,17 +1637,10 @@ struct ProviderState {
     release: watch::Receiver<bool>,
 }
 
-async fn complete(State(mut state): State<ProviderState>, Json(request): Json<Value>) -> Response {
+async fn complete(State(mut state): State<ProviderState>, Json(_): Json<Value>) -> Response {
     state.requests.fetch_add(1, Ordering::SeqCst);
-    let compact = request["instructions"]
-        .as_str()
-        .is_some_and(|instructions| {
-            instructions.starts_with("Replace the prior rolling context summary")
-        });
-    let delayed = compact && !*state.release.borrow();
-    if compact {
-        state.started.store(true, Ordering::SeqCst);
-    }
+    let delayed = !*state.release.borrow();
+    state.started.store(true, Ordering::SeqCst);
     if delayed {
         tokio::time::timeout(
             Duration::from_secs(15),

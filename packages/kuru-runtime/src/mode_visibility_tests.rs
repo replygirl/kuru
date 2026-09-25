@@ -99,6 +99,7 @@ struct MeasuredRequest {
 #[derive(Default)]
 struct RecordingDemo {
     requests: Mutex<Vec<MeasuredRequest>>,
+    optimistic_preflight: bool,
 }
 
 struct MeasurementSink<'a> {
@@ -124,6 +125,21 @@ impl ProviderSink for MeasurementSink<'_> {
 impl Provider for RecordingDemo {
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         DemoProvider.models().await
+    }
+
+    async fn estimate_context(&self, request: &CompletionRequest) -> Result<ContextEstimate> {
+        if self.optimistic_preflight {
+            // The bounded-window fixture checks a late provider rejection:
+            // its actual Demo stream measures the full selected request.
+            Ok(ContextEstimate::for_final_body(
+                request.context_budget.clone().unwrap(),
+                100,
+                false,
+                vec![],
+            ))
+        } else {
+            DemoProvider.estimate_context(request).await
+        }
     }
 
     async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
@@ -169,7 +185,10 @@ async fn observe_selection(
     visibility.omit_notes = omit_notes;
     visibility.omit_history = omit_history;
     profile.visibility = Arc::new(visibility);
-    let provider = Arc::new(RecordingDemo::default());
+    let provider = Arc::new(RecordingDemo {
+        optimistic_preflight: window.is_some(),
+        ..RecordingDemo::default()
+    });
     let mut settings = config();
     settings.assumed_context_window_tokens = window;
     if window.is_some() {

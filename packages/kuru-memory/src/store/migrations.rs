@@ -2150,9 +2150,9 @@ mod tests {
         assert_eq!(digest(definition).len(), 64);
         let name = attempt_name(2, Uuid::nil());
         assert_eq!(parse_attempt(&name).unwrap(), (2, Uuid::nil()));
-        let future = attempt_name(6, Uuid::nil());
-        assert_eq!(parse_attempt(&future).unwrap(), (6, Uuid::nil()));
-        assert!(REGISTRY.definition(6).is_err());
+        let future = attempt_name(7, Uuid::nil());
+        assert_eq!(parse_attempt(&future).unwrap(), (7, Uuid::nil()));
+        assert!(REGISTRY.definition(7).is_err());
         for invalid in [
             "kuru_migration_v2_bad",
             "kuru_migration_v0000000002_NOT-A-UUID",
@@ -2301,8 +2301,8 @@ mod tests {
                 }
                 Corruption::ExtraReceipt => {
                     bounded_query(
-                        sqlx::query("INSERT INTO kuru_migrations VALUES (6, ?, ?, ?)")
-                            .bind("fixture.extra.v6")
+                        sqlx::query("INSERT INTO kuru_migrations VALUES (7, ?, ?, ?)")
+                            .bind("fixture.extra.v7")
                             .bind("0".repeat(64))
                             .bind(Uuid::new_v4().hyphenated().to_string())
                             .execute(store.pool.as_ref()),
@@ -2381,7 +2381,7 @@ mod tests {
             let mut attempts = Vec::new();
             for _ in 0..count {
                 let operation = Uuid::new_v4();
-                let name = attempt_name(6, operation);
+                let name = attempt_name(7, operation);
                 bounded_query(
                     sqlx::query("CALL DOLT_BRANCH(?, ?)")
                         .bind(&name)
@@ -2399,7 +2399,7 @@ mod tests {
                         let built = build_attempt(
                             TEST_REGISTRY,
                             &attempt,
-                            &V6,
+                            &V7,
                             *operation,
                             &MigrationRunnerHooks::none(),
                         )
@@ -2414,7 +2414,7 @@ mod tests {
                     let built = build_attempt(
                         TEST_REGISTRY,
                         &attempt,
-                        &V6,
+                        &V7,
                         mismatched,
                         &MigrationRunnerHooks::none(),
                     )
@@ -2507,13 +2507,13 @@ mod tests {
         commit_fixture(&main, "Create branch-free schema v2 capacity fixture").await?;
         validate_version_with(TEST_REGISTRY, &main, 2).await?;
         upgrade_with(REGISTRY, &server, &main, &MigrationRunnerHooks::none()).await?;
-        validate_version_with(TEST_REGISTRY, &main, 5).await?;
+        validate_version_with(TEST_REGISTRY, &main, 6).await?;
 
         let base = revision(&main).await?;
         let mut names = Vec::with_capacity(INVENTORY_LIMIT);
         let existing = reserved_names(&main).await?.len();
         for _ in existing..INVENTORY_LIMIT {
-            let name = attempt_name(6, Uuid::new_v4());
+            let name = attempt_name(7, Uuid::new_v4());
             bounded_query(
                 sqlx::query("CALL DOLT_BRANCH(?, ?)")
                     .bind(&name)
@@ -2522,7 +2522,7 @@ mod tests {
             )
             .await?;
             let attempt = server.pool(&name).await?;
-            let prepared = bounded_query(sqlx::query(V6.sql[0]).execute(attempt.as_ref())).await;
+            let prepared = bounded_query(sqlx::query(V7.sql[0]).execute(attempt.as_ref())).await;
             after_cleanup(prepared.map(|_| ()), close_branch_pool(&attempt).await)?;
             names.push(name);
         }
@@ -2565,7 +2565,7 @@ mod tests {
             let names = match invalid {
                 InvalidInventory::Malformed => vec!["kuru_migration_bad".to_owned()],
                 InvalidInventory::UnknownTarget => {
-                    vec![attempt_name(7, Uuid::new_v4())]
+                    vec![attempt_name(8, Uuid::new_v4())]
                 }
                 InvalidInventory::Excess => {
                     let existing = reserved_names(&store.pool).await?.len();
@@ -2850,7 +2850,10 @@ mod tests {
             &store.shared.server,
             &store.pool,
             &before,
-            "schema version 5, expected 4",
+            &format!(
+                "schema version {CURRENT_VERSION}, expected {}",
+                CURRENT_VERSION - 1
+            ),
         )
         .await?;
         let completed = store.shared.server.pool(&completed_name).await?;
@@ -3012,7 +3015,7 @@ mod tests {
         assert_eq!(old_view.revision().await?, candidate_head);
         assert_eq!(
             validate_supported_with(TEST_REGISTRY, &old_view.pool).await?,
-            5
+            6
         );
         assert_eq!(
             old_view.history("candidate", 10).await?[0].plain_text(),
@@ -3027,11 +3030,11 @@ mod tests {
             )
             .await
             .is_err(),
-            "pre-v6 candidate unexpectedly fast-forwarded into v6 main"
+            "pre-v7 candidate unexpectedly fast-forwarded into v7 main"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before_stale_merge);
 
-        // Model a future v6 writer through its test registry and SQL view.
+        // Model a future v7 writer through its test registry and SQL view.
         // Released-v5 reopen refusal is checked in the separate old-registry fixture.
         let fresh_name = format!("candidate_{}", Uuid::new_v4().simple());
         let fresh_base = revision(&store.pool).await?;
@@ -3167,7 +3170,7 @@ mod tests {
         assert_eq!(revision(&old_candidate).await?, candidate_head);
         assert_eq!(
             validate_supported_with(TEST_REGISTRY, &old_candidate).await?,
-            5
+            6
         );
         let old_content: String = bounded_query(
             sqlx::query_scalar("SELECT content FROM messages WHERE namespace = ?")
@@ -3175,7 +3178,7 @@ mod tests {
                 .fetch_one(old_candidate.as_ref()),
         )
         .await?;
-        assert_eq!(old_content, "kept on schema v5");
+        assert_eq!(old_content, "kept on schema v6");
         old_candidate.close().await;
         drop(old_candidate);
         main.close().await;

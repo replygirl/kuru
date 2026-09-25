@@ -6301,7 +6301,7 @@ mod tests {
 
         let store = MemoryStore::temporary().await?;
         sqlx::query(
-            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (6, 'forged', ?, ?)",
+            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (7, 'forged', ?, ?)",
         )
         .bind("0".repeat(64))
         .bind(Uuid::new_v4().hyphenated().to_string())

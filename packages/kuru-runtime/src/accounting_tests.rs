@@ -3059,6 +3059,18 @@ impl Provider for RecordingDemo {
         DemoProvider.models().await
     }
 
+    async fn estimate_context(&self, request: &CompletionRequest) -> Result<ContextEstimate> {
+        // Exercise a connector whose preflight estimate is optimistic. The
+        // actual Demo stream still measures and rejects each oversized whole
+        // request, so the runtime must retry under one ordinary admission.
+        Ok(ContextEstimate::for_final_body(
+            request.context_budget.clone().unwrap(),
+            100,
+            false,
+            vec![],
+        ))
+    }
+
     async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
         let mut measured = None;
         let result = DemoProvider
