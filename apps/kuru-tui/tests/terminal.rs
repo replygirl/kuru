@@ -839,15 +839,39 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
         "the cleared turn was absent from follow-up provider context"
     );
     drop(captured);
+
+    let before_lifecycle = requests.lock().unwrap().len();
+    terminal.command("/sessions", Some("Sessions"))?;
+    terminal.send(b"\x06")?;
+    terminal.wait_text(&["Settled boundaries", "Enter fork"], &[])?;
+    terminal.resize(22, 65)?;
+    terminal.wait_text(&["Settled boundaries", "Enter fork"], &[])?;
+    terminal.send(b"\r")?;
+    terminal.wait_composer_frame(
+        &["current project memory remains shared", "enter send"],
+        READY_TIMEOUT,
+    )?;
+    ensure!(
+        requests.lock().unwrap().len() == before_lifecycle,
+        "session picker fork made a provider request"
+    );
     terminal.send(b"/quit\r")?;
     terminal.wait_exit(EXIT_TIMEOUT)?;
     terminal.assert_restored()?;
+
+    let forked = sandbox.sessions()?;
+    let child = forked
+        .iter()
+        .find(|candidate| candidate.id != *session)
+        .map(|candidate| candidate.id.clone())
+        .context("session picker did not publish a fork")?;
 
     let mut resume = sandbox.command("responses");
     resume
         .args(["--model", "fixture", "--config"])
         .arg(&config)
-        .args(["--resume", session])
+        .arg("--resume")
+        .arg(&child)
         .env("KURU_FIXTURE_KEY", "fixture")
         .env("KURU_REDUCED_MOTION", "1");
     let mut resumed = Terminal::spawn(resume, 48, 120)?;
@@ -858,6 +882,356 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
     resumed.send(b"/quit\r")?;
     resumed.wait_exit(EXIT_TIMEOUT)?;
     resumed.assert_restored()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_and_pty_session_actions_share_catalog_identity_and_public_transcript() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let created = sandbox
+        .command("demo")
+        .args(["run", "CLI-PARITY-ORIGIN", "--json"])
+        .output()?;
+    ensure!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: Value = serde_json::from_slice(&created.stdout)?;
+    let source = created["session"]
+        .as_str()
+        .context("CLI source session missing")?
+        .to_owned();
+    let renamed = sandbox
+        .command("demo")
+        .args(["sessions", "rename", &source, "CLI-LABEL"])
+        .output()?;
+    ensure!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    let renamed: Value = serde_json::from_slice(&renamed.stdout)?;
+    ensure!(renamed["session_id"] == source);
+    let listed = sandbox.command("demo").arg("sessions").output()?;
+    ensure!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout)?;
+    let source_record = listed
+        .as_array()
+        .context("CLI sessions is not an array")?
+        .iter()
+        .find(|row| row["id"] == source)
+        .context("renamed CLI source is absent")?;
+    let source_node = source_record["head_node_id"]
+        .as_str()
+        .context("CLI source head missing")?
+        .to_owned();
+    let cli_action = |args: &[&str]| -> Result<Value> {
+        let output = sandbox.command("demo").args(args).output()?;
+        ensure!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let cli_removed = cli_action(&[
+        "sessions",
+        "fork",
+        &source,
+        &source_node,
+        "--label",
+        "CLI-REMOVED",
+    ])?;
+    let cli_removed = cli_removed["session_id"]
+        .as_str()
+        .context("CLI removed child ID missing")?
+        .to_owned();
+    ensure!(cli_action(&["sessions", "remove", &cli_removed])?["lifecycle_state"] == "removed");
+    let cli_pending = cli_action(&[
+        "sessions",
+        "fork",
+        &source,
+        &source_node,
+        "--label",
+        "CLI-PENDING",
+    ])?;
+    let cli_pending = cli_pending["session_id"]
+        .as_str()
+        .context("CLI pending child ID missing")?
+        .to_owned();
+    ensure!(cli_action(&["sessions", "remove", &cli_pending])?["lifecycle_state"] == "removed");
+    ensure!(cli_action(&["sessions", "restore", &cli_pending])?["lifecycle_state"] == "active");
+    let (_, opening) = MemoryStore::open_managed_observed(
+        memory_options(&sandbox)?,
+        sandbox.project.canonicalize()?,
+        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+    );
+    let memory = opening.await.context("attach managed CLI catalog")?;
+    let generation = memory
+        .session_catalog_record(&cli_pending)
+        .await?
+        .context("restored CLI child catalog missing")?
+        .lifecycle_generation;
+    let namespace = format!(
+        "{}/transcript/{cli_pending}",
+        kuru_runtime::project_scope(&sandbox.project)?
+    );
+    memory
+        .checkpoint_session_turn(
+            &namespace,
+            &cli_pending,
+            &[kuru_core::Message::text("user", "CLI-PENDING-TURN")],
+            &[],
+            &kuru_memory::SessionTurnCheckpoint::Admit {
+                expected_generation: generation,
+                turn_id: "cli-pending-turn".into(),
+                label: None,
+                expected_transcript_rows: Some(0),
+            },
+        )
+        .await?;
+    memory.close().await?;
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&requests);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route(
+            "/v1/responses",
+            post(move |Json(_request): Json<Value>| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    priced_complete(Json(json!({}))).await
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("parity-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap()
+    }));
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config)
+        .arg("--resume")
+        .arg(&source)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 48, 120)?;
+    terminal.wait_composer_frame(
+        &["CLI-PARITY-ORIGIN", "enter send"],
+        sandbox.startup_timeout,
+    )?;
+    terminal.command("/help", None)?;
+    terminal.wait_composer_frame(
+        &[
+            "/file-undo",
+            "/memory-candidate-abandon",
+            "/sessions",
+            "enter send",
+        ],
+        READY_TIMEOUT,
+    )?;
+    // The shared registry has grown beyond one 48-row viewport. Page the real
+    // transcript instead of requiring its top and bottom entries at once.
+    terminal.send(b"\x1b[5~")?;
+    terminal.wait_composer_frame(&["/new", "/resume", "/export"], READY_TIMEOUT)?;
+    terminal.send(b"\x1b[6~")?;
+    terminal.wait_composer_frame(&["/tools", "enter send"], READY_TIMEOUT)?;
+    for (command, result) in [
+        ("/file-checkpoints", "[]"),
+        ("/file-inspect missing-id", "file checkpoint does not exist"),
+        ("/file-prune missing-id", "file checkpoint does not exist"),
+        ("/file-undo missing-id", "file checkpoint does not exist"),
+        ("/memory-candidates", "\"candidates\": []"),
+        (
+            "/memory-candidate-status",
+            "usage: /memory-candidate-status BRANCH",
+        ),
+        (
+            "/memory-candidate-abandon",
+            "usage: /memory-candidate-abandon BRANCH BASE HEAD",
+        ),
+    ] {
+        terminal.command(command, None)?;
+        terminal.wait_composer_frame(&[result, "enter send"], READY_TIMEOUT)?;
+        ensure!(
+            !terminal.screen().contains("Unknown command"),
+            "registered recovery command was not dispatched: {command}"
+        );
+    }
+    ensure!(
+        requests.load(Ordering::SeqCst) == 0,
+        "registered recovery command reached the lifecycle provider"
+    );
+    terminal.command("/sessions", Some("Sessions"))?;
+    terminal.wait_text(
+        &[
+            "CLI-LABEL",
+            "CLI-REMOVED",
+            "CLI-PENDING",
+            "removed",
+            "pending",
+        ],
+        &[],
+    )?;
+    let picker = terminal.screen();
+    let picker_lines = picker.lines().collect::<Vec<_>>();
+    ensure!(
+        picker_lines.iter().any(|line| {
+            line.contains(&cli_removed) && line.contains("CLI-REMOVED") && line.contains("removed")
+        }),
+        "CLI removed child was not distinct in the PTY picker: {picker}"
+    );
+    ensure!(
+        picker_lines.iter().any(|line| {
+            line.contains(&cli_pending) && line.contains("CLI-PENDING") && line.contains("pending")
+        }),
+        "CLI restored pending child was not distinct in the PTY picker: {picker}"
+    );
+    let active_order = sandbox.sessions()?;
+    for pair in active_order.windows(2) {
+        let left = picker_lines
+            .iter()
+            .position(|line| line.contains(&pair[0].id))
+            .context("CLI active session absent from picker")?;
+        let right = picker_lines
+            .iter()
+            .position(|line| line.contains(&pair[1].id))
+            .context("CLI active session absent from picker")?;
+        ensure!(
+            left < right,
+            "CLI and PTY active catalog order differs: {picker}"
+        );
+    }
+    terminal.resize(48, 80)?;
+    // A picker intentionally hides the composer cursor, so inspect its
+    // completed visible row after the narrower redraw.
+    terminal.wait_text(&["Sessions", "CLI-PENDING", "pending"], &[])?;
+    let narrow_picker = terminal.screen();
+    ensure!(
+        narrow_picker.lines().any(|line| {
+            line.contains(&cli_pending) && line.contains("pending") && line.contains("CLI-PENDING")
+        }),
+        "80-column session picker hid pending identity or state: {narrow_picker}"
+    );
+    terminal.resize(48, 120)?;
+    terminal.wait_text(&["Sessions", "CLI-PENDING"], &[])?;
+    terminal.send(b"\x0c")?;
+    terminal.wait_composer_frame(&["/session-rename", &source, "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"TUI-LABEL\r")?;
+    terminal.wait_text(&["TUI-LABEL", "Sessions"], &[])?;
+    ensure!(
+        sandbox
+            .sessions()?
+            .iter()
+            .any(|row| row.id == source && row.label == "TUI-LABEL"),
+        "CLI listing did not observe PTY rename"
+    );
+
+    terminal.send(b"\x1b")?;
+    terminal.command("/new", None)?;
+    terminal.wait_composer_frame(&["Created session", "enter send"], READY_TIMEOUT)?;
+    let active = sandbox.sessions()?;
+    ensure!(active.len() == 3, "{active:?}");
+    let new_session = active
+        .iter()
+        .find(|row| row.id != source && row.id != cli_pending)
+        .context("PTY new session missing from CLI")?;
+    ensure!(
+        new_session.turns == 0,
+        "new session inherited transcript rows"
+    );
+    terminal.resize(24, 65)?;
+    terminal.command("/sessions", Some("Sessions"))?;
+    let source_prefix = &source[..8];
+    terminal.send(source_prefix.as_bytes())?;
+    terminal.wait_text(&["Sessions", &format!("/ {source_prefix}")], &[])?;
+    terminal.send(b"\x1b[3~")?;
+    terminal.wait_text(&["Sessions", "Type to filter"], &[])?;
+    ensure!(
+        sandbox.sessions()?.iter().all(|row| row.id != source),
+        "CLI still listed PTY-removed source"
+    );
+    terminal.send(source_prefix.as_bytes())?;
+    terminal.wait_text(&["Sessions", &format!("/ {source_prefix}")], &[])?;
+    terminal.send(b"\r")?;
+    terminal.wait_composer_frame(&["Session is removed", "enter send"], READY_TIMEOUT)?;
+    terminal.command("/sessions", Some("Sessions"))?;
+    terminal.send(source_prefix.as_bytes())?;
+    terminal.wait_text(&["Sessions", &format!("/ {source_prefix}")], &[])?;
+    terminal.send(b"\x12")?;
+    terminal.wait_text(&["Sessions", "Type to filter"], &[])?;
+    ensure!(
+        sandbox
+            .sessions()?
+            .iter()
+            .any(|row| row.id == source && row.label == "TUI-LABEL"),
+        "CLI did not observe PTY restore"
+    );
+    terminal.send(source_prefix.as_bytes())?;
+    terminal.wait_text(&["Sessions", &format!("/ {source_prefix}")], &[])?;
+    terminal.send(b"\x06")?;
+    terminal.wait_text(&["Settled boundaries"], &[])?;
+    terminal.send(b"\r")?;
+    terminal.wait_composer_frame(
+        &[
+            "current project memory remains shared",
+            "CLI-PARITY-ORIGIN",
+            "enter send",
+        ],
+        READY_TIMEOUT,
+    )?;
+    ensure!(requests.load(Ordering::SeqCst) == 0);
+    let listed = sandbox.command("demo").arg("sessions").output()?;
+    ensure!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout)?;
+    let child = listed
+        .as_array()
+        .context("CLI session listing is not an array")?
+        .iter()
+        .find(|row| {
+            row["id"] != cli_pending && row["fork_provenance"]["source_session_id"] == source
+        })
+        .context("PTY fork missing from CLI catalog")?;
+    ensure!(child["fork_provenance"]["source_node_id"] == source_node);
+    let child_id = child["id"]
+        .as_str()
+        .context("PTY child ID missing")?
+        .to_owned();
+    let export = sandbox.project.join("pty-session-export.md");
+    terminal.command("/export pty-session-export.md", None)?;
+    terminal.wait_composer_frame(&["Exported public session", "enter send"], READY_TIMEOUT)?;
+    let exported = std::fs::read_to_string(&export)?;
+    ensure!(exported.contains("CLI-PARITY-ORIGIN"));
+    terminal.command(&format!("/resume {source}"), None)?;
+    terminal.wait_composer_frame(&["CLI-PARITY-ORIGIN", "enter send"], READY_TIMEOUT)?;
+    ensure!(requests.load(Ordering::SeqCst) == 0);
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()?;
+    ensure!(sandbox.sessions()?.iter().any(|row| row.id == child_id));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2713,6 +3087,161 @@ async fn real_pty_permission_choices_show_exact_file_scope_and_revoke_grants() -
         terminal.assert_restored()?;
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_resume_continue_and_fork_processes_reset_session_only_file_authority() -> Result<()>
+{
+    let sandbox = Sandbox::new()?;
+    let marker = sandbox.project.join("literal[1].txt");
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(permission_complete))
+        .with_state(PermissionProvider {
+            tool: "file_write".into(),
+            arguments: json!({"path":"literal[1].txt","content":"approved"}).to_string(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("session-permission-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=3\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap()
+    }));
+    let spawn = |selector: Option<(&str, &str)>| -> Result<Terminal> {
+        let mut command = sandbox.command("responses");
+        command
+            .args(["--model", "fixture", "--mode", "freudian", "--config"])
+            .arg(&config)
+            .env("KURU_FIXTURE_KEY", "fixture")
+            .env("KURU_REDUCED_MOTION", "1");
+        if let Some((flag, id)) = selector {
+            command.arg(flag);
+            if !id.is_empty() {
+                command.arg(id);
+            }
+        }
+        Terminal::spawn(command, 48, 120)
+    };
+
+    let mut first = spawn(None)?;
+    first.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    first.send(b"PERMISSION-ORIGINAL-TURN\r")?;
+    first.wait_composer_frame(
+        &["Permission request", "literal[1].txt", "esc cancel"],
+        READY_TIMEOUT,
+    )?;
+    ensure!(!marker.exists(), "initial file write preceded approval");
+    first.send(b"2")?;
+    first.wait_composer_frame(&["PERMISSION_FINAL", "enter send"], READY_TIMEOUT)?;
+    ensure_eq_marker(&marker, true)?;
+    first.send(b"/permissions\r")?;
+    first.wait_text(&["Selected exact scope", "literal[1].txt"], &[])?;
+    first.send(b"\x1b")?;
+    first.wait_composer_frame(&["enter send"], READY_TIMEOUT)?;
+    first.send(b"/quit\r")?;
+    first.wait_exit(EXIT_TIMEOUT)?;
+    first.assert_restored()?;
+
+    let listed = sandbox.command("demo").arg("sessions").output()?;
+    ensure!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout)?;
+    let source = listed[0]["id"]
+        .as_str()
+        .context("source session missing")?
+        .to_owned();
+    let source_node = listed[0]["head_node_id"]
+        .as_str()
+        .context("settled source node missing")?
+        .to_owned();
+    std::fs::remove_file(&marker)?;
+
+    for (selector, label) in [
+        (Some(("--resume", source.as_str())), "resume"),
+        (Some(("--continue", "")), "continue"),
+    ] {
+        let mut terminal = spawn(selector)?;
+        terminal.wait_composer_frame(
+            &["PERMISSION-ORIGINAL-TURN", "enter send"],
+            sandbox.startup_timeout,
+        )?;
+        terminal.send(b"/permissions\r")?;
+        terminal.wait_text(&["No session or always grants"], &[])?;
+        terminal.send(b"\x1b")?;
+        terminal.wait_composer_frame(&["enter send"], READY_TIMEOUT)?;
+        terminal.send(format!("PERMISSION-{label}-TURN\r").as_bytes())?;
+        terminal.wait_composer_frame(
+            &["Permission request", "literal[1].txt", "esc cancel"],
+            READY_TIMEOUT,
+        )?;
+        ensure!(
+            !marker.exists(),
+            "{label} reused the previous process grant"
+        );
+        terminal.send(b"4")?;
+        terminal.wait_composer_frame(&["PERMISSION_FINAL", "enter send"], READY_TIMEOUT)?;
+        ensure!(!marker.exists(), "{label} denied file write still ran");
+        terminal.send(b"/quit\r")?;
+        terminal.wait_exit(EXIT_TIMEOUT)?;
+        terminal.assert_restored()?;
+    }
+
+    let forked = sandbox
+        .command("demo")
+        .args([
+            "sessions",
+            "fork",
+            &source,
+            &source_node,
+            "--label",
+            "permission child",
+        ])
+        .output()?;
+    ensure!(
+        forked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forked.stderr)
+    );
+    let forked: Value = serde_json::from_slice(&forked.stdout)?;
+    let child = forked["session_id"]
+        .as_str()
+        .context("forked child missing")?;
+    let mut terminal = spawn(Some(("--resume", child)))?;
+    terminal.wait_composer_frame(
+        &["PERMISSION-ORIGINAL-TURN", "enter send"],
+        sandbox.startup_timeout,
+    )?;
+    terminal.send(b"/permissions\r")?;
+    terminal.wait_text(&["No session or always grants"], &[])?;
+    terminal.send(b"\x1b")?;
+    terminal.wait_composer_frame(&["enter send"], READY_TIMEOUT)?;
+    terminal.send(b"PERMISSION-FORK-TURN\r")?;
+    terminal.wait_composer_frame(
+        &["Permission request", "literal[1].txt", "esc cancel"],
+        READY_TIMEOUT,
+    )?;
+    ensure!(
+        !marker.exists(),
+        "fork inherited the previous process grant"
+    );
+    terminal.send(b"4")?;
+    terminal.wait_composer_frame(&["PERMISSION_FINAL", "enter send"], READY_TIMEOUT)?;
+    ensure!(!marker.exists(), "fork denied file write still ran");
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
 }
 
 #[derive(Clone)]

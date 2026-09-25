@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
-    io::{BufWriter, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::cli::ExportFormat;
 
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 const STAGED_PAYLOAD: &str = "export.json";
 
 pub async fn export(
@@ -45,6 +45,8 @@ pub async fn export(
         counts.state,
         counts.context_summaries,
         counts.context_cursors,
+        counts.session_catalog,
+        counts.public_turns,
     )?;
     staged.complete()?;
     match target {
@@ -53,13 +55,22 @@ pub async fn export(
     }
 }
 
-struct OutputTarget {
+pub(crate) struct OutputTarget {
     directory: Directory,
     name: OsString,
+    expected: Option<File>,
 }
 
 impl OutputTarget {
-    fn open(output: &Path, cwd: &Path) -> Result<Self> {
+    pub(crate) fn open(output: &Path, cwd: &Path) -> Result<Self> {
+        Self::open_with_replacement(output, cwd, false)
+    }
+
+    pub(crate) fn open_replace(output: &Path, cwd: &Path) -> Result<Self> {
+        Self::open_with_replacement(output, cwd, true)
+    }
+
+    fn open_with_replacement(output: &Path, cwd: &Path, replace: bool) -> Result<Self> {
         let output = if output.is_absolute() {
             output.to_path_buf()
         } else {
@@ -76,11 +87,46 @@ impl OutputTarget {
             .file_name()
             .context("export output has no file name")?;
         ensure!(name != OsStr::new("."), "export output must name a file");
+        let directory = Directory::open(&parent, Privacy::Inherited, NameRetention::Pinned)
+            .context("open export output directory")?;
+        let expected = if replace {
+            // Windows replacement requires a delete-sharing handle, while the
+            // pinned parent still protects the selected directory identity.
+            let movable = Directory::open(&parent, Privacy::Inherited, NameRetention::Movable)
+                .context("open movable export output directory")?;
+            ensure!(
+                movable.identity() == directory.identity(),
+                "export output directory changed while it was selected"
+            );
+            match movable.read(name) {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).context("inspect selected export destination"),
+            }
+        } else {
+            None
+        };
         Ok(Self {
-            directory: Directory::open(&parent, Privacy::Inherited, NameRetention::Pinned)
-                .context("open export output directory")?,
+            directory,
             name: name.to_owned(),
+            expected,
         })
+    }
+
+    pub(crate) fn directory(&self) -> &Directory {
+        &self.directory
+    }
+
+    fn publication(&self) -> Result<Publication> {
+        match &self.expected {
+            Some(expected) => {
+                self.directory
+                    .verify(&self.name, expected)
+                    .context("selected export destination changed before publication")?;
+                Ok(Publication::ReplaceRegular)
+            }
+            None => Ok(Publication::New),
+        }
     }
 }
 
@@ -90,6 +136,8 @@ struct Counts {
     state: u64,
     context_summaries: u64,
     context_cursors: u64,
+    session_catalog: u64,
+    public_turns: u64,
 }
 
 async fn render(
@@ -122,6 +170,8 @@ async fn render(
                 StorageRecord::State { .. } => counts.state += 1,
                 StorageRecord::ContextSummary { .. } => counts.context_summaries += 1,
                 StorageRecord::ContextCursor { .. } => counts.context_cursors += 1,
+                StorageRecord::SessionCatalog { .. } => counts.session_catalog += 1,
+                StorageRecord::PublicTurn { .. } => counts.public_turns += 1,
             }
             // JSON strings escape line breaks and fence-looking content, so a stored
             // record cannot terminate this Markdown record fence.
@@ -187,7 +237,9 @@ fn render_markdown_record(writer: &mut impl Write, record: &StorageRecord) -> Re
         }
         StorageRecord::State { .. }
         | StorageRecord::ContextSummary { .. }
-        | StorageRecord::ContextCursor { .. } => {
+        | StorageRecord::ContextCursor { .. }
+        | StorageRecord::SessionCatalog { .. }
+        | StorageRecord::PublicTurn { .. } => {
             writeln!(writer, "\n```json")?;
             serde_json::to_writer(&mut *writer, record)?;
             writeln!(writer, "\n```")?;
@@ -205,15 +257,17 @@ fn manifest(provenance: &ExportProvenance) -> serde_json::Value {
     })
 }
 
-struct StagedExport {
+pub(crate) struct StagedExport {
     // Field order closes the payload and checked directory before Drop removes it.
     file: Option<File>,
     directory: Option<Directory>,
     temp: PrivateStage,
+    auxiliaries: Vec<(OsString, File)>,
+    retain_on_drop: bool,
 }
 
 impl StagedExport {
-    fn new(parent: &Directory) -> Result<Self> {
+    pub(crate) fn new(parent: &Directory) -> Result<Self> {
         let (temp, directory) = PrivateStage::new(parent)?;
         let file = directory
             .create_new(OsStr::new(STAGED_PAYLOAD))
@@ -222,20 +276,69 @@ impl StagedExport {
             file: Some(file),
             directory: Some(directory),
             temp,
+            auxiliaries: Vec::new(),
+            retain_on_drop: false,
         })
     }
 
-    fn file_mut(&mut self) -> &mut File {
+    pub(crate) fn file_mut(&mut self) -> &mut File {
         self.file.as_mut().expect("open export staging payload")
     }
 
-    fn complete(&mut self) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn stage_path(&self) -> &Path {
+        self.temp
+            .path
+            .as_deref()
+            .expect("private export stage path")
+    }
+
+    pub(crate) fn create_auxiliary(&mut self, name: &OsStr) -> Result<File> {
+        let file = self
+            .directory
+            .as_ref()
+            .expect("open export staging directory")
+            .create_new(name)
+            .context("create private export auxiliary file")?;
+        let retained = file
+            .try_clone()
+            .context("retain owned export auxiliary identity")?;
+        self.auxiliaries.push((name.to_os_string(), retained));
+        Ok(file)
+    }
+
+    pub(crate) fn remove_auxiliary(&mut self, name: &OsStr) -> Result<()> {
+        let index = self
+            .auxiliaries
+            .iter()
+            .position(|(retained, _)| retained == name)
+            .context("export auxiliary identity was not retained")?;
+        let (name, file) = self.auxiliaries.remove(index);
+        let removed = self
+            .directory
+            .as_ref()
+            .expect("open export staging directory")
+            .remove_file(&name, file)
+            .map_err(anyhow::Error::from)
+            .context("remove checked export auxiliary file");
+        if let Err(error) = removed {
+            self.retain_on_drop = true;
+            let retained = self.temp.keep();
+            return Err(error.context(format!(
+                "private export staging directory retained at {}",
+                retained.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete(&mut self) -> Result<()> {
         self.file_mut()
             .sync_all()
             .context("flush completed export staging file")
     }
 
-    fn copy_stdout(mut self) -> Result<()> {
+    pub(crate) fn copy_stdout(mut self) -> Result<()> {
         let mut source = self
             .file
             .as_ref()
@@ -257,7 +360,17 @@ impl StagedExport {
         }
     }
 
-    fn publish(mut self, target: OutputTarget) -> Result<()> {
+    pub(crate) fn publish(mut self, target: OutputTarget) -> Result<()> {
+        let policy = match target.publication() {
+            Ok(policy) => policy,
+            Err(primary) => {
+                return match self.cleanup() {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(primary
+                        .context(format!("private staging cleanup also failed: {cleanup:#}"))),
+                };
+            }
+        };
         let result = target.directory.publish_file(
             self.directory
                 .as_ref()
@@ -265,7 +378,7 @@ impl StagedExport {
             OsStr::new(STAGED_PAYLOAD),
             self.file.as_ref().expect("open export staging payload"),
             &target.name,
-            Publication::New,
+            policy,
         );
         match result {
             Ok(()) => self.remove_empty_stage(),
@@ -294,6 +407,12 @@ impl StagedExport {
             .directory
             .as_ref()
             .expect("open export staging directory");
+        while let Some((name, file)) = self.auxiliaries.pop() {
+            directory
+                .remove_file(&name, file)
+                .map_err(anyhow::Error::from)
+                .context("remove checked export auxiliary file")?;
+        }
         let file = self.file.take().expect("open export staging payload");
         directory
             .remove_file(OsStr::new(STAGED_PAYLOAD), file)
@@ -317,7 +436,7 @@ impl StagedExport {
 
 impl Drop for StagedExport {
     fn drop(&mut self) {
-        if self.file.is_some() && self.directory.is_some() {
+        if !self.retain_on_drop && self.file.is_some() && self.directory.is_some() {
             let _ = self.cleanup();
         }
     }
@@ -358,6 +477,65 @@ impl Drop for PrivateStage {
 mod render_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cancelled_session_spool_cleans_its_owned_stage_and_keeps_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("session.jsonl");
+        std::fs::write(&destination, b"existing completed export").unwrap();
+        let target = OutputTarget::open_replace(&destination, temporary.path()).unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let mut staged = StagedExport::new(target.directory()).unwrap();
+            let mut spool = staged
+                .create_auxiliary(OsStr::new("session.spool"))
+                .unwrap();
+            spool.write_all(b"partial chronological source").unwrap();
+            let stage_path = staged.temp.path.as_ref().unwrap().clone();
+            ready_tx.send(stage_path).unwrap();
+            let _ = release_rx.await;
+            spool.sync_all().unwrap();
+            staged.complete().unwrap();
+        });
+        let stage_path = ready_rx.await.unwrap();
+        assert!(stage_path.join("session.spool").exists());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!stage_path.exists(), "cancelled spool left an orphan stage");
+        assert_eq!(
+            std::fs::read(destination).unwrap(),
+            b"existing completed export"
+        );
+    }
+
+    #[test]
+    fn selected_replacement_rejects_a_changed_destination_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("session.md");
+        let displaced = temporary.path().join("selected-session.md");
+        std::fs::write(&destination, b"selected destination").unwrap();
+        let target = OutputTarget::open_replace(&destination, temporary.path()).unwrap();
+        std::fs::rename(&destination, &displaced).unwrap();
+        std::fs::write(&destination, b"unrelated replacement").unwrap();
+
+        let mut staged = StagedExport::new(target.directory()).unwrap();
+        staged.file_mut().write_all(b"completed export").unwrap();
+        staged.complete().unwrap();
+        let error = staged.publish(target).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("selected export destination changed before publication"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(destination).unwrap(),
+            b"unrelated replacement"
+        );
+        assert_eq!(std::fs::read(displaced).unwrap(), b"selected destination");
+    }
+
     #[test]
     fn markdown_keeps_typed_content_structured_and_bumps_the_outer_format() {
         let record = StorageRecord::Message {
@@ -384,8 +562,10 @@ mod render_tests {
                 state_count: 0,
                 context_summary_count: 0,
                 context_cursor_count: 0,
+                session_catalog_count: 0,
+                public_turn_count: 0,
             })["format"],
-            3
+            4
         );
     }
 }
@@ -407,6 +587,7 @@ mod tests {
             directory: Directory::open(parent.path(), Privacy::OwnerOnly, NameRetention::Pinned)
                 .unwrap(),
             name: "committed.json".into(),
+            expected: None,
         };
         let mut staged = StagedExport::new(&parent).unwrap();
         staged.file_mut().write_all(b"committed export").unwrap();

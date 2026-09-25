@@ -25,6 +25,10 @@ composer beside their shortcuts; `kuru models` prints the provider's current cat
 | Tab / Shift+Tab | Cycle matching slash-command names before their arguments |
 | `/help` | Show commands |
 | `/clear` | Clear this terminal's visible conversation while retaining stored history and session identity |
+| `/new` | Start a new public session using the current project memory |
+| `/sessions` | Open the session picker; Enter resumes, Delete removes, Ctrl+R restores, Ctrl+L renames, and Ctrl+F opens settled fork boundaries |
+| `/resume SESSION_ID` | Resume one exact active session |
+| `/export [PATH]` | Export the current public session as Markdown |
 | `/status` | Show local session, project, selections, turns, and known usage without a provider call |
 | `/tools` | Inspect filtered tools and disabled/live/stale/degraded MCP aliases without a provider call |
 | `/mcp login [--device\|--no-browser] ALIAS` | Sign in to one OAuth-enabled MCP alias |
@@ -193,6 +197,13 @@ See [terminal design](interface.md) for the visual system and its implementation
 kuru --provider demo --mode jungian run "Explore the assumptions in this design."
 kuru --provider demo run "Plan the next step." --json
 kuru sessions
+kuru sessions rename SESSION_ID "New label"
+kuru sessions remove SESSION_ID
+kuru sessions restore SESSION_ID
+kuru sessions fork SESSION_ID SETTLED_NODE_ID --label "New branch"
+kuru sessions export SESSION_ID --format jsonl --output transcript.jsonl
+kuru sessions export SESSION_ID --format markdown --output transcript.md
+kuru --continue --provider demo run "Continue the latest active session."
 kuru --resume SESSION_ID --provider demo run "Continue from our last turn."
 kuru --resume SESSION_ID --provider demo run "Continue from our last turn." --turn-id TURN_ID
 kuru memory notes ID --limit 100
@@ -206,9 +217,32 @@ JSON output includes `session`, `speaker`, `text`, `relationship`, token counts,
 name `tool-calls` and `peer-rounds` separately; an empty model response is the
 separate `empty` response outcome. `limited` remains for compatibility, and an
 older limited record whose specific cause was not stored reports
-`legacy-unspecified`. Session listing does not create a new session. Reusing a
-session restores its transcript; peer and relationship histories also persist
-across sessions within their project and framework scope.
+`legacy-unspecified`. Session listing does not create a new session. `--resume`
+selects the exact ID; `--continue` selects the latest nonremoved session by
+durable catalog order. Removing a session hides it from ordinary listing and
+resume, but preserves its ID, transcript and revision history for restoration.
+No session command deletes project memory. A fresh process asks again for
+session-only tool grants.
+
+Each public turn has a durable boundary ID. `kuru sessions` reports the latest
+settled `head_node_id`, and the terminal session picker lets you choose an older
+settled boundary with Ctrl+F and Page Down. Forking copies the public conversation
+prefix through that completed or terminally interrupted boundary into a new
+session. Pending work cannot be a fork boundary. The fork and its source then
+grow independently, while both use current shared project memory; forking does
+not rewind private memories or topology. Existing legacy rows retain their
+original bytes. Where a historical speaker or turn cannot be proved, exports
+label the field as unknown instead of assigning the current part.
+
+`kuru sessions export` writes one public transcript in chronological order,
+including typed content, settlement and fork provenance. Markdown is the default;
+JSONL has one manifest followed by transcript records. `--output` can replace a
+selected existing file after checking its identity; without it, output goes to
+stdout. This export omits private actor and relationship histories, reasoning
+summaries, notes and candidate branches. Use `kuru memory export` for a complete
+memory export. P11 still admits one conversation driver per project; simultaneous
+drivers and live-session presence arrive with the separate concurrent-session
+work.
 
 The returned event trace freezes with the response. Periodic dreaming runs as
 later maintenance, so its activity or failure cannot remove a completed answer.

@@ -1306,10 +1306,14 @@ fn draw_footer(frame: &mut Frame<'_>, view: &View, area: Rect) {
 fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let options = view.options();
     let modes = view.picker == Some(Picker::Modes);
-    let width = area
-        .width
-        .saturating_sub(4)
-        .clamp(1, if modes { 96 } else { 72 });
+    let width = area.width.saturating_sub(4).clamp(
+        1,
+        if modes || view.picker == Some(Picker::Sessions) {
+            96
+        } else {
+            72
+        },
+    );
     let height = (if modes {
         22
     } else {
@@ -1327,7 +1331,20 @@ fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
     let (title, color) = match view.picker {
         Some(Picker::Models) => ("Models", BLUE),
         Some(Picker::Efforts) => ("Efforts", AMBER),
-        _ => ("Modes", LILAC),
+        Some(Picker::Modes) => ("Modes", LILAC),
+        Some(Picker::SessionBoundaries) => (
+            if view.session_boundaries_next.is_some() {
+                "Settled boundaries · Enter fork · PageDown older"
+            } else {
+                "Settled boundaries · Enter fork"
+            },
+            MINT,
+        ),
+        Some(Picker::Sessions) => (
+            "Sessions · Enter resume · Del remove · Ctrl+R restore · Ctrl+L rename · Ctrl+F fork",
+            MINT,
+        ),
+        None => unreachable!("picker rendering requires an active picker"),
     };
     let block = panel(format!(" {title} "), color)
         .border_style(style(color))
@@ -1371,7 +1388,10 @@ fn draw_picker(frame: &mut Frame<'_>, view: &View, area: Rect) {
             let current = match view.picker {
                 Some(Picker::Models) => label == &view.model,
                 Some(Picker::Efforts) => label == &view.effort,
-                _ => label == &view.mode,
+                Some(Picker::Modes) => label == &view.mode,
+                Some(Picker::SessionBoundaries) => false,
+                Some(Picker::Sessions) => label.starts_with(&view.session),
+                None => false,
             };
             let value = if modes {
                 scene::identity(label).title

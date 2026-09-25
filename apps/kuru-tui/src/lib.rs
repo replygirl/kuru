@@ -8,6 +8,7 @@ mod instruction_gate;
 mod memory_export;
 mod memory_notice;
 mod permission_store;
+mod session_export;
 #[cfg(test)]
 mod spawn_gate;
 mod trust;

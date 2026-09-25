@@ -7,7 +7,7 @@
 pub use crate::files::PrivateTemp as TempDir;
 #[cfg(windows)]
 pub mod windows;
-use crate::{MemoryStore, OpenOptions, files};
+use crate::{MemoryStore, OpenOptions, PublicTurnRecord, SessionCatalogRecord, files};
 use anyhow::{Context, Error, Result, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy, Publication, seal_private};
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,20 @@ pub async fn spawn_logged_owner(
     diagnostic: File,
 ) -> Result<FixtureLoggedOwner> {
     crate::service::spawn_logged_owner_fixture(options, project, executable, diagnostic).await
+}
+
+/// Seed a checked long public chain in one local fixture transaction before
+/// an application process acquires the managed service's owner lease.
+pub async fn seed_public_session(
+    options: OpenOptions,
+    catalog: &SessionCatalogRecord,
+    turns: &[PublicTurnRecord],
+) -> Result<()> {
+    let store = crate::store::MemoryStore::open(options).await?;
+    let insertion = store.fixture_insert_public_session(catalog, turns).await;
+    let cleanup = store.close().await;
+    insertion?;
+    cleanup
 }
 
 /// Open an explicit real-engine fixture with its private startup log available on failure.

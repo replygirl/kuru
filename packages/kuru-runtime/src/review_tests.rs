@@ -2320,6 +2320,7 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
     struct Cancellable {
         stalled: AtomicBool,
         active: Arc<AtomicUsize>,
+        starts: AtomicUsize,
         entered: Mutex<Option<oneshot::Sender<CompletionRequest>>>,
         dropped: Mutex<Option<oneshot::Sender<()>>>,
     }
@@ -2340,6 +2341,7 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
             Ok(vec![])
         }
         async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
             self.active.fetch_add(1, Ordering::SeqCst);
             let _guard = Guard {
                 active: self.active.clone(),
@@ -2359,21 +2361,45 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
     let provider = Arc::new(Cancellable {
         stalled: AtomicBool::new(true),
         active: Arc::new(AtomicUsize::new(0)),
+        starts: AtomicUsize::new(0),
         entered: Mutex::new(Some(entered)),
         dropped: Mutex::new(Some(dropped)),
     });
     let (_dir, harness) = fixture(
         Config {
-            max_parallel: 1,
+            max_parallel: 2,
             ..config(Mode::Freudian)
         },
         provider.clone(),
     )
     .await;
+    let initial_peers = harness
+        .topology
+        .parts
+        .iter()
+        .filter(|part| part.active)
+        .count();
+    assert!(initial_peers > 2, "fixture needs a queued peer");
+    let started_work = harness
+        .actors
+        .values()
+        .map(crate::actor::Actor::started_work_counter)
+        .collect::<Vec<_>>();
     let permits = harness.permits.clone();
     let shared = Arc::new(tokio::sync::Mutex::new(harness));
     let running = shared.clone();
-    let mut task = tokio::spawn(async move { running.lock().await.run("Start a task").await });
+    let mut task = tokio::spawn(async move {
+        running
+            .lock()
+            .await
+            .run_controlled(
+                "Start a task",
+                None,
+                "aborted-owned-id",
+                &CancellationToken::new(),
+            )
+            .await
+    });
     // Entry follows real transcript/input commits and private-history reads.
     // Use the real-dream fixture's 30s setup bound, not the cancellation bound.
     let request = tokio::select! {
@@ -2399,24 +2425,46 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
             .iter()
             .any(|message| message.role == "user" && message.text_projection() == "Start a task")
     );
-    assert_eq!(provider.active.load(Ordering::SeqCst), 1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while provider.active.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two parallel providers must enter while another peer remains queued");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while started_work
+            .iter()
+            .map(|counter| counter.load(Ordering::SeqCst))
+            .sum::<u64>()
+            < initial_peers as u64
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every initial peer Work must enter its actor, including the permit waiter");
+    assert_eq!(provider.starts.load(Ordering::SeqCst), 2);
     assert!(
-        permits.try_acquire().is_err(),
-        "provider must hold the only permit"
+        permits.try_acquire_many(2).is_err(),
+        "parallel providers must hold both permits"
     );
 
-    // Only actual cancellation and permit release get the existing 2s bound.
-    // Acquiring the permit also excludes a still-active or leaked actor call.
+    // Both parallel providers must drop; the queued third peer must never
+    // begin the cancelled invocation before the next turn is admitted.
     let permit = tokio::time::timeout(Duration::from_secs(2), async {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         cancellation
             .await
             .expect("stalled provider must be dropped");
-        permits.acquire().await.expect("actor pool remains open")
+        permits
+            .acquire_many(2)
+            .await
+            .expect("actor pool remains open")
     })
     .await
-    .expect("cancellation must drop provider work and release the pool permit within 2s");
+    .expect("cancellation must drop parallel provider work and release both permits within 2s");
     assert_eq!(provider.active.load(Ordering::SeqCst), 0);
     drop(permit);
 
@@ -2430,6 +2478,40 @@ async fn aborting_a_turn_cancels_provider_work_and_releases_the_pool_permit() {
     .unwrap();
     assert_eq!(output.text, "Recovered after cancellation");
     assert_eq!(provider.active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        provider.starts.load(Ordering::SeqCst),
+        2 + initial_peers + 1,
+        "the cancelled queued peer must not reach the provider; the new turn runs normally"
+    );
+    assert_eq!(
+        shared
+            .lock()
+            .await
+            .session_usage()
+            .await
+            .unwrap()
+            .invocation_count,
+        (2 + initial_peers + 1) as u64,
+        "only the entered cancelled invocations and the new turn are accounted"
+    );
+    let calls_before_retry = provider.starts.load(Ordering::SeqCst);
+    let original_retry = shared
+        .lock()
+        .await
+        .run_controlled(
+            "Start a task",
+            None,
+            "aborted-owned-id",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        original_retry
+            .to_string()
+            .contains("may have reached external work")
+    );
+    assert_eq!(provider.starts.load(Ordering::SeqCst), calls_before_retry);
     shared.lock().await.shutdown(false).await.unwrap();
 }
 

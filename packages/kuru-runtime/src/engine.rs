@@ -3,7 +3,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -30,7 +30,10 @@ use kuru_core::{
 };
 use kuru_memory::{
     Candidate, CandidateInventoryPage, CandidateRefStatus, CandidateTransitionResolution,
-    HistoryWindow, MemoryStatus, MemoryStore, Revision, SelectedAbandonResolution, StoredNote,
+    HistoryWindow, LegacySessionTurnResume, MemoryStatus, MemoryStore, PublicTranscriptEntry,
+    PublicTurnSettlement, Revision, SelectedAbandonResolution, SessionCatalogRecord,
+    SessionLifecycleOutcome, SessionLifecycleState, SessionModeCheckpoint, SessionTurnCheckpoint,
+    StoredNote,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,13 +44,14 @@ use uuid::Uuid;
 
 pub use crate::event::StateReport;
 use crate::{
-    actor::{Actor, Work},
+    actor::{Actor, ActorCommand, Work},
     bus::PeerMessage,
     event::{Event, ToolObservation, ToolOutcome, TurnLimitReason},
     progress::{ContextSnapshot, FacingProgress, ProgressDescriptor, ProgressTurn},
 };
 
 const SHUTDOWN_DREAM_TIMEOUT: Duration = Duration::from_secs(30);
+const ABORTED_TURN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TURN_TRANSITIONS: usize = 64;
 /// Transcript role reserved for Kuru's durable interruption marker.
 pub const INTERRUPTION_ROLE: &str = "kuru-interruption";
@@ -76,6 +80,18 @@ pub struct Session {
     pub label: String,
     #[serde(default)]
     pub last_completed_speaker: Option<String>,
+    #[serde(default)]
+    pub lifecycle_generation: u64,
+}
+
+/// Backward-readable session listing enriched with the complete typed catalog.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub turns: usize,
+    pub last_completed_speaker: Option<String>,
+    #[serde(flatten)]
+    pub catalog: SessionCatalogRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +238,10 @@ struct TurnJournal {
     possible_dispatch: bool,
     #[serde(default)]
     interruption_marker: bool,
+    /// One-based raw transcript row admitted with this journal. Historical
+    /// journals have no anchor and remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admitted_transcript_row: Option<u64>,
     output: Option<TurnOutput>,
 }
 
@@ -262,6 +282,10 @@ impl TurnJournal {
                     .iter()
                     .any(|transition| matches!(transition, TurnTransition::Interrupted)),
             "stored turn journal interruption marker state is invalid"
+        );
+        ensure!(
+            self.admitted_transcript_row.is_none_or(|row| row > 0),
+            "stored turn journal transcript row is invalid"
         );
         ensure!(
             self.output.is_some() == matches!(self.transitions.last(), Some(TurnTransition::Ended)),
@@ -316,6 +340,8 @@ struct RawTurnJournal {
     possible_dispatch: bool,
     #[serde(default)]
     interruption_marker: bool,
+    #[serde(default)]
+    admitted_transcript_row: Option<u64>,
     output: Option<RawTurnOutput>,
 }
 
@@ -361,6 +387,7 @@ fn decode_turn_journal(value: Value) -> Result<TurnJournal> {
         transitions: raw.transitions,
         possible_dispatch: raw.possible_dispatch,
         interruption_marker: raw.interruption_marker,
+        admitted_transcript_row: raw.admitted_transcript_row,
         output,
     })
 }
@@ -431,6 +458,7 @@ pub struct Harness {
     model_infos: OnceCell<Vec<ModelInfo>>,
     invocation_ordinal: AtomicU64,
     pub(crate) operation_id: String,
+    aborted_turn: Arc<Mutex<Option<AbortedTurn>>>,
     trace: Vec<Event>,
     pub(crate) pending_publication: Option<PendingPublication>,
     pub(crate) pending_candidate: Option<Candidate>,
@@ -438,11 +466,36 @@ pub struct Harness {
     #[cfg(test)]
     publication_pause: Option<PublicationPause>,
     #[cfg(test)]
+    resume_publication_pause: Option<PublicationPause>,
+    #[cfg(test)]
     dream_promotion_pause: Option<PublicationPause>,
     #[cfg(test)]
     dream_abandon_pause: Option<PublicationPause>,
     #[cfg(test)]
     pub(crate) dream_transition_reply_pause: Option<kuru_memory::test_support::ReplyBarrier>,
+}
+
+#[derive(Clone)]
+struct AbortedTurn {
+    session_id: String,
+    turn_id: String,
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+/// Only a dropped foreground invocation can authorize same-Harness recovery.
+struct TurnDropGuard {
+    slot: Arc<Mutex<Option<AbortedTurn>>>,
+    turn: Option<AbortedTurn>,
+}
+
+impl Drop for TurnDropGuard {
+    fn drop(&mut self) {
+        if let Some(turn) = self.turn.take() {
+            turn.cancellation.cancel();
+            *self.slot.lock().expect("aborted turn lock poisoned") = Some(turn);
+        }
+    }
 }
 
 pub(crate) struct PendingPublication {
@@ -458,6 +511,7 @@ pub(crate) struct PendingPublication {
 #[derive(Clone)]
 pub(crate) enum PublicationProof {
     LiveValues,
+    LiveValuesAndCatalogMode(Mode),
     CandidatePromotion {
         base: String,
         target: String,
@@ -602,13 +656,29 @@ impl Harness {
             "injected tool host root does not match the canonical workspace"
         );
         let scope = project_scope(&cwd)?;
+        memory.ensure_project_scope(&scope)?;
         let session = if let Some(id) = resume {
-            serde_json::from_value(
-                memory
-                    .get(&format!("{scope}/session/{id}"))
-                    .await?
-                    .context("session not found in this project")?,
-            )?
+            let catalog = memory
+                .session_catalog_record(id)
+                .await?
+                .context("session is absent from the durable catalog")?;
+            ensure!(
+                catalog.lifecycle_state == SessionLifecycleState::Active,
+                "session is removed; restore it before resuming"
+            );
+            match memory.get(&format!("{scope}/session/{id}")).await? {
+                Some(value) => {
+                    let mut session: Session = serde_json::from_value(value)?;
+                    ensure!(
+                        catalog.mode == session.mode,
+                        "session catalog mode differs from its retained runtime state"
+                    );
+                    session.label = catalog.label;
+                    session.lifecycle_generation = catalog.lifecycle_generation;
+                    session
+                }
+                None => session_from_catalog(&memory, catalog).await?,
+            }
         } else {
             Session {
                 id: Uuid::new_v4().to_string(),
@@ -616,6 +686,7 @@ impl Harness {
                 turns: 0,
                 label: String::new(),
                 last_completed_speaker: None,
+                lifecycle_generation: 0,
             }
         };
         let mut config = config;
@@ -641,6 +712,9 @@ impl Harness {
         tools.permission_service().reset_session()?;
         let ledger = memory.usage_ledger()?;
         if resume.is_none() {
+            memory
+                .create_session(&session.id, session.mode, &session.label)
+                .await?;
             ledger.mark_new_session(&session.id).await?;
         }
         let (events, _) = broadcast::channel(256);
@@ -666,12 +740,15 @@ impl Harness {
             model_infos: OnceCell::new(),
             invocation_ordinal: AtomicU64::new(0),
             operation_id: Uuid::new_v4().to_string(),
+            aborted_turn: Arc::new(Mutex::new(None)),
             trace: vec![],
             pending_publication: None,
             pending_candidate: None,
             pending_candidate_resolution: PendingCandidateResolution::AutomaticCleanup,
             #[cfg(test)]
             publication_pause: None,
+            #[cfg(test)]
+            resume_publication_pause: None,
             #[cfg(test)]
             dream_promotion_pause: None,
             #[cfg(test)]
@@ -906,23 +983,224 @@ impl Harness {
     pub async fn notes_for(&self, identity: &str, limit: usize) -> Result<NotesView> {
         read_notes_with_profile(&self.memory, &self.cwd, &self.profile, identity, limit).await
     }
-    pub async fn sessions(&self) -> Result<Vec<Session>> {
-        Ok(self
-            .memory
-            .get(&format!("{}/sessions", self.scope))
-            .await?
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default())
+    pub async fn sessions(&self) -> Result<Vec<SessionSummary>> {
+        session_summaries(
+            &self.memory,
+            &self.scope,
+            Some(SessionLifecycleState::Active),
+        )
+        .await
     }
-    pub async fn list_sessions(memory: &MemoryStore, cwd: &Path) -> Result<Vec<Session>> {
+    pub async fn all_sessions(&self) -> Result<Vec<SessionSummary>> {
+        session_summaries(&self.memory, &self.scope, None).await
+    }
+    pub async fn list_sessions(memory: &MemoryStore, cwd: &Path) -> Result<Vec<SessionSummary>> {
         let scope = project_scope(cwd)?;
-        Ok(memory
-            .get(&format!("{scope}/sessions"))
+        session_summaries(memory, &scope, Some(SessionLifecycleState::Active)).await
+    }
+    pub async fn continuation_session(memory: &MemoryStore, cwd: &Path) -> Result<String> {
+        memory.ensure_project_scope(&project_scope(cwd)?)?;
+        let page = memory
+            .session_catalog_page(Some(SessionLifecycleState::Active), None, None, 1)
+            .await?;
+        Ok(page
+            .records
+            .into_iter()
+            .next()
+            .context("this project has no active session to continue")?
+            .session_id)
+    }
+    pub async fn resumable_session(
+        memory: &MemoryStore,
+        cwd: &Path,
+        session_id: &str,
+    ) -> Result<String> {
+        memory.ensure_project_scope(&project_scope(cwd)?)?;
+        let record = memory
+            .session_catalog_record(session_id)
             .await?
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default())
+            .context("session is absent from this project")?;
+        ensure!(
+            record.lifecycle_state == SessionLifecycleState::Active,
+            "session is removed; restore it before resuming"
+        );
+        Ok(record.session_id)
+    }
+    /// Select one active durable session in this single-driver runtime.
+    /// Session-only tool authority is intentionally reset at the process-local
+    /// boundary while persistent grants remain available through the checked
+    /// permission store.
+    pub async fn resume_session(&mut self, session_id: &str) -> Result<()> {
+        self.reconcile().await?;
+        let catalog = self
+            .memory
+            .session_catalog_record(session_id)
+            .await?
+            .context("session is absent from this project")?;
+        ensure!(
+            catalog.lifecycle_state == SessionLifecycleState::Active,
+            "session is removed; restore it before resuming"
+        );
+        let session = match self
+            .memory
+            .get(&format!("{}/session/{session_id}", self.scope))
+            .await?
+        {
+            Some(value) => {
+                let mut session: Session = serde_json::from_value(value)?;
+                ensure!(
+                    session.mode == catalog.mode,
+                    "session catalog mode differs from its retained runtime state"
+                );
+                session.label = catalog.label.clone();
+                session.lifecycle_generation = catalog.lifecycle_generation;
+                session
+            }
+            None => session_from_catalog(&self.memory, catalog.clone()).await?,
+        };
+        let mut config = self.config.clone();
+        config.mode = session.mode;
+        config.validate()?;
+        let profile = if session.mode == self.profile.mode {
+            self.profile.clone()
+        } else {
+            ModeProfile::builtin(session.mode)
+        };
+        profile.validate(config.max_parts)?;
+        let topology = read_topology_with_profile(&self.memory, &self.scope, &profile).await?;
+        validate_topology_with_profile(&topology, &config, &profile)?;
+        let namespaces = prepared_actor_namespaces(&self.scope, &profile, &topology)?;
+        checked_transcript_key(&self.scope, &session.id, &profile)?;
+        self.tools.revalidate_root()?;
+        #[cfg(test)]
+        self.pause_before_resume_publication().await?;
+        ensure!(
+            self.memory
+                .session_catalog_record(session_id)
+                .await?
+                .as_ref()
+                == Some(&catalog),
+            "session catalog changed while resuming"
+        );
+        self.tools.permission_service().reset_session()?;
+        self.config = config;
+        self.profile = profile;
+        self.topology = topology;
+        self.session = session;
+        self.operation_id = Uuid::new_v4().to_string();
+        self.invocation_ordinal.store(0, Ordering::Release);
+        self.sync_actors_with(&namespaces);
+        self.reset_context_snapshot();
+        Ok(())
+    }
+
+    /// Create and select one fresh session without invoking a provider.
+    pub async fn new_session(&mut self) -> Result<String> {
+        self.reconcile().await?;
+        let session = Session {
+            id: Uuid::new_v4().to_string(),
+            mode: self.config.mode,
+            turns: 0,
+            label: String::new(),
+            last_completed_speaker: None,
+            lifecycle_generation: 0,
+        };
+        self.memory
+            .create_session(&session.id, session.mode, &session.label)
+            .await?;
+        self.memory
+            .usage_ledger()?
+            .mark_new_session(&session.id)
+            .await?;
+        self.tools.permission_service().reset_session()?;
+        self.session = session;
+        self.operation_id = Uuid::new_v4().to_string();
+        self.invocation_ordinal.store(0, Ordering::Release);
+        self.reset_context_snapshot();
+        self.save().await?;
+        Ok(self.session.id.clone())
+    }
+
+    pub async fn rename_session(
+        &mut self,
+        session_id: &str,
+        label: &str,
+    ) -> Result<SessionLifecycleOutcome> {
+        self.reconcile().await?;
+        let catalog = self
+            .memory
+            .session_catalog_record(session_id)
+            .await?
+            .context("session is absent from this project")?;
+        let outcome = self
+            .memory
+            .rename_session(session_id, catalog.lifecycle_generation, label)
+            .await?;
+        if self.session.id == session_id {
+            self.session.label = label.to_owned();
+            self.session.lifecycle_generation = outcome.lifecycle_generation;
+        }
+        Ok(outcome)
+    }
+
+    pub async fn remove_session(&mut self, session_id: &str) -> Result<SessionLifecycleOutcome> {
+        self.reconcile().await?;
+        ensure!(
+            self.session.id != session_id,
+            "select another session before removing the current session"
+        );
+        let catalog = self
+            .memory
+            .session_catalog_record(session_id)
+            .await?
+            .context("session is absent from this project")?;
+        self.memory
+            .remove_session(session_id, catalog.lifecycle_generation)
+            .await
+    }
+
+    pub async fn restore_session(&mut self, session_id: &str) -> Result<SessionLifecycleOutcome> {
+        self.reconcile().await?;
+        let catalog = self
+            .memory
+            .session_catalog_record(session_id)
+            .await?
+            .context("session is absent from this project")?;
+        self.memory
+            .restore_session(session_id, catalog.lifecycle_generation)
+            .await
+    }
+
+    pub async fn fork_session(
+        &mut self,
+        source_session_id: &str,
+        source_node_id: &str,
+        label: &str,
+    ) -> Result<String> {
+        self.reconcile().await?;
+        let source = self
+            .memory
+            .session_catalog_record(source_session_id)
+            .await?
+            .context("session is absent from this project")?;
+        let child = Uuid::new_v4().to_string();
+        self.memory
+            .fork_session(
+                source_session_id,
+                source.lifecycle_generation,
+                source_node_id,
+                &child,
+                label,
+            )
+            .await?;
+        self.resume_session(&child).await?;
+        Ok(child)
+    }
+
+    /// The checked memory view used by application-owned projection/export
+    /// adapters. It conveys no owner-lifetime authority beyond this harness.
+    pub fn memory(&self) -> &MemoryStore {
+        &self.memory
     }
     pub async fn load_preferences(memory: &MemoryStore, cwd: &Path) -> Result<ProjectPreferences> {
         read_preferences(memory, &project_scope(cwd)?).await
@@ -1069,6 +1347,7 @@ impl Harness {
         );
         let key = self.turn_journal_key(id);
         if let Some(value) = self.memory.get(&key).await? {
+            let expected_journal = value.clone();
             let mut journal =
                 decode_turn_journal(value).context("stored turn journal is invalid")?;
             journal.validate(id)?;
@@ -1090,8 +1369,31 @@ impl Harness {
             let resolved_target = target.map(|value| self.resolve(value)).transpose()?;
             cancellation.check()?;
             journal.push(TurnTransition::Resumed)?;
+            let legacy = self
+                .memory
+                .session_catalog_record(&self.session.id)
+                .await?
+                .and_then(|catalog| {
+                    catalog
+                        .legacy_prefix
+                        .map(|legacy_prefix| LegacySessionTurnResume {
+                            legacy_prefix,
+                            journal_key: key.clone(),
+                            expected_journal,
+                        })
+                });
             self.memory
-                .put(&key, &serde_json::to_value(&journal)?)
+                .checkpoint_session_turn(
+                    &self.checked_transcript_key()?,
+                    &self.session.id,
+                    &[],
+                    &[(key.clone(), serde_json::to_value(&journal)?)],
+                    &SessionTurnCheckpoint::Resume {
+                        expected_generation: self.session.lifecycle_generation,
+                        turn_id: id.into(),
+                        legacy,
+                    },
+                )
                 .await?;
             return Ok(TurnAdmission::Run {
                 key,
@@ -1102,6 +1404,15 @@ impl Harness {
         self.refresh_topology_for_turn().await?;
         let resolved_target = target.map(|value| self.resolve(value)).transpose()?;
         cancellation.check()?;
+        let transcript_key = self.checked_transcript_key()?;
+        let expected_transcript_rows = self
+            .memory
+            .history_window(&transcript_key, 0)
+            .await?
+            .total_rows;
+        let admitted_transcript_row = expected_transcript_rows
+            .checked_add(1)
+            .context("admitted transcript row exceeded the store range")?;
         let journal = TurnJournal {
             format: 2,
             id: id.into(),
@@ -1110,6 +1421,7 @@ impl Harness {
             transitions: vec![TurnTransition::Started],
             possible_dispatch: false,
             interruption_marker: false,
+            admitted_transcript_row: Some(admitted_transcript_row),
             output: None,
         };
         let mut updates = vec![(key.clone(), serde_json::to_value(&journal)?)];
@@ -1124,14 +1436,28 @@ impl Harness {
                 })?,
             ));
         }
+        let admission_label = self
+            .session
+            .label
+            .is_empty()
+            .then(|| prompt.chars().take(80).collect::<String>());
         self.memory
-            .checkpoint_session(
-                &self.checked_transcript_key()?,
+            .checkpoint_session_turn(
+                &transcript_key,
                 &self.session.id,
                 &[user(prompt)],
                 &updates,
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: self.session.lifecycle_generation,
+                    turn_id: id.into(),
+                    label: admission_label.clone(),
+                    expected_transcript_rows: Some(expected_transcript_rows),
+                },
             )
             .await?;
+        if let Some(label) = admission_label {
+            self.session.label = label;
+        }
         Ok(TurnAdmission::Run {
             key,
             journal,
@@ -1189,16 +1515,36 @@ impl Harness {
             return Ok(Some(output));
         }
         let already_marked = journal.interruption_marker;
-        journal.push(TurnTransition::Interrupted)?;
+        if already_marked && !journal.possible_dispatch {
+            return Ok(None);
+        }
+        if !already_marked {
+            journal.push(TurnTransition::Interrupted)?;
+        }
         let marker = Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT);
         let messages = if already_marked { vec![] } else { vec![marker] };
         journal.interruption_marker = true;
+        let public_turn = if journal.possible_dispatch {
+            SessionTurnCheckpoint::Settle {
+                expected_generation: self.session.lifecycle_generation,
+                turn_id: id,
+                settlement: PublicTurnSettlement::Interrupted,
+                speaker_id: INTERRUPTION_ROLE.into(),
+            }
+        } else {
+            SessionTurnCheckpoint::MarkRetryableInterruption {
+                expected_generation: self.session.lifecycle_generation,
+                turn_id: id,
+                speaker_id: INTERRUPTION_ROLE.into(),
+            }
+        };
         self.memory
-            .checkpoint_session(
+            .checkpoint_session_turn(
                 &self.checked_transcript_key()?,
                 &self.session.id,
                 &messages,
                 &[(key.into(), serde_json::to_value(journal)?)],
+                &public_turn,
             )
             .await?;
         Ok(None)
@@ -1352,21 +1698,11 @@ impl Harness {
 
     pub(crate) async fn state_updates(
         &self,
-        memory: &MemoryStore,
         profile: &ModeProfile,
         topology: &Topology,
         session: &Session,
         mut updates: Vec<(String, Value)>,
     ) -> Result<Vec<(String, Value)>> {
-        let mut sessions: Vec<Session> = memory
-            .get(&format!("{}/sessions", self.scope))
-            .await?
-            .map(serde_json::from_value)
-            .transpose()
-            .context("invalid saved session index")?
-            .unwrap_or_default();
-        sessions.retain(|s| s.id != session.id);
-        sessions.push(session.clone());
         ensure!(
             profile.mode == session.mode,
             "state profile does not match session mode"
@@ -1377,10 +1713,6 @@ impl Harness {
             (
                 format!("{}/session/{}", self.scope, session.id),
                 serde_json::to_value(session)?,
-            ),
-            (
-                format!("{}/sessions", self.scope),
-                serde_json::to_value(sessions)?,
             ),
         ]);
         Ok(updates)
@@ -1416,8 +1748,13 @@ impl Harness {
         validate_topology_with_profile(&topology, &config, &profile)?;
         let actor_namespaces = prepared_actor_namespaces(&self.scope, &profile, &topology)?;
         let updates = self
-            .state_updates(&self.memory, &profile, &topology, &session, updates)
+            .state_updates(&profile, &topology, &session, updates)
             .await?;
+        let mode_change = (session.mode != self.session.mode).then_some(SessionModeCheckpoint {
+            expected_generation: self.session.lifecycle_generation,
+            expected_mode: self.session.mode,
+            mode: session.mode,
+        });
         self.pending_publication = Some(PendingPublication {
             config,
             profile,
@@ -1425,9 +1762,24 @@ impl Harness {
             topology,
             session,
             updates: updates.clone(),
-            proof: PublicationProof::LiveValues,
+            proof: mode_change
+                .as_ref()
+                .map_or(PublicationProof::LiveValues, |mode| {
+                    PublicationProof::LiveValuesAndCatalogMode(mode.mode)
+                }),
         });
-        self.memory.put_many(&updates).await?;
+        if let Some(mode) = mode_change {
+            self.memory
+                .checkpoint_session_mode(
+                    &self.checked_transcript_key()?,
+                    &self.session.id,
+                    &updates,
+                    &mode,
+                )
+                .await?;
+        } else {
+            self.memory.put_many(&updates).await?;
+        }
         #[cfg(test)]
         self.pause_after_memory_write().await?;
         self.publish_pending();
@@ -1464,6 +1816,39 @@ impl Harness {
             .release
             .await
             .context("publication checkpoint release channel closed")?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_before_next_resume_publication(
+        &mut self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, observed) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        assert!(
+            self.resume_publication_pause.is_none(),
+            "resume publication pause is active"
+        );
+        self.resume_publication_pause = Some(PublicationPause {
+            reached,
+            release: wait,
+        });
+        (observed, release)
+    }
+
+    #[cfg(test)]
+    async fn pause_before_resume_publication(&mut self) -> Result<()> {
+        let Some(pause) = self.resume_publication_pause.take() else {
+            return Ok(());
+        };
+        pause
+            .reached
+            .send(())
+            .map_err(|_| anyhow::anyhow!("resume publication observer disappeared"))?;
+        pause
+            .release
+            .await
+            .context("resume publication release channel closed")?;
         Ok(())
     }
 
@@ -1787,12 +2172,25 @@ impl Harness {
         self.rebind_main_if_retired().await?;
         if let Some(pending) = &self.pending_publication {
             ensure!(
-                matches!(pending.proof, PublicationProof::LiveValues),
+                matches!(
+                    pending.proof,
+                    PublicationProof::LiveValues | PublicationProof::LiveValuesAndCatalogMode(_)
+                ),
                 "candidate promotion requires exact outcome proof"
             );
             let mut committed = true;
             for (key, value) in &pending.updates {
                 committed &= self.memory.get(key).await?.as_ref() == Some(value);
+            }
+            if let PublicationProof::LiveValuesAndCatalogMode(mode) = pending.proof {
+                committed &= self
+                    .memory
+                    .session_catalog_record(&pending.session.id)
+                    .await?
+                    .is_some_and(|catalog| {
+                        catalog.mode == mode
+                            && catalog.lifecycle_generation == pending.session.lifecycle_generation
+                    });
             }
             if committed {
                 self.publish_pending();
@@ -2276,7 +2674,6 @@ impl Harness {
             context_sources,
             inputs,
             instructions,
-            transcript_key: checked_transcript_key(&self.scope, &self.session.id, &self.profile)?,
             context_budget,
             compaction_policy: kuru_core::ContextCompactionPolicy {
                 threshold_percent: self.config.context_compaction_threshold_percent,
@@ -2298,7 +2695,11 @@ impl Harness {
         control
             .cancellation
             .wait(async {
-                actor.tx.send(work).await.context("actor stopped")?;
+                actor
+                    .tx
+                    .send(ActorCommand::Work(Box::new(work)))
+                    .await
+                    .context("actor stopped")?;
                 Ok(())
             })
             .await?;
@@ -2482,6 +2883,117 @@ impl Harness {
     }
 
     async fn run_controlled_inner(
+        &mut self,
+        prompt: &str,
+        target: Option<&str>,
+        turn_id: &str,
+        remember_local: bool,
+        cancellation: &CancellationToken,
+        reviews: TurnReviewChannels<'_>,
+    ) -> Result<ControlledTurnOutput> {
+        self.recover_aborted_turn().await?;
+        let mut guard = TurnDropGuard {
+            slot: self.aborted_turn.clone(),
+            turn: Some(AbortedTurn {
+                session_id: self.session.id.clone(),
+                turn_id: turn_id.into(),
+                generation: self.session.lifecycle_generation,
+                cancellation: cancellation.clone(),
+            }),
+        };
+        let result = self
+            .run_controlled_inner_impl(
+                prompt,
+                target,
+                turn_id,
+                remember_local,
+                cancellation,
+                reviews,
+            )
+            .await;
+        guard.turn = None;
+        result
+    }
+
+    async fn recover_aborted_turn(&mut self) -> Result<()> {
+        let aborted = self
+            .aborted_turn
+            .lock()
+            .expect("aborted turn lock poisoned")
+            .clone();
+        let Some(aborted) = aborted else {
+            return Ok(());
+        };
+        ensure!(
+            aborted.session_id == self.session.id,
+            "aborted invocation belongs to a different session"
+        );
+        // The caller future is gone before another &mut Harness call can enter.
+        // It cannot enqueue more Work; each FIFO acknowledgement follows all
+        // already enqueued Work and its complete accounting settlement.
+        aborted.cancellation.cancel();
+        tokio::time::timeout(
+            ABORTED_TURN_DRAIN_TIMEOUT,
+            join_all(self.actors.values().map(Actor::drain)),
+        )
+        .await
+        .context("aborted turn actor cleanup exceeded 30 seconds")?
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+        self.reconcile().await?;
+        let key = self.turn_journal_key(&aborted.turn_id);
+        let stored = self.memory.get(&key).await?;
+        let catalog = self
+            .memory
+            .session_catalog_record(&self.session.id)
+            .await?
+            .context("aborted turn session catalog disappeared")?;
+        ensure!(
+            catalog.lifecycle_generation == aborted.generation,
+            "aborted turn session generation changed"
+        );
+        match stored {
+            Some(value) => {
+                let journal =
+                    decode_turn_journal(value).context("aborted turn journal is invalid")?;
+                journal.validate(&aborted.turn_id)?;
+                if journal.output.is_none() {
+                    let pending = self
+                        .memory
+                        .public_transcript_page(&self.session.id, None, 1)
+                        .await?
+                        .pending
+                        .context("aborted turn has no pending public node")?;
+                    ensure!(
+                        catalog.pending_node_id.as_deref() == Some(pending.node_id.as_str())
+                            && pending.turn_id == aborted.turn_id
+                            && pending.origin_session_id == aborted.session_id,
+                        "aborted turn pending public node changed"
+                    );
+                    self.record_interruption(&key, journal).await?;
+                    // Admission may have committed just before the caller was
+                    // dropped, before its catalog label reached this Harness.
+                    self.session.label = catalog.label;
+                } else {
+                    ensure!(
+                        catalog.pending_node_id.is_none(),
+                        "completed aborted turn retains a pending public node"
+                    );
+                }
+            }
+            None => ensure!(
+                catalog.pending_node_id.is_none(),
+                "aborted invocation lacks its pending turn journal"
+            ),
+        }
+        *self
+            .aborted_turn
+            .lock()
+            .expect("aborted turn lock poisoned") = None;
+        Ok(())
+    }
+
+    async fn run_controlled_inner_impl(
         &mut self,
         prompt: &str,
         target: Option<&str>,
@@ -3092,7 +3604,7 @@ impl Harness {
         journal.push(TurnTransition::Ended)?;
         journal.output = Some(output.clone());
         let mut updates = self
-            .state_updates(&self.memory, &self.profile, &topology, &session, vec![])
+            .state_updates(&self.profile, &topology, &session, vec![])
             .await?;
         updates.push((journal_key.into(), serde_json::to_value(&*journal)?));
         ensure!(
@@ -3110,11 +3622,17 @@ impl Harness {
             proof: PublicationProof::LiveValues,
         });
         self.memory
-            .checkpoint_session(
+            .checkpoint_session_turn(
                 &self.checked_transcript_key()?,
                 &self.session.id,
                 &[assistant(&text)],
                 &updates,
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: self.session.lifecycle_generation,
+                    turn_id: journal.id.clone(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: speaker.clone(),
+                },
             )
             .await?;
         #[cfg(test)]
@@ -3432,6 +3950,142 @@ fn project_turn_output(mut output: TurnOutput) -> TurnOutput {
 fn assistant(text: &str) -> Message {
     Message::text("assistant", text)
 }
+
+async fn session_catalog(
+    memory: &MemoryStore,
+    lifecycle_state: Option<SessionLifecycleState>,
+) -> Result<Vec<SessionCatalogRecord>> {
+    let mut records = Vec::new();
+    let mut cursor = None;
+    let mut revision = None;
+    loop {
+        let page = memory
+            .session_catalog_page(lifecycle_state, cursor.as_ref(), revision.as_deref(), 1024)
+            .await?;
+        if let Some(expected) = &revision {
+            ensure!(
+                &page.revision == expected,
+                "session catalog changed during traversal"
+            );
+        } else {
+            revision = Some(page.revision.clone());
+        }
+        records.extend(page.records);
+        cursor = page.next;
+        if cursor.is_none() {
+            return Ok(records);
+        }
+    }
+}
+
+async fn session_summaries(
+    memory: &MemoryStore,
+    scope: &str,
+    lifecycle_state: Option<SessionLifecycleState>,
+) -> Result<Vec<SessionSummary>> {
+    session_summaries_inner(
+        memory,
+        scope,
+        lifecycle_state,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn session_summaries_inner(
+    memory: &MemoryStore,
+    scope: &str,
+    lifecycle_state: Option<SessionLifecycleState>,
+    #[cfg(test)] mut pause: Option<PublicationPause>,
+) -> Result<Vec<SessionSummary>> {
+    memory.ensure_project_scope(scope)?;
+    let catalog = session_catalog(memory, lifecycle_state).await?;
+    #[cfg(test)]
+    if let Some(pause) = pause.take() {
+        let _ = pause.reached.send(());
+        pause
+            .release
+            .await
+            .context("session listing publication pause was dropped")?;
+    }
+    let mut summaries = Vec::with_capacity(catalog.len());
+    for record in &catalog {
+        let mut session = match memory
+            .get(&format!("{scope}/session/{}", record.session_id))
+            .await?
+        {
+            Some(value) => serde_json::from_value::<Session>(value)
+                .context("stored session runtime state is invalid")?,
+            None => session_from_catalog(memory, record.clone()).await?,
+        };
+        ensure!(
+            session.id == record.session_id && session.mode == record.mode,
+            "session catalog differs from its retained runtime state"
+        );
+        let current = memory
+            .session_catalog_record(&record.session_id)
+            .await?
+            .context("session changed while its listing was assembled")?;
+        ensure!(
+            current == *record,
+            "session catalog changed while its listing was assembled"
+        );
+        session.label = record.label.clone();
+        session.lifecycle_generation = record.lifecycle_generation;
+        summaries.push(SessionSummary {
+            id: session.id,
+            turns: session.turns,
+            last_completed_speaker: session.last_completed_speaker,
+            catalog: record.clone(),
+        });
+    }
+    ensure!(
+        session_catalog(memory, lifecycle_state).await? == catalog,
+        "session catalog changed while its listing was assembled"
+    );
+    Ok(summaries)
+}
+
+async fn session_from_catalog(
+    memory: &MemoryStore,
+    catalog: SessionCatalogRecord,
+) -> Result<Session> {
+    let mut cursor = None;
+    let mut turns = 0_usize;
+    let mut last_completed_speaker = None;
+    loop {
+        let page = memory
+            .public_transcript_page(&catalog.session_id, cursor.as_ref(), 1024)
+            .await?;
+        for entry in page.records {
+            let PublicTranscriptEntry::Turn { record } = entry else {
+                continue;
+            };
+            if record.settlement == PublicTurnSettlement::Completed {
+                turns = turns
+                    .checked_add(1)
+                    .context("session completed-turn count overflowed")?;
+                if last_completed_speaker.is_none() {
+                    last_completed_speaker = record.speaker_id;
+                }
+            }
+        }
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(Session {
+        id: catalog.session_id,
+        mode: catalog.mode,
+        turns,
+        label: catalog.label,
+        last_completed_speaker,
+        lifecycle_generation: catalog.lifecycle_generation,
+    })
+}
+
 pub fn project_scope(cwd: &Path) -> Result<String> {
     let cwd = cwd.canonicalize()?;
     ensure!(cwd.is_dir(), "project path must be a directory");
@@ -3861,6 +4515,16 @@ mod publication_tests {
             .iter()
             .map(|part| part.id.clone())
             .collect::<Vec<_>>();
+        let session_id = harness.session.id.clone();
+        assert_eq!(
+            memory
+                .session_catalog_record(&session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mode,
+            Mode::Ifs
+        );
         let (written, release) = harness.pause_after_next_memory_write();
         let mut change = Box::pin(harness.set_mode(Mode::Jungian));
         tokio::select! {
@@ -3884,6 +4548,15 @@ mod publication_tests {
         let pending = harness.pending_publication.as_ref().unwrap();
         assert_eq!(pending.profile.mode, Mode::Jungian);
         assert_eq!(pending.session.mode, Mode::Jungian);
+        assert_eq!(
+            memory
+                .session_catalog_record(&session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mode,
+            Mode::Jungian
+        );
         assert!(
             memory
                 .get(&format!("{}/jungian/topology", harness.scope))
@@ -3895,6 +4568,15 @@ mod publication_tests {
         assert_eq!(harness.config.mode, Mode::Jungian);
         assert_eq!(harness.session.mode, Mode::Jungian);
         assert_eq!(harness.profile.mode, Mode::Jungian);
+        assert_eq!(
+            memory
+                .session_catalog_record(&session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mode,
+            Mode::Jungian
+        );
         assert_ne!(
             harness
                 .topology
@@ -3906,6 +4588,73 @@ mod publication_tests {
         );
         assert!(harness.pending_publication.is_none());
         harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_mode_checkpoint_keeps_live_and_retained_mode_unchanged() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let config = Config {
+            mode: Mode::Ifs,
+            provider: "demo".into(),
+            model: "demo".into(),
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        };
+        let mut harness = Harness::new(
+            config.clone(),
+            project.path(),
+            memory.clone(),
+            Arc::new(DemoProvider),
+            None,
+        )
+        .await
+        .unwrap();
+        let session_id = harness.session.id.clone();
+        memory
+            .rename_session(&session_id, 0, "renamed")
+            .await
+            .unwrap();
+        let before = memory.revision().await.unwrap();
+        let error = harness.set_mode(Mode::Jungian).await.unwrap_err();
+        assert!(error.to_string().contains("generation"), "{error:#}");
+        assert_eq!(memory.revision().await.unwrap(), before);
+        assert_eq!(harness.config.mode, Mode::Ifs);
+        assert_eq!(harness.profile.mode, Mode::Ifs);
+        assert_eq!(harness.session.mode, Mode::Ifs);
+        assert_eq!(
+            memory
+                .session_catalog_record(&session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mode,
+            Mode::Ifs
+        );
+        assert!(
+            memory
+                .get(&format!("{}/jungian/topology", harness.scope))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        harness.reconcile().await.unwrap();
+        assert!(harness.pending_publication.is_none());
+        drop(harness);
+        let resumed = Harness::new(
+            config,
+            project.path(),
+            memory.clone(),
+            Arc::new(DemoProvider),
+            Some(&session_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.session.mode, Mode::Ifs);
+        assert_eq!(resumed.session.label, "renamed");
+        drop(resumed);
         memory.close().await.unwrap();
     }
 
@@ -4013,6 +4762,20 @@ mod publication_tests {
         assert_eq!(serde_json::to_string(&retry).unwrap(), serialized);
         assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
         assert_eq!(first.history().await.unwrap().len(), 2);
+        let public = memory
+            .public_transcript_page(&first.session.id, None, 16)
+            .await
+            .unwrap();
+        assert!(public.pending.is_none());
+        assert!(matches!(
+            public.records.as_slice(),
+            [kuru_memory::PublicTranscriptEntry::Turn { record }]
+                if record.turn_id == "shared-external-id"
+                    && record.settlement == PublicTurnSettlement::Completed
+                    && record.speaker_id.as_deref() == Some(output.speaker.as_str())
+                    && record.user_entry == Some(user("one durable request"))
+                    && record.terminal_entries == [assistant(&output.text)]
+        ));
         memory.put(&topology_key, &valid_topology).await.unwrap();
         assert!(
             first
@@ -4140,13 +4903,230 @@ mod publication_tests {
             )
             .await
             .unwrap();
-        assert!(matches!(admission, TurnAdmission::Run { .. }));
+        let TurnAdmission::Run { key, journal, .. } = admission else {
+            panic!("safe local request was not admitted")
+        };
+        harness.record_interruption(&key, journal).await.unwrap();
+        let pending = memory
+            .public_transcript_page(&harness.session.id, None, 16)
+            .await
+            .unwrap();
+        assert!(matches!(
+            pending.pending.as_ref(),
+            Some(record)
+                if record.settlement == PublicTurnSettlement::Pending
+                    && record.terminal_entries
+                        == [Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT)]
+        ));
 
         let retried = harness.retry_last(&CancellationToken::new()).await.unwrap();
 
         assert!(!retried.reused);
-        assert_eq!(harness.history().await.unwrap().len(), 2);
+        assert_eq!(harness.history().await.unwrap().len(), 3);
+        let settled = memory
+            .public_transcript_page(&harness.session.id, None, 16)
+            .await
+            .unwrap();
+        assert!(settled.pending.is_none());
+        assert!(matches!(
+            settled.records.as_slice(),
+            [kuru_memory::PublicTranscriptEntry::Turn { record }]
+                if record.settlement == PublicTurnSettlement::Completed
+                    && record.terminal_entries.first()
+                        == Some(&Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT))
+        ));
         assert!(provider.calls.load(Ordering::SeqCst) > 0);
+        harness.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_safe_retry_parks_one_empty_continuation_without_moving_its_marker() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(CountingProvider::default());
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let target = harness.topology.parts[0].id.clone();
+        let TurnAdmission::Run { key, journal, .. } = harness
+            .admit_turn(
+                "old safe request",
+                Some(&target),
+                "old-safe-id",
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("old safe request was not admitted")
+        };
+        harness.record_interruption(&key, journal).await.unwrap();
+        harness
+            .run_controlled(
+                "later request",
+                Some(&target),
+                "later-id",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let TurnAdmission::Run {
+            key,
+            journal,
+            resolved_target: _,
+        } = harness
+            .admit_turn(
+                "old safe request",
+                Some(&target),
+                "old-safe-id",
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("older safe request was not resumed")
+        };
+        let before_revision = memory.revision().await.unwrap();
+        let before_journal = memory.get(&key).await.unwrap();
+        let calls_before_second_safe_stop = provider.calls.load(Ordering::SeqCst);
+        let before_public = memory
+            .public_transcript_page(&harness.session.id, None, 16)
+            .await
+            .unwrap();
+        assert!(matches!(
+            before_public.pending.as_ref(),
+            Some(record)
+                if record.kind == kuru_memory::PublicTurnKind::Continuation
+                    && record.terminal_entries.is_empty()
+                    && record.speaker_id.is_none()
+        ));
+
+        // The logical turn already owns its one durable interruption marker.
+        // A second safe stop therefore returns before any checkpoint: there is
+        // no new public content whose chronological position could be moved.
+        assert!(
+            harness
+                .record_interruption(&key, journal)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(memory.revision().await.unwrap(), before_revision);
+        assert_eq!(memory.get(&key).await.unwrap(), before_journal);
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            calls_before_second_safe_stop
+        );
+        assert_eq!(
+            memory
+                .public_transcript_page(&harness.session.id, None, 16)
+                .await
+                .unwrap(),
+            before_public
+        );
+
+        harness
+            .run_controlled(
+                "newest request",
+                Some(&target),
+                "newest-id",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let before_final_retry = memory
+            .public_transcript_page(&harness.session.id, None, 16)
+            .await
+            .unwrap();
+        assert!(before_final_retry.pending.is_none());
+        assert_eq!(
+            before_final_retry
+                .records
+                .iter()
+                .filter_map(|entry| match entry {
+                    kuru_memory::PublicTranscriptEntry::Turn { record } => Some(record),
+                    kuru_memory::PublicTranscriptEntry::Legacy { .. } => None,
+                })
+                .flat_map(|record| record.terminal_entries.iter())
+                .filter(|message| message.role == INTERRUPTION_ROLE)
+                .count(),
+            1
+        );
+
+        harness
+            .run_controlled(
+                "old safe request",
+                Some(&target),
+                "old-safe-id",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let settled = memory
+            .public_transcript_page(&harness.session.id, None, 16)
+            .await
+            .unwrap();
+        assert!(settled.pending.is_none());
+        let turns = settled
+            .records
+            .iter()
+            .filter_map(|entry| match entry {
+                kuru_memory::PublicTranscriptEntry::Turn { record } => Some(record),
+                kuru_memory::PublicTranscriptEntry::Legacy { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(turns.len(), 4);
+        assert_eq!(
+            turns
+                .iter()
+                .filter(|record| record.user_entry.is_some())
+                .count(),
+            3
+        );
+        assert_eq!(
+            turns
+                .iter()
+                .flat_map(|record| record.terminal_entries.iter())
+                .filter(|message| message.role == INTERRUPTION_ROLE)
+                .count(),
+            1
+        );
+        assert!(turns.iter().any(|record| {
+            record.kind == kuru_memory::PublicTurnKind::Continuation
+                && record.turn_id == "old-safe-id"
+                && record.settlement == PublicTurnSettlement::Completed
+                && record.user_entry.is_none()
+        }));
+        assert_eq!(
+            harness.history().await.unwrap(),
+            [
+                user("old safe request"),
+                Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT),
+                user("later request"),
+                assistant("durable answer"),
+                user("newest request"),
+                assistant("durable answer"),
+                assistant("durable answer")
+            ]
+        );
+        assert!(provider.calls.load(Ordering::SeqCst) > calls_before_second_safe_stop);
         harness.shutdown(false).await.unwrap();
         memory.close().await.unwrap();
     }
@@ -4217,6 +5197,20 @@ mod publication_tests {
                 .count(),
             1
         );
+        let public = memory
+            .public_transcript_page(&harness.session.id, None, 16)
+            .await
+            .unwrap();
+        assert!(public.pending.is_none());
+        assert!(matches!(
+            public.records.as_slice(),
+            [kuru_memory::PublicTranscriptEntry::Turn { record }]
+                if record.turn_id == "legacy-interrupted"
+                    && record.settlement == PublicTurnSettlement::Interrupted
+                    && record.speaker_id.as_deref() == Some(INTERRUPTION_ROLE)
+                    && record.terminal_entries
+                        == [Message::text(INTERRUPTION_ROLE, INTERRUPTION_TEXT)]
+        ));
 
         harness.record_interruption(&key, stored).await.unwrap();
         assert_eq!(
@@ -4434,9 +5428,36 @@ mod publication_tests {
         else {
             panic!("new journal must be runnable");
         };
+        let first_journal = decode_turn_journal(
+            memory
+                .get(&first.turn_journal_key("started"))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_journal.admitted_transcript_row, Some(1));
+        first.shutdown(false).await.unwrap();
+        let mut uncertain = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let uncertain_session = uncertain.session.id.clone();
         let TurnAdmission::Run {
             key, mut journal, ..
-        } = first
+        } = uncertain
             .admit_turn(
                 "remain uncertain",
                 Some(&target),
@@ -4449,14 +5470,14 @@ mod publication_tests {
         else {
             panic!("new journal must be runnable");
         };
-        first
+        uncertain
             .mark_possible_dispatch(&key, &mut journal, &cancellation)
             .await
             .unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-        first.shutdown(false).await.unwrap();
+        uncertain.shutdown(false).await.unwrap();
         memory.close().await.unwrap();
-        drop(first);
+        drop((first, uncertain));
 
         let memory = MemoryStore::open(options).await.unwrap();
         let mut resumed = Harness::new(
@@ -4486,33 +5507,6 @@ mod publication_tests {
             .unwrap();
         let sends = provider.calls.load(Ordering::SeqCst);
         assert!(sends > 0);
-        let error = resumed
-            .run_controlled(
-                "remain uncertain",
-                Some(&target),
-                "possible",
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("may have reached external work"));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
-        assert_eq!(
-            resumed.history().await.unwrap(),
-            [
-                user("resume safely"),
-                user("remain uncertain"),
-                assistant("durable answer"),
-            ]
-        );
-        let private = resumed.memory_for(&target).await.unwrap();
-        assert_eq!(
-            private
-                .iter()
-                .map(|message| message.role.as_str())
-                .collect::<Vec<_>>(),
-            ["user", "assistant", "user", "assistant"]
-        );
         let journal: TurnJournal = serde_json::from_value(
             memory
                 .get(&resumed.turn_journal_key("started"))
@@ -4530,13 +5524,393 @@ mod publication_tests {
                 TurnTransition::Ended
             ]
         ));
+        assert_eq!(journal.admitted_transcript_row, Some(1));
+        assert_eq!(
+            resumed.history().await.unwrap(),
+            [user("resume safely"), assistant("durable answer")]
+        );
         resumed.shutdown(false).await.unwrap();
+
+        let mut uncertain_resumed = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            Some(&uncertain_session),
+        )
+        .await
+        .unwrap();
+        let error = uncertain_resumed
+            .run_controlled(
+                "remain uncertain",
+                Some(&target),
+                "possible",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("may have reached external work"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), sends);
+        assert_eq!(
+            uncertain_resumed.history().await.unwrap(),
+            [user("remain uncertain")]
+        );
+        let private = uncertain_resumed.memory_for(&target).await.unwrap();
+        assert_eq!(
+            private
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "assistant", "user", "assistant"]
+        );
+        uncertain_resumed.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_resume_uses_the_typed_public_prefix_without_copying_raw_history() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let provider = Arc::new(CountingProvider::default());
+        let config = Config {
+            mode: Mode::Ifs,
+            provider: "demo".into(),
+            model: "demo".into(),
+            dream_every: 0,
+            dream_on_exit: false,
+            ..Config::default()
+        };
+        let mut parent = Harness::new(
+            config.clone(),
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let parent_id = parent.session.id.clone();
+        let target = parent.topology.parts[0].id.clone();
+        parent
+            .run_controlled(
+                "fork-parent-public-sentinel",
+                Some(&target),
+                "fork-parent-turn",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let parent_page = memory
+            .public_transcript_page(&parent_id, None, 16)
+            .await
+            .unwrap();
+        let PublicTranscriptEntry::Turn { record: selected } = &parent_page.records[0] else {
+            panic!("parent must have one settled public turn");
+        };
+        memory
+            .fork_session(
+                &parent_id,
+                parent.session.lifecycle_generation,
+                &selected.node_id,
+                "runtime-fork-child",
+                "runtime fork child",
+            )
+            .await
+            .unwrap();
+        let relation = parent
+            .relate(
+                RelationshipKind::Alliance,
+                parent.topology.parts[..2]
+                    .iter()
+                    .map(|part| part.id.clone())
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let actor_namespace = parent.checked_namespace(&target).unwrap();
+        let relation_namespace = parent.checked_namespace(&relation.id).unwrap();
+        for (namespace, sentinel) in [
+            (&actor_namespace, "parent-private-actor-only"),
+            (&relation_namespace, "parent-private-relationship-only"),
+        ] {
+            memory
+                .append_session_message(namespace, &parent_id, &Message::text("note", sentinel))
+                .await
+                .unwrap();
+            assert_eq!(
+                memory
+                    .session_history_window(namespace, "runtime-fork-child", 16)
+                    .await
+                    .unwrap()
+                    .total_rows,
+                0,
+                "fork inherited a raw private history row"
+            );
+        }
+        let shared_notes = format!("{}/notes", parent.checked_namespace(&target).unwrap());
+        memory
+            .append(
+                &shared_notes,
+                "note",
+                "current shared project note after fork",
+            )
+            .await
+            .unwrap();
+        parent.shutdown(false).await.unwrap();
+
+        let mut child = Harness::new(
+            config,
+            project.path(),
+            memory.clone(),
+            provider.clone(),
+            Some("runtime-fork-child"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(child.session.turns, 1);
+        assert_eq!(
+            child.session.last_completed_speaker.as_deref(),
+            Some(target.as_str())
+        );
+        assert!(
+            child
+                .notes_for(&target, 16)
+                .await
+                .unwrap()
+                .notes
+                .iter()
+                .any(|note| note.content == "current shared project note after fork")
+        );
+        assert!(child.history().await.unwrap().is_empty());
+        let active = child.sessions().await.unwrap();
+        assert!(
+            active
+                .iter()
+                .any(|record| record.catalog.session_id == parent_id)
+        );
+        assert!(
+            active
+                .iter()
+                .any(|record| record.catalog.session_id == "runtime-fork-child")
+        );
+        assert_eq!(
+            Harness::continuation_session(&memory, project.path())
+                .await
+                .unwrap(),
+            "runtime-fork-child"
+        );
+
+        let child_request_start = provider
+            .messages
+            .lock()
+            .expect("counting provider messages lock")
+            .len();
+        child
+            .run_controlled(
+                "fork-child-suffix",
+                Some(&target),
+                "fork-child-turn",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        {
+            let requests = provider
+                .messages
+                .lock()
+                .expect("counting provider messages lock");
+            assert!(requests.len() > child_request_start);
+            for messages in &requests[child_request_start..] {
+                let projected = serde_json::to_string(messages).unwrap();
+                assert!(!projected.contains("parent-private-actor-only"));
+                assert!(!projected.contains("parent-private-relationship-only"));
+            }
+        }
+        {
+            let requests = provider
+                .instructions
+                .lock()
+                .expect("counting provider instructions lock");
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.contains("fork-parent-public-sentinel")),
+                "fork resume omitted its typed inherited public prefix"
+            );
+        }
+        assert_eq!(
+            child.history().await.unwrap(),
+            [user("fork-child-suffix"), assistant("durable answer")]
+        );
+        let child_page = memory
+            .public_transcript_page("runtime-fork-child", None, 16)
+            .await
+            .unwrap();
+        assert_eq!(child_page.records.len(), 2);
+        child.shutdown(false).await.unwrap();
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_a_catalog_change_before_reset_or_publication() {
+        let project = tempfile::tempdir().unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        let mut harness = Harness::new(
+            Config {
+                mode: Mode::Ifs,
+                provider: "demo".into(),
+                model: "demo".into(),
+                dream_every: 0,
+                dream_on_exit: false,
+                ..Config::default()
+            },
+            project.path(),
+            memory.clone(),
+            Arc::new(CountingProvider::default()),
+            None,
+        )
+        .await
+        .unwrap();
+        let selected = harness.session.id.clone();
+        let operation = harness.operation_id.clone();
+        memory
+            .create_session("resume-race", Mode::Ifs, "captured")
+            .await
+            .unwrap();
+        let (reached, release) = harness.pause_before_next_resume_publication();
+        let harness = Arc::new(tokio::sync::Mutex::new(harness));
+        let running = tokio::spawn({
+            let harness = harness.clone();
+            async move { harness.lock().await.resume_session("resume-race").await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        let renamed = memory
+            .rename_session("resume-race", 0, "advanced")
+            .await
+            .unwrap();
+        assert_eq!(renamed.lifecycle_generation, 1);
+        release.send(()).unwrap();
+        let error = running.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session catalog changed while resuming"),
+            "unexpected stale resume error: {error:#}"
+        );
+        let mut harness = harness.lock().await;
+        assert_eq!(harness.session.id, selected);
+        assert_eq!(harness.operation_id, operation);
+        assert_ne!(harness.session.id, "resume-race");
+        harness.shutdown(false).await.unwrap();
+        drop(harness);
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_listing_rejects_a_catalog_change_during_projection() {
+        let project = tempfile::tempdir().unwrap();
+        let scope = project_scope(project.path()).unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        memory
+            .create_session("listing-race", Mode::Ifs, "captured")
+            .await
+            .unwrap();
+        let (reached_tx, reached) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let running = tokio::spawn({
+            let memory = memory.clone();
+            async move {
+                session_summaries_inner(
+                    &memory,
+                    &scope,
+                    Some(SessionLifecycleState::Active),
+                    Some(PublicationPause {
+                        reached: reached_tx,
+                        release: release_rx,
+                    }),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        memory
+            .rename_session("listing-race", 0, "advanced")
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        let error = running.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session catalog changed while its listing was assembled"),
+            "unexpected stale listing error: {error:#}"
+        );
+        memory.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_listing_rejects_a_new_session_after_its_catalog_page() {
+        let project = tempfile::tempdir().unwrap();
+        let scope = project_scope(project.path()).unwrap();
+        let memory = MemoryStore::temporary().await.unwrap();
+        memory
+            .create_session("first-listing", Mode::Ifs, "first")
+            .await
+            .unwrap();
+        let (reached_tx, reached) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let running = tokio::spawn({
+            let memory = memory.clone();
+            async move {
+                session_summaries_inner(
+                    &memory,
+                    &scope,
+                    Some(SessionLifecycleState::Active),
+                    Some(PublicationPause {
+                        reached: reached_tx,
+                        release: release_rx,
+                    }),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        memory
+            .create_session("second-listing", Mode::Ifs, "second")
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        let error = running.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session catalog changed while its listing was assembled"),
+            "unexpected stale listing error: {error:#}"
+        );
         memory.close().await.unwrap();
     }
 
     #[derive(Default)]
     struct CountingProvider {
         calls: std::sync::atomic::AtomicUsize,
+        instructions: std::sync::Mutex<Vec<String>>,
+        messages: std::sync::Mutex<Vec<Vec<Message>>>,
     }
 
     #[async_trait::async_trait]
@@ -4556,8 +5930,16 @@ mod publication_tests {
             Ok(vec![])
         }
 
-        async fn complete(&self, _request: kuru_core::CompletionRequest) -> Result<Completion> {
+        async fn complete(&self, request: kuru_core::CompletionRequest) -> Result<Completion> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.instructions
+                .lock()
+                .expect("counting provider instructions lock")
+                .push(request.instructions);
+            self.messages
+                .lock()
+                .expect("counting provider messages lock")
+                .push(request.messages);
             Ok(Completion::from_legacy("durable answer", vec![], 3, 2))
         }
     }
@@ -4988,13 +6370,7 @@ mod publication_tests {
                 },
             );
             let updates = harness
-                .state_updates(
-                    &memory,
-                    &harness.profile,
-                    &topology,
-                    &harness.session,
-                    vec![],
-                )
+                .state_updates(&harness.profile, &topology, &harness.session, vec![])
                 .await
                 .unwrap();
             memory.put_many(&updates).await.unwrap();

@@ -132,7 +132,12 @@ impl Provider for CapturingProvider {
 fn command_text(outcome: DispatchOutcome) -> String {
     match outcome {
         DispatchOutcome::Command(text) => text,
-        DispatchOutcome::Turn(_) => panic!("expected command feedback"),
+        DispatchOutcome::Session { .. }
+        | DispatchOutcome::Sessions(_)
+        | DispatchOutcome::SessionBoundaries { .. }
+        | DispatchOutcome::Turn(_) => {
+            panic!("expected command feedback")
+        }
     }
 }
 
@@ -214,7 +219,12 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
     assert_eq!(h.topology.relationships.len(), 1);
     let first = match dispatch(&mut h, &models, "hello").await.unwrap() {
         DispatchOutcome::Turn(result) => result,
-        DispatchOutcome::Command(_) => panic!("ordinary input did not run a turn"),
+        DispatchOutcome::Command(_)
+        | DispatchOutcome::Session { .. }
+        | DispatchOutcome::Sessions(_)
+        | DispatchOutcome::SessionBoundaries { .. } => {
+            panic!("ordinary input did not run a turn")
+        }
     };
     assert!(!first.reused);
     let usage_before_retry = h.session_usage().await.unwrap();
@@ -227,7 +237,12 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
     let history = h.history().await.unwrap();
     let retry = match dispatch(&mut h, &models, "/retry").await.unwrap() {
         DispatchOutcome::Turn(result) => result,
-        DispatchOutcome::Command(_) => panic!("retry did not return a turn"),
+        DispatchOutcome::Command(_)
+        | DispatchOutcome::Session { .. }
+        | DispatchOutcome::Sessions(_)
+        | DispatchOutcome::SessionBoundaries { .. } => {
+            panic!("retry did not return a turn")
+        }
     };
     assert!(retry.reused);
     assert_eq!(retry.output.text, first.output.text);
@@ -404,6 +419,143 @@ async fn compact_command_dispatches_locally_and_reports_exact_retained_range() {
     assert_eq!(provider.requests().len(), 1);
     harness.shutdown(false).await.unwrap();
     source.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_commands_switch_and_export_without_provider_dispatch() {
+    let memory = temporary_memory().await;
+    let provider = CapturingProvider::new();
+    let (directory, mut harness, models) = harness_with_provider(memory, provider.clone()).await;
+    let original = harness.session.id.clone();
+
+    let listed = dispatch(&mut harness, &models, "/sessions").await.unwrap();
+    assert!(matches!(
+        listed,
+        DispatchOutcome::Sessions(sessions)
+            if sessions.iter().any(|session| session.id == original)
+    ));
+    let created = dispatch(&mut harness, &models, "/new").await.unwrap();
+    let DispatchOutcome::Session { initial, .. } = created else {
+        panic!("new session did not refresh the visible session")
+    };
+    let fresh = initial.session;
+    assert_ne!(fresh, original);
+    assert!(initial.transcript.is_empty());
+    assert!(provider.requests().is_empty());
+
+    let resumed = dispatch(&mut harness, &models, &format!("/resume {original}"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        resumed,
+        DispatchOutcome::Session { initial, .. } if initial.session == original
+    ));
+    let turn = dispatch(&mut harness, &models, "create a settled fork boundary")
+        .await
+        .unwrap();
+    assert!(matches!(turn, DispatchOutcome::Turn(_)));
+    let turn_requests = provider.requests().len();
+    assert!(turn_requests > 0);
+    let sessions = match dispatch(&mut harness, &models, "/sessions").await.unwrap() {
+        DispatchOutcome::Sessions(sessions) => sessions,
+        _ => panic!("sessions command did not return the catalog"),
+    };
+    let node = sessions
+        .iter()
+        .find(|session| session.id == original)
+        .and_then(|session| session.catalog.head_node_id.clone())
+        .unwrap();
+    let renamed = dispatch(
+        &mut harness,
+        &models,
+        &format!("/session-rename {fresh} retained label"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        renamed,
+        DispatchOutcome::Sessions(sessions)
+            if sessions.iter().any(|session| session.id == fresh && session.catalog.label == "retained label")
+    ));
+    let removed = dispatch(&mut harness, &models, &format!("/session-remove {fresh}"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        removed,
+        DispatchOutcome::Sessions(sessions)
+            if sessions.iter().any(|session| session.id == fresh && session.catalog.lifecycle_state == kuru_memory::SessionLifecycleState::Removed)
+    ));
+    let restored = dispatch(&mut harness, &models, &format!("/session-restore {fresh}"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        restored,
+        DispatchOutcome::Sessions(sessions)
+            if sessions.iter().any(|session| session.id == fresh && session.catalog.lifecycle_state == kuru_memory::SessionLifecycleState::Active)
+    ));
+    let boundaries = dispatch(
+        &mut harness,
+        &models,
+        &format!("/session-boundaries {original}"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        boundaries,
+        DispatchOutcome::SessionBoundaries { session_id, boundaries, next: None }
+            if session_id == original
+                && boundaries.iter().any(|boundary| boundary.node_id == node)
+    ));
+    assert_eq!(provider.requests().len(), turn_requests);
+    let forked = dispatch(
+        &mut harness,
+        &models,
+        &format!("/session-fork {original} {node} selected fork"),
+    )
+    .await
+    .unwrap();
+    let child = match forked {
+        DispatchOutcome::Session { initial, notice } => {
+            assert!(notice.contains("current project memory remains shared"));
+            initial.session
+        }
+        _ => panic!("fork command did not select its child"),
+    };
+    assert_ne!(child, original);
+    assert_ne!(child, fresh);
+    assert_eq!(provider.requests().len(), turn_requests);
+    let destination = directory.path().join("public session.md");
+    let feedback = command_text(
+        dispatch(
+            &mut harness,
+            &models,
+            &format!("/export {}", destination.display()),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(feedback.contains("Exported public session"));
+    let exported = std::fs::read_to_string(&destination).unwrap();
+    assert!(exported.contains("Kuru public session export"));
+    assert!(exported.contains(&child));
+    assert!(exported.contains(&original));
+    assert!(!exported.contains(&fresh));
+    std::fs::write(&destination, "selected destination sentinel").unwrap();
+    let feedback = command_text(
+        dispatch(
+            &mut harness,
+            &models,
+            &format!("/export {}", destination.display()),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(feedback.contains("Exported public session"));
+    let replaced = std::fs::read_to_string(&destination).unwrap();
+    assert!(replaced.contains("Kuru public session export"));
+    assert!(!replaced.contains("selected destination sentinel"));
+    assert_eq!(provider.requests().len(), turn_requests);
+    harness.shutdown(false).await.unwrap();
 }
 
 #[tokio::test]
@@ -741,7 +893,9 @@ async fn first_run_notice_is_drawn_before_input_then_persisted_outside_harness_h
         StorageRecord::Message { content, .. } => !content.contains("Memory is ready at"),
         StorageRecord::State { .. }
         | StorageRecord::ContextSummary { .. }
-        | StorageRecord::ContextCursor { .. } => true,
+        | StorageRecord::ContextCursor { .. }
+        | StorageRecord::SessionCatalog { .. }
+        | StorageRecord::PublicTurn { .. } => true,
     }));
     reopened.close().await.unwrap();
     drop(project);

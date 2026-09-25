@@ -2305,7 +2305,7 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
         crate::project_scope(dir.path()).unwrap(),
     )
     .unwrap();
-    let memory = MemoryStore::open(options).await.unwrap();
+    let memory = MemoryStore::open(options.clone()).await.unwrap();
     let mut harness = Harness::new(
         config.clone(),
         dir.path(),
@@ -2316,10 +2316,36 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
     .await
     .unwrap();
     harness.set_mode(Mode::Jungian).await.unwrap();
-    harness.run("retain this session").await.unwrap();
     let id = harness.session.id.clone();
+    assert_eq!(harness.session.turns, 0);
+    assert_eq!(
+        memory
+            .session_catalog_record(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .mode,
+        Mode::Jungian
+    );
+    drop(harness);
+    memory.close().await.unwrap();
+    let memory = MemoryStore::open(options.clone()).await.unwrap();
+    let mut harness = Harness::new(
+        config.clone(),
+        dir.path(),
+        memory.clone(),
+        fake.clone(),
+        Some(&id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(harness.config.mode, Mode::Jungian);
+    assert_eq!(harness.session.turns, 0);
+    harness.run("retain this session").await.unwrap();
     assert_eq!(harness.sessions().await.unwrap().len(), 1);
     drop(harness);
+    memory.close().await.unwrap();
+    let memory = MemoryStore::open(options).await.unwrap();
     let resumed = Harness::new(
         config.clone(),
         dir.path(),
@@ -2348,7 +2374,16 @@ async fn sessions_resume_mode_and_memory_and_projects_do_not_share_namespaces() 
         .await
         .is_err()
     );
-    let another = Harness::new(config, other.path(), memory, fake, None)
+    let other_memory = MemoryStore::open(
+        kuru_memory::test_support::open_options(
+            db.path().to_owned(),
+            crate::project_scope(other.path()).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let another = Harness::new(config, other.path(), other_memory, fake, None)
         .await
         .unwrap();
     assert_ne!(resumed.scope, another.scope);

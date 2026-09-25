@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::TryStreamExt;
-use kuru_core::{ContentBlock, MemoryConfig, Message};
+use kuru_core::{ContentBlock, MemoryConfig, Message, Mode};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,6 +58,12 @@ const CONTEXT_SUMMARY_FORMAT: &str = "context_summary.v1";
 const CONTEXT_SUMMARY_OPERATION_FORMAT: &str = "context_summary.operation.v2";
 pub const MAX_SESSION_SOURCE_ROWS: usize = 1024;
 pub const MAX_SESSION_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_SESSION_LABEL_BYTES: usize = 1024;
+pub const SESSION_CATALOG_RECORD_FORMAT: &str = "session_catalog.v1";
+pub const SESSION_LIFECYCLE_OUTCOME_FORMAT: &str = "session_lifecycle_outcome.v1";
+pub const PUBLIC_TURN_RECORD_FORMAT: &str = "public_turn.v1";
+pub const LEGACY_PREFIX_RECORD_FORMAT: &str = "legacy_prefix.v1";
+pub const FORK_PROVENANCE_RECORD_FORMAT: &str = "session_fork.v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReasoningSummaryRecord {
@@ -122,6 +128,7 @@ struct Shared {
     server: Server,
     directory: PathBuf,
     project_scope: String,
+    fixture_unbound_scope: bool,
     read_only: bool,
     write: Arc<Mutex<()>>,
     dream: Arc<Mutex<()>>,
@@ -331,6 +338,283 @@ pub struct ContextSummaryWindow {
     pub revision: String,
     pub records: Vec<ContextSummaryItem>,
     pub total_rows: u64,
+}
+
+/// Reversible durable lifecycle for one public conversation identity.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifecycleState {
+    Active,
+    Removed,
+}
+
+/// Immutable legacy transcript prefix proved from retained pre-v7 rows.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyTranscriptPrefix {
+    pub namespace: String,
+    pub source_session_id: String,
+    pub source_revision: String,
+    pub first_sequence: i64,
+    pub through_sequence: i64,
+    pub row_count: u64,
+    pub record_format: String,
+}
+
+/// Exact source identity recorded when one settled public prefix is forked.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionForkProvenance {
+    pub source_session_id: String,
+    pub source_node_id: String,
+    pub source_turn_id: String,
+    pub source_label: String,
+    pub shares_current_project_memory: bool,
+    pub record_format: String,
+}
+
+/// One versioned public session catalog row.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCatalogRecord {
+    pub session_id: String,
+    pub mode: Mode,
+    pub label: String,
+    pub created_order: u64,
+    pub updated_order: u64,
+    pub lifecycle_generation: u64,
+    pub lifecycle_state: SessionLifecycleState,
+    pub head_node_id: Option<String>,
+    pub pending_node_id: Option<String>,
+    pub legacy_prefix: Option<LegacyTranscriptPrefix>,
+    pub fork_provenance: Option<SessionForkProvenance>,
+    pub record_format: String,
+}
+
+/// Stable newest-first continuation for one catalog projection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCatalogCursor {
+    pub updated_order: u64,
+    pub session_id: String,
+}
+
+/// One bounded catalog page captured from an exact memory view and revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCatalogPage {
+    pub lifecycle_state: Option<SessionLifecycleState>,
+    pub view: String,
+    pub revision: String,
+    pub records: Vec<SessionCatalogRecord>,
+    pub total_rows: u64,
+    pub next: Option<SessionCatalogCursor>,
+}
+
+/// Definite lifecycle refusal proved before a catalog mutation commits.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifecycleRefusal {
+    AlreadyExists,
+    Missing,
+    GenerationChanged,
+    AlreadyActive,
+    AlreadyRemoved,
+    SourceRemoved,
+    SourceNodeMissing,
+    SourceNodePending,
+    SourceNodeUnreachable,
+}
+
+/// Typed definite-no-effect result for one checked session lifecycle request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionLifecycleRejected(pub SessionLifecycleRefusal);
+
+impl std::fmt::Display for SessionLifecycleRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "session lifecycle request was rejected: {:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SessionLifecycleRejected {}
+
+/// Immutable receipt result for one committed lifecycle mutation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionLifecycleOutcome {
+    pub session_id: String,
+    pub lifecycle_generation: u64,
+    pub lifecycle_state: SessionLifecycleState,
+    pub updated_order: u64,
+    pub record_format: String,
+}
+
+/// Exact pre-v7 journal and immutable prefix proof for one safe legacy resume.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacySessionTurnResume {
+    pub legacy_prefix: LegacyTranscriptPrefix,
+    pub journal_key: String,
+    pub expected_journal: Value,
+}
+
+/// One public-turn transition folded into the existing session checkpoint.
+/// The checkpoint's messages provide the exact public entry bytes; this value
+/// carries only the catalog authority and transition identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "transition", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionTurnCheckpoint {
+    Admit {
+        expected_generation: u64,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// Raw transcript row count observed before this admission. The store
+        /// checks it inside the user/public/journal transaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_transcript_rows: Option<u64>,
+    },
+    MarkRetryableInterruption {
+        expected_generation: u64,
+        turn_id: String,
+        speaker_id: String,
+    },
+    Resume {
+        expected_generation: u64,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy: Option<LegacySessionTurnResume>,
+    },
+    Settle {
+        expected_generation: u64,
+        turn_id: String,
+        settlement: PublicTurnSettlement,
+        speaker_id: String,
+    },
+}
+
+/// Checked current-mode change committed with the retained runtime state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionModeCheckpoint {
+    pub expected_generation: u64,
+    pub expected_mode: Mode,
+    pub mode: Mode,
+}
+
+/// Definite no-effect refusal for a checked public-turn transition.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTurnRefusal {
+    SessionMissing,
+    SessionRemoved,
+    GenerationChanged,
+    PendingTurnExists,
+    PendingTurnMissing,
+    PendingTurnChanged,
+    TurnAlreadyExists,
+    TurnAlreadySettled,
+    RetryableInterruptionAlreadyMarked,
+    LegacyPrefixChanged,
+    LegacyJournalChanged,
+    LabelChanged,
+    TranscriptChanged,
+}
+
+/// Typed public-turn rejection proved before the checkpoint commits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionTurnRejected(pub SessionTurnRefusal);
+
+impl std::fmt::Display for SessionTurnRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "session turn checkpoint was rejected: {:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SessionTurnRejected {}
+
+/// The sole mutable phase transition of a public turn row.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicTurnSettlement {
+    Pending,
+    Completed,
+    Interrupted,
+}
+
+/// Whether a public node admits one user entry or continues an older exact ID.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicTurnKind {
+    Primary,
+    Continuation,
+    LegacyContinuation,
+}
+
+/// One pending or settled node in the immutable public predecessor chain.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicTurnRecord {
+    pub node_id: String,
+    pub origin_session_id: String,
+    pub turn_id: String,
+    pub kind: PublicTurnKind,
+    pub continuation_of_node_id: Option<String>,
+    pub predecessor_node_id: Option<String>,
+    pub settlement: PublicTurnSettlement,
+    pub user_entry: Option<Message>,
+    pub speaker_id: Option<String>,
+    pub terminal_entries: Vec<Message>,
+    pub record_format: String,
+}
+
+/// One honest public transcript entry from either the immutable v7 turn chain
+/// or the proven pre-v7 legacy prefix whose turn and speaker are unknown.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PublicTranscriptEntry {
+    Turn { record: PublicTurnRecord },
+    Legacy { sequence: i64, message: Message },
+}
+
+/// Typed continuation within one captured public transcript revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PublicTranscriptPosition {
+    Turn { node_id: String },
+    Legacy { sequence: i64 },
+}
+
+/// Opaque-to-callers continuation bound to one session, head and revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicTranscriptCursor {
+    pub session_id: String,
+    pub revision: String,
+    pub head_node_id: Option<String>,
+    pub next: PublicTranscriptPosition,
+}
+
+/// One bounded newest-first public transcript page.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicTranscriptPage {
+    pub session_id: String,
+    pub view: String,
+    pub revision: String,
+    pub head_node_id: Option<String>,
+    pub pending: Option<PublicTurnRecord>,
+    pub records: Vec<PublicTranscriptEntry>,
+    pub total_rows: u64,
+    pub next: Option<PublicTranscriptCursor>,
 }
 
 /// A conditional checkpoint was proved stale before any effect began.
@@ -1157,6 +1441,14 @@ pub use export::{ActiveExportSnapshot, ExportCursor, ExportPage, ExportProvenanc
 pub use usage_ledger::{UsageLedger, UsageProof};
 
 impl MemoryStore {
+    pub(crate) fn ensure_project_scope(&self, scope: &str) -> Result<()> {
+        ensure!(
+            self.shared.fixture_unbound_scope || self.shared.project_scope == scope,
+            "memory view belongs to a different canonical project"
+        );
+        Ok(())
+    }
+
     pub(crate) fn service_instance(&self) -> &str {
         self.shared.server.instance()
     }
@@ -1611,6 +1903,7 @@ impl MemoryStore {
             server,
             directory,
             project_scope: options.project_scope,
+            fixture_unbound_scope: temporary.is_some(),
             read_only: options.read_only,
             write: Arc::new(Mutex::new(())),
             dream: Arc::new(Mutex::new(())),
@@ -2002,6 +2295,593 @@ impl MemoryStore {
             total_rows: u64::try_from(total_rows)
                 .context("session cursor history count is negative")?,
         })
+    }
+
+    /// Read one newest-first catalog page from an exact checked view. A
+    /// continuation is valid only at the captured revision and names the last
+    /// complete row retained in the previous response.
+    pub async fn session_catalog_page(
+        &self,
+        lifecycle_state: Option<SessionLifecycleState>,
+        cursor: Option<&SessionCatalogCursor>,
+        expected_revision: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionCatalogPage> {
+        self.readable()?;
+        ensure!(
+            limit <= MAX_SESSION_SOURCE_ROWS,
+            "session catalog limit cannot exceed {MAX_SESSION_SOURCE_ROWS}"
+        );
+        if let Some(cursor) = cursor {
+            validate_session_catalog_cursor(cursor)?;
+        }
+        if let Some(revision) = expected_revision {
+            validate_revision_identity("session catalog expected revision", revision)?;
+            ensure!(cursor.is_some(), "catalog revision requires a continuation");
+        }
+        ensure!(
+            self.schema_version().await? >= 7,
+            "session catalog requires an upgraded memory view"
+        );
+        let _guard = self.shared.write.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        let captured_revision: String = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')").fetch_one(&mut *transaction),
+        )
+        .await
+        .context("session catalog revision deadline exceeded")??;
+        if let Some(expected) = expected_revision {
+            ensure!(
+                captured_revision == expected,
+                "session catalog continuation revision changed"
+            );
+        }
+        let state = lifecycle_state.map(session_lifecycle_sql);
+        let total_rows: i64 = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_catalog WHERE ? IS NULL OR lifecycle_state = ?",
+            )
+            .bind(state)
+            .bind(state)
+            .fetch_one(&mut *transaction),
+        )
+        .await
+        .context("session catalog count deadline exceeded")??;
+        let cursor_order = cursor
+            .map(|cursor| i64::try_from(cursor.updated_order))
+            .transpose()
+            .context("session catalog cursor order exceeds SQL range")?;
+        let cursor_id = cursor.map(|cursor| cursor.session_id.as_bytes());
+        let query_limit = i64::try_from(limit.saturating_add(1))
+            .context("session catalog query limit exceeds SQL range")?;
+        let mut source = sqlx::query(
+            "SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE (? IS NULL OR lifecycle_state = ?) AND (? IS NULL OR updated_order < ? OR (updated_order = ? AND session_id > ?)) ORDER BY updated_order DESC, session_id ASC LIMIT ?",
+        )
+        .bind(state)
+        .bind(state)
+        .bind(cursor_order)
+        .bind(cursor_order)
+        .bind(cursor_order)
+        .bind(cursor_id)
+        .bind(query_limit)
+        .fetch(&mut *transaction);
+        let mut records = Vec::new();
+        let mut budget = SessionSourceBudget::new(limit);
+        let mut has_more = false;
+        while let Some(row) = tokio::time::timeout(QUERY_TIMEOUT, source.try_next())
+            .await
+            .context("session catalog row deadline exceeded")??
+        {
+            let record = decode_session_catalog_row(&row)?;
+            if lifecycle_state.is_some_and(|state| state != record.lifecycle_state) {
+                bail!("session catalog query returned a different lifecycle state");
+            }
+            let row_bytes = serde_json::to_vec(&record)?.len();
+            ensure!(
+                !records.is_empty() || row_bytes <= MAX_SESSION_SOURCE_BYTES,
+                "stored session catalog row exceeds the response byte bound"
+            );
+            if !budget.try_include(row_bytes)? {
+                has_more = true;
+                break;
+            }
+            records.push(record);
+        }
+        drop(source);
+        transaction.commit().await?;
+        let next = has_more.then(|| {
+            let last = records
+                .last()
+                .expect("a continuation requires one retained catalog row");
+            SessionCatalogCursor {
+                updated_order: last.updated_order,
+                session_id: last.session_id.clone(),
+            }
+        });
+        let page = SessionCatalogPage {
+            lifecycle_state,
+            view: self.branch.clone(),
+            revision: captured_revision,
+            records,
+            total_rows: u64::try_from(total_rows).context("session catalog count is negative")?,
+            next,
+        };
+        validate_session_catalog_page(&page)?;
+        Ok(page)
+    }
+
+    /// Read the current exact catalog row for one session identity.
+    pub async fn session_catalog_record(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionCatalogRecord>> {
+        self.readable()?;
+        session_identity("session identity", session_id, 128)?;
+        ensure!(
+            self.schema_version().await? >= 7,
+            "session catalog requires an upgraded memory view"
+        );
+        let row = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id = ?")
+                .bind(session_id.as_bytes())
+                .fetch_optional(self.pool.as_ref()),
+        )
+        .await
+        .context("session catalog record deadline exceeded")??;
+        row.map(|row| decode_session_catalog_row(&row)).transpose()
+    }
+
+    pub async fn create_session_catalog(
+        &self,
+        session_id: &str,
+        mode: Mode,
+        label: &str,
+    ) -> Result<SessionLifecycleOutcome> {
+        validate_session_lifecycle_input(session_id, None, Some(label))?;
+        self.mutate_session_catalog(
+            "create session",
+            SessionLifecycleMutation::Create {
+                session_id: session_id.into(),
+                mode,
+                label: label.into(),
+            },
+        )
+        .await
+    }
+
+    pub async fn rename_session_catalog(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+        label: &str,
+    ) -> Result<SessionLifecycleOutcome> {
+        validate_session_lifecycle_input(session_id, Some(expected_generation), Some(label))?;
+        self.mutate_session_catalog(
+            "rename session",
+            SessionLifecycleMutation::Rename {
+                session_id: session_id.into(),
+                expected_generation,
+                label: label.into(),
+            },
+        )
+        .await
+    }
+
+    pub async fn remove_session_catalog(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+    ) -> Result<SessionLifecycleOutcome> {
+        validate_session_lifecycle_input(session_id, Some(expected_generation), None)?;
+        self.mutate_session_catalog(
+            "remove session",
+            SessionLifecycleMutation::Remove {
+                session_id: session_id.into(),
+                expected_generation,
+            },
+        )
+        .await
+    }
+
+    pub async fn restore_session_catalog(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+    ) -> Result<SessionLifecycleOutcome> {
+        validate_session_lifecycle_input(session_id, Some(expected_generation), None)?;
+        self.mutate_session_catalog(
+            "restore session",
+            SessionLifecycleMutation::Restore {
+                session_id: session_id.into(),
+                expected_generation,
+            },
+        )
+        .await
+    }
+
+    pub async fn fork_session_catalog(
+        &self,
+        source_session_id: &str,
+        expected_source_generation: u64,
+        source_node_id: &str,
+        child_session_id: &str,
+        label: &str,
+    ) -> Result<SessionLifecycleOutcome> {
+        validate_session_fork_input(
+            source_session_id,
+            expected_source_generation,
+            source_node_id,
+            child_session_id,
+            label,
+        )?;
+        self.mutate_session_catalog(
+            "fork session",
+            SessionLifecycleMutation::Fork {
+                source_session_id: source_session_id.into(),
+                expected_source_generation,
+                source_node_id: source_node_id.into(),
+                child_session_id: child_session_id.into(),
+                label: label.into(),
+                validated: None,
+            },
+        )
+        .await
+    }
+
+    async fn mutate_session_catalog(
+        &self,
+        label: &str,
+        mutation: SessionLifecycleMutation,
+    ) -> Result<SessionLifecycleOutcome> {
+        self.writable()?;
+        ensure!(
+            self.schema_version().await? >= 7,
+            "session lifecycle requires an upgraded memory view"
+        );
+        let guard = self.shared.write.clone().lock_owned().await;
+        self.resolve_uncertain().await?;
+        if let Some(receipt) = &self.logical_receipt
+            && operation_receipt_matches(&self.pool, receipt).await?
+        {
+            return load_session_lifecycle_outcome(
+                &self.pool,
+                &receipt.physical_id,
+                mutation.session_id(),
+            )
+            .await;
+        }
+        let store = self.clone();
+        let label = label.to_owned();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let logical = store.logical_receipt.clone();
+            let operation = logical.as_ref().map_or_else(
+                || Uuid::new_v4().to_string(),
+                |receipt| receipt.physical_id.clone(),
+            );
+            let session_id = mutation.session_id().to_owned();
+            let (mut connection, id) = owned_connection(&store.pool).await?;
+            let mutation = match mutation {
+                SessionLifecycleMutation::Fork {
+                    source_session_id,
+                    expected_source_generation,
+                    source_node_id,
+                    child_session_id,
+                    label,
+                    validated: None,
+                } => {
+                    let validated = tokio::time::timeout(
+                        QUERY_TIMEOUT,
+                        validate_session_fork_source(
+                            &mut connection,
+                            &source_session_id,
+                            expected_source_generation,
+                            &source_node_id,
+                        ),
+                    )
+                    .await
+                    .context("session fork predecessor traversal deadline exceeded")??;
+                    SessionLifecycleMutation::Fork {
+                        source_session_id,
+                        expected_source_generation,
+                        source_node_id,
+                        child_session_id,
+                        label,
+                        validated: Some(Box::new(validated)),
+                    }
+                }
+                mutation => mutation,
+            };
+            *store.shared.uncertain.lock().expect("uncertain lock") = Some(Pending {
+                pool: store.pool.clone(),
+                connection: id,
+                receipt: Receipt::Operation(operation.clone()),
+            });
+            let result = tokio::time::timeout(
+                QUERY_TIMEOUT,
+                apply_session_lifecycle(
+                    &mut connection,
+                    &operation,
+                    &label,
+                    mutation,
+                    logical.as_ref(),
+                ),
+            )
+            .await;
+            drop(connection);
+            if let Ok(Ok(outcome)) = result {
+                *store.shared.uncertain.lock().expect("uncertain lock") = None;
+                return Ok(outcome);
+            }
+            if store.resolve_uncertain().await? == Some(true) {
+                return load_session_lifecycle_outcome(&store.pool, &operation, &session_id).await;
+            }
+            result.context("session lifecycle write deadline exceeded")??;
+            bail!("session lifecycle mutation did not produce its durable receipt")
+        })
+        .await
+        .context("session lifecycle write worker failed")?
+    }
+
+    /// Read one newest-first page of the selected session's public transcript.
+    /// The continuation is accepted only at the exact captured revision and
+    /// after its next turn is proved reachable from the captured session head.
+    pub async fn public_transcript_page(
+        &self,
+        session_id: &str,
+        cursor: Option<&PublicTranscriptCursor>,
+        limit: usize,
+    ) -> Result<PublicTranscriptPage> {
+        self.readable()?;
+        session_identity("public transcript session", session_id, 128)?;
+        ensure!(
+            limit <= MAX_SESSION_SOURCE_ROWS,
+            "public transcript limit cannot exceed {MAX_SESSION_SOURCE_ROWS}"
+        );
+        if let Some(cursor) = cursor {
+            validate_public_transcript_cursor(cursor)?;
+            ensure!(
+                cursor.session_id == session_id,
+                "public transcript continuation changed session"
+            );
+        }
+        ensure!(
+            self.schema_version().await? >= 7,
+            "public transcript requires an upgraded memory view"
+        );
+
+        let _guard = self.shared.write.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        let captured_revision: String = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query_scalar("SELECT DOLT_HASHOF('HEAD')").fetch_one(&mut *transaction),
+        )
+        .await
+        .context("public transcript revision deadline exceeded")??;
+        if let Some(cursor) = cursor {
+            ensure!(
+                cursor.revision == captured_revision,
+                "public transcript continuation revision changed"
+            );
+        }
+
+        let catalog_row = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id = ?")
+                .bind(session_id.as_bytes())
+                .fetch_optional(&mut *transaction),
+        )
+        .await
+        .context("public transcript catalog deadline exceeded")??
+        .context("public transcript session does not exist")?;
+        let catalog = decode_session_catalog_row(&catalog_row)?;
+        ensure!(
+            catalog.session_id == session_id,
+            "public transcript catalog returned a different session"
+        );
+        if let Some(cursor) = cursor {
+            ensure!(
+                cursor.head_node_id == catalog.head_node_id,
+                "public transcript continuation head changed"
+            );
+        }
+
+        let pending = if let Some(pending_node_id) = &catalog.pending_node_id {
+            let pending = tokio::time::timeout(
+                QUERY_TIMEOUT,
+                load_public_turn(&mut transaction, pending_node_id),
+            )
+            .await
+            .context("public transcript pending turn deadline exceeded")??
+            .context("session catalog pending turn does not exist")?;
+            ensure!(
+                pending.origin_session_id == session_id
+                    && pending.settlement == PublicTurnSettlement::Pending,
+                "session catalog pending turn coordinates are invalid"
+            );
+            Some(pending)
+        } else {
+            None
+        };
+
+        let page_head = catalog.head_node_id.clone();
+        let requested = cursor.map(|cursor| cursor.next.clone()).or_else(|| {
+            page_head
+                .clone()
+                .map(|node_id| PublicTranscriptPosition::Turn { node_id })
+                .or_else(|| {
+                    catalog
+                        .legacy_prefix
+                        .as_ref()
+                        .map(|prefix| PublicTranscriptPosition::Legacy {
+                            sequence: prefix.through_sequence,
+                        })
+                })
+        });
+        if let Some(PublicTranscriptPosition::Legacy { sequence }) = &requested {
+            let prefix = catalog
+                .legacy_prefix
+                .as_ref()
+                .context("public transcript has no legacy prefix")?;
+            ensure!(
+                *sequence >= prefix.first_sequence && *sequence <= prefix.through_sequence,
+                "public transcript legacy continuation is outside the proven prefix"
+            );
+        }
+
+        let mut records = Vec::new();
+        let mut budget = SessionSourceBudget::new(limit);
+        let mut next = None;
+        let mut turn_count = 0_u64;
+        let mut found_requested_turn =
+            !matches!(requested, Some(PublicTranscriptPosition::Turn { .. }));
+        let mut current = page_head.clone();
+        tokio::time::timeout(QUERY_TIMEOUT, async {
+            while let Some(node_id) = current {
+                let record = load_public_turn(&mut transaction, &node_id)
+                    .await?
+                    .context("public transcript predecessor turn does not exist")?;
+                ensure!(
+                    record.node_id == node_id
+                        && record.settlement != PublicTurnSettlement::Pending,
+                    "public transcript chain contains an invalid settled turn"
+                );
+                turn_count = turn_count
+                    .checked_add(1)
+                    .context("public transcript turn count overflowed")?;
+                let is_requested = matches!(
+                    &requested,
+                    Some(PublicTranscriptPosition::Turn { node_id: requested }) if requested == &node_id
+                );
+                if is_requested {
+                    found_requested_turn = true;
+                }
+                if !matches!(requested, Some(PublicTranscriptPosition::Legacy { .. }))
+                    && found_requested_turn
+                    && next.is_none()
+                {
+                    let entry = PublicTranscriptEntry::Turn {
+                        record: record.clone(),
+                    };
+                    let row_bytes = serde_json::to_vec(&entry)?.len();
+                    ensure!(
+                        !records.is_empty() || row_bytes <= MAX_SESSION_SOURCE_BYTES,
+                        "stored public turn exceeds the response byte bound"
+                    );
+                    if budget.try_include(row_bytes)? {
+                        records.push(entry);
+                    } else {
+                        next = Some(PublicTranscriptPosition::Turn {
+                            node_id: node_id.clone(),
+                        });
+                    }
+                }
+                current = record.predecessor_node_id;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("public transcript predecessor traversal deadline exceeded")??;
+        ensure!(
+            found_requested_turn,
+            "public transcript continuation is not reachable from the captured head"
+        );
+
+        if next.is_none()
+            && let Some(prefix) = &catalog.legacy_prefix
+        {
+            let legacy_start = match &requested {
+                Some(PublicTranscriptPosition::Legacy { sequence }) => *sequence,
+                _ => prefix.through_sequence,
+            };
+            let mut source = sqlx::query("SELECT sequence, session_id, role, content_format, content FROM messages WHERE namespace = ? AND sequence >= ? AND sequence <= ? ORDER BY sequence DESC")
+                .bind(prefix.namespace.as_bytes())
+                .bind(prefix.first_sequence)
+                .bind(legacy_start)
+                .fetch(&mut *transaction);
+            while let Some(row) = tokio::time::timeout(QUERY_TIMEOUT, source.try_next())
+                .await
+                .context("legacy public transcript row deadline exceeded")??
+            {
+                let sequence: i64 = row.try_get("sequence")?;
+                let stored_session = row
+                    .try_get::<Option<Vec<u8>>, _>("session_id")?
+                    .map(String::from_utf8)
+                    .transpose()
+                    .context("legacy transcript session identity is not UTF-8")?;
+                ensure!(
+                    stored_session
+                        .as_deref()
+                        .is_none_or(|stored| stored == prefix.source_session_id),
+                    "legacy transcript row belongs to a different session"
+                );
+                let message = decode_message(
+                    String::from_utf8(row.try_get::<Vec<u8>, _>("role")?)
+                        .context("legacy transcript role is not UTF-8")?,
+                    &row.try_get::<String, _>("content_format")?,
+                    &row.try_get::<String, _>("content")?,
+                )?;
+                let entry = PublicTranscriptEntry::Legacy { sequence, message };
+                let row_bytes = serde_json::to_vec(&entry)?.len();
+                ensure!(
+                    !records.is_empty() || row_bytes <= MAX_SESSION_SOURCE_BYTES,
+                    "stored legacy transcript row exceeds the response byte bound"
+                );
+                if budget.try_include(row_bytes)? {
+                    records.push(entry);
+                } else {
+                    next = Some(PublicTranscriptPosition::Legacy { sequence });
+                    break;
+                }
+            }
+            drop(source);
+        }
+
+        let total_rows = turn_count
+            .checked_add(
+                catalog
+                    .legacy_prefix
+                    .as_ref()
+                    .map_or(0, |prefix| prefix.row_count),
+            )
+            .context("public transcript total count overflowed")?;
+        transaction.commit().await?;
+        let mut page = PublicTranscriptPage {
+            session_id: session_id.to_owned(),
+            view: self.branch.clone(),
+            revision: captured_revision,
+            head_node_id: page_head,
+            pending,
+            records,
+            total_rows,
+            next: next.map(|next| PublicTranscriptCursor {
+                session_id: session_id.to_owned(),
+                revision: String::new(),
+                head_node_id: None,
+                next,
+            }),
+        };
+        if let Some(next) = &mut page.next {
+            next.revision = page.revision.clone();
+            next.head_node_id = page.head_node_id.clone();
+        }
+        while serde_json::to_vec(&page)?.len() > MAX_SESSION_SOURCE_BYTES {
+            let removed = page
+                .records
+                .pop()
+                .context("public transcript metadata exceeds the response byte bound")?;
+            page.next = Some(PublicTranscriptCursor {
+                session_id: page.session_id.clone(),
+                revision: page.revision.clone(),
+                head_node_id: page.head_node_id.clone(),
+                next: public_transcript_entry_position(&removed),
+            });
+        }
+        validate_public_transcript_page(&page)?;
+        Ok(page)
     }
 
     /// Capture the next bounded session-private source page at this view's
@@ -2404,6 +3284,8 @@ impl MemoryStore {
                 session_id: None,
                 messages: encoded_messages,
                 values: encoded_state,
+                public_turn: None,
+                mode: None,
             },
         )
         .await
@@ -2418,10 +3300,84 @@ impl MemoryStore {
         messages: &[Message],
         values: &[(String, Value)],
     ) -> Result<()> {
+        self.checkpoint_session_inner(namespace, session_id, messages, values, None, None)
+            .await
+    }
+
+    /// Apply one public-turn admission or settlement inside the same receipt
+    /// and SQL transaction as its raw transcript and runtime state checkpoint.
+    pub async fn checkpoint_session_turn(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        messages: &[Message],
+        values: &[(String, Value)],
+        public_turn: &SessionTurnCheckpoint,
+    ) -> Result<()> {
+        let suffix = format!("/transcript/{session_id}");
+        let scope = namespace
+            .strip_suffix(&suffix)
+            .context("public turn transcript namespace does not match its session")?;
+        self.ensure_project_scope(scope)?;
+        self.checkpoint_session_inner(
+            namespace,
+            session_id,
+            messages,
+            values,
+            Some(public_turn),
+            None,
+        )
+        .await
+    }
+
+    pub async fn checkpoint_session_mode(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        values: &[(String, Value)],
+        mode: &SessionModeCheckpoint,
+    ) -> Result<()> {
+        let suffix = format!("/transcript/{session_id}");
+        let scope = namespace
+            .strip_suffix(&suffix)
+            .context("mode checkpoint transcript namespace does not match its session")?;
+        self.ensure_project_scope(scope)?;
+        self.checkpoint_session_inner(namespace, session_id, &[], values, None, Some(mode))
+            .await
+    }
+
+    async fn checkpoint_session_inner(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        messages: &[Message],
+        values: &[(String, Value)],
+        public_turn: Option<&SessionTurnCheckpoint>,
+        mode: Option<&SessionModeCheckpoint>,
+    ) -> Result<()> {
         validate_session_checkpoint(namespace, session_id, messages, values)?;
+        if let Some(public_turn) = public_turn {
+            validate_session_turn_checkpoint(session_id, messages, public_turn)?;
+        }
+        if let Some(mode) = mode {
+            validate_session_mode_checkpoint(namespace, session_id, messages, values, mode)?;
+        }
         ensure!(
-            self.schema_version().await? >= 5,
-            "session-attributed checkpoints require an upgraded memory view"
+            public_turn.is_none() || mode.is_none(),
+            "session checkpoint cannot change mode and public turn together"
+        );
+        ensure!(
+            self.schema_version().await?
+                >= if public_turn.is_some() || mode.is_some() {
+                    7
+                } else {
+                    5
+                },
+            if public_turn.is_some() || mode.is_some() {
+                "session catalog checkpoints require an upgraded memory view"
+            } else {
+                "session-attributed checkpoints require an upgraded memory view"
+            }
         );
         let mut encoded_messages = Vec::with_capacity(messages.len());
         for message in messages {
@@ -2429,6 +3385,9 @@ impl MemoryStore {
             encoded_messages.push((message.role.clone(), encode_typed_message(message)?));
         }
         let encoded_state = encode_state(values)?;
+        let public_turn = public_turn
+            .map(|checkpoint| encode_session_turn_checkpoint(checkpoint, messages).map(Box::new))
+            .transpose()?;
         ensure!(
             !encoded_messages.is_empty() || !encoded_state.is_empty(),
             "memory checkpoint must contain a message or state value"
@@ -2440,6 +3399,8 @@ impl MemoryStore {
                 session_id: Some(session_id.into()),
                 messages: encoded_messages,
                 values: encoded_state,
+                public_turn,
+                mode: mode.cloned(),
             },
         )
         .await
@@ -3168,6 +4129,129 @@ impl MemoryStore {
             .await?;
         Ok(())
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn fixture_insert_public_session(
+        &self,
+        catalog: &SessionCatalogRecord,
+        turns: &[PublicTurnRecord],
+    ) -> Result<()> {
+        self.writable()?;
+        validate_session_catalog(catalog)?;
+        for turn in turns {
+            validate_public_turn(turn)?;
+        }
+        let _guard = self.shared.write.lock().await;
+        let mut transaction = self.pool.begin().await?;
+        for record in turns {
+            sqlx::query("INSERT INTO session_public_turns (node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(&record.node_id)
+                .bind(record.origin_session_id.as_bytes())
+                .bind(record.turn_id.as_bytes())
+                .bind(match record.kind {
+                    PublicTurnKind::Primary => "primary",
+                    PublicTurnKind::Continuation => "continuation",
+                    PublicTurnKind::LegacyContinuation => "legacy",
+                })
+                .bind(record.continuation_of_node_id.as_deref())
+                .bind(record.predecessor_node_id.as_deref())
+                .bind(match record.settlement {
+                    PublicTurnSettlement::Pending => "pending",
+                    PublicTurnSettlement::Completed => "completed",
+                    PublicTurnSettlement::Interrupted => "interrupted",
+                })
+                .bind(record.user_entry.as_ref().map(serde_json::to_string).transpose()?)
+                .bind(record.speaker_id.as_deref().map(str::as_bytes))
+                .bind((!record.terminal_entries.is_empty()).then(|| serde_json::to_string(&record.terminal_entries)).transpose()?)
+                .bind(&record.record_format)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        sqlx::query("INSERT INTO session_catalog (session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(catalog.session_id.as_bytes())
+            .bind(serde_json::to_value(catalog.mode)?.as_str().context("session mode is not a string")?)
+            .bind(&catalog.label)
+            .bind(i64::try_from(catalog.created_order)?)
+            .bind(i64::try_from(catalog.updated_order)?)
+            .bind(i64::try_from(catalog.lifecycle_generation)?)
+            .bind(session_lifecycle_sql(catalog.lifecycle_state))
+            .bind(catalog.head_node_id.as_deref())
+            .bind(catalog.pending_node_id.as_deref())
+            .bind(catalog.legacy_prefix.as_ref().map(serde_json::to_string).transpose()?)
+            .bind(catalog.fork_provenance.as_ref().map(serde_json::to_string).transpose()?)
+            .bind(&catalog.record_format)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("CALL DOLT_COMMIT('-Am', 'public session fixture', '--author', ?)")
+            .bind(AUTHOR)
+            .fetch_all(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+}
+
+async fn validate_session_fork_source(
+    connection: &mut MySqlConnection,
+    source_session_id: &str,
+    expected_source_generation: u64,
+    source_node_id: &str,
+) -> Result<ValidatedSessionFork> {
+    let mut transaction = connection.begin().await?;
+    let source = sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id = ?")
+        .bind(source_session_id.as_bytes())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| decode_session_catalog_row(&row))
+        .transpose()?
+        .ok_or(SessionLifecycleRejected(SessionLifecycleRefusal::Missing))?;
+    if source.lifecycle_generation != expected_source_generation {
+        return Err(SessionLifecycleRejected(SessionLifecycleRefusal::GenerationChanged).into());
+    }
+    if source.lifecycle_state == SessionLifecycleState::Removed {
+        return Err(SessionLifecycleRejected(SessionLifecycleRefusal::SourceRemoved).into());
+    }
+
+    let selected = load_public_turn(&mut transaction, source_node_id)
+        .await?
+        .ok_or(SessionLifecycleRejected(
+            SessionLifecycleRefusal::SourceNodeMissing,
+        ))?;
+    if selected.settlement == PublicTurnSettlement::Pending {
+        return Err(SessionLifecycleRejected(SessionLifecycleRefusal::SourceNodePending).into());
+    }
+
+    let mut current = source.head_node_id.clone();
+    let mut reachable = false;
+    let mut traversed = 0_u64;
+    while let Some(node_id) = current {
+        let node = load_public_turn(&mut transaction, &node_id)
+            .await?
+            .context("session fork predecessor turn does not exist")?;
+        ensure!(
+            node.node_id == node_id && node.settlement != PublicTurnSettlement::Pending,
+            "session fork predecessor chain is invalid"
+        );
+        traversed = traversed
+            .checked_add(1)
+            .context("session fork predecessor count overflowed")?;
+        if node_id == source_node_id {
+            ensure!(
+                node == selected,
+                "session fork selected node changed during traversal"
+            );
+            reachable = true;
+            break;
+        }
+        current = node.predecessor_node_id;
+    }
+    if !reachable {
+        return Err(
+            SessionLifecycleRejected(SessionLifecycleRefusal::SourceNodeUnreachable).into(),
+        );
+    }
+    transaction.commit().await?;
+    Ok(ValidatedSessionFork { source, selected })
 }
 
 async fn run_migration_worker(
@@ -3275,6 +4359,8 @@ enum Mutation {
         session_id: Option<String>,
         messages: Vec<(String, String)>,
         values: Vec<(String, String)>,
+        public_turn: Option<Box<EncodedSessionTurnCheckpoint>>,
+        mode: Option<SessionModeCheckpoint>,
     },
     Clear(String),
     ForgetNote {
@@ -3287,6 +4373,85 @@ enum Mutation {
         record_format: &'static str,
         private_reasoning: Vec<(String, String)>,
     },
+}
+
+#[derive(Debug)]
+enum EncodedSessionTurnCheckpoint {
+    Admit {
+        expected_generation: u64,
+        turn_id: String,
+        label: Option<String>,
+        expected_transcript_rows: Option<u64>,
+        user_entry: String,
+    },
+    MarkRetryableInterruption {
+        expected_generation: u64,
+        turn_id: String,
+        speaker_id: String,
+        terminal_entries: String,
+    },
+    Resume {
+        expected_generation: u64,
+        turn_id: String,
+        legacy: Option<LegacySessionTurnResume>,
+    },
+    Settle {
+        expected_generation: u64,
+        turn_id: String,
+        settlement: PublicTurnSettlement,
+        speaker_id: String,
+        terminal_entries: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum SessionLifecycleMutation {
+    Create {
+        session_id: String,
+        mode: Mode,
+        label: String,
+    },
+    Rename {
+        session_id: String,
+        expected_generation: u64,
+        label: String,
+    },
+    Remove {
+        session_id: String,
+        expected_generation: u64,
+    },
+    Restore {
+        session_id: String,
+        expected_generation: u64,
+    },
+    Fork {
+        source_session_id: String,
+        expected_source_generation: u64,
+        source_node_id: String,
+        child_session_id: String,
+        label: String,
+        validated: Option<Box<ValidatedSessionFork>>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedSessionFork {
+    source: SessionCatalogRecord,
+    selected: PublicTurnRecord,
+}
+
+impl SessionLifecycleMutation {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Create { session_id, .. }
+            | Self::Rename { session_id, .. }
+            | Self::Remove { session_id, .. }
+            | Self::Restore { session_id, .. } => session_id,
+            Self::Fork {
+                child_session_id, ..
+            } => child_session_id,
+        }
+    }
 }
 
 async fn apply(
@@ -3363,7 +4528,33 @@ async fn apply(
             session_id,
             messages,
             values,
+            public_turn,
+            mode,
         } => {
+            if let Some(mode) = mode {
+                apply_session_mode_checkpoint(
+                    &mut transaction,
+                    &namespace,
+                    session_id
+                        .as_deref()
+                        .context("mode checkpoint lacks its session identity")?,
+                    &values,
+                    &mode,
+                )
+                .await?;
+            }
+            if let Some(public_turn) = public_turn {
+                apply_session_turn_checkpoint(
+                    &mut transaction,
+                    &namespace,
+                    session_id
+                        .as_deref()
+                        .context("public turn checkpoint lacks its session identity")?,
+                    &values,
+                    &public_turn,
+                )
+                .await?;
+            }
             for (role, content) in messages {
                 if let Some(session_id) = &session_id {
                     sqlx::query("INSERT INTO messages (namespace, session_id, role, content_format, content) VALUES (?, ?, ?, ?, ?)")
@@ -3543,6 +4734,980 @@ async fn apply(
     Ok(())
 }
 
+async fn apply_session_lifecycle(
+    connection: &mut MySqlConnection,
+    operation: &str,
+    label: &str,
+    mutation: SessionLifecycleMutation,
+    logical: Option<&LogicalReceipt>,
+) -> Result<SessionLifecycleOutcome> {
+    let mut transaction = connection.begin().await?;
+    let session_id = mutation.session_id().to_owned();
+    let existing = sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id = ? FOR UPDATE")
+        .bind(session_id.as_bytes())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| decode_session_catalog_row(&row))
+        .transpose()?;
+    let next_order: i64 = sqlx::query_scalar("SELECT CAST(GREATEST(COALESCE(MAX(created_order), 0), COALESCE(MAX(updated_order), 0)) + 1 AS SIGNED) FROM session_catalog")
+        .fetch_one(&mut *transaction)
+        .await?;
+    ensure!(next_order > 0, "session catalog order overflowed");
+    let next_order = u64::try_from(next_order)?;
+
+    let record = match mutation {
+        SessionLifecycleMutation::Create {
+            session_id,
+            mode,
+            label,
+        } => {
+            if existing.is_some() {
+                return Err(
+                    SessionLifecycleRejected(SessionLifecycleRefusal::AlreadyExists).into(),
+                );
+            }
+            let record = SessionCatalogRecord {
+                session_id,
+                mode,
+                label,
+                created_order: next_order,
+                updated_order: next_order,
+                lifecycle_generation: 0,
+                lifecycle_state: SessionLifecycleState::Active,
+                head_node_id: None,
+                pending_node_id: None,
+                legacy_prefix: None,
+                fork_provenance: None,
+                record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+            };
+            validate_session_catalog(&record)?;
+            let mode = serde_json::to_value(record.mode)?;
+            let mode = mode.as_str().context("session mode is not a string")?;
+            sqlx::query("INSERT INTO session_catalog (session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)")
+                .bind(record.session_id.as_bytes())
+                .bind(mode)
+                .bind(&record.label)
+                .bind(i64::try_from(record.created_order)?)
+                .bind(i64::try_from(record.updated_order)?)
+                .bind(i64::try_from(record.lifecycle_generation)?)
+                .bind(session_lifecycle_sql(record.lifecycle_state))
+                .bind(record.head_node_id.as_deref())
+                .bind(record.pending_node_id.as_deref())
+                .bind(&record.record_format)
+                .execute(&mut *transaction)
+                .await?;
+            record
+        }
+        SessionLifecycleMutation::Rename {
+            expected_generation,
+            label,
+            ..
+        } => {
+            let mut record = checked_session_lifecycle_record(existing, expected_generation)?;
+            record.label = label;
+            record.updated_order = next_order;
+            record.lifecycle_generation = record
+                .lifecycle_generation
+                .checked_add(1)
+                .context("session lifecycle generation overflowed")?;
+            validate_session_catalog(&record)?;
+            update_session_lifecycle_row(&mut transaction, &record, expected_generation).await?;
+            record
+        }
+        SessionLifecycleMutation::Remove {
+            expected_generation,
+            ..
+        } => {
+            let mut record = checked_session_lifecycle_record(existing, expected_generation)?;
+            if record.lifecycle_state == SessionLifecycleState::Removed {
+                return Err(
+                    SessionLifecycleRejected(SessionLifecycleRefusal::AlreadyRemoved).into(),
+                );
+            }
+            record.lifecycle_state = SessionLifecycleState::Removed;
+            record.updated_order = next_order;
+            record.lifecycle_generation = record
+                .lifecycle_generation
+                .checked_add(1)
+                .context("session lifecycle generation overflowed")?;
+            validate_session_catalog(&record)?;
+            update_session_lifecycle_row(&mut transaction, &record, expected_generation).await?;
+            record
+        }
+        SessionLifecycleMutation::Restore {
+            expected_generation,
+            ..
+        } => {
+            let mut record = checked_session_lifecycle_record(existing, expected_generation)?;
+            if record.lifecycle_state == SessionLifecycleState::Active {
+                return Err(
+                    SessionLifecycleRejected(SessionLifecycleRefusal::AlreadyActive).into(),
+                );
+            }
+            record.lifecycle_state = SessionLifecycleState::Active;
+            record.updated_order = next_order;
+            record.lifecycle_generation = record
+                .lifecycle_generation
+                .checked_add(1)
+                .context("session lifecycle generation overflowed")?;
+            validate_session_catalog(&record)?;
+            update_session_lifecycle_row(&mut transaction, &record, expected_generation).await?;
+            record
+        }
+        SessionLifecycleMutation::Fork {
+            source_session_id,
+            expected_source_generation,
+            source_node_id,
+            child_session_id,
+            label,
+            validated,
+        } => {
+            if existing.is_some() {
+                return Err(
+                    SessionLifecycleRejected(SessionLifecycleRefusal::AlreadyExists).into(),
+                );
+            }
+            let validated = validated.context("session fork source was not validated")?;
+            ensure!(
+                validated.source.session_id == source_session_id
+                    && validated.source.lifecycle_generation == expected_source_generation
+                    && validated.selected.node_id == source_node_id,
+                "session fork validation coordinates changed"
+            );
+            let current_source = sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id = ? FOR UPDATE")
+                .bind(source_session_id.as_bytes())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .map(|row| decode_session_catalog_row(&row))
+                .transpose()?
+                .ok_or(SessionLifecycleRejected(SessionLifecycleRefusal::Missing))?;
+            if current_source.lifecycle_generation != expected_source_generation {
+                return Err(
+                    SessionLifecycleRejected(SessionLifecycleRefusal::GenerationChanged).into(),
+                );
+            }
+            if current_source.lifecycle_state == SessionLifecycleState::Removed {
+                return Err(
+                    SessionLifecycleRejected(SessionLifecycleRefusal::SourceRemoved).into(),
+                );
+            }
+            ensure!(
+                current_source == validated.source,
+                SessionLifecycleRejected(SessionLifecycleRefusal::GenerationChanged)
+            );
+            let selected = load_public_turn(&mut transaction, &source_node_id)
+                .await?
+                .ok_or(SessionLifecycleRejected(
+                    SessionLifecycleRefusal::SourceNodeMissing,
+                ))?;
+            ensure!(
+                selected == validated.selected
+                    && selected.settlement != PublicTurnSettlement::Pending,
+                SessionLifecycleRejected(SessionLifecycleRefusal::SourceNodeUnreachable)
+            );
+
+            let fork_provenance = SessionForkProvenance {
+                source_session_id: source_session_id.clone(),
+                source_node_id: source_node_id.clone(),
+                source_turn_id: selected.turn_id.clone(),
+                source_label: current_source.label.clone(),
+                shares_current_project_memory: true,
+                record_format: FORK_PROVENANCE_RECORD_FORMAT.into(),
+            };
+            let record = SessionCatalogRecord {
+                session_id: child_session_id,
+                mode: current_source.mode,
+                label,
+                created_order: next_order,
+                updated_order: next_order,
+                lifecycle_generation: 0,
+                lifecycle_state: SessionLifecycleState::Active,
+                head_node_id: Some(source_node_id),
+                pending_node_id: None,
+                legacy_prefix: current_source.legacy_prefix.clone(),
+                fork_provenance: Some(fork_provenance),
+                record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+            };
+            validate_session_catalog(&record)?;
+            let mode = serde_json::to_value(record.mode)?;
+            let mode = mode.as_str().context("session mode is not a string")?;
+            sqlx::query("INSERT INTO session_catalog (session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format) VALUES (?, ?, ?, ?, ?, 0, 'active', ?, NULL, ?, ?, ?)")
+                .bind(record.session_id.as_bytes())
+                .bind(mode)
+                .bind(&record.label)
+                .bind(i64::try_from(record.created_order)?)
+                .bind(i64::try_from(record.updated_order)?)
+                .bind(record.head_node_id.as_deref())
+                .bind(record.legacy_prefix.as_ref().map(serde_json::to_string).transpose()?)
+                .bind(record.fork_provenance.as_ref().map(serde_json::to_string).transpose()?)
+                .bind(&record.record_format)
+                .execute(&mut *transaction)
+                .await?;
+            record
+        }
+    };
+
+    let outcome = session_lifecycle_outcome(&record)?;
+    let result_ref = encode_session_lifecycle_result_ref(&outcome)?;
+    let version: i32 = sqlx::query_scalar("SELECT version FROM kuru_schema WHERE id = 1")
+        .fetch_one(&mut *transaction)
+        .await?;
+    ensure!(
+        version == migrations::CURRENT_VERSION,
+        "unsupported writable memory schema version {version}"
+    );
+    if let Some(receipt) = logical {
+        sqlx::query("INSERT INTO operations (id, label, receipt_format, method, request_digest, result_ref) VALUES (?, ?, 1, ?, ?, ?)")
+            .bind(operation)
+            .bind(label)
+            .bind(&receipt.method)
+            .bind(&receipt.digest)
+            .bind(&result_ref)
+            .execute(&mut *transaction)
+            .await?;
+    } else {
+        sqlx::query("INSERT INTO operations (id, label, result_ref) VALUES (?, ?, ?)")
+            .bind(operation)
+            .bind(label)
+            .bind(&result_ref)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    sqlx::query("CALL DOLT_COMMIT('-Am', ?, '--author', ?)")
+        .bind(format!("{label} [{operation}]"))
+        .bind(AUTHOR)
+        .fetch_all(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(outcome)
+}
+
+async fn apply_session_mode_checkpoint(
+    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    namespace: &str,
+    session_id: &str,
+    values: &[(String, String)],
+    checkpoint: &SessionModeCheckpoint,
+) -> Result<()> {
+    let row = sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id = ? FOR UPDATE")
+        .bind(session_id.as_bytes())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .context("mode checkpoint session is absent from the catalog")?;
+    let mut catalog = decode_session_catalog_row(&row)?;
+    ensure!(
+        catalog.lifecycle_state == SessionLifecycleState::Active,
+        "mode checkpoint session is removed"
+    );
+    ensure!(
+        catalog.lifecycle_generation == checkpoint.expected_generation,
+        "mode checkpoint lifecycle generation changed"
+    );
+    ensure!(
+        catalog.mode == checkpoint.expected_mode,
+        "mode checkpoint current mode changed"
+    );
+    ensure!(
+        catalog.mode != checkpoint.mode,
+        "mode checkpoint must change the mode"
+    );
+    let state_key = session_mode_state_key(namespace, session_id)?;
+    let state = values
+        .iter()
+        .find(|(key, _)| key == &state_key)
+        .context("mode checkpoint lacks the matching runtime session state")?;
+    let state: Value = serde_json::from_str(&state.1)?;
+    ensure!(
+        state.get("id").and_then(Value::as_str) == Some(session_id),
+        "mode checkpoint runtime session identity differs"
+    );
+    ensure!(
+        state.get("mode") == Some(&serde_json::to_value(checkpoint.mode)?),
+        "mode checkpoint runtime state has a different mode"
+    );
+    ensure!(
+        state.get("lifecycle_generation").and_then(Value::as_u64)
+            == Some(checkpoint.expected_generation),
+        "mode checkpoint runtime state has a different lifecycle generation"
+    );
+    let next_order: i64 = sqlx::query_scalar("SELECT CAST(GREATEST(COALESCE(MAX(created_order), 0), COALESCE(MAX(updated_order), 0)) + 1 AS SIGNED) FROM session_catalog")
+        .fetch_one(&mut **transaction)
+        .await?;
+    ensure!(next_order > 0, "session catalog order overflowed");
+    catalog.mode = checkpoint.mode;
+    catalog.updated_order = u64::try_from(next_order)?;
+    validate_session_catalog(&catalog)?;
+    let mode = serde_json::to_value(checkpoint.mode)?;
+    let mode = mode.as_str().context("session mode is not a string")?;
+    let old_mode = serde_json::to_value(checkpoint.expected_mode)?;
+    let old_mode = old_mode
+        .as_str()
+        .context("previous session mode is not a string")?;
+    let updated = sqlx::query("UPDATE session_catalog SET mode = ?, updated_order = ? WHERE session_id = ? AND lifecycle_generation = ? AND lifecycle_state = 'active' AND mode = ?")
+        .bind(mode)
+        .bind(next_order)
+        .bind(session_id.as_bytes())
+        .bind(i64::try_from(checkpoint.expected_generation)?)
+        .bind(old_mode)
+        .execute(&mut **transaction)
+        .await?;
+    ensure!(
+        updated.rows_affected() == 1,
+        "mode checkpoint catalog changed before publication"
+    );
+    Ok(())
+}
+
+fn session_mode_state_key(namespace: &str, session_id: &str) -> Result<String> {
+    let suffix = format!("/transcript/{session_id}");
+    let scope = namespace
+        .strip_suffix(&suffix)
+        .context("mode checkpoint transcript namespace does not match its session")?;
+    ensure!(!scope.is_empty(), "mode checkpoint project scope is empty");
+    Ok(format!("{scope}/session/{session_id}"))
+}
+
+async fn apply_session_turn_checkpoint(
+    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    namespace: &str,
+    session_id: &str,
+    values: &[(String, String)],
+    checkpoint: &EncodedSessionTurnCheckpoint,
+) -> Result<()> {
+    let row = sqlx::query("SELECT session_id, mode, label, created_order, updated_order, lifecycle_generation, lifecycle_state, head_node_id, pending_node_id, legacy_prefix, fork_provenance, record_format FROM session_catalog WHERE session_id = ? FOR UPDATE")
+        .bind(session_id.as_bytes())
+        .fetch_optional(&mut **transaction)
+        .await?;
+    let catalog = row
+        .map(|row| decode_session_catalog_row(&row))
+        .transpose()?
+        .ok_or(SessionTurnRejected(SessionTurnRefusal::SessionMissing))?;
+    if catalog.lifecycle_state != SessionLifecycleState::Active {
+        return Err(SessionTurnRejected(SessionTurnRefusal::SessionRemoved).into());
+    }
+    let (expected_generation, turn_id) = match checkpoint {
+        EncodedSessionTurnCheckpoint::Admit {
+            expected_generation,
+            turn_id,
+            ..
+        }
+        | EncodedSessionTurnCheckpoint::MarkRetryableInterruption {
+            expected_generation,
+            turn_id,
+            ..
+        }
+        | EncodedSessionTurnCheckpoint::Resume {
+            expected_generation,
+            turn_id,
+            ..
+        }
+        | EncodedSessionTurnCheckpoint::Settle {
+            expected_generation,
+            turn_id,
+            ..
+        } => (*expected_generation, turn_id),
+    };
+    if catalog.lifecycle_generation != expected_generation {
+        return Err(SessionTurnRejected(SessionTurnRefusal::GenerationChanged).into());
+    }
+    let node_id = public_turn_node_id(session_id, turn_id)?;
+    let next_order: i64 = sqlx::query_scalar("SELECT CAST(GREATEST(COALESCE(MAX(created_order), 0), COALESCE(MAX(updated_order), 0)) + 1 AS SIGNED) FROM session_catalog")
+        .fetch_one(&mut **transaction)
+        .await?;
+    ensure!(next_order > 0, "session catalog order overflowed");
+
+    match checkpoint {
+        EncodedSessionTurnCheckpoint::Admit {
+            label,
+            expected_transcript_rows,
+            user_entry,
+            ..
+        } => {
+            if let Some(expected_rows) = expected_transcript_rows {
+                let actual_rows: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE namespace = ?")
+                        .bind(namespace.as_bytes())
+                        .fetch_one(&mut **transaction)
+                        .await?;
+                if u64::try_from(actual_rows)? != *expected_rows {
+                    return Err(SessionTurnRejected(SessionTurnRefusal::TranscriptChanged).into());
+                }
+            }
+            let mut predecessor_node_id = catalog.head_node_id.clone();
+            let mut superseded_pending = None;
+            if let Some(pending_node_id) = catalog.pending_node_id.as_deref() {
+                let pending = load_public_turn(transaction, pending_node_id)
+                    .await?
+                    .ok_or(SessionTurnRejected(SessionTurnRefusal::PendingTurnMissing))?;
+                ensure!(
+                    pending.settlement == PublicTurnSettlement::Pending
+                        && pending.origin_session_id == session_id,
+                    "session catalog pending turn coordinates are invalid"
+                );
+                match pending.kind {
+                    PublicTurnKind::Primary if !pending.terminal_entries.is_empty() => {
+                        let updated = sqlx::query("UPDATE session_public_turns SET settlement = 'interrupted' WHERE node_id = ? AND settlement = 'pending'")
+                            .bind(&pending.node_id)
+                            .execute(&mut **transaction)
+                            .await?;
+                        ensure!(
+                            updated.rows_affected() == 1,
+                            SessionTurnRejected(SessionTurnRefusal::PendingTurnChanged)
+                        );
+                        predecessor_node_id = Some(pending.node_id.clone());
+                        superseded_pending = Some(pending.node_id);
+                    }
+                    PublicTurnKind::Continuation | PublicTurnKind::LegacyContinuation
+                        if pending.terminal_entries.is_empty() =>
+                    {
+                        superseded_pending = Some(pending.node_id);
+                    }
+                    _ => {
+                        return Err(
+                            SessionTurnRejected(SessionTurnRefusal::PendingTurnExists).into()
+                        );
+                    }
+                }
+            }
+            if label
+                .as_ref()
+                .is_some_and(|label| !catalog.label.is_empty() && label != &catalog.label)
+            {
+                return Err(SessionTurnRejected(SessionTurnRefusal::LabelChanged).into());
+            }
+            if load_public_turn(transaction, &node_id).await?.is_some() {
+                return Err(SessionTurnRejected(SessionTurnRefusal::TurnAlreadyExists).into());
+            }
+            let record = PublicTurnRecord {
+                node_id: node_id.clone(),
+                origin_session_id: session_id.into(),
+                turn_id: turn_id.clone(),
+                kind: PublicTurnKind::Primary,
+                continuation_of_node_id: None,
+                predecessor_node_id: predecessor_node_id.clone(),
+                settlement: PublicTurnSettlement::Pending,
+                user_entry: Some(
+                    serde_json::from_str(user_entry)
+                        .context("encoded public user entry is malformed")?,
+                ),
+                speaker_id: None,
+                terminal_entries: vec![],
+                record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
+            };
+            validate_public_turn(&record)?;
+            sqlx::query("INSERT INTO session_public_turns (node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format) VALUES (?, ?, ?, 'primary', NULL, ?, 'pending', ?, NULL, NULL, ?)")
+                .bind(&record.node_id)
+                .bind(record.origin_session_id.as_bytes())
+                .bind(record.turn_id.as_bytes())
+                .bind(record.predecessor_node_id.as_deref())
+                .bind(user_entry)
+                .bind(&record.record_format)
+                .execute(&mut **transaction)
+                .await?;
+            let updated = if let Some(superseded_pending) = superseded_pending {
+                sqlx::query("UPDATE session_catalog SET label = COALESCE(?, label), head_node_id = ?, pending_node_id = ?, updated_order = ? WHERE session_id = ? AND lifecycle_generation = ? AND lifecycle_state = 'active' AND pending_node_id = ?")
+                    .bind(label.as_deref())
+                    .bind(predecessor_node_id.as_deref())
+                    .bind(&node_id)
+                    .bind(next_order)
+                    .bind(session_id.as_bytes())
+                    .bind(i64::try_from(expected_generation)?)
+                    .bind(&superseded_pending)
+                    .execute(&mut **transaction)
+                    .await?
+            } else {
+                sqlx::query("UPDATE session_catalog SET label = COALESCE(?, label), pending_node_id = ?, updated_order = ? WHERE session_id = ? AND lifecycle_generation = ? AND lifecycle_state = 'active' AND pending_node_id IS NULL")
+                    .bind(label.as_deref())
+                    .bind(&node_id)
+                    .bind(next_order)
+                    .bind(session_id.as_bytes())
+                    .bind(i64::try_from(expected_generation)?)
+                    .execute(&mut **transaction)
+                    .await?
+            };
+            ensure!(
+                updated.rows_affected() == 1,
+                SessionTurnRejected(SessionTurnRefusal::GenerationChanged)
+            );
+        }
+        EncodedSessionTurnCheckpoint::MarkRetryableInterruption {
+            speaker_id,
+            terminal_entries,
+            ..
+        } => {
+            let pending = catalog
+                .pending_node_id
+                .as_deref()
+                .ok_or(SessionTurnRejected(SessionTurnRefusal::PendingTurnMissing))?;
+            let mut record = load_public_turn(transaction, pending)
+                .await?
+                .ok_or(SessionTurnRejected(SessionTurnRefusal::PendingTurnMissing))?;
+            if record.settlement != PublicTurnSettlement::Pending {
+                return Err(SessionTurnRejected(SessionTurnRefusal::TurnAlreadySettled).into());
+            }
+            if !record.terminal_entries.is_empty() || record.speaker_id.is_some() {
+                return Err(SessionTurnRejected(
+                    SessionTurnRefusal::RetryableInterruptionAlreadyMarked,
+                )
+                .into());
+            }
+            ensure!(
+                record.origin_session_id == session_id
+                    && record.turn_id == *turn_id
+                    && record.predecessor_node_id == catalog.head_node_id,
+                "pending public turn no longer matches its catalog boundary"
+            );
+            ensure!(
+                record.kind == PublicTurnKind::Primary && record.node_id == node_id,
+                SessionTurnRejected(SessionTurnRefusal::PendingTurnChanged)
+            );
+            record.speaker_id = Some(speaker_id.clone());
+            record.terminal_entries = serde_json::from_str(terminal_entries)
+                .context("encoded retryable interruption entries are malformed")?;
+            validate_public_turn(&record)?;
+            let updated = sqlx::query("UPDATE session_public_turns SET speaker_id = ?, terminal_entries = ? WHERE node_id = ? AND settlement = 'pending' AND speaker_id IS NULL AND terminal_entries IS NULL")
+                .bind(speaker_id.as_bytes())
+                .bind(terminal_entries)
+                .bind(&record.node_id)
+                .execute(&mut **transaction)
+                .await?;
+            ensure!(
+                updated.rows_affected() == 1,
+                SessionTurnRejected(SessionTurnRefusal::RetryableInterruptionAlreadyMarked)
+            );
+            let updated = sqlx::query("UPDATE session_catalog SET updated_order = ? WHERE session_id = ? AND lifecycle_generation = ? AND lifecycle_state = 'active' AND pending_node_id = ?")
+                .bind(next_order)
+                .bind(session_id.as_bytes())
+                .bind(i64::try_from(expected_generation)?)
+                .bind(&record.node_id)
+                .execute(&mut **transaction)
+                .await?;
+            ensure!(
+                updated.rows_affected() == 1,
+                SessionTurnRejected(SessionTurnRefusal::PendingTurnChanged)
+            );
+        }
+        EncodedSessionTurnCheckpoint::Resume { legacy, .. } => {
+            let primary = load_public_turn(transaction, &node_id).await?;
+            let continuation = match primary {
+                Some(primary) => {
+                    ensure!(
+                        primary.kind == PublicTurnKind::Primary
+                            && primary.origin_session_id == session_id
+                            && primary.turn_id == *turn_id,
+                        "resumed public turn does not match its primary identity"
+                    );
+                    match primary.settlement {
+                        PublicTurnSettlement::Pending => {
+                            ensure!(
+                                catalog.pending_node_id.as_deref()
+                                    == Some(primary.node_id.as_str()),
+                                SessionTurnRejected(SessionTurnRefusal::PendingTurnChanged)
+                            );
+                            None
+                        }
+                        PublicTurnSettlement::Interrupted => Some((
+                            public_turn_continuation_node_id(session_id, turn_id)?,
+                            PublicTurnKind::Continuation,
+                            Some(primary.node_id),
+                        )),
+                        PublicTurnSettlement::Completed => {
+                            return Err(SessionTurnRejected(
+                                SessionTurnRefusal::TurnAlreadySettled,
+                            )
+                            .into());
+                        }
+                    }
+                }
+                None => {
+                    let legacy = legacy
+                        .as_ref()
+                        .ok_or(SessionTurnRejected(SessionTurnRefusal::PendingTurnMissing))?;
+                    validate_legacy_resume_binding(
+                        transaction,
+                        namespace,
+                        session_id,
+                        values,
+                        catalog.legacy_prefix.as_ref(),
+                        legacy,
+                    )
+                    .await?;
+                    Some((
+                        public_turn_legacy_continuation_node_id(session_id, turn_id)?,
+                        PublicTurnKind::LegacyContinuation,
+                        None,
+                    ))
+                }
+            };
+            let active_node_id = if let Some((continuation_id, kind, original)) = continuation {
+                if catalog
+                    .pending_node_id
+                    .as_deref()
+                    .is_some_and(|pending| pending != continuation_id)
+                {
+                    return Err(SessionTurnRejected(SessionTurnRefusal::PendingTurnExists).into());
+                }
+                let existing = load_public_turn(transaction, &continuation_id).await?;
+                if let Some(mut continuation) = existing {
+                    ensure!(
+                        continuation.kind == kind
+                            && continuation.settlement == PublicTurnSettlement::Pending
+                            && continuation.continuation_of_node_id == original
+                            && continuation.terminal_entries.is_empty(),
+                        SessionTurnRejected(SessionTurnRefusal::TurnAlreadySettled)
+                    );
+                    continuation.predecessor_node_id = catalog.head_node_id.clone();
+                    validate_public_turn(&continuation)?;
+                    let updated = sqlx::query("UPDATE session_public_turns SET predecessor_node_id = ? WHERE node_id = ? AND settlement = 'pending'")
+                        .bind(continuation.predecessor_node_id.as_deref())
+                        .bind(&continuation_id)
+                        .execute(&mut **transaction)
+                        .await?;
+                    ensure!(
+                        updated.rows_affected() == 1,
+                        SessionTurnRejected(SessionTurnRefusal::PendingTurnChanged)
+                    );
+                } else {
+                    let continuation = PublicTurnRecord {
+                        node_id: continuation_id.clone(),
+                        origin_session_id: session_id.into(),
+                        turn_id: turn_id.clone(),
+                        kind,
+                        continuation_of_node_id: original,
+                        predecessor_node_id: catalog.head_node_id.clone(),
+                        settlement: PublicTurnSettlement::Pending,
+                        user_entry: None,
+                        speaker_id: None,
+                        terminal_entries: vec![],
+                        record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
+                    };
+                    validate_public_turn(&continuation)?;
+                    sqlx::query("INSERT INTO session_public_turns (node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?)")
+                        .bind(&continuation.node_id)
+                        .bind(continuation.origin_session_id.as_bytes())
+                        .bind(continuation.turn_id.as_bytes())
+                        .bind(match kind {
+                            PublicTurnKind::Continuation => "continuation",
+                            PublicTurnKind::LegacyContinuation => "legacy",
+                            PublicTurnKind::Primary => unreachable!("primary cannot be admitted as a continuation"),
+                        })
+                        .bind(continuation.continuation_of_node_id.as_deref())
+                        .bind(continuation.predecessor_node_id.as_deref())
+                        .bind(&continuation.record_format)
+                        .execute(&mut **transaction)
+                        .await?;
+                }
+                continuation_id
+            } else {
+                node_id.clone()
+            };
+            let updated = sqlx::query("UPDATE session_catalog SET pending_node_id = ?, updated_order = ? WHERE session_id = ? AND lifecycle_generation = ? AND lifecycle_state = 'active' AND (pending_node_id IS NULL OR pending_node_id = ?)")
+                .bind(&active_node_id)
+                .bind(next_order)
+                .bind(session_id.as_bytes())
+                .bind(i64::try_from(expected_generation)?)
+                .bind(&active_node_id)
+                .execute(&mut **transaction)
+                .await?;
+            ensure!(
+                updated.rows_affected() == 1,
+                SessionTurnRejected(SessionTurnRefusal::PendingTurnChanged)
+            );
+        }
+        EncodedSessionTurnCheckpoint::Settle {
+            settlement,
+            speaker_id,
+            terminal_entries,
+            ..
+        } => {
+            let pending = catalog
+                .pending_node_id
+                .as_deref()
+                .ok_or(SessionTurnRejected(SessionTurnRefusal::PendingTurnMissing))?;
+            let mut record = load_public_turn(transaction, pending)
+                .await?
+                .ok_or(SessionTurnRejected(SessionTurnRefusal::PendingTurnMissing))?;
+            if record.settlement != PublicTurnSettlement::Pending {
+                return Err(SessionTurnRejected(SessionTurnRefusal::TurnAlreadySettled).into());
+            }
+            ensure!(
+                record.origin_session_id == session_id
+                    && record.turn_id == *turn_id
+                    && record.predecessor_node_id == catalog.head_node_id,
+                "pending public turn no longer matches its catalog boundary"
+            );
+            ensure!(
+                record.node_id == node_id
+                    || record.node_id == public_turn_continuation_node_id(session_id, turn_id)?
+                    || record.node_id
+                        == public_turn_legacy_continuation_node_id(session_id, turn_id)?,
+                SessionTurnRejected(SessionTurnRefusal::PendingTurnChanged)
+            );
+            let mut appended_entries: Vec<Message> = serde_json::from_str(terminal_entries)
+                .context("encoded public terminal entries are malformed")?;
+            record.settlement = *settlement;
+            record.speaker_id = Some(speaker_id.clone());
+            record.terminal_entries.append(&mut appended_entries);
+            validate_public_turn(&record)?;
+            let combined_terminal_entries = serde_json::to_string(&record.terminal_entries)?;
+            let updated = sqlx::query("UPDATE session_public_turns SET settlement = ?, speaker_id = ?, terminal_entries = ? WHERE node_id = ? AND settlement = 'pending'")
+                .bind(match settlement {
+                    PublicTurnSettlement::Completed => "completed",
+                    PublicTurnSettlement::Interrupted => "interrupted",
+                    PublicTurnSettlement::Pending => {
+                        bail!("public turn settlement cannot remain pending")
+                    }
+                })
+                .bind(speaker_id.as_bytes())
+                .bind(&combined_terminal_entries)
+                .bind(&record.node_id)
+                .execute(&mut **transaction)
+                .await?;
+            ensure!(
+                updated.rows_affected() == 1,
+                SessionTurnRejected(SessionTurnRefusal::TurnAlreadySettled)
+            );
+            let updated = sqlx::query("UPDATE session_catalog SET head_node_id = ?, pending_node_id = NULL, updated_order = ? WHERE session_id = ? AND lifecycle_generation = ? AND lifecycle_state = 'active' AND pending_node_id = ?")
+                .bind(&record.node_id)
+                .bind(next_order)
+                .bind(session_id.as_bytes())
+                .bind(i64::try_from(expected_generation)?)
+                .bind(&record.node_id)
+                .execute(&mut **transaction)
+                .await?;
+            ensure!(
+                updated.rows_affected() == 1,
+                SessionTurnRejected(SessionTurnRefusal::PendingTurnChanged)
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn validate_legacy_resume_binding(
+    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    namespace: &str,
+    session_id: &str,
+    values: &[(String, String)],
+    catalog_prefix: Option<&LegacyTranscriptPrefix>,
+    proof: &LegacySessionTurnResume,
+) -> Result<()> {
+    ensure!(
+        catalog_prefix == Some(&proof.legacy_prefix) && proof.legacy_prefix.namespace == namespace,
+        SessionTurnRejected(SessionTurnRefusal::LegacyPrefixChanged)
+    );
+    let transcript_suffix = format!("/transcript/{session_id}");
+    let scope = namespace
+        .strip_suffix(&transcript_suffix)
+        .ok_or(SessionTurnRejected(
+            SessionTurnRefusal::LegacyJournalChanged,
+        ))?;
+    let journal_prefix = format!("{scope}/session/{session_id}/turn/");
+    let correlation =
+        proof
+            .journal_key
+            .strip_prefix(&journal_prefix)
+            .ok_or(SessionTurnRejected(
+                SessionTurnRefusal::LegacyJournalChanged,
+            ))?;
+    ensure!(
+        correlation.len() == 64
+            && correlation
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        SessionTurnRejected(SessionTurnRefusal::LegacyJournalChanged)
+    );
+    ensure!(
+        matches!(values, [(key, _)] if key == &proof.journal_key),
+        SessionTurnRejected(SessionTurnRefusal::LegacyJournalChanged)
+    );
+    let expected = serde_json::to_string(&proof.expected_journal)?;
+    let retained: Option<String> =
+        sqlx::query_scalar("SELECT value FROM state WHERE BINARY `key` = BINARY ? FOR UPDATE")
+            .bind(proof.journal_key.as_bytes())
+            .fetch_optional(&mut **transaction)
+            .await?;
+    ensure!(
+        retained.as_deref() == Some(expected.as_str()),
+        SessionTurnRejected(SessionTurnRefusal::LegacyJournalChanged)
+    );
+    Ok(())
+}
+
+fn checked_session_lifecycle_record(
+    existing: Option<SessionCatalogRecord>,
+    expected_generation: u64,
+) -> Result<SessionCatalogRecord> {
+    let record = existing.ok_or(SessionLifecycleRejected(SessionLifecycleRefusal::Missing))?;
+    if record.lifecycle_generation != expected_generation {
+        return Err(SessionLifecycleRejected(SessionLifecycleRefusal::GenerationChanged).into());
+    }
+    Ok(record)
+}
+
+async fn update_session_lifecycle_row(
+    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    record: &SessionCatalogRecord,
+    expected_generation: u64,
+) -> Result<()> {
+    let updated = sqlx::query("UPDATE session_catalog SET label = ?, updated_order = ?, lifecycle_generation = ?, lifecycle_state = ? WHERE session_id = ? AND lifecycle_generation = ?")
+        .bind(&record.label)
+        .bind(i64::try_from(record.updated_order)?)
+        .bind(i64::try_from(record.lifecycle_generation)?)
+        .bind(session_lifecycle_sql(record.lifecycle_state))
+        .bind(record.session_id.as_bytes())
+        .bind(i64::try_from(expected_generation)?)
+        .execute(&mut **transaction)
+        .await?;
+    ensure!(
+        updated.rows_affected() == 1,
+        SessionLifecycleRejected(SessionLifecycleRefusal::GenerationChanged)
+    );
+    Ok(())
+}
+
+fn session_lifecycle_outcome(record: &SessionCatalogRecord) -> Result<SessionLifecycleOutcome> {
+    validate_session_catalog(record)?;
+    let outcome = SessionLifecycleOutcome {
+        session_id: record.session_id.clone(),
+        lifecycle_generation: record.lifecycle_generation,
+        lifecycle_state: record.lifecycle_state,
+        updated_order: record.updated_order,
+        record_format: SESSION_LIFECYCLE_OUTCOME_FORMAT.into(),
+    };
+    validate_session_lifecycle_outcome(&outcome)?;
+    Ok(outcome)
+}
+
+fn encode_session_lifecycle_result_ref(outcome: &SessionLifecycleOutcome) -> Result<String> {
+    validate_session_lifecycle_outcome(outcome)?;
+    let result = format!(
+        "session-lifecycle:v1:{}:{}:{}",
+        outcome.lifecycle_generation,
+        outcome.updated_order,
+        session_lifecycle_sql(outcome.lifecycle_state)
+    );
+    ensure!(
+        result.len() <= 256 && result.is_ascii(),
+        "session lifecycle receipt result exceeds its durable bound"
+    );
+    Ok(result)
+}
+
+fn decode_session_lifecycle_result_ref(
+    session_id: &str,
+    result_ref: &str,
+) -> Result<SessionLifecycleOutcome> {
+    let mut fields = result_ref.split(':');
+    ensure!(
+        fields.next() == Some("session-lifecycle") && fields.next() == Some("v1"),
+        "session lifecycle receipt result format is unsupported"
+    );
+    let lifecycle_generation = fields
+        .next()
+        .context("session lifecycle receipt omitted its generation")?
+        .parse::<u64>()
+        .context("session lifecycle receipt generation is invalid")?;
+    let updated_order = fields
+        .next()
+        .context("session lifecycle receipt omitted its update order")?
+        .parse::<u64>()
+        .context("session lifecycle receipt update order is invalid")?;
+    let lifecycle_state = match fields.next() {
+        Some("active") => SessionLifecycleState::Active,
+        Some("removed") => SessionLifecycleState::Removed,
+        _ => bail!("session lifecycle receipt state is invalid"),
+    };
+    ensure!(
+        fields.next().is_none(),
+        "session lifecycle receipt result has trailing fields"
+    );
+    let outcome = SessionLifecycleOutcome {
+        session_id: session_id.into(),
+        lifecycle_generation,
+        lifecycle_state,
+        updated_order,
+        record_format: SESSION_LIFECYCLE_OUTCOME_FORMAT.into(),
+    };
+    validate_session_lifecycle_outcome(&outcome)?;
+    Ok(outcome)
+}
+
+async fn load_session_lifecycle_outcome(
+    pool: &MySqlPool,
+    operation: &str,
+    session_id: &str,
+) -> Result<SessionLifecycleOutcome> {
+    let result_ref: Option<Option<String>> = tokio::time::timeout(
+        QUERY_TIMEOUT,
+        sqlx::query_scalar("SELECT result_ref FROM operations WHERE id = ?")
+            .bind(operation)
+            .fetch_optional(pool),
+    )
+    .await
+    .context("session lifecycle receipt result deadline exceeded")??;
+    let result_ref = result_ref
+        .flatten()
+        .context("session lifecycle receipt has no typed result")?;
+    decode_session_lifecycle_result_ref(session_id, &result_ref)
+}
+
+pub(crate) fn validate_session_lifecycle_outcome(outcome: &SessionLifecycleOutcome) -> Result<()> {
+    ensure!(
+        outcome.record_format == SESSION_LIFECYCLE_OUTCOME_FORMAT,
+        "session lifecycle outcome format is unsupported"
+    );
+    session_identity(
+        "session lifecycle outcome identity",
+        &outcome.session_id,
+        128,
+    )?;
+    ensure!(
+        outcome.lifecycle_generation <= i64::MAX as u64,
+        "session lifecycle outcome generation exceeds the store range"
+    );
+    ensure!(
+        outcome.updated_order > 0 && outcome.updated_order <= i64::MAX as u64,
+        "session lifecycle outcome order is invalid"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_session_lifecycle_input(
+    session_id: &str,
+    expected_generation: Option<u64>,
+    label: Option<&str>,
+) -> Result<()> {
+    session_identity("session lifecycle identity", session_id, 128)?;
+    if let Some(generation) = expected_generation {
+        ensure!(
+            generation <= i64::MAX as u64,
+            "session lifecycle generation exceeds the store range"
+        );
+    }
+    if let Some(label) = label {
+        bounded_session_label("session label", label)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_session_fork_input(
+    source_session_id: &str,
+    expected_source_generation: u64,
+    source_node_id: &str,
+    child_session_id: &str,
+    label: &str,
+) -> Result<()> {
+    validate_session_lifecycle_input(source_session_id, Some(expected_source_generation), None)?;
+    validate_public_node_id("fork source node", source_node_id)?;
+    validate_session_lifecycle_input(child_session_id, None, Some(label))?;
+    ensure!(
+        source_session_id != child_session_id,
+        "session fork source and child must differ"
+    );
+    Ok(())
+}
+
 fn encode_state(values: &[(String, Value)]) -> Result<Vec<(String, String)>> {
     let mut keys = BTreeSet::new();
     let mut encoded = Vec::with_capacity(values.len());
@@ -3552,6 +5717,499 @@ fn encode_state(values: &[(String, Value)]) -> Result<Vec<(String, String)>> {
         encoded.push((key.clone(), serde_json::to_string(value)?));
     }
     Ok(encoded)
+}
+
+pub fn public_turn_node_id(origin_session_id: &str, turn_id: &str) -> Result<String> {
+    session_identity("origin session identity", origin_session_id, 128)?;
+    session_identity("public turn identity", turn_id, 128)?;
+    let mut digest = Sha256::new();
+    hash_context_field(&mut digest, b"kuru.public-turn.node.v1");
+    hash_context_field(&mut digest, origin_session_id.as_bytes());
+    hash_context_field(&mut digest, turn_id.as_bytes());
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub fn public_turn_continuation_node_id(origin_session_id: &str, turn_id: &str) -> Result<String> {
+    session_identity("origin session identity", origin_session_id, 128)?;
+    session_identity("public turn identity", turn_id, 128)?;
+    let mut digest = Sha256::new();
+    hash_context_field(&mut digest, b"kuru.public-turn.continuation-node.v1");
+    hash_context_field(&mut digest, origin_session_id.as_bytes());
+    hash_context_field(&mut digest, turn_id.as_bytes());
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub fn public_turn_legacy_continuation_node_id(
+    origin_session_id: &str,
+    turn_id: &str,
+) -> Result<String> {
+    session_identity("origin session identity", origin_session_id, 128)?;
+    session_identity("public turn identity", turn_id, 128)?;
+    let mut digest = Sha256::new();
+    hash_context_field(&mut digest, b"kuru.public-turn.legacy-continuation-node.v1");
+    hash_context_field(&mut digest, origin_session_id.as_bytes());
+    hash_context_field(&mut digest, turn_id.as_bytes());
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+pub(crate) fn validate_session_catalog(record: &SessionCatalogRecord) -> Result<()> {
+    ensure!(
+        record.record_format == SESSION_CATALOG_RECORD_FORMAT,
+        "session catalog format is unsupported"
+    );
+    session_identity("session identity", &record.session_id, 128)?;
+    bounded_session_label("session label", &record.label)?;
+    ensure!(
+        record.created_order > 0
+            && record.created_order <= i64::MAX as u64
+            && record.updated_order >= record.created_order
+            && record.updated_order <= i64::MAX as u64,
+        "session catalog ordering is invalid"
+    );
+    ensure!(
+        record.lifecycle_generation <= i64::MAX as u64,
+        "session lifecycle generation exceeds the store range"
+    );
+    for (field, node) in [
+        ("session head node", record.head_node_id.as_deref()),
+        ("session pending node", record.pending_node_id.as_deref()),
+    ] {
+        if let Some(node) = node {
+            validate_public_node_id(field, node)?;
+        }
+    }
+    ensure!(
+        record.head_node_id != record.pending_node_id || record.head_node_id.is_none(),
+        "session pending node must remain separate from its settled head"
+    );
+    if let Some(prefix) = &record.legacy_prefix {
+        validate_legacy_prefix(prefix)?;
+    }
+    if let Some(fork) = &record.fork_provenance {
+        validate_fork_provenance(fork)?;
+        ensure!(
+            record.head_node_id.is_some(),
+            "a forked session requires its inherited settled head"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_session_catalog_cursor(cursor: &SessionCatalogCursor) -> Result<()> {
+    ensure!(
+        cursor.updated_order > 0 && cursor.updated_order <= i64::MAX as u64,
+        "session catalog cursor order is invalid"
+    );
+    session_identity("session catalog cursor identity", &cursor.session_id, 128)
+}
+
+pub(crate) fn validate_session_catalog_page(page: &SessionCatalogPage) -> Result<()> {
+    session_identity("session catalog page view", &page.view, 64)?;
+    validate_revision_identity("session catalog page revision", &page.revision)?;
+    ensure!(
+        page.records.len() <= MAX_SESSION_SOURCE_ROWS,
+        "session catalog page exceeds the row bound"
+    );
+    for record in &page.records {
+        validate_session_catalog(record)?;
+        if let Some(state) = page.lifecycle_state {
+            ensure!(
+                record.lifecycle_state == state,
+                "session catalog page contains a different lifecycle state"
+            );
+        }
+    }
+    if let Some(next) = &page.next {
+        validate_session_catalog_cursor(next)?;
+        let last = page
+            .records
+            .last()
+            .context("session catalog continuation lacks a retained row")?;
+        ensure!(
+            next.updated_order == last.updated_order && next.session_id == last.session_id,
+            "session catalog continuation does not match the retained last row"
+        );
+    }
+    ensure!(
+        serde_json::to_vec(page)?.len() <= MAX_SESSION_SOURCE_BYTES,
+        "session catalog page exceeds the 32 MiB managed response bound"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_public_turn(record: &PublicTurnRecord) -> Result<()> {
+    ensure!(
+        record.record_format == PUBLIC_TURN_RECORD_FORMAT,
+        "public turn format is unsupported"
+    );
+    session_identity("turn origin session", &record.origin_session_id, 128)?;
+    session_identity("public turn identity", &record.turn_id, 128)?;
+    validate_public_node_id("public turn node", &record.node_id)?;
+    let expected_node_id = match record.kind {
+        PublicTurnKind::Primary => {
+            ensure!(
+                record.continuation_of_node_id.is_none() && record.user_entry.is_some(),
+                "primary public turn requires one user entry and no continuation reference"
+            );
+            public_turn_node_id(&record.origin_session_id, &record.turn_id)?
+        }
+        PublicTurnKind::Continuation => {
+            let original = record
+                .continuation_of_node_id
+                .as_deref()
+                .context("public continuation lacks its original node reference")?;
+            validate_public_node_id("public continuation original node", original)?;
+            ensure!(
+                original == public_turn_node_id(&record.origin_session_id, &record.turn_id)?,
+                "public continuation does not reference its exact same-session primary turn"
+            );
+            ensure!(
+                record.user_entry.is_none(),
+                "public continuation cannot contain another user entry"
+            );
+            public_turn_continuation_node_id(&record.origin_session_id, &record.turn_id)?
+        }
+        PublicTurnKind::LegacyContinuation => {
+            ensure!(
+                record.continuation_of_node_id.is_none() && record.user_entry.is_none(),
+                "legacy public continuation cannot fabricate a primary reference or user entry"
+            );
+            public_turn_legacy_continuation_node_id(&record.origin_session_id, &record.turn_id)?
+        }
+    };
+    ensure!(
+        record.node_id == expected_node_id,
+        "public turn node does not match its kind, origin and turn identity"
+    );
+    if let Some(predecessor) = &record.predecessor_node_id {
+        validate_public_node_id("public turn predecessor", predecessor)?;
+        ensure!(
+            predecessor != &record.node_id,
+            "public turn cannot name itself as predecessor"
+        );
+    }
+    if let Some(user_entry) = &record.user_entry {
+        validate_public_message(user_entry)?;
+        ensure!(
+            user_entry.role == "user",
+            "public turn user entry must retain the user role"
+        );
+    }
+    for entry in &record.terminal_entries {
+        validate_public_message(entry)?;
+        ensure!(
+            entry.role != "user",
+            "public terminal entry cannot claim the user role"
+        );
+    }
+    match record.settlement {
+        PublicTurnSettlement::Pending => {
+            ensure!(
+                record.speaker_id.is_some() == !record.terminal_entries.is_empty(),
+                "pending public turn must contain both or neither retryable interruption speaker and entries"
+            );
+            if let Some(speaker) = record.speaker_id.as_deref() {
+                session_identity("pending interruption speaker", speaker, 1024)?;
+            }
+        }
+        PublicTurnSettlement::Completed | PublicTurnSettlement::Interrupted => {
+            let speaker = record
+                .speaker_id
+                .as_deref()
+                .context("settled public turn lacks stable speaker identity")?;
+            session_identity("public turn speaker", speaker, 1024)?;
+            ensure!(
+                !record.terminal_entries.is_empty()
+                    || (matches!(
+                        record.kind,
+                        PublicTurnKind::Continuation | PublicTurnKind::LegacyContinuation
+                    ) && record.settlement == PublicTurnSettlement::Interrupted),
+                "settled primary/completed public turn lacks terminal entries"
+            );
+        }
+    }
+    ensure!(
+        serde_json::to_vec(record)?.len() <= MAX_SESSION_SOURCE_BYTES,
+        "public turn exceeds the 32 MiB managed row bound"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_public_transcript_cursor(cursor: &PublicTranscriptCursor) -> Result<()> {
+    session_identity("public transcript cursor session", &cursor.session_id, 128)?;
+    validate_revision_identity("public transcript cursor revision", &cursor.revision)?;
+    if let Some(head) = &cursor.head_node_id {
+        validate_public_node_id("public transcript cursor head", head)?;
+    }
+    match &cursor.next {
+        PublicTranscriptPosition::Turn { node_id } => {
+            validate_public_node_id("public transcript cursor node", node_id)?
+        }
+        PublicTranscriptPosition::Legacy { sequence } => ensure!(
+            *sequence > 0,
+            "public transcript legacy cursor must be positive"
+        ),
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_public_transcript_page(page: &PublicTranscriptPage) -> Result<()> {
+    session_identity("public transcript page session", &page.session_id, 128)?;
+    session_identity("public transcript page view", &page.view, 64)?;
+    validate_revision_identity("public transcript page revision", &page.revision)?;
+    if let Some(head) = &page.head_node_id {
+        validate_public_node_id("public transcript page head", head)?;
+    }
+    if let Some(pending) = &page.pending {
+        validate_public_turn(pending)?;
+        ensure!(
+            pending.settlement == PublicTurnSettlement::Pending,
+            "public transcript pending row is already settled"
+        );
+    }
+    ensure!(
+        page.records.len() <= MAX_SESSION_SOURCE_ROWS,
+        "public transcript page exceeds the row bound"
+    );
+    for entry in &page.records {
+        match entry {
+            PublicTranscriptEntry::Turn { record } => {
+                validate_public_turn(record)?;
+                ensure!(
+                    record.settlement != PublicTurnSettlement::Pending,
+                    "public transcript settled page contains a pending turn"
+                );
+            }
+            PublicTranscriptEntry::Legacy { sequence, message } => {
+                ensure!(*sequence > 0, "legacy transcript sequence must be positive");
+                validate_public_message(message)?;
+            }
+        }
+    }
+    if let Some(next) = &page.next {
+        validate_public_transcript_cursor(next)?;
+        ensure!(
+            next.session_id == page.session_id
+                && next.revision == page.revision
+                && next.head_node_id == page.head_node_id,
+            "public transcript continuation changed its captured coordinates"
+        );
+    }
+    ensure!(
+        serde_json::to_vec(page)?.len() <= MAX_SESSION_SOURCE_BYTES,
+        "public transcript page exceeds the 32 MiB managed response bound"
+    );
+    Ok(())
+}
+
+fn validate_legacy_prefix(prefix: &LegacyTranscriptPrefix) -> Result<()> {
+    ensure!(
+        prefix.record_format == LEGACY_PREFIX_RECORD_FORMAT,
+        "legacy transcript prefix format is unsupported"
+    );
+    session_identity("legacy transcript namespace", &prefix.namespace, 1024)?;
+    session_identity(
+        "legacy transcript source session",
+        &prefix.source_session_id,
+        128,
+    )?;
+    validate_revision_identity("legacy transcript revision", &prefix.source_revision)?;
+    ensure!(
+        prefix.row_count > 0
+            && prefix.row_count <= i64::MAX as u64
+            && prefix.first_sequence <= prefix.through_sequence,
+        "legacy transcript prefix range is invalid"
+    );
+    Ok(())
+}
+
+fn validate_fork_provenance(fork: &SessionForkProvenance) -> Result<()> {
+    ensure!(
+        fork.record_format == FORK_PROVENANCE_RECORD_FORMAT,
+        "session fork provenance format is unsupported"
+    );
+    session_identity("fork source session", &fork.source_session_id, 128)?;
+    validate_public_node_id("fork source node", &fork.source_node_id)?;
+    session_identity("fork source turn", &fork.source_turn_id, 128)?;
+    bounded_session_label("fork source label", &fork.source_label)?;
+    ensure!(
+        fork.shares_current_project_memory,
+        "session fork must disclose shared current project memory"
+    );
+    Ok(())
+}
+
+fn session_lifecycle_sql(state: SessionLifecycleState) -> &'static str {
+    match state {
+        SessionLifecycleState::Active => "active",
+        SessionLifecycleState::Removed => "removed",
+    }
+}
+
+fn decode_session_catalog_row(row: &sqlx::mysql::MySqlRow) -> Result<SessionCatalogRecord> {
+    let mode: String = row.try_get("mode")?;
+    let lifecycle_state: String = row.try_get("lifecycle_state")?;
+    let created_order: i64 = row.try_get("created_order")?;
+    let updated_order: i64 = row.try_get("updated_order")?;
+    let lifecycle_generation: i64 = row.try_get("lifecycle_generation")?;
+    let record = SessionCatalogRecord {
+        session_id: String::from_utf8(row.try_get::<Vec<u8>, _>("session_id")?)
+            .context("stored session identity is not UTF-8")?,
+        mode: serde_json::from_value(Value::String(mode))
+            .context("stored session mode is unsupported")?,
+        label: row.try_get("label")?,
+        created_order: u64::try_from(created_order)
+            .context("stored session creation order is negative")?,
+        updated_order: u64::try_from(updated_order)
+            .context("stored session update order is negative")?,
+        lifecycle_generation: u64::try_from(lifecycle_generation)
+            .context("stored session lifecycle generation is negative")?,
+        lifecycle_state: match lifecycle_state.as_str() {
+            "active" => SessionLifecycleState::Active,
+            "removed" => SessionLifecycleState::Removed,
+            _ => bail!("stored session lifecycle state is unsupported"),
+        },
+        head_node_id: row.try_get("head_node_id")?,
+        pending_node_id: row.try_get("pending_node_id")?,
+        legacy_prefix: row
+            .try_get::<Option<String>, _>("legacy_prefix")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .context("stored legacy transcript prefix is malformed")?,
+        fork_provenance: row
+            .try_get::<Option<String>, _>("fork_provenance")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .context("stored session fork provenance is malformed")?,
+        record_format: row.try_get("record_format")?,
+    };
+    validate_session_catalog(&record)?;
+    Ok(record)
+}
+
+async fn load_public_turn(
+    transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    node_id: &str,
+) -> Result<Option<PublicTurnRecord>> {
+    validate_public_node_id("public transcript node", node_id)?;
+    let row = sqlx::query("SELECT node_id, origin_session_id, turn_id, record_kind, continuation_of_node_id, predecessor_node_id, settlement, user_entry, speaker_id, terminal_entries, record_format FROM session_public_turns WHERE node_id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    row.as_ref().map(decode_public_turn_row).transpose()
+}
+
+fn decode_public_turn_row(row: &sqlx::mysql::MySqlRow) -> Result<PublicTurnRecord> {
+    let settlement: String = row.try_get("settlement")?;
+    let record_kind: String = row.try_get("record_kind")?;
+    let user_entry: Option<String> = row.try_get("user_entry")?;
+    let terminal_entries: Option<String> = row.try_get("terminal_entries")?;
+    let record = PublicTurnRecord {
+        node_id: row.try_get("node_id")?,
+        origin_session_id: String::from_utf8(row.try_get::<Vec<u8>, _>("origin_session_id")?)
+            .context("stored public turn origin session is not UTF-8")?,
+        turn_id: String::from_utf8(row.try_get::<Vec<u8>, _>("turn_id")?)
+            .context("stored public turn identity is not UTF-8")?,
+        kind: match record_kind.as_str() {
+            "primary" => PublicTurnKind::Primary,
+            "continuation" => PublicTurnKind::Continuation,
+            "legacy" => PublicTurnKind::LegacyContinuation,
+            _ => bail!("stored public turn kind is unsupported"),
+        },
+        continuation_of_node_id: row.try_get("continuation_of_node_id")?,
+        predecessor_node_id: row.try_get("predecessor_node_id")?,
+        settlement: match settlement.as_str() {
+            "pending" => PublicTurnSettlement::Pending,
+            "completed" => PublicTurnSettlement::Completed,
+            "interrupted" => PublicTurnSettlement::Interrupted,
+            _ => bail!("stored public turn settlement is unsupported"),
+        },
+        user_entry: user_entry
+            .map(|entry| serde_json::from_str(&entry))
+            .transpose()
+            .context("stored public user entry is malformed")?,
+        speaker_id: row
+            .try_get::<Option<Vec<u8>>, _>("speaker_id")?
+            .map(String::from_utf8)
+            .transpose()
+            .context("stored public turn speaker is not UTF-8")?,
+        terminal_entries: terminal_entries
+            .map(|entries| serde_json::from_str(&entries))
+            .transpose()
+            .context("stored public terminal entries are malformed")?
+            .unwrap_or_default(),
+        record_format: row.try_get("record_format")?,
+    };
+    validate_public_turn(&record)?;
+    Ok(record)
+}
+
+fn validate_public_message(message: &Message) -> Result<()> {
+    identifier("public message role", &message.role, 128)?;
+    ensure!(
+        message
+            .blocks
+            .iter()
+            .all(|block| !matches!(block, ContentBlock::ReasoningSummary { .. })),
+        "private reasoning summaries cannot enter the public transcript"
+    );
+    encode_typed_message(message).map(drop)
+}
+
+fn public_transcript_entry_position(entry: &PublicTranscriptEntry) -> PublicTranscriptPosition {
+    match entry {
+        PublicTranscriptEntry::Turn { record } => PublicTranscriptPosition::Turn {
+            node_id: record.node_id.clone(),
+        },
+        PublicTranscriptEntry::Legacy { sequence, .. } => PublicTranscriptPosition::Legacy {
+            sequence: *sequence,
+        },
+    }
+}
+
+fn bounded_session_label(label: &str, value: &str) -> Result<()> {
+    ensure!(
+        value.len() <= MAX_SESSION_LABEL_BYTES,
+        "{label} exceeds {MAX_SESSION_LABEL_BYTES} bytes"
+    );
+    ensure!(!value.contains('\0'), "{label} must not contain NUL");
+    Ok(())
+}
+
+pub(crate) fn session_identity(label: &str, value: &str, maximum: usize) -> Result<()> {
+    identifier(label, value, maximum)?;
+    ensure!(
+        !value.chars().any(char::is_control),
+        "{label} must not contain control characters"
+    );
+    Ok(())
+}
+
+fn validate_public_node_id(label: &str, value: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{label} is malformed"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_revision_identity(label: &str, value: &str) -> Result<()> {
+    session_identity(label, value, 64)
 }
 
 fn encode_reasoning_summaries(records: &[ReasoningSummaryRecord]) -> Result<Vec<(String, String)>> {
@@ -3759,6 +6417,202 @@ pub(crate) fn validate_session_checkpoint(
         "memory checkpoint must contain a message or state value"
     );
     Ok(())
+}
+
+pub(crate) fn validate_session_mode_checkpoint(
+    namespace: &str,
+    session_id: &str,
+    messages: &[Message],
+    values: &[(String, Value)],
+    checkpoint: &SessionModeCheckpoint,
+) -> Result<()> {
+    session_identity("mode checkpoint session", session_id, 128)?;
+    ensure!(
+        messages.is_empty(),
+        "mode checkpoint cannot append a transcript entry"
+    );
+    ensure!(
+        checkpoint.expected_generation <= i64::MAX as u64,
+        "mode checkpoint generation exceeds the store range"
+    );
+    ensure!(
+        checkpoint.expected_mode != checkpoint.mode,
+        "mode checkpoint must change the mode"
+    );
+    let state_key = session_mode_state_key(namespace, session_id)?;
+    let state = values
+        .iter()
+        .find(|(key, _)| key == &state_key)
+        .context("mode checkpoint lacks the matching runtime session state")?;
+    ensure!(
+        state.1.get("id").and_then(Value::as_str) == Some(session_id),
+        "mode checkpoint runtime session identity differs"
+    );
+    ensure!(
+        state.1.get("mode") == Some(&serde_json::to_value(checkpoint.mode)?),
+        "mode checkpoint runtime state has a different mode"
+    );
+    ensure!(
+        state.1.get("lifecycle_generation").and_then(Value::as_u64)
+            == Some(checkpoint.expected_generation),
+        "mode checkpoint runtime state has a different lifecycle generation"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_session_turn_checkpoint(
+    session_id: &str,
+    messages: &[Message],
+    checkpoint: &SessionTurnCheckpoint,
+) -> Result<()> {
+    session_identity("public turn session", session_id, 128)?;
+    let (expected_generation, turn_id) = match checkpoint {
+        SessionTurnCheckpoint::Admit {
+            expected_generation,
+            turn_id,
+            ..
+        }
+        | SessionTurnCheckpoint::MarkRetryableInterruption {
+            expected_generation,
+            turn_id,
+            ..
+        }
+        | SessionTurnCheckpoint::Resume {
+            expected_generation,
+            turn_id,
+            ..
+        }
+        | SessionTurnCheckpoint::Settle {
+            expected_generation,
+            turn_id,
+            ..
+        } => (*expected_generation, turn_id),
+    };
+    ensure!(
+        expected_generation <= i64::MAX as u64,
+        "public turn generation exceeds the store range"
+    );
+    session_identity("public turn identity", turn_id, 128)?;
+    match checkpoint {
+        SessionTurnCheckpoint::Admit {
+            label,
+            expected_transcript_rows,
+            ..
+        } => {
+            if let Some(label) = label {
+                bounded_session_label("session admission label", label)?;
+            }
+            ensure!(
+                expected_transcript_rows.is_none_or(|rows| rows < i64::MAX as u64),
+                "admitted transcript row exceeds the store range"
+            );
+            ensure!(
+                messages.len() == 1 && messages[0].role == "user",
+                "public turn admission requires exactly one user entry"
+            );
+            validate_public_message(&messages[0])?;
+        }
+        SessionTurnCheckpoint::MarkRetryableInterruption { speaker_id, .. } => {
+            session_identity("public turn interruption speaker", speaker_id, 1024)?;
+            ensure!(
+                messages.len() == 1 && messages[0].role != "user",
+                "retryable interruption requires exactly one terminal marker"
+            );
+            validate_public_message(&messages[0])?;
+        }
+        SessionTurnCheckpoint::Resume { legacy, .. } => {
+            ensure!(
+                messages.is_empty(),
+                "public turn resume cannot append another transcript entry"
+            );
+            if let Some(legacy) = legacy {
+                validate_legacy_prefix(&legacy.legacy_prefix)?;
+                identifier("legacy turn journal key", &legacy.journal_key, 1024)?;
+                ensure!(
+                    serde_json::to_vec(&legacy.expected_journal)?.len() <= MAX_SESSION_SOURCE_BYTES,
+                    "legacy turn journal proof exceeds the 32 MiB managed row bound"
+                );
+            }
+        }
+        SessionTurnCheckpoint::Settle {
+            settlement,
+            speaker_id,
+            ..
+        } => {
+            ensure!(
+                *settlement != PublicTurnSettlement::Pending,
+                "public turn settlement cannot remain pending"
+            );
+            session_identity("public turn speaker", speaker_id, 1024)?;
+            ensure!(
+                !messages.is_empty() || *settlement == PublicTurnSettlement::Interrupted,
+                "completed public turn settlement requires terminal entries"
+            );
+            for message in messages {
+                validate_public_message(message)?;
+                ensure!(
+                    message.role != "user",
+                    "public terminal entry cannot claim the user role"
+                );
+            }
+            ensure!(
+                serde_json::to_vec(messages)?.len() <= MAX_SESSION_SOURCE_BYTES,
+                "public terminal entries exceed the 32 MiB managed row bound"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn encode_session_turn_checkpoint(
+    checkpoint: &SessionTurnCheckpoint,
+    messages: &[Message],
+) -> Result<EncodedSessionTurnCheckpoint> {
+    match checkpoint {
+        SessionTurnCheckpoint::Admit {
+            expected_generation,
+            turn_id,
+            label,
+            expected_transcript_rows,
+        } => Ok(EncodedSessionTurnCheckpoint::Admit {
+            expected_generation: *expected_generation,
+            turn_id: turn_id.clone(),
+            label: label.clone(),
+            expected_transcript_rows: *expected_transcript_rows,
+            user_entry: serde_json::to_string(&messages[0])?,
+        }),
+        SessionTurnCheckpoint::MarkRetryableInterruption {
+            expected_generation,
+            turn_id,
+            speaker_id,
+        } => Ok(EncodedSessionTurnCheckpoint::MarkRetryableInterruption {
+            expected_generation: *expected_generation,
+            turn_id: turn_id.clone(),
+            speaker_id: speaker_id.clone(),
+            terminal_entries: serde_json::to_string(messages)?,
+        }),
+        SessionTurnCheckpoint::Resume {
+            expected_generation,
+            turn_id,
+            legacy,
+        } => Ok(EncodedSessionTurnCheckpoint::Resume {
+            expected_generation: *expected_generation,
+            turn_id: turn_id.clone(),
+            legacy: legacy.clone(),
+        }),
+        SessionTurnCheckpoint::Settle {
+            expected_generation,
+            turn_id,
+            settlement,
+            speaker_id,
+        } => Ok(EncodedSessionTurnCheckpoint::Settle {
+            expected_generation: *expected_generation,
+            turn_id: turn_id.clone(),
+            settlement: *settlement,
+            speaker_id: speaker_id.clone(),
+            terminal_entries: serde_json::to_string(messages)?,
+        }),
+    }
 }
 
 pub(crate) fn validate_context_summary(record: &ContextSummaryRecord) -> Result<()> {
@@ -4689,6 +7543,1614 @@ mod tests {
     use crate::service::{self, ServiceCall, ServiceValue};
     use serde_json::json;
     use sha2::Digest;
+
+    fn pending_public_turn() -> PublicTurnRecord {
+        let origin_session_id = "session-a".to_owned();
+        let turn_id = "turn-a".to_owned();
+        PublicTurnRecord {
+            node_id: public_turn_node_id(&origin_session_id, &turn_id).unwrap(),
+            origin_session_id,
+            turn_id,
+            kind: PublicTurnKind::Primary,
+            continuation_of_node_id: None,
+            predecessor_node_id: None,
+            settlement: PublicTurnSettlement::Pending,
+            user_entry: Some(Message::text("user", "hello")),
+            speaker_id: None,
+            terminal_entries: vec![],
+            record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
+        }
+    }
+
+    #[test]
+    fn session_catalog_and_public_turn_validators_preserve_lifecycle_boundaries() -> Result<()> {
+        let pending = pending_public_turn();
+        validate_public_turn(&pending)?;
+
+        let mut completed = pending.clone();
+        completed.settlement = PublicTurnSettlement::Completed;
+        completed.speaker_id = Some("speaker-a".into());
+        completed.terminal_entries = vec![Message::text("assistant", "answer")];
+        validate_public_turn(&completed)?;
+
+        let mut retryable_pending = completed.clone();
+        retryable_pending.settlement = PublicTurnSettlement::Pending;
+        validate_public_turn(&retryable_pending)?;
+        let mut invalid_pending = retryable_pending;
+        invalid_pending.terminal_entries.clear();
+        assert!(validate_public_turn(&invalid_pending).is_err());
+        let mut private = completed.clone();
+        private.terminal_entries = vec![Message {
+            role: "assistant".into(),
+            blocks: vec![ContentBlock::ReasoningSummary {
+                text: "private".into(),
+            }],
+        }];
+        assert!(validate_public_turn(&private).is_err());
+
+        let catalog = SessionCatalogRecord {
+            session_id: "session-a".into(),
+            mode: Mode::Ifs,
+            label: String::new(),
+            created_order: 1,
+            updated_order: 1,
+            lifecycle_generation: 0,
+            lifecycle_state: SessionLifecycleState::Active,
+            head_node_id: None,
+            pending_node_id: Some(pending.node_id.clone()),
+            legacy_prefix: None,
+            fork_provenance: None,
+            record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+        };
+        validate_session_catalog(&catalog)?;
+        let mut invalid_catalog = catalog.clone();
+        invalid_catalog.head_node_id = invalid_catalog.pending_node_id.clone();
+        assert!(validate_session_catalog(&invalid_catalog).is_err());
+        let mut unsupported_catalog = catalog.clone();
+        unsupported_catalog.record_format = "future-catalog".into();
+        assert!(validate_session_catalog(&unsupported_catalog).is_err());
+        let mut oversized_catalog = catalog.clone();
+        oversized_catalog.label = "x".repeat(MAX_SESSION_LABEL_BYTES + 1);
+        assert!(validate_session_catalog(&oversized_catalog).is_err());
+        let mut unknown_catalog = serde_json::to_value(&catalog)?;
+        unknown_catalog["unrecognized_authority"] = json!(true);
+        assert!(serde_json::from_value::<SessionCatalogRecord>(unknown_catalog).is_err());
+
+        let mut unsupported_turn = completed.clone();
+        unsupported_turn.record_format = "future-turn".into();
+        assert!(validate_public_turn(&unsupported_turn).is_err());
+        let mut wrong_origin = completed.clone();
+        wrong_origin.origin_session_id = "other-session".into();
+        assert!(validate_public_turn(&wrong_origin).is_err());
+        let mut missing_speaker = completed.clone();
+        missing_speaker.speaker_id = None;
+        assert!(validate_public_turn(&missing_speaker).is_err());
+        let mut oversized_speaker = completed.clone();
+        oversized_speaker.speaker_id = Some("s".repeat(1025));
+        assert!(validate_public_turn(&oversized_speaker).is_err());
+        let mut oversized_turn = completed.clone();
+        oversized_turn.terminal_entries = vec![Message::text(
+            "assistant",
+            "x".repeat(MAX_SESSION_SOURCE_BYTES),
+        )];
+        assert!(validate_public_turn(&oversized_turn).is_err());
+        let mut unknown_turn = serde_json::to_value(&completed)?;
+        unknown_turn["unrecognized_entry"] = json!(true);
+        assert!(serde_json::from_value::<PublicTurnRecord>(unknown_turn).is_err());
+        let fork = SessionForkProvenance {
+            source_session_id: "session-a".into(),
+            source_node_id: completed.node_id.clone(),
+            source_turn_id: completed.turn_id.clone(),
+            source_label: "source".into(),
+            shares_current_project_memory: true,
+            record_format: FORK_PROVENANCE_RECORD_FORMAT.into(),
+        };
+        let mut forked_catalog = catalog.clone();
+        forked_catalog.head_node_id = Some(completed.node_id.clone());
+        forked_catalog.pending_node_id = None;
+        forked_catalog.fork_provenance = Some(fork.clone());
+        validate_session_catalog(&forked_catalog)?;
+        forked_catalog
+            .fork_provenance
+            .as_mut()
+            .unwrap()
+            .record_format = "future-fork".into();
+        assert!(validate_session_catalog(&forked_catalog).is_err());
+        forked_catalog.fork_provenance = Some(SessionForkProvenance {
+            shares_current_project_memory: false,
+            ..fork
+        });
+        assert!(validate_session_catalog(&forked_catalog).is_err());
+
+        let catalog_page = SessionCatalogPage {
+            lifecycle_state: Some(SessionLifecycleState::Active),
+            view: "main".into(),
+            revision: "revision".into(),
+            records: vec![catalog.clone()],
+            total_rows: 1,
+            next: Some(SessionCatalogCursor {
+                updated_order: catalog.updated_order,
+                session_id: catalog.session_id.clone(),
+            }),
+        };
+        validate_session_catalog_page(&catalog_page)?;
+        let mut wrong_catalog_cursor = catalog_page.clone();
+        wrong_catalog_cursor.next.as_mut().unwrap().session_id = "other".into();
+        assert!(validate_session_catalog_page(&wrong_catalog_cursor).is_err());
+        let mut oversized_catalog_page = catalog_page.clone();
+        oversized_catalog_page.next = None;
+        oversized_catalog_page.records = vec![catalog.clone(); MAX_SESSION_SOURCE_ROWS + 1];
+        assert!(validate_session_catalog_page(&oversized_catalog_page).is_err());
+
+        let transcript_page = PublicTranscriptPage {
+            session_id: "session-a".into(),
+            view: "main".into(),
+            revision: "revision".into(),
+            head_node_id: Some(completed.node_id.clone()),
+            pending: Some(pending),
+            records: vec![
+                PublicTranscriptEntry::Turn {
+                    record: completed.clone(),
+                },
+                PublicTranscriptEntry::Legacy {
+                    sequence: 1,
+                    message: Message::text("assistant", "legacy unknown speaker"),
+                },
+            ],
+            total_rows: 2,
+            next: Some(PublicTranscriptCursor {
+                session_id: "session-a".into(),
+                revision: "revision".into(),
+                head_node_id: Some(completed.node_id),
+                next: PublicTranscriptPosition::Legacy { sequence: 1 },
+            }),
+        };
+        validate_public_transcript_page(&transcript_page)?;
+        let mut wrong_transcript_cursor = transcript_page;
+        wrong_transcript_cursor.next.as_mut().unwrap().session_id = "other".into();
+        assert!(validate_public_transcript_page(&wrong_transcript_cursor).is_err());
+        let mut oversized_transcript_page = wrong_transcript_cursor;
+        oversized_transcript_page.next = None;
+        oversized_transcript_page.records = vec![
+            PublicTranscriptEntry::Legacy {
+                sequence: 1,
+                message: Message::text("assistant", "legacy"),
+            };
+            MAX_SESSION_SOURCE_ROWS + 1
+        ];
+        assert!(validate_public_transcript_page(&oversized_transcript_page).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_public_rows_and_foreign_turn_coordinates_have_no_dolt_effect() -> Result<()>
+    {
+        let directory = crate::test_support::tempdir()?;
+        let scope = format!("project/{}", "a".repeat(64));
+        let options =
+            crate::test_support::open_options(directory.path().to_owned(), scope.clone())?;
+        let store = MemoryStore::open(options).await?;
+        let session = "bounded-turn";
+        let namespace = format!("{scope}/transcript/{session}");
+        let catalog = SessionCatalogRecord {
+            session_id: session.into(),
+            mode: Mode::Ifs,
+            label: String::new(),
+            created_order: 1,
+            updated_order: 1,
+            lifecycle_generation: 0,
+            lifecycle_state: SessionLifecycleState::Active,
+            head_node_id: None,
+            pending_node_id: None,
+            legacy_prefix: None,
+            fork_provenance: None,
+            record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+        };
+        let before = store.revision().await?;
+        let mut unsupported = catalog.clone();
+        unsupported.record_format = "future-catalog".into();
+        assert!(
+            store
+                .fixture_insert_public_session(&unsupported, &[])
+                .await
+                .is_err()
+        );
+        let mut oversized = catalog.clone();
+        oversized.label = "x".repeat(MAX_SESSION_LABEL_BYTES + 1);
+        assert!(
+            store
+                .fixture_insert_public_session(&oversized, &[])
+                .await
+                .is_err()
+        );
+        let mut unsupported_turn = pending_public_turn();
+        unsupported_turn.record_format = "future-turn".into();
+        assert!(
+            store
+                .fixture_insert_public_session(&catalog, &[unsupported_turn])
+                .await
+                .is_err()
+        );
+        assert_eq!(store.revision().await?, before);
+        assert!(store.session_catalog_record(session).await?.is_none());
+
+        store.create_session_catalog(session, Mode::Ifs, "").await?;
+        let before = store.revision().await?;
+        let message = [Message::text("user", "exact question")];
+        let checkpoint = SessionTurnCheckpoint::Admit {
+            expected_generation: 0,
+            turn_id: "exact-turn".into(),
+            label: None,
+            expected_transcript_rows: Some(0),
+        };
+        for wrong_namespace in [
+            format!("project/{}/transcript/{session}", "b".repeat(64)),
+            format!("{scope}/transcript/other-session"),
+        ] {
+            assert!(
+                store
+                    .checkpoint_session_turn(&wrong_namespace, session, &message, &[], &checkpoint)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.revision().await?, before);
+            assert!(
+                store
+                    .public_transcript_page(session, None, 8)
+                    .await?
+                    .pending
+                    .is_none()
+            );
+            assert_eq!(store.history_window(&namespace, 8).await?.total_rows, 0);
+        }
+
+        let receipt = store.with_logical_receipt(
+            Uuid::new_v4(),
+            "view.checkpoint_session",
+            b"exact bound public turn admission",
+        );
+        receipt
+            .checkpoint_session_turn(&namespace, session, &message, &[], &checkpoint)
+            .await?;
+        let accepted_revision = store.revision().await?;
+        receipt
+            .checkpoint_session_turn(&namespace, session, &message, &[], &checkpoint)
+            .await?;
+        assert_eq!(store.revision().await?, accepted_revision);
+        assert_eq!(store.history_window(&namespace, 8).await?.total_rows, 1);
+        assert_eq!(
+            store
+                .public_transcript_page(session, None, 8)
+                .await?
+                .pending
+                .as_ref()
+                .map(|turn| turn.turn_id.as_str()),
+            Some("exact-turn")
+        );
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_transcript_pages_prove_the_selected_predecessor_chain() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let mut first = pending_public_turn();
+        first.settlement = PublicTurnSettlement::Completed;
+        first.speaker_id = Some("speaker-a".into());
+        first.terminal_entries = vec![Message::text("assistant", "first answer")];
+        let second = PublicTurnRecord {
+            node_id: public_turn_node_id("session-a", "turn-b")?,
+            origin_session_id: "session-a".into(),
+            turn_id: "turn-b".into(),
+            kind: PublicTurnKind::Primary,
+            continuation_of_node_id: None,
+            predecessor_node_id: Some(first.node_id.clone()),
+            settlement: PublicTurnSettlement::Interrupted,
+            user_entry: Some(Message::text("user", "second question")),
+            speaker_id: Some("speaker-b".into()),
+            terminal_entries: vec![Message::text("assistant", "interrupted answer")],
+            record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
+        };
+        validate_public_turn(&second)?;
+        let pending = PublicTurnRecord {
+            node_id: public_turn_node_id("session-a", "turn-c")?,
+            origin_session_id: "session-a".into(),
+            turn_id: "turn-c".into(),
+            kind: PublicTurnKind::Primary,
+            continuation_of_node_id: None,
+            predecessor_node_id: Some(second.node_id.clone()),
+            settlement: PublicTurnSettlement::Pending,
+            user_entry: Some(Message::text("user", "pending question")),
+            speaker_id: None,
+            terminal_entries: vec![],
+            record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
+        };
+        validate_public_turn(&pending)?;
+        let mut sibling = first.clone();
+        sibling.origin_session_id = "session-b".into();
+        sibling.turn_id = "turn-sibling".into();
+        sibling.node_id = public_turn_node_id(&sibling.origin_session_id, &sibling.turn_id)?;
+        sibling.predecessor_node_id = None;
+        validate_public_turn(&sibling)?;
+
+        store
+            .fixture_insert_public_session(
+                &SessionCatalogRecord {
+                    session_id: "session-a".into(),
+                    mode: Mode::Ifs,
+                    label: String::new(),
+                    created_order: 1,
+                    updated_order: 1,
+                    lifecycle_generation: 0,
+                    lifecycle_state: SessionLifecycleState::Active,
+                    head_node_id: Some(second.node_id.clone()),
+                    pending_node_id: Some(pending.node_id.clone()),
+                    legacy_prefix: None,
+                    fork_provenance: None,
+                    record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+                },
+                &[first.clone(), second.clone(), pending.clone()],
+            )
+            .await?;
+        store
+            .fixture_insert_public_session(
+                &SessionCatalogRecord {
+                    session_id: "session-b".into(),
+                    mode: Mode::Ifs,
+                    label: String::new(),
+                    created_order: 2,
+                    updated_order: 2,
+                    lifecycle_generation: 0,
+                    lifecycle_state: SessionLifecycleState::Active,
+                    head_node_id: Some(sibling.node_id.clone()),
+                    pending_node_id: None,
+                    legacy_prefix: None,
+                    fork_provenance: None,
+                    record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+                },
+                &[sibling.clone()],
+            )
+            .await?;
+
+        let first_page = store.public_transcript_page("session-a", None, 1).await?;
+        assert_eq!(first_page.total_rows, 2);
+        assert_eq!(first_page.pending.as_ref(), Some(&pending));
+        assert!(matches!(
+            first_page.records.as_slice(),
+            [PublicTranscriptEntry::Turn { record }] if record == &second
+        ));
+        let cursor = first_page
+            .next
+            .as_ref()
+            .context("first page continuation")?;
+        assert!(matches!(
+            &cursor.next,
+            PublicTranscriptPosition::Turn { node_id } if node_id == &first.node_id
+        ));
+        let last_page = store
+            .public_transcript_page("session-a", Some(cursor), 1)
+            .await?;
+        assert!(matches!(
+            last_page.records.as_slice(),
+            [PublicTranscriptEntry::Turn { record }] if record == &first
+        ));
+        assert!(last_page.next.is_none());
+
+        let mut forged = cursor.clone();
+        forged.next = PublicTranscriptPosition::Turn {
+            node_id: sibling.node_id.clone(),
+        };
+        let error = store
+            .public_transcript_page("session-a", Some(&forged), 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not reachable"), "{error:#}");
+
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn long_public_transcript_pages_cover_one_pinned_revision_exactly_once() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let session_id = "long-public-session";
+        let mut turns = Vec::with_capacity(1025);
+        let mut predecessor = None;
+        for index in 0..1025 {
+            let turn_id = format!("turn-{index:04}");
+            let record = PublicTurnRecord {
+                node_id: public_turn_node_id(session_id, &turn_id)?,
+                origin_session_id: session_id.into(),
+                turn_id,
+                kind: PublicTurnKind::Primary,
+                continuation_of_node_id: None,
+                predecessor_node_id: predecessor,
+                settlement: PublicTurnSettlement::Completed,
+                user_entry: Some(Message::text("user", format!("question-{index:04}"))),
+                speaker_id: Some("speaker-a".into()),
+                terminal_entries: vec![Message::text("assistant", format!("answer-{index:04}"))],
+                record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
+            };
+            predecessor = Some(record.node_id.clone());
+            turns.push(record);
+        }
+        store
+            .fixture_insert_public_session(
+                &SessionCatalogRecord {
+                    session_id: session_id.into(),
+                    mode: Mode::Ifs,
+                    label: "long public transcript".into(),
+                    created_order: 1,
+                    updated_order: 1,
+                    lifecycle_generation: 0,
+                    lifecycle_state: SessionLifecycleState::Active,
+                    head_node_id: predecessor,
+                    pending_node_id: None,
+                    legacy_prefix: None,
+                    fork_provenance: None,
+                    record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+                },
+                &turns,
+            )
+            .await?;
+
+        let mut cursor = None;
+        let mut first_cursor = None;
+        let mut revision = None;
+        let mut actual = Vec::new();
+        loop {
+            let page = store
+                .public_transcript_page(session_id, cursor.as_ref(), 128)
+                .await?;
+            assert_eq!(page.total_rows, 1025);
+            assert!(page.records.len() <= 128);
+            assert_eq!(
+                revision.get_or_insert_with(|| page.revision.clone()),
+                &page.revision
+            );
+            for entry in &page.records {
+                let PublicTranscriptEntry::Turn { record } = entry else {
+                    panic!("long v7 transcript returned a legacy row")
+                };
+                actual.push(record.turn_id.clone());
+            }
+            if first_cursor.is_none() {
+                first_cursor = page.next.clone();
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let expected = (0..1025)
+            .rev()
+            .map(|index| format!("turn-{index:04}"))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        let namespace = "project/transcript/long-public-session";
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session_id,
+                &[Message::text("user", "question after captured page")],
+                &[("long-page-journal".into(), json!({"state": "started"}))],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "turn-after-capture".into(),
+                    label: None,
+                    expected_transcript_rows: None,
+                },
+            )
+            .await?;
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session_id,
+                &[Message::text("assistant", "answer after captured page")],
+                &[("long-page-journal".into(), json!({"state": "ended"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "turn-after-capture".into(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: "speaker-b".into(),
+                },
+            )
+            .await?;
+        let current = store.public_transcript_page(session_id, None, 128).await?;
+        assert_eq!(current.total_rows, 1026);
+        assert!(matches!(current.records.first(),
+            Some(PublicTranscriptEntry::Turn { record })
+                if record.turn_id == "turn-after-capture"));
+        let error = store
+            .public_transcript_page(
+                session_id,
+                Some(first_cursor.as_ref().context("long transcript cursor")?),
+                128,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("revision changed"), "{error:#}");
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_interruption_is_a_fork_boundary_with_independent_suffixes() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let parent = "interrupted-fork-parent";
+        let child = "interrupted-fork-child";
+        let parent_namespace = "project/transcript/interrupted-fork-parent";
+        let child_namespace = "project/transcript/interrupted-fork-child";
+        store
+            .create_session_catalog(parent, Mode::Ifs, "parent")
+            .await?;
+        store
+            .checkpoint_session_turn(
+                parent_namespace,
+                parent,
+                &[Message::text("user", "shared interrupted question")],
+                &[("interrupted-journal".into(), json!({"state": "started"}))],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "terminal-boundary".into(),
+                    label: None,
+                    expected_transcript_rows: Some(0),
+                },
+            )
+            .await?;
+        store
+            .checkpoint_session_turn(
+                parent_namespace,
+                parent,
+                &[Message::text("kuru-interruption", "terminal interruption")],
+                &[("interrupted-journal".into(), json!({"state": "ended"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "terminal-boundary".into(),
+                    settlement: PublicTurnSettlement::Interrupted,
+                    speaker_id: "speaker-a".into(),
+                },
+            )
+            .await?;
+        let source = store.public_transcript_page(parent, None, 16).await?;
+        let [PublicTranscriptEntry::Turn { record: boundary }] = source.records.as_slice() else {
+            bail!("terminal interruption did not create a settled boundary")
+        };
+        assert_eq!(boundary.settlement, PublicTurnSettlement::Interrupted);
+        assert_eq!(boundary.speaker_id.as_deref(), Some("speaker-a"));
+        let boundary = boundary.clone();
+        store
+            .fork_session_catalog(parent, 0, &boundary.node_id, child, "child")
+            .await?;
+
+        for (session, namespace, turn, question, answer) in [
+            (
+                parent,
+                parent_namespace,
+                "parent-suffix",
+                "parent question",
+                "parent answer",
+            ),
+            (
+                child,
+                child_namespace,
+                "child-suffix",
+                "child question",
+                "child answer",
+            ),
+        ] {
+            let prior_rows = store.history_window(namespace, 0).await?.total_rows;
+            store
+                .checkpoint_session_turn(
+                    namespace,
+                    session,
+                    &[Message::text("user", question)],
+                    &[(format!("{turn}-journal"), json!({"state": "started"}))],
+                    &SessionTurnCheckpoint::Admit {
+                        expected_generation: 0,
+                        turn_id: turn.into(),
+                        label: None,
+                        expected_transcript_rows: Some(prior_rows),
+                    },
+                )
+                .await?;
+            store
+                .checkpoint_session_turn(
+                    namespace,
+                    session,
+                    &[Message::text("assistant", answer)],
+                    &[(format!("{turn}-journal"), json!({"state": "ended"}))],
+                    &SessionTurnCheckpoint::Settle {
+                        expected_generation: 0,
+                        turn_id: turn.into(),
+                        settlement: PublicTurnSettlement::Completed,
+                        speaker_id: "speaker-b".into(),
+                    },
+                )
+                .await?;
+        }
+        let parent_page = store.public_transcript_page(parent, None, 16).await?;
+        let child_page = store.public_transcript_page(child, None, 16).await?;
+        for (page, own, other) in [
+            (&parent_page, "parent-suffix", "child-suffix"),
+            (&child_page, "child-suffix", "parent-suffix"),
+        ] {
+            assert_eq!(page.total_rows, 2);
+            assert!(matches!(page.records.as_slice(),
+                [PublicTranscriptEntry::Turn { record: suffix }, PublicTranscriptEntry::Turn { record: shared }]
+                    if suffix.turn_id == own
+                        && suffix.predecessor_node_id.as_deref() == Some(boundary.node_id.as_str())
+                        && shared == &boundary));
+            assert!(!page.records.iter().any(|entry| matches!(entry,
+                PublicTranscriptEntry::Turn { record } if record.turn_id == other)));
+        }
+        assert_eq!(
+            store.history_window(parent_namespace, 16).await?.total_rows,
+            4
+        );
+        assert_eq!(
+            store.history_window(child_namespace, 16).await?.total_rows,
+            2
+        );
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_mutations_are_generation_checked_and_reversible() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let created = store
+            .create_session_catalog("lifecycle-session", Mode::Jungian, "first label")
+            .await?;
+        assert_eq!(created.lifecycle_generation, 0);
+        assert_eq!(created.lifecycle_state, SessionLifecycleState::Active);
+        let created_record = store
+            .session_catalog_page(None, None, None, 16)
+            .await?
+            .records
+            .into_iter()
+            .next()
+            .context("created session was absent from its catalog")?;
+        assert_eq!(created_record.created_order, created_record.updated_order);
+
+        let duplicate = store
+            .create_session_catalog("lifecycle-session", Mode::Jungian, "duplicate")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            duplicate
+                .downcast_ref::<SessionLifecycleRejected>()
+                .map(|error| error.0),
+            Some(SessionLifecycleRefusal::AlreadyExists)
+        );
+
+        let renamed = store
+            .rename_session_catalog("lifecycle-session", 0, "renamed")
+            .await?;
+        assert_eq!(renamed.lifecycle_generation, 1);
+        let renamed_record = store
+            .session_catalog_page(None, None, None, 16)
+            .await?
+            .records
+            .into_iter()
+            .next()
+            .context("renamed session was absent from its catalog")?;
+        assert_eq!(renamed_record.label, "renamed");
+        assert!(renamed.updated_order > created.updated_order);
+        let revision = store.revision().await?;
+        let stale = store
+            .remove_session_catalog("lifecycle-session", 0)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            stale
+                .downcast_ref::<SessionLifecycleRejected>()
+                .map(|error| error.0),
+            Some(SessionLifecycleRefusal::GenerationChanged)
+        );
+        assert_eq!(store.revision().await?, revision);
+
+        let removed = store.remove_session_catalog("lifecycle-session", 1).await?;
+        assert_eq!(removed.lifecycle_generation, 2);
+        assert_eq!(removed.lifecycle_state, SessionLifecycleState::Removed);
+        let already_removed = store
+            .remove_session_catalog("lifecycle-session", 2)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            already_removed
+                .downcast_ref::<SessionLifecycleRejected>()
+                .map(|error| error.0),
+            Some(SessionLifecycleRefusal::AlreadyRemoved)
+        );
+
+        let restored = store
+            .restore_session_catalog("lifecycle-session", 2)
+            .await?;
+        assert_eq!(restored.lifecycle_generation, 3);
+        assert_eq!(restored.lifecycle_state, SessionLifecycleState::Active);
+        assert!(restored.updated_order > removed.updated_order);
+        let page = store
+            .session_catalog_page(Some(SessionLifecycleState::Active), None, None, 16)
+            .await?;
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].label, "renamed");
+        assert_eq!(page.records[0].created_order, created_record.created_order);
+        assert_eq!(page.records[0].updated_order, restored.updated_order);
+
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_exact_retry_returns_its_original_receipt_result() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        store
+            .create_session_catalog("receipt-session", Mode::Ifs, "original")
+            .await?;
+        let request_id = Uuid::new_v4();
+        let rename =
+            store.with_logical_receipt(request_id, "view.rename_session", b"exact rename request");
+        let original = rename
+            .rename_session_catalog("receipt-session", 0, "renamed")
+            .await?;
+        assert_eq!(original.lifecycle_generation, 1);
+        assert_eq!(original.lifecycle_state, SessionLifecycleState::Active);
+
+        let removed = store.remove_session_catalog("receipt-session", 1).await?;
+        assert_eq!(removed.lifecycle_generation, 2);
+        assert_eq!(removed.lifecycle_state, SessionLifecycleState::Removed);
+        let revision = store.revision().await?;
+
+        let replayed = rename
+            .rename_session_catalog("receipt-session", 0, "renamed")
+            .await?;
+        assert_eq!(replayed, original);
+        assert_eq!(store.revision().await?, revision);
+        let page = store.session_catalog_page(None, None, None, 16).await?;
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(
+            page.records[0].lifecycle_state,
+            SessionLifecycleState::Removed
+        );
+        assert_eq!(page.records[0].lifecycle_generation, 2);
+
+        let changed = store.with_logical_receipt(
+            request_id,
+            "view.rename_session",
+            b"different rename request",
+        );
+        let conflict = changed
+            .rename_session_catalog("receipt-session", 0, "changed")
+            .await
+            .unwrap_err();
+        assert!(conflict.downcast_ref::<LogicalReceiptConflict>().is_some());
+        assert_eq!(store.revision().await?, revision);
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn settled_forks_keep_the_exact_legacy_prefix_across_ancestor_changes() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let parent = "legacy-fork-parent";
+        let child = "legacy-fork-child";
+        let grandchild = "legacy-fork-grandchild";
+        let namespace = "project/transcript/legacy-fork-parent";
+
+        store
+            .append_session_message(
+                namespace,
+                parent,
+                &Message::text("assistant", "legacy prefix sentinel"),
+            )
+            .await?;
+        let legacy = store
+            .session_history_window_after(namespace, parent, 0, 16)
+            .await?;
+        let legacy_row = legacy.rows.first().context("legacy prefix row")?;
+        let prefix = LegacyTranscriptPrefix {
+            namespace: namespace.into(),
+            source_session_id: parent.into(),
+            source_revision: legacy.revision,
+            first_sequence: legacy_row.sequence,
+            through_sequence: legacy_row.sequence,
+            row_count: 1,
+            record_format: LEGACY_PREFIX_RECORD_FORMAT.into(),
+        };
+        store
+            .fixture_insert_public_session(
+                &SessionCatalogRecord {
+                    session_id: parent.into(),
+                    mode: Mode::Freudian,
+                    label: "original parent".into(),
+                    created_order: 1,
+                    updated_order: 1,
+                    lifecycle_generation: 0,
+                    lifecycle_state: SessionLifecycleState::Active,
+                    head_node_id: None,
+                    pending_node_id: None,
+                    legacy_prefix: Some(prefix.clone()),
+                    fork_provenance: None,
+                    record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+                },
+                &[],
+            )
+            .await?;
+
+        store
+            .checkpoint_session_turn(
+                namespace,
+                parent,
+                &[Message::text("user", "shared question")],
+                &[("legacy-fork-journal-1".into(), json!({"state": "started"}))],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "shared-turn".into(),
+                    label: None,
+                    expected_transcript_rows: None,
+                },
+            )
+            .await?;
+        store
+            .checkpoint_session_turn(
+                namespace,
+                parent,
+                &[Message::text("assistant", "shared answer")],
+                &[("legacy-fork-journal-1".into(), json!({"state": "ended"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "shared-turn".into(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: "part-a".into(),
+                },
+            )
+            .await?;
+        let parent_prefix = store.public_transcript_page(parent, None, 16).await?;
+        let selected = match parent_prefix.records.first() {
+            Some(PublicTranscriptEntry::Turn { record }) => record.clone(),
+            _ => bail!("settled parent turn is absent"),
+        };
+
+        store
+            .fork_session_catalog(parent, 0, &selected.node_id, child, "child label")
+            .await?;
+        let child_before = store.public_transcript_page(child, None, 16).await?;
+        assert_eq!(
+            child_before.head_node_id.as_deref(),
+            Some(&*selected.node_id)
+        );
+        assert_eq!(child_before.total_rows, 2);
+        assert!(matches!(
+            child_before.records.as_slice(),
+            [
+                PublicTranscriptEntry::Turn { record },
+                PublicTranscriptEntry::Legacy { message, .. }
+            ] if record == &selected
+                && message.text_projection() == "legacy prefix sentinel"
+        ));
+
+        store
+            .checkpoint_session_turn(
+                namespace,
+                parent,
+                &[Message::text("user", "later parent question")],
+                &[("legacy-fork-journal-2".into(), json!({"state": "started"}))],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "later-parent-turn".into(),
+                    label: None,
+                    expected_transcript_rows: None,
+                },
+            )
+            .await?;
+        store
+            .checkpoint_session_turn(
+                namespace,
+                parent,
+                &[Message::text("assistant", "later parent answer")],
+                &[("legacy-fork-journal-2".into(), json!({"state": "ended"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "later-parent-turn".into(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: "part-b".into(),
+                },
+            )
+            .await?;
+        store
+            .fork_session_catalog(child, 0, &selected.node_id, grandchild, "grandchild label")
+            .await?;
+
+        store
+            .rename_session_catalog(parent, 0, "renamed parent")
+            .await?;
+        store.remove_session_catalog(parent, 1).await?;
+        store.restore_session_catalog(parent, 2).await?;
+
+        let page = store.session_catalog_page(None, None, None, 16).await?;
+        let parent_record = page
+            .records
+            .iter()
+            .find(|record| record.session_id == parent)
+            .context("parent catalog row")?;
+        let child_record = page
+            .records
+            .iter()
+            .find(|record| record.session_id == child)
+            .context("child catalog row")?;
+        let grandchild_record = page
+            .records
+            .iter()
+            .find(|record| record.session_id == grandchild)
+            .context("grandchild catalog row")?;
+        assert_eq!(parent_record.legacy_prefix.as_ref(), Some(&prefix));
+        assert_eq!(child_record.legacy_prefix.as_ref(), Some(&prefix));
+        assert_eq!(grandchild_record.legacy_prefix.as_ref(), Some(&prefix));
+        assert!(matches!(
+            child_record.fork_provenance.as_ref(),
+            Some(fork)
+                if fork.source_session_id == parent
+                    && fork.source_node_id == selected.node_id
+                    && fork.source_turn_id == selected.turn_id
+                    && fork.source_label == "original parent"
+                    && fork.shares_current_project_memory
+        ));
+        assert!(matches!(
+            grandchild_record.fork_provenance.as_ref(),
+            Some(fork)
+                if fork.source_session_id == child
+                    && fork.source_node_id == selected.node_id
+                    && fork.source_turn_id == selected.turn_id
+                    && fork.source_label == "child label"
+                    && fork.shares_current_project_memory
+        ));
+
+        let export = store.begin_active_export().await?;
+        let mut cursor = None;
+        let mut exported = Vec::new();
+        loop {
+            let page = export.page(cursor).await?;
+            exported.extend(page.records);
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        export.verify_counts(5, 2, 0, 0, 3, 2)?;
+        assert_eq!(
+            exported
+                .iter()
+                .filter(|record| matches!(record, StorageRecord::SessionCatalog { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            exported
+                .iter()
+                .filter(|record| matches!(record, StorageRecord::PublicTurn { .. }))
+                .count(),
+            2
+        );
+        assert!(exported.iter().any(|record| matches!(
+            record,
+            StorageRecord::SessionCatalog { record }
+                if record == child_record
+                    && record.legacy_prefix.as_ref() == Some(&prefix)
+        )));
+        assert!(exported.iter().any(|record| matches!(
+            record,
+            StorageRecord::PublicTurn { record } if record == &selected
+        )));
+
+        for forked in [child, grandchild] {
+            let transcript = store.public_transcript_page(forked, None, 16).await?;
+            assert_eq!(transcript.head_node_id.as_deref(), Some(&*selected.node_id));
+            assert_eq!(transcript.total_rows, 2);
+            assert_eq!(transcript.records, child_before.records);
+            assert!(transcript.pending.is_none());
+        }
+        let parent_after = store.public_transcript_page(parent, None, 16).await?;
+        assert_eq!(parent_after.total_rows, 3);
+        assert!(parent_after.records.iter().any(|entry| matches!(
+            entry,
+            PublicTranscriptEntry::Turn { record }
+                if record.turn_id == "later-parent-turn"
+        )));
+
+        store
+            .checkpoint_session_turn(
+                namespace,
+                parent,
+                &[Message::text("user", "pending fork question")],
+                &[("legacy-fork-journal-3".into(), json!({"state": "started"}))],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 3,
+                    turn_id: "pending-parent-turn".into(),
+                    label: None,
+                    expected_transcript_rows: None,
+                },
+            )
+            .await?;
+        let pending = store
+            .public_transcript_page(parent, None, 16)
+            .await?
+            .pending
+            .context("pending parent turn")?;
+        let before_refusal = store.revision().await?;
+        let pending_error = store
+            .fork_session_catalog(
+                parent,
+                3,
+                &pending.node_id,
+                "pending-fork-refused",
+                "refused pending",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            pending_error
+                .downcast_ref::<SessionLifecycleRejected>()
+                .map(|error| error.0),
+            Some(SessionLifecycleRefusal::SourceNodePending)
+        );
+        assert_eq!(store.revision().await?, before_refusal);
+
+        store.remove_session_catalog(child, 0).await?;
+        let before_removed_refusal = store.revision().await?;
+        let removed_error = store
+            .fork_session_catalog(
+                child,
+                1,
+                &selected.node_id,
+                "removed-fork-refused",
+                "refused removed",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            removed_error
+                .downcast_ref::<SessionLifecycleRejected>()
+                .map(|error| error.0),
+            Some(SessionLifecycleRefusal::SourceRemoved)
+        );
+        assert_eq!(store.revision().await?, before_removed_refusal);
+        let missing_node = public_turn_node_id("absent-session", "absent-turn")?;
+        let before_missing_refusal = store.revision().await?;
+        let parent_before_refusal = store
+            .session_catalog_record(parent)
+            .await?
+            .context("parent catalog before missing fork refusal")?;
+        let missing_error = store
+            .fork_session_catalog(parent, 3, &missing_node, "missing-fork-refused", "missing")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            missing_error
+                .downcast_ref::<SessionLifecycleRejected>()
+                .map(|error| error.0),
+            Some(SessionLifecycleRefusal::SourceNodeMissing)
+        );
+        assert_eq!(store.revision().await?, before_missing_refusal);
+        assert_eq!(
+            store.session_catalog_record(parent).await?,
+            Some(parent_before_refusal)
+        );
+
+        let other = "unrelated-fork-source";
+        store
+            .create_session_catalog(other, Mode::Ifs, "other")
+            .await?;
+        store
+            .checkpoint_session_turn(
+                "project/transcript/unrelated-fork-source",
+                other,
+                &[Message::text("user", "other question")],
+                &[("other-fork-journal".into(), json!({"state": "started"}))],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "other-turn".into(),
+                    label: None,
+                    expected_transcript_rows: Some(0),
+                },
+            )
+            .await?;
+        store
+            .checkpoint_session_turn(
+                "project/transcript/unrelated-fork-source",
+                other,
+                &[Message::text("assistant", "other answer")],
+                &[("other-fork-journal".into(), json!({"state": "ended"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "other-turn".into(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: "other-speaker".into(),
+                },
+            )
+            .await?;
+        let unrelated_node = public_turn_node_id(other, "other-turn")?;
+        let before_unrelated_refusal = store.revision().await?;
+        let parent_before_refusal = store
+            .session_catalog_record(parent)
+            .await?
+            .context("parent catalog before unrelated fork refusal")?;
+        let unrelated_error = store
+            .fork_session_catalog(
+                parent,
+                3,
+                &unrelated_node,
+                "unrelated-fork-refused",
+                "unrelated",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unrelated_error
+                .downcast_ref::<SessionLifecycleRejected>()
+                .map(|error| error.0),
+            Some(SessionLifecycleRefusal::SourceNodeUnreachable)
+        );
+        assert_eq!(store.revision().await?, before_unrelated_refusal);
+        assert_eq!(
+            store.session_catalog_record(parent).await?,
+            Some(parent_before_refusal)
+        );
+        let final_catalog = store.session_catalog_page(None, None, None, 16).await?;
+        assert!(final_catalog.records.iter().all(|record| {
+            record.session_id != "pending-fork-refused"
+                && record.session_id != "removed-fork-refused"
+                && record.session_id != "missing-fork-refused"
+                && record.session_id != "unrelated-fork-refused"
+        }));
+
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checked_admission_binds_raw_row_and_replays_after_later_append() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let session = "anchored-session";
+        let namespace = "project/transcript/anchored-session";
+        let journal_key = "anchored-turn-journal";
+        store.create_session_catalog(session, Mode::Ifs, "").await?;
+        store
+            .checkpoint_session(
+                namespace,
+                session,
+                &[Message::text("user", "older raw entry")],
+                &[],
+            )
+            .await?;
+        let admission = SessionTurnCheckpoint::Admit {
+            expected_generation: 0,
+            turn_id: "anchored-turn".into(),
+            label: None,
+            expected_transcript_rows: Some(1),
+        };
+        let journal = json!({"id": "anchored-turn", "admitted_transcript_row": 2});
+        let messages = [Message::text("user", "new question")];
+        let values = [(journal_key.into(), journal.clone())];
+        let stale = SessionTurnCheckpoint::Admit {
+            expected_generation: 0,
+            turn_id: "anchored-turn".into(),
+            label: None,
+            expected_transcript_rows: Some(0),
+        };
+        let before = store.revision().await?;
+        let error = store
+            .checkpoint_session_turn(namespace, session, &messages, &values, &stale)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<SessionTurnRejected>()
+                .map(|error| error.0),
+            Some(SessionTurnRefusal::TranscriptChanged)
+        );
+        assert_eq!(store.revision().await?, before);
+        assert_eq!(store.history_window(namespace, 8).await?.total_rows, 1);
+        assert!(store.get(journal_key).await?.is_none());
+        assert!(
+            store
+                .public_transcript_page(session, None, 8)
+                .await?
+                .pending
+                .is_none()
+        );
+
+        let receipt = store.with_logical_receipt(
+            Uuid::new_v4(),
+            "view.checkpoint_session",
+            b"anchored turn admission",
+        );
+        receipt
+            .checkpoint_session_turn(namespace, session, &messages, &values, &admission)
+            .await?;
+        assert_eq!(store.history_window(namespace, 8).await?.total_rows, 2);
+        assert_eq!(store.get(journal_key).await?, Some(journal));
+        let pending = store
+            .public_transcript_page(session, None, 8)
+            .await?
+            .pending;
+        assert!(matches!(pending, Some(record) if record.turn_id == "anchored-turn"));
+        store
+            .checkpoint_session(
+                namespace,
+                session,
+                &[Message::text("kuru-interruption", "later raw marker")],
+                &[],
+            )
+            .await?;
+        let later_revision = store.revision().await?;
+        receipt
+            .checkpoint_session_turn(namespace, session, &messages, &values, &admission)
+            .await?;
+        assert_eq!(store.revision().await?, later_revision);
+        assert_eq!(store.history_window(namespace, 8).await?.total_rows, 3);
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_turn_checkpoint_admits_and_settles_once_with_runtime_state() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        store
+            .create_session_catalog("turn-session", Mode::Ifs, "")
+            .await?;
+        let admission = SessionTurnCheckpoint::Admit {
+            expected_generation: 0,
+            turn_id: "turn-1".into(),
+            label: Some("first question".into()),
+            expected_transcript_rows: None,
+        };
+        let admission_id = Uuid::new_v4();
+        let admitted =
+            store.with_logical_receipt(admission_id, "view.checkpoint_session", b"admit turn-1");
+        admitted
+            .checkpoint_session_turn(
+                "project/transcript/turn-session",
+                "turn-session",
+                &[Message::text("user", "question")],
+                &[("turn-journal".into(), json!({"state": "started"}))],
+                &admission,
+            )
+            .await?;
+        let admitted_revision = store.revision().await?;
+        admitted
+            .checkpoint_session_turn(
+                "project/transcript/turn-session",
+                "turn-session",
+                &[Message::text("user", "question")],
+                &[("turn-journal".into(), json!({"state": "started"}))],
+                &admission,
+            )
+            .await?;
+        assert_eq!(store.revision().await?, admitted_revision);
+
+        let pending_page = store
+            .public_transcript_page("turn-session", None, 16)
+            .await?;
+        assert!(pending_page.records.is_empty());
+        assert!(matches!(
+            pending_page.pending.as_ref(),
+            Some(record)
+                if record.turn_id == "turn-1"
+                    && record.settlement == PublicTurnSettlement::Pending
+                    && record.user_entry == Some(Message::text("user", "question"))
+        ));
+        assert_eq!(
+            store.history("project/transcript/turn-session", 16).await?,
+            [Message::text("user", "question")]
+        );
+
+        store
+            .checkpoint_session_turn(
+                "project/transcript/turn-session",
+                "turn-session",
+                &[Message::text("kuru-interruption", "interrupted")],
+                &[("turn-journal".into(), json!({"state": "interrupted"}))],
+                &SessionTurnCheckpoint::MarkRetryableInterruption {
+                    expected_generation: 0,
+                    turn_id: "turn-1".into(),
+                    speaker_id: "kuru-interruption".into(),
+                },
+            )
+            .await?;
+        let retryable = store
+            .public_transcript_page("turn-session", None, 16)
+            .await?;
+        assert!(matches!(
+            retryable.pending.as_ref(),
+            Some(record)
+                if record.settlement == PublicTurnSettlement::Pending
+                    && record.speaker_id.as_deref() == Some("kuru-interruption")
+                    && record.terminal_entries
+                        == [Message::text("kuru-interruption", "interrupted")]
+        ));
+
+        let stale_revision = store.revision().await?;
+        let stale = store
+            .checkpoint_session_turn(
+                "project/transcript/turn-session",
+                "turn-session",
+                &[Message::text("assistant", "answer")],
+                &[("turn-journal".into(), json!({"state": "ended"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 1,
+                    turn_id: "turn-1".into(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: "part-a".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            stale
+                .downcast_ref::<SessionTurnRejected>()
+                .map(|error| error.0),
+            Some(SessionTurnRefusal::GenerationChanged)
+        );
+        assert_eq!(store.revision().await?, stale_revision);
+
+        let settlement = SessionTurnCheckpoint::Settle {
+            expected_generation: 0,
+            turn_id: "turn-1".into(),
+            settlement: PublicTurnSettlement::Completed,
+            speaker_id: "part-a".into(),
+        };
+        let settled =
+            store.with_logical_receipt(Uuid::new_v4(), "view.checkpoint_session", b"settle turn-1");
+        settled
+            .checkpoint_session_turn(
+                "project/transcript/turn-session",
+                "turn-session",
+                &[Message::text("assistant", "answer")],
+                &[("turn-journal".into(), json!({"state": "ended"}))],
+                &settlement,
+            )
+            .await?;
+        let page = store
+            .public_transcript_page("turn-session", None, 16)
+            .await?;
+        assert!(page.pending.is_none());
+        assert!(matches!(
+            page.records.as_slice(),
+            [PublicTranscriptEntry::Turn { record }]
+                if record.turn_id == "turn-1"
+                    && record.settlement == PublicTurnSettlement::Completed
+                    && record.speaker_id.as_deref() == Some("part-a")
+                    && record.terminal_entries == [
+                        Message::text("kuru-interruption", "interrupted"),
+                        Message::text("assistant", "answer")
+                    ]
+        ));
+        assert_eq!(
+            store.get("turn-journal").await?,
+            Some(json!({"state": "ended"}))
+        );
+        assert_eq!(
+            store.history("project/transcript/turn-session", 16).await?,
+            [
+                Message::text("user", "question"),
+                Message::text("kuru-interruption", "interrupted"),
+                Message::text("assistant", "answer")
+            ]
+        );
+
+        let revision = store.revision().await?;
+        let late = store
+            .checkpoint_session_turn(
+                "project/transcript/turn-session",
+                "turn-session",
+                &[Message::text("kuru-interruption", "late")],
+                &[("turn-journal".into(), json!({"state": "interrupted"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "turn-1".into(),
+                    settlement: PublicTurnSettlement::Interrupted,
+                    speaker_id: "kuru-interruption".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            late.downcast_ref::<SessionTurnRejected>()
+                .map(|error| error.0),
+            Some(SessionTurnRefusal::PendingTurnMissing)
+        );
+        assert_eq!(store.revision().await?, revision);
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn older_safe_turn_continues_after_intervening_settled_turns_without_another_user_row()
+    -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let namespace = "project/transcript/continuation-session";
+        let session = "continuation-session";
+        store
+            .create_session_catalog(session, Mode::Ifs, "continuations")
+            .await?;
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session,
+                &[Message::text("user", "old question")],
+                &[("old-journal".into(), json!({"state": "started"}))],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "old-turn".into(),
+                    label: None,
+                    expected_transcript_rows: None,
+                },
+            )
+            .await?;
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session,
+                &[Message::text("kuru-interruption", "interrupted")],
+                &[("old-journal".into(), json!({"state": "interrupted"}))],
+                &SessionTurnCheckpoint::MarkRetryableInterruption {
+                    expected_generation: 0,
+                    turn_id: "old-turn".into(),
+                    speaker_id: "kuru-interruption".into(),
+                },
+            )
+            .await?;
+
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session,
+                &[Message::text("user", "later question")],
+                &[("later-journal".into(), json!({"state": "started"}))],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "later-turn".into(),
+                    label: None,
+                    expected_transcript_rows: None,
+                },
+            )
+            .await?;
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session,
+                &[Message::text("assistant", "later answer")],
+                &[("later-journal".into(), json!({"state": "ended"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "later-turn".into(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: "part-later".into(),
+                },
+            )
+            .await?;
+
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session,
+                &[],
+                &[("old-journal".into(), json!({"state": "resumed"}))],
+                &SessionTurnCheckpoint::Resume {
+                    expected_generation: 0,
+                    turn_id: "old-turn".into(),
+                    legacy: None,
+                },
+            )
+            .await?;
+        let first_continuation = store.public_transcript_page(session, None, 16).await?;
+        let continuation = first_continuation
+            .pending
+            .as_ref()
+            .context("older retry did not create a pending continuation")?;
+        assert_eq!(continuation.kind, PublicTurnKind::Continuation);
+        assert_eq!(
+            continuation.node_id,
+            public_turn_continuation_node_id(session, "old-turn")?
+        );
+        assert_eq!(
+            continuation.continuation_of_node_id.as_deref(),
+            Some(public_turn_node_id(session, "old-turn")?.as_str())
+        );
+        assert!(continuation.user_entry.is_none());
+
+        // A distinct turn parks the empty continuation. Its next exact resume
+        // reuses the same node identity and rebases only the still-pending link.
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session,
+                &[Message::text("user", "newest question")],
+                &[("newest-journal".into(), json!({"state": "started"}))],
+                &SessionTurnCheckpoint::Admit {
+                    expected_generation: 0,
+                    turn_id: "newest-turn".into(),
+                    label: None,
+                    expected_transcript_rows: None,
+                },
+            )
+            .await?;
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session,
+                &[Message::text("assistant", "newest answer")],
+                &[("newest-journal".into(), json!({"state": "ended"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "newest-turn".into(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: "part-newest".into(),
+                },
+            )
+            .await?;
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session,
+                &[],
+                &[("old-journal".into(), json!({"state": "resumed-again"}))],
+                &SessionTurnCheckpoint::Resume {
+                    expected_generation: 0,
+                    turn_id: "old-turn".into(),
+                    legacy: None,
+                },
+            )
+            .await?;
+        let rebound = store.public_transcript_page(session, None, 16).await?;
+        let rebound_continuation = rebound.pending.as_ref().unwrap();
+        assert_eq!(rebound_continuation.node_id, continuation.node_id);
+        assert_eq!(
+            rebound_continuation.predecessor_node_id,
+            rebound.head_node_id
+        );
+
+        store
+            .checkpoint_session_turn(
+                namespace,
+                session,
+                &[Message::text("assistant", "old answer")],
+                &[("old-journal".into(), json!({"state": "ended"}))],
+                &SessionTurnCheckpoint::Settle {
+                    expected_generation: 0,
+                    turn_id: "old-turn".into(),
+                    settlement: PublicTurnSettlement::Completed,
+                    speaker_id: "part-old".into(),
+                },
+            )
+            .await?;
+        let settled = store.public_transcript_page(session, None, 16).await?;
+        assert!(settled.pending.is_none());
+        assert!(matches!(
+            settled.records.first(),
+            Some(PublicTranscriptEntry::Turn { record })
+                if record.kind == PublicTurnKind::Continuation
+                    && record.turn_id == "old-turn"
+                    && record.user_entry.is_none()
+                    && record.terminal_entries == [Message::text("assistant", "old answer")]
+        ));
+        assert_eq!(
+            store.history(namespace, 16).await?,
+            [
+                Message::text("user", "old question"),
+                Message::text("kuru-interruption", "interrupted"),
+                Message::text("user", "later question"),
+                Message::text("assistant", "later answer"),
+                Message::text("user", "newest question"),
+                Message::text("assistant", "newest answer"),
+                Message::text("assistant", "old answer"),
+            ]
+        );
+        store.close().await?;
+        Ok(())
+    }
 
     fn reasoning_summary(text: impl Into<String>) -> ReasoningSummaryRecord {
         ReasoningSummaryRecord {
@@ -5908,7 +10370,7 @@ mod tests {
         let error = MemoryStore::open(readonly).await.unwrap_err();
         let error = format!("{error:#}");
         assert!(
-            error.contains("version 1 requires writable upgrade to 6"),
+            error.contains("version 1 requires writable upgrade to 7"),
             "unexpected read-only v1 open error: {error}"
         );
         assert_eq!(fs::read(directory.join("ready.json"))?, marker);
@@ -5968,9 +10430,15 @@ mod tests {
         .bind(&fourth_parent)
         .fetch_one(store.pool.as_ref())
         .await?;
+        let sixth_parent: String = sqlx::query_scalar(
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? AND parent_index = 0",
+        )
+        .bind(&fifth_parent)
+        .fetch_one(store.pool.as_ref())
+        .await?;
         assert_eq!(
-            fifth_parent, base,
-            "upgrade must retain all five ordered commits"
+            sixth_parent, base,
+            "upgrade must retain all six ordered commits"
         );
         assert_eq!(
             sqlx::query_as::<_, (i64, Vec<u8>, Vec<u8>, String)>(
@@ -6004,7 +10472,7 @@ mod tests {
         .await?;
         assert_eq!(
             receipt.iter().map(|row| row.0).collect::<Vec<_>>(),
-            [2, 3, 4, 5, 6]
+            [2, 3, 4, 5, 6, 7]
         );
         assert!(receipt.iter().all(|row| Uuid::parse_str(&row.3).is_ok()));
         store.close().await?;
@@ -6188,6 +10656,7 @@ mod tests {
                 server,
                 directory,
                 project_scope: scope,
+                fixture_unbound_scope: false,
                 read_only: true,
                 write: Arc::new(Mutex::new(())),
                 dream: Arc::new(Mutex::new(())),
@@ -6301,8 +10770,9 @@ mod tests {
 
         let store = MemoryStore::temporary().await?;
         sqlx::query(
-            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (7, 'forged', ?, ?)",
+            "INSERT INTO kuru_migrations (version, id, digest, operation) VALUES (?, 'forged', ?, ?)",
         )
+        .bind(migrations::CURRENT_VERSION + 1)
         .bind("0".repeat(64))
         .bind(Uuid::new_v4().hyphenated().to_string())
         .execute(store.pool.as_ref())
@@ -6744,7 +11214,7 @@ mod tests {
                 break;
             }
         }
-        export.verify_counts(5, 1, 2, 1)?;
+        export.verify_counts(5, 1, 2, 1, 0, 0)?;
         assert!(exported.iter().any(|row| matches!(
             row,
             StorageRecord::Message { session_id: None, content, .. }
@@ -7159,6 +11629,8 @@ mod tests {
                     encode_typed_message(&Message::text("assistant", "answer")).unwrap(),
                 )],
                 values: vec![("two".into(), "2".into())],
+                public_turn: None,
+                mode: None,
             },
             None,
         )
@@ -7180,6 +11652,8 @@ mod tests {
                         encode_typed_message(&Message::text("assistant", "duplicate")).unwrap(),
                     )],
                     values: vec![("one".into(), "10".into())],
+                    public_turn: None,
+                    mode: None,
                 },
                 None,
             )
@@ -7570,6 +12044,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mode_checkpoint_updates_catalog_and_state_without_a_public_turn() -> Result<()> {
+        let store = MemoryStore::temporary().await?;
+        let session = "mode-session";
+        let namespace = "project/transcript/mode-session";
+        let state_key = "project/session/mode-session";
+        store.create_session_catalog(session, Mode::Ifs, "").await?;
+        let mode = SessionModeCheckpoint {
+            expected_generation: 0,
+            expected_mode: Mode::Ifs,
+            mode: Mode::Jungian,
+        };
+        let state = json!({"id": session, "mode": Mode::Jungian, "lifecycle_generation": 0});
+        let updates = vec![(state_key.into(), state.clone())];
+        let before = store.revision().await?;
+        assert!(
+            store
+                .checkpoint_session_mode(
+                    namespace,
+                    session,
+                    &[(
+                        state_key.into(),
+                        json!({"id": session, "mode": Mode::Ifs, "lifecycle_generation": 0})
+                    )],
+                    &mode
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(store.revision().await?, before);
+        assert_eq!(store.get(state_key).await?, None);
+        store
+            .checkpoint_session_mode(namespace, session, &updates, &mode)
+            .await?;
+        let catalog = store
+            .session_catalog_record(session)
+            .await?
+            .context("catalog row missing")?;
+        assert_eq!(catalog.mode, Mode::Jungian);
+        assert_eq!(catalog.lifecycle_generation, 0);
+        assert_eq!(store.get(state_key).await?, Some(state));
+        assert!(
+            store
+                .public_transcript_page(session, None, 16)
+                .await?
+                .records
+                .is_empty()
+        );
+        let committed = store.revision().await?;
+        assert!(
+            store
+                .checkpoint_session_mode(namespace, session, &updates, &mode)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.revision().await?, committed);
+        store.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn checkpoint_validates_one_namespace_and_atomic_state_inputs() {
         let store = MemoryStore::temporary().await.unwrap();
         let before = store.revision().await.unwrap();
@@ -7840,6 +12374,24 @@ mod tests {
     #[tokio::test]
     async fn stopped_store_backup_restores_revisions_and_candidate_history_in_a_new_data_directory()
     {
+        async fn export_records(
+            store: &MemoryStore,
+        ) -> Result<(ExportProvenance, Vec<StorageRecord>)> {
+            let snapshot = store.begin_active_export().await?;
+            let provenance = snapshot.provenance().clone();
+            let mut cursor = None;
+            let mut records = Vec::new();
+            loop {
+                let page = snapshot.page(cursor).await?;
+                records.extend(page.records);
+                cursor = page.next;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            Ok((provenance, records))
+        }
+
         fn copy_tree(source: &Path, target: &Path) {
             private_dir(target).unwrap();
             for entry in fs::read_dir(source).unwrap() {
@@ -7863,6 +12415,88 @@ mod tests {
             .append("session", "user", "retained transcript")
             .await
             .unwrap();
+        let parent = "backup-parent";
+        let child = "backup-child";
+        let transcript = format!("{scope}/transcript/{parent}");
+        let actor = format!("{scope}/actor/part-a");
+        store
+            .append_session_message(
+                &transcript,
+                parent,
+                &Message::text("assistant", "exact legacy prefix"),
+            )
+            .await
+            .unwrap();
+        store
+            .append_session_message(
+                &actor,
+                parent,
+                &Message::text("assistant", "parent private"),
+            )
+            .await
+            .unwrap();
+        let legacy = store
+            .session_history_window_after(&transcript, parent, 0, 16)
+            .await
+            .unwrap();
+        let legacy_row = legacy.rows.first().unwrap();
+        let prefix = LegacyTranscriptPrefix {
+            namespace: transcript.clone(),
+            source_session_id: parent.into(),
+            source_revision: legacy.revision,
+            first_sequence: legacy_row.sequence,
+            through_sequence: legacy_row.sequence,
+            row_count: 1,
+            record_format: LEGACY_PREFIX_RECORD_FORMAT.into(),
+        };
+        let turn = PublicTurnRecord {
+            node_id: public_turn_node_id(parent, "backup-turn").unwrap(),
+            origin_session_id: parent.into(),
+            turn_id: "backup-turn".into(),
+            kind: PublicTurnKind::Primary,
+            continuation_of_node_id: None,
+            predecessor_node_id: None,
+            settlement: PublicTurnSettlement::Completed,
+            user_entry: Some(Message::text("user", "backup question")),
+            speaker_id: Some("part-a".into()),
+            terminal_entries: vec![Message::text("assistant", "backup answer")],
+            record_format: PUBLIC_TURN_RECORD_FORMAT.into(),
+        };
+        store
+            .fixture_insert_public_session(
+                &SessionCatalogRecord {
+                    session_id: parent.into(),
+                    mode: Mode::Jungian,
+                    label: "original parent".into(),
+                    created_order: 1,
+                    updated_order: 1,
+                    lifecycle_generation: 0,
+                    lifecycle_state: SessionLifecycleState::Active,
+                    head_node_id: Some(turn.node_id.clone()),
+                    pending_node_id: None,
+                    legacy_prefix: Some(prefix.clone()),
+                    fork_provenance: None,
+                    record_format: SESSION_CATALOG_RECORD_FORMAT.into(),
+                },
+                std::slice::from_ref(&turn),
+            )
+            .await
+            .unwrap();
+        let child_outcome = store
+            .fork_session_catalog(parent, 0, &turn.node_id, child, "forked child")
+            .await
+            .unwrap();
+        assert_eq!(child_outcome.session_id, child);
+        let child_catalog = store.session_catalog_record(child).await.unwrap().unwrap();
+        assert_eq!(child_catalog.legacy_prefix.as_ref(), Some(&prefix));
+        let before = export_records(&store).await.unwrap();
+        assert_eq!(before.0.message_count, 3);
+        assert_eq!(before.0.session_catalog_count, 2);
+        assert_eq!(before.0.public_turn_count, 1);
+        assert!(before.1.iter().any(|record| matches!(record,
+            StorageRecord::SessionCatalog { record } if record == &child_catalog)));
+        assert!(before.1.iter().any(|record| matches!(record,
+            StorageRecord::PublicTurn { record } if record == &turn)));
         let revision = store.revision().await.unwrap();
         let candidate = store.begin_candidate("unpublished dream").await.unwrap();
         let view = candidate.view();
@@ -7880,6 +12514,39 @@ mod tests {
         let options = crate::test_support::open_options(restored.path().to_owned(), scope).unwrap();
         let store = MemoryStore::open(options).await.unwrap();
         assert_eq!(store.revision().await.unwrap(), revision);
+        assert_eq!(export_records(&store).await.unwrap(), before);
+        let restored_parent = store.session_catalog_record(parent).await.unwrap().unwrap();
+        assert_eq!(restored_parent.mode, Mode::Jungian);
+        assert_eq!(
+            restored_parent.head_node_id.as_deref(),
+            Some(turn.node_id.as_str())
+        );
+        assert_eq!(restored_parent.legacy_prefix.as_ref(), Some(&prefix));
+        assert_eq!(
+            store.session_catalog_record(child).await.unwrap(),
+            Some(child_catalog)
+        );
+        let child_page = store.public_transcript_page(child, None, 16).await.unwrap();
+        assert!(matches!(child_page.records.as_slice(),
+            [PublicTranscriptEntry::Turn { record }, PublicTranscriptEntry::Legacy { message, .. }]
+                if record == &turn && message.text_projection() == "exact legacy prefix"));
+        assert_eq!(
+            store
+                .session_history_window(&actor, parent, 16)
+                .await
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .session_history_window(&actor, child, 16)
+                .await
+                .unwrap()
+                .messages
+                .is_empty()
+        );
         assert_eq!(
             store.history("session", 10).await.unwrap()[0].plain_text(),
             Some("retained transcript")

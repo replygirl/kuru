@@ -16,6 +16,7 @@ pub(crate) enum CommandId {
     Cost,
     Dream,
     Effort,
+    Export,
     FileCheckpoints,
     FileInspect,
     FilePrune,
@@ -31,12 +32,20 @@ pub(crate) enum CommandId {
     Mcp,
     Mode,
     Model,
+    New,
     Notes,
     Parts,
     Permissions,
     Quit,
     Relate,
+    Resume,
     Retry,
+    SessionBoundaries,
+    SessionFork,
+    SessionRemove,
+    SessionRename,
+    SessionRestore,
+    Sessions,
     Status,
     Tools,
     UndoDream,
@@ -81,6 +90,12 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
         name: "/effort",
         usage: "/effort LEVEL",
         summary: "Choose reasoning effort",
+    },
+    CommandSpec {
+        id: CommandId::Export,
+        name: "/export",
+        usage: "/export PATH",
+        summary: "Export this public session as Markdown",
     },
     CommandSpec {
         id: CommandId::FileCheckpoints,
@@ -173,6 +188,12 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
         summary: "Choose a model",
     },
     CommandSpec {
+        id: CommandId::New,
+        name: "/new",
+        usage: "/new",
+        summary: "Create and select a new session",
+    },
+    CommandSpec {
         id: CommandId::Notes,
         name: "/notes",
         usage: "/notes ID",
@@ -203,10 +224,52 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
         summary: "Change a relationship",
     },
     CommandSpec {
+        id: CommandId::Resume,
+        name: "/resume",
+        usage: "/resume SESSION",
+        summary: "Select one active durable session",
+    },
+    CommandSpec {
         id: CommandId::Retry,
         name: "/retry",
         usage: "/retry",
         summary: "Retry the last settled turn",
+    },
+    CommandSpec {
+        id: CommandId::SessionBoundaries,
+        name: "/session-boundaries",
+        usage: "/session-boundaries SESSION [PAGE]",
+        summary: "Choose a settled fork boundary",
+    },
+    CommandSpec {
+        id: CommandId::SessionFork,
+        name: "/session-fork",
+        usage: "/session-fork SESSION NODE [LABEL]",
+        summary: "Fork one settled public boundary",
+    },
+    CommandSpec {
+        id: CommandId::SessionRemove,
+        name: "/session-remove",
+        usage: "/session-remove SESSION",
+        summary: "Reversibly remove one session",
+    },
+    CommandSpec {
+        id: CommandId::SessionRename,
+        name: "/session-rename",
+        usage: "/session-rename SESSION LABEL",
+        summary: "Rename one durable session",
+    },
+    CommandSpec {
+        id: CommandId::SessionRestore,
+        name: "/session-restore",
+        usage: "/session-restore SESSION",
+        summary: "Restore one removed session",
+    },
+    CommandSpec {
+        id: CommandId::Sessions,
+        name: "/sessions",
+        usage: "/sessions",
+        summary: "List active durable sessions",
     },
     CommandSpec {
         id: CommandId::Status,
@@ -423,15 +486,7 @@ mod tests {
             assert!(help.contains(spec.usage));
             assert!(names_matching(spec.name).contains(&spec.name));
         }
-        for unavailable in [
-            "/new",
-            "/sessions",
-            "/resume",
-            "/config",
-            "/export",
-            "/instruction-once",
-            "/approval-always",
-        ] {
+        for unavailable in ["/config", "/instruction-once", "/approval-always"] {
             assert!(parse(unavailable).is_none());
             assert!(!names_matching(unavailable).contains(&unavailable));
         }

@@ -12,8 +12,8 @@ pub use bus::PeerMessage;
 pub use dream::{DreamProposal, DreamReport, undo_dream};
 pub use engine::{
     CancellationToken, ControlledTurnOutput, ForgetNoteResult, Harness, INTERRUPTION_ROLE,
-    INTERRUPTION_TEXT, NotesView, ResponseOutcome, Session, Topology, TurnOutput, forget_note,
-    project_scope, read_notes, turn_was_cancelled,
+    INTERRUPTION_TEXT, NotesView, ResponseOutcome, Session, SessionSummary, Topology, TurnOutput,
+    forget_note, project_scope, read_notes, turn_was_cancelled,
 };
 pub use event::{Event, StateReport, ToolObservation, ToolOutcome, TurnLimitReason};
 pub use progress::{ContextSnapshot, FacingProgress, RequestContext};

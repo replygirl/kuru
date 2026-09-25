@@ -7,9 +7,44 @@ A session is a conversation. Starting Kuru normally creates a new one while reta
 ```sh
 kuru sessions
 kuru --resume SESSION_ID
+kuru --continue
 ```
 
 Session listing does not create a session. Resuming restores the chosen transcript and its framework, even when a different `--mode` was supplied. It does not change the remembered framework for future fresh conversations.
+`--continue` chooses the latest nonremoved session by durable catalog order. A fresh process asks again for session-only tool permissions.
+
+## Manage and export sessions
+
+```sh
+kuru sessions rename SESSION_ID "New label"
+kuru sessions remove SESSION_ID
+kuru sessions restore SESSION_ID
+kuru sessions fork SESSION_ID SETTLED_NODE_ID --label "New branch"
+kuru sessions export SESSION_ID --format markdown --output transcript.md
+kuru sessions export SESSION_ID --format jsonl --output transcript.jsonl
+```
+
+Removal hides a session from ordinary listing and resume. Restoration returns
+the same ID, transcript and mode; neither action deletes project memory or
+revision history. `kuru sessions` reports each session's latest settled
+`head_node_id`. The terminal's `/sessions` picker can also select older settled
+boundaries: choose a session, press Ctrl+F, then Page Down for older pages.
+Forking through a completed or terminally interrupted turn copies the public
+prefix into a new session. Pending turns cannot be boundaries. Parent and fork
+then grow independently, but both continue using current shared project memory;
+forking does not rewind private memory or topology.
+
+Session export contains one public transcript in chronological order, with typed
+content, settlement, speaker and fork provenance. Markdown is the default;
+JSONL has a manifest followed by one record per line. Without `--output`, it
+prints to stdout. A selected existing output can be replaced after an identity
+check. Private actor and relationship histories, reasoning summaries, notes and
+candidate branches stay outside this export. Use `kuru memory export` for the
+full current-memory snapshot. Historical rows without proven speaker or turn
+identity show unknown values; Kuru does not guess from current topology.
+
+P11 still allows one conversation driver per project. Concurrent drivers and
+live-session presence are covered by the separate concurrent-session work.
 
 When Kuru chooses a speaker automatically, it selects an eligible peer with the
 highest reported activation. Equal activations keep the session's previously

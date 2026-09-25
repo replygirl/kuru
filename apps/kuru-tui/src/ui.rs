@@ -25,11 +25,11 @@ use kuru_connectors::{
 use kuru_core::{
     Mode, ModelInfo, NativeTool, PermissionSelector, Relationship, SessionUsage, UsagePhase,
 };
-use kuru_memory::HistoryWindow;
+use kuru_memory::{PublicTranscriptEntry, PublicTranscriptPage, SessionLifecycleState};
 use kuru_runtime::{
     CancellationToken, ContextSnapshot, ControlledTurnOutput, Event, FacingProgress, Harness,
-    INTERRUPTION_ROLE, INTERRUPTION_TEXT, RequestContext, ResponseOutcome, TurnLimitReason,
-    TurnOutput, turn_was_cancelled,
+    INTERRUPTION_ROLE, INTERRUPTION_TEXT, RequestContext, ResponseOutcome, SessionSummary,
+    TurnLimitReason, TurnOutput, turn_was_cancelled,
 };
 use ratatui::{
     Terminal,
@@ -89,16 +89,93 @@ struct CommandCompletion {
     rendered: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Picker {
     Models,
     Efforts,
     Modes,
+    SessionBoundaries,
+    Sessions,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionBoundary {
+    session_id: String,
+    node_id: String,
+    label: String,
+}
+
+fn encode_transcript_cursor(cursor: &kuru_memory::PublicTranscriptCursor) -> Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = serde_json::to_vec(cursor)?;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(encoded)
+}
+
+fn decode_transcript_cursor(encoded: &str) -> Result<kuru_memory::PublicTranscriptCursor> {
+    ensure!(
+        !encoded.is_empty() && encoded.len() <= 16 * 1024 && encoded.len().is_multiple_of(2),
+        "session boundary continuation is invalid"
+    );
+    let bytes = encoded.as_bytes();
+    ensure!(bytes.is_ascii(), "session boundary continuation is invalid");
+    let decoded = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|digits| {
+            let digits = std::str::from_utf8(digits)?;
+            u8::from_str_radix(digits, 16).context("session boundary continuation is invalid")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    serde_json::from_slice(&decoded).context("session boundary continuation is invalid")
+}
+
+fn session_picker_label(session: &SessionSummary) -> String {
+    let state = match (
+        session.catalog.lifecycle_state,
+        session.catalog.pending_node_id.is_some(),
+    ) {
+        (SessionLifecycleState::Removed, true) => "removed pending",
+        (SessionLifecycleState::Removed, false) => "removed",
+        (SessionLifecycleState::Active, true) => "pending",
+        (SessionLifecycleState::Active, false) => "active",
+    };
+    let label = if session.catalog.label.is_empty() {
+        "Untitled"
+    } else {
+        &session.catalog.label
+    };
+    format!(
+        "{} · {}{} · {}",
+        session.id,
+        state,
+        if session.catalog.fork_provenance.is_some() {
+            " fork"
+        } else {
+            ""
+        },
+        label
+    )
 }
 
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
     Command(String),
+    Session {
+        initial: Box<InitialViewData>,
+        notice: String,
+    },
+    Sessions(Vec<SessionSummary>),
+    SessionBoundaries {
+        session_id: String,
+        boundaries: Vec<SessionBoundary>,
+        next: Option<String>,
+    },
     Turn(ControlledTurnOutput),
 }
 
@@ -131,6 +208,7 @@ pub struct View {
     pub cursor: usize,
     command_completion: Option<CommandCompletion>,
     command_registry: Arc<commands::Registry>,
+    saved_input: Option<(String, usize)>,
     pub mode: String,
     pub model: String,
     pub effort: String,
@@ -161,6 +239,10 @@ pub struct View {
     pub permission_counts: (usize, usize),
     pub selected: usize,
     pub models: Vec<ModelInfo>,
+    pub sessions: Vec<SessionSummary>,
+    session_boundaries: Vec<SessionBoundary>,
+    session_boundaries_session: Option<String>,
+    session_boundaries_next: Option<String>,
     pub scroll: u16,
     pub frame: u64,
     pub motion: bool,
@@ -201,6 +283,7 @@ impl View {
             cursor: 0,
             command_completion: None,
             command_registry: Arc::new(commands::Registry::default()),
+            saved_input: None,
             mode: runtime.mode,
             model: runtime.model,
             effort: runtime.effort,
@@ -225,6 +308,10 @@ impl View {
             permission_counts: (0, 0),
             selected: 0,
             models,
+            sessions: Vec::new(),
+            session_boundaries: Vec::new(),
+            session_boundaries_session: None,
+            session_boundaries_next: None,
             scroll: 0,
             frame: 0,
             motion,
@@ -446,6 +533,12 @@ impl View {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            Some(Picker::Sessions) => self.sessions.iter().map(session_picker_label).collect(),
+            Some(Picker::SessionBoundaries) => self
+                .session_boundaries
+                .iter()
+                .map(|boundary| boundary.label.clone())
+                .collect(),
             None => vec![],
         };
         let query = self.query.to_lowercase();
@@ -465,13 +558,20 @@ impl View {
             Picker::Models => &self.model,
             Picker::Efforts => &self.effort,
             Picker::Modes => &self.mode,
-        }
-        .clone();
+            Picker::Sessions => &self.session,
+            Picker::SessionBoundaries => "",
+        };
         self.picker = Some(picker);
         self.selected = self
             .options()
             .iter()
-            .position(|option| option == &current)
+            .position(|option| {
+                if picker == Picker::Sessions {
+                    option.starts_with(current)
+                } else {
+                    option == current
+                }
+            })
             .unwrap_or(0);
     }
 
@@ -803,15 +903,119 @@ impl View {
                 KeyCode::Esc => self.picker = None,
                 KeyCode::Up => self.selected = self.selected.saturating_sub(1),
                 KeyCode::Down => self.selected = (self.selected + 1).min(len.saturating_sub(1)),
+                KeyCode::PageDown if self.picker == Some(Picker::SessionBoundaries) => {
+                    let session = self.session_boundaries_session.as_deref()?;
+                    let next = self.session_boundaries_next.as_deref()?;
+                    return Some(format!("/session-boundaries {session} {next}"));
+                }
                 KeyCode::Enter => {
                     let value = self.options().get(self.selected).cloned();
                     value.as_ref()?;
                     let command = match self.picker.take() {
                         Some(Picker::Models) => "/model",
                         Some(Picker::Efforts) => "/effort",
-                        _ => "/mode",
+                        Some(Picker::Modes) => "/mode",
+                        Some(Picker::Sessions) => {
+                            let selected = value.as_deref()?;
+                            let session = self
+                                .sessions
+                                .iter()
+                                .find(|session| session_picker_label(session) == selected)?;
+                            if session.catalog.lifecycle_state == SessionLifecycleState::Removed {
+                                self.notify(
+                                    "Session is removed · Ctrl+R restores it before resume.",
+                                );
+                                return None;
+                            }
+                            return Some(format!("/resume {}", session.id));
+                        }
+                        Some(Picker::SessionBoundaries) => {
+                            let selected = value.as_deref()?;
+                            let boundary = self
+                                .session_boundaries
+                                .iter()
+                                .find(|boundary| boundary.label == selected)?;
+                            return Some(format!(
+                                "/session-fork {} {}",
+                                boundary.session_id, boundary.node_id
+                            ));
+                        }
+                        None => return None,
                     };
                     return value.map(|v| format!("{command} {v}"));
+                }
+                KeyCode::Delete if self.picker == Some(Picker::Sessions) => {
+                    let selected = self.options().get(self.selected).cloned()?;
+                    let session = self
+                        .sessions
+                        .iter()
+                        .find(|session| session_picker_label(session) == selected)?;
+                    if session.catalog.lifecycle_state == SessionLifecycleState::Removed {
+                        self.notify("Session is already removed · Ctrl+R restores it.");
+                        return None;
+                    }
+                    if session.id == self.session {
+                        self.notify("Select another session before removing the current session.");
+                        return None;
+                    }
+                    let id = session.id.clone();
+                    self.picker = None;
+                    return Some(format!("/session-remove {id}"));
+                }
+                KeyCode::Char('r')
+                    if self.picker == Some(Picker::Sessions)
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let selected = self.options().get(self.selected).cloned()?;
+                    let session = self
+                        .sessions
+                        .iter()
+                        .find(|session| session_picker_label(session) == selected)?;
+                    if session.catalog.lifecycle_state == SessionLifecycleState::Active {
+                        self.notify("Session is already active.");
+                        return None;
+                    }
+                    let id = session.id.clone();
+                    self.picker = None;
+                    return Some(format!("/session-restore {id}"));
+                }
+                KeyCode::Char('f')
+                    if self.picker == Some(Picker::Sessions)
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let selected = self.options().get(self.selected).cloned()?;
+                    let session = self
+                        .sessions
+                        .iter()
+                        .find(|session| session_picker_label(session) == selected)?;
+                    if session.catalog.lifecycle_state == SessionLifecycleState::Removed {
+                        self.notify("Restore this session before forking it.");
+                        return None;
+                    }
+                    if session.catalog.head_node_id.is_none() {
+                        self.notify("This session has no settled boundary to fork.");
+                        return None;
+                    }
+                    let command = format!("/session-boundaries {}", session.id);
+                    self.picker = None;
+                    return Some(command);
+                }
+                KeyCode::Char('l')
+                    if self.picker == Some(Picker::Sessions)
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let selected = self.options().get(self.selected).cloned()?;
+                    let session = self
+                        .sessions
+                        .iter()
+                        .find(|session| session_picker_label(session) == selected)?;
+                    self.saved_input = Some((std::mem::take(&mut self.input), self.cursor));
+                    self.input = format!("/session-rename {} ", session.id);
+                    self.cursor = self.input.len();
+                    self.picker = None;
+                    self.query.clear();
+                    self.status = "Enter the new session label · Esc cancels".into();
+                    return None;
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if self.query.len() < 256 {
@@ -825,6 +1029,15 @@ impl View {
                 }
                 _ => {}
             }
+            return None;
+        }
+        if key.code == KeyCode::Esc
+            && !self.busy
+            && let Some((input, cursor)) = self.saved_input.take()
+        {
+            self.input = input;
+            self.cursor = cursor;
+            self.status = "Session rename cancelled".into();
             return None;
         }
         if !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -1041,7 +1254,12 @@ fn revoke_selected_permission(service: &PermissionService, view: &mut View) -> R
 /// Read the initial TUI presentation from the runtime at the adapter boundary.
 /// `View` itself remains a synchronous owned value.
 pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> {
-    let transcript = transcript_from_window(harness.history_window().await?);
+    let transcript = transcript_from_public_page(
+        harness
+            .memory()
+            .public_transcript_page(&harness.session.id, None, 500)
+            .await?,
+    );
     Ok(InitialViewData {
         transcript,
         session: harness.session.id.clone(),
@@ -1057,20 +1275,54 @@ pub async fn project_initial_view(harness: &Harness) -> Result<InitialViewData> 
     })
 }
 
-fn transcript_from_window(window: HistoryWindow) -> Vec<(String, String)> {
-    let omitted = window
-        .total_rows
-        .saturating_sub(window.messages.len() as u64);
-    let mut transcript: Vec<_> = window
-        .messages
-        .into_iter()
-        .map(|message| project_transcript_message(&message.role, message.text_projection()))
-        .collect();
+fn transcript_from_public_page(mut page: PublicTranscriptPage) -> Vec<(String, String)> {
+    let omitted = page.total_rows.saturating_sub(page.records.len() as u64);
+    page.records.reverse();
+    let mut transcript = Vec::new();
+    for entry in page.records {
+        match entry {
+            PublicTranscriptEntry::Legacy { message, .. } => transcript.push(
+                project_transcript_message(&message.role, message.text_projection()),
+            ),
+            PublicTranscriptEntry::Turn { record } => {
+                if let Some(message) = record.user_entry {
+                    transcript.push(project_transcript_message(
+                        &message.role,
+                        message.text_projection(),
+                    ));
+                }
+                for message in record.terminal_entries {
+                    let role = if message.role == "assistant" {
+                        record.speaker_id.as_deref().unwrap_or("unknown")
+                    } else {
+                        &message.role
+                    };
+                    transcript.push(project_transcript_message(role, message.text_projection()));
+                }
+            }
+        }
+    }
+    if let Some(record) = page.pending {
+        if let Some(message) = record.user_entry {
+            transcript.push(project_transcript_message(
+                &message.role,
+                message.text_projection(),
+            ));
+        }
+        for message in record.terminal_entries {
+            let role = if message.role == "assistant" {
+                record.speaker_id.as_deref().unwrap_or("unknown")
+            } else {
+                &message.role
+            };
+            transcript.push(project_transcript_message(role, message.text_projection()));
+        }
+    }
     if omitted > 0 {
         transcript.push((
             "kuru".into(),
             format!(
-                "{omitted} earlier message(s) are not shown in this session view; stored history is unchanged."
+                "{omitted} earlier public turn(s) are not shown in this session view; stored history is unchanged."
             ),
         ));
     }
@@ -1725,6 +1977,44 @@ async fn apply_completion(
             view.status = "Complete".into();
             view.completion_locked = true;
         }
+        Ok(DispatchOutcome::Session { initial, notice }) => {
+            view.transcript = initial.transcript;
+            view.session = initial.session;
+            view.project = initial.project;
+            view.motion = initial.motion;
+            view.apply_runtime(initial.runtime);
+            view.usage = initial.usage;
+            view.transcript.push(("kuru".into(), notice));
+            view.show_scene = view.transcript.is_empty();
+            view.scroll = 0;
+            view.status = "Complete".into();
+            view.completion_locked = true;
+        }
+        Ok(DispatchOutcome::Sessions(sessions)) => {
+            view.sessions = sessions;
+            view.open_picker(Picker::Sessions);
+            view.status = "Choose a session".into();
+            view.completion_locked = true;
+        }
+        Ok(DispatchOutcome::SessionBoundaries {
+            session_id,
+            boundaries,
+            next,
+        }) => {
+            view.session_boundaries = boundaries;
+            view.session_boundaries_session = Some(session_id.clone());
+            view.session_boundaries_next = next;
+            view.open_picker(Picker::SessionBoundaries);
+            view.status = format!(
+                "Choose a settled boundary from {session_id}{}",
+                if view.session_boundaries_next.is_some() {
+                    " · PageDown shows older boundaries"
+                } else {
+                    ""
+                }
+            );
+            view.completion_locked = true;
+        }
         Ok(DispatchOutcome::Turn(result)) if result.reused => {
             view.notify("Stored result reused · no new provider or tool work");
             view.status = "Complete · stored result reused".into();
@@ -1763,6 +2053,10 @@ async fn apply_completion(
             view.status = "Failed · details in conversation".into();
             view.completion_locked = true;
         }
+    }
+    if let Some((input, cursor)) = view.saved_input.take() {
+        view.input = input;
+        view.cursor = cursor;
     }
     view.apply_runtime(project_runtime(harness).await);
     view.usage = Some(harness.lock().await.session_usage().await?);
@@ -2570,6 +2864,151 @@ async fn dispatch_controlled(
                 "Selected unresolved file checkpoint discarded; its recovery and undo evidence is no longer available.".into()
             }
         }
+        Some(CommandId::Sessions) => {
+            ensure!(args.is_empty(), "/sessions takes no arguments");
+            return Ok(DispatchOutcome::Sessions(harness.all_sessions().await?));
+        }
+        Some(CommandId::New) => {
+            ensure!(args.is_empty(), "/new takes no arguments");
+            let session = harness.new_session().await?;
+            let initial = Box::new(project_initial_view(harness).await?);
+            return Ok(DispatchOutcome::Session {
+                initial,
+                notice: format!("Created session {session}"),
+            });
+        }
+        Some(CommandId::Resume) => {
+            ensure!(!args.is_empty(), "usage: /resume SESSION");
+            ensure!(
+                !args.chars().any(char::is_whitespace),
+                "session ID cannot contain whitespace"
+            );
+            harness.resume_session(args).await?;
+            let initial = Box::new(project_initial_view(harness).await?);
+            return Ok(DispatchOutcome::Session {
+                initial,
+                notice: format!("Resumed session {args}"),
+            });
+        }
+        Some(CommandId::SessionRename) => {
+            let (session, label) = args
+                .split_once(' ')
+                .context("usage: /session-rename SESSION LABEL")?;
+            ensure!(!label.trim().is_empty(), "session label cannot be empty");
+            harness.rename_session(session, label.trim()).await?;
+            return Ok(DispatchOutcome::Sessions(harness.all_sessions().await?));
+        }
+        Some(CommandId::SessionBoundaries) => {
+            let mut fields = args.split_whitespace();
+            let session_id = fields
+                .next()
+                .context("usage: /session-boundaries SESSION [PAGE]")?;
+            let cursor = fields.next().map(decode_transcript_cursor).transpose()?;
+            ensure!(
+                fields.next().is_none(),
+                "usage: /session-boundaries SESSION [PAGE]"
+            );
+            let catalog = harness
+                .memory()
+                .session_catalog_record(session_id)
+                .await?
+                .context("session is absent from this project")?;
+            ensure!(
+                catalog.lifecycle_state == SessionLifecycleState::Active,
+                "restore this session before choosing a fork boundary"
+            );
+            let page = harness
+                .memory()
+                .public_transcript_page(session_id, cursor.as_ref(), 128)
+                .await?;
+            let next = page
+                .next
+                .as_ref()
+                .filter(|cursor| {
+                    matches!(
+                        cursor.next,
+                        kuru_memory::PublicTranscriptPosition::Turn { .. }
+                    )
+                })
+                .map(encode_transcript_cursor)
+                .transpose()?;
+            let boundaries = page
+                .records
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    PublicTranscriptEntry::Turn { record } => Some(SessionBoundary {
+                        session_id: session_id.into(),
+                        node_id: record.node_id.clone(),
+                        label: format!(
+                            "{} · {:?} · {} · {}",
+                            record.turn_id,
+                            record.settlement,
+                            record.speaker_id.as_deref().unwrap_or("unknown"),
+                            record.node_id
+                        ),
+                    }),
+                    PublicTranscriptEntry::Legacy { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                !boundaries.is_empty(),
+                "this session has no settled boundary to fork"
+            );
+            return Ok(DispatchOutcome::SessionBoundaries {
+                session_id: session_id.into(),
+                boundaries,
+                next,
+            });
+        }
+        Some(CommandId::SessionRemove) => {
+            ensure!(!args.is_empty(), "usage: /session-remove SESSION");
+            ensure!(
+                !args.chars().any(char::is_whitespace),
+                "session ID cannot contain whitespace"
+            );
+            harness.remove_session(args).await?;
+            return Ok(DispatchOutcome::Sessions(harness.all_sessions().await?));
+        }
+        Some(CommandId::SessionRestore) => {
+            ensure!(!args.is_empty(), "usage: /session-restore SESSION");
+            ensure!(
+                !args.chars().any(char::is_whitespace),
+                "session ID cannot contain whitespace"
+            );
+            harness.restore_session(args).await?;
+            return Ok(DispatchOutcome::Sessions(harness.all_sessions().await?));
+        }
+        Some(CommandId::SessionFork) => {
+            let mut fields = args.splitn(3, ' ');
+            let session = fields
+                .next()
+                .filter(|value| !value.is_empty())
+                .context("usage: /session-fork SESSION NODE [LABEL]")?;
+            let node = fields
+                .next()
+                .filter(|value| !value.is_empty())
+                .context("usage: /session-fork SESSION NODE [LABEL]")?;
+            let label = fields.next().unwrap_or("Fork").trim();
+            ensure!(!label.is_empty(), "fork label cannot be empty");
+            let child = harness.fork_session(session, node, label).await?;
+            let initial = Box::new(project_initial_view(harness).await?);
+            return Ok(DispatchOutcome::Session {
+                initial,
+                notice: format!("Forked session {child} · current project memory remains shared"),
+            });
+        }
+        Some(CommandId::Export) => {
+            ensure!(!args.is_empty(), "usage: /export PATH");
+            crate::session_export::export(
+                harness.memory(),
+                &harness.session.id,
+                crate::cli::SessionExportFormat::Markdown,
+                Some(std::path::Path::new(args)),
+                harness.cwd(),
+            )
+            .await?;
+            format!("Exported public session to {args}")
+        }
         Some(CommandId::Retry) => {
             return Ok(DispatchOutcome::Turn(
                 if let (Some(approval), Some(instruction_approval)) =
@@ -2730,31 +3169,41 @@ mod tests {
     }
 
     #[test]
-    fn initial_history_notice_uses_the_exact_count_beyond_the_500_row_view() {
-        let visible = (0..500)
-            .map(|index| Message::text("user", format!("message {index}")))
-            .collect::<Vec<_>>();
-        let transcript = transcript_from_window(HistoryWindow {
-            messages: visible.clone(),
-            total_rows: 503,
+    fn initial_public_history_uses_stable_speakers_and_reports_omitted_turns() {
+        let record = kuru_memory::PublicTurnRecord {
+            node_id: "a".repeat(64),
+            origin_session_id: "session".into(),
+            turn_id: "turn".into(),
+            kind: kuru_memory::PublicTurnKind::Primary,
+            continuation_of_node_id: None,
+            predecessor_node_id: None,
+            settlement: kuru_memory::PublicTurnSettlement::Completed,
+            user_entry: Some(Message::text("user", "question")),
+            speaker_id: Some("stable-speaker".into()),
+            terminal_entries: vec![Message::text("assistant", "answer")],
+            record_format: kuru_memory::PUBLIC_TURN_RECORD_FORMAT.into(),
+        };
+        let transcript = transcript_from_public_page(PublicTranscriptPage {
+            session_id: "session".into(),
+            view: "main".into(),
+            revision: "0123456789abcdef0123456789abcdef".into(),
+            head_node_id: Some(record.node_id.clone()),
+            pending: None,
+            records: vec![PublicTranscriptEntry::Turn { record }],
+            total_rows: 4,
+            next: None,
         });
-        assert_eq!(transcript.len(), 501);
+        assert_eq!(transcript.len(), 3);
+        assert_eq!(transcript[0], ("user".into(), "question".into()));
+        assert_eq!(transcript[1], ("stable-speaker".into(), "answer".into()));
         assert!(
             transcript
                 .last()
                 .unwrap()
                 .1
-                .starts_with("3 earlier message(s)")
+                .starts_with("3 earlier public turn(s)")
         );
         assert!(transcript.last().unwrap().1.contains("session view"));
-        assert_eq!(
-            transcript_from_window(HistoryWindow {
-                messages: visible,
-                total_rows: 500,
-            })
-            .len(),
-            500
-        );
     }
 
     #[test]
@@ -3041,6 +3490,110 @@ mod tests {
                 metadata: Default::default(),
             }],
         )
+    }
+
+    fn session_summary(
+        id: &str,
+        state: SessionLifecycleState,
+        head: Option<&str>,
+    ) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            turns: usize::from(head.is_some()),
+            last_completed_speaker: head.map(|_| "part-a".into()),
+            catalog: kuru_memory::SessionCatalogRecord {
+                session_id: id.into(),
+                mode: Mode::Ifs,
+                label: format!("label-{id}"),
+                created_order: 1,
+                updated_order: 1,
+                lifecycle_generation: 0,
+                lifecycle_state: state,
+                head_node_id: head.map(str::to_owned),
+                pending_node_id: None,
+                legacy_prefix: None,
+                fork_provenance: None,
+                record_format: kuru_memory::SESSION_CATALOG_RECORD_FORMAT.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn session_picker_actions_preserve_drafts_and_use_exact_catalog_identities() {
+        let mut view = fixture();
+        view.sessions = vec![
+            session_summary("other", SessionLifecycleState::Active, Some("node-other")),
+            session_summary(
+                "removed",
+                SessionLifecycleState::Removed,
+                Some("node-removed"),
+            ),
+        ];
+        view.input = "retained draft".into();
+        view.cursor = view.input.len();
+
+        view.open_picker(Picker::Sessions);
+        assert_eq!(
+            view.key(key(KeyCode::Delete)),
+            Some("/session-remove other".into())
+        );
+        assert_eq!(view.input, "retained draft");
+
+        view.open_picker(Picker::Sessions);
+        assert_eq!(
+            view.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            Some("/session-boundaries other".into())
+        );
+        assert_eq!(view.input, "retained draft");
+
+        view.session_boundaries = vec![SessionBoundary {
+            session_id: "other".into(),
+            node_id: "node-other".into(),
+            label: "turn-other · Completed · part-a · node-other".into(),
+        }];
+        view.open_picker(Picker::SessionBoundaries);
+        assert_eq!(
+            view.key(key(KeyCode::Enter)),
+            Some("/session-fork other node-other".into())
+        );
+        assert_eq!(view.input, "retained draft");
+
+        let cursor = kuru_memory::PublicTranscriptCursor {
+            session_id: "other".into(),
+            revision: "0123456789abcdef0123456789abcdef".into(),
+            head_node_id: Some("a".repeat(64)),
+            next: kuru_memory::PublicTranscriptPosition::Turn {
+                node_id: "b".repeat(64),
+            },
+        };
+        let encoded = encode_transcript_cursor(&cursor).unwrap();
+        assert_eq!(decode_transcript_cursor(&encoded).unwrap(), cursor);
+        view.session_boundaries_session = Some("other".into());
+        view.session_boundaries_next = Some(encoded.clone());
+        view.open_picker(Picker::SessionBoundaries);
+        assert_eq!(
+            view.key(key(KeyCode::PageDown)),
+            Some(format!("/session-boundaries other {encoded}"))
+        );
+        assert_eq!(view.input, "retained draft");
+
+        view.open_picker(Picker::Sessions);
+        view.selected = 1;
+        assert_eq!(
+            view.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some("/session-restore removed".into())
+        );
+        assert_eq!(view.input, "retained draft");
+
+        view.open_picker(Picker::Sessions);
+        assert_eq!(
+            view.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(view.input, "/session-rename other ");
+        assert_eq!(view.key(key(KeyCode::Esc)), None);
+        assert_eq!(view.input, "retained draft");
+        assert_eq!(view.cursor, view.input.len());
     }
 
     #[test]
