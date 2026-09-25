@@ -113,9 +113,22 @@ fn windows_coverage_tasks_launch_pwsh_without_cmd_metacharacters() {
         "$env:KURU_COVERAGE_OUTPUT",
         "$env:KURU_COVERAGE_INPUTS",
         "$env:KURU_COVERAGE_REPORT",
+        "$env:KURU_COVERAGE_DIAGNOSTICS",
+        "$env:KURU_COVERAGE_JOB_STARTED",
+        "$env:KURU_COVERAGE_JOB_MINUTES",
     ] {
         assert!(script.contains(binding), "missing script binding {binding}");
     }
+    for argument in [
+        "--diagnostics $diagnosticsDir --job-started $JobStarted --job-minutes $JobMinutes",
+        "--max-attempt $RunAttempt",
+    ] {
+        assert!(
+            script.contains(argument),
+            "missing script argument {argument}"
+        );
+    }
+    assert!(!script.contains("--run-attempt $RunAttempt --llvm-cov $llvmCov\n"));
 }
 
 #[cfg(windows)]

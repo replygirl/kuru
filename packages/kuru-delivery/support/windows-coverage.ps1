@@ -9,7 +9,10 @@ param(
     [string]$Packages = $env:KURU_COVERAGE_PACKAGES,
     [string]$OutputDir = $env:KURU_COVERAGE_OUTPUT,
     [string]$Inputs = $env:KURU_COVERAGE_INPUTS,
-    [string]$OutputPath = $env:KURU_COVERAGE_REPORT
+    [string]$OutputPath = $env:KURU_COVERAGE_REPORT,
+    [string]$Diagnostics = $env:KURU_COVERAGE_DIAGNOSTICS,
+    [string]$JobStarted = $env:KURU_COVERAGE_JOB_STARTED,
+    [string]$JobMinutes = $env:KURU_COVERAGE_JOB_MINUTES
 )
 
 $ErrorActionPreference = 'Stop'
@@ -76,6 +79,16 @@ if ($Mode -eq 'Shard') {
     if ([string]::IsNullOrWhiteSpace($Shard) -or [string]::IsNullOrWhiteSpace($Packages) -or [string]::IsNullOrWhiteSpace($OutputDir)) {
         throw 'Shard mode requires -Shard, -Packages and -OutputDir'
     }
+    if ([string]::IsNullOrWhiteSpace($Diagnostics) -or
+        [string]::IsNullOrWhiteSpace($JobStarted) -or
+        [string]::IsNullOrWhiteSpace($JobMinutes)) {
+        throw 'Shard mode requires -Diagnostics, -JobStarted and -JobMinutes'
+    }
+    if (Test-Path -LiteralPath $Diagnostics) {
+        throw "Coverage diagnostics already exist: $Diagnostics"
+    }
+    [void](New-Item -ItemType Directory -Path $Diagnostics)
+    $diagnosticsDir = (Resolve-Path -LiteralPath $Diagnostics).Path
     $selectedPackages = @($Packages.Split(',', [System.StringSplitOptions]::RemoveEmptyEntries) | Sort-Object -Unique)
     $workspacePackages = @(
         'kuru', 'kuru-archive', 'kuru-connectors', 'kuru-core',
@@ -95,23 +108,37 @@ if ($Mode -eq 'Shard') {
     $hostTarget = $hostTarget[0].Substring('host: '.Length)
     $ledger = Join-Path $state 'runner-ledger.jsonl'
     $runnerConfig = Join-Path $state 'runner-config.toml'
-    & $helper coverage runner-config --root $root --host $hostTarget --helper $helper --inventory $inventory --selection $selection --target-dir $target --ledger $ledger --output $runnerConfig
+    # The runner's test deadline sits inside the hosted job limit, so a stalled
+    # test fails here with evidence instead of being cancelled by the host.
+    & $helper coverage runner-config --root $root --host $hostTarget --helper $helper --inventory $inventory --selection $selection --target-dir $target --ledger $ledger --diagnostics $diagnosticsDir --job-started $JobStarted --job-minutes $JobMinutes --output $runnerConfig
     if ($LASTEXITCODE -ne 0) { throw 'Cargo runner configuration failed' }
 
-    # Compile-phase profiles are not test evidence. The runner below executes
-    # the same full Cargo graph while omitting only unassigned test binaries.
-    & $helper coverage discard-compile-profiles --profiles $target
-    if ($LASTEXITCODE -ne 0) { throw 'Compile-profile isolation failed' }
-    $runArgs = @(
-        '--config', $runnerConfig, 'test', '--workspace', '--all-targets',
-        '--all-features', '--locked', '--no-fail-fast'
-    )
-    & cargo @runArgs
-    if ($LASTEXITCODE -ne 0) { throw 'Coverage shard tests failed' }
-    & $helper coverage validate-run --inventory $inventory --selection $selection --ledger $ledger
-    if ($LASTEXITCODE -ne 0) { throw 'Cargo runner ledger validation failed' }
-    & $helper coverage receipt --root $root --inventory $inventory --selection $selection --ledger $ledger --profiles $target --shard $Shard --run-attempt $RunAttempt --expected-source $ExpectedSource --llvm-cov $llvmCov --output $OutputDir
-    if ($LASTEXITCODE -ne 0) { throw 'Coverage shard receipt failed' }
+    try {
+        # Compile-phase profiles are not test evidence. The runner below executes
+        # the same full Cargo graph while omitting only unassigned test binaries.
+        & $helper coverage discard-compile-profiles --profiles $target
+        if ($LASTEXITCODE -ne 0) { throw 'Compile-profile isolation failed' }
+        $runArgs = @(
+            '--config', $runnerConfig, 'test', '--workspace', '--all-targets',
+            '--all-features', '--locked', '--no-fail-fast'
+        )
+        & cargo @runArgs
+        if ($LASTEXITCODE -ne 0) { throw 'Coverage shard tests failed' }
+        & $helper coverage validate-run --inventory $inventory --selection $selection --ledger $ledger
+        if ($LASTEXITCODE -ne 0) { throw 'Cargo runner ledger validation failed' }
+        & $helper coverage receipt --root $root --inventory $inventory --selection $selection --ledger $ledger --profiles $target --shard $Shard --run-attempt $RunAttempt --expected-source $ExpectedSource --llvm-cov $llvmCov --output $OutputDir
+        if ($LASTEXITCODE -ne 0) { throw 'Coverage shard receipt failed' }
+    } catch {
+        # Keep the shard's manifests and runner ledger beside the per-test
+        # output logs and stall reports for the failure diagnostics upload.
+        foreach ($name in @('inventory.json', 'selection.json', 'runner-config.toml', 'runner-ledger.jsonl')) {
+            $source = Join-Path $state $name
+            if (Test-Path -LiteralPath $source -PathType Leaf) {
+                Copy-Item -LiteralPath $source -Destination (Join-Path $diagnosticsDir $name)
+            }
+        }
+        throw
+    }
     exit 0
 }
 
@@ -120,7 +147,8 @@ if ([string]::IsNullOrWhiteSpace($Inputs) -or [string]::IsNullOrWhiteSpace($Outp
 }
 & $helper coverage discard-compile-profiles --profiles $target
 if ($LASTEXITCODE -ne 0) { throw 'Compile-profile isolation failed' }
-& $helper coverage collect --root $root --inventory $inventory --inputs $Inputs --target-dir $target --expected-source $ExpectedSource --run-attempt $RunAttempt --llvm-cov $llvmCov
+# Each shard contributes its latest uploaded attempt no later than this one.
+& $helper coverage collect --root $root --inventory $inventory --inputs $Inputs --target-dir $target --expected-source $ExpectedSource --max-attempt $RunAttempt --llvm-cov $llvmCov
 if ($LASTEXITCODE -ne 0) { throw 'Coverage shard aggregation failed' }
 if (Test-Path -LiteralPath $OutputPath) {
     throw "Coverage report already exists: $OutputPath"

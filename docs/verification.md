@@ -31,8 +31,13 @@ Ubuntu x86-64 and macOS arm64 run instrumented native behavior with the 90%
 workspace line-coverage gate. ARM Linux and Intel macOS have additional native
 build, real-memory, packaging, and packaged offline-runtime checks. Windows
 runs four parallel coverage shards: delivery/archive, application, memory/runtime,
-and connectors/core/platform. Its aggregate requires all four checked results
-from the same run attempt and enforces the same 90% workspace threshold.
+and connectors/core/platform. Its aggregate requires a checked result for all
+four shards, taking each shard's latest attempt within the workflow run, and
+refuses a missing shard, a later or malformed attempt, or any source, tree,
+toolchain or inventory difference between them. It enforces the same 90%
+workspace threshold. A shard's tests stop at a deadline inside its job limit;
+a stalled test executable is terminated with its owned process tree and the
+shard fails with a diagnostics artifact naming the unfinished tests.
 Separate Windows jobs verify platform primitives and installation, including
 offline build-input failures, installed runtime behavior, and shipping DLLs.
 Native tests also cover terminal interaction, process cleanup, and self-update.

@@ -25,10 +25,18 @@ const PROFILE_LIMIT: u64 = 512 * 1024 * 1024;
 const PROFILE_TOTAL_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const PROFILE_COUNT_LIMIT: usize = 4096;
 const RUNNER_LEDGER_LIMIT: u64 = 16 * 1024 * 1024;
-#[cfg(windows)]
-const RUNNER_PROCESS_TIMEOUT: Duration = Duration::from_secs(90 * 60);
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 const RUNNER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time kept between the shard's test deadline and its hosted job limit. It covers
+/// tree termination and cleanup, fast refusal of the remaining Cargo test
+/// executables, evidence copying and the diagnostics upload.
+const EVIDENCE_RESERVE: Duration = Duration::from_secs(10 * 60);
+#[cfg_attr(not(windows), allow(dead_code))]
+const TEST_LOG_LIMIT: u64 = 32 * 1024 * 1024;
+#[cfg_attr(not(windows), allow(dead_code))]
+const RECENT_RESULT_LIMIT: usize = 20;
+#[cfg_attr(not(windows), allow(dead_code))]
+const PENDING_LINE_LIMIT: usize = 64 * 1024;
 
 pub const SHARDS: [(&str, &[&str]); 4] = [
     ("delivery-archive", &["kuru-delivery", "kuru-archive"]),
@@ -544,7 +552,35 @@ pub struct RunnerConfigOptions<'a> {
     pub selection: &'a Path,
     pub target_dir: &'a Path,
     pub ledger: &'a Path,
+    pub diagnostics: &'a Path,
+    /// Hosted job start, in Unix seconds, recorded by the job's first step.
+    pub job_started: u64,
+    /// The hosted job's `timeout-minutes` limit.
+    pub job_minutes: u64,
     pub output: &'a Path,
+}
+
+fn unix_now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes the Unix epoch")?
+        .as_secs())
+}
+
+/// Place the shard's test deadline strictly inside its hosted job limit, so a
+/// stalled test fails inside the job with evidence instead of being cancelled.
+pub fn shard_deadline(job_started: u64, job_minutes: u64) -> Result<u64> {
+    let job = job_minutes
+        .checked_mul(60)
+        .context("coverage job limit overflows")?;
+    ensure!(
+        job > EVIDENCE_RESERVE.as_secs(),
+        "coverage job limit of {job_minutes} minutes leaves no time inside the {}-second evidence reserve",
+        EVIDENCE_RESERVE.as_secs()
+    );
+    job_started
+        .checked_add(job - EVIDENCE_RESERVE.as_secs())
+        .context("coverage deadline overflows")
 }
 
 pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
@@ -556,6 +592,9 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
         selection: selection_path,
         target_dir,
         ledger,
+        diagnostics,
+        job_started,
+        job_minutes,
         output,
     } = options;
     ensure!(root.is_absolute(), "coverage root must be absolute");
@@ -566,6 +605,20 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
     );
     ensure!(target_dir.is_absolute(), "coverage target must be absolute");
     ensure!(ledger.is_absolute(), "coverage ledger must be absolute");
+    ensure!(
+        diagnostics.is_absolute() && fs::symlink_metadata(diagnostics)?.file_type().is_dir(),
+        "coverage diagnostics must be an absolute directory"
+    );
+    let now = unix_now()?;
+    ensure!(
+        *job_started <= now,
+        "coverage job start {job_started} is in the future"
+    );
+    let deadline = shard_deadline(*job_started, *job_minutes)?;
+    ensure!(
+        deadline > now,
+        "coverage shard deadline {deadline} passed before its tests started"
+    );
     ensure!(
         !host.is_empty()
             && host
@@ -581,12 +634,21 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
         inventory_path,
         selection_path,
         ledger,
+        diagnostics,
     ]
     .map(|path| {
         path.to_str()
             .context("Cargo runner configuration path is not UTF-8")
     });
-    let [helper, root, target_dir, inventory, selection, ledger] = strings;
+    let [
+        helper,
+        root,
+        target_dir,
+        inventory,
+        selection,
+        ledger,
+        diagnostics,
+    ] = strings;
     let runner = vec![
         helper?.to_owned(),
         "coverage".to_owned(),
@@ -601,6 +663,10 @@ pub fn write_runner_config(options: &RunnerConfigOptions<'_>) -> Result<()> {
         selection?.to_owned(),
         "--ledger".to_owned(),
         ledger?.to_owned(),
+        "--diagnostics".to_owned(),
+        diagnostics?.to_owned(),
+        "--deadline".to_owned(),
+        deadline.to_string(),
         "--".to_owned(),
     ];
     let mut host_table = toml::map::Map::new();
@@ -648,15 +714,287 @@ fn append_runner_record(ledger: &Path, record: &RunnerRecord) -> Result<()> {
     Ok(())
 }
 
-pub async fn dispatch_test(
-    root: &Path,
-    inventory_path: &Path,
-    selection_path: &Path,
-    target_dir: &Path,
-    ledger: &Path,
-    executable: &Path,
-    args: &[OsString],
-) -> Result<Option<ExitStatus>> {
+pub struct DispatchOptions<'a> {
+    pub root: &'a Path,
+    pub inventory: &'a Path,
+    pub selection: &'a Path,
+    pub target_dir: &'a Path,
+    pub ledger: &'a Path,
+    pub diagnostics: &'a Path,
+    /// Unix-seconds deadline written into the runner configuration.
+    pub deadline: u64,
+    pub executable: &'a Path,
+    pub args: &'a [OsString],
+}
+
+/// Observed libtest progress from one test executable's standard output.
+///
+/// Libtest prints a completion line for each finished test and, while running
+/// concurrently, a notice for each test that has run for over 60 seconds. A
+/// single-threaded harness prints `test name ... ` before the result instead.
+#[derive(Debug, Default)]
+struct LibtestProgress {
+    pending: Vec<u8>,
+    pending_overflowed: bool,
+    long_running: Vec<String>,
+    recent: std::collections::VecDeque<String>,
+    completed: usize,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl LibtestProgress {
+    fn observe(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                let line = std::mem::take(&mut self.pending);
+                if !std::mem::take(&mut self.pending_overflowed) {
+                    self.line(String::from_utf8_lossy(&line).trim_end_matches('\r'));
+                }
+            } else if self.pending.len() < PENDING_LINE_LIMIT {
+                self.pending.push(byte);
+            } else {
+                self.pending_overflowed = true;
+            }
+        }
+    }
+
+    fn line(&mut self, line: &str) {
+        let Some(rest) = line.strip_prefix("test ") else {
+            return;
+        };
+        if let Some((name, _)) = rest.split_once(" has been running for ") {
+            if !self.long_running.iter().any(|running| running == name) {
+                self.long_running.push(name.to_owned());
+            }
+        } else if let Some((name, outcome)) = rest.split_once(" ... ")
+            && !outcome.is_empty()
+        {
+            self.long_running.retain(|running| running != name);
+            self.completed += 1;
+            if self.recent.len() == RECENT_RESULT_LIMIT {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(line.to_owned());
+        }
+    }
+
+    /// Tests that started but have no completion line.
+    fn unfinished(&self) -> Vec<String> {
+        let mut unfinished = self.long_running.clone();
+        if !self.pending_overflowed
+            && let Some(name) = std::str::from_utf8(&self.pending)
+                .ok()
+                .and_then(|line| line.strip_prefix("test "))
+                .and_then(|rest| rest.strip_suffix(" ... "))
+            && !unfinished.iter().any(|running| running == name)
+        {
+            unfinished.push(name.to_owned());
+        }
+        unfinished
+    }
+}
+
+/// Evidence written when a test executable reaches the shard deadline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StallReport {
+    schema: u32,
+    executable: String,
+    package: String,
+    target_name: String,
+    deadline_unix: u64,
+    observed_unix: u64,
+    /// Tests libtest reported as running without a completion line.
+    unfinished_tests: Vec<String>,
+    /// The latest completion lines, oldest first.
+    recent_results: Vec<String>,
+    completed_results: usize,
+    process_sample: Option<String>,
+    termination: String,
+    cleanup: String,
+    output: String,
+    stdout_log: String,
+}
+
+/// Owned test process tree driven by the coverage runner.
+#[cfg_attr(not(windows), allow(dead_code))]
+trait TestProcess {
+    async fn wait(&mut self, timeout: Duration) -> std::io::Result<ExitStatus>;
+    /// Diagnostic resource sample taken before termination.
+    fn sample(&self) -> Option<String>;
+    /// Terminate the retained tree, never a numeric identity.
+    fn terminate(&mut self) -> std::io::Result<()>;
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+struct StallEvidence {
+    progress: LibtestProgress,
+    sample: Option<String>,
+    termination: String,
+    cleanup: String,
+    output: String,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+enum Supervision {
+    Exited(ExitStatus),
+    Stalled(StallEvidence),
+}
+
+/// Relay the test's stdout to the job log while keeping a bounded copy and
+/// observing libtest progress.
+#[cfg_attr(not(windows), allow(dead_code))]
+async fn relay_output<R, W>(
+    mut output: R,
+    mut relay: W,
+    log: &Path,
+    progress: &mut LibtestProgress,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(log)
+        .await
+        .with_context(|| format!("create {}", log.display()))?;
+    let mut logged = 0_u64;
+    let mut truncated = false;
+    let mut buffer = vec![0_u8; 16 * 1024];
+    loop {
+        let length = output.read(&mut buffer).await?;
+        if length == 0 {
+            break;
+        }
+        let chunk = &buffer[..length];
+        progress.observe(chunk);
+        relay.write_all(chunk).await?;
+        relay.flush().await?;
+        let room = TEST_LOG_LIMIT.saturating_sub(logged);
+        let kept = (length as u64).min(room) as usize;
+        if kept > 0 {
+            file.write_all(&chunk[..kept]).await?;
+            logged += kept as u64;
+        }
+        if kept < length && !truncated {
+            truncated = true;
+            file.write_all(b"\n[coverage runner: log truncated at its byte limit]\n")
+                .await?;
+        }
+        // A stalled relay is dropped; flush so its log keeps everything seen.
+        file.flush().await?;
+    }
+    file.sync_all().await?;
+    Ok(())
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn relay_outcome(result: Result<()>) -> String {
+    match result {
+        Ok(()) => "complete".to_owned(),
+        Err(error) => format!("relay failed: {error:#}"),
+    }
+}
+
+/// Wait for the owned tree until the shard deadline while relaying its output.
+/// At the deadline, sample, terminate and await bounded cleanup, then return the
+/// observed progress. Output draining is bounded in both outcomes: a process
+/// outside the owned tree may still hold the pipe after the tree is quiescent.
+#[cfg_attr(not(windows), allow(dead_code))]
+async fn supervise<P, R, W>(
+    process: &mut P,
+    output: R,
+    relay: W,
+    log: PathBuf,
+    remaining: Duration,
+    cleanup_bound: Duration,
+) -> Result<Supervision>
+where
+    P: TestProcess,
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + remaining;
+    let mut progress = LibtestProgress::default();
+    let (waited, sample, termination, cleanup, output) = {
+        let mut relay = std::pin::pin!(relay_output(output, relay, &log, &mut progress));
+        let mut relayed = None;
+        let waited = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::select! {
+                result = &mut relay, if relayed.is_none() => relayed = Some(relay_outcome(result)),
+                waited = process.wait(remaining) => break waited,
+            }
+        };
+        let (sample, termination, cleanup) = if waited.is_err() {
+            let sample = process.sample();
+            let termination = format!("{:?}", process.terminate());
+            let cleanup = format!("{:?}", process.wait(cleanup_bound).await);
+            (sample, termination, cleanup)
+        } else {
+            (None, String::new(), String::new())
+        };
+        let output = match relayed {
+            Some(outcome) => outcome,
+            None => match tokio::time::timeout(cleanup_bound, &mut relay).await {
+                Ok(result) => relay_outcome(result),
+                Err(_) => format!(
+                    "stopped after {cleanup_bound:?}: a process outside the owned tree still holds the output"
+                ),
+            },
+        };
+        (waited, sample, termination, cleanup, output)
+    };
+    match waited {
+        Ok(status) => {
+            if output != "complete" {
+                eprintln!("coverage runner output relay: {output}");
+            }
+            Ok(Supervision::Exited(status))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Ok(Supervision::Stalled(StallEvidence {
+                progress,
+                sample,
+                termination,
+                cleanup,
+                output,
+            }))
+        }
+        Err(error) => bail!(
+            "Cargo test process did not settle: {error}; termination={termination}; cleanup={cleanup}; output={output}"
+        ),
+    }
+}
+
+fn diagnostic_name(executable: &str) -> String {
+    executable
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub async fn dispatch_test(options: &DispatchOptions<'_>) -> Result<Option<ExitStatus>> {
+    let DispatchOptions {
+        root,
+        inventory: inventory_path,
+        selection: selection_path,
+        target_dir,
+        ledger,
+        diagnostics,
+        deadline,
+        executable,
+        args,
+    } = options;
     ensure!(root.is_absolute(), "coverage root must be absolute");
     ensure!(
         inventory_path.is_absolute() && selection_path.is_absolute(),
@@ -664,8 +1002,12 @@ pub async fn dispatch_test(
     );
     ensure!(target_dir.is_absolute(), "coverage target must be absolute");
     ensure!(ledger.is_absolute(), "coverage ledger must be absolute");
+    ensure!(
+        diagnostics.is_absolute() && fs::symlink_metadata(diagnostics)?.file_type().is_dir(),
+        "coverage diagnostics must be an absolute directory"
+    );
     let executable_path = if executable.is_absolute() {
-        executable.to_owned()
+        executable.to_path_buf()
     } else {
         std::env::current_dir()?.join(executable)
     };
@@ -726,11 +1068,55 @@ pub async fn dispatch_test(
         )?;
         return Ok(None);
     }
+    let now = unix_now()?;
+    if now >= *deadline {
+        append_runner_record(
+            ledger,
+            &RunnerRecord {
+                schema: SCHEMA,
+                executable: executable.clone(),
+                action: "deadline".to_owned(),
+                cwd,
+                args,
+                success: false,
+                status_code: None,
+            },
+        )?;
+        bail!("coverage shard deadline {deadline} passed before starting {executable}");
+    }
+    let remaining = Duration::from_secs(deadline - now);
+    let log = diagnostics.join(format!("{}.stdout.log", diagnostic_name(&executable)));
     #[cfg(windows)]
-    let status = {
+    let supervision = {
         use kuru_platform::windows::process::{
-            Lifetime, NativeSpawnSpec, StandardStream, inherited_stdio,
+            Lifetime, NativeChild, NativeSpawnSpec, StandardStream, Stdio, inherited_stdio,
+            sample_process,
         };
+
+        struct Native(NativeChild);
+        impl TestProcess for Native {
+            async fn wait(&mut self, timeout: Duration) -> std::io::Result<ExitStatus> {
+                self.0.wait(timeout).await
+            }
+            fn sample(&self) -> Option<String> {
+                Some(
+                    match self
+                        .0
+                        .duplicate_diagnostic_handle()
+                        .and_then(|handle| sample_process(&handle))
+                    {
+                        Ok(sample) => format!(
+                            "kernel_time={:?}; user_time={:?}; working_set_bytes={}",
+                            sample.kernel_time, sample.user_time, sample.working_set_bytes
+                        ),
+                        Err(error) => format!("sample failed: {error}"),
+                    },
+                )
+            }
+            fn terminate(&mut self) -> std::io::Result<()> {
+                self.0.terminate()
+            }
+        }
 
         let mut spec = NativeSpawnSpec::new(executable_path, std::env::current_dir()?);
         // Only the verified memory test artifact exercises an owner that must
@@ -743,24 +1129,59 @@ pub async fn dispatch_test(
         spec.args = args.iter().map(OsString::from).collect();
         spec.environment = std::env::vars_os().collect();
         spec.stdin = inherited_stdio(StandardStream::Input)?;
-        spec.stdout = inherited_stdio(StandardStream::Output)?;
+        // The runner relays stdout to the job log and observes libtest progress.
+        spec.stdout = Stdio::Pipe;
         spec.stderr = inherited_stdio(StandardStream::Error)?;
         let mut child = spec.spawn().await?;
-        match child.wait(RUNNER_PROCESS_TIMEOUT).await {
-            Ok(status) => status,
-            Err(error) => {
-                let termination = child.terminate();
-                let cleanup = child.wait(RUNNER_CLEANUP_TIMEOUT).await;
-                bail!(
-                    "Cargo test process did not settle: {error}; termination={termination:?}; cleanup={cleanup:?}"
-                );
-            }
-        }
+        let output = child
+            .take_stdout()
+            .context("Cargo test process has no stdout pipe")?;
+        let mut child = Native(child);
+        supervise(
+            &mut child,
+            output,
+            tokio::io::stdout(),
+            log.clone(),
+            remaining,
+            RUNNER_CLEANUP_TIMEOUT,
+        )
+        .await?
     };
     #[cfg(not(windows))]
-    let status = std::process::Command::new(executable_path)
-        .args(&args)
-        .status()?;
+    let supervision = {
+        let _ = (&log, remaining);
+        Supervision::Exited(
+            std::process::Command::new(executable_path)
+                .args(&args)
+                .status()?,
+        )
+    };
+    let status = match supervision {
+        Supervision::Exited(status) => status,
+        Supervision::Stalled(evidence) => {
+            append_runner_record(
+                ledger,
+                &RunnerRecord {
+                    schema: SCHEMA,
+                    executable: executable.clone(),
+                    action: "run".to_owned(),
+                    cwd,
+                    args,
+                    success: false,
+                    status_code: None,
+                },
+            )?;
+            let report = stall_report(artifact, &executable, *deadline, evidence, &log)?;
+            let path = diagnostics.join(format!("{}.stall.json", diagnostic_name(&executable)));
+            write_json(&path, &report)?;
+            bail!(
+                "coverage shard deadline reached while {executable} was running; unfinished tests: {:?}; latest results: {:?}; evidence: {}",
+                report.unfinished_tests,
+                report.recent_results.last(),
+                path.display()
+            );
+        }
+    };
     append_runner_record(
         ledger,
         &RunnerRecord {
@@ -774,6 +1195,42 @@ pub async fn dispatch_test(
         },
     )?;
     Ok(Some(status))
+}
+
+fn stall_report(
+    artifact: &Artifact,
+    executable: &str,
+    deadline: u64,
+    evidence: StallEvidence,
+    log: &Path,
+) -> Result<StallReport> {
+    let StallEvidence {
+        progress,
+        sample,
+        termination,
+        cleanup,
+        output,
+    } = evidence;
+    Ok(StallReport {
+        schema: SCHEMA,
+        executable: executable.to_owned(),
+        package: artifact.package.clone(),
+        target_name: artifact.target_name.clone(),
+        deadline_unix: deadline,
+        observed_unix: unix_now()?,
+        unfinished_tests: progress.unfinished(),
+        recent_results: progress.recent.iter().cloned().collect(),
+        completed_results: progress.completed,
+        process_sample: sample,
+        termination,
+        cleanup,
+        output,
+        stdout_log: log
+            .file_name()
+            .and_then(OsStr::to_str)
+            .context("stdout log lacks a UTF-8 name")?
+            .to_owned(),
+    })
 }
 
 #[cfg(windows)]
@@ -1270,19 +1727,77 @@ fn exact_entries(directory: &Path, expected: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn canonical_attempt(text: &str) -> Option<u64> {
+    let mut bytes = text.bytes();
+    let first = bytes.next()?;
+    ((b'1'..=b'9').contains(&first) && bytes.all(|byte| byte.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+}
+
+/// Choose one shard's highest uploaded attempt. Earlier attempts of the same
+/// workflow run remain downloadable after a partial rerun; the selected one is
+/// then validated exactly, and an invalid latest attempt is never replaced by
+/// an older one.
+fn latest_shard_attempt(inputs: &Path, shard: &str, max_attempt: u64) -> Result<(u64, PathBuf)> {
+    let directory = inputs.join(shard);
+    let metadata = fs::symlink_metadata(&directory)
+        .with_context(|| format!("coverage shard {shard} has no downloaded artifacts"))?;
+    ensure!(
+        metadata.file_type().is_dir(),
+        "coverage shard {shard} input is not a directory"
+    );
+    let marker = format!("-coverage-windows-{shard}-attempt-");
+    let mut prefix = None;
+    let mut attempts = BTreeMap::new();
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("coverage shard {shard} artifact has a non-UTF-8 name"))?;
+        let (artifact_prefix, attempt) = name
+            .rsplit_once(&marker)
+            .filter(|(artifact_prefix, _)| !artifact_prefix.is_empty())
+            .with_context(|| format!("unexpected coverage shard {shard} artifact {name}"))?;
+        let attempt = canonical_attempt(attempt).with_context(|| {
+            format!("coverage shard {shard} artifact {name} has a non-canonical attempt")
+        })?;
+        ensure!(
+            attempt <= max_attempt,
+            "coverage shard {shard} artifact {name} is newer than run attempt {max_attempt}"
+        );
+        ensure!(
+            *prefix.get_or_insert_with(|| artifact_prefix.to_owned()) == artifact_prefix,
+            "coverage shard {shard} artifacts use different prefixes"
+        );
+        ensure!(
+            fs::symlink_metadata(entry.path())?.file_type().is_dir(),
+            "coverage shard {shard} artifact {name} is not a directory"
+        );
+        ensure!(
+            attempts.insert(attempt, entry.path()).is_none(),
+            "coverage shard {shard} has duplicate attempt {attempt}"
+        );
+    }
+    attempts
+        .pop_last()
+        .with_context(|| format!("coverage shard {shard} has no downloaded artifacts"))
+}
+
+/// Verify each shard's latest attempt and copy its profiles. Returns the
+/// accepted attempt for every shard.
 pub async fn collect_profiles(
     root: &Path,
     inventory_path: &Path,
     inputs: &Path,
     target_dir: &Path,
     expected_source: &str,
-    run_attempt: &str,
+    max_attempt: &str,
     llvm_cov: &Path,
-) -> Result<()> {
-    ensure!(
-        !run_attempt.is_empty() && run_attempt.bytes().all(|byte| byte.is_ascii_digit()),
-        "coverage run attempt must contain only digits"
-    );
+) -> Result<Vec<(String, u64)>> {
+    let max_attempt = canonical_attempt(max_attempt)
+        .context("coverage run attempt must be a positive integer")?;
     let inventory: Inventory = read_json(inventory_path)?;
     ensure!(inventory.schema == SCHEMA, "unsupported inventory schema");
     let inventory_sha256 = digest_json(&inventory)?;
@@ -1292,7 +1807,7 @@ pub async fn collect_profiles(
         &inventory_sha256,
         inputs,
         target_dir,
-        run_attempt,
+        max_attempt,
         &observed,
     )
 }
@@ -1302,9 +1817,9 @@ fn collect_profiles_with_identity(
     inventory_sha256: &str,
     inputs: &Path,
     target_dir: &Path,
-    run_attempt: &str,
+    max_attempt: u64,
     observed: &ReceiptIdentity,
-) -> Result<()> {
+) -> Result<Vec<(String, u64)>> {
     ensure!(
         fs::symlink_metadata(inputs)?.file_type().is_dir(),
         "coverage inputs path is not a directory"
@@ -1313,15 +1828,13 @@ fn collect_profiles_with_identity(
         fs::symlink_metadata(target_dir)?.file_type().is_dir(),
         "aggregate target is not a directory"
     );
-    let mut directories: Vec<_> = fs::read_dir(inputs)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<_>>()?;
-    directories.sort();
-    ensure!(
-        directories.len() == SHARDS.len(),
-        "expected {} shard artifacts",
-        SHARDS.len()
-    );
+    let shard_names: Vec<_> = SHARDS.iter().map(|(name, _)| *name).collect();
+    exact_entries(inputs, &shard_names)?;
+    let mut selected = Vec::new();
+    for shard in shard_names {
+        let (attempt, directory) = latest_shard_attempt(inputs, shard, max_attempt)?;
+        selected.push((shard.to_owned(), attempt, directory));
+    }
     ensure_no_profiles(target_dir)?;
 
     let mut seen = BTreeSet::new();
@@ -1329,13 +1842,13 @@ fn collect_profiles_with_identity(
     let mut accepted = Vec::new();
     let mut aggregate_count = 0_usize;
     let mut aggregate_bytes = 0_u64;
-    for directory in directories {
+    for (shard, attempt, directory) in &selected {
         ensure!(
-            fs::symlink_metadata(&directory)?.file_type().is_dir(),
+            fs::symlink_metadata(directory)?.file_type().is_dir(),
             "shard artifact is not a directory"
         );
         exact_entries(
-            &directory,
+            directory,
             &[
                 "inventory.json",
                 "profiles",
@@ -1347,8 +1860,13 @@ fn collect_profiles_with_identity(
         let receipt: Receipt = read_json(&directory.join("receipt.json"))?;
         ensure!(receipt.schema == SCHEMA, "unsupported receipt schema");
         ensure!(
-            receipt.run_attempt == run_attempt,
-            "shard run attempt differs"
+            receipt.shard == *shard,
+            "artifact for shard {shard} carries a receipt for {}",
+            receipt.shard
+        );
+        ensure!(
+            receipt.run_attempt == attempt.to_string(),
+            "shard {shard} receipt attempt differs from its artifact attempt {attempt}"
         );
         ensure!(
             seen.insert(receipt.shard.clone()),
@@ -1479,7 +1997,10 @@ fn collect_profiles_with_identity(
             copy_checked_profile(&profile_dir.join(&profile.name), &destination, profile)?;
         }
     }
-    Ok(())
+    Ok(selected
+        .into_iter()
+        .map(|(shard, attempt, _)| (shard, attempt))
+        .collect())
 }
 
 #[cfg(test)]
@@ -1639,8 +2160,37 @@ mod tests {
             };
             let inventory_sha256 = digest_json(&inventory).unwrap();
             let identity = receipt_identity();
+            let fixture = Self {
+                _temp: temp,
+                inputs,
+                target,
+                inventory,
+                inventory_sha256,
+                identity,
+            };
             for (shard, _) in SHARDS {
-                let directory = inputs.join(shard);
+                fixture.upload(shard, 2);
+            }
+            fixture
+        }
+
+        fn artifact(&self, shard: &str, attempt: u64) -> PathBuf {
+            self.inputs
+                .join(shard)
+                .join(format!("ci-coverage-windows-{shard}-attempt-{attempt}"))
+        }
+
+        /// Write one checked shard artifact as download-artifact lays out a
+        /// pattern download: `<inputs>/<shard>/<artifact name>/`.
+        fn upload(&self, shard: &str, attempt: u64) -> PathBuf {
+            let Self {
+                inventory,
+                inventory_sha256,
+                identity,
+                ..
+            } = self;
+            let directory = self.artifact(shard, attempt);
+            {
                 let profiles = directory.join("profiles");
                 fs::create_dir_all(&profiles).unwrap();
                 let packages = shard_packages(shard).unwrap();
@@ -1696,7 +2246,7 @@ mod tests {
                     &Receipt {
                         schema: SCHEMA,
                         shard: shard.to_owned(),
-                        run_attempt: "2".to_owned(),
+                        run_attempt: attempt.to_string(),
                         packages,
                         source: identity.source.clone(),
                         tree: identity.tree.clone(),
@@ -1714,29 +2264,34 @@ mod tests {
                     },
                 );
             }
-            Self {
-                _temp: temp,
-                inputs,
-                target,
-                inventory,
-                inventory_sha256,
-                identity,
-            }
+            directory
+        }
+
+        fn remove(&self, shard: &str) {
+            fs::remove_dir_all(self.inputs.join(shard)).unwrap();
         }
 
         fn shard(&self, name: &str) -> PathBuf {
-            self.inputs.join(name)
+            self.artifact(name, 2)
         }
 
-        fn collect(&self) -> Result<()> {
+        fn collect(&self) -> Result<Vec<(String, u64)>> {
+            self.collect_through(2)
+        }
+
+        fn collect_through(&self, max_attempt: u64) -> Result<Vec<(String, u64)>> {
             collect_profiles_with_identity(
                 &self.inventory,
                 &self.inventory_sha256,
                 &self.inputs,
                 &self.target,
-                "2",
+                max_attempt,
                 &self.identity,
             )
+        }
+
+        fn profile_count(&self) -> usize {
+            fs::read_dir(&self.target).unwrap().count()
         }
     }
 
@@ -1841,6 +2396,346 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_takes_each_shards_latest_attempt_and_fails_closed() {
+        // A partial rerun uploads only the rerun shard under the new attempt.
+        let rerun = AggregateFixture::new();
+        rerun.upload("application", 3);
+        let selected = rerun.collect_through(3).unwrap();
+        let expected: Vec<_> = SHARDS
+            .iter()
+            .map(|(shard, _)| {
+                (
+                    (*shard).to_owned(),
+                    if *shard == "application" { 3 } else { 2 },
+                )
+            })
+            .collect();
+        assert_eq!(selected, expected);
+        assert_eq!(rerun.profile_count(), SHARDS.len());
+
+        // A stale lower attempt is ignored once a later one exists.
+        let stale = AggregateFixture::new();
+        let old = stale.upload("memory-runtime", 1);
+        fs::write(old.join("receipt.json"), b"not a receipt").unwrap();
+        assert!(
+            stale
+                .collect()
+                .unwrap()
+                .contains(&("memory-runtime".to_owned(), 2))
+        );
+
+        // An invalid latest attempt never falls back to an older valid one.
+        for mutation in ["profile", "source", "tree", "shard", "attempt"] {
+            let invalid = AggregateFixture::new();
+            let latest = invalid.upload("memory-runtime", 3);
+            let receipt_path = latest.join("receipt.json");
+            let mut receipt: Receipt = read_json(&receipt_path).unwrap();
+            match mutation {
+                "profile" => fs::write(latest.join("profiles/0000.profraw"), b"other").unwrap(),
+                "source" => receipt.source = "other-commit".to_owned(),
+                "tree" => receipt.tree = "other-tree".to_owned(),
+                "shard" => receipt.shard = "application".to_owned(),
+                "attempt" => receipt.run_attempt = "2".to_owned(),
+                _ => unreachable!(),
+            }
+            if mutation != "profile" {
+                fs::remove_file(&receipt_path).unwrap();
+                write(&receipt_path, &receipt);
+            }
+            let error = invalid.collect_through(3).unwrap_err().to_string();
+            let reason = match mutation {
+                "profile" => "profile 0000.profraw changed",
+                "source" => "shard source differs",
+                "tree" => "shard tree differs",
+                "shard" => "carries a receipt for application",
+                "attempt" => "receipt attempt differs",
+                _ => unreachable!(),
+            };
+            assert!(error.contains(reason), "{mutation}: {error}");
+            assert_eq!(invalid.profile_count(), 0);
+        }
+
+        // No shard may claim an attempt later than the current run attempt.
+        let future = AggregateFixture::new();
+        future.upload("application", 3);
+        let error = future.collect_through(2).unwrap_err().to_string();
+        assert!(error.contains("newer than run attempt 2"), "{error}");
+        assert_eq!(future.profile_count(), 0);
+
+        // Missing shards, unknown shard directories and non-canonical or
+        // foreign artifact names are refused.
+        let missing = AggregateFixture::new();
+        missing.remove("connectors-core-platform");
+        assert!(missing.collect().is_err());
+        let empty = AggregateFixture::new();
+        fs::remove_dir_all(empty.shard("connectors-core-platform")).unwrap();
+        let error = empty.collect().unwrap_err().to_string();
+        assert!(error.contains("has no downloaded artifacts"), "{error}");
+        let unknown = AggregateFixture::new();
+        fs::create_dir(unknown.inputs.join("unknown")).unwrap();
+        assert!(unknown.collect().is_err());
+        for name in [
+            "ci-coverage-windows-application-attempt-03",
+            "ci-coverage-windows-application-attempt-0",
+            "ci-coverage-windows-application-attempt-x",
+            "ci-coverage-windows-application-diagnostics-attempt-1",
+            "other-coverage-windows-application-attempt-1",
+            "-coverage-windows-application-attempt-1",
+        ] {
+            let foreign = AggregateFixture::new();
+            fs::create_dir(foreign.inputs.join("application").join(name)).unwrap();
+            let error = foreign.collect_through(3).unwrap_err().to_string();
+            assert!(
+                [
+                    "unexpected coverage shard",
+                    "non-canonical attempt",
+                    "different prefixes"
+                ]
+                .iter()
+                .any(|reason| error.contains(reason)),
+                "{name}: {error}"
+            );
+            assert_eq!(foreign.profile_count(), 0);
+        }
+    }
+
+    #[test]
+    fn shard_deadline_keeps_the_evidence_reserve_inside_the_job_limit() {
+        assert_eq!(
+            shard_deadline(1_000, 90).unwrap(),
+            1_000 + 90 * 60 - EVIDENCE_RESERVE.as_secs()
+        );
+        assert!(shard_deadline(1_000, EVIDENCE_RESERVE.as_secs() / 60).is_err());
+        assert!(shard_deadline(1_000, 0).is_err());
+        assert!(shard_deadline(u64::MAX, 90).is_err());
+        assert!(shard_deadline(1_000, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn libtest_progress_names_unfinished_tests_and_recent_results() {
+        let mut progress = LibtestProgress::default();
+        progress
+            .observe(b"\nrunning 4 tests\r\ntest slow::a has been running for over 60 seconds\n");
+        progress.observe(b"test slow::b has been running for over 60 seconds\ntest fast ... o");
+        progress.observe(
+            b"k\ntest slow::a ... ok\ntest slow::b has been running for over 60 seconds\n",
+        );
+        progress.observe(b"test failing ... FAILED\nnot a test line\ntest slow::c ... ");
+        assert_eq!(progress.unfinished(), ["slow::b", "slow::c"]);
+        assert_eq!(
+            progress.recent,
+            [
+                "test fast ... ok",
+                "test slow::a ... ok",
+                "test failing ... FAILED"
+            ]
+        );
+        assert_eq!(progress.completed, 3);
+
+        let mut bounded = LibtestProgress::default();
+        for index in 0..RECENT_RESULT_LIMIT + 5 {
+            bounded.observe(format!("test t{index} ... ok\n").as_bytes());
+        }
+        assert_eq!(bounded.recent.len(), RECENT_RESULT_LIMIT);
+        assert_eq!(bounded.recent.front().unwrap(), "test t5 ... ok");
+        assert_eq!(bounded.completed, RECENT_RESULT_LIMIT + 5);
+
+        // An overlong line is dropped whole instead of growing without bound.
+        let mut overlong = LibtestProgress::default();
+        overlong.observe(b"test ");
+        overlong.observe(&vec![b'x'; PENDING_LINE_LIMIT + 1]);
+        overlong.observe(b" ... ");
+        assert!(overlong.unfinished().is_empty());
+        overlong.observe(b"\ntest after has been running for over 60 seconds\n");
+        assert_eq!(overlong.unfinished(), ["after"]);
+        assert_eq!(overlong.completed, 0);
+    }
+
+    struct FakeProcess {
+        exit_after: Option<Duration>,
+        terminated: bool,
+        terminate_result: bool,
+    }
+
+    impl TestProcess for FakeProcess {
+        async fn wait(&mut self, timeout: Duration) -> std::io::Result<ExitStatus> {
+            #[cfg(unix)]
+            use std::os::unix::process::ExitStatusExt;
+            #[cfg(windows)]
+            use std::os::windows::process::ExitStatusExt;
+
+            if self.terminated {
+                return Ok(ExitStatus::from_raw(1));
+            }
+            match self.exit_after {
+                Some(after) if after <= timeout => {
+                    tokio::time::sleep(after).await;
+                    Ok(ExitStatus::from_raw(0))
+                }
+                _ => {
+                    tokio::time::sleep(timeout).await;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "native process tree did not become quiescent",
+                    ))
+                }
+            }
+        }
+        fn sample(&self) -> Option<String> {
+            Some("kernel_time=0ns".to_owned())
+        }
+        fn terminate(&mut self) -> std::io::Result<()> {
+            self.terminated = self.terminate_result;
+            if self.terminate_result {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("termination refused"))
+            }
+        }
+    }
+
+    // Supervision tests use short fake budgets; the fake process sleeps for
+    // exactly the requested wait, so outcomes do not depend on scheduling.
+    const FAKE_DEADLINE: Duration = Duration::from_millis(200);
+    const FAKE_CLEANUP: Duration = Duration::from_millis(100);
+
+    #[tokio::test]
+    async fn supervision_relays_completed_output_and_keeps_a_log() {
+        use tokio::io::AsyncWriteExt;
+
+        let temp = TempDir::new().unwrap();
+        let log = temp.path().join("test.stdout.log");
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer
+            .write_all(b"running 1 test\ntest one ... ok\n")
+            .await
+            .unwrap();
+        drop(writer);
+        let mut process = FakeProcess {
+            exit_after: Some(Duration::ZERO),
+            terminated: false,
+            terminate_result: true,
+        };
+        let (relay, mut relayed) = tokio::io::duplex(1024);
+        let supervision = supervise(
+            &mut process,
+            reader,
+            relay,
+            log.clone(),
+            FAKE_DEADLINE,
+            FAKE_CLEANUP,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(supervision, Supervision::Exited(status) if status.success()));
+        assert!(!process.terminated);
+        let mut copied = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut relayed, &mut copied)
+            .await
+            .unwrap();
+        assert_eq!(copied, "running 1 test\ntest one ... ok\n");
+        assert_eq!(fs::read_to_string(&log).unwrap(), copied);
+    }
+
+    #[tokio::test]
+    async fn supervision_terminates_a_stalled_tree_at_the_deadline_with_evidence() {
+        use tokio::io::AsyncWriteExt;
+
+        let temp = TempDir::new().unwrap();
+        let log = temp.path().join("stalled.stdout.log");
+        // The writer stays open, as when a process outside the owned tree
+        // retains the pipe; the relay drain must still be bounded.
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        writer
+            .write_all(
+                b"running 3 tests\ntest done ... ok\ntest stuck has been running for over 60 seconds\n",
+            )
+            .await
+            .unwrap();
+        let mut process = FakeProcess {
+            exit_after: None,
+            terminated: false,
+            terminate_result: true,
+        };
+        let started = tokio::time::Instant::now();
+        let supervision = supervise(
+            &mut process,
+            reader,
+            tokio::io::sink(),
+            log.clone(),
+            FAKE_DEADLINE,
+            FAKE_CLEANUP,
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() >= FAKE_DEADLINE);
+        assert!(process.terminated);
+        let Supervision::Stalled(evidence) = supervision else {
+            panic!("stalled tree exited");
+        };
+        assert_eq!(evidence.progress.unfinished(), ["stuck"]);
+        assert_eq!(evidence.progress.recent, ["test done ... ok"]);
+        assert_eq!(evidence.sample.as_deref(), Some("kernel_time=0ns"));
+        assert_eq!(evidence.termination, "Ok(())");
+        assert!(evidence.cleanup.starts_with("Ok("), "{}", evidence.cleanup);
+        assert!(
+            evidence.output.starts_with("stopped after"),
+            "{}",
+            evidence.output
+        );
+        assert!(
+            fs::read_to_string(&log)
+                .unwrap()
+                .contains("test stuck has been running")
+        );
+
+        let artifact = receipt_artifact("kuru-runtime");
+        let report = stall_report(
+            &artifact,
+            "debug/deps/kuru_runtime.exe",
+            1_000,
+            evidence,
+            &log,
+        )
+        .unwrap();
+        assert_eq!(report.unfinished_tests, ["stuck"]);
+        assert_eq!(report.package, "kuru-runtime");
+        assert_eq!(report.stdout_log, "stalled.stdout.log");
+        drop(writer);
+
+        // A tree that cannot be terminated still reports its failed cleanup.
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut refusing = FakeProcess {
+            exit_after: None,
+            terminated: false,
+            terminate_result: false,
+        };
+        let Supervision::Stalled(evidence) = supervise(
+            &mut refusing,
+            reader,
+            tokio::io::sink(),
+            temp.path().join("refusing.stdout.log"),
+            FAKE_DEADLINE,
+            FAKE_CLEANUP,
+        )
+        .await
+        .unwrap() else {
+            panic!("refusing tree exited");
+        };
+        assert!(evidence.termination.contains("termination refused"));
+        assert!(evidence.cleanup.starts_with("Err("), "{}", evidence.cleanup);
+    }
+
+    #[test]
+    fn diagnostic_names_are_single_path_components() {
+        assert_eq!(
+            diagnostic_name("debug/deps/kuru_runtime-0a1b.exe"),
+            "debug_deps_kuru_runtime-0a1b.exe"
+        );
+        assert_eq!(diagnostic_name("..\\x y"), ".._x_y");
+    }
+
+    #[test]
     fn selected_manifest_is_the_exact_full_inventory_subset() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("root");
@@ -1927,8 +2822,11 @@ mod tests {
         let helper = temp.path().join("delivery helper.exe");
         fs::write(&helper, []).unwrap();
         let ledger = temp.path().join("ledger.jsonl");
+        let diagnostics = temp.path().join("diagnostics");
+        fs::create_dir(&diagnostics).unwrap();
         let config = temp.path().join("runner.toml");
-        write_runner_config(&RunnerConfigOptions {
+        let job_started = unix_now().unwrap() - 60;
+        let options = |job_started, job_minutes, output| RunnerConfigOptions {
             root: &root,
             host: "x86_64-pc-windows-msvc",
             helper: &helper,
@@ -1936,15 +2834,37 @@ mod tests {
             selection: &selection_path,
             target_dir: &target,
             ledger: &ledger,
-            output: &config,
-        })
-        .unwrap();
+            diagnostics: &diagnostics,
+            job_started,
+            job_minutes,
+            output,
+        };
+        // A job whose remaining budget is already inside the evidence reserve,
+        // or whose start is in the future, cannot configure a runner.
+        let expired = temp.path().join("expired.toml");
+        assert!(write_runner_config(&options(job_started - 90 * 60, 90, &expired)).is_err());
+        let future = temp.path().join("future.toml");
+        assert!(write_runner_config(&options(job_started + 3600, 90, &future)).is_err());
+        assert!(!expired.exists() && !future.exists());
+        write_runner_config(&options(job_started, 90, &config)).unwrap();
         let config: toml::Value = toml::from_str(&fs::read_to_string(config).unwrap()).unwrap();
         let runner = config["target"]["x86_64-pc-windows-msvc"]["runner"]
             .as_array()
             .unwrap();
         assert_eq!(runner[0].as_str(), helper.to_str());
         assert_eq!(runner.last().unwrap().as_str(), Some("--"));
+        let argument = |flag: &str| {
+            let index = runner
+                .iter()
+                .position(|value| value.as_str() == Some(flag))
+                .unwrap();
+            runner[index + 1].as_str().unwrap().to_owned()
+        };
+        assert_eq!(argument("--diagnostics"), diagnostics.to_str().unwrap());
+        assert_eq!(
+            argument("--deadline"),
+            (job_started + 90 * 60 - EVIDENCE_RESERVE.as_secs()).to_string()
+        );
 
         let records = [
             RunnerRecord {

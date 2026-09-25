@@ -195,8 +195,11 @@ jobs:
 
   windows-coverage:
     if: inputs.os == 'windows-2025'
-    # Receipts are exact run-attempt evidence. Recovery reruns every shard and
-    # this report; it never combines a new attempt with prior shard artifacts.
+    # Receipts name their exact run attempt. Rerunning failed jobs reruns only
+    # the failed shards and the report, which takes each shard's latest attempt
+    # and requires identical source, tree, toolchain and inventory across them.
+    # The shard's inner test deadline sits inside this job limit, derived from
+    # KURU_COVERAGE_JOB_MINUTES, so a stall fails with evidence, not a cancel.
     name: Windows coverage (${{ matrix.shard }})
     runs-on: windows-2025
     timeout-minutes: 90
@@ -213,6 +216,9 @@ jobs:
           - shard: connectors-core-platform
             packages: kuru-connectors,kuru-core,kuru-platform
     steps:
+      - name: Record the job start for the inner test deadline
+        shell: pwsh
+        run: Add-Content -LiteralPath $env:GITHUB_ENV "KURU_COVERAGE_JOB_STARTED=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
@@ -245,15 +251,26 @@ jobs:
           KURU_COVERAGE_SHARD: ${{ matrix.shard }}
           KURU_COVERAGE_PACKAGES: ${{ matrix.packages }}
           KURU_COVERAGE_OUTPUT: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.shard }}-${{ github.run_attempt }}
+          KURU_COVERAGE_DIAGNOSTICS: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.shard }}-${{ github.run_attempt }}
+          # Must equal this job's timeout-minutes.
+          KURU_COVERAGE_JOB_MINUTES: "90"
         run: mise run //packages/kuru-delivery:coverage:windows:shard
       - name: Require unchanged dependency locks
         run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
+      # Only a successful shard publishes receipt evidence under the name the
+      # report accepts; a failed shard publishes its diagnostics separately.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
         with:
           name: ${{ inputs.artifact-prefix }}-coverage-windows-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kuru-coverage-evidence-${{ matrix.shard }}-${{ github.run_attempt }}
           if-no-files-found: error
+      - name: Upload failed shard diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-prefix }}-coverage-windows-${{ matrix.shard }}-diagnostics-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kuru-coverage-diagnostics-${{ matrix.shard }}-${{ github.run_attempt }}
+          if-no-files-found: warn
 
   windows-coverage-report:
     if: inputs.os == 'windows-2025' && always()
@@ -282,23 +299,29 @@ jobs:
       - name: Download delivery and archive evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ inputs.artifact-prefix }}-coverage-windows-delivery-archive-attempt-${{ github.run_attempt }}
+          pattern: ${{ inputs.artifact-prefix }}-coverage-windows-delivery-archive-attempt-*
+          merge-multiple: false
           path: ${{ runner.temp }}/kuru-coverage-inputs/delivery-archive
       - name: Download application evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ inputs.artifact-prefix }}-coverage-windows-application-attempt-${{ github.run_attempt }}
+          pattern: ${{ inputs.artifact-prefix }}-coverage-windows-application-attempt-*
+          merge-multiple: false
           path: ${{ runner.temp }}/kuru-coverage-inputs/application
       - name: Download memory and runtime evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ inputs.artifact-prefix }}-coverage-windows-memory-runtime-attempt-${{ github.run_attempt }}
+          pattern: ${{ inputs.artifact-prefix }}-coverage-windows-memory-runtime-attempt-*
+          merge-multiple: false
           path: ${{ runner.temp }}/kuru-coverage-inputs/memory-runtime
       - name: Download connectors, core and platform evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ inputs.artifact-prefix }}-coverage-windows-connectors-core-platform-attempt-${{ github.run_attempt }}
+          pattern: ${{ inputs.artifact-prefix }}-coverage-windows-connectors-core-platform-attempt-*
+          merge-multiple: false
           path: ${{ runner.temp }}/kuru-coverage-inputs/connectors-core-platform
+      # Pattern downloads include earlier attempts of this run, one directory
+      # per artifact; collection validates each shard's latest attempt.
       - name: Collect all checked profiles and require 90% coverage
         shell: pwsh
         env:

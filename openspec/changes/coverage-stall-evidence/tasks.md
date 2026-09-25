@@ -1,0 +1,8 @@
+## 1. Stall evidence and latest-attempt collection
+
+- [x] 1.1 Derive the shard test deadline from the job start and limit less the evidence reserve, supervise each test executable with bounded output relay, and write a stall report at the deadline; verify with the `coverage::` unit tests for deadline, runner configuration, libtest progress and supervision
+- [x] 1.2 Select each shard's latest attempt with fail-closed validation; verify with the aggregate `coverage::` unit tests covering partial reruns, stale, invalid, future, missing and foreign artifacts
+- [x] 1.3 Update the Windows coverage script, native-tests workflow and docs; verify with the `release_workflow` and `powershell_diagnostics` contract tests
+- [x] 1.4 Run clippy and format checks for kuru-delivery and record which native Windows checks remain unrun
+
+Evidence (macOS arm64, 2026-09-25): `cargo test -p kuru-delivery --features tooling --locked --lib coverage::` 15 passed, 0 failed; `cargo test --test release_workflow` with the package-pinned cocogitto/communiqué 20 passed, 0 failed (without those tools on PATH, four unrelated cog tests fail to find `cog`); `--test powershell_diagnostics` 4 passed; `cargo clippy -p kuru-delivery --features tooling --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` and `mise run lint:tooling` (shell, workflows, repository invariants) all exit 0. Unrun: `cargo check --target x86_64-pc-windows-msvc` stopped in the native `aws-lc-sys` C build (no Windows SDK on macOS), so the `cfg(windows)` runner glue is compiled and exercised only by the native Windows shards; the full coverage suite and all hosted runs are left to the lead's serialized push.

@@ -179,6 +179,15 @@ enum CoverageCommand {
         target_dir: PathBuf,
         #[arg(long)]
         ledger: PathBuf,
+        /// Existing directory for per-test output logs and stall reports.
+        #[arg(long)]
+        diagnostics: PathBuf,
+        /// Hosted job start in Unix seconds.
+        #[arg(long)]
+        job_started: u64,
+        /// Hosted job `timeout-minutes` limit.
+        #[arg(long)]
+        job_minutes: u64,
         #[arg(long)]
         output: PathBuf,
     },
@@ -194,6 +203,11 @@ enum CoverageCommand {
         target_dir: PathBuf,
         #[arg(long)]
         ledger: PathBuf,
+        #[arg(long)]
+        diagnostics: PathBuf,
+        /// Shard test deadline in Unix seconds.
+        #[arg(long)]
+        deadline: u64,
         executable: PathBuf,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
@@ -235,7 +249,7 @@ enum CoverageCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Verify every shard receipt and copy only accepted profiles for reporting.
+    /// Verify each shard's latest attempt and copy only accepted profiles for reporting.
     Collect {
         #[arg(long, default_value = ".")]
         root: PathBuf,
@@ -247,8 +261,9 @@ enum CoverageCommand {
         target_dir: PathBuf,
         #[arg(long)]
         expected_source: String,
+        /// The current workflow run attempt; no shard may claim a later one.
         #[arg(long)]
-        run_attempt: String,
+        max_attempt: String,
         #[arg(long)]
         llvm_cov: PathBuf,
     },
@@ -333,6 +348,9 @@ async fn main() -> Result<()> {
                     selection,
                     target_dir,
                     ledger,
+                    diagnostics,
+                    job_started,
+                    job_minutes,
                     output,
                 },
         } => {
@@ -344,6 +362,9 @@ async fn main() -> Result<()> {
                 selection: &selection,
                 target_dir: &target_dir,
                 ledger: &ledger,
+                diagnostics: &diagnostics,
+                job_started,
+                job_minutes,
                 output: &output,
             })?;
         }
@@ -355,19 +376,23 @@ async fn main() -> Result<()> {
                     selection,
                     target_dir,
                     ledger,
+                    diagnostics,
+                    deadline,
                     executable,
                     args,
                 },
         } => {
-            let status = coverage::dispatch_test(
-                &root,
-                &inventory,
-                &selection,
-                &target_dir,
-                &ledger,
-                &executable,
-                &args,
-            )
+            let status = coverage::dispatch_test(&coverage::DispatchOptions {
+                root: &root,
+                inventory: &inventory,
+                selection: &selection,
+                target_dir: &target_dir,
+                ledger: &ledger,
+                diagnostics: &diagnostics,
+                deadline,
+                executable: &executable,
+                args: &args,
+            })
             .await?;
             if let Some(status) = status
                 && !status.success()
@@ -427,20 +452,23 @@ async fn main() -> Result<()> {
                     inputs,
                     target_dir,
                     expected_source,
-                    run_attempt,
+                    max_attempt,
                     llvm_cov,
                 },
         } => {
-            coverage::collect_profiles(
+            let selected = coverage::collect_profiles(
                 &root,
                 &inventory,
                 &inputs,
                 &target_dir,
                 &expected_source,
-                &run_attempt,
+                &max_attempt,
                 &llvm_cov,
             )
             .await?;
+            for (shard, attempt) in selected {
+                println!("coverage shard {shard}: accepted run attempt {attempt}");
+            }
         }
         Command::Install {
             version,

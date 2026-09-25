@@ -209,6 +209,8 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
         "KURU_COVERAGE_OUTPUT",
         "KURU_COVERAGE_INPUTS",
         "KURU_COVERAGE_REPORT",
+        "KURU_COVERAGE_DIAGNOSTICS",
+        "KURU_COVERAGE_JOB_STARTED=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())",
         "coverage:windows:shard",
         "coverage:windows:collect",
         "cargo fetch --locked",
@@ -230,7 +232,65 @@ fn native_workflow_shards_only_windows_and_keeps_the_aggregate_fail_closed() {
             .count(),
         4
     );
-    assert_eq!(workflow.matches("if: ${{ !cancelled() }}").count(), 2);
+    // Only a successful shard publishes receipt evidence under the name the
+    // report accepts; failures publish diagnostics under a name it rejects.
+    assert_eq!(workflow.matches("if: ${{ !cancelled() }}").count(), 1);
+    let shards = workflow
+        .split("\n  windows-coverage:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n  windows-coverage-report:\n")
+        .next()
+        .unwrap();
+    assert!(!shards.contains("if: ${{ !cancelled() }}"));
+    assert_eq!(shards.matches("if: ${{ failure() }}").count(), 1);
+    assert!(shards.contains(
+        "name: ${{ inputs.artifact-prefix }}-coverage-windows-${{ matrix.shard }}-diagnostics-attempt-${{ github.run_attempt }}"
+    ));
+    assert!(shards.contains(
+        "name: ${{ inputs.artifact-prefix }}-coverage-windows-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+    ));
+    // The job start is recorded before any other step, and the inner deadline
+    // derives from the same limit the host enforces.
+    assert!(
+        shards
+            .split("    steps:\n")
+            .nth(1)
+            .unwrap()
+            .starts_with("      - name: Record the job start for the inner test deadline\n")
+    );
+    let limit = |prefix: &str, suffix: &str| {
+        let lines: Vec<_> = shards
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(prefix))
+            .map(|value| value.strip_suffix(suffix).unwrap().to_owned())
+            .collect();
+        assert_eq!(lines.len(), 1, "expected one {prefix}");
+        lines[0].parse::<u64>().unwrap()
+    };
+    assert_eq!(
+        limit("timeout-minutes: ", ""),
+        limit("KURU_COVERAGE_JOB_MINUTES: \"", "\"")
+    );
+    // The report takes each shard's latest attempt from a pattern download.
+    let report = workflow
+        .split("\n  windows-coverage-report:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n  windows-install:\n")
+        .next()
+        .unwrap();
+    for shard in [
+        "delivery-archive",
+        "application",
+        "memory-runtime",
+        "connectors-core-platform",
+    ] {
+        assert!(report.contains(&format!(
+            "          pattern: ${{{{ inputs.artifact-prefix }}}}-coverage-windows-{shard}-attempt-*\n          merge-multiple: false\n          path: ${{{{ runner.temp }}}}/kuru-coverage-inputs/{shard}\n"
+        )));
+    }
+    assert!(!report.contains("-attempt-${{ github.run_attempt }}\n          path: ${{ runner.temp }}/kuru-coverage-inputs"));
 }
 
 #[cfg(unix)]

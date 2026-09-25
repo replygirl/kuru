@@ -51,8 +51,16 @@ artifact inventory, Cargo-native runner ledger and raw-profile receipts, and
 then enforces one 90% workspace report. Each shard compiles the same full
 workspace/all-target/all-feature graph; its task-private runner executes only
 the assigned standard test targets while Cargo retains package cwd and runtime
-environment. Its source installation and installed offline-runtime checks run beside
-the coverage shards after independently preparing their locked inputs. Linux Clippy does not
+environment. That runner stops tests at a deadline derived from the job's
+`timeout-minutes`, less a fixed evidence reserve. A test executable still
+running then is terminated through its owned Job, and the shard fails with a
+`…-<shard>-diagnostics-attempt-<n>` artifact holding each executable's output
+log, a stall report naming the tests libtest reported as unfinished, and the
+shard's manifests and runner ledger; any other shard failure uploads the same
+diagnostics. Rerunning only the failed jobs is enough: the report takes each
+shard's latest attempt from the same run, validates it exactly, and never falls
+back to an older attempt when the latest one is invalid. Its source installation
+and installed offline-runtime checks run beside the coverage shards after independently preparing their locked inputs. Linux Clippy does not
 analyze platform-specific conditional code; the native suites compile and test
 those branches. Intel macOS and Linux arm64 additionally build and package the
 native executable, exercise real memory and verify the packaged offline runtime.
