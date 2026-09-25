@@ -3618,21 +3618,21 @@ impl Harness {
                 .public_transcript_page(&self.session.id, None, 0)
                 .await?;
             let original = user(prompt);
-            ensure!(
-                page.pending.as_ref().is_some_and(|pending| {
-                    pending.origin_session_id == self.session.id
-                        && pending.turn_id == turn_id
-                        && pending.settlement == PublicTurnSettlement::Pending
-                        && pending.user_entry.as_ref() == Some(&original)
-                }),
-                "active turn transcript changed before provider dispatch"
-            );
-            Some(PublicInputOverride {
+            let override_input = PublicInputOverride {
                 session_id: self.session.id.clone(),
                 operation_id: self.operation_id.clone(),
                 turn_id: turn_id.to_owned(),
                 original,
-            })
+            };
+            ensure!(
+                page.pending
+                    .as_ref()
+                    .map(|pending| override_input.matches_pending(pending))
+                    .transpose()?
+                    .unwrap_or(false),
+                "active turn transcript changed before provider dispatch"
+            );
+            Some(override_input)
         } else {
             None
         };

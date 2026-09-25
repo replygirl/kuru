@@ -1520,6 +1520,21 @@ async fn hook_started_kuru_run_reaches_provider_without_reentering_hooks() -> Re
     let config_path = sandbox.root.path().join("nested-hooks.toml");
     let hook_marker = sandbox.root.path().join("hook-invocations");
     let nested_output = sandbox.root.path().join("nested-output.json");
+    let nested_stderr = sandbox.root.path().join("nested-stderr.txt");
+    let profile_destination = std::env::var_os("LLVM_PROFILE_FILE")
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("coverage destination is not UTF-8"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if !profile_destination.is_empty() {
+        ensure!(
+            PathBuf::from(&profile_destination).is_absolute(),
+            "coverage destination must be absolute"
+        );
+    }
     let mut config = sandbox.config()?;
     config.max_rounds = 1;
     config.dream_every = 0;
@@ -1529,7 +1544,7 @@ async fn hook_started_kuru_run_reaches_provider_without_reentering_hooks() -> Re
             command: "/bin/sh".into(),
             args: vec![
                 "-c".into(),
-                "set -e; cat >/dev/null; printf x >> \"$5\"; if [ \"$(wc -c < \"$5\")\" -eq 1 ]; then \"$1\" -C \"$2\" --data-dir \"$3\" --config \"$4\" --provider demo --no-dream run 'nested hook boundary' --json > \"$6\"; fi; printf '%s' '{\"decision\":\"allow\"}'".into(),
+                "set -e; cat >/dev/null; printf x >> \"$5\"; if [ \"$(wc -c < \"$5\")\" -eq 1 ]; then if [ -n \"$8\" ]; then export LLVM_PROFILE_FILE=\"$8\"; fi; \"$1\" -C \"$2\" --data-dir \"$3\" --config \"$4\" --provider demo --no-dream run 'nested hook boundary' --json > \"$6\" 2> \"$7\"; fi; printf '%s' '{\"decision\":\"allow\"}'".into(),
                 "hook".into(),
                 env!("CARGO_BIN_EXE_kuru").into(),
                 nested_project.to_string_lossy().into_owned(),
@@ -1537,6 +1552,8 @@ async fn hook_started_kuru_run_reaches_provider_without_reentering_hooks() -> Re
                 config_path.to_string_lossy().into_owned(),
                 hook_marker.to_string_lossy().into_owned(),
                 nested_output.to_string_lossy().into_owned(),
+                nested_stderr.to_string_lossy().into_owned(),
+                profile_destination,
             ],
             timeout_ms: 15_000,
             max_output_bytes: 64 * 1024,
@@ -1545,17 +1562,28 @@ async fn hook_started_kuru_run_reaches_provider_without_reentering_hooks() -> Re
     };
     std::fs::write(&config_path, toml::to_string(&config)?)?;
 
+    let started = Instant::now();
     let output = sandbox
         .command("demo")
         .arg("--config")
         .arg(&config_path)
         .args(["run", "outer hook boundary", "--json"])
         .output()?;
-    ensure!(
-        output.status.success(),
-        "outer run failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if !output.status.success() {
+        let nested_error = std::fs::File::open(&nested_stderr)
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(4096).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            })
+            .unwrap_or_default();
+        anyhow::bail!(
+            "outer run failed after {:?}: {}; nested stderr (4 KiB max): {}",
+            started.elapsed(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&nested_error)
+        );
+    }
     let outer: Value = serde_json::from_slice(&output.stdout)?;
     let nested: Value = serde_json::from_slice(&std::fs::read(&nested_output)?)?;
     ensure!(

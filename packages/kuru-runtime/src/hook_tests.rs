@@ -1850,19 +1850,20 @@ async fn rewritten_safe_retry_uses_its_own_public_turn_after_marker_or_later_ans
             let requests = provider.requests.lock().unwrap();
             assert!(requests.len() > before);
             assert!(requests[before..].iter().all(|request| {
-                !request.instructions.contains("original pending input")
-                    && !request
-                        .messages
-                        .iter()
-                        .any(|message| message.text_projection().contains("original pending input"))
+                let current = &request.messages
+                    [request.messages.len() - request.current_message_count.unwrap()..];
+                !current
+                    .iter()
+                    .any(|message| message.text_projection().contains("original pending input"))
             }));
             assert!(requests[before..].iter().any(|request| {
-                request.instructions.contains("effective current input")
-                    || request.messages.iter().any(|message| {
-                        message
-                            .text_projection()
-                            .contains("effective current input")
-                    })
+                let current = &request.messages
+                    [request.messages.len() - request.current_message_count.unwrap()..];
+                current.iter().any(|message| {
+                    message
+                        .text_projection()
+                        .contains("effective current input")
+                })
             }));
         }
         let history = harness.history().await.unwrap();

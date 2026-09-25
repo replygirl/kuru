@@ -2,8 +2,8 @@ The dated results below belong to the preserved historical P14 branch, not to
 this reconstruction atop archived P11 `3dc69c72`. The current source restores
 the reviewed hook implementation and adapts its pre-turn projection to P11's
 typed pending public turn. Current-lineage focused typecheck, behavior, and PTY
-evidence is recorded below; full package suites, Linux/Windows native behavior,
-and combined coverage remain unrun. The Cospec archive completed after the
+evidence is recorded below; final-head Linux/Windows native behavior and
+passing combined coverage remain open. The Cospec archive completed after the
 focused evidence below. Historical results are retained
 for provenance and do not close the unchecked rows by themselves.
 
@@ -33,6 +33,29 @@ Neither preliminary failure reached the reporting assertion. Native
 Windows/Linux and full final-hook coverage remain open. `mise run cospec --
 archive lifecycle-hooks` exited 0 and applied 12 spec deltas on 2026-09-25;
 that archive does not prove the deferred native or coverage rows.
+
+Final-stack correction evidence on P24 parent `6e2a6271` (2026-09-25): the
+first normal two-ref push stopped before publication when instrumented coverage
+found three concrete failures. An interrupted safe retry followed by a later
+answer created a valid same-turn public continuation, which the pre-dispatch
+override guards rejected as though every pending node had a second user entry.
+Both guards now check the exact primary or same-session continuation node and
+primary link; the provider test checks the current-message suffix while retaining
+the original historical user entry. The exact real-memory retry failed before
+the correction and passed 1/1 afterward. The private macOS packaging copy
+remained 135,121,272 bytes after the prior strip flags, exceeding the unchanged
+134,217,728-byte cap; `strip -u -r` reduced only that independent fixture copy
+to 106,837,384 bytes. Exact instrumented offline install and update passed
+1/1 with persisted chats and one nonempty LLVM profile. The hook-started nested
+instrumented Kuru had written a default profile into its strict private memory
+directory because HookHost correctly omits coverage internals from its normal
+shell environment. The test now passes the runner's absolute profile destination
+as a quoted hook argument to the nested invocation only; exact instrumented PTY
+proof passed 1/1 with fresh profiles in the isolated coverage target. The
+bounded test-only nested stderr diagnostic identified the failure without a
+timeout, product environment, or private-memory policy change. Rust format and
+the affected runtime/TUI all-target lint tasks passed. Full normal push hooks,
+the combined 90% gate, and exact-head native CI remain pending before merge.
 
 ## 1. Configuration, trust, and process authority [critical]
 

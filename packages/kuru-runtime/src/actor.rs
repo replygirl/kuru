@@ -19,7 +19,9 @@ use kuru_core::{
 };
 use kuru_memory::{
     ContextSummaryCheckpoint, ContextSummaryRecord, ContextSummaryStale, MemoryStore,
-    PublicTranscriptEntry, ReasoningSummaryRecord, UsageLedger, context_summary_id,
+    PublicTranscriptEntry, PublicTurnKind, PublicTurnRecord, PublicTurnSettlement,
+    ReasoningSummaryRecord, UsageLedger, context_summary_id, public_turn_continuation_node_id,
+    public_turn_node_id,
 };
 use serde_json::Value;
 use tokio::{
@@ -83,6 +85,32 @@ pub(crate) struct PublicInputOverride {
     pub operation_id: String,
     pub turn_id: String,
     pub original: Message,
+}
+
+impl PublicInputOverride {
+    pub(crate) fn matches_pending(&self, pending: &PublicTurnRecord) -> Result<bool> {
+        if pending.origin_session_id != self.session_id
+            || pending.turn_id != self.turn_id
+            || pending.settlement != PublicTurnSettlement::Pending
+        {
+            return Ok(false);
+        }
+        let primary = public_turn_node_id(&self.session_id, &self.turn_id)?;
+        Ok(match pending.kind {
+            PublicTurnKind::Primary => {
+                pending.node_id == primary
+                    && pending.continuation_of_node_id.is_none()
+                    && pending.user_entry.as_ref() == Some(&self.original)
+            }
+            PublicTurnKind::Continuation => {
+                pending.node_id
+                    == public_turn_continuation_node_id(&self.session_id, &self.turn_id)?
+                    && pending.continuation_of_node_id.as_deref() == Some(primary.as_str())
+                    && pending.user_entry.is_none()
+            }
+            PublicTurnKind::LegacyContinuation => false,
+        })
+    }
 }
 
 pub(crate) struct Actor {
@@ -276,13 +304,11 @@ impl Actor {
                             })
                             .await?;
                         ensure!(
-                            page.pending.as_ref().is_some_and(|pending| {
-                                pending.origin_session_id == override_input.session_id
-                                    && pending.turn_id == override_input.turn_id
-                                    && pending.settlement
-                                        == kuru_memory::PublicTurnSettlement::Pending
-                                    && pending.user_entry.as_ref() == Some(&override_input.original)
-                            }),
+                            page.pending
+                                .as_ref()
+                                .map(|pending| override_input.matches_pending(pending))
+                                .transpose()?
+                                .unwrap_or(false),
                             "active turn transcript changed before provider dispatch"
                         );
                     }
