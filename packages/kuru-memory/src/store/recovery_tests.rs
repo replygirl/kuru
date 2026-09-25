@@ -648,7 +648,7 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
     // This boundary is inside the same production open future that was pending
     // against the live creator. Reaching it requires taking the returned startup
     // guard after the orphaned supervisor has completed its reap.
-    tokio::time::timeout(TEST_DEADLINE, control.reached())
+    tokio::time::timeout(migration_observation_deadline(&options), control.reached())
         .await
         .context("production contender did not take over after creator cleanup")??;
     assert_startup_lock_held(&options)?;
@@ -714,7 +714,7 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
     .await;
     let inspection_cleanup = inspection.close().await;
     control.resume();
-    let recovered = tokio::time::timeout(TEST_DEADLINE, recovering)
+    let recovered = tokio::time::timeout(migration_observation_deadline(&options), recovering)
         .await
         .context("cold recovery did not finish")?
         .context("cold recovery worker failed")??;
@@ -805,8 +805,9 @@ async fn process_loss_after_accepted_ddl_retains_attempt_until_cold_recovery() -
     );
     recovered_candidate.close().await;
     recovered.close().await?;
+    let reopen_deadline = migration_observation_deadline(&options);
     let reopened = tokio::time::timeout(
-        TEST_DEADLINE,
+        reopen_deadline,
         crate::test_support::spawn_gated_open(options),
     )
     .await??;
@@ -1155,7 +1156,7 @@ async fn cancelled_upgrade_call_retains_writer_through_accepted_ddl_boundaries()
         let (hooks, control) = migrations::MigrationRunnerHooks::paused(boundary);
         options.migration_hooks = Some(Arc::new(hooks));
         let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
-        tokio::time::timeout(TEST_DEADLINE, control.reached())
+        tokio::time::timeout(completion_deadline, control.reached())
             .await
             .context("migration worker did not reach its accepted cancellation boundary")??;
         opening.abort();
@@ -2150,7 +2151,7 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
     options.migration_hooks = Some(Arc::new(hooks));
     let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
 
-    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
+    let source = tokio::time::timeout(completion_deadline, control.route_source())
         .await
         .context("production migration did not expose its routed fixture source")??;
     let proxy = reserved.start(
@@ -2197,8 +2198,9 @@ async fn production_upgrade_reconciles_lost_commit_reply_after_routed_session_en
     store.close().await?;
     proxy.close().await;
 
+    let reopen_deadline = migration_observation_deadline(&options);
     let reopened = tokio::time::timeout(
-        TEST_DEADLINE,
+        reopen_deadline,
         crate::test_support::spawn_gated_open(options),
     )
     .await
@@ -2243,9 +2245,12 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
     let hooks = hooks.with_route(migrations::MigrationBoundary::BeforeBranch, reserved.port);
     options.migration_hooks = Some(Arc::new(hooks));
     let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
-    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
-        .await
-        .context("production migration did not expose branch-route source")??;
+    let source = tokio::time::timeout(
+        migration_observation_deadline(&options),
+        control.route_source(),
+    )
+    .await
+    .context("production migration did not expose branch-route source")??;
     let branch = control.branch_name()?;
     let proxy = reserved.start(
         source,
@@ -2261,7 +2266,7 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
         .context("production migration did not reach branch boundary")??;
     control.resume();
 
-    let store = tokio::time::timeout(TEST_DEADLINE, opening)
+    let store = tokio::time::timeout(migration_observation_deadline(&options), opening)
         .await
         .context("production migration did not reconcile lost branch reply")???;
     assert!(proxy.discarded.load(Ordering::Acquire));
@@ -2299,8 +2304,9 @@ async fn production_upgrade_reconciles_lost_branch_reply_after_exact_ref_creatio
     let upgraded = store.revision().await?;
     store.close().await?;
     proxy.close().await;
+    let reopen_deadline = migration_observation_deadline(&options);
     let reopened = tokio::time::timeout(
-        TEST_DEADLINE,
+        reopen_deadline,
         crate::test_support::spawn_gated_open(options),
     )
     .await??;
@@ -2531,9 +2537,12 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
     let hooks = hooks.with_route(migrations::MigrationBoundary::BeforePublish, reserved.port);
     options.migration_hooks = Some(Arc::new(hooks));
     let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
-    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
-        .await
-        .context("production migration did not expose publish-route source")??;
+    let source = tokio::time::timeout(
+        migration_observation_deadline(&options),
+        control.route_source(),
+    )
+    .await
+    .context("production migration did not expose publish-route source")??;
     let target = control.publication_target()?;
     let branch = control.branch_name()?;
     let proxy = reserved.start(
@@ -2549,7 +2558,7 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
         .context("production migration did not reach publish boundary")??;
     control.resume();
 
-    let store = tokio::time::timeout(TEST_DEADLINE, opening)
+    let store = tokio::time::timeout(migration_observation_deadline(&options), opening)
         .await
         .context("production migration did not reconcile lost fast-forward reply")???;
     assert!(proxy.discarded.load(Ordering::Acquire));
@@ -2596,8 +2605,9 @@ async fn production_upgrade_reconciles_lost_fast_forward_reply_after_target_publ
     );
     store.close().await?;
     proxy.close().await;
+    let reopen_deadline = migration_observation_deadline(&options);
     let reopened = tokio::time::timeout(
-        TEST_DEADLINE,
+        reopen_deadline,
         crate::test_support::spawn_gated_open(options),
     )
     .await??;
@@ -2639,9 +2649,12 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
     let hooks = hooks.with_route(migrations::MigrationBoundary::BeforePublish, reserved.port);
     options.migration_hooks = Some(Arc::new(hooks));
     let opening = tokio::spawn(crate::test_support::spawn_gated_open(options.clone()));
-    let source = tokio::time::timeout(TEST_DEADLINE, control.route_source())
-        .await
-        .context("production migration did not expose absent-publish route source")??;
+    let source = tokio::time::timeout(
+        migration_observation_deadline(&options),
+        control.route_source(),
+    )
+    .await
+    .context("production migration did not expose absent-publish route source")??;
     let target = control.publication_target()?;
     let branch = control.branch_name()?;
     let proxy = reserved.start_absent(
