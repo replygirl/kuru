@@ -1311,7 +1311,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             match held.try_lock() {
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(std::fs::TryLockError::WouldBlock) => break,
                 Ok(()) => held.unlock().unwrap(),
                 Err(error) => panic!("service lock check failed: {error}"),
             }
@@ -1369,13 +1369,15 @@ mod tests {
             .unwrap();
         assert!(matches!(
             held.try_lock(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            Err(std::fs::TryLockError::WouldBlock)
         ));
         drop(release_guard);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if held.try_lock().is_ok() {
-                break;
+            match held.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => (),
+                Err(error) => panic!("service retirement lock check failed: {error}"),
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
