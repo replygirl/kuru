@@ -1,13 +1,15 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::process::Stdio;
 
 use anyhow::{Context, Result, ensure};
 use kuru_platform::fs::{Directory, NameRetention, Privacy};

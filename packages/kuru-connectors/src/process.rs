@@ -29,7 +29,7 @@ pub(crate) fn configured(
 pub(crate) fn configured_finite(
     program: &str,
     args: &[String],
-    environment: impl IntoIterator<Item = (OsString, OsString)>,
+    environment: Vec<(OsString, OsString)>,
     cwd: &Path,
 ) -> Result<NativeSpawnSpec> {
     process::configured_command(
