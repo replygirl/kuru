@@ -85,6 +85,21 @@ an initial sandboxed attempt stopped during pinned Node/npm setup before docs
 validation, then the same owning task passed with tool-install access. A full
 combined coverage run, hosted supported-platform jobs and archive remain open.
 
+## Focused schema-boundary checks on release-based P09 `be261442`
+
+P11 was rebased without dropping the reviewed session behavior onto the corrected
+P09 source and signed v0.8.0 main. Its real schema is v7; the migration test
+registry uses a synthetic v8, whose unknown future authority begins at v9.
+Strict Cospec validation and apply both exited 0 with a clear gate. On this
+rebased source, the package-owned Dolt prefetch passed, all 17 focused memory
+migration tests passed, the separate store migration validation passed 1/1,
+and memory all-target Clippy passed. The 17 cases include real v6-to-v7
+upgrade/reopen/export, synthetic v8 receipt and attempt validation, retained
+v2 progression, and future-version/no-mutation refusals. A scoped ordinary
+workspace-local artifact clean preceded these checks; it preserved the separate
+live coverage target. These checks do not replace final combined coverage,
+supported-platform native jobs, or archive.
+
 ## Historical local evidence on the reviewed P11 source (2026-09-23)
 
 The observations below belong to the earlier reviewed P11 integration through
