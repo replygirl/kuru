@@ -1180,6 +1180,7 @@ async fn completion_caps_activity_while_a_concurrent_sender_continues_producing(
         activity_tx
             .send(kuru_runtime::Event::ToolStarted {
                 actor: "part".into(),
+                call_id: format!("queued-{index}"),
                 name: format!("queued-{index}"),
             })
             .unwrap();
@@ -1191,6 +1192,7 @@ async fn completion_caps_activity_while_a_concurrent_sender_continues_producing(
                 activity_tx
                     .send(kuru_runtime::Event::ToolStarted {
                         actor: "part".into(),
+                        call_id: format!("concurrent-{index}"),
                         name: format!("concurrent-{index}"),
                     })
                     .unwrap();

@@ -14,18 +14,21 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use kuru_connectors::{Provider, ToolHost};
+use kuru_connectors::{CheckpointState, CheckpointStore, ParallelReadTestGate, Provider, ToolHost};
 use kuru_core::{
-    Completion, CompletionRequest, Config, ContentBlock, Message, Mode, ModelInfo,
-    RelationshipKind, ToolCall, canonical_peer_instruction,
+    Completion, CompletionRequest, Config, ContentBlock, Message, Mode, ModelInfo, NativeTool,
+    PermissionAction, PermissionRule, PermissionSelector, RelationshipKind, ToolCall,
+    canonical_peer_instruction,
 };
+use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
 use crate::{
-    DreamProposal, Harness, PeerMessage,
+    CancellationToken, DreamProposal, Harness, PeerMessage,
     engine::{StateReport, read_topology, validate_topology},
     undo_dream,
 };
@@ -51,6 +54,61 @@ impl Fake {
             first_pair: None,
             started: AtomicUsize::new(0),
         })
+    }
+}
+
+struct MixedRefusalEffectProvider {
+    receipt: Mutex<Option<tokio::sync::oneshot::Sender<CompletionRequest>>>,
+    issued: AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for MixedRefusalEffectProvider {
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        sink: &mut dyn kuru_connectors::ProviderSink,
+    ) -> Result<()> {
+        sink.emit(kuru_connectors::ProviderEvent::Completed(
+            self.complete(request).await?,
+        ))
+        .await
+    }
+
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(vec![])
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<Completion> {
+        if request.instructions.contains("Phase: deliberate") {
+            return Ok(answer("ready to test the mixed completion"));
+        }
+        if request
+            .messages
+            .iter()
+            .any(|message| message.role == "tool")
+        {
+            let receipt = self.receipt.lock().unwrap().take();
+            if let Some(receipt) = receipt {
+                let _ = receipt.send(request);
+                return std::future::pending().await;
+            }
+        }
+        if self.issued.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Ok(answer("Draft").with_calls(vec![
+                ToolCall {
+                    id: "refused-read".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"refused.txt"}),
+                },
+                ToolCall {
+                    id: "accepted-write".into(),
+                    name: "file_write".into(),
+                    arguments: json!({"path":"accepted.txt","content":"one mixed write"}),
+                },
+            ]));
+        }
+        Ok(answer("the later turn completed"))
     }
 }
 #[async_trait]
@@ -829,6 +887,921 @@ async fn tool_calls_execute_and_feed_real_outputs_back_only_to_speaker() {
     reopened.shutdown(false).await.unwrap();
     memory.close().await.unwrap();
     drop(reopened);
+}
+
+#[tokio::test]
+async fn authorized_native_reads_overlap_but_feed_results_back_in_provider_order() {
+    let issued = Arc::new(AtomicBool::new(false));
+    let provider_issued = issued.clone();
+    let fake = Fake::new(move |request| {
+        let mut reply = answer("Draft");
+        if request.instructions.contains("Phase: speak") {
+            let tool_results = request
+                .messages
+                .iter()
+                .filter(|message| message.role == "tool")
+                .count();
+            if tool_results == 2 {
+                reply.set_text("Both checked reads completed");
+            } else if !provider_issued.swap(true, Ordering::SeqCst) {
+                reply = reply.with_calls(vec![
+                    ToolCall {
+                        id: "parallel-first".into(),
+                        name: "file_read".into(),
+                        arguments: json!({"path":"first.txt"}),
+                    },
+                    ToolCall {
+                        id: "parallel-second".into(),
+                        name: "grep".into(),
+                        arguments: json!({"pattern":"needle"}),
+                    },
+                ]);
+            }
+        }
+        reply
+    });
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("first.txt"), "needle FIRST\n").unwrap();
+    std::fs::write(directory.path().join("denied.txt"), "needle DENIED\n").unwrap();
+    let gate = ParallelReadTestGate::new(2);
+    let config = Config {
+        mode: Mode::Freudian,
+        provider: "demo".into(),
+        model: "demo".into(),
+        max_parallel: 2,
+        permissions: vec![PermissionRule {
+            action: PermissionAction::Deny,
+            selector: PermissionSelector::native(NativeTool::Grep),
+            path: Some("denied.txt".into()),
+        }],
+        dream_every: 0,
+        dream_on_exit: false,
+        ..Config::default()
+    };
+    let tools = ToolHost::new(directory.path(), &config)
+        .unwrap()
+        .with_parallel_read_test_gate(gate.clone());
+    let memory = MemoryStore::temporary().await.unwrap();
+    let harness = Harness::with_tool_host(
+        config,
+        directory.path(),
+        memory.clone(),
+        fake.clone(),
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    let actor_id = harness.topology.parts[0].id.clone();
+    let controlled_actor = actor_id.clone();
+    let mut events = harness.subscribe();
+    let task = tokio::spawn(async move {
+        let mut harness = harness;
+        let output = harness
+            .run_controlled(
+                "Read both fixture files",
+                Some(&controlled_actor),
+                "parallel-read-turn",
+                &CancellationToken::new(),
+            )
+            .await;
+        (harness, output)
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered())
+        .await
+        .expect("file and search reads did not enter checked execution together");
+    let mut contexts = gate.entered_contexts();
+    contexts.sort_by(|left, right| left.1.call_id.cmp(&right.1.call_id));
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0].1.call_id, "parallel-first");
+    assert_eq!(contexts[1].1.call_id, "parallel-second");
+    assert!(
+        contexts
+            .iter()
+            .all(|(_, context)| context.turn_id == "parallel-read-turn"
+                && context.actor_id == actor_id
+                && !context.session_id.is_empty()
+                && !context.invocation_id.is_empty())
+    );
+    assert_eq!(contexts[0].1.session_id, contexts[1].1.session_id);
+    assert_eq!(contexts[0].1.invocation_id, contexts[1].1.invocation_id);
+    gate.release_named("grep");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let crate::Event::ToolSettled { observation, .. } = events.recv().await.unwrap() {
+                assert_ne!(
+                    observation.call_id, "parallel-first",
+                    "the held first call settled before the released second call"
+                );
+                if observation.call_id == "parallel-second" {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the separately released search call did not settle");
+    gate.release_named("first.txt");
+    let (mut harness, output) = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("ordered parallel reads did not drain")
+        .unwrap();
+    let output = output.unwrap();
+    assert_eq!(output.text, "Both checked reads completed");
+    let observations = output
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            crate::Event::ToolSettled { observation, .. } => Some(observation),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(observations.len(), 2);
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.call_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["parallel-second", "parallel-first"]
+    );
+    {
+        let requests = fake.requests.lock().unwrap();
+        let continuation = requests
+            .iter()
+            .find(|request| {
+                request.instructions.contains("Phase: speak")
+                    && request
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == "tool")
+                        .count()
+                        == 2
+            })
+            .unwrap();
+        let receipts = continuation
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| crate::test_receipt(message).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(receipts[0]["call_id"], "parallel-first");
+        assert_eq!(receipts[1]["call_id"], "parallel-second");
+        let search: Value = serde_json::from_str(receipts[1]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(search["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(search["matches"][0]["path"], "first.txt");
+        assert_eq!(search["omitted"]["denied"], 1);
+    }
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_seen, request_observed) = tokio::sync::oneshot::channel();
+    let (response_release, response_held) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "web overlap request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() <= 8 * 1024, "web overlap request is oversized");
+            }
+            assert!(
+                String::from_utf8_lossy(&request).starts_with("GET /value HTTP/1.1"),
+                "web overlap request used the wrong target"
+            );
+            request_seen.send(()).unwrap();
+            response_held.await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfetched",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        })
+        .await
+        .expect("web overlap server exceeded its bound");
+    });
+
+    let issued = Arc::new(AtomicBool::new(false));
+    let provider_issued = issued.clone();
+    let fake = Fake::new(move |request| {
+        let tool_results = request
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .count();
+        if request.instructions.contains("Phase: speak") && tool_results == 2 {
+            return answer("Fetch and search completed");
+        }
+        if request.instructions.contains("Phase: speak")
+            && !provider_issued.swap(true, Ordering::SeqCst)
+        {
+            return answer("Draft").with_calls(vec![
+                ToolCall {
+                    id: "web-first".into(),
+                    name: "web_fetch".into(),
+                    arguments: json!({
+                        "url": format!("http://parallel.fixture:{}/value", address.port())
+                    }),
+                },
+                ToolCall {
+                    id: "search-second".into(),
+                    name: "grep".into(),
+                    arguments: json!({"pattern":"needle"}),
+                },
+            ]);
+        }
+        answer("Draft")
+    });
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("source.txt"), "needle SEARCH\n").unwrap();
+    let gate = ParallelReadTestGate::new(2);
+    let config = Config {
+        mode: Mode::Freudian,
+        provider: "demo".into(),
+        model: "demo".into(),
+        max_parallel: 2,
+        permissions: vec![
+            PermissionRule {
+                action: PermissionAction::Allow,
+                selector: PermissionSelector::native(NativeTool::WebFetch),
+                path: None,
+            },
+            PermissionRule {
+                action: PermissionAction::Allow,
+                selector: PermissionSelector::native(NativeTool::Grep),
+                path: None,
+            },
+        ],
+        dream_every: 0,
+        dream_on_exit: false,
+        ..Config::default()
+    };
+    let tools = ToolHost::new(directory.path(), &config)
+        .unwrap()
+        .with_parallel_read_test_gate(gate.clone())
+        .with_web_fetch_test_route("parallel.fixture", address);
+    let memory = MemoryStore::temporary().await.unwrap();
+    let harness = Harness::with_tool_host(
+        config,
+        directory.path(),
+        memory.clone(),
+        fake.clone(),
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    let actor = harness.topology.parts[0].id.clone();
+    let mut events = harness.subscribe();
+    let task = tokio::spawn(async move {
+        let mut harness = harness;
+        let output = harness
+            .run_controlled(
+                "Fetch and search independently",
+                Some(&actor),
+                "web-search-turn",
+                &CancellationToken::new(),
+            )
+            .await;
+        (harness, output)
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered())
+        .await
+        .expect("web and search calls did not reach checked execution together");
+    gate.release_named("web_fetch");
+    tokio::time::timeout(Duration::from_secs(10), request_observed)
+        .await
+        .expect("authorized web call did not reach its isolated transport")
+        .unwrap();
+    gate.release_named("grep");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let crate::Event::ToolSettled { observation, .. } = events.recv().await.unwrap()
+                && observation.call_id == "search-second"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("search did not settle while the web response remained held");
+    response_release.send(()).unwrap();
+    let (mut harness, output) = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("web/search wave did not drain")
+        .unwrap();
+    let output = output.unwrap();
+    assert_eq!(output.text, "Fetch and search completed");
+    {
+        let requests = fake.requests.lock().unwrap();
+        let continuation = requests
+            .iter()
+            .find(|request| {
+                request.instructions.contains("Phase: speak")
+                    && request
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == "tool")
+                        .count()
+                        == 2
+            })
+            .unwrap();
+        let receipts = continuation
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| crate::test_receipt(message).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(receipts[0]["call_id"], "web-first");
+        assert_eq!(receipts[1]["call_id"], "search-second");
+        let fetched: Value = serde_json::from_str(receipts[0]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(fetched["content"], "fetched");
+        let searched: Value =
+            serde_json::from_str(receipts[1]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(searched["matches"][0]["path"], "source.txt");
+    }
+    server.await.unwrap();
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_parallel_slot_and_tool_budget_preserve_a_serial_settlement_boundary() {
+    let issued = Arc::new(AtomicBool::new(false));
+    let provider_issued = issued.clone();
+    let fake = Fake::new(move |request| {
+        let tool_results = request
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .count();
+        if request.instructions.contains("Phase: speak") && tool_results == 2 {
+            return answer("The bounded wave settled");
+        }
+        if request.instructions.contains("Phase: speak")
+            && !provider_issued.swap(true, Ordering::SeqCst)
+        {
+            return answer("Draft").with_calls(vec![
+                ToolCall {
+                    id: "within-budget".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"first.txt"}),
+                },
+                ToolCall {
+                    id: "over-budget".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"second.txt"}),
+                },
+            ]);
+        }
+        answer("Draft")
+    });
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("first.txt"), "FIRST").unwrap();
+    std::fs::write(directory.path().join("second.txt"), "SECOND").unwrap();
+    let config = Config {
+        mode: Mode::Freudian,
+        provider: "demo".into(),
+        model: "demo".into(),
+        max_parallel: 1,
+        max_tool_calls: 1,
+        dream_every: 0,
+        dream_on_exit: false,
+        ..Config::default()
+    };
+    let memory = MemoryStore::temporary().await.unwrap();
+    let mut harness = Harness::new(config, directory.path(), memory.clone(), fake.clone(), None)
+        .await
+        .unwrap();
+    let output = harness.run("Respect both bounds").await.unwrap();
+    assert_eq!(output.text, "The bounded wave settled");
+    let mut active = 0usize;
+    let mut peak = 0usize;
+    let mut starts = Vec::new();
+    let mut settlements = Vec::new();
+    for event in &output.events {
+        match event {
+            crate::Event::ToolStarted { call_id, .. } => {
+                active += 1;
+                peak = peak.max(active);
+                starts.push(call_id.as_str());
+            }
+            crate::Event::ToolSettled { observation, .. } => {
+                if starts.contains(&observation.call_id.as_str()) {
+                    active = active.saturating_sub(1);
+                }
+                settlements.push((observation.call_id.as_str(), observation.outcome));
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(peak, 1);
+    assert_eq!(starts, vec!["within-budget"]);
+    assert_eq!(
+        settlements,
+        vec![
+            ("within-budget", crate::ToolOutcome::Ok),
+            ("over-budget", crate::ToolOutcome::Error),
+        ]
+    );
+    assert_eq!(
+        output
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                crate::Event::Budget {
+                    reason: crate::TurnLimitReason::ToolCalls,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    {
+        let requests = fake.requests.lock().unwrap();
+        let continuation = requests
+            .iter()
+            .find(|request| {
+                request.instructions.contains("Phase: speak")
+                    && request
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == "tool")
+                        .count()
+                        == 2
+            })
+            .unwrap();
+        let receipts = continuation
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| crate::test_receipt(message).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(receipts[0]["call_id"], "within-budget");
+        assert_eq!(receipts[0]["is_error"], false);
+        assert_eq!(receipts[1]["call_id"], "over-budget");
+        assert_eq!(receipts[1]["is_error"], true);
+        assert!(
+            receipts[1]["output"]
+                .as_str()
+                .unwrap()
+                .contains("tool budget exhausted")
+        );
+    }
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn mutation_and_opaque_calls_split_native_read_waves() {
+    let issued = Arc::new(AtomicBool::new(false));
+    let provider_issued = issued.clone();
+    let fake = Fake::new(move |request| {
+        let tool_results = request
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .count();
+        if request.instructions.contains("Phase: speak") && tool_results == 4 {
+            return answer("Every serial boundary settled");
+        }
+        if request.instructions.contains("Phase: speak")
+            && !provider_issued.swap(true, Ordering::SeqCst)
+        {
+            return answer("Draft").with_calls(vec![
+                ToolCall {
+                    id: "read-before".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"boundary.txt"}),
+                },
+                ToolCall {
+                    id: "write-between".into(),
+                    name: "file_write".into(),
+                    arguments: json!({"path":"boundary.txt","content":"after"}),
+                },
+                ToolCall {
+                    id: "read-after".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"boundary.txt"}),
+                },
+                ToolCall {
+                    id: "opaque-last".into(),
+                    name: "unavailable".into(),
+                    arguments: json!({}),
+                },
+            ]);
+        }
+        answer("Draft")
+    });
+    let project = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("boundary.txt"), "before").unwrap();
+    let config = Config {
+        mode: Mode::Freudian,
+        provider: "demo".into(),
+        model: "demo".into(),
+        allow_write: true,
+        max_parallel: 4,
+        dream_every: 0,
+        dream_on_exit: false,
+        ..Config::default()
+    };
+    let project_path = project.path().canonicalize().unwrap();
+    let root = Arc::new(
+        Directory::open(&project_path, Privacy::Inherited, NameRetention::Pinned).unwrap(),
+    );
+    let tools = ToolHost::with_retained_root(root.clone(), &config)
+        .unwrap()
+        .with_checkpoint_store(Arc::new(
+            CheckpointStore::new(&private.path().join("checkpoints"), root).unwrap(),
+        ))
+        .unwrap();
+    let memory = MemoryStore::temporary().await.unwrap();
+    let mut harness = Harness::with_tool_host(
+        config,
+        &project_path,
+        memory.clone(),
+        fake.clone(),
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    let output = harness.run("Respect every serial barrier").await.unwrap();
+    assert_eq!(output.text, "Every serial boundary settled");
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("boundary.txt")).unwrap(),
+        "after"
+    );
+    let lifecycle = output
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            crate::Event::ToolStarted { call_id, .. } => Some(("start", call_id.as_str())),
+            crate::Event::ToolSettled { observation, .. } => {
+                Some(("settle", observation.call_id.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle,
+        vec![
+            ("start", "read-before"),
+            ("settle", "read-before"),
+            ("start", "write-between"),
+            ("settle", "write-between"),
+            ("start", "read-after"),
+            ("settle", "read-after"),
+            ("start", "opaque-last"),
+            ("settle", "opaque-last"),
+        ]
+    );
+    {
+        let requests = fake.requests.lock().unwrap();
+        let continuation = requests
+            .iter()
+            .find(|request| {
+                request.instructions.contains("Phase: speak")
+                    && request
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == "tool")
+                        .count()
+                        == 4
+            })
+            .unwrap();
+        let receipts = continuation
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| crate::test_receipt(message).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt["call_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["read-before", "write-between", "read-after", "opaque-last"]
+        );
+        assert_eq!(receipts[0]["output"], "before");
+        assert_eq!(receipts[2]["output"], "after");
+        assert_eq!(receipts[3]["is_error"], true);
+    }
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
+    let issued = Arc::new(AtomicBool::new(false));
+    let provider_issued = issued.clone();
+    let fake = Fake::new(move |request| {
+        if request.instructions.contains("Phase: speak")
+            && !provider_issued.swap(true, Ordering::SeqCst)
+        {
+            return answer("Draft").with_calls(vec![
+                ToolCall {
+                    id: "cancel-first".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"first.txt"}),
+                },
+                ToolCall {
+                    id: "cancel-second".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path":"second.txt"}),
+                },
+                ToolCall {
+                    id: "must-not-start".into(),
+                    name: "file_write".into(),
+                    arguments: json!({"path":"later.txt","content":"forbidden"}),
+                },
+            ]);
+        }
+        answer("A cancelled wave must not continue")
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("first.txt"), "FIRST").unwrap();
+    std::fs::write(directory.path().join("second.txt"), "SECOND").unwrap();
+    let gate = ParallelReadTestGate::new(2);
+    let config = Config {
+        mode: Mode::Freudian,
+        provider: "demo".into(),
+        model: "demo".into(),
+        max_parallel: 2,
+        allow_write: true,
+        dream_every: 0,
+        dream_on_exit: false,
+        ..Config::default()
+    };
+    let directory_path = directory.path().canonicalize().unwrap();
+    let root = Arc::new(
+        Directory::open(&directory_path, Privacy::Inherited, NameRetention::Pinned).unwrap(),
+    );
+    let tools = ToolHost::with_retained_root(root.clone(), &config)
+        .unwrap()
+        .with_checkpoint_store(Arc::new(
+            CheckpointStore::new(&private.path().join("checkpoints"), root).unwrap(),
+        ))
+        .unwrap()
+        .with_parallel_read_test_gate(gate.clone());
+    let memory = MemoryStore::temporary().await.unwrap();
+    let harness = Harness::with_tool_host(
+        config,
+        &directory_path,
+        memory.clone(),
+        fake.clone(),
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    let mut events = harness.subscribe();
+    let target = harness.topology.parts[0].id.clone();
+    let cancellation = CancellationToken::new();
+    let controlled = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let mut harness = harness;
+        let result = harness
+            .run_controlled(
+                "Cancel both checked reads",
+                Some(&target),
+                "cancel-wave",
+                &controlled,
+            )
+            .await;
+        (harness, result)
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered())
+        .await
+        .expect("both checked reads did not enter the owned execution gate");
+    cancellation.cancel();
+    // Releasing the deterministic execution gate is the only way either read
+    // can settle. The two cancelled observations required below therefore
+    // prove the outer turn retained and drained both owned futures.
+    gate.release();
+    let (mut harness, result) = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("cancelled parallel wave did not drain")
+        .unwrap();
+    assert!(crate::turn_was_cancelled(&result.unwrap_err()));
+    let mut settled = Vec::new();
+    let mut later_started = false;
+    while let Ok(event) = events.try_recv() {
+        match event {
+            crate::Event::ToolSettled { observation, .. }
+                if observation.call_id.starts_with("cancel-") =>
+            {
+                settled.push((observation.call_id, observation.outcome));
+            }
+            crate::Event::ToolStarted { call_id, .. } if call_id == "must-not-start" => {
+                later_started = true;
+            }
+            _ => {}
+        }
+    }
+    settled.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        settled,
+        vec![
+            ("cancel-first".into(), crate::ToolOutcome::Cancelled),
+            ("cancel-second".into(), crate::ToolOutcome::Cancelled),
+        ]
+    );
+    assert!(issued.load(Ordering::SeqCst));
+    assert_eq!(
+        fake.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.instructions.contains("Phase: speak")
+                    && request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == "tool")
+            })
+            .count(),
+        0,
+        "a cancelled wave reached a provider continuation"
+    );
+    assert!(
+        !directory.path().join("later.txt").exists(),
+        "a mutation after the cancelled wave started"
+    );
+    assert!(
+        !later_started,
+        "the post-cancellation mutation emitted a start event"
+    );
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() {
+    struct ReleaseGateOnDrop(ParallelReadTestGate);
+
+    impl Drop for ReleaseGateOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let (receipt, observed) = tokio::sync::oneshot::channel();
+    let provider = Arc::new(MixedRefusalEffectProvider {
+        receipt: Mutex::new(Some(receipt)),
+        issued: AtomicUsize::new(0),
+    });
+    let project = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("refused.txt"), "admitted bytes").unwrap();
+    let gate = ParallelReadTestGate::new(1);
+    // A failed fixture assertion must not strand the read's spawn_blocking
+    // worker inside the gate while Tokio waits for that worker at shutdown.
+    let _release_gate = ReleaseGateOnDrop(gate.clone());
+    let config = Config {
+        mode: Mode::Freudian,
+        provider: "demo".into(),
+        model: "demo".into(),
+        max_parallel: 2,
+        allow_write: true,
+        dream_every: 0,
+        dream_on_exit: false,
+        ..Config::default()
+    };
+    let project_path = project.path().canonicalize().unwrap();
+    let root = Arc::new(
+        Directory::open(&project_path, Privacy::Inherited, NameRetention::Pinned).unwrap(),
+    );
+    let tools = ToolHost::with_retained_root(root.clone(), &config)
+        .unwrap()
+        .with_checkpoint_store(Arc::new(
+            CheckpointStore::new(&private.path().join("checkpoints"), root).unwrap(),
+        ))
+        .unwrap()
+        .with_parallel_read_test_gate(gate.clone());
+    let memory = MemoryStore::temporary().await.unwrap();
+    let harness = Harness::with_tool_host(
+        config,
+        &project_path,
+        memory.clone(),
+        provider.clone(),
+        None,
+        tools,
+    )
+    .await
+    .unwrap();
+    let target = harness.topology.parts[0].id.clone();
+    let cancellation = CancellationToken::new();
+    let controlled = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let mut harness = harness;
+        let result = harness
+            .run_controlled(
+                "refuse one read and publish one write",
+                Some(&target),
+                "mixed-refusal-effect",
+                &controlled,
+            )
+            .await;
+        (harness, result, target)
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered())
+        .await
+        .expect("prepared read did not enter its checked execution gate");
+    let original = project.path().join("refused.txt");
+    let alias = project.path().join("linked-refused.txt");
+    let original_info = regular_file_info(&std::fs::File::open(&original).unwrap()).unwrap();
+    assert_eq!(original_info.links, 1);
+    std::fs::hard_link(&original, &alias).unwrap();
+    let linked_info = regular_file_info(&std::fs::File::open(&alias).unwrap()).unwrap();
+    assert_eq!(linked_info.identity, original_info.identity);
+    assert_eq!(linked_info.links, 2);
+    assert_eq!(std::fs::read(&original).unwrap(), b"admitted bytes");
+    gate.release();
+
+    let continuation = tokio::time::timeout(Duration::from_secs(10), observed)
+        .await
+        .expect("provider did not observe the mixed completion receipts")
+        .unwrap();
+    let receipts = continuation
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .map(|message| crate::test_receipt(message).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0]["call_id"], "refused-read");
+    assert_eq!(receipts[0]["is_error"], true);
+    assert!(
+        receipts[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("replan this call")
+    );
+    assert_eq!(receipts[1]["call_id"], "accepted-write");
+    assert_eq!(receipts[1]["is_error"], false);
+    let checkpoint = receipts[1]["output"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("file_write completed; checkpoint ")
+        .expect("accepted serial write did not name its durable checkpoint")
+        .to_owned();
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("accepted.txt")).unwrap(),
+        "one mixed write"
+    );
+
+    cancellation.cancel();
+    let (mut harness, result, target) = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("cancelled mixed completion did not settle")
+        .unwrap();
+    assert!(crate::turn_was_cancelled(&result.unwrap_err()));
+    let checkpoint = harness
+        .file_checkpoint(&checkpoint)
+        .unwrap()
+        .expect("accepted serial write checkpoint disappeared");
+    assert_eq!(checkpoint.state, CheckpointState::Applied);
+    assert_eq!(checkpoint.path, "accepted.txt");
+    assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
+    let retry = tokio::time::timeout(
+        Duration::from_secs(10),
+        harness.run_controlled(
+            "refuse one read and publish one write",
+            Some(&target),
+            "mixed-refusal-effect",
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("retry did not refuse the already-admitted mixed effect")
+    .unwrap_err();
+    assert!(retry.to_string().contains("may have reached external work"));
+    assert_eq!(provider.issued.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("accepted.txt")).unwrap(),
+        "one mixed write"
+    );
+    tokio::time::timeout(Duration::from_secs(30), harness.shutdown(false))
+        .await
+        .expect("mixed-effect harness shutdown did not finish")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), memory.close())
+        .await
+        .expect("mixed-effect memory close did not finish")
+        .unwrap();
 }
 
 #[tokio::test]

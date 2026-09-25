@@ -216,6 +216,11 @@ use crate::{
     web_fetch,
 };
 
+mod parallel;
+#[cfg(any(test, feature = "test-support"))]
+pub use parallel::ParallelReadTestGate;
+pub use parallel::{ParallelReadAdmission, ParallelReadCancellation, PreparedRead};
+
 /// File tools operate under an opened directory capability. Shell and MCP
 /// authorization grant process/server authority; cwd is not an OS sandbox.
 pub struct ToolHost {
@@ -227,6 +232,13 @@ pub struct ToolHost {
     instruction_gate: Option<Arc<dyn InstructionGate>>,
     skill_gate: Option<Arc<dyn SkillGate>>,
     has_skills: bool,
+    parallel_read_handles: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "test-support"))]
+    parallel_read_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(any(test, feature = "test-support"))]
+    parallel_read_test_gate: Option<ParallelReadTestGate>,
+    #[cfg(any(test, feature = "test-support"))]
+    web_fetch_test_route: Option<(String, std::net::SocketAddr)>,
     mcp: McpHosts,
     #[cfg(unix)]
     shells: ShellRegistry,
@@ -346,6 +358,13 @@ impl ToolHost {
             instruction_gate: None,
             skill_gate: None,
             has_skills: false,
+            parallel_read_handles: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            parallel_read_barrier: None,
+            #[cfg(any(test, feature = "test-support"))]
+            parallel_read_test_gate: None,
+            #[cfg(any(test, feature = "test-support"))]
+            web_fetch_test_route: None,
             #[cfg(unix)]
             shells: ShellRegistry::new(),
         })
@@ -367,6 +386,47 @@ impl ToolHost {
     pub fn with_skill_gate(mut self, gate: Arc<dyn SkillGate>, has_skills: bool) -> Self {
         self.skill_gate = Some(gate);
         self.has_skills = has_skills;
+        self
+    }
+
+    /// Test-only execution barrier for proving that two checked native reads
+    /// are simultaneously live. Install it before moving the host to runtime.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_parallel_read_barrier_for_test(
+        mut self,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.parallel_read_barrier = Some(barrier);
+        self
+    }
+
+    /// Test-only two-phase gate for cancellation and cleanup assertions.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_parallel_read_test_gate(mut self, gate: ParallelReadTestGate) -> Self {
+        self.parallel_read_test_gate = Some(gate);
+        self
+    }
+
+    /// Current and maximum retained native handles available to prepared
+    /// reads. Tests use this to prove partial admission releases its permits.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn parallel_read_handle_usage_for_test(&self) -> (usize, usize) {
+        (
+            self.parallel_read_handles
+                .load(std::sync::atomic::Ordering::Acquire),
+            parallel::MAX_PREPARED_READ_HANDLES,
+        )
+    }
+
+    /// Test-only exact resolver route for exercising the production fetch
+    /// transport against one isolated local server.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_web_fetch_test_route(
+        mut self,
+        host: impl Into<String>,
+        address: std::net::SocketAddr,
+    ) -> Self {
+        self.web_fetch_test_route = Some((host.into(), address));
         self
     }
 
@@ -1210,9 +1270,14 @@ impl ToolHost {
             }
             "web_fetch" => {
                 let execution = async {
-                    web_fetch::fetch(string(&args, "url")?)
-                        .await
-                        .map(ToolExecution::Json)
+                    let url = string(&args, "url")?;
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some((host, address)) = &self.web_fetch_test_route {
+                        return web_fetch::fetch_with_test_route(url, host, *address)
+                            .await
+                            .map(ToolExecution::Json);
+                    }
+                    web_fetch::fetch(url).await.map(ToolExecution::Json)
                 }
                 .await;
                 execution.map_err(ToolFailure::built_in)
@@ -1324,6 +1389,16 @@ impl ToolHost {
             .map_err(ToolFailure::built_in)?;
         self.review_search_targets(&targets, instruction_approval, actor, instructions)
             .await?;
+        self.grep_targets(&matcher, targets, omitted)
+            .map_err(ToolFailure::built_in)
+    }
+
+    fn grep_targets(
+        &self,
+        matcher: &RegexMatcher,
+        targets: Vec<ProjectRelativeTarget>,
+        mut omitted: SearchOmissions,
+    ) -> Result<Value> {
         (|| -> Result<Value> {
             let mut matches = Vec::new();
             for target in targets {
@@ -1352,7 +1427,7 @@ impl ToolHost {
                 let target_name = target.as_str().to_owned();
                 let mut searcher = Searcher::new();
                 searcher
-                    .search_slice(&matcher, &bytes, UTF8(|line, text| {
+                    .search_slice(matcher, &bytes, UTF8(|line, text| {
                         if text.len() > MAX_SEARCH_LINE_BYTES {
                             omitted.oversized_line += 1;
                             return Ok(true);
@@ -1368,7 +1443,6 @@ impl ToolHost {
             }
             Ok(json!({"matches": matches, "omitted": omitted.into_json()}))
         })()
-        .map_err(ToolFailure::built_in)
     }
 
     async fn admitted_search_targets(
@@ -2320,6 +2394,25 @@ mod tests {
         }
     }
 
+    struct InstructionChangesAfterAdmission(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl InstructionGate for InstructionChangesAfterAdmission {
+        async fn review(
+            &self,
+            _targets: &[ProjectRelativeTarget],
+            _approval: Option<&InstructionReviewSender>,
+        ) -> Result<InstructionGateOutcome> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(InstructionGateOutcome::Unchanged)
+            } else {
+                Ok(InstructionGateOutcome::Required(
+                    "nested project instructions changed after admission".into(),
+                ))
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_shell_capture_preserves_received_bytes_until_actual_eof() {
         use tokio::io::AsyncWriteExt;
@@ -2959,6 +3052,436 @@ mod tests {
             *gate.0.lock().unwrap(),
             vec![vec!["src".to_owned()], vec!["src".to_owned()]]
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_read_admission_is_narrow_and_preserves_serial_authority_boundaries() {
+        let context = |call_id: &str| ToolInvocationContext {
+            session_id: "session-parallel".into(),
+            turn_id: "turn-parallel".into(),
+            actor_id: "actor-parallel".into(),
+            invocation_id: "invocation-parallel".into(),
+            call_id: call_id.into(),
+        };
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "needle\n").unwrap();
+        let host = Arc::new(ToolHost::new(root.path(), &Config::default()).unwrap());
+
+        let ParallelReadAdmission::Ready(read) = host
+            .prepare_parallel_read("file_read", json!({"path":"a.txt"}), context("read-a"))
+            .await
+        else {
+            panic!("ordinary file read should enter the prepared class");
+        };
+        assert_eq!(
+            read.execute(host.clone(), ParallelReadCancellation::default())
+                .await
+                .result
+                .unwrap(),
+            "needle\n"
+        );
+        let ParallelReadAdmission::Ready(cancelled) = host
+            .prepare_parallel_read("file_list", json!({"path":"."}), context("cancel-list"))
+            .await
+        else {
+            panic!("ordinary file list should enter the prepared class");
+        };
+        let cancellation = ParallelReadCancellation::default();
+        cancellation.cancel();
+        assert!(
+            cancelled
+                .execute(host.clone(), cancellation)
+                .await
+                .result
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert_eq!(host.parallel_read_handle_usage_for_test().0, 0);
+
+        std::fs::create_dir(root.path().join("many")).unwrap();
+        for index in 0..40 {
+            std::fs::write(
+                root.path().join("many").join(format!("match-{index}.txt")),
+                "bounded-search-match\n",
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            host.prepare_parallel_read(
+                "grep",
+                json!({"path":"many","pattern":"bounded-search-match"}),
+                context("serial-handle-fallback"),
+            )
+            .await,
+            ParallelReadAdmission::Serial
+        ));
+        assert_eq!(host.parallel_read_handle_usage_for_test().0, 0);
+        let ordinary: Value = serde_json::from_str(
+            &host
+                .execute(
+                    "grep",
+                    json!({"path":"many","pattern":"bounded-search-match"}),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ordinary["matches"].as_array().unwrap().len(), 40);
+        std::fs::remove_dir_all(root.path().join("many")).unwrap();
+
+        let mut retained = Vec::new();
+        let mut saw_serial = false;
+        for index in 0..64 {
+            match host
+                .prepare_parallel_read(
+                    "file_read",
+                    json!({"path":"a.txt"}),
+                    context(&format!("bounded-handle-{index}")),
+                )
+                .await
+            {
+                ParallelReadAdmission::Ready(read) => retained.push(read),
+                ParallelReadAdmission::Serial => {
+                    saw_serial = true;
+                    break;
+                }
+            }
+        }
+        let (used, maximum) = host.parallel_read_handle_usage_for_test();
+        assert!(saw_serial && used > 0 && used <= maximum);
+        drop(retained);
+        assert_eq!(host.parallel_read_handle_usage_for_test().0, 0);
+        assert!(matches!(
+            host.prepare_parallel_read(
+                "file_write",
+                json!({"path":"b.txt","content":"x"}),
+                context("serial-write"),
+            )
+            .await,
+            ParallelReadAdmission::Serial
+        ));
+        // web_fetch asks by default. A fresh foreground/Once answer cannot be
+        // represented by a prepared call and stays on immediate serial dispatch.
+        assert!(matches!(
+            host.prepare_parallel_read(
+                "web_fetch",
+                json!({"url":"https://example.com"}),
+                context("serial-web"),
+            )
+            .await,
+            ParallelReadAdmission::Serial
+        ));
+        let web = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    permissions: vec![PermissionRule {
+                        action: PermissionAction::Allow,
+                        selector: PermissionSelector::native(NativeTool::WebFetch),
+                        path: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .with_parallel_read_barrier_for_test(Arc::new(tokio::sync::Barrier::new(2))),
+        );
+        let ParallelReadAdmission::Ready(first_web) = web
+            .prepare_parallel_read(
+                "web_fetch",
+                json!({"url":"http://127.0.0.1/first"}),
+                context("web-first"),
+            )
+            .await
+        else {
+            panic!("explicitly authorized web fetch should enter the prepared class");
+        };
+        let ParallelReadAdmission::Ready(second_web) = web
+            .prepare_parallel_read(
+                "web_fetch",
+                json!({"url":"http://127.0.0.1/second"}),
+                context("web-second"),
+            )
+            .await
+        else {
+            panic!("second authorized web fetch should enter the prepared class");
+        };
+        let (first_web, second_web) = tokio::join!(
+            first_web.execute(web.clone(), ParallelReadCancellation::default()),
+            second_web.execute(web, ParallelReadCancellation::default())
+        );
+        for outcome in [first_web, second_web] {
+            let error = outcome.result.unwrap_err();
+            assert!(!crate::is_permission_denied(&error));
+            assert!(error.to_string().contains("not a public address"));
+        }
+
+        let asked = Arc::new(
+            ToolHost::new(
+                root.path(),
+                &Config {
+                    permissions: vec![PermissionRule {
+                        action: PermissionAction::Ask,
+                        selector: PermissionSelector::native(NativeTool::FileRead),
+                        path: None,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            asked
+                .prepare_parallel_read(
+                    "file_read",
+                    json!({"path":"a.txt"}),
+                    context("asked-before-once"),
+                )
+                .await,
+            ParallelReadAdmission::Serial
+        ));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let once = {
+            let asked = asked.clone();
+            tokio::spawn(async move {
+                asked
+                    .execute_with_approval(
+                        "file_read",
+                        json!({"path":"a.txt"}),
+                        Some(&crate::ApprovalSender::new(sender)),
+                    )
+                    .await
+            })
+        };
+        receiver
+            .recv()
+            .await
+            .unwrap()
+            .reply
+            .send(crate::ApprovalAnswer::Once)
+            .unwrap();
+        assert_eq!(once.await.unwrap().unwrap(), "needle\n");
+        assert!(matches!(
+            asked
+                .prepare_parallel_read(
+                    "file_read",
+                    json!({"path":"a.txt"}),
+                    context("asked-after-once"),
+                )
+                .await,
+            ParallelReadAdmission::Serial
+        ));
+
+        let denied = ToolHost::new(
+            root.path(),
+            &Config {
+                permissions: vec![PermissionRule {
+                    action: PermissionAction::Deny,
+                    selector: PermissionSelector::native(NativeTool::FileRead),
+                    path: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            denied
+                .prepare_parallel_read(
+                    "file_read",
+                    json!({"path":"a.txt"}),
+                    context("denied-read"),
+                )
+                .await,
+            ParallelReadAdmission::Serial
+        ));
+        assert!(crate::is_permission_denied(
+            &denied
+                .execute("file_read", json!({"path":"a.txt"}))
+                .await
+                .unwrap_err()
+        ));
+
+        let gate = Arc::new(RecordInstructionDirectories(std::sync::Mutex::new(
+            Vec::new(),
+        )));
+        let reviewed = ToolHost::new(root.path(), &Config::default())
+            .unwrap()
+            .with_instruction_gate(gate);
+        assert!(matches!(
+            reviewed
+                .prepare_parallel_read(
+                    "grep",
+                    json!({"pattern":"needle"}),
+                    context("reviewed-grep"),
+                )
+                .await,
+            ParallelReadAdmission::Serial
+        ));
+
+        let changed = Arc::new(
+            ToolHost::new(root.path(), &Config::default())
+                .unwrap()
+                .with_instruction_gate(Arc::new(InstructionChangesAfterAdmission(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ))),
+        );
+        let ParallelReadAdmission::Ready(read) = changed
+            .prepare_parallel_read(
+                "file_read",
+                json!({"path":"a.txt"}),
+                context("changed-instructions"),
+            )
+            .await
+        else {
+            panic!("unchanged instruction graph should admit the read");
+        };
+        let error = read
+            .execute(changed, ParallelReadCancellation::default())
+            .await
+            .result
+            .unwrap_err();
+        assert!(crate::is_permission_denied(&error));
+        assert!(error.to_string().contains("replan this call"));
+
+        std::fs::write(root.path().join("replace.txt"), "admitted bytes").unwrap();
+        let target_changed = Arc::new(ToolHost::new(root.path(), &Config::default()).unwrap());
+        let ParallelReadAdmission::Ready(read) = target_changed
+            .prepare_parallel_read(
+                "file_read",
+                json!({"path":"replace.txt"}),
+                context("changed-target"),
+            )
+            .await
+        else {
+            panic!("the original checked target should be admitted");
+        };
+        #[cfg(windows)]
+        {
+            let path = root.path().join("replace.txt");
+            let original = regular_file_info(&std::fs::File::open(&path).unwrap()).unwrap();
+            let error = std::fs::remove_file(&path).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32));
+            assert_eq!(
+                regular_file_info(&std::fs::File::open(&path).unwrap())
+                    .unwrap()
+                    .identity,
+                original.identity
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"admitted bytes");
+            assert_eq!(
+                read.execute(target_changed.clone(), ParallelReadCancellation::default())
+                    .await
+                    .result
+                    .unwrap(),
+                "admitted bytes"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::remove_file(root.path().join("replace.txt")).unwrap();
+            std::fs::write(root.path().join("replace.txt"), "replacement bytes").unwrap();
+            let error = read
+                .execute(target_changed.clone(), ParallelReadCancellation::default())
+                .await
+                .result
+                .unwrap_err();
+            assert!(crate::is_permission_denied(&error));
+            assert!(error.to_string().contains("replan this call"));
+        }
+
+        std::fs::create_dir(root.path().join("listed")).unwrap();
+        std::fs::write(root.path().join("listed/item.txt"), "admitted").unwrap();
+        let ParallelReadAdmission::Ready(list) = target_changed
+            .prepare_parallel_read(
+                "file_list",
+                json!({"path":"listed"}),
+                context("changed-directory"),
+            )
+            .await
+        else {
+            panic!("the original checked directory should be admitted");
+        };
+        #[cfg(windows)]
+        {
+            let path = root.path().join("listed");
+            let original = Directory::open(&path, Privacy::Inherited, NameRetention::Pinned)
+                .unwrap()
+                .identity();
+            let error = std::fs::rename(&path, root.path().join("old-listed")).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32));
+            assert_eq!(
+                Directory::open(&path, Privacy::Inherited, NameRetention::Pinned)
+                    .unwrap()
+                    .identity(),
+                original
+            );
+            assert_eq!(std::fs::read(path.join("item.txt")).unwrap(), b"admitted");
+            assert!(
+                list.execute(target_changed.clone(), ParallelReadCancellation::default())
+                    .await
+                    .result
+                    .unwrap()
+                    .contains("item.txt")
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(root.path().join("listed"), root.path().join("old-listed")).unwrap();
+            std::fs::create_dir(root.path().join("listed")).unwrap();
+            let error = list
+                .execute(target_changed.clone(), ParallelReadCancellation::default())
+                .await
+                .result
+                .unwrap_err();
+            assert!(crate::is_permission_denied(&error));
+            assert!(error.to_string().contains("replan this call"));
+        }
+
+        std::fs::write(root.path().join("search.txt"), "unique-admitted-pattern").unwrap();
+        let ParallelReadAdmission::Ready(grep) = target_changed
+            .prepare_parallel_read(
+                "grep",
+                json!({"pattern":"unique-admitted-pattern"}),
+                context("changed-search-candidate"),
+            )
+            .await
+        else {
+            panic!("the original checked search candidates should be admitted");
+        };
+        #[cfg(windows)]
+        {
+            let path = root.path().join("search.txt");
+            let original = regular_file_info(&std::fs::File::open(&path).unwrap()).unwrap();
+            let error = std::fs::remove_file(&path).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32));
+            assert_eq!(
+                regular_file_info(&std::fs::File::open(&path).unwrap())
+                    .unwrap()
+                    .identity,
+                original.identity
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"unique-admitted-pattern");
+            assert!(
+                grep.execute(target_changed, ParallelReadCancellation::default())
+                    .await
+                    .result
+                    .unwrap()
+                    .contains("unique-admitted-pattern")
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::remove_file(root.path().join("search.txt")).unwrap();
+            std::fs::write(root.path().join("search.txt"), "replacement search bytes").unwrap();
+            let error = grep
+                .execute(target_changed, ParallelReadCancellation::default())
+                .await
+                .result
+                .unwrap_err();
+            assert!(crate::is_permission_denied(&error));
+            assert!(error.to_string().contains("replan this call"));
+        }
     }
 
     #[tokio::test]

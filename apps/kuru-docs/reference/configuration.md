@@ -177,14 +177,17 @@ session. No external Codex executable or credential-store import is needed.
 
 ## Budgets and dreaming
 
-| Key              | Meaning                       | Bounds                                    |
-| ---------------- | ----------------------------- | ----------------------------------------- |
-| `max_rounds`     | Peer rounds per turn          | 1–64                                      |
-| `max_tool_calls` | Tool-call budget per turn     | 1–1024                                    |
-| `max_parallel`   | Concurrent work limit         | 1–64                                      |
-| `max_parts`      | Active pool size limit        | Must fit built-in membership; at most 128 |
-| `dream_every`    | Turns between periodic dreams | `0` disables the periodic trigger         |
-| `dream_on_exit`  | Consolidate at session end    | Boolean                                   |
+| Key              | Meaning                                      | Bounds                                    |
+| ---------------- | -------------------------------------------- | ----------------------------------------- |
+| `max_rounds`     | Peer rounds per turn                         | 1–64                                      |
+| `max_tool_calls` | Tool-call budget per turn                    | 1–1024                                    |
+| `max_parallel`   | Peer and independent native-read concurrency | 1–64                                      |
+| `max_parts`      | Active pool size limit                       | Must fit built-in membership; at most 128 |
+| `dream_every`    | Turns between periodic dreams                | `0` disables the periodic trigger         |
+| `dream_on_exit`  | Consolidate at session end                   | Boolean                                   |
+
+Fresh permission or instruction decisions remain serial and do not become a
+transferable grant for another call.
 
 `--no-dream` disables both automatic triggers for one invocation. Explicit dreams are separate. See [sessions and dreaming](/concepts/sessions).
 

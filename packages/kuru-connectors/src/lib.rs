@@ -47,7 +47,12 @@ pub use redaction::{
     ProjectionError, json as project_json, text as project_text, truncate_tool_output,
 };
 pub use tool_output::is_permission_denied;
-pub use tools::{ActorToolOutcome, ToolCatalog, ToolHost, ToolInvocationContext};
+#[cfg(any(test, feature = "test-support"))]
+pub use tools::ParallelReadTestGate;
+pub use tools::{
+    ActorToolOutcome, ParallelReadAdmission, ParallelReadCancellation, PreparedRead, ToolCatalog,
+    ToolHost, ToolInvocationContext,
+};
 
 /// Maximum protocol message/body size; limits also apply to chunked responses.
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;

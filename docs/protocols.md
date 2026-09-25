@@ -210,6 +210,17 @@ integer. Offset zero, a limit outside 1–10,000, an out-of-range page, binary
 text, more than 100,000 lines, or a file over 2 MiB fails without returning
 partial page metadata.
 
+When one provider response proposes several independent, already-authorized
+`file_read`, `file_list`, `grep`, `glob`, or `web_fetch` calls, Kuru may run a
+bounded group concurrently. It still evaluates each call's exact permission and
+nested-instruction scope in provider order, reports each call with its original
+ID, and returns the completed results to the provider in that original order.
+`max_parallel` bounds the group. A fresh approval or instruction activation is
+handled on the ordinary foreground path before later calls proceed. Writes,
+shell, MCP, skill activation, cognition and unknown tools remain serial. A
+permission, target, workspace or instruction change detected before a read
+returns a refusal/replan result rather than exposing data under stale authority.
+
 If a built-in shell cannot complete its normal capture or cleanup path, Kuru
 returns one fixed operational category and a 4 KiB credential-projected stderr
 excerpt. A pipe that has not reached EOF is reported as `stderr: <pending EOF>`;

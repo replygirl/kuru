@@ -140,11 +140,11 @@ pub struct View {
     /// Ephemeral selected-speaker preview; never copied into the transcript.
     pub preview: Option<FacingProgress>,
     /// Raw catalog names of the facing speaker's in-flight tool calls, oldest
-    /// first, display only. Never an argument. Each entry carries the actor
-    /// that started it so `ToolSettled` clears it by that recorded actor and
-    /// name rather than by whoever currently speaks; the set empties as calls
-    /// settle, or all at once when the preview clears.
-    pub calling_tool: Vec<(String, String)>,
+    /// first, display only. Never an argument. Each entry carries the actor and
+    /// projected provider call ID that started it so `ToolSettled` clears that
+    /// exact call rather than another same-name call or whoever currently
+    /// speaks; the set empties as calls settle, or when the preview clears.
+    pub calling_tool: Vec<(String, String, String)>,
     pub request_context: Option<RequestContext>,
     facing_context: Option<RequestContext>,
     pub active_operation_id: Option<String>,
@@ -509,22 +509,32 @@ impl View {
                 }
                 ("speaker".into(), actor, identity_kind)
             }
-            Event::ToolStarted { actor, name } => {
+            Event::ToolStarted {
+                actor,
+                call_id,
+                name,
+            } => {
                 self.part_activity.insert(actor.clone(), "tool".into());
                 if actor == self.speaker_id {
-                    self.calling_tool.push((actor.clone(), name.clone()));
+                    self.calling_tool
+                        .push((actor.clone(), call_id, name.clone()));
                 }
                 ("tool".into(), actor, name)
             }
             Event::ToolSettled { actor, observation } => {
                 self.part_activity.insert(actor.clone(), "tool".into());
-                // Clear by the actor and name recorded at `ToolStarted`, never by
-                // whoever currently speaks: a `Speaker` change mid-call must not
-                // strand this entry, and a matching name from a different actor
-                // must not clear the wrong one.
-                if let Some(pos) = self.calling_tool.iter().position(|(started_actor, name)| {
-                    started_actor == &actor && *name == observation.name
-                }) {
+                // Clear by the actor and call ID recorded at `ToolStarted`, never
+                // by whoever currently speaks. Historical wire events lack a
+                // start ID, so only those fall back to their actor/name pair.
+                if let Some(pos) =
+                    self.calling_tool
+                        .iter()
+                        .position(|(started_actor, started_id, name)| {
+                            started_actor == &actor
+                                && (started_id == &observation.call_id
+                                    || (started_id.is_empty() && *name == observation.name))
+                        })
+                {
                     self.calling_tool.remove(pos);
                     // No facing call remains in flight. The cached preview may
                     // still read the generic "Calling tool" published while
@@ -2729,9 +2739,9 @@ mod tests {
         }));
     }
 
-    fn settled(name: &str) -> ToolObservation {
+    fn settled(call_id: &str, name: &str) -> ToolObservation {
         ToolObservation {
-            call_id: "call-1".into(),
+            call_id: call_id.into(),
             name: name.into(),
             arguments: serde_json::json!({"activation":0.4,"note":"bounded"}),
             outcome: kuru_runtime::ToolOutcome::Ok,
@@ -2753,6 +2763,7 @@ mod tests {
         // A peer's call never displaces the facing activity.
         view.event(Event::ToolStarted {
             actor: "peer".into(),
+            call_id: "peer-call".into(),
             name: "peer_send".into(),
         });
         assert!(view.calling_tool.is_empty());
@@ -2760,10 +2771,11 @@ mod tests {
 
         view.event(Event::ToolStarted {
             actor: "facing".into(),
+            call_id: "call-1".into(),
             name: "state_report".into(),
         });
         assert_eq!(
-            view.calling_tool.last().map(|(_, name)| name.as_str()),
+            view.calling_tool.last().map(|(_, _, name)| name.as_str()),
             Some("state_report")
         );
         let frame = rendered(&view);
@@ -2775,7 +2787,7 @@ mod tests {
 
         view.event(Event::ToolSettled {
             actor: "facing".into(),
-            observation: settled("state_report"),
+            observation: settled("call-1", "state_report"),
         });
         // Nothing is running any more: the label must say so truthfully,
         // never the raw "Calling tool" the provider preview last published
@@ -2793,7 +2805,7 @@ mod tests {
         assert!(!frame.contains("Calling state_report"));
 
         // A new turn never inherits a stale name.
-        view.calling_tool = vec![("facing".into(), "state_report".into())];
+        view.calling_tool = vec![("facing".into(), "call-1".into(), "state_report".into())];
         view.begin_operation();
         assert!(view.calling_tool.is_empty());
     }
@@ -2806,34 +2818,49 @@ mod tests {
 
         view.event(Event::ToolStarted {
             actor: "facing".into(),
-            name: "tool_a".into(),
+            call_id: "call-a".into(),
+            name: "file_read".into(),
         });
         view.event(Event::ToolStarted {
             actor: "facing".into(),
-            name: "tool_b".into(),
+            call_id: "call-b".into(),
+            name: "file_read".into(),
         });
         assert_eq!(
             view.calling_tool
                 .iter()
-                .map(|(_, name)| name.as_str())
+                .map(|(_, call_id, name)| (call_id.as_str(), name.as_str()))
                 .collect::<Vec<_>>(),
-            vec!["tool_a", "tool_b"]
+            vec![("call-a", "file_read"), ("call-b", "file_read")]
         );
-
-        view.event(Event::ToolSettled {
-            actor: "facing".into(),
-            observation: settled("tool_a"),
-        });
         let frame = rendered(&view);
         assert!(
-            frame.contains("activity · Calling tool_b"),
+            frame.contains("activity · Calling file_read · 2 active"),
+            "both active calls must be visible without exposing their arguments: {frame}"
+        );
+
+        // The later same-name call settles first. Exact call identity must
+        // retain the earlier call rather than removing the first name match.
+        view.event(Event::ToolSettled {
+            actor: "facing".into(),
+            observation: settled("call-b", "file_read"),
+        });
+        assert_eq!(
+            view.calling_tool
+                .iter()
+                .map(|(_, call_id, _)| call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call-a"]
+        );
+        let frame = rendered(&view);
+        assert!(
+            frame.contains("activity · Calling file_read"),
             "the still-running call must stay named: {frame}"
         );
-        assert!(!frame.contains("tool_a"));
 
         view.event(Event::ToolSettled {
             actor: "facing".into(),
-            observation: settled("tool_b"),
+            observation: settled("call-a", "file_read"),
         });
         assert!(view.calling_tool.is_empty());
         let frame = rendered(&view);
@@ -2851,6 +2878,7 @@ mod tests {
 
         view.event(Event::ToolStarted {
             actor: "facing".into(),
+            call_id: "call-1".into(),
             name: "state_report".into(),
         });
         assert!(!view.calling_tool.is_empty());
@@ -2866,7 +2894,7 @@ mod tests {
 
         view.event(Event::ToolSettled {
             actor: "facing".into(),
-            observation: settled("state_report"),
+            observation: settled("call-1", "state_report"),
         });
         assert!(
             view.calling_tool.is_empty(),
@@ -3609,6 +3637,7 @@ mod tests {
             activity_tx
                 .send(Event::ToolStarted {
                     actor: "part".into(),
+                    call_id: format!("work-{index}"),
                     name: format!("work-{index}"),
                 })
                 .unwrap();
@@ -4138,6 +4167,7 @@ mod tests {
         for i in 0..110 {
             view.event(Event::ToolStarted {
                 actor: "peer".into(),
+                call_id: format!("call{i}"),
                 name: format!("call{i}"),
             });
         }

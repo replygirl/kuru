@@ -18,10 +18,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
-    FileDispositionInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
-    GetVolumeInformationByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
-    READ_CONTROL, ReOpenFile, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE,
+    FileAttributeTagInfo, FileDispositionInfo, FileIdInfo, FileStandardInfo,
+    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, ReOpenFile, SYNCHRONIZE,
+    SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::SystemServices::FILE_PERSISTENT_ACLS;
@@ -236,9 +237,19 @@ pub(super) fn open_directory(
     path: &Path,
     retention: NameRetention,
 ) -> io::Result<File> {
+    // A metadata-only directory handle does not enforce the omitted DELETE
+    // share on Windows. Traversal access is the narrowest tested right that
+    // keeps a pinned directory name stable against DELETE opens and renames.
+    let access = FILE_READ_ATTRIBUTES
+        | READ_CONTROL
+        | if retention == NameRetention::Pinned {
+            FILE_TRAVERSE
+        } else {
+            0
+        };
     open(
         path,
-        FILE_READ_ATTRIBUTES | READ_CONTROL,
+        access,
         OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS,
         retention,
@@ -463,15 +474,8 @@ fn pin_directory(
     expected: FileIdentity,
     removed: &mut bool,
 ) -> Result<File, (PublicationPhase, io::Error)> {
-    let current = open(
-        path,
-        FILE_READ_ATTRIBUTES | READ_CONTROL,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-        NameRetention::Pinned,
-        None,
-    )
-    .map_err(|error| (phase(*removed), error))?;
+    let current = open_directory(None, path, NameRetention::Pinned)
+        .map_err(|error| (phase(*removed), error))?;
     let actual = info(&current).map_err(|error| (phase(*removed), error))?;
     if !actual.directory || actual.file.identity != expected {
         return Err((
@@ -562,7 +566,12 @@ fn remove_children(
             ));
         }
         if child_info.directory {
-            remove_children(&path, child_pin, removed, depth + 1)?;
+            // The first inspection handle can also admit a regular file. Once
+            // its type is known, acquire the stronger directory pin and bind
+            // it to that same full identity before walking by pathname.
+            let directory_pin = pin_directory(&path, child_info.file.identity, removed)?;
+            drop(child_pin);
+            remove_children(&path, directory_pin, removed, depth + 1)?;
             remove_empty_directory(&path, held, child_info.file.identity).map_err(
                 |(failure, error)| {
                     (
@@ -887,8 +896,253 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::{Read, Write};
+    use windows_sys::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY;
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+
+    #[test]
+    fn pinned_directory_open_prevents_delete_and_rename_until_release() {
+        let temporary = tempfile::tempdir().unwrap();
+        let delete_path = temporary.path().join("held-delete");
+        fs::create_dir(&delete_path).unwrap();
+        fs::write(delete_path.join("item"), b"original").unwrap();
+        let retained =
+            Directory::open(&delete_path, Privacy::Inherited, NameRetention::Pinned).unwrap();
+        let identity = retained.identity();
+        let denied_delete = open(
+            &delete_path,
+            DELETE,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(denied_delete.raw_os_error(), Some(32));
+        assert_eq!(retained.identity(), identity);
+        assert_eq!(fs::read(delete_path.join("item")).unwrap(), b"original");
+        drop(retained);
+        let unpinned_delete = open(
+            &delete_path,
+            DELETE,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            NameRetention::Movable,
+            None,
+        )
+        .unwrap();
+        assert_eq!(info(&unpinned_delete).unwrap().file.identity, identity);
+        drop(unpinned_delete);
+
+        let rename_path = temporary.path().join("held-rename");
+        let moved_path = temporary.path().join("moved");
+        fs::create_dir(&rename_path).unwrap();
+        fs::write(rename_path.join("item"), b"original").unwrap();
+        let retained =
+            Directory::open(&rename_path, Privacy::Inherited, NameRetention::Pinned).unwrap();
+        let identity = retained.identity();
+        let denied_rename = fs::rename(&rename_path, &moved_path).unwrap_err();
+        assert_eq!(denied_rename.raw_os_error(), Some(32));
+        assert_eq!(retained.identity(), identity);
+        assert_eq!(fs::read(rename_path.join("item")).unwrap(), b"original");
+        assert!(!moved_path.exists());
+        drop(retained);
+        fs::rename(&rename_path, &moved_path).unwrap();
+        let moved =
+            Directory::open(&moved_path, Privacy::Inherited, NameRetention::Movable).unwrap();
+        assert_eq!(moved.identity(), identity);
+        assert_eq!(fs::read(moved_path.join("item")).unwrap(), b"original");
+        assert!(!rename_path.exists());
+
+        let movable_path = temporary.path().join("movable");
+        let movable_moved = temporary.path().join("movable-moved");
+        fs::create_dir(&movable_path).unwrap();
+        fs::write(movable_path.join("item"), b"movable").unwrap();
+        let movable =
+            Directory::open(&movable_path, Privacy::Inherited, NameRetention::Movable).unwrap();
+        let movable_identity = movable.identity();
+        fs::rename(&movable_path, &movable_moved).unwrap();
+        assert_eq!(movable.identity(), movable_identity);
+        assert_eq!(fs::read(movable_moved.join("item")).unwrap(), b"movable");
+    }
+
+    #[test]
+    fn checked_removal_directory_pin_prevents_rebind_until_release() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("held");
+        let moved_path = temporary.path().join("moved");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("item"), b"original").unwrap();
+        let expected = Directory::open(&path, Privacy::Inherited, NameRetention::Movable)
+            .unwrap()
+            .identity();
+        let mut removed = false;
+        let pin = pin_directory(&path, expected, &mut removed).unwrap();
+        let denied = fs::rename(&path, &moved_path).unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(32));
+        assert_eq!(info(&pin).unwrap().file.identity, expected);
+        assert_eq!(fs::read(path.join("item")).unwrap(), b"original");
+        assert!(!moved_path.exists());
+        assert!(!removed);
+        drop(pin);
+        fs::rename(&path, &moved_path).unwrap();
+        let moved =
+            Directory::open(&moved_path, Privacy::Inherited, NameRetention::Movable).unwrap();
+        assert_eq!(moved.identity(), expected);
+        assert_eq!(fs::read(moved_path.join("item")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn retained_directory_rights_distinguish_delete_open_from_path_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cases = [
+            ("metadata", FILE_READ_ATTRIBUTES | READ_CONTROL),
+            (
+                "traverse",
+                FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_TRAVERSE,
+            ),
+            (
+                "list",
+                FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_LIST_DIRECTORY,
+            ),
+        ];
+        for (name, access) in cases {
+            let delete_path = temporary.path().join(format!("{name}-delete"));
+            fs::create_dir(&delete_path).unwrap();
+            fs::write(delete_path.join("item"), b"original").unwrap();
+            let retained = open(
+                &delete_path,
+                access,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                NameRetention::Pinned,
+                None,
+            );
+            let retained = match retained {
+                Ok(retained) => retained,
+                Err(error) => {
+                    assert_ne!(name, "metadata", "the production access must open: {error}");
+                    writeln!(
+                        io::stderr(),
+                        "pinned_directory_rights case={name} open={:?}",
+                        error.raw_os_error()
+                    )
+                    .unwrap();
+                    continue;
+                }
+            };
+            let identity = info(&retained).unwrap().file.identity;
+            let delete_result = open(
+                &delete_path,
+                DELETE,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                NameRetention::Movable,
+                None,
+            );
+            let delete_code = delete_result
+                .as_ref()
+                .err()
+                .and_then(io::Error::raw_os_error);
+            drop(delete_result);
+            assert_eq!(info(&retained).unwrap().file.identity, identity);
+            assert_eq!(fs::read(delete_path.join("item")).unwrap(), b"original");
+            writeln!(
+                io::stderr(),
+                "pinned_directory_rights case={name} open=ok delete_open={delete_code:?} delete_identity=true delete_bytes=true"
+            )
+            .unwrap();
+            drop(retained);
+            let unpinned_delete = open(
+                &delete_path,
+                DELETE,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                NameRetention::Movable,
+                None,
+            )
+            .expect("same-path DELETE open must succeed without the retained handle");
+            drop(unpinned_delete);
+            writeln!(
+                io::stderr(),
+                "pinned_directory_rights case={name} unpinned_delete=ok"
+            )
+            .unwrap();
+
+            // Keep the rename independent of the DELETE-open attempt so one
+            // probe cannot alter the sharing state observed by the other.
+            let rename_path = temporary.path().join(format!("{name}-rename"));
+            let moved_path = temporary.path().join(format!("{name}-moved"));
+            fs::create_dir(&rename_path).unwrap();
+            fs::write(rename_path.join("item"), b"original").unwrap();
+            let retained = open(
+                &rename_path,
+                access,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                NameRetention::Pinned,
+                None,
+            )
+            .unwrap();
+            let identity = info(&retained).unwrap().file.identity;
+            let rename_result = fs::rename(&rename_path, &moved_path);
+            let rename_code = rename_result
+                .as_ref()
+                .err()
+                .and_then(io::Error::raw_os_error);
+            let renamed_with_retained_handle = rename_result.is_ok();
+            writeln!(
+                io::stderr(),
+                "pinned_directory_rights case={name} rename={rename_code:?}"
+            )
+            .unwrap();
+            match rename_result {
+                Ok(()) => {
+                    let moved =
+                        Directory::open(&moved_path, Privacy::Inherited, NameRetention::Movable)
+                            .unwrap();
+                    assert_eq!(moved.identity(), identity);
+                    assert_eq!(fs::read(moved_path.join("item")).unwrap(), b"original");
+                    assert!(!rename_path.exists());
+                    fs::create_dir(&rename_path).unwrap();
+                    fs::write(rename_path.join("replacement"), b"replacement").unwrap();
+                    let replacement =
+                        Directory::open(&rename_path, Privacy::Inherited, NameRetention::Movable)
+                            .unwrap();
+                    assert_ne!(replacement.identity(), identity);
+                    assert_eq!(
+                        fs::read(rename_path.join("replacement")).unwrap(),
+                        b"replacement"
+                    );
+                }
+                Err(_) => {
+                    let original =
+                        Directory::open(&rename_path, Privacy::Inherited, NameRetention::Movable)
+                            .unwrap();
+                    assert_eq!(original.identity(), identity);
+                    assert_eq!(fs::read(rename_path.join("item")).unwrap(), b"original");
+                    assert!(!moved_path.exists());
+                }
+            }
+            assert_eq!(info(&retained).unwrap().file.identity, identity);
+            drop(retained);
+            if !renamed_with_retained_handle {
+                fs::rename(&rename_path, &moved_path)
+                    .expect("same-path rename must succeed without the retained handle");
+                let moved =
+                    Directory::open(&moved_path, Privacy::Inherited, NameRetention::Movable)
+                        .unwrap();
+                assert_eq!(moved.identity(), identity);
+                assert_eq!(fs::read(moved_path.join("item")).unwrap(), b"original");
+            }
+            writeln!(
+                io::stderr(),
+                "pinned_directory_rights case={name} rename_identity=true rename_bytes=true unpinned_rename={}",
+                if renamed_with_retained_handle { "not_needed" } else { "ok" }
+            )
+            .unwrap();
+        }
+    }
 
     #[test]
     fn separator_conversion_preserves_raw_utf16_and_explicit_verbatim_policy() {
