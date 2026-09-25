@@ -11,9 +11,10 @@ pub mod server;
 pub use bus::PeerMessage;
 pub use dream::{DreamProposal, DreamReport, undo_dream};
 pub use engine::{
-    CancellationToken, ControlledTurnOutput, ForgetNoteResult, Harness, INTERRUPTION_ROLE,
-    INTERRUPTION_TEXT, NotesView, ResponseOutcome, Session, SessionSummary, Topology, TurnOutput,
-    forget_note, project_scope, read_notes, turn_was_cancelled,
+    CancellationToken, ControlledTurnOutput, ForgetNoteResult,
+    HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER, Harness, INTERRUPTION_ROLE, INTERRUPTION_TEXT,
+    NotesView, ResponseOutcome, Session, SessionSummary, Topology, TurnOutput, forget_note,
+    project_scope, read_notes, turn_was_cancelled,
 };
 pub use event::{
     Event, HookObservation, StateReport, ToolObservation, ToolOutcome, TurnLimitReason,
@@ -97,6 +98,9 @@ mod reasoning_summary_tests;
 
 #[cfg(all(test, unix))]
 mod hook_tests;
+
+#[cfg(test)]
+mod hook_platform_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tool_tests;

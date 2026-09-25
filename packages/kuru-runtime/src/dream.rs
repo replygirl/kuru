@@ -12,10 +12,11 @@ use uuid::Uuid;
 use crate::{
     Event,
     engine::{
-        CancellationToken, CandidatePromotionStatus, Harness, PendingCandidateResolution,
-        PendingPublication, PublicationProof, Session, ToolHookAdmission, Topology,
-        checked_state_keys, prepared_actor_namespaces, read_topology_with_profile,
-        run_post_tool_hooks, spec, turn_was_cancelled, user, validate_topology_with_profile,
+        CancellationToken, CandidatePromotionStatus, Harness, OfferedTools,
+        PendingCandidateResolution, PendingPublication, PublicationProof, Session,
+        ToolHookAdmission, Topology, checked_state_keys, prepared_actor_namespaces,
+        read_topology_with_profile, run_post_tool_hooks, spec, turn_was_cancelled, user,
+        validate_topology_with_profile,
     },
 };
 
@@ -88,6 +89,7 @@ impl Harness {
         self.operation_id = format!("dream-{}", Uuid::new_v4());
         let hook_host = self.hook_host();
         let hook_budget = hook_host.budget();
+        let dream_tools = vec![dream_tool()];
         let candidate = self.memory.begin_candidate("dream").await?;
         // A cancelled future drops local stack state without running the
         // error path below. Keep the exact ref on Harness before the first
@@ -100,7 +102,7 @@ impl Harness {
             let ids = &plan.participants;
             let replies = join_all(ids.iter().map(|id| self.ask_in_controlled_with_invocation(&memory, id,
                 vec![user(&plan.prompt)],
-                (&plan.phase, ActorPhase::Dream), vec![dream_tool()], cancellation))).await;
+                (&plan.phase, ActorPhase::Dream), dream_tools.clone(), cancellation))).await;
             let mut report = DreamReport::default();
             let mut proposals = vec![];
             for (id, reply) in ids.iter().cloned().zip(replies) {
@@ -123,17 +125,18 @@ impl Harness {
                             report.summaries += 1;
                         }
                         for (index, original) in reply.calls().into_iter().enumerate() {
-                            // The authored proposal cap is checked before a hook can
-                            // rewrite an excess call into an admitted one.
-                            let admission = if index >= plan.max_proposals_per_part {
+                            // The authored proposal cap and the offered dream tool are
+                            // checked before any hook sees the call.
+                            let admission = if index >= plan.max_proposals_per_part
+                                || !dream_tools.iter().any(|tool| tool.name == original.name)
+                            {
                                 ToolHookAdmission::Dispatch(original)
                             } else {
                                 self.run_pre_tool_hooks(
                                     &hook_host,
                                     &hook_budget,
-                                    &id,
-                                    &invocation_id,
-                                    None,
+                                    (&id, &invocation_id, None),
+                                    OfferedTools::Exact(&dream_tools),
                                     original,
                                     cancellation,
                                 ).await?
@@ -232,6 +235,8 @@ impl Harness {
             Ok(report)
         }
         .await;
+        // Hook trees whose callers were cancelled finish cleanup first.
+        self.await_hook_cleanup().await;
         self.resolve_candidate_outcome(candidate, outcome).await
     }
 

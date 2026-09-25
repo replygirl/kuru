@@ -90,6 +90,7 @@ impl HookObservation {
                     | "stopped"
                     | "annotated"
                     | "failed"
+                    | "suppressed"
             )
     }
 }

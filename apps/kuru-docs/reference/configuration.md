@@ -103,7 +103,7 @@ Each event accepts at most 16 commands. An operation allows 1–1,024 hook invoc
 
 All five events apply to conversations through `run`, `serve`, or the terminal UI. A standalone dream has real candidate-local `dream_suggest` calls, so only pre/post tool hooks apply there; no user-turn or selected-speaker event is invented. Dream annotations disappear if the candidate is abandoned. `kuru tool` and inspection commands do not run lifecycle hooks. Completed exact turn retries reuse the stored result without running hooks again.
 
-Hook commands receive only their event payload and a finite compatibility environment, but they run with your ordinary filesystem, process, and network authority. They are not sandboxed plugins. See the [published schema](/configuration.v1.schema.json) and the [tool reference](/reference/tools) for the surrounding permission contract.
+Hook commands receive only their event payload and a finite compatibility environment, but they run with your ordinary filesystem, process, and network authority. They are not sandboxed plugins. A rewrite may change pre-turn input or pre-tool arguments, never the tool itself. A Kuru process started by a hook reports its configured hooks as `suppressed` instead of running them. See the [published schema](/configuration.v1.schema.json) and the [tool reference](/reference/tools) for the surrounding permission contract.
 
 ## Remembered choices
 

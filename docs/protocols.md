@@ -275,6 +275,11 @@ actor, invocation, and call IDs and no `turn_id`. Dreams have no `pre_turn`,
 `post_turn`, or `speaker_selected` event. A dream rewrite cannot add another
 tool class or bypass its proposal cap and candidate validation.
 
+A `pre_turn` rewrite value is `{ "input": string }` (1–131,072 bytes, not blank).
+A `pre_tool` rewrite value is `{ "name": string, "arguments": object }`, where
+`name` must repeat the proposed tool name exactly. Only `arguments` may change;
+a different `name` is an invalid response.
+
 The command must write exactly one JSON response and no trailing value. Pre
 events accept `{ "decision": "allow" }`,
 `{ "decision": "deny", "reason": string? }`, or
@@ -289,7 +294,9 @@ size or time violation fails that hook. Pre and speaker failures stop dispatch;
 post failures are recorded separately and the remaining post chain continues.
 
 Hook events expose only event type, configured ordinal, invocation/turn/call
-correlation, and outcome classification. They never expose the command, its
+correlation, and outcome classification: `allowed`, `rewritten`, `denied`,
+`observed`, `stopped`, `annotated`, `failed`, or `suppressed` (a configured hook
+not run below an owned hook launch). They never expose the command, its
 arguments, stdin, stdout, stderr, rewritten value, result body, or annotation
 body. Recognized credentials are projected before a post-tool result reaches a
 hook, but an approved hook still has ordinary process authority and is not

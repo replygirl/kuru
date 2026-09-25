@@ -1676,20 +1676,40 @@ impl ToolHost {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        // Owned lifecycle-hook trees, including any whose caller was dropped,
+        // finish cleanup before this host reports shutdown and before a
+        // caller can release the project writer lease.
         #[cfg(unix)]
-        {
-            let (shell, mcp) = tokio::join!(self.shells.shutdown(), self.mcp.shutdown());
-            match (shell, mcp) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(shell), Ok(())) => Err(shell),
-                (Ok(()), Err(mcp)) => Err(mcp),
-                (Err(shell), Err(mcp)) => {
-                    Err(shell).context(format!("MCP shutdown also failed: {mcp:#}"))
-                }
-            }
-        }
+        let (shell, mcp, hooks) = tokio::join!(
+            self.shells.shutdown(),
+            self.mcp.shutdown(),
+            self.hooks.quiesce()
+        );
         #[cfg(not(unix))]
-        self.mcp.shutdown().await
+        let (shell, mcp, hooks) = {
+            let (mcp, hooks) = tokio::join!(self.mcp.shutdown(), self.hooks.quiesce());
+            (Ok(()), mcp, hooks)
+        };
+        let mut failures = [
+            shell.err(),
+            mcp.err(),
+            hooks
+                .err()
+                .map(|error| error.context("lifecycle hook cleanup failed")),
+        ]
+        .into_iter()
+        .flatten();
+        let Some(first) = failures.next() else {
+            return Ok(());
+        };
+        let others = failures
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>();
+        if others.is_empty() {
+            Err(first)
+        } else {
+            Err(first).context(format!("shutdown also failed: {}", others.join("; ")))
+        }
     }
 
     #[cfg(unix)]

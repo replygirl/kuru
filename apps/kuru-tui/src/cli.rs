@@ -22,7 +22,10 @@ use kuru_memory::{
     OpenOptions as MemoryOptions, SelectedAbandonResolution, SelectedAbandonUncertain,
 };
 use kuru_platform::fs::{Directory, NameRetention, Privacy};
-use kuru_runtime::{CancellationToken, Event, Harness, forget_note, read_notes};
+use kuru_runtime::{
+    CancellationToken, Event, HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER, Harness, forget_note,
+    read_notes,
+};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -1616,8 +1619,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                                 ))
                             }
                             Event::Error { detail, .. }
-                                if detail
-                                    == "hook annotation persistence unresolved after settled answer" =>
+                                if detail == HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER =>
                             {
                                 Some(detail)
                             }

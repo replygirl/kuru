@@ -333,7 +333,9 @@ async fn foreground_approval_is_operation_scoped_and_completed_retry_has_no_effe
 }
 
 #[tokio::test]
-async fn unattended_cognitive_a2a_asks_without_dispatch() {
+async fn deliberation_a2a_is_refused_as_an_unoffered_tool_without_dispatch() {
+    // Deliberation offers only cognition tools; a proposed `a2a_send` is
+    // settled as refused before permission evaluation or network dispatch.
     let (url, hits, server) = peer().await;
     let (_project, mut harness) = harness(config(url, Some(PermissionAction::Ask)), true).await;
     let target = harness.topology.parts[0].id.clone();
@@ -347,7 +349,7 @@ async fn unattended_cognitive_a2a_asks_without_dispatch() {
         .await
         .unwrap();
     assert_eq!(hits.load(Ordering::SeqCst), 0);
-    assert_eq!(settled(&output), [ToolOutcome::Denied]);
+    assert_eq!(settled(&output), [ToolOutcome::Error]);
     harness.shutdown(false).await.unwrap();
     harness.memory.close().await.unwrap();
     server.abort();

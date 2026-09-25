@@ -18,8 +18,9 @@ use kuru_connectors::{
     ApprovalSender, CheckpointSummary, HookBudget, HookHost,
     HookObservation as ConnectorHookObservation, HookOutcomeKind, InstructionReviewSender,
     McpBrowserLogin, McpDeviceLogin, McpOAuthAliasStatus, McpOAuthLogout, ParallelReadAdmission,
-    ParallelReadCancellation, PermissionService, PostHookRun, PreHookOutcome, PreparedRead,
-    Provider, SpeakerHookOutcome, ToolHost, a2a_send, is_permission_denied, project_text,
+    ParallelReadCancellation, PermissionService, PostHookRun, PreHookOutcome, PreToolValue,
+    PreTurnValue, PreparedRead, Provider, SpeakerHookOutcome, ToolHost, a2a_send,
+    is_permission_denied, project_text,
 };
 use kuru_core::{
     ActorPhase, Completion, Config, ContextBudget, FacingInput, HookEvent, InvocationStart,
@@ -160,22 +161,38 @@ struct PreparedToolCall {
     read: Box<PreparedRead>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TurnHookPayload {
-    input: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolHookPayload {
-    name: String,
-    arguments: Value,
-}
+/// The one bounded report a completed answer carries when a post-turn
+/// annotation write could not be confirmed. Consumers match this value rather
+/// than restating the text.
+pub const HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER: &str =
+    "hook annotation persistence unresolved after settled answer";
 
 pub(crate) enum ToolHookAdmission {
     Dispatch(ToolCall),
     Settled(ToolCall, Result<String>),
+}
+
+/// The tools offered to one actor for one provider request.
+#[derive(Clone, Copy)]
+pub(crate) enum OfferedTools<'a> {
+    /// The runtime dispatches every admitted call itself, so the final call
+    /// must name exactly one of these tools (deliberation, dream).
+    Exact(&'a [ToolSpec]),
+    /// Runtime-dispatched cognitive calls must be offered; every other call
+    /// is admitted, permission-evaluated and typed-refused by the ToolHost
+    /// against its exact final name and arguments.
+    Speaking(&'a [ToolSpec]),
+}
+
+impl OfferedTools<'_> {
+    fn admits(self, name: &str) -> bool {
+        match self {
+            Self::Exact(tools) => tools.iter().any(|tool| tool.name == name),
+            Self::Speaking(tools) => {
+                !is_cognitive(name) || tools.iter().any(|tool| tool.name == name)
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for TurnCancelled {
@@ -1622,6 +1639,17 @@ impl Harness {
         self.tools.hook_host()
     }
 
+    /// Await every owned lifecycle-hook tree, including those whose callers
+    /// were cancelled, and report cleanup that could not be confirmed.
+    pub(crate) async fn await_hook_cleanup(&mut self) {
+        if let Err(error) = self.tools.hook_host().quiesce().await {
+            self.emit_event(Event::Error {
+                actor: "pool".into(),
+                detail: format!("{error:#}"),
+            });
+        }
+    }
+
     pub(crate) fn emit_hook_observations(
         &mut self,
         actor: &str,
@@ -1645,20 +1673,26 @@ impl Harness {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the hook event carries separate actor, invocation, turn, call, and cancellation identities"
-    )]
+    /// Admit one proposed call before dispatch. The call must name a tool
+    /// offered for this exact request and phase, whether the model proposed
+    /// it or a pre-tool hook rewrote it; hooks may change only its arguments.
+    /// Every later schema, root and permission check runs on the final call.
     pub(crate) async fn run_pre_tool_hooks(
         &mut self,
         hook_host: &Arc<HookHost>,
         budget: &Arc<HookBudget>,
-        actor: &str,
-        invocation_id: &str,
-        turn_id: Option<&str>,
+        (actor, invocation_id, turn_id): (&str, &str, Option<&str>),
+        offered: OfferedTools<'_>,
         call: ToolCall,
         cancellation: &CancellationToken,
     ) -> Result<ToolHookAdmission> {
+        let is_offered = |name: &str| offered.admits(name);
+        if !is_offered(&call.name) {
+            return Ok(ToolHookAdmission::Settled(
+                call,
+                Err(anyhow::anyhow!("tool is not offered in this phase")),
+            ));
+        }
         if !hook_host.configured(HookEvent::PreTool) {
             return Ok(ToolHookAdmission::Dispatch(call));
         }
@@ -1673,7 +1707,7 @@ impl Harness {
                         actor,
                         turn_id,
                         Some(&call_id),
-                        serde_json::to_value(ToolHookPayload {
+                        serde_json::to_value(PreToolValue {
                             name: call.name.clone(),
                             arguments: call.arguments.clone(),
                         })?,
@@ -1697,34 +1731,21 @@ impl Harness {
                 call,
                 Err(anyhow::anyhow!("pre-tool hook failed")),
             )),
-            Ok(PreHookOutcome::Allowed(value)) => {
-                let Ok(payload) = serde_json::from_value::<ToolHookPayload>(value) else {
-                    return Ok(ToolHookAdmission::Settled(
-                        call,
-                        Err(anyhow::anyhow!(
-                            "pre-tool hook returned an invalid operation"
-                        )),
-                    ));
-                };
-                if payload.name.trim().is_empty()
-                    || payload.name.len() > 256
-                    || !payload.arguments.is_object()
-                    || serde_json::to_vec(&payload.arguments)
-                        .map_or(true, |bytes| bytes.len() > kuru_connectors::MAX_BYTES)
-                {
-                    return Ok(ToolHookAdmission::Settled(
-                        call,
-                        Err(anyhow::anyhow!(
-                            "pre-tool hook returned an invalid operation"
-                        )),
-                    ));
+            Ok(PreHookOutcome::Allowed(value)) => match PreToolValue::checked(value, &call.name) {
+                Ok(payload) if is_offered(&payload.name) => {
+                    Ok(ToolHookAdmission::Dispatch(ToolCall {
+                        id: call.id,
+                        name: payload.name,
+                        arguments: payload.arguments,
+                    }))
                 }
-                Ok(ToolHookAdmission::Dispatch(ToolCall {
-                    id: call.id,
-                    name: payload.name,
-                    arguments: payload.arguments,
-                }))
-            }
+                _ => Ok(ToolHookAdmission::Settled(
+                    call,
+                    Err(anyhow::anyhow!(
+                        "pre-tool hook returned an invalid operation"
+                    )),
+                )),
+            },
         }
     }
 
@@ -3500,6 +3521,9 @@ impl Harness {
             .instrument(span.clone()),
         )
         .await;
+        // A cancelled turn dropped its hook futures; their owned trees finish
+        // cleanup before the turn is recorded or returned.
+        self.await_hook_cleanup().await;
         match result {
             Err(error) => {
                 if let Some(output) = self.record_interruption(&key, journal).await? {
@@ -3577,6 +3601,7 @@ impl Harness {
         }
         let hook_host = self.tools.hook_host();
         let hook_budget = hook_host.budget();
+        let mut rewriting_hooks = Vec::new();
         let effective_prompt = if hook_host.configured(HookEvent::PreTurn) {
             let run = cancellation
                 .wait(async {
@@ -3588,24 +3613,22 @@ impl Harness {
                             "pool",
                             Some(turn_id),
                             None,
-                            serde_json::to_value(TurnHookPayload {
+                            serde_json::to_value(PreTurnValue {
                                 input: prompt.into(),
                             })?,
                         )
                         .await)
                 })
                 .await?;
+            rewriting_hooks = run
+                .observations
+                .iter()
+                .filter(|observation| observation.outcome == HookOutcomeKind::Rewritten)
+                .map(|observation| observation.hook_index + 1)
+                .collect();
             self.emit_hook_observations("pool", &journal.id, Some(turn_id), None, run.observations);
             match run.outcome {
-                Ok(PreHookOutcome::Allowed(value)) => {
-                    let payload: TurnHookPayload = serde_json::from_value(value)
-                        .context("pre-turn hook returned an invalid input")?;
-                    ensure!(
-                        !payload.input.trim().is_empty() && payload.input.len() <= 131_072,
-                        "pre-turn hook returned an invalid input"
-                    );
-                    payload.input
-                }
+                Ok(PreHookOutcome::Allowed(value)) => PreTurnValue::checked(value)?.input,
                 Ok(PreHookOutcome::Denied(reason)) => bail!(reason),
                 Err(_) => bail!("pre-turn hook failed"),
             }
@@ -3638,10 +3661,40 @@ impl Harness {
         };
         self.mark_possible_dispatch(journal_key, journal, cancellation)
             .await?;
+        // A rewritten input is hook-authored text. Wherever it is retained in
+        // an actor's durable history, this record precedes it so it is never
+        // indistinguishable from the user's own words; the original stays in
+        // the public transcript and the rewrite shapes only this turn's view.
+        let rewrite_provenance = public_input_override.as_ref().map(|_| {
+            Message::text(
+                "kuru-hook",
+                json!({
+                    "session_id": self.session.id,
+                    "operation_id": self.operation_id,
+                    "actor": "pool",
+                    "record_id": Uuid::new_v4().to_string(),
+                    "event": HookEvent::PreTurn.label(),
+                    "outcome": HookOutcomeKind::Rewritten.label(),
+                    "hook_indexes": rewriting_hooks,
+                    "invocation_id": journal.id,
+                    "turn_id": turn_id,
+                    "note": "the following current user request was rewritten by a pre_turn hook",
+                })
+                .to_string(),
+            )
+        });
+        let current_request = |text: &str| {
+            rewrite_provenance
+                .iter()
+                .cloned()
+                .chain(std::iter::once(user(text)))
+                .collect::<Vec<_>>()
+        };
         let mut pending: BTreeMap<String, Vec<Message>> = initial
             .into_iter()
-            .map(|id| (id, vec![user(&effective_prompt)]))
+            .map(|id| (id, current_request(&effective_prompt)))
             .collect();
+        let deliberation_tools = cognition_tools();
         let mut drafts = BTreeMap::new();
         let mut used = 0;
         let mut input_tokens: u64 = 0;
@@ -3679,7 +3732,7 @@ impl Harness {
                 });
             }
             let results = join_all(batch.iter().map(|(id, inputs)| self.ask_controlled_with_invocation(id, inputs.clone(),
-                "deliberate: form a concise useful contribution; explicitly send any needed peer messages. The selected speaking identity will execute workspace tools next.", ActorPhase::Deliberate, cognition_tools(), cancellation, public_input_override.as_ref()))).await;
+                "deliberate: form a concise useful contribution; explicitly send any needed peer messages. The selected speaking identity will execute workspace tools next.", ActorPhase::Deliberate, deliberation_tools.clone(), cancellation, public_input_override.as_ref()))).await;
             for ((id, _), result) in batch.into_iter().zip(results) {
                 let (completion, invocation_id) = match result {
                     Ok(c) => c,
@@ -3716,9 +3769,8 @@ impl Harness {
                         self.run_pre_tool_hooks(
                             &hook_host,
                             &hook_budget,
-                            &id,
-                            &invocation_id,
-                            Some(turn_id),
+                            (&id, &invocation_id, Some(turn_id)),
+                            OfferedTools::Exact(&deliberation_tools),
                             original,
                             cancellation,
                         )
@@ -3863,10 +3915,10 @@ impl Harness {
                 .map(|r| r.kind.to_string())
                 .unwrap_or_else(|| "part".into()),
         });
-        let mut inputs = vec![user(&format!(
+        let mut inputs = current_request(&format!(
             "User request: {effective_prompt}\nExplicit contributions to this speaking identity: {}\nRespond directly as the current conversational identity. Use tools to perform requested work when permitted. Do not narrate the whole pool.",
             serde_json::to_string(&shared)?
-        ))];
+        ));
         let mut tools = cognition_tools();
         let catalog = cancellation.wait(self.tools.catalog()).await?;
         for status in catalog.mcp() {
@@ -3888,6 +3940,7 @@ impl Harness {
             } else {
                 vec![]
             };
+            let offered = available.clone();
             let request_round = u32::try_from(request_index + 1)
                 .context("speaking request round exceeds progress identity range")?;
             let (completion, invocation_id) = self
@@ -3934,9 +3987,8 @@ impl Harness {
                         self.run_pre_tool_hooks(
                             &hook_host,
                             &hook_budget,
-                            &speaker,
-                            &invocation_id,
-                            Some(turn_id),
+                            (&speaker, &invocation_id, Some(turn_id)),
+                            OfferedTools::Speaking(&offered),
                             original,
                             cancellation,
                         )
@@ -3979,9 +4031,8 @@ impl Harness {
                                     .run_pre_tool_hooks(
                                         &hook_host,
                                         &hook_budget,
-                                        &speaker,
-                                        &invocation_id,
-                                        Some(turn_id),
+                                        (&speaker, &invocation_id, Some(turn_id)),
+                                        OfferedTools::Speaking(&offered),
                                         original,
                                         cancellation,
                                     )
@@ -4341,7 +4392,7 @@ impl Harness {
             if persistence.is_err() {
                 self.emit_event(Event::Error {
                     actor: speaker.clone(),
-                    detail: "hook annotation persistence unresolved after settled answer".into(),
+                    detail: HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER.into(),
                 });
             }
         }

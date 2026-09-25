@@ -280,15 +280,27 @@ budgets record a separate failure and leave settled work unchanged. A
 higher-priority configuration layer replaces an
 event's complete command array in normal TOML layering order.
 
-Commands run in declaration order. `pre_turn` and `pre_tool` may allow, deny, or
-rewrite the pending input or operation. Every rewrite then passes the same input,
-schema, budget, root, instruction, and permission checks as an unmodified value;
-a hook cannot reuse an earlier grant or widen authority. `speaker_selected` may
+Commands run in declaration order. `pre_turn` may allow, deny, or rewrite the
+pending input. `pre_tool` may allow, deny, or rewrite only the proposed
+arguments; a rewrite that names a different tool fails that hook, and no later
+hook, permission evaluation, or dispatch follows. Kuru refuses a call that the
+runtime would dispatch itself unless it names a tool offered for that request and
+phase, whether the model proposed it or a hook rewrote it. Deliberation offers
+only its cognition tools, and a dream offers only `dream_suggest`. Other speaking
+calls go through the tool host, which checks their exact final name and
+arguments. Every rewrite then passes the same input, schema, budget, root,
+instruction, and permission checks as an unmodified value; a hook cannot reuse an
+earlier grant or widen authority. `speaker_selected` may
 observe or stop the already-validated selection. It cannot name another speaker
 or cause a second selection. `post_tool` and `post_turn` may observe or annotate
 settled work. A post failure does not change a tool effect, result, receipt,
 usage, answer, or durable conversation, and later post hooks still run.
-In a dream, a rewrite must still be `dream_suggest` and pass the authored
+A rewritten `pre_turn` input shapes only the current turn's provider requests.
+The public transcript keeps the user's original input. Wherever the rewritten
+input is retained in a part's private history, a separate `kuru-hook` record
+(`event: pre_turn`, `outcome: rewritten`) precedes it, so hook-authored text is
+never stored as indistinguishable user speech.
+In a dream, a call must still be `dream_suggest` and pass the authored
 proposal cap and dream validation. Dream annotations stay in the candidate
 memory view and disappear if that candidate is abandoned.
 
@@ -306,12 +318,31 @@ Configured hook commands are reviewed process authority under [workspace
 trust](#workspace-trust). Kuru retains the reviewed project directory, supplies a
 finite compatibility environment without provider credentials, closes stdin
 after one request, bounds and drains output, and owns the child process tree
-through success, failure, timeout, cancellation, or caller loss. This is not an
+through success, failure, timeout, cancellation, or caller loss. A turn, a dream,
+and tool-host shutdown wait for owned hook trees to be reaped, including trees
+whose callers were cancelled, before they return and before the project writer
+lease can be released. Cleanup that cannot be confirmed is reported. After a
+hook's own process exits, Kuru drains its output only until the hook deadline. A
+descendant that left the owned process group while holding the output open
+fails the hook instead of delaying the turn. This is not an
 OS sandbox: an approved command runs with the user's filesystem, process, and
 network authority. Hook protocol handling never invokes another lifecycle hook.
 A Kuru run started by an owned hook command keeps ordinary trust, admission,
 provider, and tool checks but suppresses lifecycle-hook dispatch for that nested
-process, preventing the hook chain from starting itself again.
+process, preventing the hook chain from starting itself again. Owned hook
+launches mark their children with `KURU_INTERNAL_LIFECYCLE_HOOK_ORIGIN=1`. Any
+Kuru process that inherits that value reports each configured hook as a
+`suppressed` hook outcome at its lifecycle boundary and runs none of them. Do
+not export the variable in an ordinary shell.
+
+On Windows the finite hook environment keeps an inherited `PSModulePath`, so a
+deliberate module setting reaches a generic hook command. The exception is a
+hook that explicitly runs the system's stock Windows PowerShell
+(`WindowsPowerShell\v1.0\powershell.exe`): Kuru removes the inherited value so
+that edition reconstructs its standard module paths. Hooks do not receive the
+built-in shell tool's `$PSHOME` module bootstrap. A cold stock PowerShell 5.1
+start that autoloads cmdlets can take longer than the 5,000-millisecond default;
+raise that hook's `timeout_ms` if it needs to.
 See [hook protocol](protocols.md#lifecycle-hook-protocol) for the exact request
 and decision shapes.
 

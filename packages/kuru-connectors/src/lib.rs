@@ -34,8 +34,9 @@ pub use a2a::a2a_send;
 pub use auth::{AuthManager, AuthStatus, BrowserLogin, DeviceLogin};
 pub use file_edits::{CheckpointState, CheckpointStore, CheckpointSummary, FileEffect};
 pub use hooks::{
-    HookAnnotation, HookBudget, HookHost, HookObservation, HookOutcomeKind, PostHookRun,
-    PreHookOutcome, PreHookRun, SpeakerHookOutcome, SpeakerHookRun,
+    HookAnnotation, HookBudget, HookHost, HookObservation, HookOutcomeKind,
+    MAX_PRE_TURN_INPUT_BYTES, PostHookRun, PreHookOutcome, PreHookRun, PreToolValue, PreTurnValue,
+    SpeakerHookOutcome, SpeakerHookRun,
 };
 pub use instruction_review::{
     InstructionActivation, InstructionGate, InstructionGateOutcome, InstructionReviewAnswer,
