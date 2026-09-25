@@ -3167,7 +3167,9 @@ mod tests {
             let data = root.path().join("private");
             let options = crate::test_support::open_options(data.clone(), scope.clone())?;
             let _gate = crate::spawn_gate::spawning().await;
-            let mut owner = ServiceOwner::open(options.clone(), &project).await?;
+            let mut owner = ServiceOwner::open(options.clone(), &project)
+                .await
+                .context("initial usage fixture owner could not open")?;
             let original = owner.authority().clone();
             let record = EndpointRecord::read(&data, &scope)?.context("missing owner endpoint")?;
             let start = InvocationStart {
@@ -3252,9 +3254,27 @@ mod tests {
                 drop(server);
                 drop(client);
             }
-            owner.close().await?;
-
-            let mut successor = ServiceOwner::open(options, &project).await?;
+            // A sibling test may spawn while a shared spawn guard is held. On
+            // Unix, that child can briefly inherit the old owner's flock after
+            // close, so exclude other test spawns through successor admission.
+            drop(_gate);
+            let _restart_gate = crate::spawn_gate::locking_async().await;
+            owner
+                .close()
+                .await
+                .context("usage fixture owner could not close")?;
+            ensure!(
+                EndpointRecord::read(&data, &scope)?.is_none(),
+                "closed usage fixture owner retained its endpoint"
+            );
+            let released = ServiceLock::try_acquire(&data, &scope, ServiceLockKind::Owner)?
+                .context("closed usage fixture owner retained its lock")?;
+            drop(released);
+            let mut successor = ServiceOwner::open(options, &project)
+                .await
+                .context("successor usage fixture owner could not open")?;
+            drop(_restart_gate);
+            let _gate = crate::spawn_gate::spawning().await;
             let current = successor.authority().clone();
             let current_record =
                 EndpointRecord::read(&data, &scope)?.context("missing successor endpoint")?;

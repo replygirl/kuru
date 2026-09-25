@@ -427,6 +427,14 @@ deny_tools = ["*_secret"]
 url = "https://example.com/mcp"
 header_env = { Authorization = "REMOTE_MCP_AUTH" }
 
+[mcp.oauth_service]
+url = "https://mcp.example.com/tools"
+
+[mcp.oauth_service.oauth]
+enabled = true
+client_id = "kuru-native-client"
+scopes = ["mcp.read", "mcp.write"]
+
 [mcp.disabled_service]
 enabled = false
 command = "/absolute/path/to/disabled-server"
@@ -439,6 +447,15 @@ variable names; literal header values and protocol-owned headers are rejected.
 Resolved values are limited to 16 KiB each and 64 KiB across one server.
 Resolved values stay out of configuration, status, diagnostics, and discovery
 cache records.
+
+Enabled OAuth aliases require HTTPS and one configured `client_id`, one
+`client_metadata_url`, or advertised dynamic registration. Configured scopes are
+a ceiling over challenge/metadata authority. OAuth rejects static
+`Authorization` and `Proxy-Authorization` references; validated nonauthorization
+headers are sent only to the protected resource. Alias credentials are
+generation-bound native secret-store records with no plaintext fallback. Browser
+and advertised device login, redacted status, and local deletion are exposed by
+the `mcp` command family; remote revocation is a separate reported outcome.
 
 Servers default to `enabled = true`. A disabled server is reported without
 resolving its headers, starting its process, connecting, or loading cached tools.

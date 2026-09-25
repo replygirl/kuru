@@ -19,7 +19,7 @@ pub use accounting::{
 };
 pub use config::{
     AuthorityClaim, AuthorityClaimCategory, AuthorityManifest, ClaimDigest, Config, ConfigSnapshot,
-    InvocationOverrides, ManifestDigest, McpConfig, MemoryConfig, ModelPreference,
+    InvocationOverrides, ManifestDigest, McpConfig, McpOAuthConfig, MemoryConfig, ModelPreference,
     ProjectPreferences, ResponsesRouteConfig, SafeClaimDisplay, SafeManifest, SafeSource,
     SelectionOverrides, load_instructions,
 };

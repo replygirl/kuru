@@ -81,6 +81,11 @@ Custom prompt commands use `.kuru/commands/NAME.md` in the project or `commands/
 | `kuru dream`                                                   | Run explicit consolidation                                                                  |
 | `kuru undo-dream`                                              | Restore the previous topology change                                                        |
 | `kuru tools`                                                   | Inspect filtered tools and disabled/live/stale/degraded MCP aliases                         |
+| `kuru mcp login ALIAS`                                         | Sign in to one OAuth-enabled MCP alias with a loopback browser callback                     |
+| `kuru mcp login ALIAS --no-browser`                            | Print browser and same-host/forwarded-callback guidance                                     |
+| `kuru mcp login ALIAS --device`                                | Use an advertised device authorization flow                                                 |
+| `kuru mcp status ALIAS`                                        | Inspect redacted local MCP authorization and availability state                             |
+| `kuru mcp logout ALIAS`                                        | Delete the local MCP credential and report remote revocation separately                     |
 | `kuru tool NAME --args '{}'`                                   | Invoke a tool with JSON arguments                                                           |
 | `kuru serve`                                                   | Start authenticated loopback [A2A ingress](./a2a)                                           |
 | `kuru update`                                                  | [Install an explicit release or source checkout](/guide/installation#update-deliberately)   |

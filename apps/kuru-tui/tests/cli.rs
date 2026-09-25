@@ -4,10 +4,26 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Output,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 #[path = "support/memory.rs"]
 mod memory;
+
+#[path = "support/mcp_oauth_https.rs"]
+mod mcp_oauth_https;
+use mcp_oauth_https::HttpsMcpFixture;
+
+#[cfg(unix)]
+#[path = "support/terminal.rs"]
+#[allow(
+    dead_code,
+    reason = "this CLI fixture uses only the owned PTY browser-login path"
+)]
+mod terminal;
 
 // Windows PowerShell 5.1 engine/host cold start (module/format data load, first
 // runspace build) can stall well past a single `tool shell` call's own budget
@@ -72,6 +88,548 @@ impl Sandbox {
         );
         String::from_utf8(output.stdout).unwrap()
     }
+}
+
+#[test]
+#[ignore = "subprocess entry selected only by the MCP refusal fixture"]
+fn mcp_stdio_marker_child() {
+    let marker = std::env::var_os("KURU_TEST_MCP_STDIO_MARKER").unwrap();
+    std::fs::write(marker, b"started").unwrap();
+}
+
+#[test]
+fn mcp_cli_refuses_unselected_aliases_without_starting_stdio_or_memory() {
+    let env = Sandbox::new();
+    let marker = env.root.path().join("unrelated-stdio-started");
+    let fixture = std::env::current_exe().unwrap();
+    let config_path = env.root.path().join("config/kuru/config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+        r#"
+[mcp.stdio]
+command = {fixture}
+args = ["--ignored", "--exact", "mcp_stdio_marker_child", "--nocapture"]
+[mcp.stdio.env]
+KURU_TEST_MCP_STDIO_MARKER = {marker}
+
+[mcp.disabled]
+enabled = false
+url = "https://127.0.0.1:9/mcp"
+[mcp.disabled.oauth]
+enabled = true
+client_id = "synthetic-native-client"
+
+[mcp.selected]
+url = "https://127.0.0.1:9/mcp"
+[mcp.selected.oauth]
+enabled = true
+client_id = "synthetic-native-client"
+"#,
+        fixture = toml::Value::String(fixture.to_string_lossy().into_owned()),
+        marker = toml::Value::String(marker.to_string_lossy().into_owned())
+    ));
+    std::fs::write(config_path, config).unwrap();
+
+    let disabled: Value =
+        serde_json::from_str(&env.success(&["mcp", "status", "disabled"])).unwrap();
+    assert_eq!(disabled["state"], "disabled");
+    assert!(!marker.exists(), "disabled status started an STDIO alias");
+    let selected: Value =
+        serde_json::from_str(&env.success(&["mcp", "status", "selected"])).unwrap();
+    assert_eq!(selected["alias"], "selected");
+    assert!(
+        matches!(
+            selected["state"].as_str(),
+            Some("login_required" | "native_store_unavailable")
+        ),
+        "{selected}"
+    );
+    assert!(
+        !marker.exists(),
+        "selected status started an unrelated STDIO alias"
+    );
+    let logout: Value = serde_json::from_str(&env.success(&["mcp", "logout", "selected"])).unwrap();
+    assert_eq!(logout["alias"], "selected");
+    assert_eq!(logout["local_deleted"], false);
+    assert_eq!(logout["remote"], "no_local_credential");
+    assert!(!marker.exists(), "selected logout started unrelated STDIO");
+    let refuses = |args: &[&str], expected: &str| {
+        let output = env.run(args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains(expected), "{args:?}: {diagnostic}");
+    };
+
+    for alias in ["missing", "stdio", "disabled"] {
+        let expected = if alias == "stdio" {
+            "selected MCP alias does not enable OAuth".to_owned()
+        } else {
+            format!("configured MCP alias {alias} is unavailable")
+        };
+        refuses(&["mcp", "login", alias, "--no-browser"], &expected);
+        refuses(&["mcp", "logout", alias], &expected);
+        assert!(
+            !marker.exists(),
+            "unselected STDIO alias started for {alias}"
+        );
+        assert!(!env.data.join("memory").exists());
+    }
+
+    for alias in ["missing", "stdio"] {
+        let expected = if alias == "stdio" {
+            "selected MCP alias does not enable OAuth".to_owned()
+        } else {
+            format!("configured MCP alias {alias} is unavailable")
+        };
+        refuses(&["mcp", "status", alias], &expected);
+        assert!(
+            !marker.exists(),
+            "unselected STDIO alias started for {alias}"
+        );
+        assert!(!env.data.join("memory").exists());
+    }
+    assert!(!env.data.join("memory").exists());
+
+    let local = env.project.join(".kuru");
+    std::fs::create_dir(&local).unwrap();
+    std::fs::write(
+        local.join("config.toml"),
+        "[mcp.automatic]\nurl = 'https://127.0.0.1:9/mcp'\n[mcp.automatic.oauth]\nenabled = true\nclient_id = 'synthetic-native-client'\n",
+    )
+    .unwrap();
+    for args in [
+        ["mcp", "status", "automatic"].as_slice(),
+        ["mcp", "logout", "automatic"].as_slice(),
+        ["mcp", "login", "automatic", "--no-browser"].as_slice(),
+    ] {
+        let output = env.run(args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("workspace authority"),
+            "{args:?}: {diagnostic}"
+        );
+        assert!(!marker.exists(), "{args:?} started unrelated STDIO");
+        assert!(!env.data.join("memory").exists());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_cli_device_login_status_logout_uses_synthetic_verified_https() {
+    let env = Sandbox::new();
+    let server = HttpsMcpFixture::start(env.root.path()).await;
+    let config = env.root.path().join("config/kuru/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("\n[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n", format!("{}/mcp", server.base)));
+    std::fs::write(config, text).unwrap();
+    let root = server.ca_path.clone();
+    let run = |args: &'static [&'static str]| {
+        let mut command = env.command();
+        command
+            .env("KURU_TEST_MCP_CA_PEM", &root)
+            .arg("--trust-workspace-once")
+            .args(args);
+        tokio::task::spawn_blocking(move || command.output().unwrap())
+    };
+    let login = run(&["mcp", "login", "secure", "--device"]).await.unwrap();
+    assert!(
+        login.status.success(),
+        "{}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+    assert!(String::from_utf8_lossy(&login.stdout).contains("Signed in to MCP secure"));
+    assert_eq!(server.device_requests.load(Ordering::Relaxed), 1);
+    assert_eq!(server.token_requests.load(Ordering::Relaxed), 1);
+    let status = run(&["mcp", "status", "secure"]).await.unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["state"], "authorized");
+    let logout = run(&["mcp", "logout", "secure"]).await.unwrap();
+    assert!(
+        logout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&logout.stderr)
+    );
+    let value: Value = serde_json::from_slice(&logout.stdout).unwrap();
+    assert_eq!(value["local_deleted"], true);
+    assert_eq!(server.revocations.load(Ordering::Relaxed), 1);
+    let status = run(&["mcp", "status", "secure"]).await.unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["state"], "login_required");
+
+    // The same synthetic CA must not make a different DNS identity valid.
+    let wrong_host = server.base.replace("localhost", "127.0.0.1");
+    let config = env.root.path().join("config/kuru/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("\n[mcp.wrong_host]\nurl = {:?}\n[mcp.wrong_host.oauth]\nenabled = true\nclient_id = 'synthetic-client'\n", format!("{wrong_host}/mcp")));
+    std::fs::write(config, text).unwrap();
+    let rejected = run(&["mcp", "login", "wrong_host", "--device"])
+        .await
+        .unwrap();
+    assert!(!rejected.status.success());
+    let diagnostic = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        diagnostic.contains("certificate") || diagnostic.contains("TLS"),
+        "hostname mismatch failed for an unrelated reason: {diagnostic}"
+    );
+    assert_eq!(server.device_requests.load(Ordering::Relaxed), 1);
+}
+
+#[cfg(target_os = "linux")]
+async fn read_linux_child_pipe(
+    pipe: impl tokio::io::AsyncRead + Unpin,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut output = Vec::new();
+    let mut pipe = pipe.take(limit + 1);
+    pipe.read_to_end(&mut output).await?;
+    Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+async fn bounded_linux_cli_child(
+    env: &Sandbox,
+    ca_path: &Path,
+    disconnected_bus: Option<(&str, &Path)>,
+    args: &[&str],
+    phase: &str,
+) -> anyhow::Result<Output> {
+    use anyhow::{Context, ensure};
+    use std::{process::Stdio, time::Duration};
+
+    // Match the existing installed-CLI fixture's concurrent, bounded pipe
+    // capture and explicit kill/reap path. The 125s ceiling includes the
+    // managed owner's existing 120s outer startup allowance.
+    const CHILD_TIMEOUT: Duration = Duration::from_secs(125);
+    const OUTPUT_LIMIT: u64 = 64 * 1024;
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_kuru"));
+    command
+        .arg("-C")
+        .arg(&env.project)
+        .arg("--data-dir")
+        .arg(&env.data)
+        .args(["--provider", "demo", "--no-dream"])
+        .env("XDG_CONFIG_HOME", env.root.path().join("config"))
+        .env("KURU_TEST_MCP_CA_PEM", ca_path)
+        .env("KURU_TEST_STATIC_HEADER", "Bearer synthetic-static-proof")
+        .arg("--trust-workspace-once")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some((address, runtime)) = disconnected_bus {
+        command
+            .env("DBUS_SESSION_BUS_ADDRESS", address)
+            .env("XDG_RUNTIME_DIR", runtime);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start {phase} child"))?;
+    let stdout = child.stdout.take().context("capture stdout")?;
+    let stderr = child.stderr.take().context("capture stderr")?;
+    let stdout = tokio::spawn(read_linux_child_pipe(stdout, OUTPUT_LIMIT));
+    let stderr = tokio::spawn(read_linux_child_pipe(stderr, OUTPUT_LIMIT));
+    let status = match tokio::time::timeout(CHILD_TIMEOUT, child.wait()).await {
+        Ok(status) => status.with_context(|| format!("wait for {phase} child"))?,
+        Err(_) => {
+            child
+                .kill()
+                .await
+                .with_context(|| format!("reap timed-out {phase} child"))?;
+            let out = tokio::time::timeout(Duration::from_secs(5), stdout).await;
+            let err = tokio::time::timeout(Duration::from_secs(5), stderr).await;
+            anyhow::bail!(
+                "{phase} child exceeded {CHILD_TIMEOUT:?}; stdout={out:?}; stderr={err:?}"
+            );
+        }
+    };
+    let stdout = tokio::time::timeout(Duration::from_secs(5), stdout)
+        .await
+        .with_context(|| format!("{phase} stdout did not close"))???;
+    let stderr = tokio::time::timeout(Duration::from_secs(5), stderr)
+        .await
+        .with_context(|| format!("{phase} stderr did not close"))???;
+    ensure!(
+        stdout.len() as u64 <= OUTPUT_LIMIT && stderr.len() as u64 <= OUTPUT_LIMIT,
+        "{phase} child output exceeded {OUTPUT_LIMIT} bytes"
+    );
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_cli_missing_secret_service_refuses_without_fallback_or_static_alias_loss()
+-> anyhow::Result<()> {
+    use anyhow::ensure;
+    let env = Sandbox::new();
+    let server = HttpsMcpFixture::start(env.root.path()).await;
+    let config = env.root.path().join("config/kuru/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\n[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n\n[mcp.static]\nurl = {:?}\n[mcp.static.header_env]\nAuthorization = 'KURU_TEST_STATIC_HEADER'\n",
+        format!("{}/mcp", server.base),
+        format!("{}/static-mcp", server.base)
+    ));
+    std::fs::write(config, text).unwrap();
+
+    // CI supplies a real owned D-Bus Secret Service. Only these children get
+    // the missing-bus address; the runner's bus and native collection remain.
+    let absent_runtime = env.root.path().join("absent-bus-runtime");
+    kuru_platform::fs::Directory::ensure_private(&absent_runtime).unwrap();
+    let absent_bus = format!(
+        "unix:path={}",
+        absent_runtime.join("missing-session-bus").display()
+    );
+    let run = |args: &'static [&'static str], disconnected: bool, phase: &'static str| {
+        bounded_linux_cli_child(
+            &env,
+            &server.ca_path,
+            disconnected.then_some((absent_bus.as_str(), absent_runtime.as_path())),
+            args,
+            phase,
+        )
+    };
+
+    let proof: anyhow::Result<()> = async {
+        let login = run(&["mcp", "login", "secure", "--device"], false, "seed login").await?;
+        ensure!(
+            login.status.success(),
+            "real Secret Service seed failed: {}",
+            String::from_utf8_lossy(&login.stderr)
+        );
+        ensure!(server.device_requests.load(Ordering::Relaxed) == 1);
+        ensure!(server.token_requests.load(Ordering::Relaxed) == 1);
+        let baseline = run(&["mcp", "status", "secure"], false, "baseline status").await?;
+        ensure!(baseline.status.success(), "{baseline:?}");
+        let baseline: Value = serde_json::from_slice(&baseline.stdout)?;
+        ensure!(baseline["state"] == "authorized", "{baseline}");
+
+        let unavailable = run(&["mcp", "status", "secure"], true, "missing-bus status").await?;
+        ensure!(unavailable.status.success(), "{unavailable:?}");
+        let unavailable: Value = serde_json::from_slice(&unavailable.stdout)?;
+        ensure!(
+            unavailable["state"] == "native_store_unavailable",
+            "{unavailable}"
+        );
+        ensure!(
+            unavailable["diagnostic"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "missing bus produced no actionable status: {unavailable}"
+        );
+        let refused = run(
+            &["mcp", "login", "secure", "--device"],
+            true,
+            "missing-bus login",
+        )
+        .await?;
+        ensure!(!refused.status.success(), "missing bus admitted login");
+        let diagnostic = String::from_utf8_lossy(&refused.stderr);
+        ensure!(
+            diagnostic.contains("native") || diagnostic.contains("credential"),
+            "missing bus failed for an unrelated reason: {diagnostic}"
+        );
+        ensure!(server.device_requests.load(Ordering::Relaxed) == 1);
+        ensure!(server.token_requests.load(Ordering::Relaxed) == 1);
+
+        let catalog = run(&["tools"], true, "missing-bus static catalog").await?;
+        ensure!(catalog.status.success(), "{catalog:?}");
+        let catalog: Value = serde_json::from_slice(&catalog.stdout)?;
+        ensure!(catalog["tools"].as_array().is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("MCP static/static-proof"))
+            })
+        }));
+        ensure!(server.static_requests.load(Ordering::Relaxed) > 0);
+        ensure!(server.static_bad_headers.load(Ordering::Relaxed) == 0);
+
+        // Broken-bus children must not read a fallback or change the record.
+        let restored = run(&["mcp", "status", "secure"], false, "restored status").await?;
+        ensure!(restored.status.success(), "{restored:?}");
+        let restored: Value = serde_json::from_slice(&restored.stdout)?;
+        ensure!(restored["state"] == "authorized", "{restored}");
+        Ok(())
+    }
+    .await;
+
+    // Always attempt exact native cleanup, including when an assertion or a
+    // bounded child fails. A failed cleanup is reported with the proof error.
+    let cleanup = run(&["mcp", "logout", "secure"], false, "native logout").await;
+    if let Err(error) = proof {
+        anyhow::bail!("missing-bus proof failed: {error:#}; native cleanup: {cleanup:?}");
+    }
+    let logout = cleanup?;
+    ensure!(logout.status.success(), "{logout:?}");
+    let logout: Value = serde_json::from_slice(&logout.stdout)?;
+    ensure!(logout["local_deleted"] == true, "{logout}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_cli_no_browser_prints_local_callback_guidance_and_settles_once() {
+    let env = Sandbox::new();
+    let server = HttpsMcpFixture::start(env.root.path()).await;
+    let config = env.root.path().join("config/kuru/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\n[mcp.browser]\nurl = {:?}\n[mcp.browser.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n",
+        format!("{}/mcp", server.base)
+    ));
+    std::fs::write(config, text).unwrap();
+
+    let mut command = env.command();
+    command.env("KURU_TEST_MCP_CA_PEM", &server.ca_path).args([
+        "--trust-workspace-once",
+        "mcp",
+        "login",
+        "browser",
+        "--no-browser",
+    ]);
+    let (url_send, url_receive) = std::sync::mpsc::sync_channel(1);
+    let child = std::thread::spawn(move || -> anyhow::Result<String> {
+        let mut terminal = terminal::Terminal::spawn(command, 24, 120)?;
+        terminal.wait(
+            "no-browser URL and forwarded-loopback guidance",
+            std::time::Duration::from_secs(15),
+            |terminal| {
+                let output = String::from_utf8_lossy(&terminal.output);
+                Ok(output.contains("Sign in to MCP browser:")
+                    && output
+                        .contains("use same-host browsing or forward the printed loopback port"))
+            },
+        )?;
+        let output = String::from_utf8_lossy(&terminal.output);
+        let url = output
+            .split_whitespace()
+            .find(|word| word.starts_with("https://localhost:") && word.contains("/authorize?"))
+            .ok_or_else(|| anyhow::anyhow!("CLI did not print its authorization URL"))?
+            .to_owned();
+        url_send.send(url).unwrap();
+        terminal.wait_exit(std::time::Duration::from_secs(15))?;
+        Ok(String::from_utf8_lossy(&terminal.output).into_owned())
+    });
+    let authorization = tokio::task::spawn_blocking(move || {
+        url_receive.recv_timeout(std::time::Duration::from_secs(20))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let authorization = reqwest::Url::parse(&authorization).unwrap();
+    let parameters = authorization
+        .query_pairs()
+        .into_owned()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let redirect = parameters
+        .get("redirect_uri")
+        .expect("authorization omitted redirect_uri");
+    let state = parameters
+        .get("state")
+        .expect("authorization omitted state");
+    let mut callback = reqwest::Url::parse(redirect).unwrap();
+    callback
+        .query_pairs_mut()
+        .append_pair("code", "synthetic-callback-code")
+        .append_pair("state", state)
+        .append_pair("iss", &format!("{}/", server.base));
+    // Model a browser on another machine through a local TCP forwarder. Keep
+    // the owner's advertised callback authority in the HTTP request itself.
+    let advertised = reqwest::Url::parse(redirect).unwrap();
+    assert_eq!(advertised.scheme(), "http");
+    assert_eq!(advertised.host_str(), Some("127.0.0.1"));
+    assert_eq!(callback.scheme(), advertised.scheme());
+    assert_eq!(callback.host_str(), advertised.host_str());
+    assert_eq!(callback.port(), advertised.port());
+    assert_eq!(callback.path(), advertised.path());
+    let owner_port = advertised.port().unwrap();
+    let forwarder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forwarded_port = forwarder.local_addr().unwrap().port();
+    assert_ne!(forwarded_port, owner_port);
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_by_forwarder = Arc::clone(&accepted);
+    let forward_task = tokio::spawn(async move {
+        let (mut browser, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), forwarder.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        accepted_by_forwarder.fetch_add(1, Ordering::Relaxed);
+        let mut owner = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(("127.0.0.1", owner_port)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut browser, &mut owner).await;
+    });
+    let mut forwarded = callback.clone();
+    forwarded.set_port(Some(forwarded_port)).unwrap();
+    assert_eq!(forwarded.path(), advertised.path());
+    assert_eq!(forwarded.query(), callback.query());
+    let response = reqwest::Client::new()
+        .get(forwarded)
+        .header(reqwest::header::HOST, format!("127.0.0.1:{owner_port}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "forwarded callback refused: {}",
+        response.status()
+    );
+    let _ = response.bytes().await.unwrap();
+    forward_task.abort();
+    let _ = forward_task.await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    let output = child.join().unwrap().unwrap();
+    assert!(output.contains("Signed in to MCP browser."), "{output}");
+    assert_eq!(server.device_requests.load(Ordering::Relaxed), 0);
+    assert_eq!(server.token_requests.load(Ordering::Relaxed), 1);
+    let forms = server.token_forms();
+    assert_eq!(forms.len(), 1);
+    let form = &forms[0];
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
+    assert_eq!(
+        form.get("code").map(String::as_str),
+        Some("synthetic-callback-code")
+    );
+    assert_eq!(
+        form.get("redirect_uri").map(String::as_str),
+        Some(redirect.as_str())
+    );
+    assert_eq!(
+        parameters.get("code_challenge_method").map(String::as_str),
+        Some("S256")
+    );
+    let verifier = form
+        .get("code_verifier")
+        .expect("token exchange omitted PKCE verifier");
+    use base64::Engine;
+    use sha2::Digest;
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    assert_eq!(parameters.get("code_challenge"), Some(&challenge));
 }
 
 #[test]

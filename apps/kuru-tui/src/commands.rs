@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::Context as _;
 use kuru_core::PromptCatalog;
 use kuru_memory::{CandidateRefState, CandidateRefStatus};
 
@@ -26,6 +27,7 @@ pub(crate) enum CommandId {
     MemoryCandidates,
     MemoryHistory,
     MemoryStatus,
+    Mcp,
     Mode,
     Model,
     Notes,
@@ -108,6 +110,12 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
         name: "/help",
         usage: "/help",
         summary: "Show working commands and keys",
+    },
+    CommandSpec {
+        id: CommandId::Mcp,
+        name: "/mcp",
+        usage: "/mcp login [--device|--no-browser] ALIAS | status ALIAS | logout ALIAS",
+        summary: "Manage one configured MCP OAuth login",
     },
     CommandSpec {
         id: CommandId::Memory,
@@ -257,6 +265,64 @@ pub(crate) fn help_text() -> String {
     help
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum McpRequest<'a> {
+    Login {
+        alias: &'a str,
+        device: bool,
+        no_browser: bool,
+    },
+    Status {
+        alias: &'a str,
+    },
+    Logout {
+        alias: &'a str,
+    },
+}
+
+pub(crate) fn parse_mcp(args: &str) -> anyhow::Result<McpRequest<'_>> {
+    let mut parts = args.split_whitespace();
+    let action = parts.next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "usage: /mcp login [--device|--no-browser] ALIAS | status ALIAS | logout ALIAS"
+        )
+    })?;
+    if action == "login" {
+        let mut device = false;
+        let mut no_browser = false;
+        let mut alias = None;
+        for part in parts {
+            match part {
+                "--device" if !device && !no_browser => device = true,
+                "--no-browser" if !device && !no_browser => no_browser = true,
+                value if alias.is_none() && !value.starts_with('-') => alias = Some(value),
+                _ => anyhow::bail!("usage: /mcp login [--device|--no-browser] ALIAS"),
+            }
+        }
+        let alias = alias.context("usage: /mcp login [--device|--no-browser] ALIAS")?;
+        return Ok(McpRequest::Login {
+            alias,
+            device,
+            no_browser,
+        });
+    }
+    let alias = parts
+        .next()
+        .filter(|alias| !alias.starts_with('-'))
+        .context("usage: /mcp status ALIAS | /mcp logout ALIAS")?;
+    anyhow::ensure!(
+        parts.next().is_none(),
+        "usage: /mcp status ALIAS | /mcp logout ALIAS"
+    );
+    match action {
+        "status" => Ok(McpRequest::Status { alias }),
+        "logout" => Ok(McpRequest::Logout { alias }),
+        _ => anyhow::bail!(
+            "usage: /mcp login [--device|--no-browser] ALIAS | status ALIAS | logout ALIAS"
+        ),
+    }
+}
+
 /// An invocation-local catalog built only after workspace preflight. Built-in
 /// names remain the single typed source for reserved commands.
 #[derive(Clone, Debug, Default)]
@@ -385,6 +451,45 @@ mod tests {
             parse("/model demo")
                 .is_some_and(|request| request.id == CommandId::Model && request.args == "demo")
         );
+    }
+
+    #[test]
+    fn mcp_family_parses_one_alias_and_exclusive_login_modes() {
+        assert_eq!(
+            parse_mcp("login --device server").unwrap(),
+            McpRequest::Login {
+                alias: "server",
+                device: true,
+                no_browser: false,
+            }
+        );
+        assert_eq!(
+            parse_mcp("login server --no-browser").unwrap(),
+            McpRequest::Login {
+                alias: "server",
+                device: false,
+                no_browser: true,
+            }
+        );
+        assert_eq!(
+            parse_mcp("status server").unwrap(),
+            McpRequest::Status { alias: "server" }
+        );
+        assert_eq!(
+            parse_mcp("logout server").unwrap(),
+            McpRequest::Logout { alias: "server" }
+        );
+        for invalid in [
+            "",
+            "login",
+            "login --device --no-browser server",
+            "login one two",
+            "status",
+            "status one two",
+            "unknown server",
+        ] {
+            assert!(parse_mcp(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

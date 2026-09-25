@@ -8,6 +8,8 @@ mod http;
 mod instruction_review;
 mod mcp;
 mod mcp_cache;
+mod mcp_credentials;
+mod mcp_oauth;
 pub mod permissions;
 #[cfg(windows)]
 mod process;
@@ -34,8 +36,12 @@ pub use instruction_review::{
     InstructionActivation, InstructionGate, InstructionGateOutcome, InstructionReviewAnswer,
     InstructionReviewRequest, InstructionReviewSender, SkillGate,
 };
-pub use mcp::{McpAvailability, McpStatus};
+pub use mcp::{
+    McpAvailability, McpBrowserLogin, McpDeviceLogin, McpOAuthAliasStatus, McpOAuthLogout,
+    McpStatus,
+};
 pub use mcp_cache::McpCatalogStore;
+pub use mcp_credentials::McpCredentialStore;
 pub use permissions::{
     ApprovalAnswer, ApprovalRequest, ApprovalSender, GrantInspection, GrantRevocation, GrantScope,
     PermissionBinding, PermissionDisplay, PermissionGrantStore, PermissionInvocation,

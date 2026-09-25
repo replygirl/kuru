@@ -348,6 +348,44 @@ impl Terminal {
         Ok(())
     }
 
+    /// A completed ConPTY frame may be followed by Ratatui's one inert
+    /// empty-diff style reset. Keep every actual paint or repeated draw visible.
+    pub fn quiet_with_optional_style_reset(
+        &mut self,
+        description: &str,
+        duration: Duration,
+    ) -> Result<()> {
+        let settled = self.output.len();
+        let before = self.parser.screen().clone();
+        self.read_for(duration)?;
+        let appended = &self.output[settled..];
+        let after = self.parser.screen();
+        let (rows, columns) = before.size();
+        let cells_unchanged = before.size() == after.size()
+            && (0..rows).all(|row| {
+                before.row_wrapped(row) == after.row_wrapped(row)
+                    && (0..columns)
+                        .all(|column| before.cell(row, column) == after.cell(row, column))
+            });
+        ensure!(
+            (appended.is_empty() || appended == b"\x1b[m")
+                && cells_unchanged
+                && before.cursor_position() == after.cursor_position()
+                && before.hide_cursor() == after.hide_cursor()
+                && before.alternate_screen() == after.alternate_screen()
+                && before.input_mode_formatted() == after.input_mode_formatted(),
+            "{description}: {} additional bytes over {duration:?}; first 4096 new bytes: {}; \
+             cells/styles unchanged={cells_unchanged}; cursor {:?}/hidden={} -> {:?}/hidden={}",
+            appended.len(),
+            appended[..appended.len().min(4096)].escape_ascii(),
+            before.cursor_position(),
+            before.hide_cursor(),
+            after.cursor_position(),
+            after.hide_cursor(),
+        );
+        Ok(())
+    }
+
     pub fn command(&mut self, value: &str) -> Result<()> {
         self.text(&["enter send"], READY)?;
         self.send(value.as_bytes())?;

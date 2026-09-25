@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use kuru_connectors::permissions::{PermissionBinding, PermissionService};
 use kuru_connectors::{
-    CheckpointStore, McpAvailability, McpCatalogStore, McpStatus, Provider, ToolHost, provider,
+    CheckpointStore, McpAvailability, McpCatalogStore, McpCredentialStore, McpStatus, Provider,
+    ToolHost, provider,
 };
 use kuru_core::{
     AuthorityClaimCategory, Config, ConfigSnapshot, InvocationOverrides, Mode, ModelInfo,
@@ -134,6 +135,11 @@ pub enum Command {
     },
     /// List available workspace and MCP tools.
     Tools,
+    /// Sign in, inspect, or sign out of one configured MCP server.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Serve authenticated A2A 1.0 on loopback.
     Serve {
         #[arg(long, default_value = "127.0.0.1:7437")]
@@ -155,6 +161,24 @@ pub enum Command {
         #[command(subcommand)]
         command: TrustCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// Sign in to one configured OAuth-enabled MCP server.
+    Login {
+        alias: String,
+        /// Use the server's advertised device authorization flow.
+        #[arg(long)]
+        device: bool,
+        /// Print the browser URL without opening it automatically.
+        #[arg(long, conflicts_with = "device")]
+        no_browser: bool,
+    },
+    /// Inspect local sign-in state without displaying credentials.
+    Status { alias: String },
+    /// Delete the local credential after a bounded remote revocation attempt.
+    Logout { alias: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -999,6 +1023,16 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Command::Mcp { command }) = &cli.command {
+        let config = snapshot.finalize(&ProjectPreferences::default())?;
+        let host = permission_host(&data, root.clone(), &config, &snapshot, false)?;
+        let result = run_mcp_command(&host, command).await;
+        let cleanup = host.shutdown().await;
+        result?;
+        cleanup?;
+        return Ok(());
+    }
+
     let scope = kuru_runtime::project_scope(&cwd)?;
     let memory_config = snapshot.memory_config().clone();
     let writer = matches!(
@@ -1395,6 +1429,7 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
                 let registry = crate::commands::Registry::from_catalog(snapshot.prompt_catalog());
                 crate::ui::run_with_notice_and_commands(harness, models, notice, registry).await?
             }
+            Some(Command::Mcp { .. }) => unreachable!("MCP command returned before memory setup"),
             _ => unreachable!("early-return commands handled above"),
         }
         Ok::<_, anyhow::Error>(())
@@ -1424,6 +1459,61 @@ async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
         }
         (Ok(()), Err(error), Ok(())) => Err(error),
     }
+}
+
+async fn run_mcp_command(host: &ToolHost, command: &McpCommand) -> Result<()> {
+    match command {
+        McpCommand::Status { alias } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&host.mcp_oauth_status(alias).await?)?
+            );
+        }
+        McpCommand::Logout { alias } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&host.mcp_oauth_logout(alias).await?)?
+            );
+        }
+        McpCommand::Login {
+            alias,
+            device: true,
+            ..
+        } => {
+            let login = host.begin_mcp_oauth_device(alias).await?;
+            println!("Open {}", login.verification_url());
+            println!("Enter code: {}", login.user_code());
+            login
+                .finish_with_cancellation(ctrl_c_cancellation())
+                .await?;
+            println!("Signed in to MCP {alias}.");
+        }
+        McpCommand::Login {
+            alias, no_browser, ..
+        } => {
+            let login = host.begin_mcp_oauth_browser(alias).await?;
+            println!("Sign in to MCP {alias}:\n{}", login.authorization_url());
+            if *no_browser {
+                println!("{}", login.callback_guidance());
+            } else if crate::authentication::open_browser(login.authorization_url())
+                .await
+                .is_err()
+            {
+                eprintln!("Open the URL above in your browser to continue.");
+            }
+            login
+                .finish_with_cancellation(ctrl_c_cancellation())
+                .await?;
+            println!("Signed in to MCP {alias}.");
+        }
+    }
+    Ok(())
+}
+
+async fn ctrl_c_cancellation() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("listen for MCP login cancellation")
 }
 
 fn report_mcp_statuses(statuses: &[McpStatus]) {
@@ -1456,6 +1546,11 @@ fn permission_host(
     let permissions = Arc::new(PermissionService::new(config.clone(), binding, store)?);
     let host = ToolHost::with_permission_service(root.clone(), config, permissions)?
         .with_mcp_catalog_store(Arc::new(McpCatalogStore::new(
+            data,
+            root.clone(),
+            snapshot.manifest().full_digest(),
+        )?))?
+        .with_mcp_credential_store(Arc::new(McpCredentialStore::new(
             data,
             root.clone(),
             snapshot.manifest().full_digest(),
@@ -1513,6 +1608,7 @@ fn command_claim_categories(
             Category::McpStdio,
             Category::McpHttp,
         ],
+        Some(Command::Mcp { .. }) => &[Category::McpHttp],
         Some(Command::Tool { .. }) => &[
             Category::WorkspaceWrite,
             Category::Shell,
@@ -1857,6 +1953,28 @@ mod permission_tests {
         assert!(!claims.contains(&AuthorityClaimCategory::MemoryDoltBinary));
         assert!(!claims.contains(&AuthorityClaimCategory::MemoryCacheDir));
         assert!(!claims.contains(&AuthorityClaimCategory::ResponsesRoute));
+    }
+
+    #[test]
+    fn mcp_commands_parse_and_activate_only_http_mcp_authority() {
+        for arguments in [
+            vec!["kuru", "mcp", "login", "server"],
+            vec!["kuru", "mcp", "login", "server", "--device"],
+            vec!["kuru", "mcp", "login", "server", "--no-browser"],
+            vec!["kuru", "mcp", "status", "server"],
+            vec!["kuru", "mcp", "logout", "server"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let claims = command_claim_categories(cli.command.as_ref());
+            assert_eq!(
+                claims,
+                [AuthorityClaimCategory::McpHttp].into_iter().collect()
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["kuru", "mcp", "login", "server", "--device", "--no-browser"])
+                .is_err()
+        );
     }
 
     #[tokio::test]
