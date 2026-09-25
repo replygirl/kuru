@@ -1,0 +1,115 @@
+# Hand-authored project execpolicy rules for Codex. NOT cospec-managed:
+# `.codex/rules/cospec.rules` (sibling file) is the only file in this
+# directory cospec owns (see openspec/.cospec-manifest.json and
+# `mise run cospec:managed:check`). Edit this file directly; cospec will
+# never regenerate or overwrite it.
+#
+# Scope: safe, routine repository workflow actions for this repo only
+# (read-only inspection, everyday git/gh/mise/cargo commands, and pushes
+# to non-main branches including rebase force-pushes). Mirrors the
+# equivalent Claude Code allow/deny rules in .claude/settings.json.
+#
+# IMPORTANT LIMITATION: prefix_rule matches a *literal contiguous prefix*
+# of the tokenized command (verified with `codex execpolicy check`).
+# `forbidden` beats `allow` when both match (most-restrictive-wins), but
+# only when the forbidden pattern's tokens are literally in that position.
+# `git push origin feat --force` does NOT match a `["git","push","--force"]`
+# forbidden rule (the flag isn't immediately after "push"); neither does
+# `git push origin HEAD:main` match a `["git","push","origin","main"]`
+# forbidden rule. These forbidden rules are a convenience that catches the
+# common invocation shapes, not a hard security boundary — actual policy
+# enforcement for irreversible actions (force push, release, publish)
+# still depends on human review and the sandbox/approval flow.
+
+# --- read-only inspection ---
+
+prefix_rule(pattern=["git", ["status", "log", "diff", "show", "branch", "remote", "blame"]], decision="allow")
+prefix_rule(pattern=["git", "worktree", "list"], decision="allow")
+prefix_rule(pattern=["gh", "pr", ["view", "diff", "checks"]], decision="allow")
+prefix_rule(pattern=["gh", "run", ["view", "watch", "list"]], decision="allow")
+prefix_rule(pattern=["gh", "release", ["view", "list"]], decision="allow")
+prefix_rule(pattern=["mise", "tasks"], decision="allow")
+
+# --- everyday git mutations (local history, non-destructive) ---
+
+prefix_rule(pattern=["git", "add"], decision="allow")
+prefix_rule(pattern=["git", "commit"], decision="allow")
+prefix_rule(pattern=["git", "switch"], decision="allow")
+prefix_rule(pattern=["git", "checkout", "-b"], decision="allow")
+prefix_rule(pattern=["git", "branch"], decision="allow")
+prefix_rule(pattern=["git", "worktree", ["add", "remove", "prune"]], decision="allow")
+prefix_rule(pattern=["git", "fetch"], decision="allow")
+prefix_rule(pattern=["git", "pull", "--ff-only"], decision="allow")
+prefix_rule(pattern=["git", "merge", "--ff-only"], decision="allow")
+prefix_rule(pattern=["git", "rebase"], decision="allow")
+prefix_rule(pattern=["git", "cherry-pick"], decision="allow")
+prefix_rule(pattern=["git", "stash"], decision="allow")
+
+# --- push to origin, including force-with-lease (rebases are common) ---
+# See the LIMITATION note above: the forbidden rules below only catch the
+# flag/branch in the immediate next-token position.
+
+prefix_rule(pattern=["git", "push"], decision="allow")
+prefix_rule(pattern=["git", "push", "--force"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "-f"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "--force", "origin"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "origin", "main"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "origin", "HEAD:main"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "--delete"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "origin", "--delete"], decision="forbidden")
+prefix_rule(pattern=["git", "push", "-d"], decision="forbidden")
+prefix_rule(pattern=["git", "reset", "--hard"], decision="forbidden")
+
+prefix_rule(pattern=["gh", "stack", ["push", "submit"]], decision="allow")
+
+# --- gh pull request workflow ---
+# `gh pr merge` decisions require --squash immediately after "merge"
+# (`gh pr merge --squash 123`). `gh pr merge 123 --squash` (number first)
+# is a different, unmatched token sequence and simply falls through to
+# the default policy (prompt) rather than being silently allowed — see
+# the LIMITATION note above; there is no "any token" wildcard in this
+# rule DSL, so a PR number in between cannot be skipped.
+
+prefix_rule(pattern=["gh", "pr", ["create", "edit", "comment", "ready"]], decision="allow")
+prefix_rule(pattern=["gh", "pr", "merge", "--squash"], decision="allow")
+prefix_rule(pattern=["gh", "pr", "merge", "--admin"], decision="forbidden")
+
+# --- gh CI workflow ---
+
+prefix_rule(pattern=["gh", "run", ["rerun", "download"]], decision="allow")
+
+# --- explicit authorization stays required ---
+
+prefix_rule(pattern=["gh", "release", ["create", "delete", "edit"]], decision="forbidden")
+prefix_rule(pattern=["gh", "workflow", "run"], decision="forbidden")
+prefix_rule(pattern=["gh", "repo"], decision="forbidden")
+
+# --- mise tasks ---
+# `prefix_rule` matches whole argv tokens, not substrings, so a rule on
+# ["mise","run","release"] would NOT catch "mise run release:version" —
+# verified with `codex execpolicy check` (a substring-based deny, as used
+# in the equivalent Claude Code rules, does not translate here). A
+# blanket "mise run" allow plus enumerated forbidden subtasks is
+# therefore unsafe: any future task name under the release/package/tool
+# families would silently bypass an under-enumerated deny list. Instead
+# this allowlists only the routine root tasks AGENTS.md documents
+# (`mise run build|build:release|run|format:fix|format:check|lint|test|
+# typecheck|coverage|test:install|lint:tooling|check|docs:dev|
+# docs:build|docs:preview|docs:check|setup`) plus `mise exec`/
+# `mise install` for tool provisioning. `mise run release`,
+# `release:tool`, `release:version`, `release:set-version`,
+# `//packages/kuru-delivery:release|package|tool`, and any
+# package-scoped task not listed here (e.g. `mise run
+# //packages/kuru-core:test`) are intentionally NOT pre-approved and
+# fall through to the default policy (prompt). Add specific
+# `//packages/<name>:<verb>` entries here if that friction becomes
+# common — do not switch this section to a blanket allow.
+
+prefix_rule(pattern=["mise", "run", ["build", "build:release", "run", "format:fix", "format:check", "lint", "test", "typecheck", "coverage", "test:install", "lint:tooling", "check", "docs:dev", "docs:build", "docs:preview", "docs:check", "setup"]], decision="allow")
+prefix_rule(pattern=["mise", "exec"], decision="allow")
+prefix_rule(pattern=["mise", "install"], decision="allow")
+
+# --- cargo ---
+
+prefix_rule(pattern=["cargo", ["build", "test", "check", "clippy", "fmt", "tree", "metadata"]], decision="allow")
+prefix_rule(pattern=["cargo", "llvm-cov"], decision="allow")

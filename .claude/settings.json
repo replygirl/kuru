@@ -1,7 +1,88 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cospec *)"
+      "Bash(cospec *)",
+
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git remote:*)",
+      "Bash(git worktree list:*)",
+      "Bash(git blame:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh run watch:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh release view:*)",
+      "Bash(gh release list:*)",
+      "Bash(mise tasks:*)",
+
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git switch:*)",
+      "Bash(git checkout -b:*)",
+      "Bash(git worktree add:*)",
+      "Bash(git worktree remove:*)",
+      "Bash(git worktree prune:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull --ff-only:*)",
+      "Bash(git merge --ff-only:*)",
+      "Bash(git rebase:*)",
+      "Bash(git cherry-pick:*)",
+      "Bash(git stash:*)",
+
+      "Bash(git push:*)",
+      "Bash(gh stack push:*)",
+      "Bash(gh stack submit:*)",
+
+      "Bash(gh pr create:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(gh pr comment:*)",
+      "Bash(gh pr ready:*)",
+      "Bash(gh pr merge --squash:*)",
+
+      "Bash(gh run rerun:*)",
+      "Bash(gh run download:*)",
+
+      "Bash(mise run:*)",
+      "Bash(mise exec:*)",
+      "Bash(mise install:*)",
+
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo llvm-cov:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo metadata:*)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force origin:*)",
+      "Bash(git push origin main:*)",
+      "Bash(git push origin HEAD:main:*)",
+      "Bash(git push --delete:*)",
+      "Bash(git push origin --delete:*)",
+      "Bash(git push -d:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(gh pr merge --admin:*)",
+      "Bash(gh release create:*)",
+      "Bash(gh release delete:*)",
+      "Bash(gh release edit:*)",
+      "Bash(gh workflow run:*)",
+      "Bash(gh repo:*)",
+      "Bash(mise run release:*)",
+      "Bash(mise run package:*)",
+      "Bash(mise run tool:*)",
+      "Bash(mise run //packages/kuru-delivery:release:*)",
+      "Bash(mise run //packages/kuru-delivery:package:*)",
+      "Bash(mise run //packages/kuru-delivery:tool:*)"
     ]
   }
 }

@@ -333,6 +333,21 @@ Restart Claude Code, start a new Codex session, or reload the OpenCode project
 after adding workflows. Codex uses `$cospec-<skill>`; Claude Code uses
 `/cospec:<command>` and OpenCode uses `/cospec-<command>`.
 
+Repository permission/approval rules for these assistants are separate from
+the generated workflow files above and are authored directly, not by cospec:
+`.claude/settings.json` (project permission `allow`/`deny` rules; not listed
+in `openspec/.cospec-manifest.json`, so `mise run cospec:managed:check` never
+touches it) and `.codex/rules/agent-safe-actions.rules` (a hand-authored
+sibling of the cospec-managed `.codex/rules/cospec.rules`; Codex loads every
+`*.rules` file in `.codex/rules/`). Both scope the same safe, routine
+git/gh/mise/cargo actions and explicitly exclude force pushes to `main`,
+release/publish automation, and other actions that still require an explicit
+one-time approval. Update both together when the routine command surface
+changes, and re-verify deny/forbidden coverage with `codex execpolicy check`
+before relying on a new rule — Codex's rule matcher compares whole argv
+tokens, not substrings, so a rule scoped to one task name does not cover a
+differently-named sibling task.
+
 ## Dependency and release updates
 
 Change workspace dependency pins centrally and regenerate Cargo.lock. Change
