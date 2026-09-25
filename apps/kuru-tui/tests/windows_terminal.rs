@@ -381,11 +381,17 @@ async fn native_conpty_trust_refusal_and_persistent_choice_precede_the_alternate
     let error = terminal
         .wait(
             "missing responses route exits before the TUI",
-            READY,
+            sandbox.startup,
             |_| false,
         )
         .unwrap_err();
     ensure!(error.to_string().contains("child exited"), "{error:#}");
+    ensure!(
+        String::from_utf8_lossy(&terminal.output)
+            .contains("Responses API authentication environment variable is not set"),
+        "approved launch did not reach its missing-key refusal: {}",
+        terminal.screen()
+    );
     ensure!(
         !terminal
             .output

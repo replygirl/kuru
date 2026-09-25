@@ -6,8 +6,11 @@ use std::{
     process::Output,
 };
 
-use kuru_delivery::archive::{TARGETS, archive_name, digest};
 use kuru_delivery::command::BlockingCommand as Command;
+use kuru_delivery::{
+    archive::{TARGETS, archive_name, digest},
+    shell_support,
+};
 #[path = "support/files.rs"]
 mod files;
 use files::symlink;
@@ -16,6 +19,7 @@ struct Fixture {
     root: tempfile::TempDir,
     binary: PathBuf,
     release: PathBuf,
+    support_input: PathBuf,
     destination: PathBuf,
 }
 
@@ -28,6 +32,12 @@ impl Fixture {
             &fs::read(env!("CARGO_BIN_EXE_kuru-delivery-fixture")).unwrap(),
         );
         let release = root.path().join("release files");
+        let support_input = root.path().join("generated support");
+        fs::create_dir_all(support_input.join("completions")).unwrap();
+        fs::create_dir_all(support_input.join("man")).unwrap();
+        for name in shell_support::NAMES {
+            fs::write(support_input.join(name), format!("generated {name}\n")).unwrap();
+        }
         let destination = root.path().join("installed bin");
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("kuru"), b"previous executable").unwrap();
@@ -35,6 +45,7 @@ impl Fixture {
             root,
             binary,
             release,
+            support_input,
             destination,
         }
     }
@@ -50,13 +61,30 @@ impl Fixture {
     }
 
     fn package(&self) -> Output {
-        self.command()
+        let core = self
+            .command()
             .args(["package", "--binary"])
             .arg(&self.binary)
             .args(["--target", TARGETS[0], "--version", "v0.2.0", "--output"])
             .arg(&self.release)
             .output()
-            .unwrap()
+            .unwrap();
+        if core.status.success() {
+            let support = self
+                .command()
+                .args(["package-shell-support", "--input"])
+                .arg(&self.support_input)
+                .args(["--target", TARGETS[0], "--version", "v0.2.0", "--output"])
+                .arg(&self.release)
+                .output()
+                .unwrap();
+            assert!(
+                support.status.success(),
+                "{}",
+                String::from_utf8_lossy(&support.stderr)
+            );
+        }
+        core
     }
 
     fn archive(&self) -> PathBuf {
@@ -65,11 +93,10 @@ impl Fixture {
     }
 
     fn checksums(&self) {
-        fs::copy(
-            self.archive().with_extension("gz.sha256"),
-            self.release.join("SHA256SUMS"),
-        )
-        .unwrap();
+        let core = fs::read_to_string(self.archive().with_extension("gz.sha256")).unwrap();
+        let support = shell_support::archive_name("0.2.0", TARGETS[0]).unwrap();
+        let sidecar = fs::read_to_string(self.release.join(format!("{support}.sha256"))).unwrap();
+        fs::write(self.release.join("SHA256SUMS"), format!("{core}{sidecar}")).unwrap();
     }
 
     fn install(&self) -> Output {
@@ -133,7 +160,7 @@ fn real_package_and_env_configured_install_run_the_result() {
     assert_eq!(success(&run), "native fixture 0.2.0\n");
     assert_eq!(
         fs::read_dir(&fixture.destination).unwrap().count(),
-        1 + usize::from(cfg!(windows))
+        2 + usize::from(cfg!(windows))
     );
 
     let explicit = fixture.root.path().join("explicit destination");

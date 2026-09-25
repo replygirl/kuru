@@ -14,6 +14,8 @@ kuru_producer=''
 kuru_consumer=''
 kuru_archive_limit=$((128 * 1024 * 1024))
 kuru_manifest_limit=$((64 * 1024))
+kuru_support_limit=$((4 * 1024 * 1024))
+kuru_support_member_limit=$((512 * 1024))
 kuru_version_pattern='^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$'
 
 fail() {
@@ -126,7 +128,7 @@ if [[ -z $kuru_directory ]]; then
   kuru_directory="$HOME/.local/bin"
 fi
 [[ $kuru_directory != *$'\n'* && $kuru_directory != *$'\r'* ]] || fail 'install directory must not contain line breaks'
-for kuru_tool in mkdir mktemp mkfifo head wc cat gzip tar chmod mv rm tr cmp sort; do
+for kuru_tool in mkdir mktemp mkfifo head wc cat gzip tar chmod mv rm tr cmp sort cp; do
   command -v "$kuru_tool" >/dev/null || fail "$kuru_tool is required"
 done
 if command -v sha256sum >/dev/null; then
@@ -247,6 +249,120 @@ done < "$kuru_stage/types"
 bounded "$kuru_archive_limit" "$kuru_stage/kuru" 'release executable' tar -xOf "$kuru_stage/archive.tar" -- kuru
 [[ -s $kuru_stage/kuru ]] || fail 'release kuru entry is empty'
 chmod 755 "$kuru_stage/kuru"
+
+# The verified core README distinguishes historical three-member releases from
+# releases that require a target-paired, checksum-verified support envelope.
+bounded "$kuru_manifest_limit" "$kuru_stage/README.md" 'release README' tar -xOf "$kuru_stage/archive.tar" -- README.md
+tr -d '\000' < "$kuru_stage/README.md" > "$kuru_stage/readme-text"
+cmp -s "$kuru_stage/README.md" "$kuru_stage/readme-text" || fail 'release README contains NUL bytes'
+kuru_marker_count=0
+kuru_readme_line=0
+while IFS= read -r kuru_line || [[ -n $kuru_line ]]; do
+  kuru_readme_line=$((kuru_readme_line + 1))
+  if [[ $kuru_line == *kuru-shell-support-format* ]]; then
+    [[ $kuru_line == '<!-- kuru-shell-support-format: 1 -->' && $kuru_readme_line -le 64 ]] || fail 'release README has an invalid shell-support marker'
+    kuru_marker_count=$((kuru_marker_count + 1))
+  fi
+done < "$kuru_stage/readme-text"
+(( kuru_marker_count <= 1 )) || fail 'release README has duplicate shell-support markers'
+
+if (( kuru_marker_count == 1 )); then
+  kuru_support_name="kuru-$kuru_version-$kuru_target-shell-support.tar.gz"
+  kuru_support_matches=0
+  kuru_support_expected=''
+  while IFS= read -r kuru_line || [[ -n $kuru_line ]]; do
+    kuru_line=${kuru_line%$'\r'}
+    [[ -n $kuru_line ]] || continue
+    [[ $kuru_line =~ $kuru_manifest_pattern ]] || fail 'malformed checksum manifest'
+    if [[ ${BASH_REMATCH[2]} == "$kuru_support_name" ]]; then
+      kuru_support_matches=$((kuru_support_matches + 1))
+      kuru_support_expected=${BASH_REMATCH[1]}
+    fi
+  done < "$kuru_stage/manifest-text"
+  (( kuru_support_matches == 1 )) || fail 'checksum manifest must name the paired shell-support archive exactly once; existing executable unchanged'
+  fetch "$kuru_support_name" "$kuru_support_limit" "$kuru_stage/support.tar.gz"
+  if [[ $kuru_hash_tool == sha256sum ]]; then
+    kuru_support_actual=$(sha256sum < "$kuru_stage/support.tar.gz")
+  else
+    kuru_support_actual=$(shasum -a 256 < "$kuru_stage/support.tar.gz")
+  fi
+  kuru_support_actual=${kuru_support_actual%% *}
+  kuru_support_expected=$(printf '%s' "$kuru_support_expected" | tr '[:upper:]' '[:lower:]')
+  [[ $kuru_support_actual == "$kuru_support_expected" ]] || fail 'shell-support archive checksum mismatch; existing executable unchanged'
+
+  bounded "$kuru_support_limit" "$kuru_stage/support.tar" 'expanded shell-support archive' gzip -dc "$kuru_stage/support.tar.gz"
+  bounded "$kuru_manifest_limit" "$kuru_stage/support-names" 'shell-support inventory' tar -tf "$kuru_stage/support.tar"
+  sort "$kuru_stage/support-names" > "$kuru_stage/support-sorted-names"
+  printf 'completions/_kuru\ncompletions/kuru.bash\ncompletions/kuru.fish\ncompletions/kuru.ps1\nman/kuru.1\n' > "$kuru_stage/support-expected-names"
+  cmp -s "$kuru_stage/support-sorted-names" "$kuru_stage/support-expected-names" || fail 'shell-support archive must contain exactly five support files without duplicates or other paths'
+  bounded "$kuru_manifest_limit" "$kuru_stage/support-types" 'shell-support inventory' tar -tvf "$kuru_stage/support.tar"
+  kuru_entries=0
+  while IFS= read -r kuru_line || [[ -n $kuru_line ]]; do
+    [[ ${kuru_line:0:10} == '-rw-r--r--' ]] || fail 'shell-support archive entries must be regular files with mode 0644'
+    kuru_entries=$((kuru_entries + 1))
+  done < "$kuru_stage/support-types"
+  (( kuru_entries == 5 )) || fail 'shell-support archive must contain exactly five regular files'
+  mkdir -p -- "$kuru_stage/support/completions" "$kuru_stage/support/man"
+  for kuru_member in completions/kuru.bash completions/_kuru completions/kuru.fish completions/kuru.ps1 man/kuru.1; do
+    bounded "$kuru_support_member_limit" "$kuru_stage/support/$kuru_member" 'shell-support member' tar -xOf "$kuru_stage/support.tar" -- "$kuru_member"
+    [[ -s $kuru_stage/support/$kuru_member ]] || fail 'shell-support member is empty'
+    chmod 644 "$kuru_stage/support/$kuru_member"
+  done
+
+  # All support bytes are checked before publication of the executable. The
+  # explicit install directory is the root for both its binary and support.
+  kuru_share="$kuru_directory/share"
+  kuru_support_parent="$kuru_share/kuru"
+  for kuru_path in "$kuru_share" "$kuru_support_parent" "$kuru_support_parent/$kuru_version"; do
+    [[ ! -L $kuru_path && ( ! -e $kuru_path || -d $kuru_path ) ]] || fail 'shell-support parent must be a real directory'
+    mkdir -p -- "$kuru_path"
+    [[ ! -L $kuru_path && -d $kuru_path ]] || fail 'shell-support parent changed identity'
+  done
+  kuru_support_destination="$kuru_support_parent/$kuru_version/$kuru_target"
+  [[ ! -L $kuru_support_destination && ( ! -e $kuru_support_destination || -d $kuru_support_destination ) ]] || fail 'shell-support destination must be a real directory'
+  mkdir -p -- "$kuru_support_destination"
+  [[ ! -L $kuru_support_destination && -d $kuru_support_destination ]] || fail 'shell-support destination changed identity'
+  for kuru_path in "$kuru_support_destination/completions" "$kuru_support_destination/man"; do
+    [[ ! -L $kuru_path && ( ! -e $kuru_path || -d $kuru_path ) ]] || fail 'shell-support destination has unsafe directories'
+    mkdir -p -- "$kuru_path"
+    [[ ! -L $kuru_path && -d $kuru_path ]] || fail 'shell-support destination changed identity'
+  done
+  for kuru_member in completions/kuru.bash completions/_kuru completions/kuru.fish completions/kuru.ps1 man/kuru.1; do
+    kuru_path="$kuru_support_destination/$kuru_member"
+    [[ ! -L $kuru_path && ( ! -e $kuru_path || -f $kuru_path ) ]] || fail 'shell-support destination has an unsafe member'
+    if [[ ! -e $kuru_path ]]; then
+      cp -- "$kuru_stage/support/$kuru_member" "$kuru_path"
+    fi
+    cmp -s "$kuru_stage/support/$kuru_member" "$kuru_path" || fail 'shell-support destination differs from verified archive'
+  done
+  shopt -s nullglob dotglob
+  kuru_children=("$kuru_support_destination"/*)
+  (( ${#kuru_children[@]} == 2 )) || fail 'shell-support destination contains unexpected entries'
+  kuru_children=("$kuru_support_destination/completions"/*)
+  (( ${#kuru_children[@]} == 4 )) || fail 'shell-support destination contains unexpected completions'
+  kuru_children=("$kuru_support_destination/man"/*)
+  (( ${#kuru_children[@]} == 1 )) || fail 'shell-support destination contains unexpected man files'
+  shopt -u nullglob dotglob
+  for kuru_member in completions/kuru.bash completions/_kuru completions/kuru.fish completions/kuru.ps1 man/kuru.1; do
+    [[ ! -L $kuru_support_destination/$kuru_member && -f $kuru_support_destination/$kuru_member ]] || fail 'shell-support destination is incomplete or unsafe'
+    cmp -s "$kuru_stage/support/$kuru_member" "$kuru_support_destination/$kuru_member" || fail 'shell-support destination differs from verified archive'
+  done
+fi
+
 check_destination
 mv -f -- "$kuru_stage/kuru" "$kuru_destination"
+if (( kuru_marker_count == 1 )); then
+  kuru_man_parent="$kuru_share/man"
+  kuru_man_directory="$kuru_man_parent/man1"
+  for kuru_path in "$kuru_man_parent" "$kuru_man_directory"; do
+    [[ ! -L $kuru_path && ( ! -e $kuru_path || -d $kuru_path ) ]] || fail 'partial install: stable man directory is unsafe; rerun this installer to repair'
+    mkdir -p -- "$kuru_path"
+    [[ ! -L $kuru_path && -d $kuru_path ]] || fail 'partial install: stable man directory changed identity; rerun this installer to repair'
+  done
+  kuru_man_destination="$kuru_man_directory/kuru.1"
+  [[ ! -L $kuru_man_destination && ( ! -e $kuru_man_destination || -f $kuru_man_destination ) ]] || fail 'partial install: stable man destination is unsafe; rerun this installer to repair'
+  cp -- "$kuru_support_destination/man/kuru.1" "$kuru_stage/kuru.1"
+  mv -f -- "$kuru_stage/kuru.1" "$kuru_man_destination" || fail 'partial install: could not publish stable man file; rerun this installer to repair'
+  cmp -s "$kuru_support_destination/man/kuru.1" "$kuru_man_destination" || fail 'partial install: stable man file differs; rerun this installer to repair'
+fi
 printf 'Installed Kuru %s at %s; add %s to PATH.\n' "$kuru_version" "$kuru_destination" "$kuru_directory"

@@ -11,7 +11,10 @@ use std::{
 };
 
 use flate2::{Compression, write::GzEncoder};
-use kuru_delivery::archive::{TARGETS, archive_name, digest, package};
+use kuru_delivery::{
+    archive::{TARGETS, archive_name, digest, package},
+    shell_support,
+};
 use tokio::process::Command;
 
 #[path = "support/bootstrap_process.rs"]
@@ -42,7 +45,7 @@ impl Fixture {
         fs::write(destination.join("kuru"), PREVIOUS).unwrap();
         for name in [
             "bash", "mkdir", "mktemp", "mkfifo", "head", "wc", "cat", "gzip", "tar", "chmod", "mv",
-            "rm", "tr", "cmp", "sort",
+            "rm", "tr", "cmp", "sort", "cp",
         ] {
             symlink(system_tool(name), tools.join(name)).unwrap();
         }
@@ -73,11 +76,23 @@ impl Fixture {
         let binary = root.path().join("input binary");
         executable(&binary, CANDIDATE);
         let archive = package(&binary, target, version, &release).unwrap();
-        fs::copy(
-            archive.with_extension("gz.sha256"),
-            release.join("SHA256SUMS"),
-        )
-        .unwrap();
+        let generated = root.path().join("generated support");
+        for name in shell_support::NAMES {
+            let path = generated.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("generated {name} for {target}\n")).unwrap();
+        }
+        shell_support::package(&generated, target, version, &release).unwrap();
+        let manifest = format!(
+            "{}{}",
+            fs::read_to_string(archive.with_extension("gz.sha256")).unwrap(),
+            fs::read_to_string(release.join(format!(
+                "{}.sha256",
+                shell_support::archive_name(version, target).unwrap()
+            )))
+            .unwrap(),
+        );
+        fs::write(release.join("SHA256SUMS"), manifest).unwrap();
         fs::copy(
             release.join("SHA256SUMS"),
             root.path().join("latest-manifest"),
@@ -102,22 +117,37 @@ impl Fixture {
             .join(archive_name(self.version, self.target).unwrap())
     }
 
+    fn support_archive(&self) -> PathBuf {
+        self.release
+            .join(shell_support::archive_name(self.version, self.target).unwrap())
+    }
+
     fn checksums(&self) {
         fs::write(
             self.release.join("SHA256SUMS"),
             format!(
-                "{}  {}\n",
+                "{}  {}\n{}  {}\n",
                 digest(&fs::read(self.archive()).unwrap()),
-                self.archive().file_name().unwrap().to_str().unwrap()
+                self.archive().file_name().unwrap().to_str().unwrap(),
+                digest(&fs::read(self.support_archive()).unwrap()),
+                self.support_archive()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
             ),
         )
         .unwrap();
     }
 
     fn command(&self) -> Command {
+        self.command_from("support/install.sh")
+    }
+
+    fn command_from(&self, script: &str) -> Command {
         let mut command = Command::new("/bin/bash");
         command
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("support/install.sh"))
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
             .current_dir(self.root.path())
             .env_clear()
             .env("PATH", &self.tools)
@@ -207,8 +237,22 @@ impl Fixture {
         );
         assert_eq!(
             fs::read_dir(directory).unwrap().count(),
-            1,
+            2,
             "staging leaked"
+        );
+        let snapshot = directory
+            .join("share/kuru")
+            .join(self.version)
+            .join(self.target);
+        for name in shell_support::NAMES {
+            assert_eq!(
+                fs::read(snapshot.join(name)).unwrap(),
+                format!("generated {name} for {}\n", self.target).into_bytes()
+            );
+        }
+        assert_eq!(
+            fs::read(directory.join("share/man/man1/kuru.1")).unwrap(),
+            fs::read(snapshot.join("man/kuru.1")).unwrap()
         );
         assert!(
             !self.path("executed").exists(),
@@ -393,6 +437,74 @@ async fn actual_package_installs_with_system_bash_and_no_compiler_or_candidate_e
 }
 
 #[tokio::test]
+async fn marked_core_requires_its_paired_support_before_binary_replacement() {
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    fs::write(
+        fixture.release.join("SHA256SUMS"),
+        format!(
+            "{}  {}\n",
+            digest(&fs::read(fixture.archive()).unwrap()),
+            fixture.archive().file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    failure(
+        &fixture.run(fixture.explicit()).await,
+        "paired shell-support archive exactly once",
+    );
+    fixture.unchanged();
+
+    fixture.checksums();
+    fs::write(fixture.support_archive(), b"corrupt support").unwrap();
+    failure(
+        &fixture.run(fixture.explicit()).await,
+        "shell-support archive checksum mismatch",
+    );
+    fixture.unchanged();
+}
+
+#[tokio::test]
+async fn verified_unmarked_historical_core_remains_executable_only() {
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    fixture.write_archive(&[
+        ("kuru", CANDIDATE, 0o755, tar::EntryType::Regular),
+        ("LICENSE", b"license", 0o644, tar::EntryType::Regular),
+        (
+            "README.md",
+            b"historical release",
+            0o644,
+            tar::EntryType::Regular,
+        ),
+    ]);
+    success(&fixture.run(fixture.explicit()).await);
+    assert_eq!(
+        fs::read(fixture.destination.join("kuru")).unwrap(),
+        CANDIDATE
+    );
+    assert!(!fixture.destination.join("share").exists());
+}
+
+#[tokio::test]
+async fn retained_v041_v042_bootstrap_accepts_the_unchanged_marked_core() {
+    // Both published tags contain byte-identical support/install.sh files:
+    // v0.4.1 and v0.4.2, SHA-256
+    // 05d72c99c150480ff1856f2b5ab9ea028fc8f34b48f77a60171f5bdcc6235f75.
+    // Keep their actual script in-tree so this test needs no Git checkout.
+    let fixture = Fixture::new(TARGETS[0], "0.2.0");
+    let old = "tests/fixtures/install-v0.4.2.sh";
+    let mut command = fixture.command_from(old);
+    command.args(["--version", "0.2.0", "--target", TARGETS[0]]);
+    let result = fixture.run(command).await;
+    success(&result);
+    assert_eq!(
+        fs::read(fixture.destination.join("kuru")).unwrap(),
+        CANDIDATE
+    );
+    assert!(!fixture.destination.join("share").exists());
+    assert!(!fixture.path("executed").exists());
+}
+
+#[tokio::test]
 async fn latest_is_resolved_once_then_downloads_the_selected_immutable_version() {
     let fixture = Fixture::new(TARGETS[0], "0.2.0-rc.1");
     let mut command = fixture.command();
@@ -407,6 +519,7 @@ async fn latest_is_resolved_once_then_downloads_the_selected_immutable_version()
         [
             "https://github.com/replygirl/kuru/releases/latest/download/SHA256SUMS",
             "https://github.com/replygirl/kuru/releases/download/v0.2.0-rc.1/kuru-0.2.0-rc.1-aarch64-apple-darwin.tar.gz",
+            "https://github.com/replygirl/kuru/releases/download/v0.2.0-rc.1/kuru-0.2.0-rc.1-aarch64-apple-darwin-shell-support.tar.gz",
         ]
     );
     let arguments = fs::read_to_string(fixture.path("curl-arguments")).unwrap();
@@ -437,7 +550,7 @@ async fn explicit_github_and_custom_mirror_versions_use_literal_release_director
         fixture.installed(&fixture.destination);
         let requests = fs::read_to_string(fixture.path("requests")).unwrap();
         assert!(!requests.contains("latest"));
-        assert_eq!(requests.lines().count(), 2);
+        assert_eq!(requests.lines().count(), 3);
         assert!(requests.lines().next().unwrap().ends_with("/SHA256SUMS"));
     }
 }
@@ -835,10 +948,14 @@ async fn duplicate_latest_versions_are_ambiguous_and_crlf_uppercase_binary_hashe
         1
     );
     fixture.unchanged();
-    let (hash, name) = manifest.trim_end().split_once("  ").unwrap();
+    let (hash, name) = manifest.lines().next().unwrap().split_once("  ").unwrap();
     fs::write(
         fixture.release.join("SHA256SUMS"),
-        format!("{} *{name}\r\n", hash.to_ascii_uppercase()),
+        format!(
+            "{} *{name}\r\n{}\r\n",
+            hash.to_ascii_uppercase(),
+            manifest.lines().nth(1).unwrap()
+        ),
     )
     .unwrap();
     success(&fixture.run(fixture.explicit()).await);

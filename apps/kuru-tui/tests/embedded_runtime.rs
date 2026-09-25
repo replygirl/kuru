@@ -7,7 +7,7 @@ mod update_profiles;
 
 use anyhow::{Context, Result, ensure};
 use kuru_core::MemoryConfig;
-use kuru_delivery::{archive, command::Command};
+use kuru_delivery::{archive, command::Command, shell_support};
 use kuru_memory::{MemoryStore, OpenOptions};
 use kuru_platform::fs::{Directory, regular_file_info};
 use serde_json::Value;
@@ -32,7 +32,7 @@ const BOOTSTRAP_INVENTORY_BYTES: usize = 4096;
 // 30-second bound, then includes their handshakes and bounded shutdowns.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(100);
 const PREPARE_INPUT_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_INSTRUMENTED_INPUT_BYTES: u64 = archive::MAX_ARCHIVE_BYTES as u64 + 32 * 1024 * 1024;
+const MAX_FIXTURE_INPUT_BYTES: u64 = archive::MAX_ARCHIVE_BYTES as u64 + 32 * 1024 * 1024;
 const MANIFEST: &str = include_str!("../../../packages/kuru-memory/support/dolt-assets.json");
 #[cfg(windows)]
 const BOOTSTRAP_PHASES: &[&str] = &[
@@ -80,31 +80,31 @@ fn digest_file(file: &mut File) -> Result<String> {
         .collect())
 }
 
-async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Result<PathBuf> {
-    let mut held = File::open(source).context("open instrumented Cargo artifact")?;
+async fn prepare_bounded_packaging_input(root: &Path, source: &Path) -> Result<PathBuf> {
+    let mut held = File::open(source).context("open selected Cargo artifact")?;
     let before = regular_file_info(&held)?;
     ensure!(
-        before.len > 0 && before.len <= MAX_INSTRUMENTED_INPUT_BYTES,
-        "instrumented Cargo artifact exceeds the bounded fixture input"
+        before.len > 0 && before.len <= MAX_FIXTURE_INPUT_BYTES,
+        "selected Cargo artifact exceeds the bounded fixture input"
     );
     let source_digest = digest_file(&mut held)?;
     let staged = root.join(if cfg!(windows) {
-        "instrumented-package-input.exe"
+        "private-package-input.exe"
     } else {
-        "instrumented-package-input"
+        "private-package-input"
     });
     let mut candidate = FsOpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&staged)
-        .context("create private instrumented packaging input")?;
+        .context("create private packaging input")?;
     let copied_bytes = std::io::copy(
-        &mut Read::by_ref(&mut held).take(MAX_INSTRUMENTED_INPUT_BYTES + 1),
+        &mut Read::by_ref(&mut held).take(MAX_FIXTURE_INPUT_BYTES + 1),
         &mut candidate,
     )?;
     ensure!(
         copied_bytes == before.len,
-        "instrumented Cargo artifact changed length while snapshotting"
+        "selected Cargo artifact changed length while snapshotting"
     );
     candidate.set_permissions(held.metadata()?.permissions())?;
     candidate.flush()?;
@@ -117,7 +117,7 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
             && copied_info.links == 1
             && copied_info.len == before.len
             && digest_file(&mut copied)? == source_digest,
-        "instrumented packaging input is not an independent exact copy"
+        "selected packaging input is not an independent exact copy"
     );
 
     #[cfg(target_os = "macos")]
@@ -132,7 +132,7 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
     {
         let output = kuru_delivery::command::output(&mut strip, PREPARE_INPUT_TIMEOUT)
             .await
-            .context("remove symbols from the private coverage copy")?;
+            .context("remove symbols from the private packaging copy")?;
         ensure!(
             output.status.success(),
             "debug-symbol removal failed: {}",
@@ -140,7 +140,7 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
         );
     }
 
-    let current = File::open(source).context("reopen instrumented Cargo artifact")?;
+    let current = File::open(source).context("reopen selected Cargo artifact")?;
     let after = regular_file_info(&held)?;
     let named = regular_file_info(&current)?;
     ensure!(
@@ -149,7 +149,7 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
             && before.len == after.len
             && before.len == named.len
             && digest_file(&mut held)? == source_digest,
-        "instrumented Cargo artifact changed while preparing its private copy"
+        "selected Cargo artifact changed while preparing its private copy"
     );
     let staged_info = regular_file_info(&File::open(&staged)?)?;
     ensure!(
@@ -157,7 +157,7 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
             && staged_info.links == 1
             && staged_info.len > 0
             && staged_info.len <= archive::MAX_ARCHIVE_BYTES as u64,
-        "prepared instrumented packaging input is not a bounded independent file: distinct_identity={}, links={}, bytes={}, maximum_bytes={}",
+        "prepared packaging input is not a bounded independent file: distinct_identity={}, links={}, bytes={}, maximum_bytes={}",
         staged_info.identity != before.identity,
         staged_info.links,
         staged_info.len,
@@ -166,28 +166,34 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
     #[cfg(unix)]
     ensure!(
         staged_info.len < before.len,
-        "symbol removal did not reduce the instrumented packaging input"
+        "symbol removal did not reduce the private packaging input"
     );
 
-    let destination = std::env::var_os("LLVM_PROFILE_FILE")
-        .map(PathBuf::from)
-        .context("instrumented packaging preparation requires a coverage destination")?;
-    ensure!(
-        destination.is_absolute(),
-        "coverage destination must be absolute"
-    );
-    let profile_dir = destination.parent().context("coverage directory")?;
-    let reservation = tempfile::Builder::new()
-        .prefix("kuru-package-input-")
-        .tempfile_in(profile_dir)?;
-    let prefix = format!(
-        "{}-",
-        reservation
-            .path()
-            .file_name()
-            .and_then(OsStr::to_str)
-            .context("coverage reservation filename")?
-    );
+    // Instrumented children keep the runner's profile destination. An ordinary
+    // debug build needs the same private, bounded copy when its symbols alone
+    // put it above the shipping archive cap, but it has no profile to collect.
+    let profile = if let Some(destination) = std::env::var_os("LLVM_PROFILE_FILE") {
+        let destination = PathBuf::from(destination);
+        ensure!(
+            destination.is_absolute(),
+            "coverage destination must be absolute"
+        );
+        let profile_dir = destination.parent().context("coverage directory")?;
+        let reservation = tempfile::Builder::new()
+            .prefix("kuru-package-input-")
+            .tempfile_in(profile_dir)?;
+        let prefix = format!(
+            "{}-",
+            reservation
+                .path()
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("coverage reservation filename")?
+        );
+        Some((reservation, prefix, profile_dir.to_path_buf()))
+    } else {
+        None
+    };
     let probe_root = root.join("instrumented-packaging-probe");
     let probe_home = probe_root.join("home");
     let probe_config = probe_root.join("config");
@@ -221,47 +227,52 @@ async fn prepare_instrumented_packaging_input(root: &Path, source: &Path) -> Res
         .env("TMP", &probe_temporary)
         .env("TEMP", &probe_temporary)
         .env("PATH", &probe_empty_path)
-        .env(
-            "LLVM_PROFILE_FILE",
-            profile_dir.join(format!("{prefix}%p-%m.profraw")),
-        )
         .current_dir(&probe_workspace)
         .arg("-C")
         .arg(&probe_workspace)
         .arg("--data-dir")
         .arg(&probe_data)
         .arg("config");
+    if let Some((_, prefix, profile_dir)) = &profile {
+        probe.env(
+            "LLVM_PROFILE_FILE",
+            profile_dir.join(format!("{prefix}%p-%m.profraw")),
+        );
+    }
     #[cfg(windows)]
     if let Some(path) = std::env::var_os("SystemRoot") {
         probe.env("SystemRoot", path);
     }
     let output = kuru_delivery::command::output(&mut probe, PREPARE_INPUT_TIMEOUT)
         .await
-        .context("run prepared instrumented packaging input")?;
+        .context("run prepared private packaging input")?;
     ensure!(
         output.status.success()
             && String::from_utf8_lossy(&output.stderr).contains("memory was not opened"),
-        "prepared instrumented packaging input did not complete isolated configuration inspection: {}",
+        "prepared private packaging input did not complete isolated configuration inspection: {}",
         String::from_utf8_lossy(&output.stderr),
     );
-    let mut profiles = Vec::new();
-    for entry in fs::read_dir(profile_dir)? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".profraw"))
-        {
-            profiles.push(entry);
+    if let Some((reservation, prefix, profile_dir)) = profile {
+        let mut profiles = Vec::new();
+        for entry in fs::read_dir(profile_dir)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".profraw"))
+            {
+                profiles.push(entry);
+            }
         }
+        let profile_metadata = profiles.first().map(|entry| entry.metadata()).transpose()?;
+        ensure!(
+            profiles.len() == 1
+                && profile_metadata
+                    .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0),
+            "prepared packaging input did not emit one nonempty coverage profile"
+        );
+        drop(reservation);
     }
-    let profile_metadata = profiles.first().map(|entry| entry.metadata()).transpose()?;
-    ensure!(
-        profiles.len() == 1
-            && profile_metadata.is_some_and(|metadata| metadata.is_file() && metadata.len() > 0),
-        "prepared packaging input did not emit one nonempty coverage profile"
-    );
-    drop(reservation);
     Ok(staged)
 }
 
@@ -930,6 +941,213 @@ async fn install_packaged(
     .await
 }
 
+#[cfg(unix)]
+async fn verify_installed_shell_activation(
+    root: &Path,
+    installed: &Path,
+    install_dir: &Path,
+) -> Result<()> {
+    let isolated_home = root.join("shell activation home");
+    fs::create_dir(&isolated_home)?;
+    ensure!(Path::new("/bin/bash").is_file(), "stock Bash is required");
+    for (shell, args, script, expected) in [
+        (
+            "/bin/bash",
+            &["--noprofile", "--norc", "-c"][..],
+            "eval \"$(\"$KURU_INSTALLED\" completions bash)\"; complete -p kuru",
+            "kuru",
+        ),
+        (
+            "/bin/zsh",
+            &["-f", "-c"][..],
+            "autoload -Uz compinit; compinit -d /dev/null; eval \"$(\"$KURU_INSTALLED\" completions zsh)\"; typeset -f _kuru",
+            "_kuru",
+        ),
+    ] {
+        if !Path::new(shell).is_file() {
+            continue;
+        }
+        let mut command = Command::new(shell);
+        command
+            .env_clear()
+            .env("HOME", &isolated_home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("KURU_INSTALLED", installed)
+            .args(args)
+            .arg(script);
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        let output = execute(&mut command).await?;
+        ensure!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(expected),
+            "stock shell {shell} did not activate installed completions: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let man_root = install_dir.join("share/man");
+    let stable_man = man_root.join("man1/kuru.1");
+    let mut man = Command::new("/usr/bin/man");
+    man.env_clear()
+        .env("HOME", &isolated_home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("MANPATH", &man_root)
+        .args(["-w", "kuru"]);
+    let output = execute(&mut man).await?;
+    let located = String::from_utf8(output.stdout)?;
+    ensure!(
+        output.status.success() && located.lines().count() == 1,
+        "stock man did not resolve the selected install root's stable page: {located:?}; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        fs::canonicalize(located.trim())? == fs::canonicalize(&stable_man)?,
+        "stock man resolved a page outside the selected install root: {located:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn verify_legacy_core_only_repair(
+    root: &Path,
+    releases: &Path,
+    version: &str,
+    target: &str,
+    packaged: &Path,
+    expected_support: &shell_support::Files,
+) -> Result<()> {
+    let install_dir = root.join("legacy installed bin");
+    let home = root.join("legacy isolated home");
+    fs::create_dir(&install_dir)?;
+    fs::create_dir(&home)?;
+    fs::write(install_dir.join("kuru"), b"legacy installed executable")?;
+    let old_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packages/kuru-delivery/tests/fixtures/install-v0.4.2.sh");
+    let mut installer = Command::new("/bin/bash");
+    installer
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .arg(old_script)
+        .args(["--version", version, "--target", target, "--release-base"])
+        .arg(releases)
+        .arg("--install-dir")
+        .arg(&install_dir);
+    let output = execute(&mut installer).await?;
+    ensure!(
+        output.status.success(),
+        "retained v0.4.1/v0.4.2 installer could not install the new core: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let installed = install_dir.join("kuru");
+    ensure!(
+        digest(&installed)? == digest(packaged)? && !install_dir.join("share").exists(),
+        "legacy installer did not leave an exact executable-only upgrade"
+    );
+
+    let repair = root.join("explicit user shell repair");
+    let project = root.join("legacy repair project");
+    let data = root.join("legacy repair private data");
+    let config_home = root.join("legacy repair config home");
+    fs::create_dir(&project)?;
+    fs::create_dir_all(repair.join("completions"))?;
+    fs::create_dir(repair.join("man"))?;
+    let invalid_config = project.join("invalid.toml");
+    fs::write(&invalid_config, b"[")?;
+    for (name, args) in [
+        ("completions/kuru.bash", &["completions", "bash"][..]),
+        ("completions/_kuru", &["completions", "zsh"]),
+        ("completions/kuru.fish", &["completions", "fish"]),
+        ("completions/kuru.ps1", &["completions", "powershell"]),
+        ("man/kuru.1", &["man"][..]),
+    ] {
+        let mut generator = Command::new(&installed);
+        generator
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_CONFIG_HOME", &config_home)
+            .arg("-C")
+            .arg(&project)
+            .arg("--config")
+            .arg(&invalid_config)
+            .arg("--data-dir")
+            .arg(&data)
+            .args(args);
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            generator.env("LLVM_PROFILE_FILE", profile);
+        }
+        let output = execute(&mut generator).await?;
+        ensure!(
+            output.status.success() && output.stderr.is_empty(),
+            "legacy-upgraded Kuru could not generate {name} without authority: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(repair.join(name), output.stdout)?;
+    }
+    ensure!(
+        &shell_support::read_generated(&repair)? == expected_support
+            && !data.exists()
+            && !config_home.exists()
+            && fs::read(&invalid_config)? == b"[",
+        "explicit shell repair changed support bytes or activated private authority"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn verify_installed_powershell_activation(root: &Path, installed: &Path) -> Result<()> {
+    let system = kuru_platform::windows::process::system_directory()?;
+    let powershell = system.join("WindowsPowerShell/v1.0/powershell.exe");
+    let isolated = root.join("shell activation home");
+    fs::create_dir(&isolated)?;
+    let mut command = Command::new(powershell);
+    command
+        .env_clear()
+        .env(
+            "SystemRoot",
+            system.parent().context("Windows system root")?,
+        )
+        .env("PROCESSOR_ARCHITECTURE", "AMD64")
+        .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        .env("USERPROFILE", &isolated)
+        .env("APPDATA", &isolated)
+        .env("LOCALAPPDATA", &isolated)
+        .env("TMP", &isolated)
+        .env("TEMP", &isolated)
+        .env(
+            "PATH",
+            installed
+                .parent()
+                .context("installed executable directory")?,
+        )
+        .env("KURU_INSTALLED", installed)
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(
+            "$ErrorActionPreference = 'Stop'; \
+             $script = & $env:KURU_INSTALLED completions powershell | Out-String; \
+             if ($LASTEXITCODE -ne 0) { throw 'installed completion generator failed' }; \
+             Invoke-Expression $script; \
+             $found = (TabExpansion2 -inputScript 'kuru mem' -cursorColumn 8).CompletionMatches; \
+             if (@($found | Where-Object { $_.CompletionText -eq 'memory' }).Count -ne 1) \
+             { throw 'installed PowerShell completion was not registered' }; \
+             [Console]::Out.WriteLine('installed PowerShell completion registered')",
+        );
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let output = execute(&mut command).await?;
+    ensure!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains("installed PowerShell completion registered"),
+        "stock PowerShell did not activate installed completions: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 // The install step's COMMAND_TIMEOUT bounds the install; it must not also
 // have to absorb the stock PowerShell 5.1 engine's own cold-start cost
 // (loading System.Management.Automation.dll, types.ps1xml/format.ps1xml,
@@ -1072,8 +1290,11 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         }
         None => PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
     };
-    let binary = if explicit.is_none() && std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        prepare_instrumented_packaging_input(root, &selected).await?
+    let needs_private_copy = explicit.is_none()
+        && (std::env::var_os("LLVM_PROFILE_FILE").is_some()
+            || (cfg!(unix) && fs::metadata(&selected)?.len() > archive::MAX_ARCHIVE_BYTES as u64));
+    let binary = if needs_private_copy {
+        prepare_bounded_packaging_input(root, &selected).await?
     } else {
         selected
     };
@@ -1106,9 +1327,38 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         .file_name()
         .and_then(OsStr::to_str)
         .context("archive name")?;
-    fs::copy(
-        releases.join(format!("{name}.sha256")),
+    // Package the marked core's support from this exact selected executable,
+    // including the private instrumented copy under coverage.
+    let generated = root.join("generated shell support");
+    for (name, args) in [
+        ("completions/kuru.bash", &["completions", "bash"][..]),
+        ("completions/_kuru", &["completions", "zsh"]),
+        ("completions/kuru.fish", &["completions", "fish"]),
+        ("completions/kuru.ps1", &["completions", "powershell"]),
+        ("man/kuru.1", &["man"][..]),
+    ] {
+        let path = generated.join(name);
+        fs::create_dir_all(path.parent().context("support file has no parent")?)?;
+        let output = execute(Command::new(&binary).args(args)).await?;
+        ensure!(
+            output.status.success(),
+            "selected binary could not generate {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(path, output.stdout)?;
+    }
+    let support_path = shell_support::package(&generated, target, version, &releases)?;
+    let support_name = support_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("shell support archive name")?;
+    fs::write(
         releases.join("SHA256SUMS"),
+        format!(
+            "{}{}",
+            fs::read_to_string(releases.join(format!("{name}.sha256")))?,
+            fs::read_to_string(releases.join(format!("{support_name}.sha256")))?
+        ),
     )?;
     let installed = install_packaged(root, &releases, version, &install_dir, target)
         .await
@@ -1119,8 +1369,24 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         "direct installation changed the packaged executable"
     );
     ensure!(
-        fs::read_dir(&install_dir)?.count() == if cfg!(windows) { 2 } else { 1 },
-        "installation must contain only Kuru and the Windows update coordination directory"
+        fs::read_dir(&install_dir)?.count() == 2 + usize::from(cfg!(windows)),
+        "installation must contain Kuru, shell support and only the Windows update coordination directory when applicable"
+    );
+    let expected_support = shell_support::read_generated(&generated)?;
+    ensure!(
+        shell_support::read_generated(&install_dir.join("share/kuru").join(version).join(target))?
+            == expected_support,
+        "direct installation changed its paired shell support"
+    );
+    // The stable MANPATH file is a Unix direct-install contract. Stock Windows
+    // PowerShell installs the exact five files in the versioned support tree.
+    #[cfg(unix)]
+    ensure!(
+        fs::read(install_dir.join("share/man/man1/kuru.1"))?
+            == expected_support
+                .get("man/kuru.1")
+                .context("generated man file")?,
+        "direct installation changed its stable man page"
     );
     let first = Installation::new(root, "direct", &project, &installed)?;
     first.native_auth_status().await?;
@@ -1172,6 +1438,26 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         digest(&installed)? == original_digest,
         "self-update lost or changed the bundled executable"
     );
+    ensure!(
+        shell_support::read_generated(&install_dir.join("share/kuru").join(version).join(target))?
+            == expected_support,
+        "self-update changed its paired shell support"
+    );
+    #[cfg(unix)]
+    ensure!(
+        fs::read(install_dir.join("share/man/man1/kuru.1"))?
+            == expected_support
+                .get("man/kuru.1")
+                .context("generated man file")?,
+        "self-update changed its stable man page"
+    );
+    #[cfg(unix)]
+    verify_installed_shell_activation(root, &installed, &install_dir).await?;
+    #[cfg(unix)]
+    verify_legacy_core_only_repair(root, &releases, version, target, &binary, &expected_support)
+        .await?;
+    #[cfg(windows)]
+    verify_installed_powershell_activation(root, &installed).await?;
     let second = Installation::new(root, "updated", &project, &installed)?;
     second.native_auth_status().await?;
     second
@@ -1188,8 +1474,8 @@ async fn packaged_roundtrip(root: &Path) -> Result<()> {
         .await
         .context("retire the updated installation's managed memory owner")?;
     ensure!(
-        fs::read_dir(&install_dir)?.count() == if cfg!(windows) { 2 } else { 1 },
-        "self-update left a required companion executable"
+        fs::read_dir(&install_dir)?.count() == 2 + usize::from(cfg!(windows)),
+        "self-update left an unexpected companion alongside Kuru and shell support"
     );
     eprintln!(
         "embedded runtime accepted: target={target} executable_bytes={} archive_bytes={} engine={dolt_version}; direct install and self-update each persisted chat from an empty offline cache",

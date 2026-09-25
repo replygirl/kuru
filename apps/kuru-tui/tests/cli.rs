@@ -91,6 +91,56 @@ impl Sandbox {
 }
 
 #[test]
+fn shell_support_generation_bypasses_invalid_workspace_authority_without_state() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("foreign-project");
+    std::fs::create_dir(&project).unwrap();
+    let invalid_config = project.join("invalid-config.toml");
+    std::fs::write(&invalid_config, b"[").unwrap();
+    let data = root.path().join("private-data");
+    let user_config = root.path().join("user-config");
+
+    for command in [
+        &["completions", "bash"][..],
+        &["completions", "zsh"],
+        &["completions", "fish"],
+        &["completions", "powershell"],
+        &["man"],
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_kuru"));
+        #[cfg(windows)]
+        child.fixture_allow_independent_service();
+        let output = child
+            .arg("-C")
+            .arg(&project)
+            .arg("--config")
+            .arg(&invalid_config)
+            .arg("--data-dir")
+            .arg(&data)
+            .arg("--provider")
+            .arg("responses")
+            .env("XDG_CONFIG_HOME", &user_config)
+            .args(command)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{command:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty() && output.stdout.len() <= 512 * 1024);
+        assert!(output.stderr.is_empty(), "{command:?}: {output:?}");
+        if command == ["man"] {
+            let manual = String::from_utf8(output.stdout).unwrap();
+            assert!(manual.contains(".SH \"KURU MEMORY EXPORT\""), "{manual}");
+        }
+        assert!(!data.exists(), "{command:?} created private state");
+        assert!(!user_config.exists(), "{command:?} read user configuration");
+    }
+    assert_eq!(std::fs::read(&invalid_config).unwrap(), b"[");
+}
+
+#[test]
 #[ignore = "subprocess entry selected only by the MCP refusal fixture"]
 fn mcp_stdio_marker_child() {
     let marker = std::env::var_os("KURU_TEST_MCP_STDIO_MARKER").unwrap();

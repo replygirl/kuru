@@ -5,6 +5,7 @@ use kuru_archive::zip::{self, Limits, MemberKind, WriteMember};
 use kuru_delivery::{
     archive::{MAX_ARCHIVE_BYTES, archive_name, digest, package},
     command::{Command, output},
+    shell_support,
 };
 use kuru_platform::{
     fs::{
@@ -55,9 +56,20 @@ impl Fixture {
         fs::write(&candidate, &replacement).unwrap();
         fs::write(install.join("kuru.exe"), &original).unwrap();
         let archive = package(&candidate, TARGET, VERSION, &release).unwrap();
-        fs::copy(
-            archive.with_extension("zip.sha256"),
+        let generated = root.path().join("generated support");
+        for name in shell_support::NAMES {
+            let path = generated.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("generated {name} for {TARGET}\n")).unwrap();
+        }
+        let support = shell_support::package(&generated, TARGET, VERSION, &release).unwrap();
+        fs::write(
             release.join("SHA256SUMS"),
+            format!(
+                "{}{}",
+                fs::read_to_string(archive.with_extension("zip.sha256")).unwrap(),
+                fs::read_to_string(support.with_extension("zip.sha256")).unwrap()
+            ),
         )
         .unwrap();
         fs::create_dir(root.path().join("temporary compiler output")).unwrap();
@@ -180,6 +192,13 @@ impl Fixture {
 
     fn installed(&self, path: &Path) {
         assert_eq!(fs::read(path.join("kuru.exe")).unwrap(), self.replacement);
+        let support = path.join(format!("share/kuru/{VERSION}/{TARGET}"));
+        for name in shell_support::NAMES {
+            assert_eq!(
+                fs::read(support.join(name)).unwrap(),
+                format!("generated {name} for {TARGET}\n").into_bytes()
+            );
+        }
         assert!(!self.root.path().join("executed").exists());
         assert_no_stage(path);
         let state = Directory::open(
@@ -208,6 +227,11 @@ impl Fixture {
             format!("{}  {name}\n", digest(bytes)),
         )
         .unwrap();
+    }
+
+    fn support_archive(&self) -> PathBuf {
+        self.release
+            .join(shell_support::archive_name(VERSION, TARGET).unwrap())
     }
 
     async fn crash_gap(&self) {
@@ -346,6 +370,121 @@ async fn default_install_destination_uses_local_app_data_programs_and_recover_ne
         .await;
     success(&result);
     fixture.installed(&destination);
+}
+
+#[tokio::test]
+async fn marked_windows_core_requires_verified_paired_support_before_publication() {
+    let fixture = Fixture::new();
+    let core = fixture.release.join(archive_name(VERSION, TARGET).unwrap());
+    fs::write(
+        fixture.release.join("SHA256SUMS"),
+        format!(
+            "{}  {}\n",
+            digest(&fs::read(&core).unwrap()),
+            core.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let mut command = fixture.command();
+    let result = fixture.run(&mut command).await;
+    assert!(
+        stderr_message(&result).contains("paired shell-support archive exactly once"),
+        "{}",
+        stderr_message(&result)
+    );
+    fixture.unchanged();
+
+    let sidecar = fixture.support_archive();
+    fs::write(
+        fixture.release.join("SHA256SUMS"),
+        format!(
+            "{}  {}\n{}  {}\n",
+            digest(&fs::read(&core).unwrap()),
+            core.file_name().unwrap().to_str().unwrap(),
+            digest(&fs::read(&sidecar).unwrap()),
+            sidecar.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(sidecar, b"corrupt support").unwrap();
+    let mut command = fixture.command();
+    let result = fixture.run(&mut command).await;
+    assert!(
+        stderr_message(&result).contains("Shell-support archive checksum mismatch"),
+        "{}",
+        stderr_message(&result)
+    );
+    fixture.unchanged();
+}
+
+#[tokio::test]
+async fn stock_ps51_accepts_a_verified_unmarked_historical_core_without_support() {
+    let fixture = Fixture::new();
+    let members = [
+        WriteMember {
+            name: "kuru.exe",
+            kind: MemberKind::File,
+            bytes: &fixture.replacement,
+            executable: true,
+        },
+        WriteMember {
+            name: "LICENSE",
+            kind: MemberKind::File,
+            bytes: b"historical license",
+            executable: false,
+        },
+        WriteMember {
+            name: "README.md",
+            kind: MemberKind::File,
+            bytes: b"historical release without a support marker",
+            executable: false,
+        },
+    ];
+    fixture.replace_archive(
+        &zip::write(
+            &members,
+            Limits {
+                max_compressed_bytes: MAX_ARCHIVE_BYTES as u64,
+                max_expanded_bytes: MAX_ARCHIVE_BYTES as u64,
+                allow_ntfs_timestamps: false,
+            },
+        )
+        .unwrap(),
+    );
+    let mut command = fixture.command();
+    success(&fixture.run(&mut command).await);
+    assert_eq!(
+        fs::read(fixture.install.join("kuru.exe")).unwrap(),
+        fixture.replacement
+    );
+    assert!(!fixture.install.join("share").exists());
+}
+
+#[tokio::test]
+async fn retained_v041_v042_powershell_reader_accepts_the_new_three_member_core() {
+    // v0.4.1 and v0.4.2 shipped byte-identical install.ps1 readers. Retain
+    // their actual script so this native compatibility check needs no checkout.
+    const OLD_READER_SHA256: &str =
+        "2425cfa02eea191752a7617b3c1cafffdd96f584348a36ea9c9b0e938d97084d";
+    let fixture = Fixture::new();
+    let old = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/install-v0.4.2.ps1");
+    assert_eq!(digest(&fs::read(&old).unwrap()), OLD_READER_SHA256);
+    let mut command = Command::new(fixture.powershell());
+    command
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+        .arg(old)
+        .args(["-Version", VERSION])
+        .current_dir(fixture.root.path())
+        .env_clear()
+        .envs(fixture.environment());
+    success(&fixture.run(&mut command).await);
+    assert_eq!(
+        fs::read(fixture.install.join("kuru.exe")).unwrap(),
+        fixture.replacement
+    );
+    assert!(!fixture.install.join("share").exists());
+    assert!(!fixture.root.path().join("executed").exists());
+    assert_no_stage(&fixture.install);
 }
 
 #[tokio::test]
@@ -684,6 +823,12 @@ async fn omitted_version_freezes_simulated_release_roots_before_fetching_real_na
     fs::create_dir_all(&frozen).unwrap();
     let name = archive_name(VERSION, TARGET).unwrap();
     fs::copy(fixture.release.join(&name), frozen.join(&name)).unwrap();
+    let support_name = shell_support::archive_name(VERSION, TARGET).unwrap();
+    fs::copy(
+        fixture.release.join(&support_name),
+        frozen.join(&support_name),
+    )
+    .unwrap();
     let manifest = fs::read(fixture.release.join("SHA256SUMS")).unwrap();
     fs::write(latest.join("SHA256SUMS"), &manifest).unwrap();
     // The actual bootstrap is unchanged except its fixed release-origin literal.

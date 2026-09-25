@@ -247,6 +247,9 @@ fn expected_assets(version: &str) -> Result<BTreeSet<String>> {
         .iter()
         .map(|target| archive::archive_name(version, target.triple))
         .collect::<Result<BTreeSet<_>>>()?;
+    for target in &targets::CATALOG {
+        names.insert(crate::shell_support::archive_name(version, target.triple)?);
+    }
     names.insert("SHA256SUMS".to_owned());
     Ok(names)
 }
@@ -715,11 +718,27 @@ pub async fn run(options: Options) -> Result<()> {
         checksums.get(&archive_name) == Some(&archive_sha256),
         "published Windows archive differs from SHA256SUMS"
     );
-    let executable = archive::extract_binary(
+    let (executable, marked) = archive::extract_core(
         &archive_bytes,
         targets::find(WINDOWS_TARGET)?,
         archive::MAX_ARCHIVE_BYTES,
     )?;
+    ensure!(
+        marked,
+        "published core is missing its required shell support marker"
+    );
+    let support_name = crate::shell_support::archive_name(&version, WINDOWS_TARGET)?;
+    let support_bytes = github
+        .get(
+            &format!("{download_base}/{support_name}"),
+            crate::shell_support::MAX_ENVELOPE_BYTES,
+        )
+        .await?;
+    ensure!(
+        checksums.get(&support_name) == Some(&archive::digest(&support_bytes)),
+        "published Windows shell support differs from SHA256SUMS"
+    );
+    let support = crate::shell_support::decode(&support_bytes, targets::find(WINDOWS_TARGET)?)?;
     let executable_sha256 = archive::digest(&executable);
 
     let manifest: EngineManifest = serde_json::from_slice(&read_bounded(
@@ -785,6 +804,30 @@ pub async fn run(options: Options) -> Result<()> {
         ensure!(
             reported.trim() == format!("kuru {version}"),
             "installed Kuru reports a different version"
+        );
+        for (name, shell) in [
+            ("completions/kuru.bash", "bash"),
+            ("completions/_kuru", "zsh"),
+            ("completions/kuru.fish", "fish"),
+            ("completions/kuru.ps1", "powershell"),
+        ] {
+            let output = install
+                .success(
+                    "installed-shell-support",
+                    &["exec", "--", "kuru", "completions", shell],
+                )
+                .await?;
+            ensure!(
+                support.get(name) == Some(output.as_bytes()),
+                "published shell support differs from the installed CLI"
+            );
+        }
+        let man = install
+            .success("installed-man", &["exec", "--", "kuru", "man"])
+            .await?;
+        ensure!(
+            support.get("man/kuru.1") == Some(man.as_bytes()),
+            "published man page differs from the installed CLI"
         );
         ensure!(
             !install.data.exists() && !install.engine_cache.exists(),

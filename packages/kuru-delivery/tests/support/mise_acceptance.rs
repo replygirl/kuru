@@ -681,7 +681,11 @@ oauth_client_id=""
 'regex:^(https?://.*)'='FIXTURE_BASE/unexpected/$1'
 "#;
 
-async fn run_archive(bytes: Vec<u8>, expected: String) -> Result<()> {
+async fn run_archive(
+    bytes: Vec<u8>,
+    expected: String,
+    support: Option<&kuru_delivery::shell_support::Files>,
+) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let env = ["PATH", "PATHEXT", "SystemRoot"]
         .into_iter()
@@ -798,6 +802,27 @@ async fn run_archive(bytes: Vec<u8>, expected: String) -> Result<()> {
                 "mise activation selected wrong version"
             );
             if index == 0 {
+                if let Some(files) = support {
+                    for (name, shell) in [
+                        ("completions/kuru.bash", "bash"),
+                        ("completions/_kuru", "zsh"),
+                        ("completions/kuru.fish", "fish"),
+                        ("completions/kuru.ps1", "powershell"),
+                    ] {
+                        let output = installed
+                            .success(&["exec", "--", "kuru", "completions", shell])
+                            .await?;
+                        ensure!(
+                            files.get(name) == Some(output.as_bytes()),
+                            "staged support differs from the installed CLI"
+                        );
+                    }
+                    let man = installed.success(&["exec", "--", "kuru", "man"]).await?;
+                    ensure!(
+                        files.get("man/kuru.1") == Some(man.as_bytes()),
+                        "staged manual differs from the installed CLI"
+                    );
+                }
                 installed.conversation(&path).await?;
             }
         }
@@ -861,7 +886,7 @@ pub async fn run(binary: &Path) -> Result<()> {
     let archive = archive::package(binary, TARGET, VERSION, root.path())?;
     let bytes = fs::read(archive)?;
     let expected = archive::digest(&fs::read(binary)?);
-    run_archive(bytes, expected).await
+    run_archive(bytes, expected, None).await
 }
 
 pub async fn run_staged(archive_path: &Path) -> Result<()> {
@@ -884,6 +909,10 @@ pub async fn run_staged(archive_path: &Path) -> Result<()> {
         archive::digest(&bytes) == expected_archive,
         "staged Windows archive differs from SHA256SUMS"
     );
-    let executable = archive::verified_binary(directory, VERSION, TARGET).await?;
-    run_archive(bytes, archive::digest(&executable)).await
+    let (executable, support) = archive::verified_release(directory, VERSION, TARGET).await?;
+    ensure!(
+        support.is_some(),
+        "staged new release is missing its paired shell support"
+    );
+    run_archive(bytes, archive::digest(&executable), support.as_ref()).await
 }

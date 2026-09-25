@@ -8,7 +8,8 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use kuru_delivery::release::{self, GitHub, Version};
-use kuru_delivery::{archive::digest, command};
+use kuru_delivery::{archive::digest, command, shell_support};
+use kuru_platform::fs::make_executable;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -86,6 +87,16 @@ fn required_release_checks_precede_the_only_publication_job() {
     assert!(assembly.contains("if-no-files-found: error"));
     assert!(!assembly.contains("contents: write"));
     assert!(!assembly.contains("GH_TOKEN:"));
+
+    let build = job("build");
+    for required in [
+        "mise run //apps/kuru-tui:shell-support:generate",
+        "mise run //packages/kuru-delivery:package:shell-support",
+        "Get-FileHash -Algorithm SHA256",
+        "openssl dgst -sha256",
+    ] {
+        assert!(build.contains(required), "native build lost {required}");
+    }
 
     let verifier = job("verify-staged-windows");
     for required in [
@@ -682,14 +693,14 @@ async fn real_cli_assembles_a_candidate_without_github_credentials() {
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "Assembled 6 release candidate checks"
+        "Assembled 11 release candidate checks"
     );
     assert_eq!(
         fs::read_to_string(archives.directory.join("SHA256SUMS"))
             .unwrap()
             .lines()
             .count(),
-        release::TARGETS.len()
+        release::TARGETS.len() * 2
     );
 }
 
@@ -1124,17 +1135,19 @@ impl Archives {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join("dist");
         fs::create_dir(&directory).unwrap();
-        // Publication validates opaque packager output. Installer/package tests
-        // independently validate tar contents; here each native asset is distinct.
+        // The candidate verifier decodes every exact core and support inventory.
+        let binary = temp.path().join("fixture-kuru");
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        make_executable(&File::open(&binary).unwrap()).unwrap();
+        let generated = temp.path().join("generated");
+        fs::create_dir_all(generated.join("completions")).unwrap();
+        fs::create_dir_all(generated.join("man")).unwrap();
+        for name in shell_support::NAMES {
+            fs::write(generated.join(name), format!("fixture {name}\n")).unwrap();
+        }
         for target in release::TARGETS {
-            let name = kuru_delivery::archive::archive_name("0.1.0", target).unwrap();
-            let data = format!("verified native fixture {target}");
-            fs::write(directory.join(&name), &data).unwrap();
-            fs::write(
-                directory.join(format!("{name}.sha256")),
-                format!("{}  {name}\n", digest(data.as_bytes())),
-            )
-            .unwrap();
+            kuru_delivery::archive::package(&binary, target, "0.1.0", &directory).unwrap();
+            shell_support::package(&generated, target, "0.1.0", &directory).unwrap();
         }
         let notes = temp.path().join("notes.md");
         fs::write(&notes, "# Kuru 0.1.0\n\nPersistent peer conversations.\n").unwrap();
@@ -1179,7 +1192,7 @@ async fn interrupted_draft_resumes_missing_assets_then_publishes_exact_commit() 
     );
     {
         let remote = server.state.lock().unwrap();
-        assert_eq!(remote.uploads.len(), 6);
+        assert_eq!(remote.uploads.len(), 11);
         assert_eq!(remote.release.as_ref().unwrap()["draft"], false);
         assert!(
             remote.release.as_ref().unwrap()["body"]
@@ -1209,7 +1222,7 @@ async fn interrupted_draft_resumes_missing_assets_then_publishes_exact_commit() 
             .unwrap()
             .lines()
             .count(),
-        release::TARGETS.len()
+        release::TARGETS.len() * 2
     );
 }
 #[tokio::test]
@@ -1300,6 +1313,32 @@ async fn published_recovery_rejects_incomplete_or_mismatched_remote_content() {
 async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
     let archives = Archives::new();
     let server = Server::new(A).await;
+    let support_name = shell_support::archive_name("0.1.0", release::TARGETS[0]).unwrap();
+    let support_path = archives.directory.join(&support_name);
+    let original_support = fs::read(&support_path).unwrap();
+    fs::remove_file(&support_path).unwrap();
+    assert!(
+        release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
+            .unwrap_err()
+            .to_string()
+            .contains("five core and five paired")
+    );
+    fs::write(&support_path, b"not a support envelope").unwrap();
+    fs::write(
+        archives.directory.join(format!("{support_name}.sha256")),
+        format!("{}  {support_name}\n", digest(b"not a support envelope")),
+    )
+    .unwrap();
+    assert!(
+        release::assemble(&archives.directory, v("0.1.0"), &archives.notes).is_err(),
+        "candidate accepted a checksummed but invalid support envelope"
+    );
+    fs::write(&support_path, &original_support).unwrap();
+    fs::write(
+        archives.directory.join(format!("{support_name}.sha256")),
+        format!("{}  {support_name}\n", digest(&original_support)),
+    )
+    .unwrap();
     let name = kuru_delivery::archive::archive_name("0.1.0", release::TARGETS[0]).unwrap();
     let path = archives.directory.join(name);
     let original = fs::read(&path).unwrap();
@@ -1308,7 +1347,7 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
         release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
             .unwrap_err()
             .to_string()
-            .contains("five supported")
+            .contains("five core and five paired")
     );
     assert!(
         archives
@@ -1316,7 +1355,7 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("five supported")
+            .contains("five core and five paired")
     );
     fs::write(&path, b"corrupt").unwrap();
     assert!(

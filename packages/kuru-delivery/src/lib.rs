@@ -20,6 +20,7 @@ pub mod published_windows;
 pub mod release;
 #[cfg(feature = "tooling")]
 pub mod repo;
+pub mod shell_support;
 mod staging;
 pub mod targets;
 #[cfg(windows)]

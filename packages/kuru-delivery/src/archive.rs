@@ -22,6 +22,27 @@ use std::{
 
 pub use crate::targets::TARGETS;
 pub const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
+pub const SHELL_SUPPORT_MARKER: &str = "<!-- kuru-shell-support-format: 1 -->";
+pub const MAX_README_BYTES: usize = 64 * 1024;
+
+fn shell_support_marker(readme: &[u8]) -> Result<bool> {
+    ensure!(
+        readme.len() <= MAX_README_BYTES,
+        "release README exceeds size limit"
+    );
+    let readme = std::str::from_utf8(readme).context("release README is not UTF-8")?;
+    let mut found = false;
+    for (offset, line) in readme.lines().enumerate() {
+        if line.contains("kuru-shell-support-format") {
+            ensure!(
+                !found && offset < 64 && line == SHELL_SUPPORT_MARKER,
+                "release README has a malformed, duplicate or unsupported shell support marker"
+            );
+            found = true;
+        }
+    }
+    Ok(found)
+}
 
 pub fn checked_version(value: &str) -> Result<&str> {
     let value = value.strip_prefix('v').unwrap_or(value);
@@ -234,8 +255,16 @@ pub async fn install(
         Some(target) => target,
         None => host_target()?,
     };
-    let bytes = verified_binary(base, version, target).await?;
-    install_binary(&bytes, destination, crate::targets::find(target)?)
+    let (bytes, support) = verified_release(base, version, target).await?;
+    if let Some(files) = &support {
+        crate::shell_support::install_versioned(files, destination, version, target)?;
+    }
+    let installed = install_binary(&bytes, destination, crate::targets::find(target)?)?;
+    if let Some(files) = &support {
+        crate::shell_support::publish_stable_man(files, destination)
+            .context("executable installed, but stable man page publication is incomplete")?;
+    }
+    Ok(installed)
 }
 
 /// Install a trusted local build using the same bounded held-file publication
@@ -263,14 +292,31 @@ pub fn install_local(binary: &Path, destination: &Path, target: Option<&str>) ->
 /// Verify release checksum and the complete archive before exposing candidate bytes.
 /// This function never executes, installs or probes the candidate.
 pub async fn verified_binary(base: &str, version: &str, target: &str) -> Result<Vec<u8>> {
+    Ok(verified_release(base, version, target).await?.0)
+}
+
+/// Verify one authenticated core and its required paired support before any
+/// executable mutation. Historical unmarked cores remain executable-only.
+pub async fn verified_release(
+    base: &str,
+    version: &str,
+    target: &str,
+) -> Result<(Vec<u8>, Option<crate::shell_support::Files>)> {
     let name = archive_name(version, target)?;
-    let expected = expected_digest(&read_asset(base, "SHA256SUMS", 64 * 1024).await?, &name)?;
+    let manifest = read_asset(base, "SHA256SUMS", 64 * 1024).await?;
+    let expected = expected_digest(&manifest, &name)?;
     let bytes = read_asset(base, &name, MAX_ARCHIVE_BYTES).await?;
     ensure!(
         digest(&bytes) == expected,
         "release archive checksum mismatch; existing executable unchanged"
     );
-    extract_binary(&bytes, crate::targets::find(target)?, MAX_ARCHIVE_BYTES)
+    let (binary, marked) = extract_core(&bytes, crate::targets::find(target)?, MAX_ARCHIVE_BYTES)?;
+    let support = if marked {
+        Some(crate::shell_support::verified(base, version, target, &manifest).await?)
+    } else {
+        None
+    };
+    Ok((binary, support))
 }
 
 #[cfg(test)]
@@ -287,13 +333,24 @@ fn zip_limits(limit: usize) -> Limits {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn extract_binary(bytes: &[u8], target: &Target, limit: usize) -> Result<Vec<u8>> {
+    Ok(extract_core(bytes, target, limit)?.0)
+}
+
+/// Decode the unchanged three-member core and classify its authenticated README.
+/// An unmarked historical core is valid, while an unsafe marker never is.
+pub fn extract_core(bytes: &[u8], target: &Target, limit: usize) -> Result<(Vec<u8>, bool)> {
     ensure!(bytes.len() <= limit, "release archive exceeds size limit");
     if target.format == ArchiveFormat::Zip {
         let expected = [target.executable, "LICENSE", "README.md"].map(|name| MemberSpec {
             name,
             kind: MemberKind::File,
-            max_bytes: limit as u64,
+            max_bytes: if name == "README.md" {
+                MAX_README_BYTES as u64
+            } else {
+                limit as u64
+            },
             exact_bytes: None,
             unix_mode: Some(if name == target.executable {
                 0o100755
@@ -309,16 +366,17 @@ pub(crate) fn extract_binary(bytes: &[u8], target: &Target, limit: usize) -> Res
             "release kuru entry is not an executable"
         );
         // Validate every member's decoded CRC/size, including non-executable documentation.
-        for name in ["LICENSE", "README.md"] {
-            archive.copy(name, &mut std::io::sink())?;
-        }
-        return Ok(binary);
+        archive.copy("LICENSE", &mut std::io::sink())?;
+        let mut readme = Vec::new();
+        archive.copy("README.md", &mut readme)?;
+        return Ok((binary, shell_support_marker(&readme)?));
     }
     // Bound all expanded bytes before the tar parser can allocate for PAX or GNU metadata.
     let expanded = bounded(GzDecoder::new(bytes), limit, "expanded release archive")?;
     let mut archive = tar::Archive::new(expanded.as_slice());
     let mut seen = HashSet::new();
     let mut binary = None;
+    let mut readme = None;
     // Raw entries expose extension headers, which are unnecessary in our USTAR format.
     for entry in archive.entries()?.raw(true) {
         let mut entry = entry?;
@@ -345,12 +403,34 @@ pub(crate) fn extract_binary(bytes: &[u8], target: &Target, limit: usize) -> Res
                 "release executable is truncated"
             );
             binary = Some(content);
+        } else if name == b"README.md" {
+            let expected_size = entry.size();
+            let content = bounded(&mut entry, MAX_README_BYTES, "release README")?;
+            ensure!(
+                content.len() as u64 == expected_size,
+                "release README is truncated"
+            );
+            readme = Some(content);
+        } else {
+            let expected_size = entry.size();
+            let content = bounded(&mut entry, limit, "release license")?;
+            ensure!(
+                content.len() as u64 == expected_size,
+                "release license is truncated"
+            );
         }
     }
-    binary.context("release archive must contain exactly one kuru executable")
+    ensure!(
+        seen.len() == 3,
+        "release archive must contain exactly three members"
+    );
+    Ok((
+        binary.context("release archive must contain exactly one kuru executable")?,
+        shell_support_marker(&readme.context("release archive has no README")?)?,
+    ))
 }
 
-fn destination_directory(path: &Path) -> Result<Directory> {
+pub(crate) fn destination_directory(path: &Path) -> Result<Directory> {
     let path = absolute(path)?;
     match Directory::open(&path, Privacy::Inherited, NameRetention::Movable) {
         Ok(directory) => Ok(directory),
@@ -400,6 +480,10 @@ fn install_binary(binary: &[u8], destination: &Path, target: &Target) -> Result<
 }
 
 pub fn package(binary: &Path, target: &str, version: &str, output: &Path) -> Result<PathBuf> {
+    ensure!(
+        shell_support_marker(include_bytes!("../../../README.md"))?,
+        "new release README must declare shell support format"
+    );
     package_with_docs(
         binary,
         target,

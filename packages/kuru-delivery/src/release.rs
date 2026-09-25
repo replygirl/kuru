@@ -616,10 +616,15 @@ pub async fn ensure_tag(api: &GitHub, selected: Version, candidate: &str) -> Res
     Ok(())
 }
 fn archive_assets(directory: &Path, selected: Version) -> Result<BTreeMap<String, String>> {
-    let expected: BTreeSet<_> = TARGETS
+    let cores: BTreeSet<_> = TARGETS
         .iter()
         .map(|target| crate::archive::archive_name(&selected.to_string(), target))
         .collect::<Result<_>>()?;
+    let support: BTreeSet<_> = TARGETS
+        .iter()
+        .map(|target| crate::shell_support::archive_name(&selected.to_string(), target))
+        .collect::<Result<_>>()?;
+    let expected = cores.union(&support).cloned().collect::<BTreeSet<_>>();
     let sidecars = expected
         .iter()
         .map(|name| format!("{name}.sha256"))
@@ -642,7 +647,7 @@ fn archive_assets(directory: &Path, selected: Version) -> Result<BTreeMap<String
     }
     ensure!(
         expected.is_subset(&actual) && sidecars.is_subset(&actual),
-        "release candidate must contain exactly five supported native archives and sidecars"
+        "release candidate must contain five core and five paired shell support archives with checksum sidecars"
     );
     let mut checksums = BTreeMap::new();
     for name in expected {
@@ -659,6 +664,20 @@ fn archive_assets(directory: &Path, selected: Version) -> Result<BTreeMap<String
             "checksum mismatch: {name}"
         );
         checksums.insert(name, digest);
+    }
+    for target in TARGETS {
+        let target = crate::targets::find(target)?;
+        let core_name = crate::archive::archive_name(&selected.to_string(), target.triple)?;
+        let core_bytes = fs::read(directory.join(core_name))?;
+        let (_, marked) =
+            crate::archive::extract_core(&core_bytes, target, crate::archive::MAX_ARCHIVE_BYTES)?;
+        ensure!(
+            marked,
+            "new release core is missing its shell support marker"
+        );
+        let support_name =
+            crate::shell_support::archive_name(&selected.to_string(), target.triple)?;
+        crate::shell_support::decode(&fs::read(directory.join(support_name))?, target)?;
     }
     Ok(checksums)
 }
@@ -776,16 +795,20 @@ async fn published_url(api: &GitHub, release: &Value, selected: Version) -> Resu
     let bytes = api.checksum_manifest(id).await?;
     let text = std::str::from_utf8(&bytes)?;
     ensure!(
-        text.lines().count() == TARGETS.len(),
+        text.lines().count() == TARGETS.len() * 2,
         "published checksum manifest is incomplete"
     );
     let mut checksums = BTreeMap::new();
     for target in TARGETS {
-        let name = crate::archive::archive_name(&selected.to_string(), target)?;
-        checksums.insert(
-            name.clone(),
-            crate::archive::expected_digest(&bytes, &name)?,
-        );
+        for name in [
+            crate::archive::archive_name(&selected.to_string(), target)?,
+            crate::shell_support::archive_name(&selected.to_string(), target)?,
+        ] {
+            checksums.insert(
+                name.clone(),
+                crate::archive::expected_digest(&bytes, &name)?,
+            );
+        }
     }
     checksums.insert("SHA256SUMS".into(), digest(&bytes));
     ensure!(

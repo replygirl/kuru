@@ -2683,11 +2683,14 @@ async fn absent_fast_forward_keeps_the_same_ready_attempt_for_next_open() -> Res
     );
     inspection_main.close().await;
     inspection.close().await?;
+    let reopen_deadline = migration_observation_deadline(&options);
     let reopened = tokio::time::timeout(
-        TEST_DEADLINE,
+        reopen_deadline,
         crate::test_support::spawn_gated_open(options),
     )
-    .await??;
+    .await
+    .context("retained-ready migration reopen exceeded configured observation deadline")?
+    .context("retained-ready migration reopen failed within configured observation deadline")?;
     let completed = reopened.revision().await?;
     let published_ancestor: String = sqlx::query_scalar("SELECT DOLT_MERGE_BASE(?, ?)")
         .bind(&target)

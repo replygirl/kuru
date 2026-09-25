@@ -54,10 +54,12 @@ kuru --provider demo
 
 The bootstrap requires Bash 3.2 or newer, curl, tar, gzip, and either `sha256sum`
 or `shasum`, alongside standard macOS/Linux command-line utilities. It resolves
-latest once, then downloads the selected version's immutable archive and verifies
-its SHA-256 digest. It extracts only the executable into staging beside the
-destination and replaces it atomically after validation. It does not run the
-downloaded executable during installation.
+latest once, then verifies the selected version's immutable executable archive
+and, for a marked release, its matching shell-support archive using SHA-256.
+The five support files are checked and placed under the selected install directory
+before the executable is replaced. The stable Unix manual page is published
+only after the executable replacement is confirmed. The bootstrap does not run
+the downloaded executable during installation or edit shell profiles.
 
 To choose a version and destination, download the script and pass options:
 
@@ -97,9 +99,11 @@ directory on a local drive for installation. `-InstallDir`
 and `-ReleaseBase` override `KURU_INSTALL_DIR` and
 `KURU_RELEASE_BASE`. A custom release directory requires `-Version`. The script
 freezes latest to an explicit version, verifies the ZIP checksum and its exact
-three regular members, and installs only `kuru.exe`. It never runs the downloaded
-candidate to validate it. Reparse points, extra hardlinks, unsafe names and
-unexpected installation objects are refused.
+three regular members. A marked release also requires a checksum-verified
+target-paired shell-support ZIP with exactly five files, installed under the
+selected install directory before `kuru.exe` is replaced. It never runs the
+downloaded candidate to validate it or edits shell profiles. Reparse points,
+extra hardlinks, unsafe names and unexpected installation objects are refused.
 
 Add `-Verbose` when running the saved PowerShell script to see bootstrap stages
 while troubleshooting installation.
@@ -147,7 +151,11 @@ another supported tar target. PowerShell uses the Windows x86-64 ZIP and accepts
 Release archives use `kuru-VERSION-TARGET.tar.gz` for macOS/Linux and
 `kuru-VERSION-x86_64-pc-windows-msvc.zip` for Windows, alongside `SHA256SUMS`.
 Each archive includes the executable,
-`LICENSE` and `README.md`. To install from
+`LICENSE` and `README.md`. New marked releases also have a matching
+`kuru-VERSION-TARGET-shell-support.tar.gz` or `.zip` containing Bash, Zsh,
+Fish and PowerShell completions plus `man/kuru.1`. For offline installation,
+place that sidecar beside the core archive and `SHA256SUMS`; older unmarked
+releases need only the core archive. To install from
 an HTTPS mirror, pass its literal version directory and an explicit version:
 
 ```sh
@@ -155,7 +163,8 @@ bash /tmp/kuru-install.sh --version VERSION \
   --release-base https://github.com/replygirl/kuru/releases/download/vVERSION
 ```
 
-For offline installation, download the matching archive and `SHA256SUMS` into
+For offline installation, download the matching archive, its sidecar when
+present, and `SHA256SUMS` into
 one directory and use that directory as `--release-base`:
 
 ```sh
@@ -167,6 +176,45 @@ require `--version` and are used directly, without appending another version
 directory. Remote sources and redirects must use HTTPS. Downloads and extraction
 are bounded, and checksums are verified before extraction. Checksums detect
 corruption; trust comes from the release source you choose.
+
+## Shell completions and manual page
+
+The current direct installer places verified support snapshots at
+`INSTALL_DIR/share/kuru/VERSION/TARGET/`. Unix installs also maintain the regular
+file `INSTALL_DIR/share/man/man1/kuru.1`. For the default Unix install, load
+completions from the fixed installed executable in your chosen shell:
+
+```bash
+eval "$("$HOME/.local/bin/kuru" completions bash)"
+```
+
+```zsh
+eval "$("$HOME/.local/bin/kuru" completions zsh)"
+```
+
+```fish
+"$HOME/.local/bin/kuru" completions fish | source
+```
+
+On Windows, load PowerShell completions from the installed executable:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\kuru\bin\kuru.exe" completions powershell | Out-String | Invoke-Expression
+```
+
+For ordinary Unix `man kuru`, include the selected install root's manual
+directory in `MANPATH`, for example
+`MANPATH="$HOME/.local/bin/share/man:${MANPATH:-}" man kuru`. `kuru man` emits
+the manual directly. The installer does not edit your profile. If you choose to
+save an activation line yourself, keep this fixed executable path rather than
+a versioned support-file path. After a settled update, start a new shell or
+reload the line to get the new command tree; an already-running shell retains
+the completion code it previously loaded. A failed or uncertain update does
+not promise synchronized activation: finish the normal update recovery first.
+Older updaters can install the compatible core executable without adding its
+new sidecar; rerun the current verified installer for that exact version and
+install directory to repair managed support, or use the installed executable's
+pure `completions` and `man` outputs for files you manage yourself.
 
 From a checkout, `bash scripts/install.sh` forwards these binary-install options
 to the shell bootstrap; `& .\scripts\install.ps1` forwards PowerShell options to

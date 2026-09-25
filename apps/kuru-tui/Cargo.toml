@@ -26,6 +26,8 @@ kuru-delivery.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
 crossterm = { workspace = true, features = ["event-stream", "use-dev-tty"] }
 futures.workspace = true
 kuru-core.workspace = true
