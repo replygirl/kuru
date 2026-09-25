@@ -15,7 +15,9 @@ use kuru_core::{
     ContextSource, ContextSourceKind, Message, Mode, ModeProfile, ModelInfo, RelationshipKind,
     ToolCall, VisibilityPolicy,
 };
-use kuru_memory::MemoryStore;
+use kuru_memory::{
+    ContextSummaryCheckpoint, ContextSummaryRecord, MemoryStore, ReasoningSummaryRecord,
+};
 use serde_json::json;
 
 use crate::{Harness, RequestContext};
@@ -97,6 +99,7 @@ struct MeasuredRequest {
 #[derive(Default)]
 struct RecordingDemo {
     requests: Mutex<Vec<MeasuredRequest>>,
+    optimistic_preflight: bool,
 }
 
 struct MeasurementSink<'a> {
@@ -122,6 +125,21 @@ impl ProviderSink for MeasurementSink<'_> {
 impl Provider for RecordingDemo {
     async fn models(&self) -> Result<Vec<ModelInfo>> {
         DemoProvider.models().await
+    }
+
+    async fn estimate_context(&self, request: &CompletionRequest) -> Result<ContextEstimate> {
+        if self.optimistic_preflight {
+            // The bounded-window fixture checks a late provider rejection:
+            // its actual Demo stream measures the full selected request.
+            Ok(ContextEstimate::for_final_body(
+                request.context_budget.clone().unwrap(),
+                100,
+                false,
+                vec![],
+            ))
+        } else {
+            DemoProvider.estimate_context(request).await
+        }
     }
 
     async fn stream(&self, request: CompletionRequest, sink: &mut dyn ProviderSink) -> Result<()> {
@@ -167,7 +185,10 @@ async fn observe_selection(
     visibility.omit_notes = omit_notes;
     visibility.omit_history = omit_history;
     profile.visibility = Arc::new(visibility);
-    let provider = Arc::new(RecordingDemo::default());
+    let provider = Arc::new(RecordingDemo {
+        optimistic_preflight: window.is_some(),
+        ..RecordingDemo::default()
+    });
     let mut settings = config();
     settings.assumed_context_window_tokens = window;
     if window.is_some() {
@@ -624,6 +645,218 @@ async fn visibility_delivery_veto_has_truthful_refusal_and_no_mail_or_recipient_
                 message.role == "tool" && message.text_projection().contains("visibility")
             })
     );
+    harness.shutdown(false).await.unwrap();
+    memory.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn own_history_admits_only_typed_same_actor_cross_session_summaries() {
+    let project = tempfile::tempdir().unwrap();
+    let memory = MemoryStore::temporary().await.unwrap();
+    let profile = ModeProfile::builtin(Mode::Ifs);
+    let provider = Arc::new(RecordingDemo::default());
+    let mut settings = config();
+    settings.assumed_context_window_tokens = Some(4_096);
+    settings.context_output_reserve_tokens = Some(256);
+    let mut harness = Harness::new_with_test_profile(
+        settings,
+        project.path(),
+        memory.clone(),
+        provider.clone(),
+        None,
+        profile,
+    )
+    .await
+    .unwrap();
+    let actor = harness.topology.parts[0].id.clone();
+    let other_actor = harness.topology.parts[1].id.clone();
+    let namespace = harness.namespace(&actor);
+    let other_namespace = harness.namespace(&other_actor);
+    let current_session = harness.session.id.clone();
+
+    async fn seed_summary(
+        memory: &MemoryStore,
+        namespace: &str,
+        session: &str,
+        actor: &str,
+        raw: &str,
+        summary: &str,
+        private_reasoning: &str,
+    ) {
+        memory
+            .append_session_message(namespace, session, &Message::text("user", raw))
+            .await
+            .unwrap();
+        let snapshot = memory
+            .session_source_snapshot(namespace, session, namespace, 0, 1_024)
+            .await
+            .unwrap();
+        let through = snapshot.through_inclusive.unwrap();
+        let operation_id = format!("cross-session-operation-{session}-{actor}");
+        let invocation_id = format!("cross-session-invocation-{session}-{actor}");
+        memory
+            .checkpoint_context_summary(&ContextSummaryCheckpoint {
+                record: ContextSummaryRecord {
+                    actor_namespace: namespace.into(),
+                    session_id: session.into(),
+                    source_namespace: namespace.into(),
+                    summary_namespace: crate::context_compaction::summary_namespace(namespace),
+                    source_view: snapshot.view,
+                    source_revision: snapshot.revision,
+                    after_sequence: 0,
+                    through_sequence: through,
+                    turn_id: None,
+                    operation_id: Some(operation_id.clone()),
+                    producer_actor_id: Some(actor.into()),
+                    invocation_id: invocation_id.clone(),
+                    summary: summary.into(),
+                },
+                private_reasoning: vec![ReasoningSummaryRecord {
+                    session_id: session.into(),
+                    turn_id: None,
+                    operation_id: Some(operation_id),
+                    actor_id: actor.into(),
+                    invocation_id,
+                    item_id: Some("private-item".into()),
+                    output_index: Some(0),
+                    summary_index: 0,
+                    text: private_reasoning.into(),
+                }],
+            })
+            .await
+            .unwrap();
+    }
+
+    seed_summary(
+        &memory,
+        &namespace,
+        "older-foreign-session",
+        &actor,
+        "OLDER_FOREIGN_RAW_MUST_NOT_APPEAR",
+        &"OLDER_SHARED_SUMMARY_MUST_BE_OMITTED".repeat(1_000),
+        "OLDER_FOREIGN_REASONING_MUST_NOT_APPEAR",
+    )
+    .await;
+    seed_summary(
+        &memory,
+        &namespace,
+        "foreign-session",
+        &actor,
+        "FOREIGN_RAW_MUST_NOT_APPEAR",
+        "ALLOWED_SHARED_SUMMARY",
+        "FOREIGN_REASONING_MUST_NOT_APPEAR",
+    )
+    .await;
+    seed_summary(
+        &memory,
+        &other_namespace,
+        "other-actor-session",
+        &other_actor,
+        "OTHER_ACTOR_RAW_MUST_NOT_APPEAR",
+        "OTHER_ACTOR_SUMMARY_MUST_NOT_APPEAR",
+        "OTHER_ACTOR_REASONING_MUST_NOT_APPEAR",
+    )
+    .await;
+    seed_summary(
+        &memory,
+        &namespace,
+        &current_session,
+        &actor,
+        "CURRENT_RAW_BEFORE_CURSOR_MUST_NOT_APPEAR",
+        "CURRENT_SESSION_SUMMARY_ONCE",
+        "CURRENT_REASONING_MUST_NOT_APPEAR",
+    )
+    .await;
+    let current_cursor = memory
+        .context_summary_cursor(&namespace, &current_session, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+
+    harness
+        .ask(
+            &actor,
+            vec![Message::text("user", "current-session-input")],
+            "speak and act: shared continuity",
+            vec![],
+        )
+        .await
+        .unwrap();
+    let allowed = provider
+        .requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .request
+        .clone();
+    let allowed_text = serde_json::to_string(&allowed.messages).unwrap();
+    assert!(allowed_text.contains("ALLOWED_SHARED_SUMMARY"));
+    assert!(!allowed_text.contains("OLDER_SHARED_SUMMARY_MUST_BE_OMITTED"));
+    assert_eq!(
+        allowed_text.matches("CURRENT_SESSION_SUMMARY_ONCE").count(),
+        1
+    );
+    for forbidden in [
+        "FOREIGN_RAW_MUST_NOT_APPEAR",
+        "FOREIGN_REASONING_MUST_NOT_APPEAR",
+        "OLDER_FOREIGN_RAW_MUST_NOT_APPEAR",
+        "OLDER_FOREIGN_REASONING_MUST_NOT_APPEAR",
+        "CURRENT_RAW_BEFORE_CURSOR_MUST_NOT_APPEAR",
+        "CURRENT_REASONING_MUST_NOT_APPEAR",
+        "OTHER_ACTOR_RAW_MUST_NOT_APPEAR",
+        "OTHER_ACTOR_SUMMARY_MUST_NOT_APPEAR",
+        "OTHER_ACTOR_REASONING_MUST_NOT_APPEAR",
+    ] {
+        assert!(!allowed_text.contains(forbidden), "leaked {forbidden}");
+    }
+    let allowed_context = harness.subscribe_context().borrow().latest.clone().unwrap();
+    assert_eq!(allowed_context.omitted_summary_rows, 1);
+    assert!(allowed_context.runtime_sources.iter().any(|source| {
+        source.kind == ContextSourceKind::ContextSummary && !source.mandatory && source.units == 1
+    }));
+    assert_eq!(
+        memory
+            .context_summary_cursor(&namespace, &current_session, &namespace)
+            .await
+            .unwrap()
+            .unwrap(),
+        current_cursor,
+        "foreign continuity advanced the current session cursor"
+    );
+
+    let mut denied = SelectedVisibility::new(harness.profile.visibility.clone());
+    denied.omit_history = true;
+    harness.profile.visibility = Arc::new(denied);
+    harness
+        .ask(
+            &actor,
+            vec![Message::text("user", "denied-current-input")],
+            "speak and act: denied shared continuity",
+            vec![],
+        )
+        .await
+        .unwrap();
+    let denied = provider
+        .requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .request
+        .clone();
+    let denied_text = serde_json::to_string(&denied.messages).unwrap();
+    assert!(!denied_text.contains("ALLOWED_SHARED_SUMMARY"));
+    assert!(denied_text.contains("denied-current-input"));
+    assert_eq!(
+        memory
+            .context_summary_cursor(&namespace, &current_session, &namespace)
+            .await
+            .unwrap()
+            .unwrap(),
+        current_cursor
+    );
+
     harness.shutdown(false).await.unwrap();
     memory.close().await.unwrap();
 }

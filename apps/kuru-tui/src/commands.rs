@@ -12,6 +12,7 @@ pub(crate) const CANDIDATE_PAGE_LIMIT: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandId {
     Clear,
+    Compact,
     Cost,
     Dream,
     Effort,
@@ -56,6 +57,12 @@ pub(crate) const BUILT_INS: &[CommandSpec] = &[
         name: "/clear",
         usage: "/clear",
         summary: "Clear this visible conversation view",
+    },
+    CommandSpec {
+        id: CommandId::Compact,
+        name: "/compact",
+        usage: "/compact [ID]",
+        summary: "Compact retained context for one or all active identities",
     },
     CommandSpec {
         id: CommandId::Cost,
@@ -422,7 +429,6 @@ mod tests {
             "/resume",
             "/config",
             "/export",
-            "/compact",
             "/instruction-once",
             "/approval-always",
         ] {

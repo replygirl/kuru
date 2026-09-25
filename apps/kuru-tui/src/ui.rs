@@ -1162,12 +1162,16 @@ fn format_session_usage(usage: &SessionUsage) -> String {
 fn omission_notice(context: &RequestContext) -> Option<String> {
     let total = context
         .omitted_public_rows
+        .saturating_add(context.omitted_summary_rows)
         .saturating_add(context.omitted_private_rows)
         .saturating_add(context.omitted_note_rows);
     (total > 0).then(|| {
         format!(
-            "For this response, {} older public, {} private and {} note row(s) were omitted from model context; stored history is unchanged.",
-            context.omitted_public_rows, context.omitted_private_rows, context.omitted_note_rows
+            "For this response, {} older public, {} shared summary, {} private and {} note row(s) were omitted from model context; stored history is unchanged.",
+            context.omitted_public_rows,
+            context.omitted_summary_rows,
+            context.omitted_private_rows,
+            context.omitted_note_rows
         )
     })
 }
@@ -2509,6 +2513,10 @@ async fn dispatch_controlled(
             ensure!(args.is_empty(), "usage: /tools");
             serde_json::to_string_pretty(&harness.tool_catalog().await?)?
         }
+        Some(CommandId::Compact) => harness
+            .compact_controlled((!args.is_empty()).then_some(args), cancellation)
+            .await?
+            .join("\n"),
         Some(CommandId::FileCheckpoints) => {
             ensure!(args.is_empty(), "usage: /file-checkpoints");
             serde_json::to_string_pretty(&harness.file_checkpoints(100)?)?
@@ -2766,6 +2774,7 @@ mod tests {
             ),
             runtime_sources: vec![],
             omitted_public_rows: 2,
+            omitted_summary_rows: 0,
             omitted_private_rows: 1,
             omitted_note_rows: 0,
         };
@@ -2783,7 +2792,7 @@ mod tests {
         assert!(
             omission_notice(&context)
                 .unwrap()
-                .contains("2 older public, 1 private")
+                .contains("2 older public, 0 shared summary, 1 private")
         );
         let mut dream = context.clone();
         dream.operation_id = "dream-after-turn".into();

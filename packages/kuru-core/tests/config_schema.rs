@@ -47,10 +47,20 @@ fn published_schema_accepts_defaults_and_documented_configuration() {
     let validator = schema();
     let defaults = serde_json::to_value(Config::default()).unwrap();
     assert!(validator.is_valid(&defaults));
-    let example = "provider='responses'\nmodel='future-model'\neffort='future-effort'\nassumed_context_window_tokens=64000\ncontext_output_reserve_tokens=4096\n[mcp.local]\ncommand='runner'\nargs=['--stdio']\n[mcp.local.env]\nTOKEN='from-environment'\n[external_agents]\npeer='https://example.test/a2a'\n[memory]\nstartup_timeout_secs=60";
+    assert_eq!(Config::default().context_compaction_threshold_percent, 75);
+    assert_eq!(
+        Config::default().context_compaction_output_reserve_tokens,
+        1_024
+    );
+    let example = "provider='responses'\nmodel='future-model'\neffort='future-effort'\nassumed_context_window_tokens=64000\ncontext_output_reserve_tokens=4096\ncontext_compaction_threshold_percent=80\ncontext_compaction_output_reserve_tokens=2048\n[mcp.local]\ncommand='runner'\nargs=['--stdio']\n[mcp.local.env]\nTOKEN='from-environment'\n[external_agents]\npeer='https://example.test/a2a'\n[memory]\nstartup_timeout_secs=60";
     let value = json_from_toml(example);
     assert!(validator.is_valid(&value));
     parse_config(example).unwrap();
+    for threshold in [50, 95] {
+        let text = format!("context_compaction_threshold_percent={threshold}");
+        assert!(validator.is_valid(&json_from_toml(&text)), "schema: {text}");
+        parse_config(&text).unwrap();
+    }
 }
 
 #[test]
@@ -96,6 +106,10 @@ fn schema_and_parser_reject_unknown_keys_and_shared_bounds() {
         "assumed_context_window_tokens=2000001",
         "context_output_reserve_tokens=0",
         "context_output_reserve_tokens=2000001",
+        "context_compaction_threshold_percent=49",
+        "context_compaction_threshold_percent=96",
+        "context_compaction_output_reserve_tokens=0",
+        "context_compaction_output_reserve_tokens=2000001",
         "[memory]\nstartup_timeout_secs=0",
     ] {
         assert!(!validator.is_valid(&json_from_toml(text)), "schema: {text}");

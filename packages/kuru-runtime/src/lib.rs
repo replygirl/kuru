@@ -1,6 +1,7 @@
 //! A pool of persistent peers; scheduling policy is deterministic, never an LLM supervisor.
 mod actor;
 mod bus;
+mod context_compaction;
 mod dream;
 mod engine;
 mod event;

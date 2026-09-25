@@ -110,6 +110,7 @@ fn prepared_context_status_is_bounded_and_keeps_the_composer_at_practical_sizes(
         ),
         runtime_sources: vec![],
         omitted_public_rows: 2,
+        omitted_summary_rows: 0,
         omitted_private_rows: 1,
         omitted_note_rows: 0,
     });

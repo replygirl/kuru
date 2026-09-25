@@ -1099,6 +1099,7 @@ fn draw_status(frame: &mut Frame<'_>, view: &View, area: Rect) {
             UsagePhase::Speak => "speak",
             UsagePhase::Consult => "consult",
             UsagePhase::Dream => "dream",
+            UsagePhase::Compact => "compact",
         };
         let (provenance, short_provenance) =
             window_provenance(&context.estimate.budget.window.provenance);

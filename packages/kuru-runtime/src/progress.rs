@@ -40,6 +40,7 @@ pub struct RequestContext {
     /// Runtime-visible source inventory; final wire fit remains connector-owned.
     pub runtime_sources: Vec<ContextSourceSize>,
     pub omitted_public_rows: u64,
+    pub omitted_summary_rows: u64,
     pub omitted_private_rows: u64,
     pub omitted_note_rows: u64,
 }

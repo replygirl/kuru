@@ -215,7 +215,11 @@ and actor-history writes carry their session identity. Existing and imported
 rows remain unattributed rather than being assigned to a guessed session; they
 remain available to explicit inspection, export and recovery. The ordinary
 conversation-driver lease remains in force while later Phase 2 work integrates
-policy-selected cross-session context and concurrent admission.
+concurrent admission. Context assembly already admits bounded same-actor current
+summaries from other sessions only through the mode's own-history visibility and
+memory namespace. It keeps the current session's cursor-selected summary
+separate, omits older shared summaries whole when the model budget requires it,
+and never substitutes another session's raw rows or private reasoning sidecars.
 
 The SQL schema version is independent from the format-1 `ready.json` activation
 record, the database identity record, and the supervisor protocol. An old dream

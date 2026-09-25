@@ -26,7 +26,7 @@ pub use rpc::{ServiceCall, ServiceReply, ServiceRequest, ServiceResponse, Servic
 pub const PROTOCOL_MAJOR: u16 = 1;
 // Exact-ref recovery and session-provenance calls require this owner version.
 // Older owners reject the new client before a mutating frame.
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 6;
 pub const HANDSHAKE_LIMIT: usize = 16 * 1024;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SERVICE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3432,10 +3432,10 @@ mod tests {
                 .await? else { bail!("service did not start the candidate") };
             ensure!(matches!(client.call(ServiceCall::View {
                 candidate: Some(handle),
-                operation: ViewOperation::PutMany { values: vec![("private".into(), serde_json::json!(1))] },
+                operation: Box::new(ViewOperation::PutMany { values: vec![("private".into(), serde_json::json!(1))] }),
             }).await?, ServiceValue::Unit));
             let ServiceValue::Revision(target) = client.call(ServiceCall::View {
-                candidate: Some(handle), operation: ViewOperation::Revision,
+                candidate: Some(handle), operation: Box::new(ViewOperation::Revision),
             }).await? else { bail!("service did not report candidate target") };
             let id = uuid::Uuid::new_v4();
             let request = rpc::ServiceRequest::with_id(&generation, id,
@@ -3495,12 +3495,12 @@ mod tests {
             }).await? else { bail!("service did not start the abandonment candidate") };
             ensure!(matches!(abandoner.call(ServiceCall::View {
                 candidate: Some(abandon_handle),
-                operation: ViewOperation::PutMany {
+                operation: Box::new(ViewOperation::PutMany {
                     values: vec![("abandoned-private".into(), serde_json::json!(1))],
-                },
+                }),
             }).await?, ServiceValue::Unit));
             let ServiceValue::Revision(abandon_target) = abandoner.call(ServiceCall::View {
-                candidate: Some(abandon_handle), operation: ViewOperation::Revision,
+                candidate: Some(abandon_handle), operation: Box::new(ViewOperation::Revision),
             }).await? else { bail!("service did not report the abandonment target") };
             let abandon_id = uuid::Uuid::new_v4();
             let request = rpc::ServiceRequest::with_id(&abandon_generation, abandon_id,

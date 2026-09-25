@@ -351,6 +351,62 @@ async fn slash_commands_change_real_runtime_state_and_validate_errors() {
 }
 
 #[tokio::test]
+async fn compact_command_dispatches_locally_and_reports_exact_retained_range() {
+    let memory = temporary_memory().await;
+    let source = memory.clone();
+    let provider = CapturingProvider::new();
+    let (_directory, mut harness, models) = harness_with_provider(memory, provider.clone()).await;
+    let actor = harness.topology.parts[0].id.clone();
+    let namespace = harness.namespace(&actor);
+    source
+        .append_session_message(
+            &namespace,
+            &harness.session.id,
+            &kuru_core::Message::text("user", "manual command source"),
+        )
+        .await
+        .unwrap();
+
+    let invalid = dispatch(&mut harness, &models, "/compact inactive-target")
+        .await
+        .unwrap_err();
+    assert!(
+        invalid.to_string().contains("unknown or ambiguous"),
+        "{invalid:#}"
+    );
+    assert!(provider.requests().is_empty());
+
+    let notice = command_text(
+        dispatch(&mut harness, &models, &format!("/compact {actor}"))
+            .await
+            .unwrap(),
+    );
+    assert!(notice.starts_with(&format!("Compacted {actor} source sequences (0, 1] as ")));
+    assert!(notice.ends_with("; original records remain stored."));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].actor.ends_with("#compact"));
+    assert!(
+        !serde_json::to_string(&requests[0])
+            .unwrap()
+            .contains("/compact")
+    );
+
+    let no_op = command_text(
+        dispatch(&mut harness, &models, &format!("/compact {actor}"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        no_op,
+        format!("No eligible uncompacted history for {actor}; original records remain stored.")
+    );
+    assert_eq!(provider.requests().len(), 1);
+    harness.shutdown(false).await.unwrap();
+    source.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn retry_without_a_local_submission_is_narrowly_rejected() {
     let (_dir, mut harness, models) = fixture().await;
     let error = dispatch(&mut harness, &models, "/retry").await.unwrap_err();

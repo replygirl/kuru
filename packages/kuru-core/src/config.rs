@@ -10,13 +10,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::permissions;
 use crate::prompt_sources::{
     MAX_MATERIAL_SOURCES, MAX_MATERIAL_TOTAL, MaterialKind, PromptCatalog, PromptMaterial,
     select_material,
 };
 use crate::{
     Framework, Mode, PermissionAction, PermissionRule, PermissionSelector, ProjectRelativeTarget,
+};
+use crate::{
+    context::{
+        DEFAULT_COMPACTION_OUTPUT_RESERVE_TOKENS, DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+        MAX_CONFIGURED_OUTPUT_RESERVE_TOKENS,
+    },
+    permissions,
 };
 
 const MAX_FILE_BYTES: usize = 256 * 1024;
@@ -456,6 +462,12 @@ pub struct Config {
     /// Optional fit reserve. This is local accounting, not a provider wire
     /// parameter or an override of verified model output metadata.
     pub context_output_reserve_tokens: Option<u64>,
+    /// Percentage of the effective model window at which Kuru attempts one
+    /// actor-local rolling context compaction before ordinary fit omission.
+    pub context_compaction_threshold_percent: u8,
+    /// Output space reserved for the compaction provider request. This is
+    /// independent of the ordinary answer reserve.
+    pub context_compaction_output_reserve_tokens: u64,
     pub max_rounds: usize,
     pub max_tool_calls: usize,
     pub max_parallel: usize,
@@ -482,6 +494,8 @@ impl Default for Config {
             effort: None,
             assumed_context_window_tokens: None,
             context_output_reserve_tokens: None,
+            context_compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+            context_compaction_output_reserve_tokens: DEFAULT_COMPACTION_OUTPUT_RESERVE_TOKENS,
             max_rounds: 3,
             max_tool_calls: 12,
             max_parallel: 4,
@@ -1317,6 +1331,15 @@ impl Config {
                 "context_output_reserve_tokens must be between 1 and 2000000"
             );
         }
+        ensure!(
+            (50..=95).contains(&self.context_compaction_threshold_percent),
+            "context_compaction_threshold_percent must be between 50 and 95"
+        );
+        ensure!(
+            (1..=MAX_CONFIGURED_OUTPUT_RESERVE_TOKENS)
+                .contains(&self.context_compaction_output_reserve_tokens),
+            "context_compaction_output_reserve_tokens must be between 1 and 2000000"
+        );
         bounded("max_rounds", self.max_rounds, 1, 64)?;
         bounded("max_tool_calls", self.max_tool_calls, 1, 1024)?;
         bounded("max_parallel", self.max_parallel, 1, 64)?;

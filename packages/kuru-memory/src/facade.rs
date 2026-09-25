@@ -384,9 +384,9 @@ impl RemoteSession {
         let Some(pending) = pending else {
             return Ok(None);
         };
-        let creation_id = pending
-            .candidate_creation_id
-            .context("pending unit receipt is not a candidate write")?;
+        let Some(creation_id) = pending.candidate_creation_id else {
+            return Ok(None);
+        };
         let mut attachment =
             service::attach_or_start(&self.options, &self.project, &self.executable)
                 .await
@@ -1000,7 +1000,7 @@ impl RemoteView {
     async fn call(&self, operation: ViewOperation) -> Result<ServiceValue> {
         self.call_raw(ServiceCall::View {
             candidate: self.candidate,
-            operation,
+            operation: Box::new(operation),
         })
         .await
     }
@@ -1386,6 +1386,40 @@ impl MemoryStore {
         }
     }
 
+    pub async fn session_history_window_after(
+        &self,
+        namespace: &str,
+        session_id: &str,
+        after_exclusive: i64,
+        limit: usize,
+    ) -> Result<store::SessionHistoryWindowAfter> {
+        store::validate_session_history_after_request(
+            namespace,
+            session_id,
+            after_exclusive,
+            limit,
+        )?;
+        match &self.backend {
+            Backend::Local(store) => {
+                store
+                    .session_history_window_after(namespace, session_id, after_exclusive, limit)
+                    .await
+            }
+            Backend::Remote(remote) => match remote
+                .call(ViewOperation::SessionHistoryWindowAfter {
+                    namespace: namespace.into(),
+                    session_id: session_id.into(),
+                    after_exclusive,
+                    limit,
+                })
+                .await?
+            {
+                ServiceValue::SessionHistoryWindowAfter(window) => Ok(window),
+                _ => bail!("memory service returned the wrong session cursor history response"),
+            },
+        }
+    }
+
     pub async fn acquire_dream_lease(&self) -> Result<DreamLease> {
         match &self.backend {
             Backend::Local(store) => {
@@ -1468,17 +1502,18 @@ impl MemoryStore {
 
     pub async fn checkpoint_context_summary(
         &self,
-        record: &store::ContextSummaryRecord,
+        checkpoint: &store::ContextSummaryCheckpoint,
     ) -> Result<()> {
-        store::validate_context_summary(record)?;
+        service::rpc::validate_context_summary_checkpoint_request(checkpoint)?;
         match &self.backend {
-            Backend::Local(store) => store.checkpoint_context_summary(record).await,
+            Backend::Local(store) => store.checkpoint_context_summary(checkpoint).await,
             Backend::Remote(remote) => {
                 remote.ensure_writable()?;
                 unit(
                     remote
                         .call(ViewOperation::CheckpointContextSummary {
-                            record: record.clone(),
+                            record: checkpoint.record.clone(),
+                            private_reasoning: checkpoint.private_reasoning.clone(),
                         })
                         .await?,
                 )
@@ -1971,7 +2006,7 @@ impl Candidate {
                     &mut attachment,
                     ServiceCall::View {
                         candidate: Some(candidate.handle),
-                        operation: ViewOperation::Revision,
+                        operation: Box::new(ViewOperation::Revision),
                     },
                 )
                 .await?
@@ -2496,7 +2531,8 @@ mod tests {
             };
             let record = crate::ReasoningSummaryRecord {
                 session_id: "session".into(),
-                turn_id: "turn".into(),
+                turn_id: Some("turn".into()),
+                operation_id: None,
                 actor_id: "actor".into(),
                 invocation_id: "invocation".into(),
                 item_id: Some("item".into()),
@@ -2639,6 +2675,16 @@ mod tests {
                     && session_window.messages[0].plain_text() == Some("source"),
                 "managed session history included legacy or another-session rows"
             );
+            let session_suffix = memory
+                .session_history_window_after(actor, "session-a", 0, 16)
+                .await?;
+            ensure!(
+                session_suffix.view == "main"
+                    && session_suffix.total_rows == 1
+                    && session_suffix.rows.len() == 1
+                    && session_suffix.rows[0].message.plain_text() == Some("source"),
+                "managed session cursor history returned the wrong source suffix"
+            );
             let snapshot = memory
                 .session_source_snapshot(actor, "session-a", actor, 0, 16)
                 .await?;
@@ -2658,9 +2704,27 @@ mod tests {
                 source_revision: snapshot.revision,
                 after_sequence: snapshot.after_exclusive,
                 through_sequence: through,
-                turn_id: "turn-a".into(),
+                turn_id: None,
+                operation_id: Some("compact-a".into()),
+                producer_actor_id: Some("producer-a".into()),
                 invocation_id: "invocation-a".into(),
                 summary: "managed summary".into(),
+            };
+            let private = crate::ReasoningSummaryRecord {
+                session_id: "session-a".into(),
+                turn_id: None,
+                operation_id: Some("compact-a".into()),
+                actor_id: "producer-a".into(),
+                invocation_id: "invocation-a".into(),
+                item_id: Some("item-a".into()),
+                output_index: Some(0),
+                summary_index: 0,
+                text: "private compact reasoning".into(),
+            };
+            let private_key = store::reasoning_summary_key(&private)?;
+            let checkpoint = store::ContextSummaryCheckpoint {
+                record: record.clone(),
+                private_reasoning: vec![private.clone()],
             };
             let Backend::Remote(remote) = &memory.backend else {
                 bail!("session checkpoint fixture did not attach to the service")
@@ -2671,10 +2735,66 @@ mod tests {
                 .lock()
                 .await
                 .pause_after_next_send(pause.clone());
+            let mut invalid = checkpoint.clone();
+            invalid.private_reasoning[0].actor_id = "wrong-producer".into();
+            let rejected = memory
+                .checkpoint_context_summary(&invalid)
+                .await
+                .expect_err("mismatched private producer reached the managed service");
+            ensure!(
+                rejected
+                    .to_string()
+                    .contains("private compact reasoning provenance does not match"),
+                "checkpoint rejected the wrong invalid field: {rejected:#}"
+            );
+            ensure!(
+                tokio::time::timeout(Duration::from_millis(100), pause.sent.notified())
+                    .await
+                    .is_err(),
+                "invalid checkpoint acquired a mutating attachment and sent an RPC frame"
+            );
+            let mut oversized = checkpoint.clone();
+            oversized.record.summary = "\u{0001}".repeat(16 * 1024 * 1024);
+            let rejected = memory
+                .checkpoint_context_summary(&oversized)
+                .await
+                .expect_err("oversized checkpoint reached the managed service");
+            ensure!(
+                rejected
+                    .to_string()
+                    .contains("context summary checkpoint exceeds 64 MiB"),
+                "checkpoint rejected the wrong oversized field: {rejected:#}"
+            );
+            ensure!(
+                tokio::time::timeout(Duration::from_millis(100), pause.sent.notified())
+                    .await
+                    .is_err(),
+                "oversized checkpoint acquired a mutating attachment and sent an RPC frame"
+            );
+            drop(oversized);
+            let request_id = Uuid::new_v4();
             let writer = tokio::spawn({
-                let memory = memory.clone();
-                let record = record.clone();
-                async move { memory.checkpoint_context_summary(&record).await }
+                let remote = remote.clone();
+                let checkpoint = checkpoint.clone();
+                async move {
+                    let _mutation = remote.session.mutations.lock().await;
+                    let mut attachment = remote.attachment.lock().await;
+                    unit(
+                        remote
+                            .checked_call_locked_with_id(
+                                &mut attachment,
+                                ServiceCall::View {
+                                    candidate: remote.candidate,
+                                    operation: Box::new(ViewOperation::CheckpointContextSummary {
+                                        record: checkpoint.record,
+                                        private_reasoning: checkpoint.private_reasoning,
+                                    }),
+                                },
+                                request_id,
+                            )
+                            .await?,
+                    )
+                }
             });
             let _writer_cleanup = AbortOnDrop(writer.abort_handle());
             tokio::time::timeout(Duration::from_secs(5), pause.sent.notified())
@@ -2722,6 +2842,25 @@ mod tests {
             })
             .await
             .context("context checkpoint indexed-outcome deadline")??;
+            {
+                let _mutation = remote.session.mutations.lock().await;
+                let mut attachment = remote.attachment.lock().await;
+                unit(
+                    remote
+                        .checked_call_locked_with_id(
+                            &mut attachment,
+                            ServiceCall::View {
+                                candidate: remote.candidate,
+                                operation: Box::new(ViewOperation::CheckpointContextSummary {
+                                    record: checkpoint.record.clone(),
+                                    private_reasoning: checkpoint.private_reasoning.clone(),
+                                }),
+                            },
+                            request_id,
+                        )
+                        .await?,
+                )?;
+            }
             let summaries = inspector
                 .context_summary_window(
                     actor,
@@ -2737,8 +2876,12 @@ mod tests {
                     && summaries.records[0].record == record,
                 "managed summary projection did not return the cursor-selected record"
             );
+            ensure!(
+                inspector.get(&private_key).await? == Some(serde_json::to_value(&private)?),
+                "managed checkpoint did not atomically retain its private sidecar"
+            );
             let stale = memory
-                .checkpoint_context_summary(&record)
+                .checkpoint_context_summary(&checkpoint)
                 .await
                 .expect_err("moved context cursor accepted a duplicate checkpoint");
             ensure!(
@@ -2773,6 +2916,19 @@ mod tests {
                     .any(|row| row.message.plain_text() == Some("candidate only")),
                 "candidate-pinned source snapshot omitted its private row"
             );
+            let candidate_suffix = candidate
+                .view()
+                .session_history_window_after(actor, "session-a", through, 16)
+                .await?;
+            ensure!(
+                candidate_suffix.view == candidate.branch()
+                    && candidate_suffix.total_rows == 2
+                    && candidate_suffix
+                        .rows
+                        .iter()
+                        .any(|row| row.message.plain_text() == Some("candidate only")),
+                "candidate-pinned cursor history omitted its private row"
+            );
             ensure!(
                 candidate
                     .view()
@@ -2791,6 +2947,18 @@ mod tests {
                     .iter()
                     .all(|row| row.message.plain_text() != Some("candidate only")),
                 "candidate row leaked into the main session snapshot"
+            );
+            let main_suffix = memory
+                .session_history_window_after(actor, "session-a", through, 16)
+                .await?;
+            ensure!(
+                main_suffix.view == "main"
+                    && main_suffix.total_rows == 1
+                    && main_suffix
+                        .rows
+                        .iter()
+                        .all(|row| row.message.plain_text() != Some("candidate only")),
+                "candidate row leaked into main cursor history"
             );
             ensure!(
                 memory
@@ -3092,9 +3260,9 @@ mod tests {
                         let value = witness
                             .call(ServiceCall::View {
                                 candidate: Some(handle),
-                                operation: ViewOperation::Get {
+                                operation: Box::new(ViewOperation::Get {
                                     key: "accepted-private".into(),
-                                },
+                                }),
                             })
                             .await?;
                         if matches!(value, ServiceValue::StoredValue(Some(ref stored)) if stored == &json!(1)) {

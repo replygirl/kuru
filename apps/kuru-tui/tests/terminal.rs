@@ -714,22 +714,77 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
         READY_TIMEOUT,
     )?;
     terminal.command("/help", None)?;
-    terminal.wait_composer_frame(&["/clear", "/status", "enter send"], READY_TIMEOUT)?;
+    terminal.wait_composer_frame(
+        &["/clear", "/compact [ID]", "/status", "enter send"],
+        READY_TIMEOUT,
+    )?;
 
-    let before_unknown = requests.lock().unwrap().len();
-    terminal.command("/compact", None)?;
-    terminal.wait_composer_frame(&["Unknown command", "enter send"], READY_TIMEOUT)?;
+    let before_compact = requests.lock().unwrap().len();
+    terminal.send(b"/comp\t")?;
+    terminal.wait_composer_frame(&["/compact", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"\r")?;
+    terminal.wait_composer_frame(
+        &[
+            "No eligible uncompacted history",
+            "original records remain stored",
+            "enter send",
+        ],
+        READY_TIMEOUT,
+    )?;
     ensure!(
-        requests.lock().unwrap().len() == before_unknown,
-        "an unregistered future command reached the provider"
+        requests.lock().unwrap().len() == before_compact,
+        "an empty manual compact reached the provider"
     );
 
+    let compact_actor = kuru_core::ModeProfile::builtin(sandbox.config()?.mode)
+        .roles
+        .seeds()
+        .into_iter()
+        .next()
+        .context("mode omitted its first compactable actor")?
+        .id;
+    terminal.command(&format!("/focus {compact_actor}"), None)?;
+    terminal.wait_composer_frame(&["Speaking focus", "enter send"], READY_TIMEOUT)?;
     terminal.command("OLDER_VISIBLE_MARKER", None)?;
     terminal.wait_composer_frame(&["PRICED_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
     let after_first = requests.lock().unwrap().len();
     ensure!(
-        after_first > before_unknown,
+        after_first > before_compact,
         "first turn never reached the provider"
+    );
+    terminal.command(&format!("/compact {compact_actor}"), None)?;
+    terminal.wait_composer_frame(
+        &[
+            &format!("Compacted {compact_actor}"),
+            "source sequences",
+            "original records remain stored",
+            "enter send",
+        ],
+        READY_TIMEOUT,
+    )?;
+    let after_named_compact = requests.lock().unwrap().len();
+    ensure!(
+        after_named_compact > after_first,
+        "named manual compact never reached the provider"
+    );
+    ensure!(
+        requests.lock().unwrap()[after_first..after_named_compact]
+            .iter()
+            .all(|request| !request.to_string().contains("/compact")),
+        "slash command text reached a compaction provider request"
+    );
+    terminal.command(&format!("/compact {compact_actor}"), None)?;
+    terminal.wait_composer_frame(
+        &[
+            &format!("No eligible uncompacted history for {compact_actor}"),
+            "original records remain stored",
+            "enter send",
+        ],
+        READY_TIMEOUT,
+    )?;
+    ensure!(
+        requests.lock().unwrap().len() == after_named_compact,
+        "manual no-op repeated the provider request"
     );
     let sessions = sandbox.sessions()?;
     ensure!(
@@ -747,14 +802,14 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
             "Model: fixture",
             "Effort:",
             "Mode:",
-            "Focus: auto",
+            &format!("Focus: {compact_actor}"),
             "Turns: 1",
             "Session usage",
         ],
         READY_TIMEOUT,
     )?;
     ensure!(
-        requests.lock().unwrap().len() == after_first,
+        requests.lock().unwrap().len() == after_named_compact,
         "/status made a provider request"
     );
     terminal.send(b"/cle\t")?;
@@ -767,18 +822,18 @@ async fn real_pty_commands_complete_and_clear_only_the_visible_conversation() ->
         terminal.screen()
     );
     ensure!(
-        requests.lock().unwrap().len() == after_first,
+        requests.lock().unwrap().len() == after_named_compact,
         "/clear made a provider request"
     );
     terminal.command("FOLLOWUP_VISIBLE_MARKER", None)?;
     terminal.wait_composer_frame(&["PRICED_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
     let captured = requests.lock().unwrap();
     ensure!(
-        captured.len() > after_first,
+        captured.len() > after_named_compact,
         "follow-up never reached the provider"
     );
     ensure!(
-        captured[after_first..]
+        captured[after_named_compact..]
             .iter()
             .any(|request| request.to_string().contains("OLDER_VISIBLE_MARKER")),
         "the cleared turn was absent from follow-up provider context"
@@ -1228,6 +1283,177 @@ async fn real_pty_status_bar_renders_known_cost_from_priced_invocation() -> Resu
     terminal.assert_restored()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_pty_reports_automatic_compaction_cost_once_and_reuses_its_summary() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = Arc::clone(&requests);
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route(
+            "/v1/responses",
+            post(move |Json(request): Json<Value>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let compact = request["instructions"]
+                        .as_str()
+                        .is_some_and(|instructions| {
+                            instructions.starts_with("Replace the prior rolling context summary")
+                        });
+                    captured.lock().unwrap().push(request);
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        format!(
+                            "data: {}\n\n",
+                            json!({
+                                "type":"response.completed",
+                                "response":{
+                                    "id":"resumed-compaction-fixture",
+                                    "status":"completed",
+                                    "output":[{"type":"message","content":[{
+                                        "type":"output_text",
+                                        "text": if compact {
+                                            "AUTO_COMPACT_SUMMARY_SENTINEL"
+                                        } else {
+                                            "RESUMED_ORDINARY_RESPONSE"
+                                        }
+                                    }]}],
+                                    "usage":{
+                                        "input_tokens": PRICED_INPUT_TOKENS_PER_INVOCATION,
+                                        "output_tokens": PRICED_OUTPUT_TOKENS_PER_INVOCATION,
+                                        "input_tokens_details":{"cached_tokens": 0},
+                                        "output_tokens_details":{"reasoning_tokens": 0}
+                                    }
+                                }
+                            })
+                        ),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("resumed-compaction-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\nassumed_context_window_tokens=8192\ncontext_output_reserve_tokens=64\ncontext_compaction_threshold_percent=50\ncontext_compaction_output_reserve_tokens=64\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap()
+    }));
+    let catalog_override =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/priced-model-catalog.json");
+    let command = || {
+        let mut command = sandbox.command("responses");
+        command
+            .args(["--model", "fixture", "--config"])
+            .arg(&config)
+            .env("KURU_FIXTURE_KEY", "fixture")
+            .env("KURU_REDUCED_MOTION", "1")
+            .env("KURU_TEST_MODEL_CATALOG_PATH", &catalog_override);
+        command
+    };
+    let mut terminal = Terminal::spawn(command(), 48, 120)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command("automatic compaction source", None)?;
+    terminal.wait_composer_frame(&["RESUMED_ORDINARY_RESPONSE", "enter send"], READY_TIMEOUT)?;
+    terminal.command("automatic compaction trigger", None)?;
+    terminal.wait_composer_frame(&["RESUMED_ORDINARY_RESPONSE", "enter send"], READY_TIMEOUT)?;
+    let sessions = sandbox.sessions()?;
+    ensure!(
+        sessions.len() == 1 && sessions[0].turns == 2,
+        "{sessions:?}"
+    );
+    let session = sessions[0].id.clone();
+    let before_resume = requests.lock().unwrap().clone();
+    let compact_requests = before_resume
+        .iter()
+        .filter(|request| {
+            request["instructions"]
+                .as_str()
+                .is_some_and(|instructions| {
+                    instructions.starts_with("Replace the prior rolling context summary")
+                })
+        })
+        .count();
+    ensure!(compact_requests > 0, "automatic compaction did not run");
+    terminal.command("/cost", None)?;
+    terminal.wait_composer_frame(&["Session usage", "enter send"], READY_TIMEOUT)?;
+    let first_cost = terminal.screen();
+    ensure!(
+        parse_component_tokens(&first_cost, "Input")?
+            == before_resume.len() as u64 * PRICED_INPUT_TOKENS_PER_INVOCATION,
+        "automatic compaction input usage was not counted exactly once: {first_cost}"
+    );
+    ensure!(
+        parse_component_tokens(&first_cost, "Output")?
+            == before_resume.len() as u64 * PRICED_OUTPUT_TOKENS_PER_INVOCATION,
+        "automatic compaction output usage was not counted exactly once: {first_cost}"
+    );
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()?;
+
+    let mut resume = command();
+    resume.args(["--resume", &session]);
+    let mut resumed = Terminal::spawn(resume, 48, 120)?;
+    resumed.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    resumed.command("/status", None)?;
+    resumed.wait_composer_frame(
+        &[
+            &format!("Session: {session}"),
+            "Turns: 2",
+            &format!(
+                "Session usage · {} provider invocations",
+                before_resume.len()
+            ),
+            "enter send",
+        ],
+        READY_TIMEOUT,
+    )?;
+    resumed.command("/cost", None)?;
+    resumed.wait_composer_frame(&["Session usage", "enter send"], READY_TIMEOUT)?;
+    let resumed_cost = resumed.screen();
+    ensure!(
+        parse_component_tokens(&resumed_cost, "Input")?
+            == before_resume.len() as u64 * PRICED_INPUT_TOKENS_PER_INVOCATION
+            && parse_component_tokens(&resumed_cost, "Output")?
+                == before_resume.len() as u64 * PRICED_OUTPUT_TOKENS_PER_INVOCATION,
+        "resumed usage duplicated or lost automatic compaction cost: {resumed_cost}"
+    );
+    ensure!(
+        requests.lock().unwrap().len() == before_resume.len(),
+        "resume/status/cost made a provider request"
+    );
+
+    resumed.command("resumed context uses the summary", None)?;
+    resumed.wait_composer_frame(&["RESUMED_ORDINARY_RESPONSE", "enter send"], READY_TIMEOUT)?;
+    let after_resume = requests.lock().unwrap();
+    ensure!(
+        after_resume[before_resume.len()..].iter().any(|request| {
+            !request["instructions"]
+                .as_str()
+                .is_some_and(|instructions| {
+                    instructions.starts_with("Replace the prior rolling context summary")
+                })
+                && request
+                    .to_string()
+                    .contains("AUTO_COMPACT_SUMMARY_SENTINEL")
+        }),
+        "resumed ordinary context omitted the persisted rolling summary"
+    );
+    drop(after_resume);
+    resumed.send(b"/quit\r")?;
+    resumed.wait_exit(EXIT_TIMEOUT)?;
+    resumed.assert_restored()
+}
+
 #[test]
 fn real_pty_reports_actual_optional_context_omission_without_erasing_history() -> Result<()> {
     let sandbox = Sandbox::new()?;
@@ -1437,11 +1663,108 @@ async fn complete(State(mut state): State<ProviderState>, Json(_): Json<Value>) 
                         "type":"output_text", "text": if delayed { "LATE_RESPONSE_MUST_STAY_ABSENT" }
                         else { "FRESH_RESPONSE_MARKER" }
                     }]}],
-                    "usage":{"input_tokens":8,"output_tokens":5}
+                    "usage":{
+                        "input_tokens":8,
+                        "output_tokens":5,
+                        "input_tokens_details":{"cached_tokens":0},
+                        "output_tokens_details":{"reasoning_tokens":0}
+                    }
                 }
             })
         ),
     ).into_response()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_cancels_manual_compaction_before_later_identities() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    let (release, receiver) = watch::channel(true);
+    let started = Arc::new(AtomicBool::new(false));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route("/v1/responses", post(complete))
+        .with_state(ProviderState {
+            started: started.clone(),
+            requests: requests.clone(),
+            release: receiver,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let config = sandbox.root.path().join("compact-cancel-provider.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "api_base='http://{}/v1'\napi_key_env='KURU_FIXTURE_KEY'\nmax_rounds=1\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let _server = Server(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let actor = kuru_core::ModeProfile::builtin(Mode::Ifs)
+        .roles
+        .seeds()
+        .into_iter()
+        .next()
+        .context("IFS mode omitted its first compactable actor")?
+        .id;
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config)
+        .env("KURU_FIXTURE_KEY", "fixture")
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 35, 120)?;
+    terminal.wait_text_with_timeout(&["KURU", "enter send"], &[], sandbox.startup_timeout)?;
+    terminal.command(&format!("/focus {actor}"), None)?;
+    terminal.wait_composer_frame(&["Speaking focus", "enter send"], READY_TIMEOUT)?;
+    terminal.command("manual compact cancellation source", None)?;
+    terminal.wait_composer_frame(&["FRESH_RESPONSE_MARKER", "enter send"], READY_TIMEOUT)?;
+    let before = requests.load(Ordering::SeqCst);
+
+    started.store(false, Ordering::SeqCst);
+    release.send(false)?;
+    terminal.send(b"/compact")?;
+    terminal.wait_composer_frame(&["/compact", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"\r")?;
+    terminal.wait(
+        "manual compact provider request started",
+        READY_TIMEOUT,
+        |_| Ok(started.load(Ordering::SeqCst)),
+    )?;
+    terminal.send(b"\x1b")?;
+    terminal.wait_composer_frame(
+        &["Cancelled", "turn interrupted", "enter send"],
+        READY_TIMEOUT,
+    )?;
+    release.send(true)?;
+    terminal.read_for(Duration::from_millis(250))?;
+    ensure!(
+        requests.load(Ordering::SeqCst) == before + 1,
+        "manual all-active cancellation started a later identity"
+    );
+
+    terminal.command(&format!("/compact {actor}"), None)?;
+    terminal.wait_composer_frame(
+        &[
+            &format!("Compacted {actor}"),
+            "source sequences",
+            "; original",
+            "records remain stored.",
+            "enter send",
+        ],
+        READY_TIMEOUT,
+    )?;
+    ensure!(
+        requests.load(Ordering::SeqCst) == before + 2,
+        "cancelled compaction advanced its cursor or replayed provider work"
+    );
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()
 }
 
 struct Server(tokio::task::JoinHandle<()>);

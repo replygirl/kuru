@@ -103,6 +103,9 @@ mode = "ifs"
 provider = "codex"
 model = "auto"
 # assumed_context_window_tokens = 128000 # optional; omit to use the built-in fallback
+# context_output_reserve_tokens = 8192 # optional; resolved from model/window when omitted
+context_compaction_threshold_percent = 75
+context_compaction_output_reserve_tokens = 1024
 max_rounds = 3
 max_tool_calls = 12
 max_parallel = 4
@@ -117,17 +120,27 @@ api_key_env = "OPENAI_API_KEY"
 
 ## Models and providers
 
-| Key                             | Accepted value                                                                       |
-| ------------------------------- | ------------------------------------------------------------------------------------ |
-| `mode`                          | `ifs`, `polyvagal`, `freudian`, `jungian`                                            |
-| `provider`                      | `codex`, `responses`, `demo`                                                         |
-| `model`                         | Provider model ID; `auto` permits provider selection where supported                 |
-| `effort`                        | Optional provider-advertised string                                                  |
-| `assumed_context_window_tokens` | Optional 1–2,000,000 fallback for models with no advertised or pinned context window |
-| `api_base`                      | Responses API base URL                                                               |
-| `api_key_env`                   | Environment variable containing the API key                                          |
+| Key                                        | Accepted value                                                                                |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `mode`                                     | `ifs`, `polyvagal`, `freudian`, `jungian`                                                     |
+| `provider`                                 | `codex`, `responses`, `demo`                                                                  |
+| `model`                                    | Provider model ID; `auto` permits provider selection where supported                          |
+| `effort`                                   | Optional provider-advertised string                                                           |
+| `assumed_context_window_tokens`            | Optional 1–2,000,000 fallback for models with no advertised or pinned context window          |
+| `context_output_reserve_tokens`            | Optional 1–2,000,000 reserve for the ordinary answer request                                  |
+| `context_compaction_threshold_percent`     | 50–95; full pre-omission request percentage that triggers one compaction attempt (default 75) |
+| `context_compaction_output_reserve_tokens` | 1–2,000,000 output reserve for the separate accounted compaction request (default 1024)       |
+| `api_base`                                 | Responses API base URL                                                                        |
+| `api_key_env`                              | Environment variable containing the API key                                                   |
 
 Use `kuru models` to discover current capabilities. Kuru preserves newly advertised effort strings. The Responses catalog does not supply a default chat model, so that provider requires an explicit `model` or `--model`.
+
+Compaction keeps the current session's rolling summary mandatory and selects its
+raw suffix strictly after that summary's cursor. The mode's existing own-history
+grant also admits same-actor current summaries from other sessions. Those shared
+summaries are optional whole records: Kuru keeps the newest suffix that fits and
+reports older summary omissions separately. It never projects another session's
+raw rows or producer-private reasoning records through this continuity path.
 
 An unknown model remains selectable. Kuru resolves its context window from live
 route advertisement, then a route-matched offline snapshot, then this optional

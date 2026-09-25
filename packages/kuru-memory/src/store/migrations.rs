@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::server::Server;
 
-pub(super) const CURRENT_VERSION: i32 = 5;
+pub(super) const CURRENT_VERSION: i32 = 6;
 pub(super) const USAGE_CURRENT_VERSION: i32 = 4;
 const RESERVED_PREFIX: &str = "kuru_migration_";
 const USAGE_RESERVED_PREFIX: &str = "kuru_usage_migration_";
@@ -399,7 +399,23 @@ const V5: Definition = Definition {
     ],
 };
 
-const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5];
+const V6: Definition = Definition {
+    from: 5,
+    to: 6,
+    id: "kuru.memory.compact-checkpoint-provenance.v6",
+    sql: &[
+        "ALTER TABLE context_summaries MODIFY COLUMN turn_id VARBINARY(128) NULL, ADD COLUMN operation_id VARBINARY(128) NULL AFTER turn_id, ADD COLUMN producer_actor_id VARBINARY(1024) NULL AFTER operation_id",
+    ],
+    transform: "existing context summaries retain exact turn provenance; no operation or producer is inferred",
+    postcondition: "version=6;exclusive turn/operation context provenance;v5 rows and v4 usage registry retained",
+    failed_status: &[StatusRow {
+        table: "context_summaries",
+        staged: 0,
+        status: "modified",
+    }],
+};
+
+const DEFINITIONS: &[Definition] = &[V2, V3, V4, V5, V6];
 
 #[derive(Clone, Copy)]
 struct Registry {
@@ -676,19 +692,19 @@ async fn validate_schema_with(registry: Registry, pool: &MySqlPool, found: i32) 
         validate_operation_receipt_shape(pool).await?;
     }
     if found >= 5 {
-        validate_session_provenance_shape(pool).await?;
+        validate_session_provenance_shape(pool, found).await?;
     }
     #[cfg(test)]
-    if registry.current >= 6 && found >= 6 {
+    if registry.current >= 7 && found >= 7 {
         bounded_query(
-            sqlx::query("SELECT marker FROM kuru_migration_test_v6 LIMIT 0").fetch_all(pool),
+            sqlx::query("SELECT marker FROM kuru_migration_test_v7 LIMIT 0").fetch_all(pool),
         )
         .await?;
     }
     Ok(())
 }
 
-async fn validate_session_provenance_shape(pool: &MySqlPool) -> Result<()> {
+async fn validate_session_provenance_shape(pool: &MySqlPool, version: i32) -> Result<()> {
     bounded_query(sqlx::query("SELECT session_id FROM messages LIMIT 0").fetch_all(pool)).await?;
     let columns = bounded_query(
         sqlx::query("SELECT data_type, is_nullable, character_maximum_length FROM information_schema.columns WHERE table_schema = DATABASE() AND BINARY table_name = BINARY 'messages' AND BINARY column_name = BINARY 'session_id'")
@@ -704,47 +720,52 @@ async fn validate_session_provenance_shape(pool: &MySqlPool) -> Result<()> {
             && columns[0].try_get::<i64, _>(2)? == 128,
         "message session identity column differs from schema v5"
     );
-    bounded_query(
-        sqlx::query("SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, invocation_id, record_format, summary FROM context_summaries LIMIT 0")
-            .fetch_all(pool),
-    )
-    .await?;
+    let summary_projection = if version >= 6 {
+        "SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, operation_id, producer_actor_id, invocation_id, record_format, summary FROM context_summaries LIMIT 0"
+    } else {
+        "SELECT summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, invocation_id, record_format, summary FROM context_summaries LIMIT 0"
+    };
+    bounded_query(sqlx::query(summary_projection).fetch_all(pool)).await?;
     bounded_query(
         sqlx::query("SELECT actor_namespace, session_id, source_namespace, through_sequence, summary_id, source_view, source_revision FROM context_summary_cursors LIMIT 0")
             .fetch_all(pool),
     )
     .await?;
-    validate_columns(
-        pool,
-        "context_summaries",
-        &[
-            ("summary_id", "char", Some(64)),
-            ("actor_namespace", "varbinary", Some(1024)),
-            ("session_id", "varbinary", Some(128)),
-            ("source_namespace", "varbinary", Some(1024)),
-            ("summary_namespace", "varbinary", Some(1024)),
-            ("source_view", "varchar", Some(64)),
-            ("source_revision", "char", Some(64)),
-            ("after_sequence", "bigint", None),
-            ("through_sequence", "bigint", None),
-            ("turn_id", "varbinary", Some(128)),
-            ("invocation_id", "varbinary", Some(128)),
-            ("record_format", "varchar", Some(32)),
-            ("summary", "longtext", None),
-        ],
-    )
-    .await?;
+    let mut summary_columns = vec![
+        ("summary_id", "char", Some(64), false),
+        ("actor_namespace", "varbinary", Some(1024), false),
+        ("session_id", "varbinary", Some(128), false),
+        ("source_namespace", "varbinary", Some(1024), false),
+        ("summary_namespace", "varbinary", Some(1024), false),
+        ("source_view", "varchar", Some(64), false),
+        ("source_revision", "char", Some(64), false),
+        ("after_sequence", "bigint", None, false),
+        ("through_sequence", "bigint", None, false),
+        ("turn_id", "varbinary", Some(128), version >= 6),
+    ];
+    if version >= 6 {
+        summary_columns.extend([
+            ("operation_id", "varbinary", Some(128), true),
+            ("producer_actor_id", "varbinary", Some(1024), true),
+        ]);
+    }
+    summary_columns.extend([
+        ("invocation_id", "varbinary", Some(128), false),
+        ("record_format", "varchar", Some(32), false),
+        ("summary", "longtext", None, false),
+    ]);
+    validate_columns(pool, "context_summaries", &summary_columns).await?;
     validate_columns(
         pool,
         "context_summary_cursors",
         &[
-            ("actor_namespace", "varbinary", Some(1024)),
-            ("session_id", "varbinary", Some(128)),
-            ("source_namespace", "varbinary", Some(1024)),
-            ("through_sequence", "bigint", None),
-            ("summary_id", "char", Some(64)),
-            ("source_view", "varchar", Some(64)),
-            ("source_revision", "char", Some(64)),
+            ("actor_namespace", "varbinary", Some(1024), false),
+            ("session_id", "varbinary", Some(128), false),
+            ("source_namespace", "varbinary", Some(1024), false),
+            ("through_sequence", "bigint", None, false),
+            ("summary_id", "char", Some(64), false),
+            ("source_view", "varchar", Some(64), false),
+            ("source_revision", "char", Some(64), false),
         ],
     )
     .await?;
@@ -784,7 +805,7 @@ async fn validate_session_provenance_shape(pool: &MySqlPool) -> Result<()> {
 async fn validate_columns(
     pool: &MySqlPool,
     table: &str,
-    expected: &[(&str, &str, Option<i64>)],
+    expected: &[(&str, &str, Option<i64>, bool)],
 ) -> Result<()> {
     let rows = bounded_query(
         sqlx::query("SELECT column_name, data_type, is_nullable, character_maximum_length FROM information_schema.columns WHERE table_schema = DATABASE() AND BINARY table_name = BINARY ? ORDER BY ordinal_position")
@@ -796,7 +817,7 @@ async fn validate_columns(
         rows.len() == expected.len(),
         "{table} columns differ from schema v5"
     );
-    for (row, (name, data_type, length)) in rows.into_iter().zip(expected) {
+    for (row, (name, data_type, length, nullable)) in rows.into_iter().zip(expected) {
         // Dolt may preserve uppercase protocol labels for information-schema
         // projections, so use the checked SELECT order rather than label case.
         let observed_name: String = row.try_get(0)?;
@@ -806,7 +827,7 @@ async fn validate_columns(
         ensure!(
             observed_name == *name
                 && observed_type.eq_ignore_ascii_case(data_type)
-                && observed_nullable == "NO"
+                && observed_nullable == if *nullable { "YES" } else { "NO" }
                 && length.is_none_or(|length| observed_length == Some(length)),
             "{table} column {name} differs from schema v5"
         );
@@ -1728,28 +1749,33 @@ mod tests {
         status: Vec<(String, i64, String)>,
     }
 
-    const V6: Definition = Definition {
-        from: 5,
-        to: 6,
-        id: "kuru.memory.test-marker.v6",
-        sql: &["CREATE TABLE kuru_migration_test_v6 (marker INT PRIMARY KEY)"],
+    const V7: Definition = Definition {
+        from: 6,
+        to: 7,
+        id: "kuru.memory.test-marker.v7",
+        sql: &["CREATE TABLE kuru_migration_test_v7 (marker INT PRIMARY KEY)"],
         transform: "none",
-        postcondition: "version=6;test marker table exists;v5 session provenance remains exact",
+        postcondition: "version=7;test marker table exists;v6 compact provenance remains exact",
         failed_status: &[StatusRow {
-            table: "kuru_migration_test_v6",
+            table: "kuru_migration_test_v7",
             staged: 0,
             status: "new table",
         }],
     };
-    const TEST_DEFINITIONS: &[Definition] = &[V2, super::V3, super::V4, super::V5, V6];
+    const TEST_DEFINITIONS: &[Definition] = &[V2, super::V3, super::V4, super::V5, super::V6, V7];
     const TEST_REGISTRY: Registry = Registry {
-        current: 6,
+        current: 7,
         definitions: TEST_DEFINITIONS,
     };
     const RELEASED_V3_DEFINITIONS: &[Definition] = &[V2, super::V3];
     const RELEASED_V3_REGISTRY: Registry = Registry {
         current: 3,
         definitions: RELEASED_V3_DEFINITIONS,
+    };
+    const RELEASED_V5_DEFINITIONS: &[Definition] = &[V2, super::V3, super::V4, super::V5];
+    const RELEASED_V5_REGISTRY: Registry = Registry {
+        current: 5,
+        definitions: RELEASED_V5_DEFINITIONS,
     };
 
     const RELEASED_V4_REGISTRY: Registry = Registry {
@@ -1843,7 +1869,7 @@ mod tests {
         server.close().await?;
 
         let store = super::super::MemoryStore::open(options.clone()).await?;
-        assert_eq!(version(&store.pool).await?, 5);
+        assert_eq!(version(&store.pool).await?, CURRENT_VERSION);
         assert_eq!(
             store.history("history", 10).await?[0].plain_text(),
             Some(legacy)
@@ -1966,7 +1992,7 @@ mod tests {
         server.close().await?;
 
         let store = super::super::MemoryStore::open(options).await?;
-        assert_eq!(version(&store.pool).await?, 5);
+        assert_eq!(version(&store.pool).await?, CURRENT_VERSION);
         let retained: Vec<(i64, Option<Vec<u8>>, String)> = bounded_query(
             sqlx::query_as("SELECT sequence, session_id, content FROM messages WHERE namespace = ? ORDER BY sequence")
                 .bind(b"private/actor".as_slice())
@@ -2124,9 +2150,9 @@ mod tests {
         assert_eq!(digest(definition).len(), 64);
         let name = attempt_name(2, Uuid::nil());
         assert_eq!(parse_attempt(&name).unwrap(), (2, Uuid::nil()));
-        let future = attempt_name(6, Uuid::nil());
-        assert_eq!(parse_attempt(&future).unwrap(), (6, Uuid::nil()));
-        assert!(REGISTRY.definition(6).is_err());
+        let future = attempt_name(7, Uuid::nil());
+        assert_eq!(parse_attempt(&future).unwrap(), (7, Uuid::nil()));
+        assert!(REGISTRY.definition(7).is_err());
         for invalid in [
             "kuru_migration_v2_bad",
             "kuru_migration_v0000000002_NOT-A-UUID",
@@ -2275,8 +2301,8 @@ mod tests {
                 }
                 Corruption::ExtraReceipt => {
                     bounded_query(
-                        sqlx::query("INSERT INTO kuru_migrations VALUES (6, ?, ?, ?)")
-                            .bind("fixture.extra.v6")
+                        sqlx::query("INSERT INTO kuru_migrations VALUES (7, ?, ?, ?)")
+                            .bind("fixture.extra.v7")
                             .bind("0".repeat(64))
                             .bind(Uuid::new_v4().hyphenated().to_string())
                             .execute(store.pool.as_ref()),
@@ -2355,7 +2381,7 @@ mod tests {
             let mut attempts = Vec::new();
             for _ in 0..count {
                 let operation = Uuid::new_v4();
-                let name = attempt_name(6, operation);
+                let name = attempt_name(7, operation);
                 bounded_query(
                     sqlx::query("CALL DOLT_BRANCH(?, ?)")
                         .bind(&name)
@@ -2373,7 +2399,7 @@ mod tests {
                         let built = build_attempt(
                             TEST_REGISTRY,
                             &attempt,
-                            &V6,
+                            &V7,
                             *operation,
                             &MigrationRunnerHooks::none(),
                         )
@@ -2388,7 +2414,7 @@ mod tests {
                     let built = build_attempt(
                         TEST_REGISTRY,
                         &attempt,
-                        &V6,
+                        &V7,
                         mismatched,
                         &MigrationRunnerHooks::none(),
                     )
@@ -2481,13 +2507,13 @@ mod tests {
         commit_fixture(&main, "Create branch-free schema v2 capacity fixture").await?;
         validate_version_with(TEST_REGISTRY, &main, 2).await?;
         upgrade_with(REGISTRY, &server, &main, &MigrationRunnerHooks::none()).await?;
-        validate_version_with(TEST_REGISTRY, &main, 5).await?;
+        validate_version_with(TEST_REGISTRY, &main, 6).await?;
 
         let base = revision(&main).await?;
         let mut names = Vec::with_capacity(INVENTORY_LIMIT);
         let existing = reserved_names(&main).await?.len();
         for _ in existing..INVENTORY_LIMIT {
-            let name = attempt_name(6, Uuid::new_v4());
+            let name = attempt_name(7, Uuid::new_v4());
             bounded_query(
                 sqlx::query("CALL DOLT_BRANCH(?, ?)")
                     .bind(&name)
@@ -2496,7 +2522,7 @@ mod tests {
             )
             .await?;
             let attempt = server.pool(&name).await?;
-            let prepared = bounded_query(sqlx::query(V6.sql[0]).execute(attempt.as_ref())).await;
+            let prepared = bounded_query(sqlx::query(V7.sql[0]).execute(attempt.as_ref())).await;
             after_cleanup(prepared.map(|_| ()), close_branch_pool(&attempt).await)?;
             names.push(name);
         }
@@ -2539,7 +2565,7 @@ mod tests {
             let names = match invalid {
                 InvalidInventory::Malformed => vec!["kuru_migration_bad".to_owned()],
                 InvalidInventory::UnknownTarget => {
-                    vec![attempt_name(7, Uuid::new_v4())]
+                    vec![attempt_name(8, Uuid::new_v4())]
                 }
                 InvalidInventory::Excess => {
                     let existing = reserved_names(&store.pool).await?.len();
@@ -2582,7 +2608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v6_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
+    async fn test_v7_receipt_order_and_operation_uniqueness_are_enforced() -> Result<()> {
         for repeated_operation in [false, true] {
             let store = super::super::MemoryStore::temporary().await?;
             upgrade_with(
@@ -2604,7 +2630,7 @@ mod tests {
                 )
                 .await?;
                 bounded_query(
-                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 6")
+                    sqlx::query("UPDATE kuru_migrations SET operation = ? WHERE version = 7")
                         .bind(operation)
                         .execute(store.pool.as_ref()),
                 )
@@ -2824,7 +2850,10 @@ mod tests {
             &store.shared.server,
             &store.pool,
             &before,
-            "schema version 5, expected 4",
+            &format!(
+                "schema version {CURRENT_VERSION}, expected {}",
+                CURRENT_VERSION - 1
+            ),
         )
         .await?;
         let completed = store.shared.server.pool(&completed_name).await?;
@@ -2860,7 +2889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_v2_attempts_and_candidate_survive_test_v6_progression() -> Result<()> {
+    async fn retained_v2_attempts_and_candidate_survive_test_v7_progression() -> Result<()> {
         let root = crate::test_support::tempdir()?;
         let options = crate::test_support::open_options(
             root.path().join("private"),
@@ -2870,10 +2899,10 @@ mod tests {
         store
             .append("conversation", "user", "written after the v2 upgrade")
             .await?;
-        let candidate = store.begin_candidate("pre-v6 candidate").await?;
+        let candidate = store.begin_candidate("pre-v7 candidate").await?;
         candidate
             .view()
-            .append("candidate", "assistant", "kept on schema v5")
+            .append("candidate", "assistant", "kept on schema v6")
             .await?;
         let candidate_head = candidate.view().revision().await?;
 
@@ -2913,14 +2942,14 @@ mod tests {
 
         assert_eq!(
             validate_ready_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?,
-            5
+            6
         );
-        let v6_operation = Uuid::new_v4();
-        let v6_name = attempt_name(6, v6_operation);
+        let v7_operation = Uuid::new_v4();
+        let v7_name = attempt_name(7, v7_operation);
         let current_base = store.revision().await?;
         bounded_query(
             sqlx::query("CALL DOLT_BRANCH(?, ?)")
-                .bind(&v6_name)
+                .bind(&v7_name)
                 .bind(&current_base)
                 .fetch_all(store.pool.as_ref()),
         )
@@ -2929,7 +2958,7 @@ mod tests {
             validate_ready_with(TEST_REGISTRY, &store.shared.server, &store.pool)
                 .await
                 .is_err(),
-            "a ready v5 stage must reject even a pristine v6 attempt"
+            "a ready v7 stage must reject while an earlier failed attempt remains"
         );
 
         upgrade_with(
@@ -2940,25 +2969,25 @@ mod tests {
         )
         .await?;
         validate_active_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 6);
-        let v6_attempt = store.shared.server.pool(&v6_name).await?;
-        assert_eq!(revision(&v6_attempt).await?, store.revision().await?);
-        let v6_receipt: String = bounded_query(
-            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 6")
-                .fetch_one(v6_attempt.as_ref()),
+        assert_eq!(version(&store.pool).await?, 7);
+        let v7_attempt = store.shared.server.pool(&v7_name).await?;
+        assert_eq!(revision(&v7_attempt).await?, store.revision().await?);
+        let v7_receipt: String = bounded_query(
+            sqlx::query_scalar("SELECT operation FROM kuru_migrations WHERE version = 7")
+                .fetch_one(v7_attempt.as_ref()),
         )
         .await?;
-        assert_eq!(v6_receipt, v6_operation.hyphenated().to_string());
-        v6_attempt.close().await;
-        drop(v6_attempt);
+        assert_eq!(v7_receipt, v7_operation.hyphenated().to_string());
+        v7_attempt.close().await;
+        drop(v7_attempt);
         assert_eq!(
             reserved_names(&store.pool)
                 .await?
                 .into_iter()
-                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 6))
+                .filter(|name| parse_attempt(name).is_ok_and(|(target, _)| target == 7))
                 .count(),
             1,
-            "the pristine exact-base v6 attempt must be reused"
+            "the pristine exact-base v7 attempt must be reused"
         );
         // This is a synthetic future schema, beyond the current store API's
         // validated open contract. Inspect the test-registry-backed SQL view.
@@ -2986,11 +3015,11 @@ mod tests {
         assert_eq!(old_view.revision().await?, candidate_head);
         assert_eq!(
             validate_supported_with(TEST_REGISTRY, &old_view.pool).await?,
-            5
+            6
         );
         assert_eq!(
             old_view.history("candidate", 10).await?[0].plain_text(),
-            Some("kept on schema v5")
+            Some("kept on schema v6")
         );
         let before_stale_merge = durable_snapshot(&store.pool).await?;
         assert!(
@@ -3001,11 +3030,11 @@ mod tests {
             )
             .await
             .is_err(),
-            "pre-v6 candidate unexpectedly fast-forwarded into v6 main"
+            "pre-v7 candidate unexpectedly fast-forwarded into v7 main"
         );
         assert_eq!(durable_snapshot(&store.pool).await?, before_stale_merge);
 
-        // Model a future v6 writer through its test registry and SQL view.
+        // Model a future v7 writer through its test registry and SQL view.
         // Released-v5 reopen refusal is checked in the separate old-registry fixture.
         let fresh_name = format!("candidate_{}", Uuid::new_v4().simple());
         let fresh_base = revision(&store.pool).await?;
@@ -3017,7 +3046,7 @@ mod tests {
         )
         .await?;
         let fresh = store.shared.server.pool(&fresh_name).await?;
-        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 6);
+        assert_eq!(validate_supported_with(TEST_REGISTRY, &fresh).await?, 7);
         bounded_query(
             sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
                 .bind(b"post-v6".as_slice())
@@ -3049,7 +3078,7 @@ mod tests {
         .await?;
         commit_fixture(&store.pool, "Test future-schema conversation write").await?;
         validate_active_with(TEST_REGISTRY, &store.shared.server, &store.pool).await?;
-        assert_eq!(version(&store.pool).await?, 6);
+        assert_eq!(version(&store.pool).await?, 7);
         let promoted_value: String = bounded_query(
             sqlx::query_scalar("SELECT value FROM state WHERE `key` = ?")
                 .bind(b"post-v6".as_slice())
@@ -3141,7 +3170,7 @@ mod tests {
         assert_eq!(revision(&old_candidate).await?, candidate_head);
         assert_eq!(
             validate_supported_with(TEST_REGISTRY, &old_candidate).await?,
-            5
+            6
         );
         let old_content: String = bounded_query(
             sqlx::query_scalar("SELECT content FROM messages WHERE namespace = ?")
@@ -3149,7 +3178,7 @@ mod tests {
                 .fetch_one(old_candidate.as_ref()),
         )
         .await?;
-        assert_eq!(old_content, "kept on schema v5");
+        assert_eq!(old_content, "kept on schema v6");
         old_candidate.close().await;
         drop(old_candidate);
         main.close().await;
@@ -3247,7 +3276,7 @@ mod tests {
         server.close().await?;
 
         let store = super::super::MemoryStore::open(options).await?;
-        assert_eq!(version(&store.pool).await?, 5);
+        assert_eq!(version(&store.pool).await?, CURRENT_VERSION);
         let usage = store
             .shared
             .usage_pool
@@ -3293,9 +3322,180 @@ mod tests {
         assert_eq!(old_content, "historical candidate");
         old_candidate.close().await;
         let fresh = store.begin_candidate("after receipt upgrade").await?;
-        assert_eq!(version(&fresh.view().pool).await?, 5);
+        assert_eq!(version(&fresh.view().pool).await?, CURRENT_VERSION);
         drop(fresh);
         drop(usage);
         store.close().await
+    }
+
+    #[tokio::test]
+    async fn released_v5_summary_identity_survives_v6_upgrade_reopen_and_export() -> Result<()> {
+        let root = crate::test_support::tempdir()?;
+        let options = crate::test_support::open_options(
+            root.path().join("private"),
+            format!("project/{}", "6".repeat(64)),
+        )?;
+        released_v2(&options).await?;
+        let server = super::super::tests::released_server(&options).await?;
+        let main = server.pool("main").await?;
+        upgrade_with(
+            RELEASED_V5_REGISTRY,
+            &server,
+            &main,
+            &MigrationRunnerHooks::none(),
+        )
+        .await?;
+        assert_eq!(version(&main).await?, 5);
+        let inserted = bounded_query(
+            sqlx::query("INSERT INTO messages (namespace, session_id, role, content_format, content) VALUES (?, ?, ?, 'text-v1', ?)")
+                .bind(b"actor namespace".as_slice())
+                .bind(b"session".as_slice())
+                .bind(b"user".as_slice())
+                .bind("legacy compact source")
+                .execute(main.as_ref()),
+        )
+        .await?;
+        let through_sequence = i64::try_from(inserted.last_insert_id())
+            .context("legacy compact source sequence exceeds integer range")?;
+        commit_fixture(&main, "Released v5 compact source").await?;
+        let source_revision = revision(&main).await?;
+        let context = super::super::ContextSummaryRecord {
+            actor_namespace: "actor namespace".into(),
+            session_id: "session".into(),
+            source_namespace: "actor namespace".into(),
+            summary_namespace: "summary namespace".into(),
+            source_view: "main".into(),
+            source_revision: source_revision.clone(),
+            after_sequence: 0,
+            through_sequence,
+            turn_id: Some("turn".into()),
+            operation_id: None,
+            producer_actor_id: None,
+            invocation_id: "invocation".into(),
+            summary: "released v5 context".into(),
+        };
+        let summary_id = super::super::context_summary_id(&context)?;
+        let reasoning = super::super::ReasoningSummaryRecord {
+            session_id: "session".into(),
+            turn_id: Some("turn".into()),
+            operation_id: None,
+            actor_id: "actor".into(),
+            invocation_id: "invocation".into(),
+            item_id: Some("item".into()),
+            output_index: Some(0),
+            summary_index: 0,
+            text: "released v5 private reasoning".into(),
+        };
+        let reasoning_key = super::super::reasoning_summary_key(&reasoning)?;
+        let reasoning_json = serde_json::to_string(&reasoning)?;
+        bounded_query(
+            sqlx::query("INSERT INTO state (`key`, value) VALUES (?, ?)")
+                .bind(reasoning_key.as_bytes())
+                .bind(&reasoning_json)
+                .execute(main.as_ref()),
+        )
+        .await?;
+        bounded_query(
+            sqlx::query("INSERT INTO context_summaries (summary_id, actor_namespace, session_id, source_namespace, summary_namespace, source_view, source_revision, after_sequence, through_sequence, turn_id, invocation_id, record_format, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(&summary_id)
+                .bind(context.actor_namespace.as_bytes())
+                .bind(context.session_id.as_bytes())
+                .bind(context.source_namespace.as_bytes())
+                .bind(context.summary_namespace.as_bytes())
+                .bind(&context.source_view)
+                .bind(&context.source_revision)
+                .bind(context.after_sequence)
+                .bind(context.through_sequence)
+                .bind(context.turn_id.as_deref().context("legacy turn missing")?.as_bytes())
+                .bind(context.invocation_id.as_bytes())
+                .bind(super::super::CONTEXT_SUMMARY_FORMAT)
+                .bind(&context.summary)
+                .execute(main.as_ref()),
+        )
+        .await?;
+        bounded_query(
+            sqlx::query("INSERT INTO context_summary_cursors (actor_namespace, session_id, source_namespace, through_sequence, summary_id, source_view, source_revision) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                .bind(context.actor_namespace.as_bytes())
+                .bind(context.session_id.as_bytes())
+                .bind(context.source_namespace.as_bytes())
+                .bind(context.through_sequence)
+                .bind(&summary_id)
+                .bind(&context.source_view)
+                .bind(&context.source_revision)
+                .execute(main.as_ref()),
+        )
+        .await?;
+        commit_fixture(&main, "Released v5 summary fixture").await?;
+        main.close().await;
+        drop(main);
+        server.close().await?;
+
+        let store = super::super::MemoryStore::open(options.clone()).await?;
+        assert_eq!(version(&store.pool).await?, CURRENT_VERSION);
+        type MigratedSummaryRow = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, String);
+        let row: MigratedSummaryRow = bounded_query(
+            sqlx::query_as("SELECT turn_id, operation_id, producer_actor_id, record_format FROM context_summaries WHERE summary_id = ?")
+                .bind(&summary_id)
+                .fetch_one(store.pool.as_ref()),
+        )
+        .await?;
+        assert_eq!(row.0, Some(b"turn".to_vec()));
+        assert_eq!(row.1, None);
+        assert_eq!(row.2, None);
+        assert_eq!(row.3, super::super::CONTEXT_SUMMARY_FORMAT);
+        assert_eq!(
+            store.get(&reasoning_key).await?,
+            Some(serde_json::from_str(&reasoning_json)?)
+        );
+        let usage = store
+            .shared
+            .usage_pool
+            .lock()
+            .expect("usage pool lock")
+            .clone()
+            .context("usage pool missing after v6 upgrade")?;
+        assert_eq!(version(&usage).await?, USAGE_CURRENT_VERSION);
+        drop(usage);
+
+        let export = store.begin_active_export().await?;
+        let mut cursor = None;
+        let mut records = Vec::new();
+        let reasoning_value: serde_json::Value = serde_json::from_str(&reasoning_json)?;
+        loop {
+            let page = export.page(cursor).await?;
+            records.extend(page.records);
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(records.iter().any(|record| matches!(record,
+            super::super::StorageRecord::ContextSummary { summary_id: exported_id, record, record_format }
+                if exported_id == &summary_id
+                    && record == &context
+                    && record_format == super::super::CONTEXT_SUMMARY_FORMAT
+        )));
+        assert!(records.iter().any(|record| matches!(record,
+            super::super::StorageRecord::State { key, value }
+                if key == &reasoning_key && value == &reasoning_value
+        )));
+        let upgraded_head = store.revision().await?;
+        store.close().await?;
+
+        let reopened = super::super::MemoryStore::open(options).await?;
+        assert_eq!(reopened.revision().await?, upgraded_head);
+        let window = reopened
+            .context_summary_window(
+                &context.actor_namespace,
+                &context.summary_namespace,
+                Some(&context.session_id),
+                Some(&context.source_namespace),
+                16,
+            )
+            .await?;
+        assert_eq!(window.records.len(), 1);
+        assert_eq!(window.records[0].summary_id, summary_id);
+        assert_eq!(window.records[0].record, context);
+        reopened.close().await
     }
 }
