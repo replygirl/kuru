@@ -36,10 +36,13 @@ use sqlx::{
 };
 use tokio::sync::watch;
 
+#[path = "support/mcp_oauth_https.rs"]
+mod mcp_oauth_https;
 #[path = "support/memory.rs"]
 mod memory;
 #[path = "support/terminal.rs"]
 mod terminal;
+use mcp_oauth_https::HttpsMcpFixture;
 use terminal::{READY_TIMEOUT, Terminal, startup_timeout};
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1948,6 +1951,135 @@ fn real_pty_mcp_oauth_status_uses_the_shared_command_family_without_network() ->
         "MCP status terminal output disclosed the configured client secret"
     );
     terminal.assert_restored()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_pty_mcp_device_login_status_logout_matches_cli() -> Result<()> {
+    let sandbox = Sandbox::new()?;
+    kuru_platform::fs::Directory::ensure_private(&sandbox.data)?;
+    let oauth = HttpsMcpFixture::start(sandbox.root.path()).await;
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let response_calls = Arc::clone(&provider_calls);
+    let provider = Router::new()
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data":[{"id":"fixture"}]})) }),
+        )
+        .route(
+            "/v1/responses",
+            post(move || {
+                let calls = Arc::clone(&response_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _provider = Server(tokio::spawn(async move {
+        axum::serve(listener, provider).await.unwrap();
+    }));
+
+    let mut config = sandbox.config()?;
+    config.provider = "responses".into();
+    config.model = "fixture".into();
+    config.api_base = format!("http://{address}/v1");
+    config.api_key_env = "KURU_FIXTURE_KEY".into();
+    config.mcp.insert(
+        "secure".into(),
+        McpConfig {
+            url: Some(format!("{}/mcp", oauth.base)),
+            oauth: Some(McpOAuthConfig {
+                enabled: true,
+                client_id: Some("synthetic-client".into()),
+                scopes: vec!["mcp.read".into()],
+                ..McpOAuthConfig::default()
+            }),
+            ..McpConfig::default()
+        },
+    );
+    let config_path = sandbox.root.path().join("mcp-device-pty.toml");
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+    let cli_status = || -> Result<Value> {
+        let output = sandbox
+            .command("responses")
+            .args(["--model", "fixture", "--config"])
+            .arg(&config_path)
+            .args(["--trust-workspace-once", "mcp", "status", "secure"])
+            .env("KURU_FIXTURE_KEY", "fixture-key")
+            .env("KURU_TEST_MCP_CA_PEM", &oauth.ca_path)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "selected CLI MCP status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+
+    let mut command = sandbox.command("responses");
+    command
+        .args(["--model", "fixture", "--config"])
+        .arg(&config_path)
+        .arg("--trust-workspace-once")
+        .env("KURU_FIXTURE_KEY", "fixture-key")
+        .env("KURU_TEST_MCP_CA_PEM", &oauth.ca_path)
+        .env("KURU_REDUCED_MOTION", "1");
+    let mut terminal = Terminal::spawn(command, 50, 160)?;
+    terminal.wait_composer_frame(&["enter send"], sandbox.startup_timeout)?;
+    terminal.command("/mcp login --device secure", None)?;
+    terminal.wait_composer_frame(&["Signed in to MCP secure.", "enter send"], READY_TIMEOUT)?;
+    ensure!(
+        String::from_utf8_lossy(&terminal.output).contains("TEST-CODE"),
+        "device login did not show its public user code"
+    );
+    assert_eq!(oauth.device_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(oauth.token_requests.load(Ordering::SeqCst), 1);
+    let forms = oauth.token_forms();
+    assert_eq!(forms.len(), 1);
+    assert_eq!(
+        forms[0].get("grant_type").map(String::as_str),
+        Some("urn:ietf:params:oauth:grant-type:device_code")
+    );
+    assert_eq!(
+        forms[0].get("device_code").map(String::as_str),
+        Some("synthetic-device")
+    );
+
+    terminal.command("/mcp status secure", None)?;
+    terminal.wait_composer_frame(&["\"state\": \"authorized\"", "enter send"], READY_TIMEOUT)?;
+    assert_eq!(cli_status()?["state"], "authorized");
+    terminal.command("/mcp logout secure", None)?;
+    terminal.wait_composer_frame(&["\"local_deleted\": true", "enter send"], READY_TIMEOUT)?;
+    assert_eq!(oauth.revocations.load(Ordering::SeqCst), 1);
+    terminal.command("/mcp status secure", None)?;
+    terminal.wait_composer_frame(
+        &["\"state\": \"login_required\"", "enter send"],
+        READY_TIMEOUT,
+    )?;
+    assert_eq!(cli_status()?["state"], "login_required");
+    terminal.command("/help", None)?;
+    terminal.wait_composer_frame(&["/mcp", "enter send"], READY_TIMEOUT)?;
+    terminal.send(b"/quit\r")?;
+    terminal.wait_exit(EXIT_TIMEOUT)?;
+    terminal.assert_restored()?;
+    ensure!(
+        provider_calls.load(Ordering::SeqCst) == 0,
+        "MCP account commands sent a provider request"
+    );
+    let output = String::from_utf8_lossy(&terminal.output);
+    for secret in [
+        "synthetic-mcp-access",
+        "synthetic-mcp-refresh",
+        "synthetic-device",
+    ] {
+        ensure!(
+            !output.contains(secret),
+            "MCP account output included a private credential"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

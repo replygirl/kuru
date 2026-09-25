@@ -13,6 +13,10 @@ use std::{
 #[path = "support/memory.rs"]
 mod memory;
 
+#[path = "support/mcp_oauth_https.rs"]
+mod mcp_oauth_https;
+use mcp_oauth_https::HttpsMcpFixture;
+
 #[cfg(unix)]
 #[path = "support/terminal.rs"]
 #[allow(
@@ -210,204 +214,6 @@ client_id = "synthetic-native-client"
     }
 }
 
-struct HttpsMcpFixture {
-    base: String,
-    ca_path: PathBuf,
-    device_requests: Arc<AtomicUsize>,
-    token_requests: Arc<AtomicUsize>,
-    revocations: Arc<AtomicUsize>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for HttpsMcpFixture {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl HttpsMcpFixture {
-    async fn start(root: &Path) -> Self {
-        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
-        use tokio_rustls::rustls::{
-            ServerConfig,
-            pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
-        };
-
-        let mut ca_params = CertificateParams::default();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let issuer = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
-        let leaf_params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
-        let leaf_key = KeyPair::generate().unwrap();
-        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
-        let ca_path = root.join("synthetic-mcp-ca.pem");
-        std::fs::write(&ca_path, issuer.pem()).unwrap();
-        let config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![leaf.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
-            )
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let base = format!("https://localhost:{port}");
-        let device_requests = Arc::new(AtomicUsize::new(0));
-        let token_requests = Arc::new(AtomicUsize::new(0));
-        let revocations = Arc::new(AtomicUsize::new(0));
-        let task = tokio::spawn({
-            let base = base.clone();
-            let device_requests = Arc::clone(&device_requests);
-            let token_requests = Arc::clone(&token_requests);
-            let revocations = Arc::clone(&revocations);
-            async move {
-                loop {
-                    let (socket, _) = listener.accept().await.unwrap();
-                    let acceptor = acceptor.clone();
-                    let base = base.clone();
-                    let device_requests = Arc::clone(&device_requests);
-                    let token_requests = Arc::clone(&token_requests);
-                    let revocations = Arc::clone(&revocations);
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let Ok(Ok(mut stream)) = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            acceptor.accept(socket),
-                        )
-                        .await
-                        else {
-                            return;
-                        };
-                        let mut request = Vec::new();
-                        let headers_end = loop {
-                            let mut chunk = [0u8; 1024];
-                            let Ok(Ok(count)) = tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                stream.read(&mut chunk),
-                            )
-                            .await
-                            else {
-                                return;
-                            };
-                            if count == 0 || request.len() + count > 16 * 1024 {
-                                return;
-                            }
-                            request.extend_from_slice(&chunk[..count]);
-                            if let Some(end) =
-                                request.windows(4).position(|part| part == b"\r\n\r\n")
-                            {
-                                break end + 4;
-                            }
-                        };
-                        let headers = String::from_utf8_lossy(&request[..headers_end]).into_owned();
-                        let Some(first) = headers.lines().next() else {
-                            return;
-                        };
-                        let mut parts = first.split_whitespace();
-                        let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
-                            return;
-                        };
-                        let length = headers
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().ok())
-                                    .flatten()
-                            })
-                            .unwrap_or(0);
-                        if length > 8 * 1024 {
-                            return;
-                        }
-                        while request.len() - headers_end < length {
-                            let mut chunk = [0u8; 1024];
-                            let Ok(Ok(count)) = tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                stream.read(&mut chunk),
-                            )
-                            .await
-                            else {
-                                return;
-                            };
-                            if count == 0 || request.len() + count > 24 * 1024 {
-                                return;
-                            }
-                            request.extend_from_slice(&chunk[..count]);
-                        }
-                        let payload = &request[headers_end..headers_end + length];
-                        let mut extra = String::new();
-                        let (status, body) = match (method, path) {
-                            ("GET", "/mcp") => {
-                                extra = format!(
-                                    "WWW-Authenticate: Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource/mcp\", scope=\"mcp.read\"\r\n"
-                                );
-                                (401, serde_json::json!({"error":"unauthorized"}))
-                            }
-                            ("GET", "/.well-known/oauth-protected-resource/mcp") => (
-                                200,
-                                serde_json::json!({"resource":format!("{base}/mcp"),"authorization_servers":[format!("{base}/")],"scopes_supported":["mcp.read"]}),
-                            ),
-                            ("GET", "/.well-known/oauth-authorization-server") => (
-                                200,
-                                serde_json::json!({"issuer":format!("{base}/"),"authorization_endpoint":format!("{base}/authorize"),"token_endpoint":format!("{base}/token"),"device_authorization_endpoint":format!("{base}/device"),"revocation_endpoint":format!("{base}/revoke"),"grant_types_supported":["authorization_code","urn:ietf:params:oauth:grant-type:device_code","refresh_token"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true}),
-                            ),
-                            ("POST", "/device") => {
-                                device_requests.fetch_add(1, Ordering::Relaxed);
-                                (
-                                    200,
-                                    serde_json::json!({"device_code":"synthetic-device","user_code":"TEST-CODE","verification_uri":format!("{base}/verify"),"expires_in":120,"interval":1}),
-                                )
-                            }
-                            ("POST", "/token") => {
-                                token_requests.fetch_add(1, Ordering::Relaxed);
-                                (
-                                    200,
-                                    serde_json::json!({"access_token":"synthetic-mcp-access","refresh_token":"synthetic-mcp-refresh","token_type":"Bearer","expires_in":120,"scope":"mcp.read"}),
-                                )
-                            }
-                            ("POST", "/revoke") => {
-                                revocations.fetch_add(1, Ordering::Relaxed);
-                                (200, serde_json::json!({}))
-                            }
-                            ("POST", "/mcp") => {
-                                let parsed: Value = serde_json::from_slice(payload).unwrap();
-                                let result = match parsed["method"].as_str() {
-                                    Some("initialize") => {
-                                        serde_json::json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}}})
-                                    }
-                                    Some("tools/list") => serde_json::json!({"tools":[]}),
-                                    Some("notifications/initialized") => serde_json::json!({}),
-                                    _ => serde_json::json!({}),
-                                };
-                                (
-                                    200,
-                                    serde_json::json!({"jsonrpc":"2.0","id":parsed["id"],"result":result}),
-                                )
-                            }
-                            _ => (404, serde_json::json!({"error":"not found"})),
-                        };
-                        let body = body.to_string();
-                        let response = format!(
-                            "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
-                            body.len()
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                        let _ = stream.shutdown().await;
-                    });
-                }
-            }
-        });
-        Self {
-            base,
-            ca_path,
-            device_requests,
-            token_requests,
-            revocations,
-            task,
-        }
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_cli_device_login_status_logout_uses_synthetic_verified_https() {
     let env = Sandbox::new();
@@ -478,6 +284,204 @@ async fn mcp_cli_device_login_status_logout_uses_synthetic_verified_https() {
     assert_eq!(server.device_requests.load(Ordering::Relaxed), 1);
 }
 
+#[cfg(target_os = "linux")]
+async fn read_linux_child_pipe(
+    pipe: impl tokio::io::AsyncRead + Unpin,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut output = Vec::new();
+    let mut pipe = pipe.take(limit + 1);
+    pipe.read_to_end(&mut output).await?;
+    Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+async fn bounded_linux_cli_child(
+    env: &Sandbox,
+    ca_path: &Path,
+    disconnected_bus: Option<(&str, &Path)>,
+    args: &[&str],
+    phase: &str,
+) -> anyhow::Result<Output> {
+    use anyhow::{Context, ensure};
+    use std::{process::Stdio, time::Duration};
+
+    // Match the existing installed-CLI fixture's concurrent, bounded pipe
+    // capture and explicit kill/reap path. The 125s ceiling includes the
+    // managed owner's existing 120s outer startup allowance.
+    const CHILD_TIMEOUT: Duration = Duration::from_secs(125);
+    const OUTPUT_LIMIT: u64 = 64 * 1024;
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_kuru"));
+    command
+        .arg("-C")
+        .arg(&env.project)
+        .arg("--data-dir")
+        .arg(&env.data)
+        .args(["--provider", "demo", "--no-dream"])
+        .env("XDG_CONFIG_HOME", env.root.path().join("config"))
+        .env("KURU_TEST_MCP_CA_PEM", ca_path)
+        .env("KURU_TEST_STATIC_HEADER", "Bearer synthetic-static-proof")
+        .arg("--trust-workspace-once")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some((address, runtime)) = disconnected_bus {
+        command
+            .env("DBUS_SESSION_BUS_ADDRESS", address)
+            .env("XDG_RUNTIME_DIR", runtime);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start {phase} child"))?;
+    let stdout = child.stdout.take().context("capture stdout")?;
+    let stderr = child.stderr.take().context("capture stderr")?;
+    let stdout = tokio::spawn(read_linux_child_pipe(stdout, OUTPUT_LIMIT));
+    let stderr = tokio::spawn(read_linux_child_pipe(stderr, OUTPUT_LIMIT));
+    let status = match tokio::time::timeout(CHILD_TIMEOUT, child.wait()).await {
+        Ok(status) => status.with_context(|| format!("wait for {phase} child"))?,
+        Err(_) => {
+            child
+                .kill()
+                .await
+                .with_context(|| format!("reap timed-out {phase} child"))?;
+            let out = tokio::time::timeout(Duration::from_secs(5), stdout).await;
+            let err = tokio::time::timeout(Duration::from_secs(5), stderr).await;
+            anyhow::bail!(
+                "{phase} child exceeded {CHILD_TIMEOUT:?}; stdout={out:?}; stderr={err:?}"
+            );
+        }
+    };
+    let stdout = tokio::time::timeout(Duration::from_secs(5), stdout)
+        .await
+        .with_context(|| format!("{phase} stdout did not close"))???;
+    let stderr = tokio::time::timeout(Duration::from_secs(5), stderr)
+        .await
+        .with_context(|| format!("{phase} stderr did not close"))???;
+    ensure!(
+        stdout.len() as u64 <= OUTPUT_LIMIT && stderr.len() as u64 <= OUTPUT_LIMIT,
+        "{phase} child output exceeded {OUTPUT_LIMIT} bytes"
+    );
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_cli_missing_secret_service_refuses_without_fallback_or_static_alias_loss()
+-> anyhow::Result<()> {
+    use anyhow::ensure;
+    let env = Sandbox::new();
+    let server = HttpsMcpFixture::start(env.root.path()).await;
+    let config = env.root.path().join("config/kuru/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\n[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nscopes = ['mcp.read']\n\n[mcp.static]\nurl = {:?}\n[mcp.static.header_env]\nAuthorization = 'KURU_TEST_STATIC_HEADER'\n",
+        format!("{}/mcp", server.base),
+        format!("{}/static-mcp", server.base)
+    ));
+    std::fs::write(config, text).unwrap();
+
+    // CI supplies a real owned D-Bus Secret Service. Only these children get
+    // the missing-bus address; the runner's bus and native collection remain.
+    let absent_runtime = env.root.path().join("absent-bus-runtime");
+    kuru_platform::fs::Directory::ensure_private(&absent_runtime).unwrap();
+    let absent_bus = format!(
+        "unix:path={}",
+        absent_runtime.join("missing-session-bus").display()
+    );
+    let run = |args: &'static [&'static str], disconnected: bool, phase: &'static str| {
+        bounded_linux_cli_child(
+            &env,
+            &server.ca_path,
+            disconnected.then_some((absent_bus.as_str(), absent_runtime.as_path())),
+            args,
+            phase,
+        )
+    };
+
+    let proof: anyhow::Result<()> = async {
+        let login = run(&["mcp", "login", "secure", "--device"], false, "seed login").await?;
+        ensure!(
+            login.status.success(),
+            "real Secret Service seed failed: {}",
+            String::from_utf8_lossy(&login.stderr)
+        );
+        ensure!(server.device_requests.load(Ordering::Relaxed) == 1);
+        ensure!(server.token_requests.load(Ordering::Relaxed) == 1);
+        let baseline = run(&["mcp", "status", "secure"], false, "baseline status").await?;
+        ensure!(baseline.status.success(), "{baseline:?}");
+        let baseline: Value = serde_json::from_slice(&baseline.stdout)?;
+        ensure!(baseline["state"] == "authorized", "{baseline}");
+
+        let unavailable = run(&["mcp", "status", "secure"], true, "missing-bus status").await?;
+        ensure!(unavailable.status.success(), "{unavailable:?}");
+        let unavailable: Value = serde_json::from_slice(&unavailable.stdout)?;
+        ensure!(
+            unavailable["state"] == "native_store_unavailable",
+            "{unavailable}"
+        );
+        ensure!(
+            unavailable["diagnostic"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "missing bus produced no actionable status: {unavailable}"
+        );
+        let refused = run(
+            &["mcp", "login", "secure", "--device"],
+            true,
+            "missing-bus login",
+        )
+        .await?;
+        ensure!(!refused.status.success(), "missing bus admitted login");
+        let diagnostic = String::from_utf8_lossy(&refused.stderr);
+        ensure!(
+            diagnostic.contains("native") || diagnostic.contains("credential"),
+            "missing bus failed for an unrelated reason: {diagnostic}"
+        );
+        ensure!(server.device_requests.load(Ordering::Relaxed) == 1);
+        ensure!(server.token_requests.load(Ordering::Relaxed) == 1);
+
+        let catalog = run(&["tools"], true, "missing-bus static catalog").await?;
+        ensure!(catalog.status.success(), "{catalog:?}");
+        let catalog: Value = serde_json::from_slice(&catalog.stdout)?;
+        ensure!(catalog["tools"].as_array().is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("MCP static/static-proof"))
+            })
+        }));
+        ensure!(server.static_requests.load(Ordering::Relaxed) > 0);
+        ensure!(server.static_bad_headers.load(Ordering::Relaxed) == 0);
+
+        // Broken-bus children must not read a fallback or change the record.
+        let restored = run(&["mcp", "status", "secure"], false, "restored status").await?;
+        ensure!(restored.status.success(), "{restored:?}");
+        let restored: Value = serde_json::from_slice(&restored.stdout)?;
+        ensure!(restored["state"] == "authorized", "{restored}");
+        Ok(())
+    }
+    .await;
+
+    // Always attempt exact native cleanup, including when an assertion or a
+    // bounded child fails. A failed cleanup is reported with the proof error.
+    let cleanup = run(&["mcp", "logout", "secure"], false, "native logout").await;
+    if let Err(error) = proof {
+        anyhow::bail!("missing-bus proof failed: {error:#}; native cleanup: {cleanup:?}");
+    }
+    let logout = cleanup?;
+    ensure!(logout.status.success(), "{logout:?}");
+    let logout: Value = serde_json::from_slice(&logout.stdout)?;
+    ensure!(logout["local_deleted"] == true, "{logout}");
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_cli_no_browser_prints_local_callback_guidance_and_settles_once() {
@@ -545,16 +549,87 @@ async fn mcp_cli_no_browser_prints_local_callback_guidance_and_settles_once() {
         .append_pair("code", "synthetic-callback-code")
         .append_pair("state", state)
         .append_pair("iss", &format!("{}/", server.base));
-    let response = reqwest::Client::new().get(callback).send().await.unwrap();
+    // Model a browser on another machine through a local TCP forwarder. Keep
+    // the owner's advertised callback authority in the HTTP request itself.
+    let advertised = reqwest::Url::parse(redirect).unwrap();
+    assert_eq!(advertised.scheme(), "http");
+    assert_eq!(advertised.host_str(), Some("127.0.0.1"));
+    assert_eq!(callback.scheme(), advertised.scheme());
+    assert_eq!(callback.host_str(), advertised.host_str());
+    assert_eq!(callback.port(), advertised.port());
+    assert_eq!(callback.path(), advertised.path());
+    let owner_port = advertised.port().unwrap();
+    let forwarder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forwarded_port = forwarder.local_addr().unwrap().port();
+    assert_ne!(forwarded_port, owner_port);
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_by_forwarder = Arc::clone(&accepted);
+    let forward_task = tokio::spawn(async move {
+        let (mut browser, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), forwarder.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        accepted_by_forwarder.fetch_add(1, Ordering::Relaxed);
+        let mut owner = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(("127.0.0.1", owner_port)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut browser, &mut owner).await;
+    });
+    let mut forwarded = callback.clone();
+    forwarded.set_port(Some(forwarded_port)).unwrap();
+    assert_eq!(forwarded.path(), advertised.path());
+    assert_eq!(forwarded.query(), callback.query());
+    let response = reqwest::Client::new()
+        .get(forwarded)
+        .header(reqwest::header::HOST, format!("127.0.0.1:{owner_port}"))
+        .send()
+        .await
+        .unwrap();
     assert!(
         response.status().is_success(),
-        "callback refused: {}",
+        "forwarded callback refused: {}",
         response.status()
     );
+    let _ = response.bytes().await.unwrap();
+    forward_task.abort();
+    let _ = forward_task.await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
     let output = child.join().unwrap().unwrap();
     assert!(output.contains("Signed in to MCP browser."), "{output}");
     assert_eq!(server.device_requests.load(Ordering::Relaxed), 0);
     assert_eq!(server.token_requests.load(Ordering::Relaxed), 1);
+    let forms = server.token_forms();
+    assert_eq!(forms.len(), 1);
+    let form = &forms[0];
+    assert_eq!(
+        form.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
+    assert_eq!(
+        form.get("code").map(String::as_str),
+        Some("synthetic-callback-code")
+    );
+    assert_eq!(
+        form.get("redirect_uri").map(String::as_str),
+        Some(redirect.as_str())
+    );
+    assert_eq!(
+        parameters.get("code_challenge_method").map(String::as_str),
+        Some("S256")
+    );
+    let verifier = form
+        .get("code_verifier")
+        .expect("token exchange omitted PKCE verifier");
+    use base64::Engine;
+    use sha2::Digest;
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    assert_eq!(parameters.get("code_challenge"), Some(&challenge));
 }
 
 #[test]

@@ -2204,8 +2204,9 @@ mod tests {
         routing::{get, post},
     };
     use kuru_core::{ConfigSnapshot, InvocationOverrides};
+    use tokio::time::Duration;
     #[cfg(unix)]
-    use tokio::time::{Duration, timeout};
+    use tokio::time::timeout;
 
     fn http_config(url: &str) -> BTreeMap<String, McpConfig> {
         [(
@@ -2273,6 +2274,296 @@ mod tests {
             &HeaderValue::from_static("retained")
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_issuer_keeps_two_oauth_resources_and_one_static_alias_separate() {
+        let static_value = std::env::var("PATH").expect("test runner PATH is required");
+        HeaderValue::from_str(&static_value).expect("PATH must be a valid test header");
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", socket.local_addr().unwrap());
+        let issuer = format!("{base}/");
+        let observed = Arc::new(tokio::sync::Mutex::new(Vec::<(
+            axum::http::Method,
+            String,
+            HeaderMap,
+        )>::new()));
+        let app = Router::new().fallback(axum::routing::any({
+            let base = base.clone();
+            let issuer = issuer.clone();
+            let observed = observed.clone();
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: HeaderMap,
+                  body: Bytes| {
+                let base = base.clone();
+                let issuer = issuer.clone();
+                let observed = observed.clone();
+                async move {
+                    let path = uri.path().to_owned();
+                    observed.lock().await.push((method.clone(), path.clone(), headers));
+                    if method == axum::http::Method::GET
+                        && path.starts_with("/.well-known/oauth-protected-resource/")
+                    {
+                        let alias = path.rsplit('/').next().unwrap();
+                        if !matches!(alias, "left" | "right") {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        return axum::Json(json!({
+                            "resource": format!("{base}/{alias}"),
+                            "authorization_servers": [issuer],
+                            "scopes_supported": [format!("mcp.{alias}")]
+                        }))
+                        .into_response();
+                    }
+                    if method == axum::http::Method::GET
+                        && path == "/.well-known/oauth-authorization-server"
+                    {
+                        return axum::Json(json!({
+                            "issuer": issuer,
+                            "authorization_endpoint": format!("{base}/authorize"),
+                            "token_endpoint": format!("{base}/token"),
+                            "code_challenge_methods_supported": ["S256"],
+                            "grant_types_supported": ["authorization_code", "refresh_token"]
+                        }))
+                        .into_response();
+                    }
+                    if method == axum::http::Method::GET
+                        && matches!(path.as_str(), "/left" | "/right")
+                    {
+                        let alias = path.trim_start_matches('/');
+                        let challenge = format!(
+                            "Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource/{alias}\", scope=\"mcp.{alias}\""
+                        );
+                        let mut response = StatusCode::UNAUTHORIZED.into_response();
+                        response
+                            .headers_mut()
+                            .insert(WWW_AUTHENTICATE, challenge.parse().unwrap());
+                        return response;
+                    }
+                    if method != axum::http::Method::POST
+                        || !matches!(path.as_str(), "/left" | "/right" | "/static")
+                    {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    if request["method"] == "notifications/initialized" {
+                        return StatusCode::ACCEPTED.into_response();
+                    }
+                    let alias = path.trim_start_matches('/');
+                    let result = match request["method"].as_str() {
+                        Some("initialize") => json!({
+                            "protocolVersion": VERSION,
+                            "capabilities": {"tools": {}}
+                        }),
+                        Some("tools/list") => json!({"tools": [tool(&format!("{alias}-read"))]}),
+                        Some("tools/call") => json!({
+                            "content": [{"type": "text", "text": format!("{alias}-result")}]
+                        }),
+                        _ => return StatusCode::NOT_FOUND.into_response(),
+                    };
+                    axum::Json(json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": result
+                    }))
+                    .into_response()
+                }
+            }
+        }));
+        let task = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+
+        let project = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let credentials = credential_store(project.path(), private.path());
+        let mut config = BTreeMap::new();
+        for alias in ["left", "right"] {
+            let resource = format!("{base}/{alias}");
+            let mut credential =
+                fixture_credential(&credentials, alias, &resource, unix_time().unwrap() + 300);
+            credential.issuer = oauth_binding(b"issuer", &issuer);
+            credential.client_id = format!("{alias}-client");
+            credential.scopes = vec![format!("mcp.{alias}")];
+            credential.client_secret = None;
+            credential.access_token = format!("{alias}-access");
+            credential.refresh_token = None;
+            credentials
+                .acquire(alias)
+                .await
+                .unwrap()
+                .create(credential.encode().unwrap())
+                .await
+                .unwrap();
+            config.insert(
+                alias.into(),
+                McpConfig {
+                    url: Some(resource),
+                    header_env: BTreeMap::from([(format!("X-{alias}"), "PATH".into())]),
+                    oauth: Some(McpOAuthConfig {
+                        enabled: true,
+                        client_id: Some(format!("{alias}-client")),
+                        scopes: vec![format!("mcp.{alias}")],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        config.insert(
+            "static".into(),
+            McpConfig {
+                url: Some(format!("{base}/static")),
+                header_env: BTreeMap::from([("Authorization".into(), "PATH".into())]),
+                ..Default::default()
+            },
+        );
+        let hosts = McpHosts::new(project.path(), &config).unwrap();
+        hosts.install_credentials(credentials.clone()).unwrap();
+
+        let checked: Result<()> = async {
+            let catalog = hosts.catalog().await?;
+            ensure!(
+                catalog.tools.len() == 3,
+                "expected three exact alias routes"
+            );
+            for alias in ["left", "right", "static"] {
+                let route = projected_name(alias, &format!("{alias}-read"));
+                ensure!(
+                    matches!(
+                        hosts.execute(&route, json!({})).await,
+                        Ok(McpExecution::Success(_))
+                    ),
+                    "selected alias did not execute"
+                );
+            }
+            for alias in ["left", "right"] {
+                let login = hosts.begin_oauth_browser(alias).await?;
+                let url = url::Url::parse(login.authorization_url())?;
+                let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                ensure!(
+                    query.get("client_id") == Some(&format!("{alias}-client"))
+                        && query.get("resource") == Some(&format!("{base}/{alias}"))
+                        && query.get("scope") == Some(&format!("mcp.{alias}")),
+                    "authorization selected the wrong alias binding"
+                );
+                drop(login);
+            }
+            let requests = observed.lock().await;
+            let mut counts = BTreeMap::<&str, usize>::new();
+            for (method, path, headers) in requests.iter() {
+                match path.as_str() {
+                    "/left" | "/right" => {
+                        let alias = path.trim_start_matches('/');
+                        let selected_header = format!("x-{alias}");
+                        ensure!(
+                            headers
+                                .get(selected_header.as_str())
+                                .and_then(|value| value.to_str().ok())
+                                == Some(static_value.as_str()),
+                            "selected resource header was absent"
+                        );
+                        let other = if alias == "left" { "x-right" } else { "x-left" };
+                        ensure!(
+                            !headers.contains_key(other),
+                            "foreign resource header crossed aliases"
+                        );
+                        if method == axum::http::Method::GET {
+                            ensure!(
+                                !headers.contains_key(AUTHORIZATION),
+                                "preauthorization resource probe carried a bearer"
+                            );
+                            *counts
+                                .entry(if alias == "left" {
+                                    "probe-left"
+                                } else {
+                                    "probe-right"
+                                })
+                                .or_default() += 1;
+                        } else {
+                            ensure!(
+                                method == axum::http::Method::POST,
+                                "unexpected resource method"
+                            );
+                            ensure!(
+                                headers
+                                    .get(AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    == Some(format!("Bearer {alias}-access").as_str()),
+                                "OAuth bearer reached the wrong resource"
+                            );
+                            *counts.entry(alias).or_default() += 1;
+                        }
+                    }
+                    "/static" => {
+                        ensure!(
+                            method == axum::http::Method::POST,
+                            "unexpected static method"
+                        );
+                        ensure!(
+                            headers
+                                .get(AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                == Some(static_value.as_str()),
+                            "static authorization changed"
+                        );
+                        ensure!(
+                            !headers.contains_key("x-left") && !headers.contains_key("x-right"),
+                            "OAuth resource header entered static alias"
+                        );
+                        *counts.entry("static").or_default() += 1;
+                    }
+                    path if path.starts_with("/.well-known/") => {
+                        ensure!(
+                            method == axum::http::Method::GET,
+                            "unexpected authority method"
+                        );
+                        ensure!(
+                            !headers.contains_key(AUTHORIZATION)
+                                && !headers.contains_key("x-left")
+                                && !headers.contains_key("x-right"),
+                            "resource or static authorization entered OAuth authority discovery"
+                        );
+                        *counts.entry("authority").or_default() += 1;
+                    }
+                    _ => bail!("unexpected fake MCP request path"),
+                }
+            }
+            ensure!(
+                [
+                    "left",
+                    "right",
+                    "probe-left",
+                    "probe-right",
+                    "static",
+                    "authority"
+                ]
+                .iter()
+                .all(|name| counts.get(name).copied().unwrap_or_default() > 0),
+                "one alias or authority boundary was not exercised"
+            );
+            Ok(())
+        }
+        .await;
+        let shutdown = hosts.shutdown().await;
+        for alias in ["left", "right"] {
+            if let Some(record) = credentials
+                .acquire(alias)
+                .await
+                .unwrap()
+                .get()
+                .await
+                .unwrap()
+            {
+                credentials
+                    .acquire(alias)
+                    .await
+                    .unwrap()
+                    .delete(record.generation())
+                    .await
+                    .unwrap();
+            }
+        }
+        task.abort();
+        shutdown.unwrap();
+        checked.unwrap();
     }
 
     #[tokio::test]

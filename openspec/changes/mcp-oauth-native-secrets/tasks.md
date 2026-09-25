@@ -1,7 +1,7 @@
 ## 1. Configuration and protocol foundations
 
 - [x] 1.1 Add bounded MCP OAuth configuration, semantic validation, final-leaf authority claims and `configuration.v1.schema.json` parity, and verify accepted preregistered/CIMD/DCR examples plus authoritative scope restriction, non-authorization static headers, authorization-header conflict, literal-secret, STDIO, disabled-activation, unknown-field and bound failures on both paths.
-- [ ] 1.2 Pin only the required current OAuth/native-store dependencies with matching workspace and lockfile changes, and verify supported target feature selection plus license/provenance checks through owning package tasks.
+- [x] 1.2 Pin only the required current OAuth/native-store dependencies with matching workspace and lockfile changes, and verify supported target feature selection plus license/provenance checks through owning package tasks.
 - [x] 1.3 Implement bounded protected-resource, authorization-server, registration, token, device and revocation types with redacted Debug/errors, and verify hostile JSON, URL, redirect, RFC 9207 issuer-response matrix, resource, authoritative initial/step-up scope and body-limit cases as pure protocol tests.
 
 ## 2. Native secret storage

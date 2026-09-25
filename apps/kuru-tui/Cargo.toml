@@ -49,6 +49,7 @@ unicode-width.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 # Always compiled in for test builds only (dev-dependencies never reach the
 # shipping binary): unlocks the KURU_TEST_MODEL_CATALOG_PATH fixture seam so
 # `cargo test -p kuru` need not be run with --all-features for tests that
@@ -73,7 +74,6 @@ rustix.workspace = true
 vt100.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
-base64.workspace = true
 vt100.workspace = true
 
 [lints]

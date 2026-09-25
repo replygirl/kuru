@@ -23,8 +23,12 @@ use kuru_memory::MemoryStore;
 use kuru_runtime::{DreamProposal, Harness, Topology};
 use serde_json::{Value, json};
 
+#[allow(dead_code)] // The shared HTTPS fixture's token counters are used by cli.rs and terminal.rs.
+#[path = "support/mcp_oauth_https.rs"]
+mod mcp_oauth_https;
 #[path = "support/memory.rs"]
 mod memory;
+use mcp_oauth_https::HttpsMcpFixture;
 
 #[cfg(unix)]
 #[allow(dead_code)]
@@ -1049,6 +1053,130 @@ fn one_shot_is_subset_only_and_persistent_approval_binds_the_full_manifest() {
     assert!(!invalidated.status.success());
     assert!(!marker.exists());
     assert!(text(&invalidated.stderr).contains("does not match"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_oauth_claim_requires_exact_root_trust_before_selected_status() {
+    let ca_root = tempfile::tempdir().unwrap();
+    let https = HttpsMcpFixture::start(ca_root.path()).await;
+    let config = format!(
+        "[mcp.secure]\nurl = {:?}\n[mcp.secure.oauth]\nenabled = true\nclient_id = 'synthetic-client'\nclient_secret_env = 'KURU_ABSENT_TEST_MCP_CLIENT_SECRET'\nscopes = ['mcp.read']\n",
+        format!("{}/mcp", https.base)
+    );
+    let sandbox = Sandbox::new(&config);
+    let run = |args: &[&str]| {
+        sandbox
+            .command()
+            .env("KURU_TEST_MCP_CA_PEM", &https.ca_path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        ["mcp", "status", "secure"].as_slice(),
+        ["mcp", "logout", "secure"].as_slice(),
+        ["mcp", "login", "secure", "--device"].as_slice(),
+    ] {
+        let output = run(args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let error = text(&output.stderr);
+        assert!(
+            error.contains("workspace authority is not approved"),
+            "{args:?}: {error}"
+        );
+        assert!(
+            !error.contains("KURU_ABSENT_TEST_MCP_CLIENT_SECRET"),
+            "{args:?}: {error}"
+        );
+        assert_eq!(
+            https.requests(),
+            0,
+            "{args:?} reached OAuth HTTP before trust"
+        );
+        assert!(
+            !sandbox.data.exists(),
+            "{args:?} created private state before trust"
+        );
+    }
+    sandbox.success(&["config"]);
+    assert_eq!(
+        https.requests(),
+        0,
+        "pure config inspection activated OAuth HTTP"
+    );
+    assert!(
+        !sandbox.data.exists(),
+        "pure config inspection created private state"
+    );
+
+    sandbox.success(&["trust", "approve", "--yes"]);
+    assert_eq!(https.requests(), 0, "approval activated OAuth HTTP");
+    let selected = run(&["mcp", "status", "secure"]);
+    assert!(
+        selected.status.success(),
+        "selected status after approval failed: {}",
+        text(&selected.stderr)
+    );
+    let selected: Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(selected["alias"], "secure");
+    assert!(
+        matches!(
+            selected["state"].as_str(),
+            Some("login_required" | "native_store_unavailable")
+        ),
+        "{selected}"
+    );
+    let requests_after_selected = https.requests();
+    if selected["state"] == "login_required" {
+        assert!(
+            requests_after_selected > 0,
+            "selected approved status did not exercise the fake HTTPS request counter"
+        );
+    }
+
+    let other = sandbox.root.path().join("another-project");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::create_dir(other.join(".kuru")).unwrap();
+    std::fs::write(other.join(".kuru/config.toml"), &config).unwrap();
+    let wrong_root = sandbox
+        .command_at(&other)
+        .env("KURU_TEST_MCP_CA_PEM", &https.ca_path)
+        .args(["mcp", "status", "secure"])
+        .output()
+        .unwrap();
+    assert!(!wrong_root.status.success());
+    assert!(
+        text(&wrong_root.stderr).contains("workspace authority is not approved"),
+        "{}",
+        text(&wrong_root.stderr)
+    );
+    assert_eq!(
+        https.requests(),
+        requests_after_selected,
+        "other root activated OAuth HTTP"
+    );
+
+    let changed = config.replace("scopes = ['mcp.read']", "scopes = ['mcp.write']");
+    assert_ne!(changed, config);
+    sandbox.write_config(&changed);
+    let stale = run(&["mcp", "status", "secure"]);
+    assert!(!stale.status.success());
+    assert!(
+        text(&stale.stderr).contains("does not match"),
+        "{}",
+        text(&stale.stderr)
+    );
+    assert_eq!(
+        https.requests(),
+        requests_after_selected,
+        "changed final leaf activated OAuth HTTP"
+    );
+    sandbox.success(&["config"]);
+    assert_eq!(
+        https.requests(),
+        requests_after_selected,
+        "post-change inspection activated OAuth HTTP"
+    );
 }
 
 #[test]
