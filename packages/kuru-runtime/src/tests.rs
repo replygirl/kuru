@@ -16,8 +16,8 @@ use axum::{
 };
 use kuru_connectors::{CheckpointState, CheckpointStore, ParallelReadTestGate, Provider, ToolHost};
 use kuru_core::{
-    Completion, CompletionRequest, Config, ContentBlock, Message, Mode, ModelInfo, NativeTool,
-    PermissionAction, PermissionRule, PermissionSelector, RelationshipKind, ToolCall,
+    Completion, CompletionRequest, Config, ContentBlock, MemoryConfig, Message, Mode, ModelInfo,
+    NativeTool, PermissionAction, PermissionRule, PermissionSelector, RelationshipKind, ToolCall,
     canonical_peer_instruction,
 };
 use kuru_platform::fs::{Directory, NameRetention, Privacy, regular_file_info};
@@ -34,6 +34,28 @@ use crate::{
 };
 
 type Responder = dyn Fn(&CompletionRequest) -> Completion + Send + Sync;
+
+/// Releases every caller when a gated fixture unwinds. A failed assertion must
+/// not strand a checked read's spawn_blocking worker inside the gate, because
+/// Tokio waits for that worker before the test runtime can finish shutting down.
+struct ReleaseGateOnDrop(ParallelReadTestGate);
+
+impl Drop for ReleaseGateOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// Bounds a gated fixture's wait for its turn to reach checked execution.
+/// `MemoryStore::temporary()` opens with `MemoryConfig::default()`, and turn
+/// admission persists the session catalog and transcript through that store
+/// before any tool runs. The store's Dolt listener derives its statement read
+/// timeout from at least this startup budget, so the wait follows the same
+/// configured budget instead of a fixed literal.
+fn turn_admission_deadline() -> Duration {
+    Duration::from_secs(MemoryConfig::default().startup_timeout_secs)
+}
+
 struct Fake {
     requests: Mutex<Vec<CompletionRequest>>,
     respond: Box<Responder>,
@@ -924,6 +946,7 @@ async fn authorized_native_reads_overlap_but_feed_results_back_in_provider_order
     std::fs::write(directory.path().join("first.txt"), "needle FIRST\n").unwrap();
     std::fs::write(directory.path().join("denied.txt"), "needle DENIED\n").unwrap();
     let gate = ParallelReadTestGate::new(2);
+    let _release_gate = ReleaseGateOnDrop(gate.clone());
     let config = Config {
         mode: Mode::Freudian,
         provider: "demo".into(),
@@ -967,7 +990,7 @@ async fn authorized_native_reads_overlap_but_feed_results_back_in_provider_order
             .await;
         (harness, output)
     });
-    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered())
+    tokio::time::timeout(turn_admission_deadline(), gate.wait_until_entered())
         .await
         .expect("file and search reads did not enter checked execution together");
     let mut contexts = gate.entered_contexts();
@@ -1061,23 +1084,33 @@ async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
     let address = listener.local_addr().unwrap();
     let (request_seen, request_observed) = tokio::sync::oneshot::channel();
     let (response_release, response_held) = tokio::sync::oneshot::channel();
+    // Each server bound starts at the transport step it observes. Cold memory
+    // startup and turn admission happen before the web call is released and
+    // are bounded by the test's own gate and request waits, not by this fixture.
     let server = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
             let mut request = Vec::new();
             let mut buffer = [0_u8; 1024];
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
                 let read = stream.read(&mut buffer).await.unwrap();
                 assert!(read > 0, "web overlap request ended before its headers");
                 request.extend_from_slice(&buffer[..read]);
-                assert!(request.len() <= 8 * 1024, "web overlap request is oversized");
+                assert!(
+                    request.len() <= 8 * 1024,
+                    "web overlap request is oversized"
+                );
             }
             assert!(
                 String::from_utf8_lossy(&request).starts_with("GET /value HTTP/1.1"),
                 "web overlap request used the wrong target"
             );
-            request_seen.send(()).unwrap();
-            response_held.await.unwrap();
+        })
+        .await
+        .expect("web overlap request exceeded its bound");
+        request_seen.send(()).unwrap();
+        response_held.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfetched",
@@ -1087,7 +1120,7 @@ async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
             stream.shutdown().await.unwrap();
         })
         .await
-        .expect("web overlap server exceeded its bound");
+        .expect("web overlap response exceeded its bound");
     });
 
     let issued = Arc::new(AtomicBool::new(false));
@@ -1124,6 +1157,7 @@ async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("source.txt"), "needle SEARCH\n").unwrap();
     let gate = ParallelReadTestGate::new(2);
+    let _release_gate = ReleaseGateOnDrop(gate.clone());
     let config = Config {
         mode: Mode::Freudian,
         provider: "demo".into(),
@@ -1174,14 +1208,14 @@ async fn authorized_web_fetch_overlaps_checked_search_and_keeps_result_order() {
             .await;
         (harness, output)
     });
-    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered())
+    tokio::time::timeout(turn_admission_deadline(), gate.wait_until_entered())
         .await
         .expect("web and search calls did not reach checked execution together");
     gate.release_named("web_fetch");
     tokio::time::timeout(Duration::from_secs(10), request_observed)
         .await
         .expect("authorized web call did not reach its isolated transport")
-        .unwrap();
+        .expect("web overlap server dropped before observing the request");
     gate.release_named("grep");
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -1535,6 +1569,7 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
     std::fs::write(directory.path().join("first.txt"), "FIRST").unwrap();
     std::fs::write(directory.path().join("second.txt"), "SECOND").unwrap();
     let gate = ParallelReadTestGate::new(2);
+    let _release_gate = ReleaseGateOnDrop(gate.clone());
     let config = Config {
         mode: Mode::Freudian,
         provider: "demo".into(),
@@ -1583,7 +1618,7 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
             .await;
         (harness, result)
     });
-    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered())
+    tokio::time::timeout(turn_admission_deadline(), gate.wait_until_entered())
         .await
         .expect("both checked reads did not enter the owned execution gate");
     cancellation.cancel();
@@ -1650,14 +1685,6 @@ async fn cancelled_parallel_wave_drains_every_owned_read_before_returning() {
 
 #[tokio::test]
 async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() {
-    struct ReleaseGateOnDrop(ParallelReadTestGate);
-
-    impl Drop for ReleaseGateOnDrop {
-        fn drop(&mut self) {
-            self.0.release();
-        }
-    }
-
     let (receipt, observed) = tokio::sync::oneshot::channel();
     let provider = Arc::new(MixedRefusalEffectProvider {
         receipt: Mutex::new(Some(receipt)),
@@ -1667,8 +1694,6 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
     let private = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("refused.txt"), "admitted bytes").unwrap();
     let gate = ParallelReadTestGate::new(1);
-    // A failed fixture assertion must not strand the read's spawn_blocking
-    // worker inside the gate while Tokio waits for that worker at shutdown.
     let _release_gate = ReleaseGateOnDrop(gate.clone());
     let config = Config {
         mode: Mode::Freudian,
@@ -1717,7 +1742,7 @@ async fn refused_parallel_read_does_not_replay_a_later_accepted_serial_effect() 
             .await;
         (harness, result, target)
     });
-    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered())
+    tokio::time::timeout(turn_admission_deadline(), gate.wait_until_entered())
         .await
         .expect("prepared read did not enter its checked execution gate");
     let original = project.path().join("refused.txt");
