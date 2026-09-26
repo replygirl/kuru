@@ -171,9 +171,12 @@ fn reopen_budget() -> std::time::Duration {
 /// `acquire_maintenance_permit`'s startup deadline, which covers the owner's
 /// reap, or one owned server close. A fixture whose owner retires only through
 /// idle expiry adds `SERVICE_IDLE_TIMEOUT` for it at the call site. The sum
-/// lets any single stalled product step report its own error before this
-/// bound expires. Fixtures call [`warm_runtime_cache`] first, so no cold
-/// runtime install is charged here, and keep the `OpenOptions::new` budgets.
+/// lets any single stalled product step that has its own bound report its
+/// own error before this bound expires. Steps without a product bound, such
+/// as warm cache verification, legacy import preparation and activation
+/// reads, rely on this backstop alone. Fixtures call [`warm_runtime_cache`]
+/// first, so no cold runtime install is charged here, and keep the
+/// `OpenOptions::new` budgets.
 #[cfg(test)]
 pub(crate) fn fixture_deadline(fresh: u32, reopened: u32) -> std::time::Duration {
     let settle = crate::store::QUERY_TIMEOUT
