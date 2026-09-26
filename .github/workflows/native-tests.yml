@@ -360,8 +360,8 @@ jobs:
 
   install:
     if: inputs.install
-    # One installation and update job per OS. The release-profile build that
-    # the install task produces is also the previous-release updater candidate.
+    # One installation and update job per OS. The installed release-profile
+    # executable is also the previous-release updater candidate.
     name: Installation, offline runtime and update
     runs-on: ${{ inputs.os }}
     timeout-minutes: 45
@@ -450,8 +450,10 @@ jobs:
       # downloads the previous release's assets anonymously.
       - name: Accept an update from the previous published release
         env:
-          # build:release passes --target on Windows, so its output is target-qualified.
-          KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.os == 'Windows' && format('{0}\target\x86_64-pc-windows-msvc\release\kuru.exe', github.workspace) || format('{0}/target/release/kuru', github.workspace) }}
+          # The installed copy is the verified shipping build; on Windows
+          # bundle:verify-native-build later relinks Cargo's release output
+          # with all features, so the target directory is not the candidate.
+          KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-bin/kuru${{ runner.os == 'Windows' && '.exe' || '' }}
           GITHUB_TOKEN: ${{ github.token }}
         run: mise run //packages/kuru-delivery:test:previous-release-update
       - name: Require unchanged dependency locks

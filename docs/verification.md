@@ -50,10 +50,10 @@ The release workflow validates its source and selected version commit, builds
 all five native archives, and assembles one complete candidate. Native Windows
 then installs the exact staged ZIP through the pinned mise backend with isolated
 loopback release metadata, verifies its bundled engine, and exercises an offline
-conversation and durable reopen. Linux x86_64 and macOS arm64 verify their
-staged archive checksums, run the extracted executable's packaged offline
-runtime check, and have the previous release's updater install it; they do not
-yet exercise the mise route. This proves staged installation and runtime
+conversation and durable reopen. Linux x86_64, Linux arm64 and macOS arm64
+verify their staged archive checksums, run the extracted executable's packaged
+offline runtime check, and have the previous release's updater install it; they
+do not yet exercise the mise route. Intel macOS has no staged leg yet. This proves staged installation and runtime
 behavior; it is not a test of downloading the release from public GitHub.
 Documentation builds in parallel with staged acceptance. Documentation deployment
 must succeed before publication. A separate post-publication Windows job checks
