@@ -86,6 +86,8 @@ pub(crate) const PRE_TURN_REWRITE_FORMAT: u64 = 1;
 /// original) so every provider projection of that turn's public user entry —
 /// later turns, retries, resumes and forks, for every actor — carries what the
 /// model actually received. It is private provenance, never projected itself.
+/// A re-admitted attempt that sends the original replaces it with a
+/// `cleared` tombstone (no input), so projections use the original again.
 pub(crate) fn pre_turn_rewrite_key(scope: &str, primary_node_id: &str) -> String {
     format!("{scope}/pre-turn-rewrite/{primary_node_id}")
 }
@@ -3705,6 +3707,28 @@ impl Harness {
                 .await?;
             Some(override_input)
         } else {
+            // A re-admitted turn may still hold the rewrite record of an
+            // earlier attempt that stopped before dispatch. This attempt sends
+            // the original, so a tombstone makes later projections use it.
+            if journal
+                .transitions
+                .iter()
+                .any(|transition| matches!(transition, TurnTransition::Resumed))
+            {
+                let primary = public_turn_node_id(&self.session.id, turn_id)?;
+                self.memory
+                    .put(
+                        &pre_turn_rewrite_key(&self.scope, &primary),
+                        &json!({
+                            "format": PRE_TURN_REWRITE_FORMAT,
+                            "session_id": self.session.id,
+                            "turn_id": turn_id,
+                            "invocation_id": journal.id,
+                            "cleared": true,
+                        }),
+                    )
+                    .await?;
+            }
             None
         };
         self.mark_possible_dispatch(journal_key, journal, cancellation)

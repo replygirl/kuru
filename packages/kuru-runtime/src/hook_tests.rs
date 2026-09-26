@@ -1117,7 +1117,7 @@ async fn parallel_post_hooks_settle_independently_but_rejoin_in_original_call_or
     let provider = CapturingProvider::new(ReplyPlan::ParallelReads);
     let hooks = LifecycleHooks {
         post_tool: vec![shell_hook(
-            "request=$(cat); case \"$request\" in *parallel-first*) while [ ! -e second-settled ]; do sleep 0.01; done; annotation=first-annotation;; *) : > second-settled; annotation=second-annotation;; esac; printf '{\"decision\":\"annotate\",\"annotation\":\"%s\"}' \"$annotation\"",
+            "request=$(cat); case \"$request\" in *parallel-first*) while [ ! -e second-settled ]; do sleep 0.01; done; annotation=first-annotation;; *) annotation=second-annotation;; esac; printf '{\"decision\":\"annotate\",\"annotation\":\"%s\"}' \"$annotation\"",
         )],
         ..LifecycleHooks::default()
     };
@@ -1133,7 +1133,28 @@ async fn parallel_post_hooks_settle_independently_but_rejoin_in_original_call_or
     .await
     .unwrap();
     let target = harness.topology.parts[0].id.clone();
+    // The first call's post hook is released only after the runtime has
+    // observably settled the second call, so the settle order is determined
+    // by the fixture rather than by hook exit timing and polling.
+    let mut events = harness.subscribe();
+    let released = project.path().join("second-settled");
+    let release = tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(crate::Event::ToolSettled { observation, .. })
+                    if observation.call_id == "parallel-second" =>
+                {
+                    std::fs::write(&released, b"").unwrap();
+                    return;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
     let output = harness.run_for("read both", Some(&target)).await.unwrap();
+    release.await.unwrap();
+    assert!(project.path().join("second-settled").exists());
 
     let settled = output
         .events
@@ -2048,4 +2069,104 @@ async fn rewritten_safe_retry_uses_its_own_public_turn_after_marker_or_later_ans
         );
         harness.shutdown(false).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn retry_that_no_longer_rewrites_projects_the_original_input_again() {
+    let project = tempfile::tempdir().unwrap();
+    let provider = CapturingProvider::new(ReplyPlan::Text);
+    // The first attempt is rewritten; every later run allows its input.
+    let hooks = LifecycleHooks {
+        pre_turn: vec![shell_hook(
+            "cat >/dev/null; if test ! -e rewrote-once; then : > rewrote-once; printf '%s' '{\"decision\":\"rewrite\",\"value\":{\"input\":\"stale rewrite\"}}'; else printf '%s' '{\"decision\":\"allow\"}'; fi",
+        )],
+        ..LifecycleHooks::default()
+    };
+    let mut harness = Harness::new(
+        config(hooks),
+        project.path(),
+        MemoryStore::temporary().await.unwrap(),
+        provider.clone(),
+        None,
+    )
+    .await
+    .unwrap();
+    let target = harness.topology.parts[0].id.clone();
+    // Stop the first attempt after its rewrite is retained but before any
+    // provider dispatch, leaving a retryable turn with a rewrite record.
+    let stop = CancellationToken::new();
+    let mut events = harness.subscribe();
+    let stopper = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) if is_hook(&event, "pre_turn", Some("rewritten"), None) => {
+                        stop.cancel();
+                        return;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    });
+    harness
+        .run_local_controlled("stale original", Some(&target), "stale-retry", &stop)
+        .await
+        .unwrap_err();
+    stopper.await.unwrap();
+    assert!(provider.requests.lock().unwrap().is_empty());
+    let primary = kuru_memory::public_turn_node_id(&harness.session.id, "stale-retry").unwrap();
+    let key = crate::engine::pre_turn_rewrite_key(&harness.scope, &primary);
+    assert_eq!(
+        harness.memory.get(&key).await.unwrap().unwrap()["input"],
+        "stale rewrite"
+    );
+
+    // The retry is allowed unchanged, so the model receives the original.
+    harness
+        .run_local_controlled(
+            "stale original",
+            Some(&target),
+            "stale-retry",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        harness.memory.get(&key).await.unwrap().unwrap()["cleared"],
+        true
+    );
+    let later_from = provider.requests.lock().unwrap().len();
+    harness
+        .run_local_controlled(
+            "later input",
+            Some(&target),
+            "after-stale-retry",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let requests = provider.requests.lock().unwrap().clone();
+    assert!(requests[..later_from].iter().any(|request| {
+        request
+            .messages
+            .iter()
+            .any(|message| message == &Message::text("user", "stale original"))
+    }));
+    assert!(requests.len() > later_from);
+    // Later projections show what the retried turn's model actually received.
+    assert!(requests[later_from..].iter().all(|request| {
+        request.instructions.contains("stale original")
+            && !request.instructions.contains("stale rewrite")
+    }));
+    assert!(requests.iter().all(|request| {
+        !request.instructions.contains("stale rewrite")
+            && !request
+                .messages
+                .iter()
+                .any(|message| message.text_projection().contains("stale rewrite"))
+    }));
+    harness.shutdown(false).await.unwrap();
 }

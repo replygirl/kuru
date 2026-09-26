@@ -296,13 +296,15 @@ or cause a second selection. `post_tool` and `post_turn` may observe or annotate
 settled work. A post failure does not change a tool effect, result, receipt,
 usage, answer, or durable conversation, and later post hooks still run.
 A rewritten `pre_turn` input replaces the original in every provider
-projection of that turn: its own requests and a retry of it, every later turn's
+projection of that turn: its own requests, every later turn's
 public-transcript context for every part (including parts that did not take
 part in the rewritten turn), resumed sessions, forks that inherit the turn, and
 context compaction. The model therefore sees only the rewritten text as the
-user's request, and its view of the conversation matches what it received. The
-user-facing public transcript, session history, export and terminal view keep
-the user's original input.
+user's request, and its view of the conversation matches what it received. If
+an interrupted turn is retried and its hooks no longer rewrite it, later
+projections use the original input that the retry actually sent. The
+user-facing public transcript, session history, `kuru sessions export` and
+terminal view keep the user's original input.
 
 Kuru keeps two private provenance records for a rewrite, and neither is ever
 sent to a provider:
@@ -315,7 +317,12 @@ sent to a provider:
   context for that part's later turns.
 - Before any provider request, Kuru stores one turn-scoped record with the
   rewritten input and the same identities, but not the original. Every public
-  transcript projection of that turn uses it in place of the original.
+  transcript projection of that turn uses it in place of the original. A
+  retried attempt that sends the original replaces it with a `cleared` record
+  that carries no input.
+
+`kuru memory export` is a full-project export, so it includes both private
+records and therefore the rewritten text, but neither contains the original.
 
 In a dream, a call must still be `dream_suggest` and pass the authored
 proposal cap and dream validation. Dream annotations stay in the candidate

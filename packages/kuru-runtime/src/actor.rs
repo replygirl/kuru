@@ -765,8 +765,9 @@ async fn read_public_window(
 }
 
 /// A public turn's user entry as a provider may see it: the durable
-/// turn-scoped rewrite when a pre-turn hook rewrote that turn, otherwise the
-/// unchanged user entry. The rewrite record is keyed by the primary node, so
+/// turn-scoped rewrite when a pre-turn hook rewrote that turn's latest
+/// attempt, otherwise (no record, or a cleared tombstone) the unchanged user
+/// entry. The rewrite record is keyed by the primary node, so
 /// it serves every actor, later session, resume and fork that projects the
 /// turn.
 async fn provider_user_entry(
@@ -793,11 +794,20 @@ async fn provider_user_entry(
         rewrite["format"] == crate::engine::PRE_TURN_REWRITE_FORMAT
             && rewrite["session_id"] == record.origin_session_id.as_str()
             && rewrite["turn_id"] == record.turn_id.as_str(),
-        "pre-turn rewrite record does not match its public turn"
+        "pre-turn rewrite record {key} does not match public turn {} (node {})",
+        record.turn_id,
+        record.node_id
     );
-    let input = rewrite["input"]
-        .as_str()
-        .context("pre-turn rewrite record lacks its rewritten input")?;
+    // A tombstone: the latest attempt of this turn sent the original input.
+    if rewrite["cleared"] == true {
+        return Ok(user.clone());
+    }
+    let input = rewrite["input"].as_str().with_context(|| {
+        format!(
+            "pre-turn rewrite record {key} for public turn {} (node {}) lacks its rewritten input",
+            record.turn_id, record.node_id
+        )
+    })?;
     Ok(Message::text("user", input))
 }
 

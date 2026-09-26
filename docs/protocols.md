@@ -277,8 +277,9 @@ tool class or bypass its proposal cap and candidate validation.
 
 A `pre_turn` rewrite value is `{ "input": string }` (1–131,072 bytes, not blank).
 The final rewritten input replaces the original in every provider projection of
-that turn, including later turns' public-transcript context, retries, resumed
-sessions and forks. The user-facing transcript keeps the original; see
+that turn, including later turns' public-transcript context, resumed sessions
+and forks. A retry that is no longer rewritten projects its original input.
+The user-facing transcript and session export keep the original; see
 [lifecycle hooks](configuration.md#lifecycle-hooks).
 A `pre_tool` rewrite value is `{ "name": string, "arguments": object }`, where
 `name` must repeat the proposed tool name exactly. Only `arguments` may change;
