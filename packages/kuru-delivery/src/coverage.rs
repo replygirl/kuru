@@ -862,7 +862,107 @@ struct StallEvidence {
 enum Supervision {
     Exited(ExitStatus),
     Stalled(Box<StallEvidence>),
+    /// The Unix runner itself received a termination request.
+    #[cfg(unix)]
+    Interrupted(Box<InterruptEvidence>),
 }
+
+/// A termination request delivered to the Unix coverage runner.
+///
+/// The test executable runs in its own process group, so a terminal interrupt
+/// or hangup reaches Cargo and this runner but not the test tree. The runner
+/// therefore handles these requests itself and terminates the tree through its
+/// retained owner before exiting.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerSignal {
+    Interrupt,
+    Terminate,
+    Hangup,
+}
+
+#[cfg(unix)]
+impl RunnerSignal {
+    fn kind(self) -> tokio::signal::unix::SignalKind {
+        use tokio::signal::unix::SignalKind;
+
+        match self {
+            Self::Interrupt => SignalKind::interrupt(),
+            Self::Terminate => SignalKind::terminate(),
+            Self::Hangup => SignalKind::hangup(),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+            Self::Hangup => "SIGHUP",
+        }
+    }
+
+    /// The conventional shell status of a process ended by this signal.
+    pub fn exit_code(self) -> i32 {
+        128 + self.kind().as_raw_value()
+    }
+}
+
+/// Install the runner's handlers and return the first request they observe.
+///
+/// Call this before the test group exists: once installed, the handlers
+/// replace the default disposition, so the runner can no longer die without
+/// cleaning up the group.
+#[cfg(unix)]
+fn runner_signals() -> std::io::Result<impl std::future::Future<Output = RunnerSignal>> {
+    use tokio::signal::unix::signal;
+
+    let mut interrupt = signal(RunnerSignal::Interrupt.kind())?;
+    let mut terminate = signal(RunnerSignal::Terminate.kind())?;
+    let mut hangup = signal(RunnerSignal::Hangup.kind())?;
+    Ok(async move {
+        // `None` means the signal driver shut down, not that a signal arrived.
+        tokio::select! {
+            Some(()) = interrupt.recv() => RunnerSignal::Interrupt,
+            Some(()) = terminate.recv() => RunnerSignal::Terminate,
+            Some(()) = hangup.recv() => RunnerSignal::Hangup,
+            else => std::future::pending().await,
+        }
+    })
+}
+
+#[cfg(unix)]
+struct InterruptEvidence {
+    signal: RunnerSignal,
+    termination: String,
+    cleanup: String,
+    presence_after_reap: Option<String>,
+}
+
+/// The Unix runner stopped its test group after a termination request.
+/// The caller exits with [`RunnerInterrupted::exit_code`].
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct RunnerInterrupted {
+    signal: RunnerSignal,
+    detail: String,
+}
+
+#[cfg(unix)]
+impl RunnerInterrupted {
+    pub fn exit_code(&self) -> i32 {
+        self.signal.exit_code()
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for RunnerInterrupted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for RunnerInterrupted {}
 
 /// Keep the bounded log copy of one relayed chunk.
 async fn log_chunk(
@@ -1221,6 +1321,8 @@ pub async fn dispatch_test(options: &DispatchOptions<'_>) -> Result<Option<ExitS
     };
     #[cfg(unix)]
     let supervision = {
+        // Handlers are installed before the test group exists.
+        let interrupt = runner_signals()?;
         // The test inherits this runner's complete environment, including the
         // LLVM_PROFILE_FILE destination, working directory, stdin and stderr.
         let mut command = std::process::Command::new(executable_path);
@@ -1235,11 +1337,41 @@ pub async fn dispatch_test(options: &DispatchOptions<'_>) -> Result<Option<ExitS
             log.clone(),
             remaining,
             RUNNER_CLEANUP_TIMEOUT,
+            interrupt,
         )
         .await?
     };
     let status = match supervision {
         Supervision::Exited(status) => status,
+        #[cfg(unix)]
+        Supervision::Interrupted(evidence) => {
+            append_runner_record(
+                ledger,
+                &RunnerRecord {
+                    schema: SCHEMA,
+                    executable: executable.clone(),
+                    action: "run".to_owned(),
+                    cwd,
+                    args,
+                    success: false,
+                    status_code: None,
+                },
+            )?;
+            let InterruptEvidence {
+                signal,
+                termination,
+                cleanup,
+                presence_after_reap,
+            } = *evidence;
+            return Err(RunnerInterrupted {
+                signal,
+                detail: format!(
+                    "coverage runner received {} while {executable} was running; termination={termination}; cleanup={cleanup}; presence_after_reap={presence_after_reap:?}",
+                    signal.name()
+                ),
+            }
+            .into());
+        }
         Supervision::Stalled(evidence) => {
             append_runner_record(
                 ledger,
@@ -1412,16 +1544,22 @@ impl GroupProcess {
 
 /// Start one test command in a fresh owned process group and supervise it.
 /// The command's stdout must be piped; everything else is the caller's.
+///
+/// `interrupt` resolves when the runner itself is asked to stop. Supervision is
+/// then abandoned (its wait is cancellation-safe) and the group is terminated,
+/// reaped and confirmed absent through the same owner as a stall.
 #[cfg(unix)]
-async fn supervise_group<W>(
+async fn supervise_group<W, S>(
     command: std::process::Command,
     relay: W,
     log: PathBuf,
     remaining: Duration,
     cleanup_bound: Duration,
+    interrupt: S,
 ) -> Result<Supervision>
 where
     W: tokio::io::AsyncWrite + Unpin,
+    S: std::future::Future<Output = RunnerSignal>,
 {
     let mut child = GroupProcess::spawn(command, cleanup_bound)?;
     let output = match child.take_stdout() {
@@ -1434,7 +1572,23 @@ where
             );
         }
     };
-    supervise(&mut child, output, relay, log, remaining, cleanup_bound).await
+    let signal = {
+        let supervised = supervise(&mut child, output, relay, log, remaining, cleanup_bound);
+        tokio::select! {
+            biased;
+            signal = interrupt => signal,
+            supervision = supervised => return supervision,
+        }
+    };
+    let termination = format!("{:?}", child.terminate().await);
+    let cleanup = format!("{:?}", child.wait(cleanup_bound).await);
+    Ok(Supervision::Interrupted(Box::new(InterruptEvidence {
+        signal,
+        termination,
+        cleanup,
+        // Recorded only after the cleanup wait has had its chance to reap.
+        presence_after_reap: child.presence_after_reap(),
+    })))
 }
 
 #[cfg(unix)]
@@ -3465,6 +3619,7 @@ mod tests {
             log.clone(),
             GROUP_BOUND,
             GROUP_BOUND,
+            std::future::pending(),
         )
         .await
         .unwrap();
@@ -3525,6 +3680,7 @@ mod tests {
             temp.path().join("unpiped.stdout.log"),
             GROUP_BOUND,
             GROUP_BOUND,
+            std::future::pending(),
         )
         .await
         .err()
@@ -3548,6 +3704,7 @@ mod tests {
             log.clone(),
             Duration::from_millis(750),
             GROUP_BOUND,
+            std::future::pending(),
         )
         .await
         .unwrap();
@@ -3577,6 +3734,120 @@ mod tests {
         assert_eq!(written["presence_after_reap"], "Absent");
         assert_eq!(written["unfinished_tests"], serde_json::json!(["stuck"]));
         assert_eq!(read_json::<StallReport>(&path).unwrap(), report);
+    }
+
+    /// Re-executed by the signal test below; inert in an ordinary test run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_runner_signal_child() {
+        let Some(directory) = std::env::var_os("KURU_COVERAGE_SIGNAL_CHILD") else {
+            return;
+        };
+        // The production handlers, installed before the group exists. The
+        // readiness line names the group only after both are in place.
+        let interrupt = runner_signals().unwrap();
+        let supervision = supervise_group(
+            group_command("sleep 300 & printf 'ready %s\\n' $$; wait"),
+            tokio::io::stdout(),
+            PathBuf::from(directory).join("signal.stdout.log"),
+            GROUP_BOUND * 3,
+            GROUP_BOUND,
+            interrupt,
+        )
+        .await
+        .unwrap();
+        let Supervision::Interrupted(evidence) = supervision else {
+            panic!("an interrupted runner reported its group as finished");
+        };
+        println!(
+            "interrupted {} termination={} presence_after_reap={:?}",
+            evidence.signal.name(),
+            evidence.termination,
+            evidence.presence_after_reap
+        );
+        std::process::exit(evidence.signal.exit_code());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_runner_signal_terminates_its_group_and_exits_with_the_signal() {
+        use rustix::process::{Pid, Signal, kill_process, test_kill_process_group};
+        use std::io::BufRead as _;
+
+        assert_eq!(RunnerSignal::Interrupt.exit_code(), 130);
+        assert_eq!(RunnerSignal::Terminate.exit_code(), 143);
+        assert_eq!(RunnerSignal::Hangup.exit_code(), 129);
+
+        let temp = TempDir::new().unwrap();
+        // The environment, including LLVM_PROFILE_FILE, is inherited unchanged.
+        let mut runner = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "coverage::tests::unix_runner_signal_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("KURU_COVERAGE_SIGNAL_CHILD", temp.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        // Drain the runner's stdout on a thread so waits below stay bounded.
+        let (lines, received) = std::sync::mpsc::channel();
+        let stdout = runner.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if lines.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut seen = Vec::new();
+        let group = loop {
+            match received.recv_timeout(GROUP_BOUND) {
+                Ok(line) => {
+                    // libtest's unterminated test name may precede the marker.
+                    if let Some((_, group)) = line.rsplit_once("ready ") {
+                        break group.trim().parse::<i32>().unwrap();
+                    }
+                    seen.push(line);
+                }
+                Err(error) => {
+                    let _ = runner.kill();
+                    let _ = runner.wait();
+                    panic!("runner never reported its group ({error}); output: {seen:?}");
+                }
+            }
+        };
+        // The runner is our unreaped child, so its identity is still ours.
+        kill_process(Pid::from_child(&runner), Signal::TERM).unwrap();
+        let limit = std::time::Instant::now() + GROUP_BOUND * 2;
+        let status = loop {
+            if let Some(status) = runner.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= limit {
+                let _ = runner.kill();
+                let _ = runner.wait();
+                panic!("runner did not exit after SIGTERM; output: {seen:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        reader.join().unwrap();
+        seen.extend(received.try_iter());
+        assert_eq!(status.code(), Some(143), "{status:?}; output: {seen:?}");
+        assert!(
+            seen.iter().any(|line| line
+                == "interrupted SIGTERM termination=Ok(()) presence_after_reap=Some(\"Absent\")"),
+            "{seen:?}"
+        );
+        // Observation only: the runner reaped the root and saw the group absent.
+        assert_eq!(
+            test_kill_process_group(Pid::from_raw(group).unwrap()),
+            Err(rustix::io::Errno::SRCH)
+        );
     }
 
     #[test]

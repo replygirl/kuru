@@ -408,7 +408,17 @@ async fn main() -> Result<()> {
                 executable: &executable,
                 args: &args,
             })
-            .await?;
+            .await;
+            // A runner stopped by a signal has already terminated its test
+            // group; report the signal as a failed runner to Cargo.
+            #[cfg(unix)]
+            if let Err(error) = &status
+                && let Some(interrupted) = error.downcast_ref::<coverage::RunnerInterrupted>()
+            {
+                eprintln!("Error: {error}");
+                std::process::exit(interrupted.exit_code());
+            }
+            let status = status?;
             if let Some(status) = status
                 && !status.success()
             {
