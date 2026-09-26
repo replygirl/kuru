@@ -48,6 +48,99 @@ fn defaults_are_usable_and_preserve_explicit_permission_boundaries() {
 }
 
 #[test]
+fn lifecycle_hooks_validate_order_bounds_layers_and_manifest_authority() {
+    let accepted = "[[hooks.pre_tool]]\ncommand='first-policy'\nargs=['--one']\ntimeout_ms=7000\nmax_output_bytes=2048\n[[hooks.pre_tool]]\ncommand='second-policy'\n[[hooks.post_turn]]\ncommand='observer'";
+    let config = load_text(accepted).unwrap();
+    assert_eq!(config.hooks.pre_tool.len(), 2);
+    assert_eq!(config.hooks.pre_tool[0].command, "first-policy");
+    assert_eq!(config.hooks.pre_tool[0].timeout_ms, 7000);
+    assert_eq!(config.hooks.pre_tool[1].command, "second-policy");
+    assert_eq!(config.hooks.pre_tool[1].timeout_ms, 5000);
+    assert_eq!(config.hooks.post_turn[0].max_output_bytes, 64 * 1024);
+    assert_eq!(config.hooks.max_invocations, 256);
+    assert_eq!(config.hooks.max_total_ms, 120_000);
+    assert_eq!(config.hooks.max_annotation_bytes, 256 * 1024);
+
+    let project = TempDir::new().unwrap();
+    write(project.path().join(".kuru/config.toml"), accepted);
+    let snapshot =
+        ConfigSnapshot::parse(None, project.path(), None, InvocationOverrides::default()).unwrap();
+    let claim = snapshot
+        .manifest()
+        .claims()
+        .iter()
+        .find(|claim| claim.category() == AuthorityClaimCategory::LifecycleHooks)
+        .unwrap();
+    assert_eq!(
+        claim.display().to_string(),
+        "3 ordered lifecycle hook command(s)"
+    );
+    let initial_digest = claim.digest();
+    write(
+        project.path().join(".kuru/config.toml"),
+        accepted.replace("--one", "--changed"),
+    );
+    let changed =
+        ConfigSnapshot::parse(None, project.path(), None, InvocationOverrides::default()).unwrap();
+    let changed_digest = changed
+        .manifest()
+        .claims()
+        .iter()
+        .find(|claim| claim.category() == AuthorityClaimCategory::LifecycleHooks)
+        .unwrap()
+        .digest();
+    assert_ne!(initial_digest, changed_digest);
+    write(
+        project.path().join(".kuru/config.toml"),
+        accepted.replace("max_output_bytes=2048", "max_output_bytes=2049"),
+    );
+    let changed_bound =
+        ConfigSnapshot::parse(None, project.path(), None, InvocationOverrides::default()).unwrap();
+    let changed_bound_digest = changed_bound
+        .manifest()
+        .claims()
+        .iter()
+        .find(|claim| claim.category() == AuthorityClaimCategory::LifecycleHooks)
+        .unwrap()
+        .digest();
+    assert_ne!(initial_digest, changed_bound_digest);
+
+    let explicit = project.path().join("explicit.toml");
+    write(&explicit, "[[hooks.pre_tool]]\ncommand='explicit-only'");
+    let layered = ConfigSnapshot::parse(
+        None,
+        project.path(),
+        Some(&explicit),
+        InvocationOverrides::default(),
+    )
+    .unwrap()
+    .finalize(&ProjectPreferences::default())
+    .unwrap();
+    assert_eq!(layered.hooks.pre_tool.len(), 1);
+    assert_eq!(layered.hooks.pre_tool[0].command, "explicit-only");
+
+    let too_many = (0..17)
+        .map(|_| "[[hooks.pre_tool]]\ncommand='policy'")
+        .collect::<Vec<_>>()
+        .join("\n");
+    for invalid in [
+        "[hooks]\nunknown=[]".to_owned(),
+        "[[hooks.pre_turn]]\ncommand=''".to_owned(),
+        "[[hooks.pre_turn]]\ncommand='policy'\ntimeout_ms=0".to_owned(),
+        "[[hooks.pre_turn]]\ncommand='policy'\nmax_output_bytes=262145".to_owned(),
+        "[hooks]\nmax_invocations=0".to_owned(),
+        "[hooks]\nmax_total_ms=600001".to_owned(),
+        "[hooks]\nmax_annotation_bytes=1048577".to_owned(),
+        too_many,
+    ] {
+        assert!(
+            load_text(&invalid).is_err(),
+            "accepted invalid hooks: {invalid}"
+        );
+    }
+}
+
+#[test]
 fn managed_defaults_and_exact_locks_cover_budget_rules_and_alias_tables() {
     let dir = TempDir::new().unwrap();
     let project = dir.path().join("project");

@@ -64,6 +64,42 @@ fn published_schema_accepts_defaults_and_documented_configuration() {
 }
 
 #[test]
+fn lifecycle_hook_schema_matches_native_parser_and_bounds() {
+    let validator = schema();
+    for (text, accepted) in [
+        (
+            "[[hooks.pre_turn]]\ncommand='turn-policy'\nargs=['--strict']\ntimeout_ms=5000\nmax_output_bytes=65536\n[[hooks.post_tool]]\ncommand='tool-observer'",
+            true,
+        ),
+        ("[hooks]\nunknown=[]", false),
+        ("[[hooks.pre_turn]]\ncommand=''", false),
+        ("[[hooks.pre_turn]]\ncommand='policy'\ntimeout_ms=0", false),
+        (
+            "[[hooks.pre_turn]]\ncommand='policy'\nmax_output_bytes=262145",
+            false,
+        ),
+        ("[hooks]\nmax_invocations=0", false),
+        ("[hooks]\nmax_total_ms=600001", false),
+        ("[hooks]\nmax_annotation_bytes=1048577", false),
+        ("[[hooks.pre_turn]]\ncommand='policy'\nunknown=true", false),
+    ] {
+        assert_eq!(
+            validator.is_valid(&json_from_toml(text)),
+            accepted,
+            "schema: {text}"
+        );
+        assert_eq!(parse_config(text).is_ok(), accepted, "native: {text}");
+    }
+
+    let too_many = (0..17)
+        .map(|_| "[[hooks.pre_tool]]\ncommand='policy'")
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!validator.is_valid(&json_from_toml(&too_many)));
+    assert!(parse_config(&too_many).is_err());
+}
+
+#[test]
 fn managed_schema_and_native_parser_accept_typed_locks_and_reject_unknown_keys() {
     let validator = managed_schema();
     let dir = TempDir::new().unwrap();

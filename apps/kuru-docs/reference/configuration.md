@@ -82,6 +82,29 @@ Review text and configuration diagnostics are bounded and escaped. They do not p
 
 Workspace trust is authorization, not confinement. Approved shell and stdio MCP children keep your process authority. Kuru revalidates the retained workspace before a pathname-based child launch, but Unix cannot atomically bind that check to the later child cwd selection. Workspace trust is not an OS sandbox.
 
+## Lifecycle hooks
+
+Configure ordered one-shot commands under `hooks.pre_turn`, `hooks.post_turn`, `hooks.pre_tool`, `hooks.post_tool`, and `hooks.speaker_selected`. Each command receives one versioned JSON request on stdin and returns one event-specific JSON decision. Pre hooks may allow, deny, or rewrite pending input or tool arguments; Kuru validates the final value through the ordinary budget, tool, root, and permission checks. Speaker hooks may observe or stop a validated selection. Post hooks may observe or add a bounded private annotation, but cannot change a settled answer, result, receipt, or effect. Failed post hooks are recorded separately and later post hooks continue.
+
+```toml
+[hooks]
+max_invocations = 256
+max_total_ms = 120000
+max_annotation_bytes = 262144
+
+[[hooks.pre_tool]]
+command = "/path/to/review-tool"
+args = ["--strict"]
+timeout_ms = 5000
+max_output_bytes = 65536
+```
+
+Each event accepts at most 16 commands. An operation allows 1–1,024 hook invocations, 1–600,000 milliseconds of shared active hook time, and 1–1,048,576 annotation bytes. The defaults are shown above. Overlapping commands spend active wall time once, including cleanup; inference and ordinary tool time do not spend it. Exhaustion blocks a pre hook and reports a post hook failure without changing settled work. A higher configuration layer replaces each event array. An automatic ancestor hook command, event order, or bound joins the exact-root workspace trust manifest, so changing it requires review again.
+
+All five events apply to conversations through `run`, `serve`, or the terminal UI. A standalone dream has real candidate-local `dream_suggest` calls, so only pre/post tool hooks apply there; no user-turn or selected-speaker event is invented. Dream annotations disappear if the candidate is abandoned. `kuru tool` and inspection commands do not run lifecycle hooks. Completed exact turn retries reuse the stored result without running hooks again.
+
+Hook commands receive only their event payload and a finite compatibility environment, but they run with your ordinary filesystem, process, and network authority. They are not sandboxed plugins. A rewrite may change pre-turn input or pre-tool arguments, never the tool itself. The model sees only a rewritten pre-turn input, in that turn and in every later projection of it: later turns' transcript context for every part, resumed sessions, forks and compaction. If an interrupted turn is retried without a rewrite, later projections use the original that the retry sent. The public transcript, session history and session export keep the original. The private records that mark the rewrite are never sent to a provider. A full `kuru memory export` includes those records and the rewritten text, never the original. On Windows, a hook that runs stock PowerShell should set `timeout_ms` to allow for a cold PowerShell start, which can exceed the 5,000 ms default. A Kuru process started by a hook reports its configured hooks as `suppressed` instead of running them. See the [published schema](/configuration.v1.schema.json) and the [tool reference](/reference/tools) for the surrounding permission contract.
+
 ## Remembered choices
 
 <kbd>F2</kbd>, <kbd>F3</kbd>, <kbd>F4</kbd> and their matching slash commands save model, effort, and framework choices immediately. They apply to the canonical project directory and selected data store. A symlink to that directory shares the choices; a different directory has its own.

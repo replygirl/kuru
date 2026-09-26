@@ -137,7 +137,7 @@ const WINDOWS_SHELL_ENVIRONMENT: &[&str] = &[
 ];
 
 #[cfg(unix)]
-fn unix_shell_environment(
+pub(crate) fn unix_shell_environment(
     environment: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
     let environment: Vec<_> = environment.into_iter().collect();
@@ -153,7 +153,7 @@ fn unix_shell_environment(
 }
 
 #[cfg(windows)]
-fn windows_shell_environment(
+pub(crate) fn windows_shell_environment(
     environment: impl IntoIterator<Item = (OsString, OsString)>,
     system_directory: &Path,
 ) -> Result<Vec<(OsString, OsString)>> {
@@ -206,6 +206,7 @@ fn windows_shell_environment(
 use crate::{
     MAX_BYTES,
     file_edits::{CheckpointStore, CheckpointSummary, EditHunk, FileEffect, apply_hunks},
+    hooks::HookHost,
     instruction_review::{
         InstructionGate, InstructionGateOutcome, InstructionReviewSender, SkillGate,
     },
@@ -232,6 +233,7 @@ pub struct ToolHost {
     root: PathBuf,
     directory: Dir,
     root_guard: Arc<Directory>,
+    hooks: Arc<HookHost>,
     permissions: Arc<PermissionService>,
     checkpoints: Option<Arc<CheckpointStore>>,
     instruction_gate: Option<Arc<dyn InstructionGate>>,
@@ -358,6 +360,7 @@ impl ToolHost {
             mcp: McpHosts::with_retained_root(root_guard.clone(), &config.mcp)?,
             root,
             directory,
+            hooks: Arc::new(HookHost::new(root_guard.clone(), config.hooks.clone())),
             root_guard,
             permissions,
             checkpoints: None,
@@ -374,6 +377,11 @@ impl ToolHost {
             #[cfg(unix)]
             shells: ShellRegistry::new(),
         })
+    }
+
+    /// The lifecycle hook authority bound to this host's retained workspace.
+    pub fn hook_host(&self) -> Arc<HookHost> {
+        self.hooks.clone()
     }
 
     pub fn with_instruction_gate(mut self, gate: Arc<dyn InstructionGate>) -> Self {
@@ -1668,20 +1676,40 @@ impl ToolHost {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        // Owned lifecycle-hook trees, including any whose caller was dropped,
+        // finish cleanup before this host reports shutdown and before a
+        // caller can release the project writer lease.
         #[cfg(unix)]
-        {
-            let (shell, mcp) = tokio::join!(self.shells.shutdown(), self.mcp.shutdown());
-            match (shell, mcp) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(shell), Ok(())) => Err(shell),
-                (Ok(()), Err(mcp)) => Err(mcp),
-                (Err(shell), Err(mcp)) => {
-                    Err(shell).context(format!("MCP shutdown also failed: {mcp:#}"))
-                }
-            }
-        }
+        let (shell, mcp, hooks) = tokio::join!(
+            self.shells.shutdown(),
+            self.mcp.shutdown(),
+            self.hooks.quiesce()
+        );
         #[cfg(not(unix))]
-        self.mcp.shutdown().await
+        let (shell, mcp, hooks) = {
+            let (mcp, hooks) = tokio::join!(self.mcp.shutdown(), self.hooks.quiesce());
+            (Ok::<(), anyhow::Error>(()), mcp, hooks)
+        };
+        let mut failures = [
+            shell.err(),
+            mcp.err(),
+            hooks
+                .err()
+                .map(|error| error.context("lifecycle hook cleanup failed")),
+        ]
+        .into_iter()
+        .flatten();
+        let Some(first) = failures.next() else {
+            return Ok(());
+        };
+        let others = failures
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>();
+        if others.is_empty() {
+            Err(first)
+        } else {
+            Err(first).context(format!("shutdown also failed: {}", others.join("; ")))
+        }
     }
 
     #[cfg(unix)]

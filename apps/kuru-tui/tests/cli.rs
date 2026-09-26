@@ -90,6 +90,61 @@ impl Sandbox {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_post_turn_failure_reports_separately_after_completed_json_answer() -> anyhow::Result<()>
+{
+    use kuru_memory::{MemoryStore, PublicTranscriptEntry, PublicTurnSettlement};
+    use kuru_runtime::project_scope;
+
+    let env = Sandbox::new();
+    let marker = env.project.join("post-turn-hook-ran");
+    let config_path = env.root.path().join("config/kuru/config.toml");
+    let mut config = std::fs::read_to_string(&config_path)?;
+    config.push_str(&format!(
+        "\n[[hooks.post_turn]]\ncommand = '/bin/sh'\nargs = ['-c', 'cat >/dev/null; printf x > \"$1\"; printf RAW_HOOK_SECRET >&2; printf \"{{\"', 'hook', {}]\n",
+        toml::Value::String(marker.to_string_lossy().into_owned())
+    ));
+    std::fs::write(config_path, config)?;
+
+    // Retain a checked managed attachment across the CLI process boundary so
+    // the completed public record can be read without a second cold start or
+    // a direct local lock that excludes the CLI's own managed attachment.
+    let scope = project_scope(&env.project)?;
+    let options = kuru_memory::test_support::open_options(env.data.clone(), scope)?;
+    let (_, opening) = MemoryStore::open_managed_observed(
+        options,
+        std::fs::canonicalize(&env.project)?,
+        PathBuf::from(env!("CARGO_BIN_EXE_kuru")),
+    );
+    let memory = opening.await?;
+
+    let output = tokio::task::block_in_place(|| {
+        env.run(&["run", "a completed answer survives its post hook", "--json"])
+    });
+    assert!(
+        output.status.success(),
+        "settled answer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer: Value = serde_json::from_slice(&output.stdout)?;
+    assert!(answer["text"].as_str().is_some_and(|text| !text.is_empty()));
+    let session = answer["session"].as_str().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("post-turn hook 1: failed"), "{stderr}");
+    assert!(!stderr.contains("RAW_HOOK_SECRET"), "{stderr}");
+    assert_eq!(std::fs::read(marker)?, b"x");
+
+    let page = memory.public_transcript_page(session, None, 8).await?;
+    assert!(page.records.iter().any(|entry| {
+        matches!(entry, PublicTranscriptEntry::Turn { record }
+            if record.origin_session_id == session
+                && record.settlement == PublicTurnSettlement::Completed)
+    }));
+    memory.close().await?;
+    Ok(())
+}
+
 #[test]
 fn shell_support_generation_bypasses_invalid_workspace_authority_without_state() {
     let root = tempfile::tempdir().unwrap();

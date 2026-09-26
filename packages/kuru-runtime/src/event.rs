@@ -52,6 +52,49 @@ pub struct ToolObservation {
     pub elapsed_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HookObservation {
+    pub event: String,
+    pub hook_index: u16,
+    pub invocation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub outcome: String,
+}
+
+impl HookObservation {
+    fn valid(&self) -> bool {
+        matches!(
+            self.event.as_str(),
+            "pre_turn" | "post_turn" | "pre_tool" | "post_tool" | "speaker_selected"
+        ) && self.hook_index > 0
+            && !self.invocation_id.is_empty()
+            && self.invocation_id.len() <= 256
+            && self
+                .turn_id
+                .as_ref()
+                .is_none_or(|id| !id.is_empty() && id.len() <= 256)
+            && self
+                .call_id
+                .as_ref()
+                .is_none_or(|call_id| !call_id.is_empty() && call_id.len() <= 256)
+            && matches!(
+                self.outcome.as_str(),
+                "allowed"
+                    | "rewritten"
+                    | "denied"
+                    | "observed"
+                    | "stopped"
+                    | "annotated"
+                    | "failed"
+                    | "suppressed"
+            )
+    }
+}
+
 impl ToolObservation {
     pub fn projected(
         call_id: &str,
@@ -151,6 +194,10 @@ pub enum Event {
         actor: String,
         observation: ToolObservation,
     },
+    Hook {
+        actor: String,
+        observation: HookObservation,
+    },
     Mcp {
         actor: String,
         detail: String,
@@ -203,6 +250,7 @@ impl Event {
             Self::Speaker { .. } => "speaker",
             Self::ToolStarted { .. } => "tool",
             Self::ToolSettled { .. } => "tool-observation",
+            Self::Hook { .. } => "hook",
             Self::Mcp { .. } => "mcp",
             Self::Peer { .. } => "peer",
             Self::Relationship { .. } => "relationship",
@@ -223,6 +271,7 @@ impl Event {
             | Self::Speaker { actor, .. }
             | Self::ToolStarted { actor, .. }
             | Self::ToolSettled { actor, .. }
+            | Self::Hook { actor, .. }
             | Self::Mcp { actor, .. }
             | Self::Peer { actor, .. }
             | Self::Relationship { actor, .. }
@@ -248,6 +297,7 @@ impl Event {
             Self::Speaker { identity_kind, .. } => identity_kind.clone(),
             Self::ToolStarted { name, .. } => name.clone(),
             Self::ToolSettled { observation, .. } => wire_json(observation),
+            Self::Hook { observation, .. } => wire_json(observation),
             Self::Peer { envelope, .. } => wire_json(envelope),
             Self::Relationship { relationship, .. } => wire_json(relationship),
             Self::State { report, .. } => wire_json(report),
@@ -291,6 +341,16 @@ impl Event {
                 actor,
                 observation: project_observation(observation),
             },
+            Self::Hook {
+                mut observation, ..
+            } => {
+                observation.event = project_detail(observation.event);
+                observation.invocation_id = project_detail(observation.invocation_id);
+                observation.turn_id = observation.turn_id.map(project_detail);
+                observation.call_id = observation.call_id.map(project_detail);
+                observation.outcome = project_detail(observation.outcome);
+                Self::Hook { actor, observation }
+            }
             Self::Mcp { detail, .. } => Self::Mcp {
                 actor,
                 detail: project_detail(detail),
@@ -415,6 +475,14 @@ impl Event {
                 .ok()
                 .filter(ToolObservation::valid)
                 .map(|observation| Self::ToolSettled {
+                    actor: actor.clone(),
+                    observation,
+                })
+                .unwrap_or_else(|| Self::Withheld { kind, actor }),
+            "hook" => serde_json::from_str::<HookObservation>(&detail)
+                .ok()
+                .filter(HookObservation::valid)
+                .map(|observation| Self::Hook {
                     actor: actor.clone(),
                     observation,
                 })

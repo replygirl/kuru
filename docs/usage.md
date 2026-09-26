@@ -262,6 +262,13 @@ no result has zero result bytes and no digest. Completed journals now write
 format 2 and replay older format-1 event triplets through their legacy
 projector without rewriting historical revisions.
 
+A `hook` event records only the lifecycle event name, configured one-based
+ordinal, opaque invocation/turn/call correlation, and `allowed`, `rewritten`,
+`denied`, `observed`, `stopped`, `annotated`, or `failed`. It omits hook command
+details and all payload, output, result, and annotation bodies. Hook annotations
+remain separate private context records; they do not replace the displayed
+answer or tool result. See [lifecycle hooks](configuration.md#lifecycle-hooks).
+
 `kuru memory notes ID` reads an existing project's selected-mode durable notes
 without starting a conversation, provider, or tool. It returns the same bounded
 notes view as `/notes`: `mode`, canonical `identity`, chronological `notes`,
@@ -376,6 +383,11 @@ output item's ID, kind, position and text length, never its text. It does not en
 `RUST_LOG`, capture prompts, tool arguments/results, credentials, or remote error
 text, and it does not change command stdout or TUI rendering. These files are
 operational diagnostics, not conversation history or semantic turn events.
+A turn's tool call refused before dispatch, because its name was not offered for
+that request and phase or because a `pre_tool` hook denied it, failed or returned
+an invalid rewrite, leaves one `kuru.tool` record. That record carries the
+`admission` operation and the tool category and status only, never the tool
+name, arguments or a hook's reason.
 For native provider requests, debug records pair the local input-token estimate
 and final body byte length with the provider's reported input and cached subset;
 they do not record the request body or imply that a matching prefix was cached.

@@ -1,0 +1,34 @@
+The implementation below is reconstructed from reviewed P14 commits onto
+archived P11. Dated historical results remain provenance, while current-lineage
+focused results are recorded in `verification.md`. Final-head full hooks,
+native platform behavior, and 90% coverage remain hard before-merge gates.
+
+## 1. Configuration and authority
+
+- [x] 1.1 Add strict lifecycle-hook configuration types, event arrays, finite defaults/bounds, layer replacement, managed-constraint behavior, and native validation; verify accepted declaration order and every unknown/empty/out-of-range refusal in focused core tests.
+- [x] 1.2 Add parser/schema parity and documented examples for every hook event; verify equivalent TOML and JSON cases against `Config::validate` and `configuration.v1.schema.json`.
+- [x] 1.3 Capture effective automatic hook command, arguments, event, order, and bounds in the exact-root authority manifest; verify preflight blocks process/payload activation before approval and every authority/root change invalidates approval. Observed real TUI trust regression 1/1 on the P11/P14 integrated source, 2026-09-23.
+
+## 2. Owned hook command protocol
+
+- [x] 2.1 Implement connector-owned versioned request/response DTOs with event-specific result validation, stable opaque identifiers, exact JSON framing, finite input/output/stderr/time/count bounds, and redacted diagnostics; verify all valid variants plus unknown, trailing, malformed, hostile, and boundary cases. Focused native connector hooks passed 9/9 on macOS, including all six decision variants, exact pre-tool stdin fields, oversized input before launch/count, bounded output, hostile diagnostics, and shared budgets (2026-09-23).
+- [x] 2.2 Implement one-shot owned hook execution on retained reviewed roots with finite compatibility environment, closed stdin, concurrent bounded pipe drains, deadlines, cancellation, and child/tree reap; add Unix and Windows owned-child fixtures for blocking descendants, output pressure, timeout, caller loss, and cleanup. The Windows started-child/exclusive-handle fixture is source-reviewed but not yet native-run; its final-head Windows job is a hard before-merge gate in `verification.md`.
+- [x] 2.3 Add hook-chain orchestration in declaration order with pre-stop and post-continue failure rules plus explicit non-recursion; verify deterministic rewrite precedence, no partial result use, later post execution after failure, and no nested hook dispatch.
+
+## 3. Runtime lifecycle integration
+
+- [x] 3.1 Integrate pre-turn and post-turn chains at the real actor dispatch/settlement boundaries, preserving original user and settled answer records; verify allow/rewrite/deny/failure/cancellation, final budget/input validation, later-context-only annotations, omission, and no implicit provider request. Native runtime rewrite/refusal/retry and post-turn tests, connector pre-hook bound/caller-loss tests, actor context-fit proof, and completed-frame PTY checks cover the shared dispatch and projection paths as mapped in `verification.md` (2026-09-23).
+- [x] 3.2 Integrate speaker-selected hooks after validated mode-policy selection and before publication/dispatch; verify observe/stop across built-in modes and reject substitution, changed reason, reselection, topology mutation, or authority expansion. Focused real-Dolt fake-provider tests passed for observe and stop across all four modes, plus invalid actor/reason, malformed and timed-out decisions with no speaking dispatch or topology change (2026-09-23).
+- [x] 3.3 Add bounded typed hook outcome and annotation projection, immutable completed-output replay, separate post-settlement CLI/TUI reporting, and exact retry; verify hostile data exclusion and that replay reruns no hook, provider, or tool. Historical real-PTY, hostile-output, and managed lost-reply evidence remains labelled in `verification.md`; the current-lineage CLI post-settlement JSON/stderr/Completed case passed 1/1, while final-head native and coverage gates remain open.
+
+## 4. Tool ordering and settlement
+
+- [x] 4.1 Integrate pre-tool chains into P06 original-order admission and rerun decoding, schema, budget, root, permission, instruction, and execution validation on the exact final operation; verify read/mutation/shell/MCP rewrites, denied expansion, replan boundaries, and one settlement per original call ID. The final ToolHookPayload flows into the same ToolHost validators as ordinary calls; native rewrite tests cover memory mutation, outside-root read, separately denied shell/MCP, and path-instruction replan, with original call-ID settlement (2026-09-23).
+- [x] 4.2 Integrate post-tool chains after immutable per-call settlement while preserving eligible concurrency and original-order provider continuation; verify reverse settlement, same-name calls, unchanged results/effects/receipts/usage, ordered annotations, post failure, cancellation, and ambiguous caller loss. Native real-Dolt tests cover two same-name parallel reads settled in reverse order, failed post hooks followed by annotation, exact managed lost-reply reconciliation/no replay, and cancelled shell/cognitive calls observed after settlement (2026-09-23). Final integrated coverage and native platform gates remain in 5.3.
+- [x] 4.3 Apply pre/post tool hooks to actual candidate-local dream proposals with real call identities and no fabricated turn/speaker event; verify authored proposal limits, final dream-only validation, candidate annotation isolation, abandonment, and cancellation cleanup.
+
+## 5. Documentation and acceptance
+
+- [x] 5.1 Document hook configuration, event payload/results, ordering, trust, permissions, annotations, failures, cancellation, portability, and process-authority/no-sandbox/no-plugin limits; verify docs formatting, build, content, and links.
+- [x] 5.2 Exercise the deterministic fake-command matrix and a completed-frame real PTY for allow, rewrite, deny, stop, annotate, malformed, timeout, cancellation, secrecy, and session continuation; record exact observed evidence in `verification.md` without live or paid provider calls. Hook-specific native runtime/connector fixtures cover timeout, caller cancellation and owned cleanup; hook-enabled real PTY fixtures cover rewrite/annotation/refusal/stop/later use, while the existing completed-frame PTY cancellation fixture covers the shared terminal cancellation and continuation path. No hook-specific PTY cancellation run is claimed (2026-09-23).
+- [x] 5.3 Run current-lineage granular format, lint, typecheck, connector/runtime/TUI focused process checks, and strict Cospec validation; record observed results separately from historical evidence. Assign final-head full hooks, native Linux/Windows behavior, and at least 90% combined workspace coverage as hard before-merge gates in `verification.md`; archive through Cospec and hand Delivery the clean scoped commit. The final-head gates are not claimed passed here.

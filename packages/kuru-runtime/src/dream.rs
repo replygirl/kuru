@@ -12,9 +12,10 @@ use uuid::Uuid;
 use crate::{
     Event,
     engine::{
-        CancellationToken, CandidatePromotionStatus, Harness, PendingCandidateResolution,
-        PendingPublication, PublicationProof, Session, Topology, checked_state_keys,
-        prepared_actor_namespaces, read_topology_with_profile, spec, turn_was_cancelled, user,
+        CancellationToken, CandidatePromotionStatus, Harness, OfferedTools,
+        PendingCandidateResolution, PendingPublication, PublicationProof, Session,
+        ToolHookAdmission, Topology, checked_state_keys, prepared_actor_namespaces,
+        read_topology_with_profile, run_post_tool_hooks, spec, turn_was_cancelled, user,
         validate_topology_with_profile,
     },
 };
@@ -86,6 +87,9 @@ impl Harness {
         let plan = self.profile.memory.consolidation_plan(&active);
         validate_consolidation_plan(&plan, &active.iter().cloned().collect())?;
         self.operation_id = format!("dream-{}", Uuid::new_v4());
+        let hook_host = self.hook_host();
+        let hook_budget = hook_host.budget();
+        let dream_tools = vec![dream_tool()];
         let candidate = self.memory.begin_candidate("dream").await?;
         // A cancelled future drops local stack state without running the
         // error path below. Keep the exact ref on Harness before the first
@@ -96,9 +100,9 @@ impl Harness {
             let memory = candidate.view();
             self.emit_event(Event::Dream { actor: "pool".into(), detail: "parts are consolidating their own memories".into() });
             let ids = &plan.participants;
-            let replies = join_all(ids.iter().map(|id| self.ask_in_controlled(&memory, id,
+            let replies = join_all(ids.iter().map(|id| self.ask_in_controlled_with_invocation(&memory, id,
                 vec![user(&plan.prompt)],
-                (&plan.phase, ActorPhase::Dream), vec![dream_tool()], cancellation))).await;
+                (&plan.phase, ActorPhase::Dream), dream_tools.clone(), cancellation))).await;
             let mut report = DreamReport::default();
             let mut proposals = vec![];
             for (id, reply) in ids.iter().cloned().zip(replies) {
@@ -106,7 +110,7 @@ impl Harness {
                     Err(error) if error.is::<crate::actor::MemoryFailure>() || error.is::<crate::actor::AccountingFailure>() => return Err(error),
                     Err(error) if turn_was_cancelled(&error) => return Err(error),
                     Err(error) => report.rejected.push(format!("{id}: {error:#}")),
-                    Ok(reply) => {
+                    Ok((reply, invocation_id)) => {
                         let summary = reply.text_projection();
                         if !summary.trim().is_empty() {
                             cancellation.check()?;
@@ -120,7 +124,26 @@ impl Harness {
                             cancellation.check()?;
                             report.summaries += 1;
                         }
-                        for (index, call) in reply.calls().into_iter().enumerate() {
+                        for (index, original) in reply.calls().into_iter().enumerate() {
+                            // The authored proposal cap is checked before any hook sees
+                            // the call; the shared pre-tool admission then settles a call
+                            // outside the offered dream tool before any hook runs.
+                            let admission = if index >= plan.max_proposals_per_part {
+                                ToolHookAdmission::Dispatch(original)
+                            } else {
+                                self.run_pre_tool_hooks(
+                                    &hook_host,
+                                    &hook_budget,
+                                    (&id, &invocation_id, None),
+                                    OfferedTools::Exact(&dream_tools),
+                                    original,
+                                    cancellation,
+                                ).await?
+                            };
+                            let (call, pre_settled) = match admission {
+                                ToolHookAdmission::Dispatch(call) => (call, None),
+                                ToolHookAdmission::Settled(call, result) => (call, Some(result)),
+                            };
                             let result = if index >= plan.max_proposals_per_part {
                                 Err(anyhow::anyhow!(if plan.max_proposals_per_part == 2 {
                                     "at most two dream proposals are accepted per part".to_string()
@@ -130,29 +153,32 @@ impl Harness {
                                         plan.max_proposals_per_part
                                     )
                                 }))
+                            } else if let Some(result) = pre_settled {
+                                result.and_then(|_| Err(anyhow::anyhow!("pre-tool hook did not settle a dream proposal")))
                             } else if call.name != "dream_suggest" {
-                                Err(anyhow::anyhow!("only dream_suggest is available"))
+                                // Unreachable: admission settles unoffered calls above.
+                                Err(anyhow::anyhow!("tool is not offered in this phase"))
                             } else {
                                 serde_json::from_value::<DreamProposal>(call.arguments.clone())
                                     .map_err(Into::into)
                             };
-                            let outcome = match result {
+                            let (outcome, succeeded) = match result {
                                 Ok(proposal) => {
                                     if matches!(&proposal, DreamProposal::Retire { id: target } if target != &id)
                                     {
                                         let error =
                                             format!("{id}: parts may only retire themselves");
                                         report.rejected.push(error.clone());
-                                        error
+                                        (error, false)
                                     } else {
                                         proposals.push(proposal);
-                                        "proposal submitted for validation".to_string()
+                                        ("proposal submitted for validation".to_string(), true)
                                     }
                                 }
                                 Err(error) => {
                                     let error = format!("{id}: {error}");
                                     report.rejected.push(error.clone());
-                                    error
+                                    (error, false)
                                 }
                             };
                             cancellation.check()?;
@@ -164,6 +190,30 @@ impl Harness {
                                 )
                                 .await?;
                             cancellation.check()?;
+                            let settled: Result<String> = if succeeded {
+                                Ok(outcome)
+                            } else {
+                                Err(anyhow::anyhow!(outcome))
+                            };
+                            let post = cancellation.wait(async {
+                                Ok(run_post_tool_hooks(
+                                    hook_host.clone(),
+                                    hook_budget.clone(),
+                                    id.clone(),
+                                    invocation_id.clone(),
+                                    None,
+                                    call.clone(),
+                                    &settled,
+                                ).await)
+                            }).await?;
+                            self.finish_post_tool_hooks(
+                                &memory,
+                                &id,
+                                &invocation_id,
+                                None,
+                                &call,
+                                post,
+                            ).await?;
                         }
                     }
                 }
@@ -185,6 +235,8 @@ impl Harness {
             Ok(report)
         }
         .await;
+        // Hook trees whose callers were cancelled finish cleanup first.
+        self.await_hook_cleanup().await;
         self.resolve_candidate_outcome(candidate, outcome).await
     }
 

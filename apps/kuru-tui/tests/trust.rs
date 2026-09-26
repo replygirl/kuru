@@ -550,6 +550,64 @@ fn persistent_approval_replaces_inspects_and_revokes_its_record() {
     assert!(text(&final_status.stdout).contains("Status: not approved"));
 }
 
+#[cfg(unix)]
+#[test]
+fn lifecycle_hook_trust_preflight_binds_command_event_order_and_bounds() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = "provider = 'demo'\nmodel = 'demo'\ndream_every = 0\ndream_on_exit = false\n";
+    let sandbox = Sandbox::new(base);
+    let hook = sandbox.project.join("hook-policy.sh");
+    let marker = sandbox.project.join("hook-ran");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf x >> '{}'\nprintf '%s' '{{\"decision\":\"allow\"}}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let original = format!("{base}[[hooks.pre_turn]]\ncommand = '{}'\n", hook.display());
+    sandbox.write_config(&original);
+
+    let status = sandbox.success(&["trust", "status"]);
+    assert!(text(&status.stdout).contains("lifecycle hook"));
+    assert!(!text(&status.stdout).contains(&hook.display().to_string()));
+    let refused = sandbox.run(&["run", "before approval"]);
+    assert!(!refused.status.success());
+    assert!(!marker.exists());
+    assert!(!sandbox.data.exists());
+
+    sandbox.success(&["--trust-workspace-once", "run", "one invocation"]);
+    assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+    assert!(!sandbox.data.join("trust").exists());
+    std::fs::remove_file(&marker).unwrap();
+
+    sandbox.success(&["trust", "approve", "--yes"]);
+    sandbox.success(&["run", "persistently approved"]);
+    assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+    std::fs::remove_file(&marker).unwrap();
+
+    for changed in [
+        original.replace("hook-policy.sh'", "hook-policy.sh'\nargs = ['changed']"),
+        original.replace("pre_turn", "pre_tool"),
+        format!(
+            "{original}[[hooks.pre_turn]]\ncommand = '{}'\n",
+            hook.display()
+        ),
+        original.replace("hook-policy.sh'", "hook-policy.sh'\ntimeout_ms = 4000"),
+        original.replace(&hook.display().to_string(), "/bin/false"),
+    ] {
+        sandbox.write_config(&changed);
+        let status = sandbox.success(&["trust", "status"]);
+        assert!(text(&status.stdout).contains("does not match"));
+        let refused = sandbox.run(&["run", "changed authority"]);
+        assert!(!refused.status.success());
+        assert!(!marker.exists());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stdio_and_http_mcp_require_cli_approval_before_activation() {
     let stdio = NativeMcpFixture::new();

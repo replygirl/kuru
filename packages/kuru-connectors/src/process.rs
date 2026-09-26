@@ -26,6 +26,21 @@ pub(crate) fn configured(
     .context("cannot resolve configured Windows command")
 }
 
+pub(crate) fn configured_finite(
+    program: &str,
+    args: &[String],
+    environment: Vec<(OsString, OsString)>,
+    cwd: &Path,
+) -> Result<NativeSpawnSpec> {
+    process::configured_command(
+        program.as_ref(),
+        &args.iter().map(OsString::from).collect::<Vec<_>>(),
+        cwd,
+        environment,
+    )
+    .context("cannot resolve configured Windows hook command")
+}
+
 pub(crate) async fn piped(
     program: &str,
     args: &[String],

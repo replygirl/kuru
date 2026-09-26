@@ -19,7 +19,9 @@ use kuru_core::{
 };
 use kuru_memory::{
     ContextSummaryCheckpoint, ContextSummaryRecord, ContextSummaryStale, MemoryStore,
-    PublicTranscriptEntry, ReasoningSummaryRecord, UsageLedger, context_summary_id,
+    PublicTranscriptEntry, PublicTurnKind, PublicTurnRecord, PublicTurnSettlement,
+    ReasoningSummaryRecord, UsageLedger, context_summary_id, public_turn_continuation_node_id,
+    public_turn_node_id,
 };
 use serde_json::Value;
 use tokio::{
@@ -54,11 +56,14 @@ impl std::error::Error for AccountingFailure {}
 
 pub(crate) struct Work {
     pub memory: MemoryStore,
+    /// Project scope of this work's durable state keys.
+    pub scope: String,
     pub ledger: UsageLedger,
     pub invocation: InvocationStart,
     pub turn_id: Option<String>,
     pub inputs: Vec<Message>,
     pub instructions: String,
+    pub public_input_override: Option<PublicInputOverride>,
     pub context_sources: Vec<ContextSource>,
     pub context_budget: ContextBudget,
     pub compaction_policy: ContextCompactionPolicy,
@@ -74,6 +79,40 @@ pub(crate) struct Work {
     pub progress: Option<ProgressDescriptor>,
     pub span: tracing::Span,
     pub reply: Option<oneshot::Sender<Result<Completion>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PublicInputOverride {
+    pub session_id: String,
+    pub operation_id: String,
+    pub turn_id: String,
+    pub original: Message,
+}
+
+impl PublicInputOverride {
+    pub(crate) fn matches_pending(&self, pending: &PublicTurnRecord) -> Result<bool> {
+        if pending.origin_session_id != self.session_id
+            || pending.turn_id != self.turn_id
+            || pending.settlement != PublicTurnSettlement::Pending
+        {
+            return Ok(false);
+        }
+        let primary = public_turn_node_id(&self.session_id, &self.turn_id)?;
+        Ok(match pending.kind {
+            PublicTurnKind::Primary => {
+                pending.node_id == primary
+                    && pending.continuation_of_node_id.is_none()
+                    && pending.user_entry.as_ref() == Some(&self.original)
+            }
+            PublicTurnKind::Continuation => {
+                pending.node_id
+                    == public_turn_continuation_node_id(&self.session_id, &self.turn_id)?
+                    && pending.continuation_of_node_id.as_deref() == Some(primary.as_str())
+                    && pending.user_entry.is_none()
+            }
+            PublicTurnKind::LegacyContinuation => false,
+        })
+    }
 }
 
 pub(crate) struct Actor {
@@ -246,6 +285,35 @@ impl Actor {
                     let public_transcript = work
                         .context_sources
                         .contains(&ContextSource::PublicTranscript);
+                    if let Some(override_input) = &work.public_input_override {
+                        ensure!(
+                            override_input.session_id == work.invocation.session_id
+                                && override_input.operation_id == work.invocation.operation_id
+                                && work
+                                    .turn_id
+                                    .as_deref()
+                                    .is_none_or(|turn_id| turn_id == override_input.turn_id),
+                            "active turn identity changed before provider dispatch"
+                        );
+                        let page = work
+                            .cancellation
+                            .wait(async {
+                                work.memory
+                                    .public_transcript_page(&work.invocation.session_id, None, 0)
+                                    .await
+                                    .map_err(MemoryFailure)
+                                    .map_err(Into::into)
+                            })
+                            .await?;
+                        ensure!(
+                            page.pending
+                                .as_ref()
+                                .map(|pending| override_input.matches_pending(pending))
+                                .transpose()?
+                                .unwrap_or(false),
+                            "active turn transcript changed before provider dispatch"
+                        );
+                    }
                     let required = work
                         .inputs
                         .iter()
@@ -324,6 +392,7 @@ impl Actor {
                     let (mut optional_public, omitted_public_rows) = if public_transcript {
                         read_public_window(
                             &work.memory,
+                            &work.scope,
                             &work.invocation.session_id,
                             16,
                             &work.cancellation,
@@ -657,8 +726,12 @@ async fn read_window(
         .await
 }
 
+/// The provider projection of the public transcript. It keeps the user-facing
+/// record's order and entries, except that a pre-turn-rewritten turn's user
+/// entry is projected as the rewritten input the model actually received.
 async fn read_public_window(
     memory: &MemoryStore,
+    scope: &str,
     session_id: &str,
     limit: usize,
     cancellation: &CancellationToken,
@@ -677,8 +750,10 @@ async fn read_public_window(
     for entry in page.records.into_iter().rev() {
         match entry {
             PublicTranscriptEntry::Turn { record } => {
-                if let Some(user) = record.user_entry {
-                    visible.push(user);
+                if let Some(user) = &record.user_entry {
+                    visible.push(
+                        provider_user_entry(memory, scope, &record, user, cancellation).await?,
+                    );
                 }
                 visible.extend(record.terminal_entries);
             }
@@ -687,6 +762,53 @@ async fn read_public_window(
     }
     visible.retain(|message| message.role != crate::engine::INTERRUPTION_ROLE);
     Ok((visible, omitted))
+}
+
+/// A public turn's user entry as a provider may see it: the durable
+/// turn-scoped rewrite when a pre-turn hook rewrote that turn's latest
+/// attempt, otherwise (no record, or a cleared tombstone) the unchanged user
+/// entry. The rewrite record is keyed by the primary node, so
+/// it serves every actor, later session, resume and fork that projects the
+/// turn.
+async fn provider_user_entry(
+    memory: &MemoryStore,
+    scope: &str,
+    record: &PublicTurnRecord,
+    user: &Message,
+    cancellation: &CancellationToken,
+) -> Result<Message> {
+    let key = crate::engine::pre_turn_rewrite_key(scope, &record.node_id);
+    let rewrite = cancellation
+        .wait(async {
+            memory
+                .get(&key)
+                .await
+                .map_err(MemoryFailure)
+                .map_err(Into::into)
+        })
+        .await?;
+    let Some(rewrite) = rewrite else {
+        return Ok(user.clone());
+    };
+    ensure!(
+        rewrite["format"] == crate::engine::PRE_TURN_REWRITE_FORMAT
+            && rewrite["session_id"] == record.origin_session_id.as_str()
+            && rewrite["turn_id"] == record.turn_id.as_str(),
+        "pre-turn rewrite record {key} does not match public turn {} (node {})",
+        record.turn_id,
+        record.node_id
+    );
+    // A tombstone: the latest attempt of this turn sent the original input.
+    if rewrite["cleared"] == true {
+        return Ok(user.clone());
+    }
+    let input = rewrite["input"].as_str().with_context(|| {
+        format!(
+            "pre-turn rewrite record {key} for public turn {} (node {}) lacks its rewritten input",
+            record.turn_id, record.node_id
+        )
+    })?;
+    Ok(Message::text("user", input))
 }
 
 async fn read_private_context(
@@ -771,7 +893,15 @@ async fn read_private_context(
         .total_rows
         .saturating_sub(u64::from(source.prior.is_some()));
     let omitted_shared = eligible_shared.saturating_sub(shared_summaries.len() as u64);
-    let messages = window.rows.into_iter().map(|row| row.message).collect();
+    // Pre-turn rewrite provenance stays in private history only. Remove it
+    // here, once, so context-fit omission only ever drops a projected row;
+    // these records were never budget-omitted and are not counted as such.
+    let messages = window
+        .rows
+        .into_iter()
+        .map(|row| row.message)
+        .filter(|message| !crate::engine::is_pre_turn_rewrite_record(message))
+        .collect();
     revalidate_compaction_source(memory, &source, cancellation).await?;
     let current_shared = cancellation
         .wait(async {
@@ -822,6 +952,12 @@ fn ordinary_request(
     private: &[Message],
     required: &[Message],
 ) -> Result<(CompletionRequest, Vec<ContextSourceSize>)> {
+    // Pre-turn rewrite provenance stays in private history only; every
+    // provider projection omits it, so the model sees only the rewritten input.
+    // Retained private rows were filtered when read; the current input is
+    // filtered here.
+    let required = provider_visible(required);
+    let required = required.as_slice();
     let mut instructions = work.instructions.clone();
     instructions.push_str(&serde_json::to_string(
         &public
@@ -867,6 +1003,16 @@ fn ordinary_request(
     ))
 }
 
+/// Messages a provider request may carry: everything except durable pre-turn
+/// rewrite provenance records.
+fn provider_visible(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter(|message| !crate::engine::is_pre_turn_rewrite_record(message))
+        .cloned()
+        .collect()
+}
+
 async fn run_context_compaction(
     provider: &dyn Provider,
     work: &Work,
@@ -882,12 +1028,15 @@ async fn run_context_compaction(
         work.effort.as_deref(),
         budget,
     )?;
-    let rows = source
+    // Compaction is a provider projection too: rewrite provenance records are
+    // omitted, and the covered range ends at the last projected row.
+    let (sequences, rows): (Vec<_>, Vec<_>) = source
         .snapshot
         .rows
         .iter()
-        .map(|row| row.message.clone())
-        .collect::<Vec<_>>();
+        .filter(|row| !crate::engine::is_pre_turn_rewrite_record(&row.message))
+        .map(|row| (row.sequence, row.message.clone()))
+        .unzip();
     let fit = work
         .cancellation
         .wait(largest_fitting_context_prefix(provider, &base, &rows))
@@ -895,7 +1044,7 @@ async fn run_context_compaction(
     if fit.selected_messages == 0 {
         return Ok(None);
     }
-    let through_sequence = source.snapshot.rows[fit.selected_messages - 1].sequence;
+    let through_sequence = sequences[fit.selected_messages - 1];
     let invocation_id = source.invocation_id(&work.invocation.operation_id, through_sequence)?;
     revalidate_compaction_source(&work.memory, source, &work.cancellation).await?;
     let invocation = InvocationStart {
@@ -909,6 +1058,7 @@ async fn run_context_compaction(
         price_at_invocation: work.invocation.price_at_invocation.clone(),
     };
     invocation.validate()?;
+    let omitted_private_rows = rows.len().saturating_sub(fit.selected_messages) as u64;
     let mut request = base;
     request
         .messages
@@ -934,11 +1084,7 @@ async fn run_context_compaction(
         context_generation: work.context_generation,
         omitted_public_rows: 0,
         omitted_summary_rows: 0,
-        omitted_private_rows: source
-            .snapshot
-            .rows
-            .len()
-            .saturating_sub(fit.selected_messages) as u64,
+        omitted_private_rows,
         omitted_note_rows: 0,
         runtime_sources,
         settled_reasoning_summaries: vec![],

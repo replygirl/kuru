@@ -94,6 +94,93 @@ async fn attempt() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+static HOOK_WARMED: OnceCell<Result<(), String>> = OnceCell::const_new();
+
+/// The warm-up hook's own timeout: the validated product maximum, used only by
+/// this untimed warm-up under `WARM_UP_TIMEOUT`, never by a hook under test.
+#[cfg(windows)]
+const WARM_UP_HOOK_TIMEOUT_MS: u64 = 120_000;
+
+/// Warm the owned lifecycle-hook launch path (command resolution, finite hook
+/// environment, Job ownership and stock PowerShell 5.1 engine start) once per
+/// process, outside every timed hook budget. Hook launches do not use the
+/// ToolHost shell's module bootstrap, so `warm_up_stock_powershell_engine`
+/// does not warm this path. A no-op on non-Windows targets.
+pub async fn warm_up_stock_powershell_hook_launch() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        let outcome = HOOK_WARMED.get_or_init(run_hook_once).await;
+        return outcome.clone().map_err(|message| anyhow::anyhow!(message));
+    }
+    #[cfg(not(windows))]
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn run_hook_once() -> Result<(), String> {
+    match tokio::time::timeout(WARM_UP_TIMEOUT, hook_attempt()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("{error:#}")),
+        Err(_) => Err(format!(
+            "lifecycle-hook warm-up exceeded its own {WARM_UP_TIMEOUT:?} bound (distinct from \
+             and not counted against any timed hook); a stall here points at PowerShell \
+             engine/host cold start, not the tested hook"
+        )),
+    }
+}
+
+#[cfg(windows)]
+async fn hook_attempt() -> anyhow::Result<()> {
+    use kuru_core::{HookCommand, HookEvent, LifecycleHooks};
+    use kuru_platform::fs::{Directory, NameRetention, Privacy};
+
+    let root = tempfile::tempdir().context("create hook warm-up workspace")?;
+    let powershell = kuru_platform::windows::process::system_directory()?
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let hook = HookCommand {
+        command: powershell.to_string_lossy().into_owned(),
+        args: [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            r#"$null = [Console]::In.ReadToEnd(); [Console]::Out.Write('{"decision":"allow"}')"#,
+        ]
+        .map(String::from)
+        .to_vec(),
+        timeout_ms: WARM_UP_HOOK_TIMEOUT_MS,
+        max_output_bytes: 1024,
+    };
+    let hooks = LifecycleHooks {
+        max_total_ms: WARM_UP_HOOK_TIMEOUT_MS,
+        pre_turn: vec![hook],
+        ..LifecycleHooks::default()
+    };
+    let directory = std::sync::Arc::new(
+        Directory::open(root.path(), Privacy::Inherited, NameRetention::Pinned)
+            .context("open hook warm-up workspace")?,
+    );
+    let host = crate::HookHost::new(directory, hooks);
+    let budget = host.budget();
+    let run = host
+        .run_pre(
+            &budget,
+            HookEvent::PreTurn,
+            "warm-up",
+            "warm-up",
+            None,
+            None,
+            serde_json::json!({"input":"warm"}),
+        )
+        .await;
+    run.outcome
+        .context("warm up the owned lifecycle-hook stock PowerShell launch ahead of timed hooks")?;
+    host.quiesce().await
+}
+
 /// Runs `future` to completion on a fresh, dedicated OS thread that owns its
 /// own `current_thread` Tokio runtime, then joins that thread and returns the
 /// future's output.

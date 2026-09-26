@@ -15,25 +15,27 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use kuru_connectors::{
-    ApprovalSender, CheckpointSummary, InstructionReviewSender, McpBrowserLogin, McpDeviceLogin,
-    McpOAuthAliasStatus, McpOAuthLogout, ParallelReadAdmission, ParallelReadCancellation,
-    PermissionService, PreparedRead, Provider, ToolHost, a2a_send, is_permission_denied,
-    project_text,
+    ApprovalSender, CheckpointSummary, HookBudget, HookHost,
+    HookObservation as ConnectorHookObservation, HookOutcomeKind, InstructionReviewSender,
+    McpBrowserLogin, McpDeviceLogin, McpOAuthAliasStatus, McpOAuthLogout, ParallelReadAdmission,
+    ParallelReadCancellation, PermissionService, PostHookRun, PreHookOutcome, PreToolValue,
+    PreTurnValue, PreparedRead, Provider, SpeakerHookOutcome, ToolHost, a2a_send,
+    is_permission_denied, project_text,
 };
 use kuru_core::{
-    ActorPhase, Completion, Config, ContextBudget, FacingInput, InvocationStart, Message, Mode,
-    ModeProfile, ModelInfo, ModelMetadata, ModelPreference, ModelRoute, Part, ProjectPreferences,
-    Relationship, RelationshipKind, RelationshipOrigin, SessionUsage, StateKeys, ToolCall,
-    ToolSpec, UsagePhase, enrich_model, load_instructions, validate_context_sources,
-    validate_contributions, validate_facing, validate_identity_namespace, validate_peer_edge,
-    validate_recipients, validate_relationship_members,
+    ActorPhase, Completion, Config, ContextBudget, FacingInput, HookEvent, InvocationStart,
+    Message, Mode, ModeProfile, ModelInfo, ModelMetadata, ModelPreference, ModelRoute, Part,
+    ProjectPreferences, Relationship, RelationshipKind, RelationshipOrigin, SessionUsage,
+    StateKeys, ToolCall, ToolSpec, UsagePhase, enrich_model, load_instructions,
+    validate_context_sources, validate_contributions, validate_facing, validate_identity_namespace,
+    validate_peer_edge, validate_recipients, validate_relationship_members,
 };
 use kuru_memory::{
     Candidate, CandidateInventoryPage, CandidateRefStatus, CandidateTransitionResolution,
     HistoryWindow, LegacySessionTurnResume, MemoryStatus, MemoryStore, PublicTranscriptEntry,
     PublicTurnSettlement, Revision, SelectedAbandonResolution, SessionCatalogRecord,
     SessionLifecycleOutcome, SessionLifecycleState, SessionModeCheckpoint, SessionTurnCheckpoint,
-    StoredNote,
+    StoredNote, public_turn_node_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -44,9 +46,9 @@ use uuid::Uuid;
 
 pub use crate::event::StateReport;
 use crate::{
-    actor::{Actor, ActorCommand, Work},
+    actor::{Actor, ActorCommand, PublicInputOverride, Work},
     bus::PeerMessage,
-    event::{Event, ToolObservation, ToolOutcome, TurnLimitReason},
+    event::{Event, HookObservation, ToolObservation, ToolOutcome, TurnLimitReason},
     progress::{ContextSnapshot, FacingProgress, ProgressDescriptor, ProgressTurn},
 };
 
@@ -57,6 +59,38 @@ const MAX_TURN_TRANSITIONS: usize = 64;
 pub const INTERRUPTION_ROLE: &str = "kuru-interruption";
 /// Stable user-facing content of a durable interruption marker.
 pub const INTERRUPTION_TEXT: &str = "Turn interrupted; no completed answer was committed.";
+/// Private-history role of Kuru's lifecycle-hook records (annotations and
+/// pre-turn rewrite provenance).
+pub(crate) const HOOK_RECORD_ROLE: &str = "kuru-hook";
+
+/// Whether `message` is a durable pre-turn rewrite provenance record. It is
+/// kept in private history but never projected into a provider request: the
+/// model sees only the rewritten input. Post-hook annotations share the role
+/// and remain eligible for context.
+pub(crate) fn is_pre_turn_rewrite_record(message: &Message) -> bool {
+    message.role == HOOK_RECORD_ROLE
+        && message
+            .plain_text()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .is_some_and(|record| {
+                record["event"] == HookEvent::PreTurn.label()
+                    && record["outcome"] == HookOutcomeKind::Rewritten.label()
+            })
+}
+
+/// Format of the turn-scoped pre-turn rewrite record.
+pub(crate) const PRE_TURN_REWRITE_FORMAT: u64 = 1;
+
+/// State key of the turn-scoped pre-turn rewrite record for one primary
+/// public turn node. The record holds the final rewritten input (never the
+/// original) so every provider projection of that turn's public user entry —
+/// later turns, retries, resumes and forks, for every actor — carries what the
+/// model actually received. It is private provenance, never projected itself.
+/// A re-admitted attempt that sends the original replaces it with a
+/// `cleared` tombstone (no input), so projections use the original again.
+pub(crate) fn pre_turn_rewrite_key(scope: &str, primary_node_id: &str) -> String {
+    format!("{scope}/pre-turn-rewrite/{primary_node_id}")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Focus {
@@ -157,6 +191,40 @@ struct PreparedToolCall {
     call: ToolCall,
     admitted: std::time::Instant,
     read: Box<PreparedRead>,
+}
+
+/// The one bounded report a completed answer carries when a post-turn
+/// annotation write could not be confirmed. Consumers match this value rather
+/// than restating the text.
+pub const HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER: &str =
+    "hook annotation persistence unresolved after settled answer";
+
+pub(crate) enum ToolHookAdmission {
+    Dispatch(ToolCall),
+    Settled(ToolCall, Result<String>),
+}
+
+/// The tools offered to one actor for one provider request.
+#[derive(Clone, Copy)]
+pub(crate) enum OfferedTools<'a> {
+    /// The runtime dispatches every admitted call itself, so the final call
+    /// must name exactly one of these tools (deliberation, dream).
+    Exact(&'a [ToolSpec]),
+    /// Runtime-dispatched cognitive calls must be offered; every other call
+    /// is admitted, permission-evaluated and typed-refused by the ToolHost
+    /// against its exact final name and arguments.
+    Speaking(&'a [ToolSpec]),
+}
+
+impl OfferedTools<'_> {
+    fn admits(self, name: &str) -> bool {
+        match self {
+            Self::Exact(tools) => tools.iter().any(|tool| tool.name == name),
+            Self::Speaking(tools) => {
+                !is_cognitive(name) || tools.iter().any(|tool| tool.name == name)
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for TurnCancelled {
@@ -406,6 +474,7 @@ struct AskControl<'a> {
     progress: Option<ProgressDescriptor>,
     phase: ActorPhase,
     operation_id: Option<&'a str>,
+    public_input_override: Option<&'a PublicInputOverride>,
 }
 
 /// A bounded, current-mode projection of one identity's durable notes.
@@ -466,6 +535,13 @@ pub struct Harness {
     #[cfg(test)]
     publication_pause: Option<PublicationPause>,
     #[cfg(test)]
+    pub(crate) annotation_reply_pause: std::sync::Mutex<
+        Option<(
+            kuru_memory::test_support::ReplyBarrier,
+            oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
     resume_publication_pause: Option<PublicationPause>,
     #[cfg(test)]
     dream_promotion_pause: Option<PublicationPause>,
@@ -473,6 +549,10 @@ pub struct Harness {
     dream_abandon_pause: Option<PublicationPause>,
     #[cfg(test)]
     pub(crate) dream_transition_reply_pause: Option<kuru_memory::test_support::ReplyBarrier>,
+    #[cfg(test)]
+    pub(crate) reject_next_hook_annotation: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) reject_next_turn_settlement: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -748,6 +828,8 @@ impl Harness {
             #[cfg(test)]
             publication_pause: None,
             #[cfg(test)]
+            annotation_reply_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
             resume_publication_pause: None,
             #[cfg(test)]
             dream_promotion_pause: None,
@@ -755,6 +837,10 @@ impl Harness {
             dream_abandon_pause: None,
             #[cfg(test)]
             dream_transition_reply_pause: None,
+            #[cfg(test)]
+            reject_next_hook_annotation: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            reject_next_turn_settlement: std::sync::atomic::AtomicBool::new(false),
         };
         harness.sync_actors_with(&actor_namespaces);
         harness.save().await?;
@@ -1581,9 +1667,296 @@ impl Harness {
         self.trace.push(event);
     }
 
-    async fn execute_parallel_reads(
+    pub(crate) fn hook_host(&self) -> Arc<HookHost> {
+        self.tools.hook_host()
+    }
+
+    /// Await every owned lifecycle-hook tree, including those whose callers
+    /// were cancelled, and report cleanup that could not be confirmed.
+    pub(crate) async fn await_hook_cleanup(&mut self) {
+        if let Err(error) = self.tools.hook_host().quiesce().await {
+            self.emit_event(Event::Error {
+                actor: "pool".into(),
+                detail: format!("{error:#}"),
+            });
+        }
+    }
+
+    pub(crate) fn emit_hook_observations(
         &mut self,
         actor: &str,
+        invocation_id: &str,
+        turn_id: Option<&str>,
+        call_id: Option<&str>,
+        observations: Vec<ConnectorHookObservation>,
+    ) {
+        for observation in observations {
+            self.emit_event(Event::Hook {
+                actor: actor.into(),
+                observation: HookObservation {
+                    event: observation.event.label().into(),
+                    hook_index: u16::try_from(observation.hook_index + 1).unwrap_or(u16::MAX),
+                    invocation_id: invocation_id.into(),
+                    turn_id: turn_id.map(str::to_owned),
+                    call_id: call_id.map(str::to_owned),
+                    outcome: observation.outcome.label().into(),
+                },
+            });
+        }
+    }
+
+    /// Admit one proposed call before dispatch. The call must name a tool
+    /// offered for this exact request and phase, whether the model proposed
+    /// it or a pre-tool hook rewrote it; hooks may change only its arguments.
+    /// Every later schema, root and permission check runs on the final call.
+    pub(crate) async fn run_pre_tool_hooks(
+        &mut self,
+        hook_host: &Arc<HookHost>,
+        budget: &Arc<HookBudget>,
+        (actor, invocation_id, turn_id): (&str, &str, Option<&str>),
+        offered: OfferedTools<'_>,
+        call: ToolCall,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolHookAdmission> {
+        let is_offered = |name: &str| offered.admits(name);
+        if !is_offered(&call.name) {
+            return Ok(ToolHookAdmission::Settled(
+                call,
+                Err(anyhow::anyhow!("tool is not offered in this phase")),
+            ));
+        }
+        if !hook_host.configured(HookEvent::PreTool) {
+            return Ok(ToolHookAdmission::Dispatch(call));
+        }
+        let call_id = call.id.clone();
+        let run = cancellation
+            .wait(async {
+                Ok(hook_host
+                    .run_pre(
+                        budget,
+                        HookEvent::PreTool,
+                        invocation_id,
+                        actor,
+                        turn_id,
+                        Some(&call_id),
+                        serde_json::to_value(PreToolValue {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        })?,
+                    )
+                    .await)
+            })
+            .await?;
+        self.emit_hook_observations(
+            actor,
+            invocation_id,
+            turn_id,
+            Some(&call_id),
+            run.observations,
+        );
+        match run.outcome {
+            Ok(PreHookOutcome::Denied(reason)) => Ok(ToolHookAdmission::Settled(
+                call,
+                Err(anyhow::anyhow!(reason)),
+            )),
+            Err(_) => Ok(ToolHookAdmission::Settled(
+                call,
+                Err(anyhow::anyhow!("pre-tool hook failed")),
+            )),
+            Ok(PreHookOutcome::Allowed(value)) => match PreToolValue::checked(value, &call.name) {
+                Ok(payload) if is_offered(&payload.name) => {
+                    Ok(ToolHookAdmission::Dispatch(ToolCall {
+                        id: call.id,
+                        name: payload.name,
+                        arguments: payload.arguments,
+                    }))
+                }
+                _ => Ok(ToolHookAdmission::Settled(
+                    call,
+                    Err(anyhow::anyhow!(
+                        "pre-tool hook returned an invalid operation"
+                    )),
+                )),
+            },
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "settled tool provenance stays explicit across hook observation and persistence"
+    )]
+    async fn settle_post_tool_hooks(
+        &mut self,
+        hook_host: &Arc<HookHost>,
+        budget: &Arc<HookBudget>,
+        actor: &str,
+        invocation_id: &str,
+        turn_id: &str,
+        call: &ToolCall,
+        result: &Result<String>,
+    ) -> Result<()> {
+        let run = run_post_tool_hooks(
+            hook_host.clone(),
+            budget.clone(),
+            actor.to_owned(),
+            invocation_id.to_owned(),
+            Some(turn_id.to_owned()),
+            call.clone(),
+            result,
+        )
+        .await;
+        self.finish_post_tool_hooks(
+            &self.memory.clone(),
+            actor,
+            invocation_id,
+            Some(turn_id),
+            call,
+            run,
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_post_tool_hooks(
+        &mut self,
+        memory: &MemoryStore,
+        actor: &str,
+        invocation_id: &str,
+        turn_id: Option<&str>,
+        call: &ToolCall,
+        mut run: PostHookRun,
+    ) -> Result<()> {
+        let persistence = self
+            .persist_hook_annotations(
+                memory,
+                actor,
+                invocation_id,
+                turn_id,
+                Some(&call.id),
+                &mut run,
+            )
+            .await;
+        self.emit_hook_observations(
+            actor,
+            invocation_id,
+            turn_id,
+            Some(&call.id),
+            run.observations,
+        );
+        if persistence.is_err() {
+            self.emit_event(Event::Error {
+                actor: actor.into(),
+                detail: "hook annotation persistence unresolved after settled tool work".into(),
+            });
+        }
+        persistence
+    }
+
+    async fn persist_hook_annotations(
+        &self,
+        memory: &MemoryStore,
+        actor: &str,
+        invocation_id: &str,
+        turn_id: Option<&str>,
+        call_id: Option<&str>,
+        run: &mut PostHookRun,
+    ) -> Result<()> {
+        let namespace = self.checked_namespace(actor).ok();
+        for annotation in &run.annotations {
+            let message = Message::text(
+                HOOK_RECORD_ROLE,
+                json!({
+                    "session_id": self.session.id,
+                    "operation_id": self.operation_id,
+                    "actor": actor,
+                    "record_id": Uuid::new_v4().to_string(),
+                    "event": annotation.event.label(),
+                    "hook_index": annotation.hook_index + 1,
+                    "invocation_id": invocation_id,
+                    "turn_id": turn_id,
+                    "call_id": call_id,
+                    "annotation": annotation.text,
+                })
+                .to_string(),
+            );
+            let saved = if let Some(namespace) = &namespace {
+                #[cfg(test)]
+                if self
+                    .reject_next_hook_annotation
+                    .swap(false, Ordering::SeqCst)
+                {
+                    // A known rejected append has no uncertain receipt to reconcile.
+                    if let Some(observation) = run.observations.iter_mut().find(|observation| {
+                        observation.event == annotation.event
+                            && observation.hook_index == annotation.hook_index
+                    }) {
+                        observation.outcome = HookOutcomeKind::Failed;
+                    }
+                    continue;
+                }
+                #[cfg(test)]
+                let pause = self
+                    .annotation_reply_pause
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                #[cfg(test)]
+                let write = if let Some((barrier, cancel)) = pause {
+                    memory.fixture_pause_next_service_reply(&barrier).await?;
+                    let mut pending = Box::pin(memory.append_session_message(
+                        namespace,
+                        &self.session.id,
+                        &message,
+                    ));
+                    let result = tokio::select! {
+                        result = &mut pending => result,
+                        _ = cancel => Err(anyhow::anyhow!("fixture lost an annotation reply")),
+                    };
+                    drop(pending);
+                    result
+                } else {
+                    memory
+                        .append_session_message(namespace, &self.session.id, &message)
+                        .await
+                };
+                #[cfg(not(test))]
+                let write = memory
+                    .append_session_message(namespace, &self.session.id, &message)
+                    .await;
+                match write {
+                    Ok(()) => true,
+                    Err(_) => {
+                        let receipt = memory.reconcile().await.context(
+                            "post-hook annotation persistence unresolved after settled work",
+                        )?;
+                        // Managed lost replies retain a view-bound unit receipt;
+                        // its exact outcome is authoritative. Local writes
+                        // resolve committed work to Ok and retain their own
+                        // fence on uncertainty, so None here is a definite
+                        // rejected or no-send write.
+                        receipt.unwrap_or(false)
+                    }
+                }
+            } else {
+                false
+            };
+            if !saved
+                && let Some(observation) = run.observations.iter_mut().find(|observation| {
+                    observation.event == annotation.event
+                        && observation.hook_index == annotation.hook_index
+                })
+            {
+                observation.outcome = HookOutcomeKind::Failed;
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_parallel_reads(
+        &mut self,
+        budget: &Arc<HookBudget>,
+        actor: &str,
+        invocation_id: &str,
+        turn_id: &str,
         wave: Vec<PreparedToolCall>,
         cancellation: &CancellationToken,
     ) -> Result<Vec<(ToolCall, Result<String>)>> {
@@ -1600,14 +1973,30 @@ impl Harness {
                 name: prepared.call.name.clone(),
             });
             let tools = self.tools.clone();
+            let hook_host = tools.hook_host();
+            let hook_actor = actor.to_owned();
+            let hook_invocation = invocation_id.to_owned();
+            let hook_turn = turn_id.to_owned();
+            let hook_budget = budget.clone();
             let read_cancellation = wave_cancellation.clone();
             running.push(async move {
                 let outcome = prepared.read.execute(tools, read_cancellation).await;
+                let hooks = run_post_tool_hooks(
+                    hook_host,
+                    hook_budget,
+                    hook_actor,
+                    hook_invocation,
+                    Some(hook_turn),
+                    prepared.call.clone(),
+                    &outcome.result,
+                )
+                .await;
                 (
                     prepared.position,
                     prepared.call,
                     prepared.admitted,
                     outcome.result,
+                    hooks,
                 )
             });
         }
@@ -1627,7 +2016,7 @@ impl Harness {
                     settled = running.next() => settled,
                 }
             };
-            let Some((position, call, admitted, result)) = settled else {
+            let Some((position, call, admitted, result, hooks)) = settled else {
                 continue;
             };
             if cancelled {
@@ -1636,15 +2025,27 @@ impl Harness {
             } else {
                 self.observe_tool(actor, &call, &result, admitted, false);
             }
-            results[position] = Some((call, result));
+            results[position] = Some((call, result, hooks));
+        }
+        let mut ordered = Vec::with_capacity(result_count);
+        for result in results {
+            let (call, outcome, hooks) =
+                result.context("parallel tool wave lost a settled call")?;
+            self.finish_post_tool_hooks(
+                &self.memory.clone(),
+                actor,
+                invocation_id,
+                Some(turn_id),
+                &call,
+                hooks,
+            )
+            .await?;
+            ordered.push((call, outcome));
         }
         if cancelled || cancellation.is_cancelled() {
             return Err(TurnCancelled.into());
         }
-        results
-            .into_iter()
-            .map(|result| result.context("parallel tool wave lost a settled call"))
-            .collect()
+        Ok(ordered)
     }
 
     fn observe_tool(
@@ -2463,10 +2864,22 @@ impl Harness {
         tools: Vec<ToolSpec>,
     ) -> Result<Completion> {
         let cancellation = CancellationToken::new();
-        self.ask_controlled(id, inputs, phase, ActorPhase::Speak, tools, &cancellation)
-            .await
+        self.ask_controlled(
+            id,
+            inputs,
+            phase,
+            ActorPhase::Speak,
+            tools,
+            &cancellation,
+            None,
+        )
+        .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the active public input projection is invocation-scoped and separate from durable actor input"
+    )]
     async fn ask_controlled(
         &self,
         id: &str,
@@ -2475,21 +2888,57 @@ impl Harness {
         phase_kind: ActorPhase,
         tools: Vec<ToolSpec>,
         cancellation: &CancellationToken,
+        public_input_override: Option<&PublicInputOverride>,
     ) -> Result<Completion> {
-        self.ask_in_controlled(
+        Ok(self
+            .ask_controlled_with_invocation(
+                id,
+                inputs,
+                phase,
+                phase_kind,
+                tools,
+                cancellation,
+                public_input_override,
+            )
+            .await?
+            .0)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the active public input projection is invocation-scoped and separate from durable actor input"
+    )]
+    async fn ask_controlled_with_invocation(
+        &self,
+        id: &str,
+        inputs: Vec<Message>,
+        phase: &str,
+        phase_kind: ActorPhase,
+        tools: Vec<ToolSpec>,
+        cancellation: &CancellationToken,
+        public_input_override: Option<&PublicInputOverride>,
+    ) -> Result<(Completion, String)> {
+        self.ask_in_controlled_with_progress(
             &self.memory,
             id,
+            None,
             inputs,
-            (phase, phase_kind),
+            phase,
             tools,
-            cancellation,
+            AskControl {
+                cancellation,
+                progress: None,
+                phase: phase_kind,
+                operation_id: None,
+                public_input_override,
+            },
         )
         .await
     }
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "the admitted turn ID stays distinct from actor work and progress identity"
+        reason = "the admitted turn ID, hook projection, and progress identity remain explicit"
     )]
     async fn ask_controlled_with_progress(
         &self,
@@ -2500,6 +2949,7 @@ impl Harness {
         tools: Vec<ToolSpec>,
         cancellation: &CancellationToken,
         progress: ProgressDescriptor,
+        public_input_override: Option<&PublicInputOverride>,
     ) -> Result<(Completion, String)> {
         self.ask_in_controlled_with_progress(
             &self.memory,
@@ -2513,11 +2963,13 @@ impl Harness {
                 progress: Some(progress),
                 phase: phase.1,
                 operation_id: None,
+                public_input_override,
             },
         )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn ask_in_controlled(
         &self,
         memory: &MemoryStore,
@@ -2540,10 +2992,38 @@ impl Harness {
                     progress: None,
                     phase: phase.1,
                     operation_id: None,
+                    public_input_override: None,
                 },
             )
             .await?
             .0)
+    }
+
+    pub(crate) async fn ask_in_controlled_with_invocation(
+        &self,
+        memory: &MemoryStore,
+        id: &str,
+        inputs: Vec<Message>,
+        phase: (&str, ActorPhase),
+        tools: Vec<ToolSpec>,
+        cancellation: &CancellationToken,
+    ) -> Result<(Completion, String)> {
+        self.ask_in_controlled_with_progress(
+            memory,
+            id,
+            None,
+            inputs,
+            phase.0,
+            tools,
+            AskControl {
+                cancellation,
+                progress: None,
+                phase: phase.1,
+                operation_id: None,
+                public_input_override: None,
+            },
+        )
+        .await
     }
 
     /// Run one explicit, local compaction operation without admitting a prompt turn.
@@ -2602,6 +3082,7 @@ impl Harness {
                         progress: None,
                         phase: ActorPhase::Compact,
                         operation_id: Some(&operation_id),
+                        public_input_override: None,
                     },
                 )
                 .await?;
@@ -2693,12 +3174,14 @@ impl Harness {
         let instructions = self.instruction_parts(id, phase)?;
         let work = Work {
             memory: memory.clone(),
+            scope: self.scope.clone(),
             ledger: self.memory.usage_ledger()?,
             invocation,
             turn_id: turn_id.map(str::to_owned),
             context_sources,
             inputs,
             instructions,
+            public_input_override: control.public_input_override.cloned(),
             context_budget,
             compaction_policy: kuru_core::ContextCompactionPolicy {
                 threshold_percent: self.config.context_compaction_threshold_percent,
@@ -3071,6 +3554,9 @@ impl Harness {
             .instrument(span.clone()),
         )
         .await;
+        // A cancelled turn dropped its hook futures; their owned trees finish
+        // cleanup before the turn is recorded or returned.
+        self.await_hook_cleanup().await;
         match result {
             Err(error) => {
                 if let Some(output) = self.record_interruption(&key, journal).await? {
@@ -3146,12 +3632,142 @@ impl Harness {
                 "mode selected no eligible initial peers"
             );
         }
-        let mut pending: BTreeMap<String, Vec<Message>> = initial
-            .into_iter()
-            .map(|id| (id, vec![user(prompt)]))
-            .collect();
+        let hook_host = self.tools.hook_host();
+        let hook_budget = hook_host.budget();
+        let mut rewriting_hooks = Vec::new();
+        let effective_prompt = if hook_host.configured(HookEvent::PreTurn) {
+            let run = cancellation
+                .wait(async {
+                    Ok(hook_host
+                        .run_pre(
+                            &hook_budget,
+                            HookEvent::PreTurn,
+                            &journal.id,
+                            "pool",
+                            Some(turn_id),
+                            None,
+                            serde_json::to_value(PreTurnValue {
+                                input: prompt.into(),
+                            })?,
+                        )
+                        .await)
+                })
+                .await?;
+            rewriting_hooks = run
+                .observations
+                .iter()
+                .filter(|observation| observation.outcome == HookOutcomeKind::Rewritten)
+                .map(|observation| observation.hook_index + 1)
+                .collect();
+            self.emit_hook_observations("pool", &journal.id, Some(turn_id), None, run.observations);
+            match run.outcome {
+                Ok(PreHookOutcome::Allowed(value)) => PreTurnValue::checked(value)?.input,
+                Ok(PreHookOutcome::Denied(reason)) => bail!(reason),
+                Err(_) => bail!("pre-turn hook failed"),
+            }
+        } else {
+            prompt.into()
+        };
+        let public_input_override = if effective_prompt != prompt {
+            let page = self
+                .memory
+                .public_transcript_page(&self.session.id, None, 0)
+                .await?;
+            let original = user(prompt);
+            let override_input = PublicInputOverride {
+                session_id: self.session.id.clone(),
+                operation_id: self.operation_id.clone(),
+                turn_id: turn_id.to_owned(),
+                original,
+            };
+            ensure!(
+                page.pending
+                    .as_ref()
+                    .map(|pending| override_input.matches_pending(pending))
+                    .transpose()?
+                    .unwrap_or(false),
+                "active turn transcript changed before provider dispatch"
+            );
+            // Before any dispatch, retain the rewritten input for this turn's
+            // public node so every later provider projection of the public
+            // transcript substitutes it for the original user entry.
+            let primary = public_turn_node_id(&self.session.id, turn_id)?;
+            self.memory
+                .put(
+                    &pre_turn_rewrite_key(&self.scope, &primary),
+                    &json!({
+                        "format": PRE_TURN_REWRITE_FORMAT,
+                        "session_id": self.session.id,
+                        "turn_id": turn_id,
+                        "invocation_id": journal.id,
+                        "hook_indexes": rewriting_hooks,
+                        "input": effective_prompt,
+                    }),
+                )
+                .await?;
+            Some(override_input)
+        } else {
+            // A re-admitted turn may still hold the rewrite record of an
+            // earlier attempt that stopped before dispatch. This attempt sends
+            // the original, so a tombstone makes later projections use it.
+            if journal
+                .transitions
+                .iter()
+                .any(|transition| matches!(transition, TurnTransition::Resumed))
+            {
+                let primary = public_turn_node_id(&self.session.id, turn_id)?;
+                self.memory
+                    .put(
+                        &pre_turn_rewrite_key(&self.scope, &primary),
+                        &json!({
+                            "format": PRE_TURN_REWRITE_FORMAT,
+                            "session_id": self.session.id,
+                            "turn_id": turn_id,
+                            "invocation_id": journal.id,
+                            "cleared": true,
+                        }),
+                    )
+                    .await?;
+            }
+            None
+        };
         self.mark_possible_dispatch(journal_key, journal, cancellation)
             .await?;
+        // A rewritten input is hook-authored text. Wherever it is retained in
+        // an actor's durable history, this record precedes it so it is never
+        // indistinguishable from the user's own words; the original stays in
+        // the public transcript. The record is private: provider projections
+        // omit it, so the model sees only the rewritten request.
+        let rewrite_provenance = public_input_override.as_ref().map(|_| {
+            Message::text(
+                HOOK_RECORD_ROLE,
+                json!({
+                    "session_id": self.session.id,
+                    "operation_id": self.operation_id,
+                    "actor": "pool",
+                    "record_id": Uuid::new_v4().to_string(),
+                    "event": HookEvent::PreTurn.label(),
+                    "outcome": HookOutcomeKind::Rewritten.label(),
+                    "hook_indexes": rewriting_hooks,
+                    "invocation_id": journal.id,
+                    "turn_id": turn_id,
+                    "note": "the following current user request was rewritten by a pre_turn hook",
+                })
+                .to_string(),
+            )
+        });
+        let current_request = |text: &str| {
+            rewrite_provenance
+                .iter()
+                .cloned()
+                .chain(std::iter::once(user(text)))
+                .collect::<Vec<_>>()
+        };
+        let mut pending: BTreeMap<String, Vec<Message>> = initial
+            .into_iter()
+            .map(|id| (id, current_request(&effective_prompt)))
+            .collect();
+        let deliberation_tools = cognition_tools();
         let mut drafts = BTreeMap::new();
         let mut used = 0;
         let mut input_tokens: u64 = 0;
@@ -3188,10 +3804,10 @@ impl Harness {
                     detail: format!("peer round {}", round + 1),
                 });
             }
-            let results = join_all(batch.iter().map(|(id, inputs)| self.ask_controlled(id, inputs.clone(),
-                "deliberate: form a concise useful contribution; explicitly send any needed peer messages. The selected speaking identity will execute workspace tools next.", ActorPhase::Deliberate, cognition_tools(), cancellation))).await;
+            let results = join_all(batch.iter().map(|(id, inputs)| self.ask_controlled_with_invocation(id, inputs.clone(),
+                "deliberate: form a concise useful contribution; explicitly send any needed peer messages. The selected speaking identity will execute workspace tools next.", ActorPhase::Deliberate, deliberation_tools.clone(), cancellation, public_input_override.as_ref()))).await;
             for ((id, _), result) in batch.into_iter().zip(results) {
-                let completion = match result {
+                let (completion, invocation_id) = match result {
                     Ok(c) => c,
                     Err(error) if error.is::<crate::actor::AccountingFailure>() => {
                         return Err(error);
@@ -3218,9 +3834,36 @@ impl Harness {
                     actor: id.clone(),
                     detail: "contribution ready".into(),
                 });
-                for call in completion.calls() {
+                for original in completion.calls() {
                     let admitted = std::time::Instant::now();
-                    let result = if used >= self.config.max_tool_calls {
+                    let admission = if used >= self.config.max_tool_calls {
+                        ToolHookAdmission::Dispatch(original)
+                    } else {
+                        self.run_pre_tool_hooks(
+                            &hook_host,
+                            &hook_budget,
+                            (&id, &invocation_id, Some(turn_id)),
+                            OfferedTools::Exact(&deliberation_tools),
+                            original,
+                            cancellation,
+                        )
+                        .await?
+                    };
+                    let (call, pre_settled) = match admission {
+                        ToolHookAdmission::Dispatch(call) => (call, None),
+                        ToolHookAdmission::Settled(call, result) => (call, Some(result)),
+                    };
+                    let result = if let Some(result) = pre_settled {
+                        used += 1;
+                        self.emit_event(Event::ToolStarted {
+                            actor: id.clone(),
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                        });
+                        trace_settled_admission(&call, &result, admitted);
+                        self.observe_tool(&id, &call, &result, admitted, true);
+                        result
+                    } else if used >= self.config.max_tool_calls {
                         limited = true;
                         if limit_reasons.insert(TurnLimitReason::ToolCalls) {
                             self.emit_event(Event::Budget {
@@ -3248,10 +3891,19 @@ impl Harness {
                         )
                         .await
                     };
-                    let result = match result {
-                        Err(error) if turn_was_cancelled(&error) => return Err(error),
-                        result => result,
-                    };
+                    self.settle_post_tool_hooks(
+                        &hook_host,
+                        &hook_budget,
+                        &id,
+                        &invocation_id,
+                        turn_id,
+                        &call,
+                        &result,
+                    )
+                    .await?;
+                    if result.as_ref().is_err_and(turn_was_cancelled) {
+                        return Err(result.unwrap_err());
+                    }
                     let output = tool_result(&call, result, true);
                     pending.entry(id.clone()).or_default().push(output);
                 }
@@ -3284,6 +3936,33 @@ impl Harness {
             "all peers failed to produce a contribution; inspect provider/model configuration and event errors"
         );
         let (speaker, selection_reason) = self.choose_speaker(target.as_deref(), &drafts)?;
+        if hook_host.configured(HookEvent::SpeakerSelected) {
+            let run = cancellation
+                .wait(async {
+                    Ok(hook_host
+                        .run_speaker(
+                            &hook_budget,
+                            &journal.id,
+                            &speaker,
+                            Some(turn_id),
+                            &json!({"speaker": speaker, "reason": selection_reason}),
+                        )
+                        .await)
+                })
+                .await?;
+            self.emit_hook_observations(
+                &speaker,
+                &journal.id,
+                Some(turn_id),
+                None,
+                run.observations,
+            );
+            match run.outcome {
+                Ok(SpeakerHookOutcome::Continue) => {}
+                Ok(SpeakerHookOutcome::Stop(reason)) => bail!(reason),
+                Err(_) => bail!("speaker-selected hook failed"),
+            }
+        }
         let relation = self
             .topology
             .relationships
@@ -3310,10 +3989,10 @@ impl Harness {
                 .map(|r| r.kind.to_string())
                 .unwrap_or_else(|| "part".into()),
         });
-        let mut inputs = vec![user(&format!(
-            "User request: {prompt}\nExplicit contributions to this speaking identity: {}\nRespond directly as the current conversational identity. Use tools to perform requested work when permitted. Do not narrate the whole pool.",
+        let mut inputs = current_request(&format!(
+            "User request: {effective_prompt}\nExplicit contributions to this speaking identity: {}\nRespond directly as the current conversational identity. Use tools to perform requested work when permitted. Do not narrate the whole pool.",
             serde_json::to_string(&shared)?
-        ))];
+        ));
         let mut tools = cognition_tools();
         let catalog = cancellation.wait(self.tools.catalog()).await?;
         for status in catalog.mcp() {
@@ -3335,6 +4014,7 @@ impl Harness {
             } else {
                 vec![]
             };
+            let offered = available.clone();
             let request_round = u32::try_from(request_index + 1)
                 .context("speaking request round exceeds progress identity range")?;
             let (completion, invocation_id) = self
@@ -3349,6 +4029,7 @@ impl Harness {
                     available,
                     cancellation,
                     progress_turn.round(request_round),
+                    public_input_override.as_ref(),
                 )
                 .await?;
             input_tokens = input_tokens.saturating_add(completion.input_tokens());
@@ -3364,12 +4045,35 @@ impl Harness {
             inputs = vec![];
             let mut instructions_refreshed = false;
             let mut call_index = 0;
-            while call_index < calls.len() {
+            let mut pending_admission: Option<(ToolHookAdmission, std::time::Instant)> = None;
+            while call_index < calls.len() || pending_admission.is_some() {
                 cancellation.check()?;
-                let admitted = std::time::Instant::now();
-                if used < self.config.max_tool_calls && !instructions_refreshed {
-                    let call = &calls[call_index];
-                    if !is_cognitive(&call.name) {
+                let admitted = pending_admission
+                    .as_ref()
+                    .map_or_else(std::time::Instant::now, |(_, admitted)| *admitted);
+                if pending_admission.is_none()
+                    && used < self.config.max_tool_calls
+                    && !instructions_refreshed
+                {
+                    let original = calls[call_index].clone();
+                    call_index += 1;
+                    pending_admission = Some((
+                        self.run_pre_tool_hooks(
+                            &hook_host,
+                            &hook_budget,
+                            (&speaker, &invocation_id, Some(turn_id)),
+                            OfferedTools::Speaking(&offered),
+                            original,
+                            cancellation,
+                        )
+                        .await?,
+                        admitted,
+                    ));
+                }
+                if let Some((ToolHookAdmission::Dispatch(call), admitted)) = pending_admission
+                    .take_if(|(admission, _)| matches!(admission, ToolHookAdmission::Dispatch(_)))
+                {
+                    if !is_cognitive(&call.name) && !instructions_refreshed {
                         let context = kuru_connectors::ToolInvocationContext {
                             session_id: self.session.id.clone(),
                             turn_id: turn_id.to_owned(),
@@ -3385,50 +4089,78 @@ impl Harness {
                             cancellation.check()?;
                             let mut wave = vec![PreparedToolCall {
                                 position: 0,
-                                call: call.clone(),
+                                call,
                                 admitted,
                                 read,
                             }];
                             used += 1;
-                            call_index += 1;
                             while call_index < calls.len()
                                 && used < self.config.max_tool_calls
                                 && wave.len() < self.config.max_parallel
                             {
-                                let next = &calls[call_index];
+                                let original = calls[call_index].clone();
+                                call_index += 1;
                                 let next_admitted = std::time::Instant::now();
-                                if is_cognitive(&next.name) {
+                                let next = self
+                                    .run_pre_tool_hooks(
+                                        &hook_host,
+                                        &hook_budget,
+                                        (&speaker, &invocation_id, Some(turn_id)),
+                                        OfferedTools::Speaking(&offered),
+                                        original,
+                                        cancellation,
+                                    )
+                                    .await?;
+                                let ToolHookAdmission::Dispatch(next_call) = next else {
+                                    pending_admission = Some((next, next_admitted));
+                                    break;
+                                };
+                                if is_cognitive(&next_call.name) {
+                                    pending_admission = Some((
+                                        ToolHookAdmission::Dispatch(next_call),
+                                        next_admitted,
+                                    ));
                                     break;
                                 }
                                 let ParallelReadAdmission::Ready(read) = self
                                     .tools
                                     .prepare_parallel_read(
-                                        &next.name,
-                                        next.arguments.clone(),
+                                        &next_call.name,
+                                        next_call.arguments.clone(),
                                         kuru_connectors::ToolInvocationContext {
                                             session_id: self.session.id.clone(),
                                             turn_id: turn_id.to_owned(),
                                             actor_id: speaker.clone(),
                                             invocation_id: invocation_id.clone(),
-                                            call_id: next.id.clone(),
+                                            call_id: next_call.id.clone(),
                                         },
                                     )
                                     .await
                                 else {
+                                    pending_admission = Some((
+                                        ToolHookAdmission::Dispatch(next_call),
+                                        next_admitted,
+                                    ));
                                     break;
                                 };
                                 cancellation.check()?;
+                                used += 1;
                                 wave.push(PreparedToolCall {
                                     position: wave.len(),
-                                    call: next.clone(),
+                                    call: next_call,
                                     admitted: next_admitted,
                                     read,
                                 });
-                                used += 1;
-                                call_index += 1;
                             }
                             for (call, result) in self
-                                .execute_parallel_reads(&speaker, wave, cancellation)
+                                .execute_parallel_reads(
+                                    &hook_budget,
+                                    &speaker,
+                                    &invocation_id,
+                                    turn_id,
+                                    wave,
+                                    cancellation,
+                                )
                                 .await?
                             {
                                 inputs.push(tool_result(&call, result, false));
@@ -3436,10 +4168,28 @@ impl Harness {
                             continue;
                         }
                     }
+                    pending_admission = Some((ToolHookAdmission::Dispatch(call), admitted));
                 }
-                let call = calls[call_index].clone();
-                call_index += 1;
-                let result = if used >= self.config.max_tool_calls {
+                let (call, pre_settled) = match pending_admission.take() {
+                    Some((ToolHookAdmission::Dispatch(call), _)) => (call, None),
+                    Some((ToolHookAdmission::Settled(call, result), _)) => (call, Some(result)),
+                    None => {
+                        let call = calls[call_index].clone();
+                        call_index += 1;
+                        (call, None)
+                    }
+                };
+                let result = if let Some(result) = pre_settled {
+                    used += 1;
+                    self.emit_event(Event::ToolStarted {
+                        actor: speaker.clone(),
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                    });
+                    trace_settled_admission(&call, &result, admitted);
+                    self.observe_tool(&speaker, &call, &result, admitted, true);
+                    result
+                } else if used >= self.config.max_tool_calls {
                     limited = true;
                     if limit_reasons.insert(TurnLimitReason::ToolCalls) {
                         self.emit_event(Event::Budget {
@@ -3466,7 +4216,7 @@ impl Harness {
                         result
                     } else if is_cognitive(&call.name) {
                         let mut mail = BTreeMap::new();
-                        let result = match self
+                        let mut result = self
                             .cognitive_call(
                                 &speaker,
                                 &call,
@@ -3479,48 +4229,42 @@ impl Harness {
                                 },
                                 reviews.permission,
                             )
-                            .await
-                        {
-                            Err(error) if turn_was_cancelled(&error) => {
-                                let cancelled: Result<String> = Err(TurnCancelled.into());
-                                self.observe_tool(&speaker, &call, &cancelled, admitted, true);
-                                return Err(error);
-                            }
-                            result => result,
-                        };
+                            .await;
                         // Execute a direct peer request, not recursive delegation. Peer replies cannot spend more tools here.
-                        for (id, messages) in mail {
-                            match self
-                                .ask_controlled(
-                                    &id,
-                                    messages,
-                                    "peer consultation: answer the sender briefly",
-                                    ActorPhase::Consult,
-                                    vec![],
-                                    cancellation,
-                                )
-                                .await
-                            {
-                                Ok(reply) => {
-                                    input_tokens =
-                                        input_tokens.saturating_add(reply.input_tokens());
-                                    output_tokens =
-                                        output_tokens.saturating_add(reply.output_tokens());
-                                    inputs.push(user(&format!(
-                                        "Peer {id} replied: {}",
-                                        reply.text_projection()
-                                    )));
-                                }
-                                Err(error) if turn_was_cancelled(&error) => {
-                                    let cancelled: Result<String> = Err(TurnCancelled.into());
-                                    self.observe_tool(&speaker, &call, &cancelled, admitted, true);
-                                    return Err(error);
-                                }
-                                Err(error) if error.is::<crate::actor::AccountingFailure>() => {
-                                    return Err(error);
-                                }
-                                Err(error) => {
-                                    inputs.push(user(&format!("Peer {id} failed: {error}")))
+                        if !result.as_ref().is_err_and(turn_was_cancelled) {
+                            for (id, messages) in mail {
+                                match self
+                                    .ask_controlled(
+                                        &id,
+                                        messages,
+                                        "peer consultation: answer the sender briefly",
+                                        ActorPhase::Consult,
+                                        vec![],
+                                        cancellation,
+                                        public_input_override.as_ref(),
+                                    )
+                                    .await
+                                {
+                                    Ok(reply) => {
+                                        input_tokens =
+                                            input_tokens.saturating_add(reply.input_tokens());
+                                        output_tokens =
+                                            output_tokens.saturating_add(reply.output_tokens());
+                                        inputs.push(user(&format!(
+                                            "Peer {id} replied: {}",
+                                            reply.text_projection()
+                                        )));
+                                    }
+                                    Err(error) if turn_was_cancelled(&error) => {
+                                        result = Err(error);
+                                        break;
+                                    }
+                                    Err(error) if error.is::<crate::actor::AccountingFailure>() => {
+                                        return Err(error);
+                                    }
+                                    Err(error) => {
+                                        inputs.push(user(&format!("Peer {id} failed: {error}")))
+                                    }
                                 }
                             }
                         }
@@ -3562,28 +4306,25 @@ impl Harness {
                                 }
                                 outcome.result
                             });
-                        let status = match &result {
-                            Ok(output)
-                                if call.name == "shell"
-                                    && serde_json::from_str::<Value>(output)
-                                        .ok()
-                                        .and_then(|value| value["success"].as_bool())
-                                        == Some(false) =>
-                            {
-                                "error"
-                            }
-                            Ok(_) => "ok",
-                            Err(error) if turn_was_cancelled(error) => "cancelled",
-                            Err(_) => "error",
-                        };
+                        let status = tool_diagnostic_status(&call, &result);
                         tracing::info!(target: "kuru.tool", parent: &span, status, elapsed_ms = started.elapsed().as_millis() as u64, "external tool finished");
                         self.observe_tool(&speaker, &call, &result, admitted, false);
-                        match result {
-                            Err(error) if turn_was_cancelled(&error) => return Err(error),
-                            result => result,
-                        }
+                        result
                     }
                 };
+                self.settle_post_tool_hooks(
+                    &hook_host,
+                    &hook_budget,
+                    &speaker,
+                    &invocation_id,
+                    turn_id,
+                    &call,
+                    &result,
+                )
+                .await?;
+                if result.as_ref().is_err_and(turn_was_cancelled) {
+                    return Err(result.unwrap_err());
+                }
                 inputs.push(tool_result(&call, result, is_cognitive(&call.name)));
             }
         }
@@ -3646,6 +4387,18 @@ impl Harness {
             updates: updates.clone(),
             proof: PublicationProof::LiveValues,
         });
+        let expected_generation = self.session.lifecycle_generation;
+        #[cfg(test)]
+        let expected_generation = if self
+            .reject_next_turn_settlement
+            .swap(false, Ordering::SeqCst)
+        {
+            expected_generation
+                .checked_add(1)
+                .context("fixture turn generation overflow")?
+        } else {
+            expected_generation
+        };
         self.memory
             .checkpoint_session_turn(
                 &self.checked_transcript_key()?,
@@ -3653,7 +4406,7 @@ impl Harness {
                 &[assistant(&text)],
                 &updates,
                 &SessionTurnCheckpoint::Settle {
-                    expected_generation: self.session.lifecycle_generation,
+                    expected_generation,
                     turn_id: journal.id.clone(),
                     settlement: PublicTurnSettlement::Completed,
                     speaker_id: speaker.clone(),
@@ -3666,6 +4419,45 @@ impl Harness {
         let _ = self.events.send(response.clone());
         self.trace.push(response);
         progress_turn.finish();
+        // The answer and its journal are durable before an observer can run.
+        // Post-turn outcomes are separate live observations; exact replay uses
+        // the immutable completed output and never executes the hook again.
+        if hook_host.configured(HookEvent::PostTurn) {
+            let mut run = hook_host
+                .run_post(
+                    &hook_budget,
+                    HookEvent::PostTurn,
+                    &journal.id,
+                    &speaker,
+                    Some(turn_id),
+                    None,
+                    &json!({"answer": text, "outcome": response_outcome}),
+                )
+                .await;
+            let persistence = self
+                .persist_hook_annotations(
+                    &self.memory,
+                    &speaker,
+                    &journal.id,
+                    Some(turn_id),
+                    None,
+                    &mut run,
+                )
+                .await;
+            self.emit_hook_observations(
+                &speaker,
+                &journal.id,
+                Some(turn_id),
+                None,
+                run.observations,
+            );
+            if persistence.is_err() {
+                self.emit_event(Event::Error {
+                    actor: speaker.clone(),
+                    detail: HOOK_ANNOTATION_UNRESOLVED_AFTER_ANSWER.into(),
+                });
+            }
+        }
         if self.config.dream_every > 0 && self.session.turns.is_multiple_of(self.config.dream_every)
         {
             match self.dream_controlled_during_turn(cancellation).await {
@@ -3767,11 +4559,7 @@ impl Harness {
             )
             .instrument(span.clone())
             .await;
-        let status = match &result {
-            Ok(_) => "ok",
-            Err(error) if turn_was_cancelled(error) => "cancelled",
-            Err(_) => "error",
-        };
+        let status = tool_diagnostic_status(call, &result);
         tracing::info!(
             target: "kuru.tool",
             parent: &span,
@@ -4199,7 +4987,7 @@ fn tool_result(call: &ToolCall, result: Result<String>, project_receipt: bool) -
     )
 }
 
-fn projected_tool_receipt(result: &Result<String>, project_receipt: bool) -> Value {
+pub(crate) fn projected_tool_receipt(result: &Result<String>, project_receipt: bool) -> Value {
     let output = match result {
         Ok(output) => output.clone(),
         Err(error) => format!("ERROR: {error:#}"),
@@ -4211,6 +4999,34 @@ fn projected_tool_receipt(result: &Result<String>, project_receipt: bool) -> Val
     };
     Value::String(kuru_connectors::truncate_tool_output(&output, 8192))
 }
+
+pub(crate) async fn run_post_tool_hooks(
+    hook_host: Arc<HookHost>,
+    budget: Arc<HookBudget>,
+    actor: String,
+    invocation_id: String,
+    turn_id: Option<String>,
+    call: ToolCall,
+    result: &Result<String>,
+) -> PostHookRun {
+    hook_host
+        .run_post(
+            &budget,
+            HookEvent::PostTool,
+            &invocation_id,
+            &actor,
+            turn_id.as_deref(),
+            Some(&call.id),
+            &json!({
+                "name": call.name,
+                "arguments": call.arguments,
+                "result": projected_tool_receipt(result, true),
+                "is_error": result.is_err(),
+            }),
+        )
+        .await
+}
+
 pub(crate) fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
     args.get(name)
         .and_then(Value::as_str)
@@ -4265,6 +5081,41 @@ fn external_tool() -> ToolSpec {
         &["agent", "message"],
     )
 }
+
+/// The operational diagnostic status of one settled tool call. A failed
+/// shell receipt is an error even though the tool host returned it.
+fn tool_diagnostic_status(call: &ToolCall, result: &Result<String>) -> &'static str {
+    match result {
+        Ok(output)
+            if call.name == "shell"
+                && serde_json::from_str::<Value>(output)
+                    .ok()
+                    .and_then(|value| value["success"].as_bool())
+                    == Some(false) =>
+        {
+            "error"
+        }
+        Ok(_) => "ok",
+        Err(error) if turn_was_cancelled(error) => "cancelled",
+        Err(_) => "error",
+    }
+}
+
+/// Record a call that pre-tool admission settled without dispatch: a name not
+/// offered for that request and phase, or a pre-tool hook denial, failure or
+/// invalid rewrite. It carries the tool category and status only, never the
+/// tool name, arguments or a hook's reason.
+fn trace_settled_admission(call: &ToolCall, result: &Result<String>, admitted: std::time::Instant) {
+    tracing::info!(
+        target: "kuru.tool",
+        tool = if is_cognitive(&call.name) { "cognitive" } else { "external" },
+        operation = "admission",
+        status = tool_diagnostic_status(call, result),
+        elapsed_ms = admitted.elapsed().as_millis() as u64,
+        "tool admission settled"
+    );
+}
+
 fn is_cognitive(name: &str) -> bool {
     matches!(
         name,

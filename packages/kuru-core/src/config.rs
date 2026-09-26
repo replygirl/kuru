@@ -30,6 +30,180 @@ const MAX_COMBINED_BYTES: usize = 1024 * 1024;
 const MAX_INSTRUCTION_PATHS: usize = 128;
 const MAX_IMPORT_DEPTH: usize = 8;
 const MAX_INSTRUCTION_NOTICES: usize = 16;
+pub const MAX_HOOKS_PER_EVENT: usize = 16;
+pub const MAX_HOOK_ARGUMENTS: usize = 64;
+pub const MAX_HOOK_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_HOOK_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_HOOK_INVOCATIONS: usize = 1024;
+pub const MAX_HOOK_TOTAL_MS: u64 = 600_000;
+pub const MAX_HOOK_ANNOTATION_BYTES: usize = 1024 * 1024;
+
+const fn default_hook_timeout_ms() -> u64 {
+    5_000
+}
+
+const fn default_hook_output_bytes() -> usize {
+    64 * 1024
+}
+
+const fn default_hook_invocations() -> usize {
+    256
+}
+const fn default_hook_total_ms() -> u64 {
+    120_000
+}
+const fn default_hook_annotation_bytes() -> usize {
+    256 * 1024
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HookCommand {
+    pub command: String,
+    pub args: Vec<String>,
+    pub timeout_ms: u64,
+    pub max_output_bytes: usize,
+}
+
+impl Default for HookCommand {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            timeout_ms: default_hook_timeout_ms(),
+            max_output_bytes: default_hook_output_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    PreTurn,
+    PostTurn,
+    PreTool,
+    PostTool,
+    SpeakerSelected,
+}
+
+impl HookEvent {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PreTurn => "pre_turn",
+            Self::PostTurn => "post_turn",
+            Self::PreTool => "pre_tool",
+            Self::PostTool => "post_tool",
+            Self::SpeakerSelected => "speaker_selected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LifecycleHooks {
+    pub max_invocations: usize,
+    pub max_total_ms: u64,
+    pub max_annotation_bytes: usize,
+    pub pre_turn: Vec<HookCommand>,
+    pub post_turn: Vec<HookCommand>,
+    pub pre_tool: Vec<HookCommand>,
+    pub post_tool: Vec<HookCommand>,
+    pub speaker_selected: Vec<HookCommand>,
+}
+
+impl Default for LifecycleHooks {
+    fn default() -> Self {
+        Self {
+            max_invocations: default_hook_invocations(),
+            max_total_ms: default_hook_total_ms(),
+            max_annotation_bytes: default_hook_annotation_bytes(),
+            pre_turn: Vec::new(),
+            post_turn: Vec::new(),
+            pre_tool: Vec::new(),
+            post_tool: Vec::new(),
+            speaker_selected: Vec::new(),
+        }
+    }
+}
+
+impl LifecycleHooks {
+    pub fn event(&self, event: HookEvent) -> &[HookCommand] {
+        match event {
+            HookEvent::PreTurn => &self.pre_turn,
+            HookEvent::PostTurn => &self.post_turn,
+            HookEvent::PreTool => &self.pre_tool,
+            HookEvent::PostTool => &self.post_tool,
+            HookEvent::SpeakerSelected => &self.speaker_selected,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        [
+            &self.pre_turn,
+            &self.post_turn,
+            &self.pre_tool,
+            &self.post_tool,
+            &self.speaker_selected,
+        ]
+        .into_iter()
+        .all(Vec::is_empty)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=MAX_HOOK_INVOCATIONS).contains(&self.max_invocations),
+            "hooks.max_invocations must be between 1 and {MAX_HOOK_INVOCATIONS}"
+        );
+        ensure!(
+            (1..=MAX_HOOK_TOTAL_MS).contains(&self.max_total_ms),
+            "hooks.max_total_ms must be between 1 and {MAX_HOOK_TOTAL_MS}"
+        );
+        ensure!(
+            (1..=MAX_HOOK_ANNOTATION_BYTES).contains(&self.max_annotation_bytes),
+            "hooks.max_annotation_bytes must be between 1 and {MAX_HOOK_ANNOTATION_BYTES}"
+        );
+        for event in [
+            HookEvent::PreTurn,
+            HookEvent::PostTurn,
+            HookEvent::PreTool,
+            HookEvent::PostTool,
+            HookEvent::SpeakerSelected,
+        ] {
+            let hooks = self.event(event);
+            ensure!(
+                hooks.len() <= MAX_HOOKS_PER_EVENT,
+                "hooks.{} has too many commands",
+                event.label()
+            );
+            for hook in hooks {
+                nonempty("hook command", &hook.command, 4096)?;
+                ensure!(
+                    !hook.command.contains('\0'),
+                    "hook command cannot contain NUL characters"
+                );
+                ensure!(
+                    hook.args.len() <= MAX_HOOK_ARGUMENTS,
+                    "hook command has too many arguments"
+                );
+                ensure!(
+                    hook.args
+                        .iter()
+                        .all(|argument| argument.len() <= 4096 && !argument.contains('\0')),
+                    "hook arguments must be at most 4096 bytes without NUL characters"
+                );
+                ensure!(
+                    (1..=MAX_HOOK_TIMEOUT_MS).contains(&hook.timeout_ms),
+                    "hook timeout_ms must be between 1 and {MAX_HOOK_TIMEOUT_MS}"
+                );
+                ensure!(
+                    (1..=MAX_HOOK_OUTPUT_BYTES).contains(&hook.max_output_bytes),
+                    "hook max_output_bytes must be between 1 and {MAX_HOOK_OUTPUT_BYTES}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -158,6 +332,7 @@ pub enum AuthorityClaimCategory {
     ProjectSkillMetadata,
     ProjectSkillMaterial,
     ProjectCommands,
+    LifecycleHooks,
 }
 
 impl AuthorityClaimCategory {
@@ -176,6 +351,7 @@ impl AuthorityClaimCategory {
             Self::ProjectSkillMetadata => "project skill metadata",
             Self::ProjectSkillMaterial => "selected project skill material",
             Self::ProjectCommands => "project commands",
+            Self::LifecycleHooks => "lifecycle hooks",
         }
     }
 }
@@ -478,6 +654,7 @@ pub struct Config {
     pub allow_shell: bool,
     pub allow_write: bool,
     pub permissions: Vec<PermissionRule>,
+    pub hooks: LifecycleHooks,
     pub api_base: String,
     pub api_key_env: String,
     pub mcp: BTreeMap<String, McpConfig>,
@@ -505,6 +682,7 @@ impl Default for Config {
             allow_shell: false,
             allow_write: false,
             permissions: Vec::new(),
+            hooks: LifecycleHooks::default(),
             api_base: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             mcp: BTreeMap::new(),
@@ -795,6 +973,10 @@ impl ConfigSnapshot {
             .validate()
             .map_err(|_| config_error("validation", provisional.workspace()))?;
         permissions::validate_rules(&config.permissions)
+            .map_err(|_| config_error("validation", provisional.workspace()))?;
+        config
+            .hooks
+            .validate()
             .map_err(|_| config_error("validation", provisional.workspace()))?;
         provisional.check_constraints(&config, false)?;
         let manifest = derive_manifest(
@@ -1294,6 +1476,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.memory.validate()?;
         permissions::validate_rules(&self.permissions)?;
+        self.hooks.validate()?;
         for rule in &self.permissions {
             match &rule.selector {
                 PermissionSelector::Mcp { alias, .. } => {
@@ -2020,6 +2203,26 @@ fn derive_manifest(
                 "{} ordered tool permission rule(s)",
                 config.permissions.len()
             ),
+        )?;
+    }
+    let hook_origins = automatic_origins(origins, "hooks");
+    if !config.hooks.is_empty() && !hook_origins.is_empty() {
+        let hook_count = [
+            HookEvent::PreTurn,
+            HookEvent::PostTurn,
+            HookEvent::PreTool,
+            HookEvent::PostTool,
+            HookEvent::SpeakerSelected,
+        ]
+        .into_iter()
+        .map(|event| config.hooks.event(event).len())
+        .sum::<usize>();
+        push_claim(
+            &mut claims,
+            AuthorityClaimCategory::LifecycleHooks,
+            &config.hooks,
+            &hook_origins,
+            format!("{hook_count} ordered lifecycle hook command(s)"),
         )?;
     }
     let binary_origins = automatic_origins(origins, "memory.dolt_binary");

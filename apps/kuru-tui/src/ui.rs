@@ -668,6 +668,14 @@ impl View {
                 self.show_scene = false;
                 ("mcp".into(), actor, "authorization guidance shown".into())
             }
+            Event::Hook { actor, observation } => (
+                "hook".into(),
+                actor,
+                format!(
+                    "{} #{} · {}",
+                    observation.event, observation.hook_index, observation.outcome
+                ),
+            ),
             Event::Mcp { actor, detail } => ("mcp".into(), actor, detail),
             Event::Dream { actor, detail } => ("dream".into(), actor, detail),
             Event::Peer { actor, envelope } => {
@@ -3092,7 +3100,7 @@ mod tests {
         ContextBudget, ContextEstimate, Framework, Message, MoneyEstimate, RelationshipKind,
         Sourced, UnappliedPriceTerm, Usage, UsageCompleteness,
     };
-    use kuru_runtime::ToolObservation;
+    use kuru_runtime::{HookObservation, ToolObservation};
     use ratatui::backend::TestBackend;
 
     fn progress(turn_id: &str, request_round: u32, seq: u64) -> FacingProgress {
@@ -3270,6 +3278,28 @@ mod tests {
             result_sha256: None,
             elapsed_ms: 1,
         }
+    }
+
+    #[test]
+    fn hook_activity_shows_only_projected_identity_and_outcome() {
+        let mut view = fixture();
+        view.event(Event::Hook {
+            actor: "facing".into(),
+            observation: HookObservation {
+                event: "pre_tool".into(),
+                hook_index: 2,
+                invocation_id: "invocation".into(),
+                turn_id: Some("turn".into()),
+                call_id: Some("call".into()),
+                outcome: "rewritten".into(),
+            },
+        });
+        assert_eq!(
+            view.activity.last().map(String::as_str),
+            Some("hook · facing · pre_tool #2 · rewritten")
+        );
+        assert!(!view.activity.last().unwrap().contains("invocation"));
+        assert!(!view.activity.last().unwrap().contains("call"));
     }
 
     #[test]
