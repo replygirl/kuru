@@ -38,10 +38,11 @@ const RECENT_RESULT_LIMIT: usize = 20;
 #[cfg_attr(not(windows), allow(dead_code))]
 const PENDING_LINE_LIMIT: usize = 64 * 1024;
 
-pub const SHARDS: [(&str, &[&str]); 4] = [
+pub const SHARDS: [(&str, &[&str]); 5] = [
     ("delivery-archive", &["kuru-delivery", "kuru-archive"]),
     ("application", &["kuru"]),
-    ("memory-runtime", &["kuru-memory", "kuru-runtime"]),
+    ("memory", &["kuru-memory"]),
+    ("runtime", &["kuru-runtime"]),
     (
         "connectors-core-platform",
         &["kuru-connectors", "kuru-core", "kuru-platform"],
@@ -2463,7 +2464,7 @@ mod tests {
         assert_eq!(fs::read_dir(&missing.target).unwrap().count(), 0);
 
         let duplicate = AggregateFixture::new();
-        let receipt_path = duplicate.shard("memory-runtime").join("receipt.json");
+        let receipt_path = duplicate.shard("memory").join("receipt.json");
         let mut receipt: Receipt = read_json(&receipt_path).unwrap();
         receipt.shard = "application".to_owned();
         write(&receipt_path, &receipt);
@@ -2532,7 +2533,7 @@ mod tests {
         for mutation in ["missing", "empty", "changed"] {
             let changed_profile = AggregateFixture::new();
             let profile = changed_profile
-                .shard("memory-runtime")
+                .shard("memory")
                 .join("profiles/0000.profraw");
             match mutation {
                 "missing" => fs::remove_file(profile).unwrap(),
@@ -2568,19 +2569,14 @@ mod tests {
 
         // A stale lower attempt is ignored once a later one exists.
         let stale = AggregateFixture::new();
-        let old = stale.upload("memory-runtime", 1);
+        let old = stale.upload("memory", 1);
         fs::write(old.join("receipt.json"), b"not a receipt").unwrap();
-        assert!(
-            stale
-                .collect()
-                .unwrap()
-                .contains(&("memory-runtime".to_owned(), 2))
-        );
+        assert!(stale.collect().unwrap().contains(&("memory".to_owned(), 2)));
 
         // An invalid latest attempt never falls back to an older valid one.
         for mutation in ["profile", "source", "tree", "shard", "attempt"] {
             let invalid = AggregateFixture::new();
-            let latest = invalid.upload("memory-runtime", 3);
+            let latest = invalid.upload("memory", 3);
             let receipt_path = latest.join("receipt.json");
             let mut receipt: Receipt = read_json(&receipt_path).unwrap();
             match mutation {
@@ -2738,25 +2734,15 @@ mod tests {
         // Several attempts of one shard use the per-artifact layout while the
         // other shards stay flat.
         let rerun = AggregateFixture::new();
-        rerun.upload("memory-runtime", 3);
-        assert!(
-            rerun
-                .artifact("memory-runtime", 2)
-                .join("attempt-2")
-                .is_dir()
-        );
-        assert!(
-            rerun
-                .artifact("memory-runtime", 3)
-                .join("attempt-3")
-                .is_dir()
-        );
+        rerun.upload("memory", 3);
+        assert!(rerun.artifact("memory", 2).join("attempt-2").is_dir());
+        assert!(rerun.artifact("memory", 3).join("attempt-3").is_dir());
         assert!(rerun.inputs.join("application/attempt-2").is_dir());
         assert!(
             rerun
                 .collect_through(3)
                 .unwrap()
-                .contains(&("memory-runtime".to_owned(), 3))
+                .contains(&("memory".to_owned(), 3))
         );
     }
 

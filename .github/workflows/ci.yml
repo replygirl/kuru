@@ -53,10 +53,16 @@ jobs:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
       # Native archive and memory tests need only the pinned Rust toolchain.
       MISE_NO_HOOKS: "1"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Select private bundle build inputs
+        shell: bash
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        # Cargo's restored target/ cache must not supply these directory grants.
+        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
@@ -64,6 +70,13 @@ jobs:
           install_args: rust
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      # The save-time cleanup keeps only build, .fingerprint and deps in each
+      # profile directory, so the private kuru-test-supervisors snapshot that
+      # kuru-memory:test creates under target/<profile> is never archived.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          shared-key: native-build-${{ matrix.target }}
       - name: Build and package native executable
         env:
           RELEASE_TARGET: ${{ matrix.target }}
