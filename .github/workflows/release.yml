@@ -40,7 +40,7 @@ jobs:
   plan:
     if: github.ref == 'refs/heads/main'
     needs: [source-quality, source-tests]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
@@ -80,7 +80,7 @@ jobs:
 
   bump:
     needs: plan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
     outputs:
@@ -143,14 +143,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
           - os: windows-2025
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
@@ -224,7 +222,7 @@ jobs:
     # Generate read-only notes alongside final validation to surface failures
     # earlier. Publication still requires every native build.
     needs: [plan, bump]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -259,7 +257,7 @@ jobs:
 
   assemble-candidate:
     needs: [plan, bump, build, notes]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
     outputs:
@@ -333,7 +331,7 @@ jobs:
   build-docs:
     name: Build docs
     needs: [bump, assemble-candidate]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     outputs:
       artifact_name: ${{ steps.artifact.outputs.name }}
     permissions:
@@ -374,7 +372,7 @@ jobs:
   deploy-docs:
     name: Deploy docs
     needs: [build-docs, verify-staged-windows]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     concurrency:
       group: github-pages
       cancel-in-progress: false
@@ -395,7 +393,7 @@ jobs:
   # below observes the immutable release and never rolls publication back.
   publish:
     needs: [plan, bump, assemble-candidate, verify-staged-windows, deploy-docs]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
     permissions:

@@ -80,7 +80,6 @@ The bootstrap freezes latest to an explicit version, verifies the ZIP checksum a
 | System                           | Architecture  | Target                      |
 | -------------------------------- | ------------- | --------------------------- |
 | macOS                            | Apple Silicon | `aarch64-apple-darwin`      |
-| macOS                            | Intel         | `x86_64-apple-darwin`       |
 | Linux                            | ARM64         | `aarch64-unknown-linux-gnu` |
 | Linux                            | x86-64        | `x86_64-unknown-linux-gnu`  |
 | Windows 10 version 1809 or newer | x86-64        | `x86_64-pc-windows-msvc`    |

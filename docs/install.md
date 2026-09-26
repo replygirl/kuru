@@ -1,7 +1,7 @@
 # Installation and updates
 
-Kuru ships native executables for macOS and Linux on arm64 and x86-64, and Windows
-on x86-64. Binary installation requires no separately installed compiler, Dolt
+Kuru ships native executables for Apple Silicon macOS, Linux on arm64 and x86-64,
+and Windows on x86-64. Binary installation requires no separately installed compiler, Dolt
 server or MSVC redistributable. Run it as `kuru` (`kuru.exe` on Windows).
 ChatGPT sign-in and OpenAI model requests are native to Kuru; no Codex CLI,
 Node or npm installation is needed for them.
@@ -137,7 +137,6 @@ for storage overrides and migration from the removed `codex_command` setting.
 | System | Architecture | Target |
 | --- | --- | --- |
 | macOS | Apple Silicon | `aarch64-apple-darwin` |
-| macOS | Intel | `x86_64-apple-darwin` |
 | Linux | ARM64 | `aarch64-unknown-linux-gnu` |
 | Linux | x86-64 | `x86_64-unknown-linux-gnu` |
 | Windows 10 version 1809 or newer | x86-64 | `x86_64-pc-windows-msvc` |
@@ -367,6 +366,6 @@ run `kuru update --source /path/to/kuru`.
 
 Maintainers dispatch the Release workflow from main. It calculates the next
 version from conventional commits, runs the gate, creates or recovers the signed
-version commit, builds five native targets, generates Communiqué notes, and
+version commit, builds every supported native target, generates Communiqué notes, and
 publishes the release before deploying its docs. See [release operations](release.md)
 for credentials and recovery.

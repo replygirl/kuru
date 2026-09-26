@@ -38,10 +38,8 @@ The delivery package activates Cocogitto and Communiqué only for its tests,
 combined coverage and release tasks. Its `setup` task preinstalls those tools
 with mise's `--include-task-tools` option; lean CI jobs use `setup:test-tools`
 to install only those two exact package-owned pins. Communiqué 1.3.5 provides Linux x86_64
-and arm64, macOS arm64 and Windows x86_64 binaries; it does not publish an Intel macOS binary.
-Run the full maintainer gate on one of those supported platforms. Building,
-installing and packaging Kuru on Intel macOS uses the Rust tasks and does not
-require Communiqué or maintainer setup.
+and arm64, macOS arm64 and Windows x86_64 binaries, which cover every supported
+platform for the full maintainer gate.
 
 CI runs format, lint, typecheck, repository/workflow tooling, cospec validation,
 managed-file checks and documentation as separate Ubuntu jobs. Native coverage
@@ -73,9 +71,9 @@ limit; if repeated reruns exhaust it, dispatch a fresh run. The source
 installation and installed offline-runtime checks run beside the coverage shards
 after independently preparing their locked inputs. Linux Clippy does not analyze
 platform-specific conditional code; the native suites compile and test those
-branches. Intel macOS and Linux arm64 additionally build and package the native
-executable, exercise real memory and verify the packaged offline runtime; that
-job restores and saves its own per-target Cargo dependency cache.
+branches. Linux arm64 additionally builds and packages the native executable,
+exercises real memory and verifies the packaged offline runtime; that job
+restores and saves its own per-target Cargo dependency cache.
 Windows primitives retain a separate native coverage job for early feedback. The
 required `ci-gate` accepts only success from every branch of this graph.
 
@@ -88,8 +86,7 @@ use a focused local run or another native job when those details are needed.
 
 CI installs only each job's tools before task activation, disables automatic
 installation of unrelated root tools, and uses `MISE_NO_HOOKS=1` because validation jobs do not create Git
-commits. Local Git hooks and maintainer setup retain hk. Archive-only Intel macOS
-jobs need neither hk nor Communiqué, which have no matching upstream binaries.
+commits. Local Git hooks and maintainer setup retain hk.
 
 On Windows, use the x86-64 MSVC Rust target with Visual Studio C++ Build Tools
 and the Windows SDK. The app-owned release task passes an explicit target and
@@ -199,8 +196,7 @@ Set `KURU_MBX=0` in the process environment to build with plain Cargo. mise
 reads it while resolving tools, before any mise `[env]` applies, so setting it
 in `mise.local.toml` has no effect. CI workflows, the source installers and
 `kuru update --source` set it, so published and user-built executables never
-depend on a maintainer cache. mbx publishes no Intel macOS binary; mise skips it
-there and Cargo runs unwrapped. Instrumented coverage never reads or writes the
+depend on a maintainer cache. Instrumented coverage never reads or writes the
 cache: cargo-llvm-cov supplies its own `RUSTC_WRAPPER`, which mbx defers to.
 
 mbx restores outputs by copy-on-write clone on APFS, Btrfs, XFS with reflink,
@@ -250,8 +246,8 @@ directory for both preparation and compilation. Valid files are reverified and
 reused; corrupt or unsafe entries fail without replacement. This build cache is
 separate from the installed application's extracted `memory.cache_dir`.
 
-Every cached native CI job (coverage, installation and the Intel macOS and Linux arm64
-native builds) selects a bundle directory under `${{ runner.temp }}` for all its
+Every cached native CI job (coverage, installation and the Linux arm64 native
+build) selects a bundle directory under `${{ runner.temp }}` for all its
 preparation and build steps. The Windows coverage shards share one Cargo cache
 key that only one shard saves; their instrumented target directories live in
 `${{ runner.temp }}` and are never cached. Private bundle directories must be created by the
