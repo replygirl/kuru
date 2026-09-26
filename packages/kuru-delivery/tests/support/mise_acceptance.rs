@@ -91,12 +91,26 @@ impl Drop for Server {
 fn asset_name() -> String {
     archive::archive_name(VERSION, TARGET).unwrap()
 }
+// Simulated numbering follows the target catalog's own order (matching a real
+// GitHub release's asset enumeration), plus one trailing slot for SHA256SUMS.
+// Deriving both ids from the catalog keeps the fixture correct regardless of
+// how many targets it currently lists.
+fn windows_asset_id() -> usize {
+    targets::CATALOG
+        .iter()
+        .position(|target| target.triple == TARGET)
+        .expect("Windows target present in the release catalog")
+        + 1
+}
+fn sha256sums_asset_id() -> usize {
+    targets::CATALOG.len() + 1
+}
 fn release(data: &ServerData) -> Value {
     let mut assets:Vec<_>=targets::CATALOG.iter().enumerate().filter(|(_,target)| !data.scenario.missing || target.triple!=TARGET).map(|(index,target)| {
         let name=archive::archive_name(VERSION,target.triple).unwrap();
         json!({"name":name,"browser_download_url":format!("https://github.com/replygirl/kuru/releases/download/v{VERSION}/{name}"),"url":format!("https://api.github.com/repos/replygirl/kuru/releases/assets/{}",index+1),"digest":if data.scenario.api_digest && target.triple==TARGET {Some(format!("sha256:{}",data.digest))} else {None}})
     }).collect();
-    assets.push(json!({"name":"SHA256SUMS","browser_download_url":format!("https://github.com/replygirl/kuru/releases/download/v{VERSION}/SHA256SUMS"),"url":"https://api.github.com/repos/replygirl/kuru/releases/assets/6"}));
+    assets.push(json!({"name":"SHA256SUMS","browser_download_url":format!("https://github.com/replygirl/kuru/releases/download/v{VERSION}/SHA256SUMS"),"url":format!("https://api.github.com/repos/replygirl/kuru/releases/assets/{}",sha256sums_asset_id())}));
     json!({"tag_name":format!("v{VERSION}"),"draft":false,"prerelease":false,"created_at":"2020-01-01T00:00:00Z","published_at":"2020-01-01T00:00:00Z","assets":assets})
 }
 
@@ -150,7 +164,11 @@ async fn serve(
     {
         br#"{"attestations":[]}"#.to_vec()
     } else if (path == format!("/download/v{VERSION}/{}", asset_name())
-        || path == "/api/repos/replygirl/kuru/releases/assets/5")
+        || path
+            == format!(
+                "/api/repos/replygirl/kuru/releases/assets/{}",
+                windows_asset_id()
+            ))
         && query.is_none()
         && (method == Method::GET || method == Method::HEAD)
         && !data.scenario.missing
@@ -167,7 +185,11 @@ async fn serve(
             bytes
         }
     } else if (path == format!("/download/v{VERSION}/SHA256SUMS")
-        || path == "/api/repos/replygirl/kuru/releases/assets/6")
+        || path
+            == format!(
+                "/api/repos/replygirl/kuru/releases/assets/{}",
+                sha256sums_asset_id()
+            ))
         && query.is_none()
         && (method == Method::GET || method == Method::HEAD)
     {
@@ -840,7 +862,9 @@ async fn run_archive(
                         .any(|request| request.method == Method::GET
                             && request.bytes == bytes.len()
                             && (request.path.ends_with(&asset_name())
-                                || request.path.ends_with("assets/5"))),
+                                || request
+                                    .path
+                                    .ends_with(&format!("assets/{}", windows_asset_id())))),
                     "mise never downloaded the full Windows ZIP"
                 );
             }
@@ -851,7 +875,9 @@ async fn run_archive(
                         .iter()
                         .any(|request| request.method == Method::GET
                             && (request.path.ends_with("SHA256SUMS")
-                                || request.path.ends_with("assets/6"))),
+                                || request
+                                    .path
+                                    .ends_with(&format!("assets/{}", sha256sums_asset_id())))),
                     "mise skipped release checksum file"
                 );
             }
@@ -861,7 +887,9 @@ async fn run_archive(
                         .requests
                         .iter()
                         .any(|request| request.method == Method::GET
-                            && request.path.ends_with("assets/5")),
+                            && request
+                                .path
+                                .ends_with(&format!("assets/{}", windows_asset_id()))),
                     "API fallback was not exercised"
                 );
             }
