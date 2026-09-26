@@ -41,9 +41,9 @@
 
 ## 8. Tooling and lockfiles on `windows-11-arm`
 
-- [ ] 8.1 @manual (agent) step-zero probe job output -> stock PowerShell 5.1 native machine is ARM64 under both shells; `VC.Tools.ARM64` and `dumpbin.exe` paths listed; `rustc --print host-tuple` is `aarch64-pc-windows-msvc`; `cospec --version` and `cog --version` results, whether an x64 PowerShell host launches, and the instrumented `cargo llvm-cov` smoke result recorded verbatim
+- [ ] 8.1 @manual (agent) step-zero probe job output -> stock PowerShell 5.1 native machine is ARM64 under both shells; `VC.Tools.ARM64` and `dumpbin.exe` paths listed; `rustc --print host-tuple` is `aarch64-pc-windows-msvc`; `cospec --version` and `cog --version` results, whether an x64 PowerShell host launches, the runner image version and Visual Studio edition/version (README and `vswhere`) recorded because the label migrates to Visual Studio 2026 during 2026-09-21 to 2026-09-30 (actions/runner-images#14602), and the instrumented `cargo llvm-cov` smoke result recorded verbatim, including `llvm-profdata merge -sparse` stderr so rust-lang/rust#150123 is confirmed or ruled out on Rust 1.98.1 (a reproduction invokes design Open Question 7)
 - [ ] 8.2 @integration (agent) `mise install` under `MISE_LOCKED=1` on `windows-11-arm` with the `windows-arm64` lock entries -> every job's `install_args` tool installs; if cospec does not, the named `cospec_contract` exclusion is present in the shard receipt with its reason and nothing else is skipped
-- [ ] 8.3 @regression (agent) root `mise.toml` cospec `platforms.windows-arm64.asset_pattern` -> `mise lock` generates the `windows-arm64` entry naming `cospec-0.7.1-windows-x64.zip`, a second `mise lock` produces no diff, and the cocogitto `windows-arm64` entry records the x64 asset aqua selected
+- [ ] 8.3 @regression (agent) root `mise.toml` cospec `platforms.windows-arm64.asset_pattern` -> `mise lock` generates the `windows-arm64` entry naming `cospec-0.7.1-windows-x64.zip`, a second `mise lock` produces no diff, the cocogitto `windows-arm64` entry records the x64 asset aqua selected, and a deliberately non-matching `asset_pattern` fails resolution instead of falling back to autodetection
 
 ## 9. Documentation and support claim
 

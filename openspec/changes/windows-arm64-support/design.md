@@ -53,13 +53,23 @@ Current state, `main` at `501ab92d` unless noted:
   `release_workflow.rs` asserts the literal workflow text. Release-time
   `native-tests` calls pass no `os`, so release validation runs Ubuntu only.
   No CI job runs #108's `test:previous-release-update` yet.
-- Tooling on `windows-11-arm` (design note §7 and the runner image
-  `20260105.41.1`): Rust, mise, mise-action, mr-boxington, hk, taplo, actionlint,
-  cargo-llvm-cov, node and communique have native arm64 assets; cocogitto and
-  shellcheck are x64-only and run emulated; `github:aligned-team/cospec` 0.7.1 has
-  no arm64 asset (blocker B2). The image omits zstd, so `rust-cache` falls back to
-  gzip; public-repo Arm runners have 4 vCPU. Whether stock Windows PowerShell 5.1
-  is native ARM64 on the image is not itemized. Windows 11 is the Arm floor
+- Tooling on `windows-11-arm` (design note §7; runner image README
+  `actions/runner-images` `images/windows/Windows11-Arm64-Readme.md` at
+  `d50c3090b1`, 2026-09-25, which supersedes the `actions/partner-runner-images`
+  README last updated 2026-01-16 at image `20260105.41.1`): Rust, mise,
+  mise-action, mr-boxington, hk, taplo, actionlint, cargo-llvm-cov, node and
+  communique have native arm64 assets; cocogitto and shellcheck are x64-only and
+  run emulated; `github:aligned-team/cospec` 0.7.1 has no arm64 asset (blocker
+  B2). The `windows-11-arm` label is mid-migration (actions/runner-images#14602,
+  rolling out 2026-09-21 to 2026-09-30) from image `20260920.174.1` (Visual
+  Studio Enterprise 2022 17.14.37710.0) to image `20260920.164.1` (Visual Studio
+  Enterprise 2026 18.10.12210.168 under `Microsoft Visual Studio\18\Enterprise`;
+  pre-test label `windows-11-vs2026-arm`). Both images ship Rust 1.98.1, rustup
+  1.29.1, PowerShell 7.6.6 and zstd 1.5.7, so `rust-cache` no longer falls back
+  to gzip; public-repo Arm runners have 4 vCPU. Instrumented coverage on
+  `aarch64-pc-windows-msvc` has an open upstream defect, rust-lang/rust#150123
+  (D7, Open Question 7). Whether stock Windows PowerShell 5.1 is native ARM64 on
+  the image is not itemized. Windows 11 is the Arm floor
   because .NET Framework 4.8.1's native Arm64 support is Windows 11+.
 - Constraints: AGENTS.md forbids compile-only support claims, host fallbacks and
   unbundled builds; platform mechanics live in `kuru-platform`; `linux-x64` is the
@@ -432,7 +442,7 @@ line is the acceptance evidence to look for in the job log.
 | Tool | On arm64 | Action |
 |---|---|---|
 | rust 1.98.1, llvm-tools-preview | native | none |
-| cargo-llvm-cov 0.9.1 | built from source for arm64 through the `cargo:` backend | none; step zero runs an instrumented smoke test |
+| cargo-llvm-cov 0.9.1 | built from source for arm64 through the `cargo:` backend; installation works, but instrumented collection has an open upstream defect: rust-lang/rust#150123 (open, label `O-aarch64-pc-windows-msvc`, filed 2025-12-18 against nightly 1.94.0 `f794a0873`, last updated 2025-12-19, no comments) reports `llvm-profdata merge` failing with "malformed instrumentation profile data: symbol name is empty"; not yet checked on the pinned 1.98.1 | step zero runs an instrumented smoke test including the issue's `llvm-profdata merge -sparse` step and records its stderr; a reproduction invokes Open Question 7 before any arm64 coverage job is wired |
 | mise 2026.9.4, mise-action v4.3.0 | native | none |
 | mr-boxington 1.17.0 | native asset; CI sets `KURU_MBX=0` | lock entry for maintainers |
 | hk 1.58.1 | native; CI sets `MISE_NO_HOOKS=1` | lock entry |
@@ -443,15 +453,24 @@ line is the acceptance evidence to look for in the job log.
 
 Lockfiles: root `mise.lock` (hk, shellcheck, actionlint, taplo, cospec,
 mr-boxington), `packages/kuru-delivery/mise.lock` (cocogitto, communique) and
-`apps/kuru-docs/mise.lock` gain `windows-arm64` platform entries, refreshed
+`apps/kuru-docs/mise.lock` (node) gain `windows-arm64` platform entries. Read
+at main `501ab92d`, none of the three lockfiles has any `platforms.windows-arm64`
+block; each of those tools has only `windows-x64` and `windows-x64-baseline`
+blocks, although mr-boxington, hk, actionlint, taplo, communique and node publish
+native arm64 assets upstream. The entries are refreshed
 through the `mise lock --platform ...,windows-arm64` commands documented in
 `docs/development.md`. A hand-written lock entry would be regenerated away by the
 next `mise lock`, so the cospec selection lives in `mise.toml` and the lock only
 records what mise resolved from it. The `platforms.<platform>.asset_pattern`
-syntax is taken from the live mise github-backend documentation
-(mise.jdx.dev/dev-tools/backends/github.html, read 2026-09-26; local mise is
-2026.9.13); task 2.9 re-confirms it and the `windows-arm64` key against the
-pinned mise 2026.9.4 before relying on them. `aqua:cocogitto/cocogitto` needs no
+syntax is confirmed against the pinned release's own documentation
+(`docs/dev-tools/backends/github.md` at jdx/mise tag `v2026.9.4`, read
+2026-09-26): `asset_pattern` replaces asset autodetection entirely for that
+platform key, whereas `matching` and `matching_regex` only narrow the candidate
+set while keeping autodetection and are silently ignored when `asset_pattern` is
+set. The arm64 pin is therefore a hard override with no autodetected fallback:
+if the x64 asset is renamed upstream, resolution fails rather than choosing
+another asset. The documented examples use `linux-x64` and `macos-arm64` keys, so
+the `windows-arm64` key itself is still confirmed at the first `mise lock`. `aqua:cocogitto/cocogitto` needs no
 option: the aqua backend has no `asset_pattern`, and the aqua registry entry's
 `windows_arm_emulation: true` makes aqua select the x64 asset on
 `windows-arm64`; task 2.9 records the resolved asset from the generated lock as
@@ -512,7 +531,7 @@ ARM64 before the bootstrap is trusted on that assumption.
 Caveats carried into the tasks: release-time `native-tests` calls pass no `os`
 and therefore run no Windows coverage for either architecture; arm64 coverage at
 release time exists only through staged and published acceptance, and the docs
-say so. Public-repo Arm runners have 4 vCPU and gzip caches; the 90-minute shard
+say so. Public-repo Arm runners have 4 vCPU; the 90-minute shard
 budget is measured on the first run before any change, and a fifth-or-more
 shard needs a `SHARDS` code change first. `windows-11-arm` is GA for public
 repositories and the repository is public; minutes are billed at the Arm rate
@@ -599,8 +618,10 @@ publishing.
 ## Operational surface
 
 Every arm64 delivery path runs on the same hosts and with the same secrets as the
-x64 one. `windows-11-arm` GitHub-hosted runners (image `20260105.41.1`, 4 vCPU
-in public repositories, no zstd) run the native jobs; `ubuntu-24.04` runs PR6a's
+x64 one. `windows-11-arm` GitHub-hosted runners (image `20260920.174.1` with
+Visual Studio 2022 or, after the actions/runner-images#14602 migration completes
+by 2026-09-30, `20260920.164.1` with Visual Studio 2026; 4 vCPU in public
+repositories; zstd 1.5.7 installed) run the native jobs; `ubuntu-24.04` runs PR6a's
 engine build and hands the archive over as a workflow artifact that each arm64
 job imports offline into its own runner-created private `KURU_DOLT_BUNDLE_DIR`.
 No job binds a network listener beyond the existing loopback mise fixture in
@@ -609,7 +630,7 @@ staged acceptance; no new secret is introduced, and the only token used is
 listing step only, `GITHUB_TOKEN` for the GitHub REST metadata request. Asset
 downloads stay anonymous over HTTPS. Binary versions and architectures: Rust
 1.98.1 `aarch64-pc-windows-msvc`, mise 2026.9.4 native arm64, cargo-llvm-cov
-0.9.1 built from source, cocogitto 7.0.0 and cospec 0.7.1 x64 assets under
+0.9.1 built from source (instrumented collection subject to rust-lang/rust#150123), cocogitto 7.0.0 and cospec 0.7.1 x64 assets under
 emulation, communique 1.3.5 and hk 1.58.1 native arm64, Dolt v2.3.3 built by
 PR6a for windows/arm64. Connection limits and deadlines are unchanged: the
 resolver's 60-second HTTPS client, 64 KiB `SHA256SUMS` bound, 4 MiB metadata
@@ -665,8 +686,19 @@ tools; `dumpbin` is a build-time acceptance dependency only.
   report collector requires one host triple across its receipts.
 - [The gate accepts an unknown Windows label on the Unix branch] → explicit
   allowlist that fails on unknown labels, with test cases for each branch.
-- [4 vCPU and gzip caches push a shard past 90 minutes] → measure the first
-  run; add a shard through `SHARDS` if needed rather than raising the budget.
+- [4 vCPU pushes a shard past 90 minutes] → measure the first run; add a shard
+  through `SHARDS` if needed rather than raising the budget.
+- [The `windows-11-arm` label resolves to either the Visual Studio 2022 or 2026
+  image during the actions/runner-images#14602 migration week] → `dumpbin`
+  discovery already goes through `vswhere` component queries
+  (`verify-windows-imports.ps1`) with no hard-coded Visual Studio year or
+  install root; step zero records the image version and Visual Studio edition,
+  and the README is re-read when phase 3 starts.
+- [rust-lang/rust#150123 breaks instrumented coverage on
+  `aarch64-pc-windows-msvc`] → step zero reproduces the issue's
+  `llvm-profdata merge` step on the pinned toolchain before any arm64 coverage
+  job is wired; a reproduction is resolved by Open Question 7, never by
+  substituting an uninstrumented run inside the coverage gate.
 - [`SHA256SUMS` cross-check adds one small download per published release on a
   first release] → bounded to 64 KiB each on immutable paths, authenticated
   against listed digests; only on the no-predecessor path.
@@ -698,3 +730,17 @@ tools; `dumpbin` is a build-time acceptance dependency only.
    (.NET Framework 4.8.1 native Arm64); Windows 10 on Arm is out of scope.
 6. Designer default, needs lead confirmation: release-time Windows coverage
    stays staged/published-only for both architectures (D8 caveats).
+7. Needs lead decision if step zero reproduces rust-lang/rust#150123 on the
+   pinned Rust 1.98.1; blocks phase 3 in that case. D8, D11 and verification
+   rows 1.1 and 2.1 assume instrumented coverage works on arm64. Options: (a)
+   keep the arm64 `windows-coverage` shards, report and the `native-platform`
+   arm64 leg instrumented and hold the support claim until a pinned toolchain
+   carries the upstream fix; or (b) run the same arm64 test selection
+   uninstrumented as separately named behavioral evidence for the memory,
+   cleanup and terminal checks, explicitly outside the 90% gate that x64 and
+   Ubuntu keep enforcing. Recommended fallback: (b), recorded as a named
+   host-keyed decision in the receipts like the D7 contingency; AGENTS.md's
+   "never substitute an uninstrumented executable to make a coverage run pass"
+   means (b) must never report or satisfy coverage, only behavior. If step zero
+   does not reproduce the defect, the question closes with the recorded
+   evidence.
