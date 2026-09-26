@@ -48,19 +48,23 @@ async fn cli_refuses_offline_builds_before_any_work() {
 
 #[tokio::test]
 async fn cli_requires_print_pins_on_a_non_authoritative_host() {
-    // The override passes the host gate on every test host but cannot verify
-    // the committed arm64 pins, so the build stops before any work.
-    let (success, stderr) = run(|command| {
-        command
-            .args(["--target", "aarch64-pc-windows-msvc"])
-            .env("KURU_BUNDLE_BUILD_HOST_OVERRIDE", "1");
-    })
-    .await;
-    assert!(!success);
-    assert!(
-        stderr.contains("a non-authoritative host cannot verify pins; pass --print-pins"),
-        "{stderr}"
-    );
+    // Elsewhere the override passes the host gate but cannot verify the
+    // committed arm64 pins, so the build stops before any work. linux-x64 is
+    // the authoritative build host, where a verifying build would start the
+    // real recipe; the injected-host unit tests cover this refusal there.
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let (success, stderr) = run(|command| {
+            command
+                .args(["--target", "aarch64-pc-windows-msvc"])
+                .env("KURU_BUNDLE_BUILD_HOST_OVERRIDE", "1");
+        })
+        .await;
+        assert!(!success);
+        assert!(
+            stderr.contains("a non-authoritative host cannot verify pins; pass --print-pins"),
+            "{stderr}"
+        );
+    }
     let (success, stderr) = run(|command| {
         command
             .args(["--target", "x86_64-pc-windows-msvc", "--print-pins"])
