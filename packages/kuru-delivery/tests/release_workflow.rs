@@ -98,7 +98,7 @@ fn required_release_checks_precede_the_only_publication_job() {
         assert!(tests.contains(required), "release tests lost {required}");
     }
     assert!(!tests.contains("continue-on-error:"));
-    // The OS secret-store session is the same text CI runs around coverage.
+    // The OS secret-store session is the same text CI runs around each coverage shard.
     let native = fs::read_to_string(root.join(".github/workflows/native-tests.yml")).unwrap();
     let session = |text: &str, command: &str| {
         let start = text
@@ -113,7 +113,7 @@ fn required_release_checks_precede_the_only_publication_job() {
     };
     assert_eq!(
         session(&tests, "mise run test"),
-        session(&native, "mise run coverage")
+        session(&native, "mise run //packages/kuru-delivery:coverage:shard")
     );
 
     let assembly = job("assemble-candidate");
