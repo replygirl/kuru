@@ -94,6 +94,9 @@ fn required_release_checks_precede_the_only_publication_job() {
         "mise run //packages/kuru-delivery:package:shell-support",
         "Get-FileHash -Algorithm SHA256",
         "openssl dgst -sha256",
+        // Linux release archives keep the documented Ubuntu 24.04 glibc floor.
+        "- os: ubuntu-24.04\n            target: x86_64-unknown-linux-gnu\n",
+        "- os: ubuntu-24.04-arm\n            target: aarch64-unknown-linux-gnu\n",
     ] {
         assert!(build.contains(required), "native build lost {required}");
     }
@@ -397,7 +400,7 @@ async fn native_workflow_gate_rejects_incomplete_windows_results() {
             &root,
             gate,
             (
-                "ubuntu-24.04",
+                "ubuntu-latest",
                 "true",
                 "success",
                 "skipped",
@@ -782,7 +785,10 @@ async fn real_cli_assembles_a_candidate_without_github_credentials() {
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        "Assembled 11 release candidate checks"
+        format!(
+            "Assembled {} release candidate checks",
+            release::TARGETS.len() * 2 + 1
+        )
     );
     assert_eq!(
         fs::read_to_string(archives.directory.join("SHA256SUMS"))
@@ -1281,7 +1287,7 @@ async fn interrupted_draft_resumes_missing_assets_then_publishes_exact_commit() 
     );
     {
         let remote = server.state.lock().unwrap();
-        assert_eq!(remote.uploads.len(), 11);
+        assert_eq!(remote.uploads.len(), release::TARGETS.len() * 2 + 1);
         assert_eq!(remote.release.as_ref().unwrap()["draft"], false);
         assert!(
             remote.release.as_ref().unwrap()["body"]
@@ -1410,7 +1416,7 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
         release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
             .unwrap_err()
             .to_string()
-            .contains("five core and five paired")
+            .contains("a core and a paired shell support archive for every release target")
     );
     fs::write(&support_path, b"not a support envelope").unwrap();
     fs::write(
@@ -1436,7 +1442,7 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
         release::assemble(&archives.directory, v("0.1.0"), &archives.notes)
             .unwrap_err()
             .to_string()
-            .contains("five core and five paired")
+            .contains("a core and a paired shell support archive for every release target")
     );
     assert!(
         archives
@@ -1444,7 +1450,7 @@ async fn missing_corrupt_assets_and_empty_notes_prevent_all_remote_writes() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("five core and five paired")
+            .contains("a core and a paired shell support archive for every release target")
     );
     fs::write(&path, b"corrupt").unwrap();
     assert!(

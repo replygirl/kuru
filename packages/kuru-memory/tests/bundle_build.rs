@@ -26,7 +26,6 @@ fn target_selection_uses_requested_target_and_generates_coherent_versioned_paylo
     let manifest = Manifest::load(&path).unwrap();
     for target in [
         "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
         "x86_64-pc-windows-msvc",
@@ -44,7 +43,12 @@ fn target_selection_uses_requested_target_and_generates_coherent_versioned_paylo
         assert!(selected.contains(&asset.license_sha256));
         assert!(generated.contains(&format!("DOLT_VERSION: &str = {:?}", manifest.version)));
     }
-    for target in ["", "aarch64-pc-windows-msvc", "aarch64-unknown-linux-musl"] {
+    for target in [
+        "",
+        "x86_64-apple-darwin",
+        "aarch64-pc-windows-msvc",
+        "aarch64-unknown-linux-musl",
+    ] {
         assert!(
             manifest
                 .select(target)
@@ -69,9 +73,9 @@ fn malformed_or_ambiguous_manifests_cannot_produce_a_bundle() {
         ("/assets/0/stem", json!("dolt-linux-arm64")),
         ("/assets/0/format", json!("zip")),
         ("/assets/0/executable_name", json!("dolt.exe")),
-        ("/assets/4/format", json!("tar.gz")),
-        ("/assets/4/executable_name", json!("dolt")),
-        ("/assets/4/expanded_bytes", json!(130339212)),
+        ("/assets/3/format", json!("tar.gz")),
+        ("/assets/3/executable_name", json!("dolt")),
+        ("/assets/3/expanded_bytes", json!(130339212)),
         ("/assets/0/url", json!("http://localhost/archive")),
         ("/assets/0/compressed_bytes", json!(MAX_COMPRESSED + 1)),
         ("/assets/0/compressed_bytes", json!(0)),
@@ -95,6 +99,14 @@ fn malformed_or_ambiguous_manifests_cannot_produce_a_bundle() {
     let mut missing = valid.clone();
     missing["assets"].as_array_mut().unwrap().pop();
     assert!(Manifest::parse(&serde_json::to_vec(&missing).unwrap()).is_err());
+    let mut intel = valid.clone();
+    let mut retired = intel["assets"][0].clone();
+    retired["target"] = json!("x86_64-apple-darwin");
+    retired["stem"] = json!("dolt-darwin-amd64");
+    retired["url"] =
+        json!("https://github.com/dolthub/dolt/releases/download/v2.3.3/dolt-darwin-amd64.tar.gz");
+    intel["assets"].as_array_mut().unwrap().push(retired);
+    assert!(Manifest::parse(&serde_json::to_vec(&intel).unwrap()).is_err());
     let mut unknown = valid;
     unknown["unrecognized"] = json!(true);
     assert!(Manifest::parse(&serde_json::to_vec(&unknown).unwrap()).is_err());

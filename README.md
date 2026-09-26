@@ -56,7 +56,7 @@ kuru --version
 
 Add that installation directory to your user `PATH` for future terminals. Binary
 installation needs no separately installed compiler or MSVC redistributable.
-The native targets are macOS/Linux arm64 and x86-64, and Windows x86-64;
+The native targets are macOS arm64, Linux arm64 and x86-64, and Windows x86-64;
 see [installation and updates](docs/install.md) for platform requirements,
 version selection, destinations and offline installation.
 

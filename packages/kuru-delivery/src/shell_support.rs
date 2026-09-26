@@ -437,7 +437,7 @@ mod tests {
     fn support_decoder_rejects_extra_duplicate_and_oversized_members() {
         let input = files();
         let unix = crate::targets::find(crate::targets::TARGETS[0]).unwrap();
-        let windows = crate::targets::find(crate::targets::TARGETS[4]).unwrap();
+        let windows = crate::targets::find("x86_64-pc-windows-msvc").unwrap();
         let malformed = zip::write(
             &[
                 WriteMember {

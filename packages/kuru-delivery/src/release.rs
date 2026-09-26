@@ -647,7 +647,7 @@ fn archive_assets(directory: &Path, selected: Version) -> Result<BTreeMap<String
     }
     ensure!(
         expected.is_subset(&actual) && sidecars.is_subset(&actual),
-        "release candidate must contain five core and five paired shell support archives with checksum sidecars"
+        "release candidate must contain a core and a paired shell support archive for every release target, with checksum sidecars"
     );
     let mut checksums = BTreeMap::new();
     for name in expected {

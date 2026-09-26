@@ -2,7 +2,7 @@
 
 Kuru releases use one manually dispatched workflow with a version bump as its
 only input. The workflow validates the source, creates a signed version commit
-when necessary, builds all five native archives, generates Communiqué notes,
+when necessary, builds every supported native archive, generates Communiqué notes,
 assembles and tests the complete candidate, deploys documentation from that exact
 commit, and publishes the release only after those gates succeed. A separate
 post-publication Windows job then verifies the immutable public download.
@@ -41,9 +41,8 @@ The build job has `contents: read` and `pages: read`; only the deploy job receiv
 `pages: write` and `id-token: write`. There is no standalone Pages workflow.
 
 Release notes run on Ubuntu with the delivery package's task-scoped Cocogitto
-7.0.0 and Communiqué 1.3.5 pins. The latter has no Intel macOS release binary;
-native archive build jobs use only the Rust packaging task, so all five Kuru
-targets remain buildable. Full maintainer tests and notes generation run on
+7.0.0 and Communiqué 1.3.5 pins. Native archive build jobs use only the Rust
+packaging task and do not need the notes toolchain. Full maintainer tests and notes generation run on
 Linux, Apple Silicon macOS or Windows x86_64. App installation does not require these tools.
 
 ## Choose and release a version
@@ -101,15 +100,15 @@ runtime is involved.
    commit when it remains in main's history. Later main changes are excluded.
 3. Run the same independent validation jobs on that exact version commit. Both
    quality and coverage must pass before building native archives
-   on Linux x86_64/arm64, macOS x86_64/arm64 and Windows x86_64 MSVC, verifying
+   on Linux x86_64/arm64, macOS arm64 and Windows x86_64 MSVC, verifying
    each binary's version and bundled offline engine. The Windows build uses a
    static CRT and validates its PE imports against the allowed system DLLs.
 4. Generate notes in a separate job with a read-only GitHub token, alongside final
    validation of the selected version commit. No release writes are available to
    that job. Its output is an artifact for publication, which still waits for
-   validation and all five builds.
+   validation and every native build.
 5. Assemble one attempt-scoped candidate artifact without a release-write token.
-   The delivery tool requires exactly five archives and their checksum sidecars,
+   The delivery tool requires exactly one archive per supported target and their checksum sidecars,
    generates `SHA256SUMS`, validates the bounded notes, and retains `dist/` plus
    `RELEASE_NOTES.md` for the remaining jobs. Invalid or incomplete inputs stop
    here without creating a tag, draft, or public release.
@@ -129,16 +128,16 @@ runtime is involved.
    succeed. Pages deployment and GitHub release promotion are separate service
    operations; this ordering does not claim they update atomically.
 8. Run `publish` after the acceptance gates. It consumes the same candidate, rechecks
-   the five archives and existing `SHA256SUMS`, creates or reuses the immutable
+   those archives and existing `SHA256SUMS`, creates or reuses the immutable
    annotated tag, stages notes and release assets in a draft, verifies uploaded
    digests, and only then promotes the release. A matching complete published
    release is verified and reused without replacing notes or assets after a lost
    response. GitHub selects the latest release by version and date; recovering
    an older draft does not force it to become latest.
 
-The four Unix archives retain `kuru-VERSION-TARGET.tar.gz`; Windows uses
+The Unix archives retain `kuru-VERSION-TARGET.tar.gz`; Windows uses
 `kuru-VERSION-x86_64-pc-windows-msvc.zip` with exactly `kuru.exe`, `LICENSE` and
-`README.md`. All five are published alongside `SHA256SUMS`. Users install through
+`README.md`. All are published alongside `SHA256SUMS`. Users install through
 mise or the package-owned
 [shell](install.md#install-with-the-shell-bootstrap) and
 [PowerShell](install.md#install-with-powershell) bootstraps, which resolve
@@ -153,8 +152,8 @@ Release jobs inherit `MISE_LOCKED=1`, including nested package tasks. This keeps
 tool installation from extending lockfiles after source validation. The bump
 and publish jobs explicitly install locked Rust/hk and disable automatic task-tool
 installation. Native build jobs install only Rust and set `MISE_NO_HOOKS=1` to
-omit mise's repository-setup postinstall hook; the pinned hk has no Intel macOS asset,
-and archive construction does not create Git commits. Local Git hooks and the
+omit mise's repository-setup postinstall hook, since archive construction does not
+create Git commits. Local Git hooks and the
 release bump, publish, notes and docs jobs retain hk. Native archive subcommands
 do not need the notes toolchain. Reusable quality and native-test workflows skip
 hook setup and install only their scoped tools, with frozen locks.

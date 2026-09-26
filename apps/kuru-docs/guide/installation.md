@@ -80,12 +80,17 @@ The bootstrap freezes latest to an explicit version, verifies the ZIP checksum a
 | System                           | Architecture  | Target                      |
 | -------------------------------- | ------------- | --------------------------- |
 | macOS                            | Apple Silicon | `aarch64-apple-darwin`      |
-| macOS                            | Intel         | `x86_64-apple-darwin`       |
 | Linux                            | ARM64         | `aarch64-unknown-linux-gnu` |
 | Linux                            | x86-64        | `x86_64-unknown-linux-gnu`  |
 | Windows 10 version 1809 or newer | x86-64        | `x86_64-pc-windows-msvc`    |
 
 Linux archives are built on Ubuntu 24.04 and need a compatible glibc. Linux support uses GNU targets; musl targets are not supported. The shell bootstrap's `--target` overrides host detection for supported tar targets. PowerShell selects Windows x86-64 and accepts `-Target x86_64-pc-windows-msvc` explicitly.
+
+Intel Macs (`x86_64-apple-darwin`) are not supported after v0.9.0, and the current shell bootstrap refuses them before downloading anything. On Apple Silicon, a Rosetta-translated shell reports `x86_64`; the bootstrap detects the translation and selects `aarch64-apple-darwin` instead. To install v0.9.0 on an Intel Mac, use that tag's own bootstrap with an explicit version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/replygirl/kuru/v0.9.0/packages/kuru-delivery/support/install.sh | bash -s -- --version 0.9.0
+```
 
 ## Release archives and mirrors
 
