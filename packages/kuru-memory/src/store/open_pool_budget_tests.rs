@@ -82,3 +82,49 @@ async fn migrated_stage_pool_uses_remaining_startup_budget_and_post_open_pools_s
     );
     Ok(())
 }
+
+/// SQLx keeps a pool's acquire timeout for its whole life. Pools created while
+/// the store was opening must still be ordinary once it reports ready.
+#[tokio::test]
+async fn retained_open_pools_keep_the_ordinary_acquire_window() -> Result<()> {
+    let root = crate::test_support::tempdir()?;
+    let options = crate::test_support::open_options(
+        root.path().join("retained"),
+        format!("project/{}", "3".repeat(64)),
+    )?;
+    let store = crate::test_support::spawn_gated_open(options).await?;
+    let usage = store
+        .shared
+        .usage_pool
+        .lock()
+        .expect("usage pool lock")
+        .clone()
+        .context("writable store did not retain its usage-ledger pool")?;
+    for (name, pool) in [("main", &store.pool), ("usage ledger", &usage)] {
+        assert_eq!(
+            pool.options().get_acquire_timeout(),
+            crate::server::ORDINARY_POOL_WINDOW,
+            "retained {name} pool kept an opening-phase acquire window"
+        );
+    }
+
+    // Contend the retained main pool: with every connection held, the next
+    // acquire must end at the ordinary window, not a startup-length one.
+    let mut held = Vec::new();
+    for _ in 0..store.pool.options().get_max_connections() {
+        held.push(store.pool.acquire().await?);
+    }
+    let contended = tokio::time::timeout(
+        crate::server::ORDINARY_POOL_WINDOW * 2,
+        store.pool.acquire(),
+    )
+    .await;
+    assert!(
+        matches!(contended, Ok(Err(sqlx::Error::PoolTimedOut))),
+        "contended retained pool did not fail at its ordinary acquire window"
+    );
+    drop(held);
+    drop(usage);
+    store.close().await?;
+    Ok(())
+}

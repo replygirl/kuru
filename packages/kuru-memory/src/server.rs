@@ -600,7 +600,9 @@ impl Server {
                     options.read_only,
                     1,
                     PoolAttemptOptions {
+                        // One transient attempt, closed after verification.
                         acquire_timeout: remaining,
+                        first_acquire_window: remaining,
                         identity_rejection_is_terminal: true,
                         _test_probe_delay: _initial_probe_delay,
                     },
@@ -745,7 +747,10 @@ impl Server {
     fn pool_attempt(&self) -> PoolAttemptOptions {
         let opening = self.opening_deadline().is_some();
         PoolAttemptOptions {
-            acquire_timeout: self.pool_attempt_window(),
+            // SQLx keeps this for every later acquire on the pool, so a pool
+            // created while opening must still be ordinary once memory is open.
+            acquire_timeout: ORDINARY_POOL_WINDOW,
+            first_acquire_window: self.pool_attempt_window(),
             // A longer opening window must not wait out an identity
             // rejection; the same endpoint cannot answer differently.
             identity_rejection_is_terminal: opening,
@@ -1240,7 +1245,11 @@ impl ConnectionObservation {
 }
 
 struct PoolAttemptOptions {
+    /// SQLx's per-acquire timeout for the whole lifetime of the pool.
     acquire_timeout: Duration,
+    /// Bound on the pool's first acquisition, at least `acquire_timeout`.
+    /// Acquires that time out are retried until it ends.
+    first_acquire_window: Duration,
     /// SQLx retries every `after_connect` error until `acquire_timeout`.
     /// When set, an authored identity rejection ends acquisition instead.
     identity_rejection_is_terminal: bool,
@@ -1251,6 +1260,7 @@ impl PoolAttemptOptions {
     fn ordinary() -> Self {
         Self {
             acquire_timeout: ORDINARY_POOL_WINDOW,
+            first_acquire_window: ORDINARY_POOL_WINDOW,
             identity_rejection_is_terminal: false,
             _test_probe_delay: None,
         }
@@ -1354,7 +1364,11 @@ async fn connect_pool_attempt(
     let callback_observation = observation.clone();
     let rejection = IdentityRejection::default();
     let callback_rejection = rejection.clone();
-    let connecting = MySqlPoolOptions::new()
+    // Every callback of this attempt stalls until one instant, fixed by the
+    // first: a server that becomes responsive then, not a per-retry delay.
+    #[cfg(test)]
+    let stalled_until = Arc::new(std::sync::OnceLock::<Instant>::new());
+    let pool = MySqlPoolOptions::new()
         .max_connections(max)
         .min_connections(0)
         .acquire_timeout(attempt.acquire_timeout)
@@ -1367,12 +1381,15 @@ async fn connect_pool_attempt(
             let rejection = callback_rejection.clone();
             #[cfg(test)]
             let test_probe_delay = attempt._test_probe_delay.clone();
+            #[cfg(test)]
+            let stalled_until = stalled_until.clone();
             Box::pin(async move {
                 #[cfg(test)]
                 if let Some((delay, entered)) = test_probe_delay {
                     observation.phase("initial authentication callback entered");
                     entered.store(true, Ordering::SeqCst);
-                    sleep(delay).await;
+                    tokio::time::sleep_until(*stalled_until.get_or_init(|| Instant::now() + delay))
+                        .await;
                 }
                 let result = async {
                     observation.phase("data directory query");
@@ -1408,15 +1425,31 @@ async fn connect_pool_attempt(
                 result
             })
         })
-        .connect_with(options);
-    let result = if attempt.identity_rejection_is_terminal {
-        tokio::select! {
-            result = connecting => result,
-            error = rejection.rejected() => Err(error),
+        .connect_lazy_with(options);
+    // Equivalent to `connect_with` (one acquire, then release) when the first
+    // window equals the lifetime timeout. A longer opening window retries
+    // timed-out acquires without changing any later acquire on this pool.
+    let first_deadline = Instant::now() + attempt.first_acquire_window;
+    let acquired = loop {
+        let acquiring = timeout_at(first_deadline, pool.acquire());
+        let acquired = if attempt.identity_rejection_is_terminal {
+            tokio::select! {
+                acquired = acquiring => acquired,
+                error = rejection.rejected() => Ok(Err(error)),
+            }
+        } else {
+            acquiring.await
+        };
+        match acquired {
+            Ok(Err(sqlx::Error::PoolTimedOut)) if Instant::now() < first_deadline => {}
+            Ok(acquired) => break acquired,
+            Err(_) => break Err(sqlx::Error::PoolTimedOut),
         }
-    } else {
-        connecting.await
     };
+    let result = acquired.map(|connection| {
+        drop(connection);
+        pool
+    });
     Ok((result, observation))
 }
 
