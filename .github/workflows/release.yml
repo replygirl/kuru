@@ -30,16 +30,143 @@ jobs:
       ref: ${{ github.sha }}
       artifact-prefix: validation-plan
 
-  source-tests:
+  tests:
     if: github.ref == 'refs/heads/main'
-    uses: ./.github/workflows/native-tests.yml
-    with:
-      ref: ${{ github.sha }}
-      artifact-prefix: validation-plan
+    # One ordinary native test pass on the dispatch SHA. The 90% coverage gate
+    # is enforced per OS by CI on pull requests, merge groups and main, and the
+    # staged candidate is accepted on every supported platform below.
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MISE_NO_HOOKS: "1"
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # Keep the genuine test-profile Kuru input below its production archive bound.
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select private bundle build inputs
+        shell: bash
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        run: printf 'KURU_DOLT_BUNDLE_DIR=%s/kuru-bundles\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Reserve space for bundled runtime tests
+        shell: bash
+        run: |
+          # This Rust/Node job does not use the hosted image's mobile or Swift SDKs.
+          df -h /
+          for sdk in /usr/local/lib/android /usr/share/swift; do
+            if [ -d "$sdk" ]; then
+              sudo du -sh "$sdk"
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+          df -h /
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          version: 2026.9.4
+          # Cospec is exercised by delivery's real standalone contract tests.
+          install_args: rust github:aligned-team/cospec
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Install package-owned test tools
+        run: mise run //packages/kuru-delivery:setup:test-tools
+      - name: Install Ubuntu native secret-store fixture tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus gnome-keyring libsecret-tools
+      - name: Run Ubuntu native tests with the OS secret store
+        shell: bash
+        run: |
+          # The Linux keyring backend requires the real Secret Service default
+          # collection. Give this headless runner its own session and fixture
+          # collection; never use a file-backed replacement or provider store.
+          fixture_root=$(mktemp -d "$RUNNER_TEMP/kuru-native-store.XXXXXX")
+          chmod 700 "$fixture_root"
+          mkdir -m 700 "$fixture_root/data" "$fixture_root/runtime"
+          # Preserve the installed pinned tools before XDG_DATA_HOME is made
+          # private for this test session's native keyring.
+          export MISE_DATA_DIR="${MISE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mise}"
+          export XDG_DATA_HOME="$fixture_root/data"
+          export XDG_RUNTIME_DIR="$fixture_root/runtime"
+          cleanup_fixture() {
+            status=$?
+            trap - EXIT
+            rm -rf -- "$fixture_root"
+            exit "$status"
+          }
+          trap cleanup_fixture EXIT
+          dbus-run-session -- bash -euo pipefail <<'KURU_NATIVE_STORE'
+            printf '%s' 'kuru-ci-fixture-only-password' |
+              gnome-keyring-daemon --foreground --unlock --components=secrets \
+                >"$XDG_RUNTIME_DIR/daemon.log" 2>&1 &
+            daemon_pid=$!
+            cleanup_daemon() {
+              status=$?
+              trap - EXIT
+              kill "$daemon_pid" 2>/dev/null || true
+              wait "$daemon_pid" 2>/dev/null || true
+              exit "$status"
+            }
+            trap cleanup_daemon EXIT
+            # NameHasOwner queries the bus itself and cannot auto-activate a
+            # second keyring daemon before this owned one claims the name.
+            owned=0
+            for attempt in {1..10}; do
+              if ! kill -0 "$daemon_pid" 2>/dev/null; then
+                break
+              fi
+              owner_reply=$(dbus-send --session --print-reply \
+                --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+                org.freedesktop.DBus.NameHasOwner \
+                string:org.freedesktop.secrets 2>/dev/null || true)
+              if [[ "$owner_reply" == *'boolean true'* ]]; then
+                owned=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$owned" -ne 1 ]; then
+              echo 'Owned Secret Service daemon did not claim the session bus' >&2
+              exit 1
+            fi
+            # Probe the default collection with fake bytes before running the
+            # actual OS-store tests. A missing service fails setup, not coverage.
+            ready=0
+            for attempt in {1..10}; do
+              if ! kill -0 "$daemon_pid" 2>/dev/null; then
+                break
+              fi
+              if printf '%s' 'kuru-ci-probe-only' |
+                timeout 5s secret-tool store --label='Kuru CI probe' kuru-ci-fixture probe \
+                  >/dev/null 2>&1; then
+                if [ "$(timeout 5s secret-tool lookup kuru-ci-fixture probe)" = 'kuru-ci-probe-only' ]; then
+                  ready=1
+                  break
+                fi
+              fi
+              sleep 1
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo 'Native Secret Service default collection did not start' >&2
+              exit 1
+            fi
+            secret-tool clear kuru-ci-fixture probe >/dev/null
+            mise run test
+          KURU_NATIVE_STORE
+      - name: Require unchanged dependency locks
+        run: git diff --exit-code -- mise.lock apps/kuru-docs/mise.lock apps/kuru-docs/package-lock.json packages/kuru-delivery/mise.lock Cargo.lock
 
   plan:
     if: github.ref == 'refs/heads/main'
-    needs: [source-quality, source-tests]
+    needs: [source-quality, tests]
     runs-on: ubuntu-24.04
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
@@ -126,15 +253,8 @@ jobs:
       ref: ${{ needs.bump.outputs.sha }}
       artifact-prefix: validation-verify
 
-  verify-tests:
-    needs: bump
-    uses: ./.github/workflows/native-tests.yml
-    with:
-      ref: ${{ needs.bump.outputs.sha }}
-      artifact-prefix: validation-verify
-
   build:
-    needs: [plan, bump, verify, verify-tests]
+    needs: [plan, bump, verify]
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
       # Archive jobs do not write Git commits or need repository-hook setup.
@@ -151,7 +271,7 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
-          - os: windows-2025
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
@@ -301,10 +421,24 @@ jobs:
             RELEASE_NOTES.md
           if-no-files-found: error
 
-  verify-staged-windows:
-    name: Verify staged Windows release
+  verify-staged:
+    # Every leg must pass: jobs that need this matrix wait for all of its legs.
+    name: Verify staged release (${{ matrix.target }})
     needs: [plan, bump, assemble-candidate]
-    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
       MISE_NO_HOOKS: "1"
@@ -313,6 +447,10 @@ jobs:
         with:
           ref: ${{ needs.bump.outputs.sha }}
           persist-credentials: false
+      - name: Select private bundle build inputs
+        shell: pwsh
+        # Leave the leaf absent so the preparer creates this runner's private ACLs.
+        run: Add-Content -LiteralPath $env:GITHUB_ENV "KURU_DOLT_BUNDLE_DIR=$env:RUNNER_TEMP/kuru-bundles-staged"
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
@@ -324,9 +462,38 @@ jobs:
         with:
           name: ${{ needs.assemble-candidate.outputs.artifact_name }}
           path: candidate
+      # Interim Unix leg: it proves the exact staged executable's checksum, cold
+      # offline runtime and previous-release update, but not the mise
+      # installation route that the Windows leg proves.
+      - name: Extract the exact staged Unix archive
+        if: runner.os != 'Windows'
+        env:
+          RELEASE_ARCHIVE: kuru-${{ needs.plan.outputs.version }}-${{ matrix.target }}.tar.gz
+        run: |
+          grep -F "  $RELEASE_ARCHIVE" candidate/dist/SHA256SUMS > "$RUNNER_TEMP/kuru-staged.sha256"
+          test "$(wc -l < "$RUNNER_TEMP/kuru-staged.sha256")" -eq 1
+          (cd candidate/dist && shasum -a 256 -c "$RUNNER_TEMP/kuru-staged.sha256")
+          mkdir "$RUNNER_TEMP/kuru-staged"
+          tar -xzf "candidate/dist/$RELEASE_ARCHIVE" -C "$RUNNER_TEMP/kuru-staged"
+          test -x "$RUNNER_TEMP/kuru-staged/kuru"
+      - name: Verify the staged Unix executable's offline runtime
+        if: runner.os != 'Windows'
+        env:
+          KURU_EMBEDDED_TEST_BINARY: ${{ runner.temp }}/kuru-staged/kuru
+        run: mise run //apps/kuru-tui:test:embedded-runtime
+      - name: Accept the staged Unix executable from the previous published release
+        if: runner.os != 'Windows'
+        env:
+          KURU_UPDATE_CANDIDATE_BINARY: ${{ runner.temp }}/kuru-staged/kuru
+          GITHUB_TOKEN: ${{ github.token }}
+        run: mise run //packages/kuru-delivery:test:previous-release-update
       - name: Verify the exact staged package
+        if: runner.os == 'Windows'
         env:
           KURU_STAGED_WINDOWS_ARCHIVE: ${{ github.workspace }}/candidate/dist/kuru-${{ needs.plan.outputs.version }}-x86_64-pc-windows-msvc.zip
+          # The task re-runs previous-release update acceptance; the token
+          # authenticates only its release listing on api.github.com.
+          GITHUB_TOKEN: ${{ github.token }}
         run: mise run //apps/kuru-tui:verify:staged-windows
 
   # Documentation and staged acceptance must finish before public promotion.
@@ -373,7 +540,7 @@ jobs:
 
   deploy-docs:
     name: Deploy docs
-    needs: [build-docs, verify-staged-windows]
+    needs: [build-docs, verify-staged]
     runs-on: ubuntu-24.04
     concurrency:
       group: github-pages
@@ -394,7 +561,7 @@ jobs:
   # Public promotion follows every acceptance gate. Public-download verification
   # below observes the immutable release and never rolls publication back.
   publish:
-    needs: [plan, bump, assemble-candidate, verify-staged-windows, deploy-docs]
+    needs: [plan, bump, assemble-candidate, verify-staged, deploy-docs]
     runs-on: ubuntu-24.04
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
@@ -426,7 +593,7 @@ jobs:
   verify-published-windows:
     name: Verify published Windows download
     needs: [plan, bump, publish]
-    runs-on: windows-2025
+    runs-on: windows-latest
     timeout-minutes: 30
     permissions:
       contents: read

@@ -279,10 +279,11 @@ archives and Communiqué notes. Preserve the scoped credential names documented
 there; no credentials belong in source or generated artifacts.
 
 Build and publish docs only through the `build-docs` and `deploy-docs` jobs inside
-that Release workflow and from the exact selected release commit. The staged
-Windows candidate acceptance, which re-runs previous-release update acceptance
-as a sanity check, and documentation deployment must succeed before the
-publication job can promote the public release. A separate post-publication
+that Release workflow and from the exact selected release commit. Staged
+candidate acceptance on each supported operating system, each leg re-running
+previous-release update acceptance as a sanity check, and documentation
+deployment must succeed before the publication job can promote the public
+release. A separate post-publication
 Windows job verifies the immutable public download against the exact released
 commit and retains its acceptance receipt. Its failure is reported on the run;
 it never changes or unpublishes the release. For recovery, rerun the failed

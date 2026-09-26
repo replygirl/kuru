@@ -69,9 +69,18 @@ never replaced by an older one. It accepts both download layouts: one artifact
 extracted directly into the shard directory, or several in directories named
 after their artifacts. Each rerun adds one more artifact download per rerun
 shard, bounded by the receipt profile limits, inside the report's 30-minute
-limit; if repeated reruns exhaust it, dispatch a fresh run. The source
-installation and installed offline-runtime checks run beside the coverage shards
-after independently preparing their locked inputs. Linux Clippy does not analyze
+limit; if repeated reruns exhaust it, dispatch a fresh run. On every OS, one
+installation job runs beside coverage after independently preparing its locked
+inputs: it installs the release build offline, verifies the installed offline
+runtime and then runs
+`mise run //packages/kuru-delivery:test:previous-release-update`, in which the
+previous published release's own updater installs the installed executable
+under the job's temporary `kuru-bin` directory. It never reads Cargo's target
+directory: on Windows, the offline build-input check between installation and
+this step has already relinked it with all features. That step needs outbound HTTPS and receives the workflow's read-only
+`GITHUB_TOKEN`, used only to list releases. It runs on pull requests, merge
+groups and `main` pushes; a branch older than the latest published release fails
+it and must be rebased. Linux Clippy does not analyze
 platform-specific conditional code; the native suites compile and test those
 branches. Intel macOS and Linux arm64 additionally build and package the native
 executable, exercise real memory and verify the packaged offline runtime; that
