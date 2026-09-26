@@ -222,7 +222,24 @@ requests, add `--external-usage` when generating a script, for example
 self-contained; the external option changes the generated script's helper and
 uses Usage's generic completion script. Its Bash variant also requires the
 `bash-completion` shell package to be loaded. The default Bash script uses the
-installed Kuru executable and needs no such package.
+installed Kuru executable and needs no such package. Its generic Bash variant
+caches the embedded command spec as a file under
+`${XDG_CACHE_HOME:-~/.cache}/usage/`, pruning cache entries for this version
+family older than 30 days; nothing else on disk is read or written by either
+Bash variant.
+
+A path-valued option or argument (an install directory, a config file, and
+similar) completes by listing entries in your current working directory —
+read-only, and only the directory you are already in — rather than any
+project or Kuru-managed path.
+
+**Not independently verified**: escaping and spacing for filenames answered
+under Bash 3.2 (still the system `/bin/bash` on unpatched macOS). The default
+script calls `compopt -o filenames` to get correct trailing-slash and
+no-escaping behavior for path completions, redirecting its error to `/dev/null`
+because `compopt` does not exist before Bash 4.0; `COMPREPLY` still populates
+without it, but whether filenames containing spaces or special characters
+render identically on that shell has not been checked.
 
 For ordinary Unix `man kuru`, include the selected install root's manual
 directory in `MANPATH`, for example
