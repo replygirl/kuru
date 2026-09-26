@@ -132,7 +132,7 @@ fn default_startup() -> std::time::Duration {
 /// One owned Dolt server start: the configured startup timeout plus the
 /// supervisor-transport allowance `Server::open` adds to it.
 #[cfg(test)]
-fn server_start_budget() -> std::time::Duration {
+pub(crate) fn server_start_budget() -> std::time::Duration {
     default_startup().saturating_add(crate::server::SUPERVISOR_TRANSPORT_ALLOWANCE)
 }
 

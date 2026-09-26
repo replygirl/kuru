@@ -183,8 +183,20 @@ corruption; trust comes from the release source you choose.
 
 The current direct installer places verified support snapshots at
 `INSTALL_DIR/share/kuru/VERSION/TARGET/`. Unix installs also maintain the regular
-file `INSTALL_DIR/share/man/man1/kuru.1`. For the default Unix install, load
-completions from the fixed installed executable in your chosen shell:
+file `INSTALL_DIR/share/man/man1/kuru.1`.
+
+Kuru uses the Usage completion engine and derives its completion scripts and
+manual from the same Clap command tree that parses commands. The default scripts
+ask the installed Kuru executable for candidates; no separate Usage installation
+is required. This completion request runs before project configuration, trust,
+memory or provider startup. Put the selected install directory first in `PATH`
+before loading a script, including when you chose a custom `--install-dir` or
+`-InstallDir`, so the script's `kuru` command resolves to that same executable.
+For example, on Unix use `export PATH="INSTALL_DIR:$PATH"`; in PowerShell use
+`$env:PATH = "INSTALL_DIR;$env:PATH"` for the current session.
+
+For the default Unix install, load completions from the fixed installed
+executable in your chosen shell:
 
 ```bash
 eval "$("$HOME/.local/bin/kuru" completions bash)"
@@ -203,6 +215,43 @@ On Windows, load PowerShell completions from the installed executable:
 ```powershell
 & "$env:LOCALAPPDATA\Programs\kuru\bin\kuru.exe" completions powershell | Out-String | Invoke-Expression
 ```
+
+If you have installed the Usage executable and prefer it to answer completion
+requests, add `--external-usage` when generating a script, for example
+`kuru completions bash --external-usage`. The four default scripts remain
+self-contained; the external option changes the generated script's helper and
+uses Usage's generic completion script. Its Bash variant also requires the
+`bash-completion` shell package to be loaded. The default Bash script uses the
+installed Kuru executable and needs no such package. Its generic Bash variant
+caches the embedded command spec as a file under
+`${XDG_CACHE_HOME:-~/.cache}/usage/`, pruning cache entries for this version
+family older than 30 days. That cache write is the default script's only
+disk access beyond the completion request itself; the external mode's
+separately installed `usage` executable does its own reads (its own config,
+cache and completion logic) that Kuru neither controls nor observes.
+
+A path-valued option or argument (an install directory, a config file, and
+similar) completes by listing entries in your current working directory —
+read-only, and only the directory you are already in — rather than any
+project or Kuru-managed path.
+
+**Known limitation**: a path candidate with a space in its name does not
+complete correctly in the default Bash script. `compopt -o filenames` — which
+tells Bash to quote a completion as a filename — is never invoked for Kuru's
+own path-valued options, on any Bash version: the pinned completion engine
+answers a typed path argument by listing the directory itself and returning
+each entry as a plain candidate string, the same protocol path used for an
+ordinary non-path value, rather than telling the script to switch into
+file-completion mode. Confirmed directly on the system `/bin/bash` 3.2
+shipped on unpatched macOS, sourcing the generated script by hand:
+`COMPREPLY=([0]="my dir/" [1]="plaindir/")` for a directory named `my dir`
+next to an ordinary one — Bash then inserts the unescaped text verbatim,
+splitting the completed line at the space. The generated script's logic here
+does not vary by Bash version, so the same result is expected (not
+independently run here) on Bash 4+. Not fixable in Kuru's own code without
+reimplementing the pinned engine's argument-position-aware candidate
+classification; tracked as a limitation of the pinned dependency rather than
+patched locally.
 
 For ordinary Unix `man kuru`, include the selected install root's manual
 directory in `MANPATH`, for example

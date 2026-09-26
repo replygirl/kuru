@@ -97,6 +97,9 @@ pub enum Command {
     /// Print shell completions derived from the current command tree.
     Completions {
         shell: CompletionShell,
+        /// Use a separately installed Usage executable for completion answers.
+        #[arg(long)]
+        external_usage: bool,
     },
     /// Print the current command manual in roff format.
     Man,
@@ -188,65 +191,192 @@ pub enum CompletionShell {
 }
 
 impl CompletionShell {
-    fn generator(self) -> clap_complete::Shell {
+    fn as_str(self) -> &'static str {
         match self {
-            Self::Bash => clap_complete::Shell::Bash,
-            Self::Zsh => clap_complete::Shell::Zsh,
-            Self::Fish => clap_complete::Shell::Fish,
-            Self::PowerShell => clap_complete::Shell::PowerShell,
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+            Self::PowerShell => "powershell",
+        }
+    }
+
+    fn native_shell(self) -> usage_argv::complete::Shell {
+        match self {
+            Self::Bash => usage_argv::complete::Shell::Bash,
+            Self::Zsh => usage_argv::complete::Shell::Zsh,
+            Self::Fish => usage_argv::complete::Shell::Fish,
+            Self::PowerShell => usage_argv::complete::Shell::PowerShell,
         }
     }
 }
 
 const SHELL_SUPPORT_OUTPUT_LIMIT: usize = 512 * 1024;
 
+fn usage_spec() -> usage::Spec {
+    let mut command = Cli::command();
+    command.build();
+    usage::Spec::from(&command)
+}
+
 fn shell_support_output(command: &Command) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
-    match command {
-        Command::Completions { shell } => {
-            clap_complete::generate(shell.generator(), &mut Cli::command(), "kuru", &mut output);
-        }
-        Command::Man => {
-            let mut tree = Cli::command().disable_help_subcommand(true);
-            tree.build();
-            clap_mangen::Man::new(tree.clone()).render(&mut output)?;
-
-            fn append_subcommands(
-                parent: &clap::Command,
-                names: &mut Vec<String>,
-                output: &mut Vec<u8>,
-            ) -> Result<()> {
-                for child in parent
-                    .get_subcommands()
-                    .filter(|child| !child.is_hide_set())
-                {
-                    names.push(child.get_name().to_owned());
-                    let mut heading = clap_mangen::roff::Roff::default();
-                    let title = format!("KURU {}", names.join(" ").to_uppercase());
-                    heading.control("SH", [title.as_str()]);
-                    heading.to_writer(output)?;
-
-                    let manual = clap_mangen::Man::new(child.clone());
-                    manual.render_synopsis_section(output)?;
-                    manual.render_description_section(output)?;
-                    if child.get_arguments().next().is_some() {
-                        manual.render_options_section(output)?;
-                    }
-                    append_subcommands(child, names, output)?;
-                    names.pop();
-                }
-                Ok(())
+    let output = match command {
+        Command::Completions {
+            shell,
+            external_usage,
+        } => {
+            if *external_usage {
+                usage::complete::complete(&usage::complete::CompleteOptions {
+                    usage_bin: "usage".to_owned(),
+                    shell: shell.as_str().to_owned(),
+                    bin: "kuru".to_owned(),
+                    cache_key: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                    spec: Some(usage_spec()),
+                    usage_cmd: None,
+                    source_file: None,
+                })?
+                .into_bytes()
+            } else {
+                usage_argv::script::script("kuru", shell.native_shell()).into_bytes()
             }
-
-            append_subcommands(&tree, &mut Vec::new(), &mut output)?;
         }
+        Command::Man => usage::docs::manpage::ManpageRenderer::new(usage_spec())
+            .render()?
+            .into_bytes(),
         _ => bail!("shell-support output requires a generation command"),
-    }
+    };
     ensure!(
         !output.is_empty() && output.len() <= SHELL_SUPPORT_OUTPUT_LIMIT,
         "generated shell support exceeds its bounded output limit"
     );
     Ok(output)
+}
+
+/// Process-launching audit (AGENTS.md: "audit new process-launching
+/// dependencies and consumer call sites instead of claiming isolation across
+/// arbitrary spawn mechanisms"), against `usage-cli` 6.11.1 as published:
+///
+/// - `usage::sh::sh` (tries `sh -c` first on every platform, falling back to
+///   `cmd /c` only on Windows and only when `sh` itself is not found) runs
+///   behind `usage_cli::complete_answer` only when a `SpecComplete.run` is
+///   `Some(_)` (`usage-cli/src/cli/complete_word.rs`, `if let Some(run) =
+///   &complete.run`). `usage-lib`'s `From<&clap::Command> for Spec`
+///   conversion (`usage-lib/src/spec/cmd.rs`, the arg/flag loop building
+///   `spec.complete`) only ever sets `name` and `type_` from
+///   `clap::ValueHint`; `run` is left at its `Default` (`None`) for every
+///   entry. `usage_spec()` below is exactly that conversion, so no
+///   `SpecComplete` it produces can ever carry a `run` script — this path is
+///   statically unreachable here, not merely unexercised.
+/// - `std::process::Command` at `usage-cli/src/cli/exec.rs:92` and
+///   `cli/shell.rs:133` belong to `usage-cli`'s own `exec`/`shell`
+///   subcommands (`Cli::Exec`, `Cli::Shell`), reachable only through
+///   `usage_cli::Cli`'s own arg dispatch (`Cli::run`/`Cli::parse_from`).
+///   Kuru never imports `usage_cli::Cli` and never calls `usage_cli::run`;
+///   the only `usage_cli` symbol referenced anywhere in this crate is
+///   `complete_answer` itself (grepped: `usage_cli::` appears exactly once,
+///   at its call site below).
+/// - The Unix-only `exec` crate (`[target.'cfg(unix)'.dependencies]` in
+///   `usage-cli`'s Cargo.toml) has no call site under its `src/` at all as
+///   published — `exec::` never appears in its source, only the crate's own
+///   local `mod exec` (the module above, an unrelated name collision). It
+///   appears to be a vestigial manifest entry upstream; either way nothing
+///   in `usage-cli`'s compiled surface invokes it.
+/// - `env_logger`'s `Builder::init()` call lives only in `usage-cli`'s
+///   `[[bin]] usage` target (`src/main.rs`), which is never built when
+///   `usage-cli` is consumed as a library dependency, as Kuru does.
+///
+/// Net: the only process this call path can start is Kuru's own re-exec of
+/// itself through the shell-installed completion script, never a subprocess
+/// `usage-cli` spawns on Kuru's behalf.
+fn native_completion_answer_output(
+    request: &usage_argv::complete::CompletionRequest,
+) -> Result<Vec<u8>> {
+    let words = request.split.walked();
+    ensure!(
+        words.len() <= 128 && words.iter().map(String::len).sum::<usize>() <= 16 * 1024,
+        "completion request exceeds its bound"
+    );
+    let answer = usage_cli::complete_answer(
+        &usage_spec(),
+        words,
+        request.split.cword,
+        request.shell.as_str(),
+    )?;
+    let mut projected = usage_argv::complete::Completions::default();
+    if answer.files && !request.split.prefix.starts_with("--") {
+        projected.files = Some(usage_argv::complete::Files::Any);
+    } else {
+        projected.candidates = answer
+            .candidates
+            .into_iter()
+            .map(|(value, description)| {
+                if description.is_empty() {
+                    usage_argv::complete::Candidate::new(value)
+                } else {
+                    usage_argv::complete::Candidate::described(value, description)
+                }
+            })
+            .collect();
+    }
+    let output = usage_argv::complete::render_request(&projected, request);
+    ensure!(
+        output.len() <= SHELL_SUPPORT_OUTPUT_LIMIT,
+        "completion answer exceeds its bounded output limit"
+    );
+    Ok(output.into_bytes())
+}
+
+fn native_completion_from_argv() -> Result<Option<Vec<u8>>> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    usage_argv::complete::CompletionRequest::parse(&args)
+        .map(|request| native_completion_answer_output(&request))
+        .transpose()
+}
+
+#[cfg(test)]
+mod shell_support_tests {
+    use super::*;
+
+    #[test]
+    fn usage_completion_protocol_preserves_unicode_spaces_and_quotes() {
+        let candidates = || usage_argv::complete::Completions {
+            candidates: vec![
+                usage_argv::complete::Candidate::described("plain", "simple"),
+                usage_argv::complete::Candidate::described("équipe d'amis", "Unicode choice"),
+            ],
+            files: None,
+        };
+        let request = |shell: &str| {
+            usage_argv::complete::CompletionRequest::parse(&[
+                "__complete_word__".into(),
+                "--shell".into(),
+                shell.into(),
+                "--line".into(),
+                "kuru ".into(),
+            ])
+            .unwrap()
+        };
+        for shell in ["bash", "fish", "zsh", "powershell"] {
+            let output = usage_argv::complete::render_request(&candidates(), &request(shell));
+            assert!(output.contains("équipe d'amis"), "{shell}: {output}");
+            if shell != "bash" {
+                assert!(output.contains("Unicode choice"), "{shell}: {output}");
+            }
+            if shell == "zsh" {
+                assert!(output.contains("'équipe d'\\''amis'"), "{output}");
+            }
+        }
+    }
+
+    #[test]
+    fn native_answer_is_not_an_authored_clap_command() {
+        assert!(
+            usage_spec()
+                .cmd
+                .subcommands
+                .get("__complete_word__")
+                .is_none()
+        );
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -911,12 +1041,34 @@ fn data_directory_error(data: &Path, error: std::io::Error) -> anyhow::Error {
     error.into()
 }
 
+/// Writes generated shell-support or completion-answer bytes to stdout, the
+/// same as a well-behaved Unix tool: a reader that closes early (`kuru
+/// completions bash | head`) is not an error condition — Rust's runtime
+/// ignores `SIGPIPE`, so a write past a closed pipe returns a plain
+/// `BrokenPipe` `io::Error` rather than terminating the process, and letting
+/// that propagate as an ordinary `anyhow` error prints a spurious `Error:
+/// Broken pipe (os error 32)` and exits 1 for what is, from the reader's
+/// side, a completely successful invocation.
+fn write_stdout_ignoring_broken_pipe(output: &[u8]) -> Result<()> {
+    match io::stdout().write_all(output) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub async fn run() -> Result<()> {
+    if let Some(output) = native_completion_from_argv()? {
+        return write_stdout_ignoring_broken_pipe(&output);
+    }
     execute(Cli::parse()).await
 }
 
 /// Binary-only entrypoint. Library callers remain subscriber-neutral.
 pub async fn run_with_diagnostics() -> Result<()> {
+    if let Some(output) = native_completion_from_argv()? {
+        return write_stdout_ignoring_broken_pipe(&output);
+    }
     execute_inner(Cli::parse(), true).await
 }
 
@@ -926,8 +1078,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
 
 async fn execute_inner(cli: Cli, install_diagnostics: bool) -> Result<()> {
     if let Some(command @ (Command::Completions { .. } | Command::Man)) = &cli.command {
-        io::stdout().write_all(&shell_support_output(command)?)?;
-        return Ok(());
+        return write_stdout_ignoring_broken_pipe(&shell_support_output(command)?);
     }
     if let Some(Command::Update {
         version,

@@ -1,9 +1,4 @@
-# shell-support Specification
-
-## Purpose
-Define executable-derived shell completions and manual output, their exact native release envelopes, and the checks that keep installed support paired with its executable.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: CLI-derived shell and manual output
 
@@ -20,15 +15,3 @@ Kuru SHALL generate Bash, Zsh, Fish and PowerShell completion content and a man 
 #### Scenario: Self-hosted completion answer
 - **WHEN** a generated Bash, Zsh, Fish or PowerShell completion script asks Kuru for candidates
 - **THEN** the hidden pure endpoint returns candidates in that shell's protocol without loading project state, and an explicit external-executable script remains available.
-
-### Requirement: Exact shell-support archive content
-
-Each native release target SHALL pair its executable archive with one bounded target-specific Unix tar.gz or Windows ZIP shell-support envelope containing exactly five regular files: `completions/kuru.bash`, `completions/_kuru`, `completions/kuru.fish`, `completions/kuru.ps1` and `man/kuru.1`. Each envelope MUST reject missing, extra, duplicated, linked, traversing, oversized or corrupt members. Its uncompressed files SHALL match generation from its own selected target executable; different targets need not produce equal bytes.
-
-#### Scenario: Target-paired output agreement
-- **WHEN** the release candidate collects generated support files from its supported native builds
-- **THEN** it rejects a sidecar that differs from its paired target executable and publishes exactly one checked five-file envelope per target without requiring other targets' bytes to match.
-
-#### Scenario: Unsafe support member
-- **WHEN** a support envelope contains an unexpected or unsafe member, or fails its release checksum
-- **THEN** installation refuses it before executable replacement or support publication.
