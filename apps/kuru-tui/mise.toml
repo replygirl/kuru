@@ -13,7 +13,7 @@ depends = [
   ] },
 ]
 run = 'cargo build -p kuru --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
-run_windows = 'cargo build -p kuru --locked --target {% if usage.target == "host" %}x86_64-pc-windows-msvc{% else %}"%usage_target%"{% endif %}'
+run_windows = 'cargo build -p kuru --locked --target {% if usage.target == "host" %}host-tuple{% else %}"%usage_target%"{% endif %}'
 
 [tasks."build:release"]
 shell = "{% if os() == 'windows' %}cmd /d /s /c{% else %}sh -c{% endif %}"
@@ -21,6 +21,7 @@ dir = "{{config_root}}/../.."
 usage = 'flag "--target <target>" default="{{vars.kuru_tui_build_target}}"'
 env.CARGO_BUILD_TARGET = false
 env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
+env.CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
 depends = [
   { task = "//packages/kuru-memory:bundle:prepare", args = [
     "--target",
@@ -28,7 +29,7 @@ depends = [
   ] },
 ]
 run = 'cargo build -p kuru --release --locked {% if usage.target != "host" %}--target "${usage_target?}"{% endif %}'
-run_windows = 'cargo build -p kuru --release --locked --target {% if usage.target == "host" %}x86_64-pc-windows-msvc{% else %}"%usage_target%"{% endif %}'
+run_windows = 'cargo build -p kuru --release --locked --target {% if usage.target == "host" %}host-tuple{% else %}"%usage_target%"{% endif %}'
 
 [tasks."shell-support:generate"]
 description = "Generate the selected release binary's exact shell and man files into a new private output directory"

@@ -10,9 +10,10 @@ param()
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../..'))
-$target = 'x86_64-pc-windows-msvc'
-if ((& rustc --print host-tuple).Trim() -ne $target -or $LASTEXITCODE -ne 0) {
-    throw 'Bundle build acceptance requires native Windows x64/MSVC.'
+# The shipping target is the native host tuple; the manifest asset is selected by it.
+$target = ([string](& rustc --print host-tuple)).Trim()
+if ($LASTEXITCODE -ne 0 -or @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc') -cnotcontains $target) {
+    throw 'Bundle build acceptance requires native Windows x64 or Arm64 MSVC.'
 }
 $catalog = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'dolt-assets.json') | ConvertFrom-Json
 $assets = @($catalog.assets | Where-Object { $_.target -ceq $target })

@@ -11,12 +11,41 @@ if ([string]::IsNullOrWhiteSpace($Binary)) { throw 'Set KURU_EMBEDDED_TEST_BINAR
 $Binary = (Resolve-Path -LiteralPath $Binary).ProviderPath
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw 'MSVC Build Tools with vswhere are required for the shipping import check' }
-$tools = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe')
-$discoveryExitCode = $LASTEXITCODE
-if ($discoveryExitCode -ne 0 -or $tools.Count -eq 0) {
-    $diagnostic = ($tools | Select-Object -First 12) -join [Environment]::NewLine
+# Either MSVC tool set provides dumpbin, and /IMPORTS reads any PE machine, so
+# an x64 or Arm64 host tool can inspect either shipping image. Prefer the host
+# layout matching this process; this ordering never selects the target.
+$components = @(
+    'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+    'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+)
+$layouts = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
+    @('Hostarm64/arm64', 'Hostx64/x64')
+} else {
+    @('Hostx64/x64', 'Hostarm64/arm64')
+}
+$tools = @()
+$queries = @()
+foreach ($layout in $layouts) {
+    foreach ($component in $components) {
+        $found = @(& $vswhere -latest -products '*' -requires $component -find "VC/Tools/MSVC/**/bin/$layout/dumpbin.exe")
+        $discoveryExitCode = $LASTEXITCODE
+        $queries += "$component $layout (vswhere exit $discoveryExitCode; matches $($found.Count))"
+        if ($discoveryExitCode -ne 0) {
+            $diagnostic = (@($queries) + @($found | Select-Object -First 12)) -join [Environment]::NewLine
+            $diagnostic = $diagnostic.Substring(0, [Math]::Min(4096, $diagnostic.Length))
+            throw "MSVC dumpbin discovery failed: $diagnostic"
+        }
+        if ($found.Count -gt 0) {
+            $tools = $found
+            break
+        }
+    }
+    if ($tools.Count -gt 0) { break }
+}
+if ($tools.Count -eq 0) {
+    $diagnostic = $queries -join [Environment]::NewLine
     $diagnostic = $diagnostic.Substring(0, [Math]::Min(4096, $diagnostic.Length))
-    throw "The native MSVC dumpbin tool is missing (vswhere exit $discoveryExitCode; matches $($tools.Count)): $diagnostic"
+    throw "The native MSVC dumpbin tool is missing: $diagnostic"
 }
 $dumpbin = $tools[-1]
 
