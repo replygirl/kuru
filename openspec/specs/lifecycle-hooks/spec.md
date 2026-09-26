@@ -42,7 +42,7 @@ Before dispatch, Kuru MUST admit a call the runtime dispatches itself only when 
 
 A prior grant or evaluation MUST NOT authorize a changed operation.
 
-Original durable user and raw input MUST NOT be rewritten. A pre-turn rewrite changes the current turn's provider view. Wherever the rewritten input is durably retained in an actor's private history, it MUST be accompanied by a hook-provenance record, so hook-authored text is never stored as indistinguishable user speech.
+Original durable user and raw input MUST NOT be rewritten. A pre-turn rewrite replaces the original in the current turn's provider requests. Wherever the rewritten input is durably retained in an actor's private history, it MUST be accompanied by a hook-provenance record, so hook-authored text is never stored as indistinguishable user speech. The provenance record MUST remain private: Kuru MUST omit it from every provider projection, including the current request, later turns' retained history and context compaction. Post-hook annotations are separate records and keep their own context eligibility.
 
 #### Scenario: Ordered tool rewrite narrows authority
 
@@ -68,6 +68,11 @@ Original durable user and raw input MUST NOT be rewritten. A pre-turn rewrite ch
 
 - **WHEN** a pre-turn hook rewrites the input and the turn settles
 - **THEN** each participating actor's private history retains a `kuru-hook` pre-turn provenance record immediately before the rewritten current input, and the public transcript retains the original input
+
+#### Scenario: Provenance record is never sent to a provider
+
+- **WHEN** a pre-turn hook rewrites the input, the turn settles, a later turn runs and the part's history is compacted
+- **THEN** no provider request carries the original input or the `kuru-hook` provenance record, the current request carries the rewritten input, and the private history still holds the record immediately before the rewritten input
 
 ### Requirement: Post-event hooks preserve settled work
 
@@ -104,7 +109,7 @@ Owned hook cleanup MUST signal before reap. It MUST complete, or be reported as 
 - the cancelled or completed turn or dream returns
 - tool-host shutdown returns, and therefore before the project writer lease can be released
 
-After the root process exits, stdout and stderr MUST be drained only within the remaining invocation deadline. A pipe still held after that deadline MUST fail the hook closed without using partial output.
+After the root process exits, reaping and draining stdout and stderr MUST share one post-exit cleanup bound and MUST stay within the remaining invocation deadline. A pipe still held after that bound MUST fail the hook closed without using partial output. Caller loss during the drain MUST stop it at the next poll, so the post-exit tail never exceeds the host's quiescence bound.
 
 Lifecycle-hook execution and response handling MUST NOT recursively trigger another lifecycle hook. When the internal hook-origin marker suppresses configured hooks, Kuru MUST report each suppressed configured hook as a typed `suppressed` outcome at its lifecycle boundary instead of silently skipping it.
 
@@ -131,3 +136,8 @@ Documentation and diagnostics MUST describe hook commands as process authority a
 
 - **WHEN** a dream participant returns a `dream_suggest` provider call
 - **THEN** Kuru may run pre/post tool hooks with its real actor, session, operation, invocation, and call identities and no turn ID, while no user-turn or speaker-selection hook fires
+
+#### Scenario: Cancellation after root exit
+
+- **WHEN** a caller is cancelled after the hook root exits while an escaped descendant still holds its output open
+- **THEN** the hook worker stops draining and settles within its shared post-exit bound, quiescence reports no unconfirmed cleanup, and Kuru does not wait for the escaped descendant
