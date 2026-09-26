@@ -16,7 +16,9 @@ run = "cargo run -p kuru-delivery --features tooling --locked --bin kuru-deliver
 
 [tasks."setup:build-tools"]
 description = "Install only the pinned Go and llvm-mingw toolchains used by bundle:build"
-run = "mise install go@{{vars.kuru_go_version}} github:mstorsjo/llvm-mingw@{{vars.kuru_llvm_mingw_version}}"
+# Repeat bundle:build's linux-x64 asset option so the locked install matches
+# its packages/kuru-memory/mise.lock entry.
+run = "mise install go@{{vars.kuru_go_version}} 'github:mstorsjo/llvm-mingw[asset_pattern=llvm-mingw-{{vars.kuru_llvm_mingw_version}}-ucrt-ubuntu-22.04-x86_64.tar.xz]@{{vars.kuru_llvm_mingw_version}}'"
 
 # Source-built engine archives (manifest `provenance: built`). The recipe's
 # only build host is linux-x64; the delivery helper refuses any other host
