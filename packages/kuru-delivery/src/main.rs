@@ -130,6 +130,31 @@ enum BundleCommand {
         #[arg(long, env = "KURU_DOLT_BUNDLE_OFFLINE")]
         offline: bool,
     },
+    /// Build a pinned source-built engine archive on the linux-x64 build host.
+    Build {
+        #[arg(long, default_value = "packages/kuru-memory/support/dolt-assets.json")]
+        manifest: PathBuf,
+        #[arg(long)]
+        target: String,
+        /// Fresh private work directory (must not exist).
+        #[arg(long)]
+        work_dir: PathBuf,
+        /// Private directory receiving `<stem>.zip` and `pins.json`.
+        #[arg(long)]
+        output: PathBuf,
+        /// Report observed pins; required while the manifest is unpinned.
+        #[arg(long)]
+        print_pins: bool,
+        #[arg(long, env = "KURU_DOLT_BUNDLE_OFFLINE")]
+        offline: bool,
+        /// Non-authoritative local iteration on another host.
+        #[arg(
+            long,
+            env = "KURU_BUNDLE_BUILD_HOST_OVERRIDE",
+            value_parser = clap::builder::BoolishValueParser::new()
+        )]
+        host_override: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -307,6 +332,35 @@ async fn main() -> Result<()> {
             })
             .await?;
             println!("{}", prepared.display());
+        }
+        Command::Bundle {
+            command:
+                BundleCommand::Build {
+                    manifest,
+                    target,
+                    work_dir,
+                    output,
+                    print_pins,
+                    offline,
+                    host_override,
+                },
+        } => {
+            let report = bundle::build::build(&bundle::build::BuildOptions {
+                manifest,
+                target,
+                work_dir,
+                output,
+                print_pins,
+                offline,
+                host_override,
+                host: bundle::build::Host::current(),
+                jobs: std::thread::available_parallelism().map_or(2, usize::from),
+            })
+            .await?;
+            if print_pins {
+                println!("{}", serde_json::to_string_pretty(&report.pins)?);
+            }
+            println!("{}", bundle::build::summary(&report));
         }
         Command::Coverage {
             command:

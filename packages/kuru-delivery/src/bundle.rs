@@ -27,6 +27,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(15)];
 
+#[path = "bundle/build.rs"]
+pub mod build;
 #[cfg(test)]
 #[path = "bundle/recovery_tests.rs"]
 mod recovery_tests;
@@ -165,7 +167,7 @@ const RECIPES: [&str; 1] = ["dolt-cgo-llvm-mingw-icu-stub/1"];
 pub(crate) const BUILD_HOST: &str = "linux-x64";
 const DOLT_MODULE: &str = "github.com/dolthub/dolt/go";
 const ICU_RELEASES: &str = "https://github.com/unicode-org/icu/releases/download/";
-const GO_DOWNLOADS: &str = "https://go.dev/dl/";
+const GO_DOWNLOADS: &str = "https://dl.google.com/go/";
 const LLVM_MINGW_RELEASES: &str = "https://github.com/mstorsjo/llvm-mingw/releases/download/";
 const MAX_SOURCE_ARCHIVE: u64 = 64 * 1024 * 1024;
 const MAX_TOOLCHAIN_ARCHIVE: u64 = 512 * 1024 * 1024;
