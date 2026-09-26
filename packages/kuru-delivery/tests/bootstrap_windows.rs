@@ -3,7 +3,7 @@
 use base64::Engine;
 use kuru_archive::zip::{self, Limits, MemberKind, WriteMember};
 use kuru_delivery::{
-    archive::{MAX_ARCHIVE_BYTES, archive_name, digest, package},
+    archive::{MAX_ARCHIVE_BYTES, archive_name, digest, host_target, package},
     command::{Command, output},
     shell_support,
 };
@@ -23,11 +23,22 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Output,
+    sync::LazyLock,
     time::Duration,
 };
 use tokio::io::AsyncReadExt;
 
-const TARGET: &str = "x86_64-pc-windows-msvc";
+const WINDOWS_TARGETS: [&str; 2] = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
+// The test executable is native, so its compiled catalog target is the runner's
+// native machine target: the one the bootstrap must select.
+static TARGET: LazyLock<&'static str> = LazyLock::new(|| {
+    let target = host_target().expect("bootstrap tests require a catalog host target");
+    assert!(
+        WINDOWS_TARGETS.contains(&target),
+        "bootstrap tests require a Windows catalog target, found {target}"
+    );
+    target
+});
 const VERSION: &str = "0.2.0";
 const TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -55,14 +66,14 @@ impl Fixture {
         let candidate = root.path().join("candidate.exe");
         fs::write(&candidate, &replacement).unwrap();
         fs::write(install.join("kuru.exe"), &original).unwrap();
-        let archive = package(&candidate, TARGET, VERSION, &release).unwrap();
+        let archive = package(&candidate, *TARGET, VERSION, &release).unwrap();
         let generated = root.path().join("generated support");
         for name in shell_support::NAMES {
             let path = generated.join(name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, format!("generated {name} for {TARGET}\n")).unwrap();
+            fs::write(&path, format!("generated {name} for {}\n", *TARGET)).unwrap();
         }
-        let support = shell_support::package(&generated, TARGET, VERSION, &release).unwrap();
+        let support = shell_support::package(&generated, *TARGET, VERSION, &release).unwrap();
         fs::write(
             release.join("SHA256SUMS"),
             format!(
@@ -192,11 +203,11 @@ impl Fixture {
 
     fn installed(&self, path: &Path) {
         assert_eq!(fs::read(path.join("kuru.exe")).unwrap(), self.replacement);
-        let support = path.join(format!("share/kuru/{VERSION}/{TARGET}"));
+        let support = path.join(format!("share/kuru/{VERSION}/{}", *TARGET));
         for name in shell_support::NAMES {
             assert_eq!(
                 fs::read(support.join(name)).unwrap(),
-                format!("generated {name} for {TARGET}\n").into_bytes()
+                format!("generated {name} for {}\n", *TARGET).into_bytes()
             );
         }
         assert!(!self.root.path().join("executed").exists());
@@ -220,7 +231,7 @@ impl Fixture {
     }
 
     fn replace_archive(&self, bytes: &[u8]) {
-        let name = archive_name(VERSION, TARGET).unwrap();
+        let name = archive_name(VERSION, *TARGET).unwrap();
         fs::write(self.release.join(&name), bytes).unwrap();
         fs::write(
             self.release.join("SHA256SUMS"),
@@ -231,7 +242,7 @@ impl Fixture {
 
     fn support_archive(&self) -> PathBuf {
         self.release
-            .join(shell_support::archive_name(VERSION, TARGET).unwrap())
+            .join(shell_support::archive_name(VERSION, *TARGET).unwrap())
     }
 
     async fn crash_gap(&self) {
@@ -271,6 +282,66 @@ fn assert_no_stage(path: &Path) {
 
 fn stderr_message(result: &Output) -> String {
     powershell_diagnostic::message(&result.stderr)
+}
+
+fn other_target() -> &'static str {
+    WINDOWS_TARGETS
+        .into_iter()
+        .find(|target| *target != *TARGET)
+        .unwrap()
+}
+
+fn pe_machine(target: &str) -> (u16, &'static str) {
+    match target {
+        "x86_64-pc-windows-msvc" => (0x8664, "x64"),
+        "aarch64-pc-windows-msvc" => (0xaa64, "ARM64"),
+        other => panic!("{other} is not a Windows catalog target"),
+    }
+}
+
+fn machine_field(image: &[u8]) -> usize {
+    let offset = u32::from_le_bytes(image[60..64].try_into().unwrap()) as usize;
+    assert_eq!(
+        &image[offset..offset + 4],
+        b"PE\0\0",
+        "fixture is not a PE image"
+    );
+    offset + 4
+}
+
+// Renames the sealed cached helper itself, so its identity, length and digest
+// still match the receipt; only its name changes.
+fn rename_helper(cache: &Path, from: &OsStr, to: &OsStr) {
+    let pinned = Directory::open(cache, Privacy::OwnerOnly, NameRetention::Pinned).unwrap();
+    let movable = Directory::open(cache, Privacy::OwnerOnly, NameRetention::Movable).unwrap();
+    let file = movable.read(from).unwrap();
+    pinned
+        .rename_file(&movable, from, &file, to, Publication::New)
+        .unwrap();
+}
+
+// Publishes receipt bytes the way the updater does: a private draft replaced
+// into place, never an in-place write.
+fn replace_receipt(install: &Path, bytes: &[u8]) {
+    let state = Directory::open(
+        &install.join(".kuru-update"),
+        Privacy::OwnerOnly,
+        NameRetention::Movable,
+    )
+    .unwrap();
+    let draft = OsStr::new("receipt-fixture.json");
+    let mut file = state.create_new(draft).unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+    state
+        .publish_file(
+            &state,
+            draft,
+            &file,
+            OsStr::new("receipt.json"),
+            Publication::ReplaceRegular,
+        )
+        .unwrap();
 }
 
 fn success(result: &Output) {
@@ -326,7 +397,7 @@ async fn stock_ps51_installs_real_pe_zip_with_empty_path_and_explicit_options_ov
                 .arg("-Version")
                 .arg("v0.2.0")
                 .arg("-Target")
-                .arg(TARGET)
+                .arg(*TARGET)
                 .arg("-InstallDir")
                 .arg(&destination)
                 .arg("-ReleaseBase")
@@ -400,7 +471,9 @@ foreach ($name in @('Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Uti
 #[tokio::test]
 async fn marked_windows_core_requires_verified_paired_support_before_publication() {
     let fixture = Fixture::new();
-    let core = fixture.release.join(archive_name(VERSION, TARGET).unwrap());
+    let core = fixture
+        .release
+        .join(archive_name(VERSION, *TARGET).unwrap());
     fs::write(
         fixture.release.join("SHA256SUMS"),
         format!(
@@ -643,7 +716,7 @@ async fn stock_ps51_enforces_archive_and_decoded_output_limits_before_publicatio
     );
     fixture.installed(&control);
 
-    let name = archive_name(VERSION, TARGET).unwrap();
+    let name = archive_name(VERSION, *TARGET).unwrap();
     let archive = fixture.release.join(&name);
     let valid = fs::read(&archive).unwrap();
     // A real oversized local file exercises bounded Fetch/ReadBytes before
@@ -846,9 +919,9 @@ async fn omitted_version_freezes_simulated_release_roots_before_fetching_real_na
     let frozen = upstream.join("download/v0.2.0");
     fs::create_dir_all(&latest).unwrap();
     fs::create_dir_all(&frozen).unwrap();
-    let name = archive_name(VERSION, TARGET).unwrap();
+    let name = archive_name(VERSION, *TARGET).unwrap();
     fs::copy(fixture.release.join(&name), frozen.join(&name)).unwrap();
-    let support_name = shell_support::archive_name(VERSION, TARGET).unwrap();
+    let support_name = shell_support::archive_name(VERSION, *TARGET).unwrap();
     fs::copy(
         fixture.release.join(&support_name),
         frozen.join(&support_name),
@@ -886,7 +959,7 @@ async fn omitted_version_freezes_simulated_release_roots_before_fetching_real_na
     };
     let mut ambiguous = manifest.clone();
     ambiguous
-        .extend_from_slice(format!("{}  kuru-0.3.0-{TARGET}.zip\n", "0".repeat(64)).as_bytes());
+        .extend_from_slice(format!("{}  kuru-0.3.0-{}.zip\n", "0".repeat(64), *TARGET).as_bytes());
     for invalid in [ambiguous, vec![b'x'; 65537]] {
         fs::write(latest.join("SHA256SUMS"), invalid).unwrap();
         assert!(!fixture.run(&mut command()).await.status.success());
@@ -941,7 +1014,7 @@ async fn killing_actual_bootstrap_during_large_verified_archive_work_keeps_old_b
     // the acknowledgment precedes decode, not a sleep or guessed startup time.
     fixture.replacement.resize(96 * 1024 * 1024, 0x5a);
     fs::write(&fixture.candidate, &fixture.replacement).unwrap();
-    let path = package(&fixture.candidate, TARGET, VERSION, &fixture.release).unwrap();
+    let path = package(&fixture.candidate, *TARGET, VERSION, &fixture.release).unwrap();
     fs::copy(
         path.with_extension("zip.sha256"),
         fixture.release.join("SHA256SUMS"),
@@ -978,6 +1051,17 @@ async fn normal_bootstrap_recovers_genuine_missing_path_crash_gap_before_install
         &fs::read(fixture.install.join(".kuru-update/receipt.json")).unwrap(),
     )
     .unwrap();
+    // The updater names the helper by its own compiled target. On x64 this is
+    // the x64-named helper receipt; recovery never compares it with the
+    // native installation target.
+    assert_eq!(
+        Path::new(receipt["helper"].as_str().unwrap()).file_name(),
+        Some(OsStr::new(&format!(
+            "{}-{}.exe",
+            *TARGET,
+            digest(&fixture.original)
+        )))
+    );
     let result = fixture.run(&mut fixture.command()).await;
     success(&result);
     fixture.installed(&fixture.install);
@@ -1070,4 +1154,180 @@ async fn recover_only_restores_exact_old_identity_and_rejects_corrupted_trusted_
             .identity,
         identity
     );
+}
+
+#[tokio::test]
+async fn bootstrap_selects_the_native_machine_target_whatever_the_architecture_environment_reports()
+{
+    // AMD64 is true on x64 and false on Arm64; ARM64 is the reverse, so every
+    // runner sees one contradicting report in both variables. This proves the
+    // environment is ignored in a native shell. It does not launch the
+    // bootstrap from an emulated process (design D2, task 3.7).
+    let fixture = Fixture::new();
+    for reported in ["AMD64", "ARM64"] {
+        let destination = fixture.root.path().join(format!("reported {reported}"));
+        let mut command = fixture.script(&format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+& $env:KURU_BOOTSTRAP_SCRIPT -Version '{VERSION}' -InstallDir $env:KURU_TEST_DESTINATION
+Write-Output "reported=$env:PROCESSOR_ARCHITECTURE/$env:PROCESSOR_ARCHITEW6432"
+Write-Output "native=$([Kuru.Bootstrap.Native]::MachineTarget([Kuru.Bootstrap.Native]::NativeMachine()))"
+"#
+        ));
+        command
+            .env("PROCESSOR_ARCHITECTURE", reported)
+            .env("PROCESSOR_ARCHITEW6432", reported)
+            .env("KURU_TEST_DESTINATION", &destination);
+        let result = fixture.run(&mut command).await;
+        success(&result);
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let lines = stdout.lines().map(str::trim).collect::<Vec<_>>();
+        assert!(
+            lines.contains(&format!("reported={reported}/{reported}").as_str()),
+            "injected architecture did not reach the bootstrap: {stdout}"
+        );
+        assert!(
+            lines.contains(&format!("native={}", *TARGET).as_str()),
+            "bootstrap did not detect the native machine: {stdout}"
+        );
+        fixture.installed(&destination);
+    }
+    fixture.unchanged();
+}
+
+#[tokio::test]
+async fn explicit_target_that_differs_from_the_native_machine_fails_before_any_download() {
+    let fixture = Fixture::new();
+    for requested in [other_target(), "x86_64-pc-windows-gnu"] {
+        let result = fixture
+            .run(
+                fixture
+                    .command()
+                    .arg("-Target")
+                    .arg(requested)
+                    .env("PROCESSOR_ARCHITECTURE", "AMD64")
+                    .env("KURU_RELEASE_BASE", "https://must-not-contact.invalid"),
+            )
+            .await;
+        assert!(!result.status.success());
+        let message = stderr_message(&result);
+        for expected in [
+            format!("Requested target {requested}"),
+            format!("does not match the native machine target {}", *TARGET),
+        ] {
+            assert!(
+                message.contains(&expected),
+                "{expected:?} missing: {message}"
+            );
+        }
+        assert!(
+            !String::from_utf8_lossy(&result.stdout).contains("Verifying Kuru release archive."),
+            "a mismatched target reached archive work"
+        );
+        fixture.unchanged();
+        assert!(
+            !fixture.install.join(".kuru-update").exists(),
+            "a mismatched target opened installation state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn release_executable_for_another_machine_fails_before_publication() {
+    let fixture = Fixture::new();
+    let (native, name) = pe_machine(*TARGET);
+    let mut foreign = fixture.replacement.clone();
+    let field = machine_field(&foreign);
+    assert_eq!(
+        u16::from_le_bytes(foreign[field..field + 2].try_into().unwrap()),
+        native,
+        "the native fixture executable must carry the native PE machine"
+    );
+    foreign[field..field + 2].copy_from_slice(&pe_machine(other_target()).0.to_le_bytes());
+    let members = [
+        WriteMember {
+            name: "kuru.exe",
+            kind: MemberKind::File,
+            bytes: &foreign,
+            executable: true,
+        },
+        WriteMember {
+            name: "LICENSE",
+            kind: MemberKind::File,
+            bytes: b"license text",
+            executable: false,
+        },
+        WriteMember {
+            name: "README.md",
+            kind: MemberKind::File,
+            bytes: b"release without a support marker",
+            executable: false,
+        },
+    ];
+    fixture.replace_archive(
+        &zip::write(
+            &members,
+            Limits {
+                max_compressed_bytes: MAX_ARCHIVE_BYTES as u64,
+                max_expanded_bytes: MAX_ARCHIVE_BYTES as u64,
+                allow_ntfs_timestamps: false,
+            },
+        )
+        .unwrap(),
+    );
+    let result = fixture.run(&mut fixture.command()).await;
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("Verifying Kuru release archive."),
+        "PE validation was never reached: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let message = stderr_message(&result);
+    for expected in [
+        format!("must be an {name} PE32+ executable"),
+        format!("for {}", *TARGET),
+    ] {
+        assert!(
+            message.contains(&expected),
+            "{expected:?} missing: {message}"
+        );
+    }
+    fixture.unchanged();
+}
+
+#[tokio::test]
+async fn recovery_rejects_a_helper_whose_name_and_machine_disagree() {
+    let fixture = Fixture::new();
+    fixture.crash_gap().await;
+    let original_receipt = fs::read(fixture.install.join(".kuru-update/receipt.json")).unwrap();
+    let mut receipt: serde_json::Value = serde_json::from_slice(&original_receipt).unwrap();
+    let helper = PathBuf::from(receipt["helper"].as_str().unwrap());
+    let cache = helper.parent().unwrap();
+    let sha256 = receipt["helper_image"]["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let helper_name = OsString::from(format!("{}-{sha256}.exe", *TARGET));
+    assert_eq!(helper.file_name(), Some(helper_name.as_os_str()));
+    // The other Windows catalog target is an accepted helper name on its own;
+    // it is rejected only because the image's PE machine disagrees.
+    let mislabeled = OsString::from(format!("{}-{sha256}.exe", other_target()));
+    rename_helper(cache, &helper_name, &mislabeled);
+    receipt["helper"] = helper.with_file_name(&mislabeled).to_str().unwrap().into();
+    replace_receipt(&fixture.install, &serde_json::to_vec(&receipt).unwrap());
+    let result = fixture.run(fixture.command().arg("-Recover")).await;
+    assert!(!result.status.success());
+    assert!(
+        stderr_message(&result).contains("Recorded helper name and executable machine disagree"),
+        "mislabeled helper rejection: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!fixture.install.join("kuru.exe").exists());
+    assert!(!fixture.root.path().join("executed").exists());
+
+    rename_helper(cache, &mislabeled, &helper_name);
+    replace_receipt(&fixture.install, &original_receipt);
+    let result = fixture.run(fixture.command().arg("-Recover")).await;
+    success(&result);
+    fixture.unchanged();
 }
