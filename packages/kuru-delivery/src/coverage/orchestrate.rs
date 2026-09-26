@@ -861,10 +861,10 @@ mod tests {
 
     const MACOS_CAPTURED: &str =
         include_str!("../../tests/fixtures/coverage-show-env/macos-captured.pwsh.txt");
-    const LINUX_AUTHORED: &str =
-        include_str!("../../tests/fixtures/coverage-show-env/linux-authored.pwsh.txt");
-    const WINDOWS_AUTHORED: &str =
-        include_str!("../../tests/fixtures/coverage-show-env/windows-authored.pwsh.txt");
+    const LINUX_CAPTURED: &str =
+        include_str!("../../tests/fixtures/coverage-show-env/linux-captured.pwsh.txt");
+    const WINDOWS_CAPTURED: &str =
+        include_str!("../../tests/fixtures/coverage-show-env/windows-captured.pwsh.txt");
 
     fn pwsh(name: &str, value: &str) -> String {
         let escaped: String = value
@@ -899,11 +899,14 @@ mod tests {
                 .split(',')
                 .any(|name| name == "kuru_delivery")
         );
-        let names: Vec<_> = parse_show_env(MACOS_CAPTURED)
-            .unwrap()
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
+        let names_of = |text: &str| -> Vec<String> {
+            parse_show_env(text)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect()
+        };
+        let names = names_of(MACOS_CAPTURED);
         assert_eq!(
             names,
             [
@@ -919,27 +922,57 @@ mod tests {
             ]
         );
 
-        // Authored from the 0.9.1 `--pwsh` writer (cli.rs `ShowEnvFormat::Pwsh`
-        // and main.rs `set_env`) with GitHub-hosted runner paths; not captured.
-        let linux = variables(LINUX_AUTHORED);
+        // Captured on GitHub-hosted ubuntu-latest and windows-latest runners
+        // (CI run 36276764569, cargo-llvm-cov 0.9.1) from the stdout of
+        // `show-env --pwsh` with the target in `runner.temp`. The Windows
+        // target keeps the mixed separators of the runner-built path.
+        let linux = variables(LINUX_CAPTURED);
+        let target = "/home/runner/work/_temp/kuru-coverage-show-env-1";
+        assert_eq!(linux["CARGO_LLVM_COV_TARGET_DIR"], target);
+        assert_eq!(linux["CARGO_LLVM_COV_BUILD_DIR"], target);
         assert_eq!(
-            linux["CARGO_LLVM_COV_TARGET_DIR"],
-            "/home/runner/work/_temp/kuru-coverage-memory-1"
+            linux["LLVM_PROFILE_FILE"],
+            format!("{target}/kuru-%p-%4m.profraw")
         );
-        assert_eq!(linux.len(), macos.len());
-        let windows = variables(WINDOWS_AUTHORED);
         assert_eq!(
-            windows["CARGO_LLVM_COV_TARGET_DIR"],
-            r"D:\a\_temp\kuru-coverage-memory-1"
+            linux["RUSTC_WRAPPER"],
+            "/home/runner/.local/share/mise/installs/cargo-cargo-llvm-cov/0.9.1/bin/cargo-llvm-cov"
         );
-        assert!(windows["RUSTC_WRAPPER"].ends_with(r"\bin\cargo-llvm-cov.exe"));
+        assert_eq!(
+            linux["__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS"],
+            macos["__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS"]
+        );
+        assert!(
+            linux["__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES"]
+                .split(',')
+                .any(|name| name == "kuru_delivery")
+        );
+        assert_eq!(names_of(LINUX_CAPTURED), names);
+        let windows = variables(WINDOWS_CAPTURED);
+        let target = r"D:\a\_temp/kuru-coverage-show-env-1";
+        assert_eq!(windows["CARGO_LLVM_COV_TARGET_DIR"], target);
+        assert_eq!(windows["CARGO_LLVM_COV_BUILD_DIR"], target);
         assert_eq!(
             windows["LLVM_PROFILE_FILE"],
-            r"D:\a\_temp\kuru-coverage-memory-1\kuru-%p-%4m.profraw"
+            format!(r"{target}\kuru-%p-%4m.profraw")
         );
-        assert_eq!(windows.len(), macos.len());
-        // The trimmed capture parses identically.
-        assert_eq!(variables(MACOS_CAPTURED.trim_end()), macos);
+        assert_eq!(
+            windows["RUSTC_WRAPPER"],
+            r"C:\Users\runneradmin\AppData\Local\mise\installs\cargo-cargo-llvm-cov\0.9.1\bin\cargo-llvm-cov.exe"
+        );
+        assert_eq!(
+            windows["__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS"],
+            macos["__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS"]
+        );
+        assert_eq!(
+            windows["__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES"],
+            linux["__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES"]
+        );
+        assert_eq!(names_of(WINDOWS_CAPTURED), names);
+        // The trimmed captures parse identically.
+        for capture in [MACOS_CAPTURED, LINUX_CAPTURED, WINDOWS_CAPTURED] {
+            assert_eq!(variables(capture.trim_end()), variables(capture));
+        }
     }
 
     #[test]
