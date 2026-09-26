@@ -42,17 +42,17 @@ Before dispatch, Kuru MUST admit a call the runtime dispatches itself only when 
 
 A prior grant or evaluation MUST NOT authorize a changed operation.
 
-Original durable user and raw input MUST NOT be rewritten. The user-facing public transcript, session history and export MUST keep the original input of a rewritten turn.
+Original durable user and raw input MUST NOT be rewritten. The user-facing public transcript, session history and session export MUST keep the original input of a rewritten turn. A full memory export MAY carry the private provenance records and the rewritten input, but never the original.
 
 A pre-turn rewrite MUST replace the original in every provider projection of that turn's input:
-- the rewritten turn's own requests, and a retry of that turn
+- the rewritten turn's own requests
 - every later turn's projection of the public transcript, for every actor, including an actor that did not take part in the rewritten turn
 - resumed sessions and forks that inherit the turn
 - context compaction
 
-The provider-facing view MUST be consistent with what the model received, and MUST NOT disclose that a hook rewrote the input.
+The provider-facing view MUST be consistent with what the model received, and MUST NOT disclose that a hook rewrote the input. The projection MUST follow the turn's latest attempt: a retried attempt that is rewritten again replaces the retained rewrite, and a retried attempt that sends the original MUST make later projections use the original.
 
-Wherever the rewritten input is durably retained in an actor's private history, it MUST be accompanied by a hook-provenance record, so hook-authored text is never stored as indistinguishable user speech. Kuru MUST also retain durable turn-scoped rewrite provenance that carries the rewritten input without the original. It MUST retain that provenance before provider dispatch.
+Wherever the rewritten input is durably retained in an actor's private history, it MUST be accompanied by a hook-provenance record, so hook-authored text is never stored as indistinguishable user speech. Kuru MUST also retain durable turn-scoped rewrite provenance that carries the rewritten input without the original. It MUST retain that provenance, or clear it for an attempt that sends the original, before provider dispatch.
 
 Both provenance records MUST remain private: Kuru MUST omit them from every provider projection. Post-hook annotations are separate records and keep their own context eligibility.
 
@@ -90,6 +90,11 @@ Both provenance records MUST remain private: Kuru MUST omit them from every prov
 
 - **WHEN** a pre-turn hook rewrites one targeted turn and afterwards a later turn targets a different actor, the part's history is compacted, the session is resumed and a fork of the rewritten turn runs a turn
 - **THEN** no provider request message or instructions carry the original input, later public-transcript projections carry the rewritten input in its place, and the user-facing history still shows the original input
+
+#### Scenario: Retry without a rewrite projects the original
+
+- **WHEN** a pre-turn hook rewrites a turn, the attempt stops after the rewrite is retained but before provider dispatch, and the retried attempt's hooks allow the original input unchanged
+- **THEN** the retry sends the original input, later public-transcript projections carry the original input, and no provider request carries the earlier rewritten text
 
 ### Requirement: Post-event hooks preserve settled work
 
