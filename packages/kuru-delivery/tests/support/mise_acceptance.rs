@@ -33,14 +33,43 @@ mod mise_isolation;
 const DEADLINE: Duration = Duration::from_secs(180);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const TARGET: &str = "x86_64-pc-windows-msvc";
-const OLD_VERSION: &str = "0.4.2";
-const OLD_RELEASE: &str = "https://github.com/replygirl/kuru/releases/download/v0.4.2";
-// Digests of the immutable public v0.4.2 assets, independent of their
+/// One previously published Windows client to authenticate and exercise its
+/// real `update` subcommand against the exact staged candidate. Both current
+/// clients predate the five-file shell-support archive (#88 shipped after the
+/// v0.9.0 tag), so both assert an unmarked old core today. A release actually
+/// carrying managed shell support does not exist yet; once one publishes, add
+/// a third case here asserting `old_support.is_some()` and exact continuity
+/// of its existing support files across the upgrade — that is the one proof
+/// this pair still cannot make.
+struct OldClient {
+    version: &'static str,
+    release: &'static str,
+    manifest_sha256: &'static str,
+    windows_archive_sha256: &'static str,
+}
+
+// Digests of the immutable public release assets, independent of their
 // downloaded SHA256SUMS contents. Never execute an unverified old image.
-const OLD_MANIFEST_SHA256: &str =
-    "1cadb599c8cacfbd1161af733a22126454249c76a5be9d2dc9e31732f2df52a4";
-const OLD_WINDOWS_ARCHIVE_SHA256: &str =
-    "e85a5a378f12827eb9bb5666eb7af522c1ba9c19f7e3bd79f4f07ca4b8e860b3";
+const OLD_CLIENTS: [OldClient; 2] = [
+    OldClient {
+        version: "0.4.2",
+        release: "https://github.com/replygirl/kuru/releases/download/v0.4.2",
+        manifest_sha256: "1cadb599c8cacfbd1161af733a22126454249c76a5be9d2dc9e31732f2df52a4",
+        windows_archive_sha256: "e85a5a378f12827eb9bb5666eb7af522c1ba9c19f7e3bd79f4f07ca4b8e860b3",
+    },
+    OldClient {
+        // The currently shipped release, and the actual updater binary a
+        // real user upgrades from today. `update.rs` itself is byte-identical
+        // to v0.4.2 (verified via `git diff v0.4.2 v0.9.0 -- update.rs`); the
+        // value here is a different build (toolchain, dependency tree, CLI
+        // wiring in cli.rs) exercising the same update path, not different
+        // updater logic.
+        version: "0.9.0",
+        release: "https://github.com/replygirl/kuru/releases/download/v0.9.0",
+        manifest_sha256: "21703d2ee9f89459e8987f1ef31abc3fc02a830df6a3d4decb0c9c204f3817d7",
+        windows_archive_sha256: "7bf971ea1a410d50f95fbebcaccf3b2fb03140ca90b65b691ba70bcd060249c5",
+    },
+];
 
 fn checked_file_within(path: &Path, root: &Path) -> Result<bool> {
     let ancestor = Directory::open(root, Privacy::Inherited, NameRetention::Movable)?;
@@ -923,43 +952,55 @@ pub async fn run_staged(archive_path: &Path) -> Result<()> {
         "staged new release is missing its paired shell support"
     );
     run_archive(bytes, archive::digest(&executable), support.as_ref()).await?;
-    old_updater_accepts_staged_release(directory, &executable, support.as_ref().unwrap()).await
+    for old_client in &OLD_CLIENTS {
+        old_updater_accepts_staged_release(
+            old_client,
+            directory,
+            &executable,
+            support.as_ref().unwrap(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn old_updater_accepts_staged_release(
+    old_client: &OldClient,
     staged_directory: &str,
     staged_executable: &[u8],
     staged_support: &shell_support::Files,
 ) -> Result<()> {
+    let old_version = old_client.version;
+    let old_release = old_client.release;
     let root = tempfile::tempdir()?;
-    let old_release = root.path().join("verified-old-release");
-    fs::create_dir(&old_release)?;
-    let old_name = archive::archive_name(OLD_VERSION, TARGET)?;
-    let old_manifest = archive::read_asset(OLD_RELEASE, "SHA256SUMS", 64 * 1024).await?;
+    let old_release_dir = root.path().join("verified-old-release");
+    fs::create_dir(&old_release_dir)?;
+    let old_name = archive::archive_name(old_version, TARGET)?;
+    let old_manifest = archive::read_asset(old_release, "SHA256SUMS", 64 * 1024).await?;
     ensure!(
-        archive::digest(&old_manifest) == OLD_MANIFEST_SHA256,
-        "published v0.4.2 checksum manifest differs from the pinned asset"
+        archive::digest(&old_manifest) == old_client.manifest_sha256,
+        "published v{old_version} checksum manifest differs from the pinned asset"
     );
     ensure!(
-        archive::expected_digest(&old_manifest, &old_name)? == OLD_WINDOWS_ARCHIVE_SHA256,
-        "published v0.4.2 manifest names an unexpected Windows archive digest"
+        archive::expected_digest(&old_manifest, &old_name)? == old_client.windows_archive_sha256,
+        "published v{old_version} manifest names an unexpected Windows archive digest"
     );
     let old_archive =
-        archive::read_asset(OLD_RELEASE, &old_name, archive::MAX_ARCHIVE_BYTES).await?;
+        archive::read_asset(old_release, &old_name, archive::MAX_ARCHIVE_BYTES).await?;
     ensure!(
-        archive::digest(&old_archive) == OLD_WINDOWS_ARCHIVE_SHA256,
-        "published v0.4.2 Windows archive differs from the pinned asset"
+        archive::digest(&old_archive) == old_client.windows_archive_sha256,
+        "published v{old_version} Windows archive differs from the pinned asset"
     );
-    fs::write(old_release.join("SHA256SUMS"), &old_manifest)?;
-    fs::write(old_release.join(&old_name), &old_archive)?;
-    let old_directory = old_release
+    fs::write(old_release_dir.join("SHA256SUMS"), &old_manifest)?;
+    fs::write(old_release_dir.join(&old_name), &old_archive)?;
+    let old_directory = old_release_dir
         .to_str()
         .context("isolated old release directory is not Unicode")?;
     let (old_executable, old_support) =
-        archive::verified_release(old_directory, OLD_VERSION, TARGET).await?;
+        archive::verified_release(old_directory, old_version, TARGET).await?;
     ensure!(
         old_support.is_none(),
-        "published v0.4.2 core unexpectedly declares managed shell support"
+        "published v{old_version} core unexpectedly declares managed shell support"
     );
 
     let installation = root.path().join("old-installed-bin");
@@ -977,12 +1018,13 @@ async fn old_updater_accepts_staged_release(
         }
         command
     };
-    let mut old_version = command();
-    old_version.arg("--version");
-    let output = command::output(&mut old_version, DEADLINE).await?;
+    let mut version_probe = command();
+    version_probe.arg("--version");
+    let output = command::output(&mut version_probe, DEADLINE).await?;
     ensure!(
-        output.status.success() && output.stdout.as_slice() == b"kuru 0.4.2\n",
-        "verified old executable did not identify as v0.4.2: {}",
+        output.status.success()
+            && output.stdout.as_slice() == format!("kuru {old_version}\n").as_bytes(),
+        "verified old executable did not identify as v{old_version}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -993,7 +1035,7 @@ async fn old_updater_accepts_staged_release(
     let output = command::output(&mut update, DEADLINE).await?;
     ensure!(
         output.status.success(),
-        "actual v0.4.2 updater rejected the staged release: {}",
+        "actual v{old_version} updater rejected the staged release: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     ensure!(
@@ -1013,7 +1055,10 @@ async fn old_updater_accepts_staged_release(
         "upgraded executable did not report the staged version"
     );
 
-    let repair = root.path().join("explicit-support-repair");
+    // Not a repair of anything broken: this proves the upgraded binary's own
+    // regeneration matches the staged sidecar byte-for-byte, independent of
+    // whatever the old updater itself did or did not install as support.
+    let regenerated = root.path().join("regenerated-support-sidecar");
     for (name, args) in [
         ("completions/kuru.bash", &["completions", "bash"][..]),
         ("completions/_kuru", &["completions", "zsh"][..]),
@@ -1029,21 +1074,21 @@ async fn old_updater_accepts_staged_release(
             "upgraded executable did not regenerate exact staged support {name}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let destination = repair.join(name);
+        let destination = regenerated.join(name);
         fs::create_dir_all(
             destination
                 .parent()
-                .context("repair member has no parent")?,
+                .context("regenerated support member has no parent")?,
         )?;
         fs::write(&destination, &output.stdout)?;
         ensure!(
             fs::read(&destination)? == output.stdout,
-            "explicit support repair changed generated bytes for {name}"
+            "regeneration matching the staged sidecar changed on disk for {name}"
         );
     }
     ensure!(
         !root.path().join("xdg-data/kuru").exists() && !root.path().join("appdata/kuru").exists(),
-        "old update or pure support repair created application private data"
+        "old update or support sidecar regeneration created application private data"
     );
     root.close()
         .context("retire isolated old-updater acceptance root")
