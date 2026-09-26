@@ -117,25 +117,14 @@ runtime is involved.
    GitHub metadata that serves the exact staged Windows ZIP. In parallel,
    `build-docs` checks out the selected commit and builds and validates the site.
    The Windows check verifies candidate checksums and bytes, installation,
-   activation, bundled Dolt, an offline conversation and durable reopen.
-   Upgrade compatibility is required only from the immediately previous
-   published release. The check resolves it at run time from the public GitHub
-   releases list: the greatest stable `vX.Y.Z` release other than the
-   candidate, failing if none is older or one is newer. It downloads that
-   release's own `SHA256SUMS`, Windows ZIP and, when the release publishes
-   one, its Windows shell-support envelope over HTTPS. It verifies each file
-   against that manifest and GitHub's asset digests before running anything.
-   A support-aware previous release is installed with its own versioned
-   support tree, as the installers lay it out. That release's own updater
-   then runs against the staged candidate. The check requires the exact
-   replacement bytes and version. An executable-only previous updater must
-   leave no managed support. A support-aware one must install the candidate's
-   exact versioned support snapshot and leave the previous tree unchanged.
-   The upgraded binary regenerates the five support files, which must match
-   the staged sidecar. Nothing is pinned, so each release is checked against
-   the one users actually have. The loopback mise fixture and the local
-   release base given to the previous updater are not public downloads of the
-   new release. A failure in either path blocks `publish`.
+   activation, bundled Dolt, an offline conversation and durable reopen. It
+   then repeats
+   [previous-release update acceptance](#previous-release-update-acceptance)
+   against the exact staged candidate, requested at its real version, as a
+   release-time sanity re-run of the check ordinary CI runs on its native-test
+   platforms. The loopback mise fixture and the local release base given to the
+   previous updater are not public downloads of the new release. A failure in
+   either path blocks `publish`.
 7. Run `deploy-docs` only after both staged Windows acceptance and `build-docs`
    succeed. Pages deployment and GitHub release promotion are separate service
    operations; this ordering does not claim they update atomically.
@@ -188,10 +177,68 @@ simulated metadata, verifies what mise installs, and then runs and resumes an
 offline demo conversation from empty Kuru and engine caches. It checks memory
 status, history and sessions and compares the extracted Dolt executable and
 licenses with `packages/kuru-memory/support/dolt-assets.json` at the selected
-commit. It receives no release token, provider credential, proxy or public
-endpoint. Informational application stderr is allowed; machine results remain
-JSON on stdout. This proves the exact staged package through the native mise
-path, not availability or download behavior from the public GitHub release.
+commit. The fixture, mise and Kuru children receive no token, provider
+credential, proxy or public endpoint. Informational application stderr is
+allowed; machine results remain JSON on stdout. This proves the exact staged
+package through the native mise path, not availability or download behavior
+from the public GitHub release.
+
+The task then runs
+[previous-release update acceptance](#previous-release-update-acceptance)
+against the staged ZIP and its sidecar. Only its release resolver contacts
+public GitHub, as described there; the workflow step currently passes no
+`GITHUB_TOKEN`, so that listing request is anonymous and an exhausted anonymous
+rate limit on the runner fails the check and blocks `publish`.
+
+## Previous-release update acceptance
+
+Updating Kuru must always be possible and must succeed; migrations exist so that
+it does. As a floor under that policy, not a replacement for it, the previous
+published release's own updater must install every candidate. Ordinary PR and
+main CI runs `//packages/kuru-delivery:test:previous-release-update` natively on
+the platforms where it runs native behavior tests: Linux x86-64, macOS Apple
+Silicon and Windows x86-64. Other published targets are built in CI but not
+exercised by this check. The task requires `KURU_UPDATE_CANDIDATE_BINARY`, the
+absolute path of the release-profile `kuru` built from the tree under test, and
+outbound HTTPS to GitHub. It has no bundle-preparation dependency, because the
+binary already embeds its engine.
+
+The test packages the binary, and the five shell-support files it generates in
+an isolated environment, as a local release directory for the host target.
+Main's workspace version equals its latest published tag, so the candidate is
+packaged under the next patch version. The previous updater is asked for
+`X.Y.(Z+1)` while the installed binary still reports its built version `X.Y.Z`.
+The updater binds the archive name and checksums, not the reported version, so
+both versions are checked separately and the exact installed bytes are the
+discriminating check. A branch whose workspace version is older than the latest
+published tag fails release selection and must be rebased.
+
+The previous release is resolved at run time from the public GitHub releases
+list: the greatest stable `vX.Y.Z` release other than the candidate, failing if
+none is older or one is newer. The resolver downloads that release's own
+`SHA256SUMS`, the host target's archive (`.tar.gz` on Linux and macOS, `.zip` on
+Windows) and, when the release publishes one, that target's shell-support
+envelope. It verifies each file against that manifest and GitHub's asset digests
+before running anything. An optional `GITHUB_TOKEN` is sent as a bearer token
+only on the single release-listing request to `api.github.com`. Without it, that
+request is anonymous and can fail with `HTTP 403 rate limit exceeded` on shared
+runner addresses; pass the workflow's `${{ github.token }}` with `contents: read`
+to avoid it. Asset downloads are anonymous, and no
+Kuru or mise child process receives the token.
+
+The previous executable is installed into fresh isolated user, configuration,
+cache, data, state and temporary roots. A support-aware previous release also
+gets its own versioned support tree, and on Linux and macOS its stable man page,
+as the installers lay them out. That release's own `kuru update` then runs
+against the candidate directory. The check requires the exact replacement bytes
+and the built version. An executable-only previous updater must leave no managed
+support. A support-aware one must install the candidate's exact versioned
+support snapshot, leave the previous tree unchanged and, on Linux and macOS,
+publish the candidate's stable man page. The upgraded binary regenerates the
+five support files, which must match the candidate's. Nothing is pinned, so each
+change is checked against the release users actually have. The Release workflow
+repeats the check on Windows against the exact staged candidate before
+publication.
 
 `deploy-docs` depends on this native check and the independent docs build. The
 `publish` job depends on successful deployment, so a

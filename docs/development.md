@@ -123,6 +123,7 @@ bridge before any downloaded application can be trusted.
 | `mise run test:install` | Native archive tests and, on macOS/Linux, real Bash bootstrap tests |
 | `mise run //packages/kuru-delivery:test` | Delivery contracts, including native PowerShell bootstrap/update fixtures on Windows |
 | `mise run //apps/kuru-tui:test:embedded-runtime` | Package, install, update and reopen actual Kuru with cold offline memory |
+| `mise run //packages/kuru-delivery:test:previous-release-update` | [Previous published release's updater](release.md#previous-release-update-acceptance) installs `KURU_UPDATE_CANDIDATE_BINARY`; optional `GITHUB_TOKEN` |
 | `mise run lint:tooling` | Shell, GitHub Actions and metadata validation |
 | `mise run docs:dev` | Local VitePress server |
 | `mise run docs:check` | Docs formatting/lint, production build, local links, anchors and public content boundary |

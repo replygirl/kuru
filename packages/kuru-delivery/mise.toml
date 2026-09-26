@@ -123,6 +123,14 @@ run = [
   "cargo test -p kuru-delivery --all-features --locked --test bootstrap_install",
 ]
 
+[tasks."test:previous-release-update"]
+description = "Run the previous published release's own updater against this tree's release build on the native host"
+# Inputs: KURU_UPDATE_CANDIDATE_BINARY (required) is the absolute path to the
+# release-profile kuru executable built from this tree. GITHUB_TOKEN (optional)
+# authenticates only the GitHub release-listing request; it never reaches a
+# download or a Kuru child. Needs outbound HTTPS to api.github.com and github.com.
+run = "cargo test -p kuru-delivery --features tooling --locked --test previous_release_update previous_published_release_updates_to_this_tree -- --ignored --exact --nocapture --test-threads=1"
+
 [tasks."verify:published-windows"]
 description = "Verify the exact published Windows release through ordinary mise"
 dir = "{{config_root}}/../.."
