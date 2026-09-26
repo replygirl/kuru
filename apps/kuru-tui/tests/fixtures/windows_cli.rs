@@ -24,6 +24,7 @@ fn main() -> anyhow::Result<()> {
                 "arguments": arguments,
                 "no_hooks": std::env::var("MISE_NO_HOOKS").ok(),
                 "auto_install": std::env::var("MISE_TASK_RUN_AUTO_INSTALL").ok(),
+                "mbx": std::env::var("KURU_MBX").ok(),
                 "install_dir": std::env::var("KURU_INSTALL_DIR").ok(),
             }),
         )?;
@@ -44,6 +45,10 @@ fn main() -> anyhow::Result<()> {
                 "source build retained foreign selection: {selector}"
             );
         }
+        anyhow::ensure!(
+            std::env::var("KURU_MBX").as_deref() == Ok("0"),
+            "source build did not opt out of the maintainer build cache"
+        );
         anyhow::ensure!(
             std::env::var("GIT_SSH_COMMAND").as_deref() == Ok("fixture-ssh-command")
                 && std::env::var("GIT_CONFIG_GLOBAL").as_deref() == Ok("fixture-global-config"),

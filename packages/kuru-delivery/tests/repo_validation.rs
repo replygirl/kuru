@@ -113,6 +113,62 @@ fn rust_toolchain_and_mise_monorepo_scope_must_match() {
 }
 
 #[test]
+fn root_rust_pin_may_carry_tool_options_but_must_match_the_toolchain() {
+    let repo = Repository::new();
+    let options = "rust = { version = \"1.98.1\", mr_boxington = \"{{ get_env(name='KURU_MBX', default='1') != '0' }}\" }\nmr-boxington = { version = \"1.17.0\", os = [\"linux\", \"macos/arm64\", \"windows\"] }";
+    repo.replace("mise.toml", "rust = \"1.98.1\"", options);
+    assert!(repo.errors().is_empty(), "{:?}", repo.errors());
+    repo.replace("rust-toolchain.toml", "1.98.1", "1.97.0");
+    assert!(
+        repo.errors()
+            .iter()
+            .any(|error| error.contains("Rust pins differ"))
+    );
+    let repo = Repository::new();
+    repo.replace(
+        "mise.toml",
+        "rust = \"1.98.1\"",
+        "rust = { mr_boxington = true }",
+    );
+    let errors = repo.errors();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("Rust pins differ"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("rust must be exactly pinned"))
+    );
+}
+
+#[test]
+fn root_mise_tools_require_exact_versions() {
+    for pin in [
+        "\"latest\"",
+        "\"1.17\"",
+        "\"^1.17.0\"",
+        "{ version = \"latest\", os = [\"linux\"] }",
+        "{ os = [\"linux\"] }",
+        "[\"1.17.0\", \"1.18.0\"]",
+    ] {
+        let repo = Repository::new();
+        repo.replace(
+            "mise.toml",
+            "rust = \"1.98.1\"\n",
+            &format!("rust = \"1.98.1\"\nmr-boxington = {pin}\n"),
+        );
+        assert!(
+            repo.errors()
+                .iter()
+                .any(|error| error.contains("mr-boxington must be exactly pinned")),
+            "{pin}"
+        );
+    }
+}
+
+#[test]
 fn registry_dependencies_require_complete_exact_versions() {
     for version in [
         "1.2.3",

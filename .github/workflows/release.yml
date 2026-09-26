@@ -15,6 +15,8 @@ permissions:
 env:
   # Root aliases launch nested mise processes; freeze their lock writers too.
   MISE_LOCKED: "1"
+  # CI and release builds stay outside the maintainer mr-boxington cache.
+  KURU_MBX: "0"
 
 concurrency:
   group: release

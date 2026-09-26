@@ -32,6 +32,12 @@ fn exact_version(version: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// A mise tool pin is a version string or a table whose `version` carries it.
+fn tool_version(tool: &Value) -> Option<&str> {
+    tool.as_str()
+        .or_else(|| tool.get("version").and_then(Value::as_str))
+}
+
 fn owned_member(member: &str) -> bool {
     let parts: Vec<_> = Path::new(member).components().collect();
     matches!(parts.as_slice(), [Component::Normal(root), Component::Normal(_)] if *root == "apps" || *root == "packages")
@@ -65,16 +71,21 @@ pub fn check(root: &Path) -> Result<Vec<String>> {
     let config = read_toml(&root.join("mise.toml"))?;
     let toolchain = read_toml(&root.join("rust-toolchain.toml"))?;
     let mut errors = BTreeSet::new();
-    let rust = config
-        .get("tools")
+    let tools = config.get("tools").and_then(Value::as_table);
+    let rust = tools
         .and_then(|tools| tools.get("rust"))
-        .and_then(Value::as_str);
+        .and_then(tool_version);
     let channel = toolchain
         .get("toolchain")
         .and_then(|toolchain| toolchain.get("channel"))
         .and_then(Value::as_str);
     if rust.is_none() || rust != channel {
         errors.insert("Rust pins differ between mise.toml and rust-toolchain.toml".into());
+    }
+    for (name, tool) in tools.into_iter().flatten() {
+        if !tool_version(tool).is_some_and(|version| exact_version(&format!("={version}"))) {
+            errors.insert(format!("mise tool {name} must be exactly pinned"));
+        }
     }
     if config.get("monorepo_root").and_then(Value::as_bool) != Some(true) {
         errors.insert("mise.toml must declare monorepo_root = true".into());
