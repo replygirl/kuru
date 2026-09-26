@@ -255,8 +255,9 @@ fn shell_support_output(command: &Command) -> Result<Vec<u8>> {
 /// dependencies and consumer call sites instead of claiming isolation across
 /// arbitrary spawn mechanisms"), against `usage-cli` 6.11.1 as published:
 ///
-/// - `usage::sh::sh` (spawns `sh -c` on Unix, `cmd /c` on Windows) runs behind
-///   `usage_cli::complete_answer` only when a `SpecComplete.run` is
+/// - `usage::sh::sh` (tries `sh -c` first on every platform, falling back to
+///   `cmd /c` only on Windows and only when `sh` itself is not found) runs
+///   behind `usage_cli::complete_answer` only when a `SpecComplete.run` is
 ///   `Some(_)` (`usage-cli/src/cli/complete_word.rs`, `if let Some(run) =
 ///   &complete.run`). `usage-lib`'s `From<&clap::Command> for Spec`
 ///   conversion (`usage-lib/src/spec/cmd.rs`, the arg/flag loop building
