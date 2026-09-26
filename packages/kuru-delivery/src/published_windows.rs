@@ -339,14 +339,18 @@ pub struct PreviousWindowsRelease {
     pub version: String,
     pub manifest: Vec<u8>,
     pub archive: Vec<u8>,
+    /// The paired Windows shell-support envelope, present exactly when the
+    /// previous release publishes one.
+    pub support: Option<Vec<u8>>,
 }
 
 /// Resolve and download the release preceding `candidate` from public GitHub.
 ///
 /// Nothing is pinned: the release is selected at run time by
-/// [`select_previous`]. Both assets are read over HTTPS from their immutable
-/// version paths, and no bytes are returned until the ZIP matches that
-/// release's own `SHA256SUMS` and both match GitHub's asset digests.
+/// [`select_previous`]. Every asset is read over HTTPS from its immutable
+/// version path, and no bytes are returned until the ZIP and any paired
+/// shell-support envelope match that release's own `SHA256SUMS` and every
+/// file matches GitHub's asset digest.
 pub async fn previous_windows_release(candidate: &str) -> Result<PreviousWindowsRelease> {
     let candidate = candidate.parse::<release::Version>()?;
     let github = PublicGitHub::new()?;
@@ -365,23 +369,34 @@ pub async fn previous_windows_release(candidate: &str) -> Result<PreviousWindows
     let manifest = github
         .get(&format!("{download_base}/SHA256SUMS"), 64 * 1024)
         .await?;
+    verify_manifest(&manifest, &manifest_digest)?;
     let archive = github
         .get(
             &format!("{download_base}/{archive_name}"),
             archive::MAX_ARCHIVE_BYTES,
         )
         .await?;
-    verify_previous(
-        &manifest,
-        &archive,
-        &archive_name,
-        &manifest_digest,
-        &archive_digest,
-    )?;
+    verify_listed_asset(&manifest, &archive, &archive_name, &archive_digest)?;
+    let support_name = crate::shell_support::archive_name(&version, WINDOWS_TARGET)?;
+    let support = if publishes_asset(listed, &manifest, &support_name) {
+        // Either source naming the envelope requires both to agree on it.
+        let support_digest = listed_digest(listed, &version, &support_name)?;
+        let support = github
+            .get(
+                &format!("{download_base}/{support_name}"),
+                crate::shell_support::MAX_ENVELOPE_BYTES,
+            )
+            .await?;
+        verify_listed_asset(&manifest, &support, &support_name, &support_digest)?;
+        Some(support)
+    } else {
+        None
+    };
     Ok(PreviousWindowsRelease {
         version,
         manifest,
         archive,
+        support,
     })
 }
 
@@ -451,25 +466,37 @@ fn listed_digest(listed: &PublishedRelease, version: &str, name: &str) -> Result
     Ok(digest.to_owned())
 }
 
-fn verify_previous(
-    manifest: &[u8],
-    archive_bytes: &[u8],
-    archive_name: &str,
-    manifest_digest: &str,
-    archive_digest: &str,
-) -> Result<()> {
+fn publishes_asset(listed: &PublishedRelease, manifest: &[u8], name: &str) -> bool {
+    listed.assets.iter().any(|asset| asset.name == name)
+        || String::from_utf8_lossy(manifest).lines().any(|line| {
+            line.split_once(' ')
+                .and_then(|(_, listed)| listed.strip_prefix(' ').or(listed.strip_prefix('*')))
+                == Some(name)
+        })
+}
+
+fn verify_manifest(manifest: &[u8], manifest_digest: &str) -> Result<()> {
     ensure!(
         archive::digest(manifest) == manifest_digest,
         "previous release SHA256SUMS differs from its GitHub asset digest"
     );
-    let expected = archive::expected_digest(manifest, archive_name)?;
+    Ok(())
+}
+
+fn verify_listed_asset(
+    manifest: &[u8],
+    bytes: &[u8],
+    name: &str,
+    listed_digest: &str,
+) -> Result<()> {
+    let expected = archive::expected_digest(manifest, name)?;
     ensure!(
-        archive::digest(archive_bytes) == expected,
-        "previous release Windows archive differs from its SHA256SUMS"
+        archive::digest(bytes) == expected,
+        "previous release {name} differs from its SHA256SUMS"
     );
     ensure!(
-        expected == archive_digest,
-        "previous release SHA256SUMS and GitHub disagree on the Windows archive"
+        expected == listed_digest,
+        "previous release SHA256SUMS and GitHub disagree on {name}"
     );
     Ok(())
 }
@@ -1313,43 +1340,15 @@ mod tests {
             listed_digest(&release, "0.9.0", &name).unwrap(),
             archive_digest
         );
-        verify_previous(
-            &manifest,
-            &archive_bytes,
-            &name,
-            &manifest_digest,
-            &archive_digest,
-        )
-        .unwrap();
+        verify_manifest(&manifest, &manifest_digest).unwrap();
+        verify_listed_asset(&manifest, &archive_bytes, &name, &archive_digest).unwrap();
 
         let other = "f".repeat(64);
-        assert!(
-            verify_previous(
-                &manifest,
-                b"altered",
-                &name,
-                &manifest_digest,
-                &archive_digest
-            )
-            .is_err()
-        );
-        assert!(
-            verify_previous(&manifest, &archive_bytes, &name, &other, &archive_digest).is_err()
-        );
-        assert!(
-            verify_previous(&manifest, &archive_bytes, &name, &manifest_digest, &other).is_err()
-        );
+        assert!(verify_manifest(&manifest, &other).is_err());
+        assert!(verify_listed_asset(&manifest, b"altered", &name, &archive_digest).is_err());
+        assert!(verify_listed_asset(&manifest, &archive_bytes, &name, &other).is_err());
         let foreign = format!("{archive_digest}  kuru-0.9.0-other.zip\n").into_bytes();
-        assert!(
-            verify_previous(
-                &foreign,
-                &archive_bytes,
-                &name,
-                &archive::digest(&foreign),
-                &archive_digest
-            )
-            .is_err()
-        );
+        assert!(verify_listed_asset(&foreign, &archive_bytes, &name, &archive_digest).is_err());
 
         release.assets[1].digest = None;
         assert!(listed_digest(&release, "0.9.0", &name).is_err());
@@ -1365,6 +1364,55 @@ mod tests {
         assert!(listed_digest(&release, "0.9.0", &name).is_err());
         release.assets.truncate(1);
         assert!(listed_digest(&release, "0.9.0", &name).is_err());
+    }
+
+    #[test]
+    fn previous_support_envelope_is_detected_and_authenticated() {
+        let core = archive::archive_name("1.0.0", WINDOWS_TARGET).unwrap();
+        let support = crate::shell_support::archive_name("1.0.0", WINDOWS_TARGET).unwrap();
+        let envelope = b"support envelope".to_vec();
+        let envelope_digest = archive::digest(&envelope);
+        let unmarked = format!("{}  {core}\n", "a".repeat(64)).into_bytes();
+        let marked =
+            format!("{}  {core}\n{envelope_digest}  {support}\n", "a".repeat(64)).into_bytes();
+        let asset = |name: &str| ReleaseAsset {
+            name: name.into(),
+            browser_download_url: format!(
+                "https://github.com/{REPOSITORY}/releases/download/v1.0.0/{name}"
+            ),
+            digest: Some(format!("sha256:{envelope_digest}")),
+        };
+        let mut release = listed("v1.0.0", false, false);
+        release.assets = vec![asset(&core)];
+
+        // An executable-only release names no envelope in either source.
+        assert!(!publishes_asset(&release, &unmarked, &support));
+        // Naming it in either source requires it; a listing without it (or a
+        // manifest without it) then fails authentication instead of skipping.
+        assert!(publishes_asset(&release, &marked, &support));
+        assert!(listed_digest(&release, "1.0.0", &support).is_err());
+        release.assets.push(asset(&support));
+        assert!(publishes_asset(&release, &unmarked, &support));
+        assert!(verify_listed_asset(&unmarked, &envelope, &support, &envelope_digest).is_err());
+        let binary_marked =
+            format!("{}  {core}\n{envelope_digest} *{support}\n", "a".repeat(64)).into_bytes();
+        assert!(publishes_asset(
+            &listed("v1.0.0", false, false),
+            &binary_marked,
+            &support
+        ));
+
+        let digest = listed_digest(&release, "1.0.0", &support).unwrap();
+        verify_listed_asset(&marked, &envelope, &support, &digest).unwrap();
+        assert!(verify_listed_asset(&marked, b"altered envelope", &support, &digest).is_err());
+        assert!(verify_listed_asset(&marked, &envelope, &support, &"f".repeat(64)).is_err());
+        let substituted = format!(
+            "{}  {core}\n{}  {support}\n",
+            "a".repeat(64),
+            "b".repeat(64)
+        )
+        .into_bytes();
+        assert!(verify_listed_asset(&substituted, &envelope, &support, &digest).is_err());
     }
 
     #[test]

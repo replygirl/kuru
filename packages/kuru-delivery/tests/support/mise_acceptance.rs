@@ -943,6 +943,12 @@ async fn previous_updater_accepts_staged_release(
         old_release_dir.join(archive::archive_name(old_version, TARGET)?),
         &previous.archive,
     )?;
+    if let Some(envelope) = &previous.support {
+        fs::write(
+            old_release_dir.join(shell_support::archive_name(old_version, TARGET)?),
+            envelope,
+        )?;
+    }
     let old_directory = old_release_dir
         .to_str()
         .context("isolated old release directory is not Unicode")?;
@@ -955,6 +961,21 @@ async fn previous_updater_accepts_staged_release(
     fs::create_dir(&project)?;
     let installed = installation.join("kuru.exe");
     fs::write(&installed, &old_executable)?;
+    // Model a real previous installation: a support-aware release installs
+    // its own versioned support tree beside the executable, as the installers
+    // do, and that tree must survive the update unchanged.
+    let old_support_tree = installation
+        .join("share")
+        .join("kuru")
+        .join(old_version)
+        .join(TARGET);
+    if let Some(files) = &old_support {
+        shell_support::install_versioned(files, &installation, old_version, TARGET)?;
+        ensure!(
+            shell_support::read_generated(&old_support_tree)? == *files,
+            "previous v{old_version} support tree was not installed exactly"
+        );
+    }
     let environment = mise_isolation::prepare(root.path(), &project)?;
     let command = || {
         let mut command = Command::new(&installed);
@@ -991,11 +1012,15 @@ async fn previous_updater_accepts_staged_release(
     // A marked previous core shipped with the support-aware updater, which
     // stages the candidate's versioned snapshot before replacing itself.
     let managed = installation.join("share");
-    if old_support.is_some() {
+    if let Some(files) = &old_support {
         ensure!(
             shell_support::read_generated(&managed.join("kuru").join(VERSION).join(TARGET))?
                 == *staged_support,
             "support-aware v{old_version} updater did not install the exact staged support"
+        );
+        ensure!(
+            shell_support::read_generated(&old_support_tree)? == *files,
+            "v{old_version} update changed the previously installed support tree"
         );
     } else {
         ensure!(

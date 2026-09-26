@@ -122,18 +122,20 @@ runtime is involved.
    published release. The check resolves it at run time from the public GitHub
    releases list: the greatest stable `vX.Y.Z` release other than the
    candidate, failing if none is older or one is newer. It downloads that
-   release's own `SHA256SUMS` and Windows ZIP over HTTPS, verifies the ZIP
-   against that manifest and both files against GitHub's asset digests before
-   running anything, then runs that release's own updater against the staged
-   candidate. It checks the exact replacement bytes and version, requires an
-   executable-only previous updater to leave no managed support and a
-   support-aware one to install the candidate's exact versioned support
-   snapshot, and regenerates the five support files explicitly from the
-   upgraded binary against the staged sidecar. Nothing is pinned, so each
-   release is checked against the one users actually have. The loopback mise
-   fixture and the local release base given to the previous updater are not
-   public downloads of the new release. A failure in either path blocks
-   `publish`.
+   release's own `SHA256SUMS`, Windows ZIP and, when the release publishes
+   one, its Windows shell-support envelope over HTTPS. It verifies each file
+   against that manifest and GitHub's asset digests before running anything.
+   A support-aware previous release is installed with its own versioned
+   support tree, as the installers lay it out. That release's own updater
+   then runs against the staged candidate. The check requires the exact
+   replacement bytes and version. An executable-only previous updater must
+   leave no managed support. A support-aware one must install the candidate's
+   exact versioned support snapshot and leave the previous tree unchanged.
+   The upgraded binary regenerates the five support files, which must match
+   the staged sidecar. Nothing is pinned, so each release is checked against
+   the one users actually have. The loopback mise fixture and the local
+   release base given to the previous updater are not public downloads of the
+   new release. A failure in either path blocks `publish`.
 7. Run `deploy-docs` only after both staged Windows acceptance and `build-docs`
    succeed. Pages deployment and GitHub release promotion are separate service
    operations; this ordering does not claim they update atomically.
