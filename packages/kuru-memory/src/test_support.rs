@@ -80,6 +80,31 @@ pub fn tempdir() -> Result<TempDir> {
     TempDir::new("kuru-fixture-", None)
 }
 
+/// Outer hang backstop for a fixture that runs `lifecycles` real Dolt
+/// lifecycles, derived from the product budgets it exercises so that a real
+/// stall reports its own product error before this bound expires.
+///
+/// The fixture's first Dolt start may wait behind another fixture's cold
+/// install of the shared test runtime cache; the provisioner bounds that wait
+/// by `LOCK_TIMEOUT`. Each real lifecycle (a `ServiceOwner::open`, a spawned
+/// service owner, or a local `MemoryStore::open` that starts Dolt; managed
+/// attaches and checked rebinds start none) then gets the startup budget for
+/// its open, `QUERY_TIMEOUT` for the fixture's operations, and the larger
+/// retirement bound: `acquire_maintenance_permit`'s startup deadline, which
+/// covers the owner's reap, or the owned server's own close budget. A fixture
+/// whose owner retires only through idle expiry adds `SERVICE_IDLE_TIMEOUT`
+/// for that lifecycle at its call site. Fixtures keep the `OpenOptions::new`
+/// budgets; `open_options` changes only cache, offline mode and supervisor.
+#[cfg(test)]
+pub(crate) fn fixture_deadline(lifecycles: u32) -> std::time::Duration {
+    let config = OpenOptions::new(PathBuf::new(), String::new()).config;
+    let startup = std::time::Duration::from_secs(config.startup_timeout_secs);
+    let lifecycle = startup
+        .saturating_add(crate::store::QUERY_TIMEOUT)
+        .saturating_add(startup.max(crate::server::close_budget()));
+    crate::provision::LOCK_TIMEOUT.saturating_add(lifecycle.saturating_mul(lifecycles))
+}
+
 pub fn open_options(data_dir: PathBuf, project_scope: String) -> Result<OpenOptions> {
     let mut options = OpenOptions::new(data_dir, project_scope);
     options.config.cache_dir = Some(crate::store::test_cache());

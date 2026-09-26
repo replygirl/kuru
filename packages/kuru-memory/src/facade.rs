@@ -2804,6 +2804,7 @@ impl ActiveExportSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::fixture_deadline;
     use anyhow::Context;
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -2815,30 +2816,6 @@ mod tests {
         fn drop(&mut self) {
             self.0.abort();
         }
-    }
-
-    /// Outer hang backstop for a facade fixture, derived from the product
-    /// budgets it exercises so that a real stall reports its own product error
-    /// before this bound expires.
-    ///
-    /// The fixture's first Dolt start may wait behind another fixture's cold
-    /// install of the shared test runtime cache; the provisioner bounds that
-    /// wait by `LOCK_TIMEOUT`. Each real service lifecycle (a
-    /// `ServiceOwner::open` or a local `MemoryStore::open` that starts Dolt;
-    /// managed attaches and checked rebinds start none) then gets the startup
-    /// budget for its store open, `QUERY_TIMEOUT` for the fixture's operations,
-    /// and the startup budget again for `acquire_maintenance_permit`, whose
-    /// election and retirement deadline covers the owner's Dolt reap. Every
-    /// fixture's options keep the `OpenOptions::new` budgets;
-    /// `test_support::open_options` changes only cache, offline mode and
-    /// supervisor.
-    fn fixture_deadline(lifecycles: u32) -> Duration {
-        let config = OpenOptions::new(PathBuf::new(), String::new()).config;
-        let startup = Duration::from_secs(config.startup_timeout_secs);
-        let lifecycle = startup
-            .saturating_mul(2)
-            .saturating_add(store::QUERY_TIMEOUT);
-        crate::provision::LOCK_TIMEOUT.saturating_add(lifecycle.saturating_mul(lifecycles))
     }
 
     async fn cancel_before_session_acceptance<F>(remote: &RemoteView, operation: F) -> Result<()>

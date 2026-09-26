@@ -57,6 +57,17 @@ const LOG_LIMIT: usize = 32 * 1024;
 const CLOSE_GRACE: Duration = Duration::from_secs(8);
 const KILL_GRACE: Duration = Duration::from_secs(3);
 
+/// Worst-case owned close, as bounded by `close_pools_and_owner`: the first
+/// graceful pool drain, the Windows lifetime close, the supervisor reap
+/// allowance in `finish_owner`, and the post-reap pool drain.
+#[cfg(test)]
+pub(crate) fn close_budget() -> Duration {
+    CLOSE_GRACE
+        .saturating_add(KILL_GRACE)
+        .saturating_add(CLOSE_GRACE + KILL_GRACE + Duration::from_secs(2))
+        .saturating_add(CLOSE_GRACE)
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
     pub binary: PathBuf,
